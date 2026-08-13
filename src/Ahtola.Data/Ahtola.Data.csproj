@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>Ahtola</RootNamespace>
-    <AssemblyName>Ahtola.Data</AssemblyName>
+    <AssemblyName>Devolutions.Ahtola.Data</AssemblyName>
 
     <Title>Ahtola ADO.NET Provider (embedded)</Title>
     <Description>ADO.NET provider base for Ahtola (embedded inside Devolutions.Ahtola.Data.Sqlite). Exposes local and optional remote database access through System.Data.Common. Not shipped as a standalone package.</Description>

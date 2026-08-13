@@ -7,7 +7,6 @@ using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using Ahtola.Data.Sqlite;
-using YamlDotNet.Serialization;
 
 namespace Ahtola.PSSqlite;
 
@@ -27,30 +26,8 @@ internal static class StringExpansion
     }
 }
 
-internal static class YamlConfiguration
-{
-    public static IDictionary Load(string path)
-    {
-        var deserializer = new DeserializerBuilder().Build();
-        var parsed = deserializer.Deserialize<object>(File.ReadAllText(path));
-        if (parsed is null)
-        {
-            throw new InvalidDataException($"Configuration file '{path}' is empty.");
-        }
-
-        var normalized = DefinitionReader.Normalize(parsed);
-        if (normalized is not IDictionary dictionary)
-        {
-            throw new InvalidDataException($"Configuration file '{path}' must contain a mapping at its root.");
-        }
-
-        return dictionary;
-    }
-}
-
 public sealed class SQLiteDBConfig
 {
-    public string? ConfigurationFile { get; set; }
     public string? DatabasePath { get; set; }
     public string? DatabaseFile { get; set; }
     public string? ConnectionString { get; set; }
@@ -76,35 +53,19 @@ public sealed class SQLiteDBConfig
 
     public SQLiteDBConfig(string stringInfo)
     {
-        if (File.Exists(stringInfo))
-        {
-            ConfigurationFile = GetAbsolutePath(stringInfo);
-            SetObjectProperties(YamlConfiguration.Load(ConfigurationFile));
-        }
-        else if (stringInfo.StartsWith("Data Source=", StringComparison.OrdinalIgnoreCase))
+        if (stringInfo.StartsWith("Data Source=", StringComparison.OrdinalIgnoreCase))
         {
             ConnectionString = stringInfo;
         }
         else
         {
-            throw new ArgumentException($"Invalid SQLite connection string format: {stringInfo}");
+            throw new ArgumentException($"Connection strings must start with 'Data Source='. Received: {stringInfo}");
         }
     }
 
     public SQLiteDBConfig(IDictionary definition)
     {
         SetObjectProperties(definition);
-    }
-
-    public static SQLiteDBConfig Load(string configFile, Func<string, string>? expander = null)
-    {
-        var absolutePath = GetAbsolutePath(configFile);
-        var config = new SQLiteDBConfig
-        {
-            ConfigurationFile = absolutePath
-        };
-        config.SetObjectProperties(YamlConfiguration.Load(absolutePath), expander);
-        return config;
     }
 
     public string GetDatabaseSDL()

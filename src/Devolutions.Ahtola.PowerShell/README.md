@@ -12,7 +12,7 @@ Microsoft.Data.Sqlite / SQLitePCLRaw.
 
 ## Scope
 
-- YAML config / migration model ported from the C# port of synedgy.PSSqlite, with a collision-resistant `*-AhtolaSqlite*` public command surface.
+- A collision-resistant `*-AhtolaSqlite*` public command surface for managed SQLite operations.
 - Targets PowerShell 7+ only (`net8.0` / `net9.0` / `net10.0`). No Windows PowerShell 5.1 / netstandard2.0 path.
 - Adds managed operational cmdlets for connections, transactions, backups, schema
   inspection, maintenance, bulk copy, JSON/CSV table interchange, and Ahtola
@@ -44,7 +44,7 @@ Import-Module ./artifacts/powershell-modules/Devolutions.Ahtola.Sqlite
 Get-Command -Module Devolutions.Ahtola.Sqlite
 ```
 
-No native SQLite assets are required; PreLoadTypes loads managed Ahtola + YamlDotNet assemblies from `bin/`.
+No native SQLite assets are required; PreLoadTypes loads the managed Ahtola assemblies from `bin/`.
 
 ## Tests
 

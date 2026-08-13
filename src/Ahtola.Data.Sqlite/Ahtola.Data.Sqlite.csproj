@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Ahtola.Data.Sqlite</RootNamespace>
-    <AssemblyName>Ahtola.Data.Sqlite</AssemblyName>
+    <AssemblyName>Devolutions.Ahtola.Data.Sqlite</AssemblyName>
 
     <PackageId>Devolutions.Ahtola.Data.Sqlite</PackageId>
     <Title>Ahtola SQLite-compatible ADO.NET Provider</Title>
@@ -37,10 +37,10 @@
 
   <Target Name="AddProjectReferencesToPackage">
     <ItemGroup>
-      <BuildOutputInPackage Include="$(OutputPath)Ahtola.Data.dll"
-                            Condition="Exists('$(OutputPath)Ahtola.Data.dll')" />
-      <BuildOutputInPackage Include="$(OutputPath)Ahtola.Data.xml"
-                            Condition="Exists('$(OutputPath)Ahtola.Data.xml')" />
+      <BuildOutputInPackage Include="$(OutputPath)Devolutions.Ahtola.Data.dll"
+                            Condition="Exists('$(OutputPath)Devolutions.Ahtola.Data.dll')" />
+      <BuildOutputInPackage Include="$(OutputPath)Devolutions.Ahtola.Data.xml"
+                            Condition="Exists('$(OutputPath)Devolutions.Ahtola.Data.xml')" />
     </ItemGroup>
   </Target>
 </Project>

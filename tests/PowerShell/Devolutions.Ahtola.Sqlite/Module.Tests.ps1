@@ -41,16 +41,13 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
             'Compare-AhtolaSqliteDatabaseVersion'
             'Complete-AhtolaSqliteTransaction'
             'Export-AhtolaSqliteTable'
-            'Find-AhtolaSqliteConfigurationFile'
             'Get-AhtolaSqliteDatabaseInfo'
             'Get-AhtolaSqliteDatabaseMetadata'
             'Get-AhtolaSqliteIndex'
             'Get-AhtolaSqliteRow'
             'Get-AhtolaSqliteSchema'
             'Get-AhtolaSqliteTable'
-            'Import-AhtolaSqliteConfiguration'
             'Import-AhtolaSqliteTable'
-            'Initialize-AhtolaSqliteDatabase'
             'Invoke-AhtolaSqliteBulkCopy'
             'Invoke-AhtolaSqliteMaintenance'
             'Invoke-AhtolaSqliteQuery'
@@ -72,6 +69,15 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
         }
 
         $commands.Count | Should-Be $expected.Count
+    }
+
+    It 'does not export YAML configuration cmdlets' {
+        foreach ($name in @(
+                'Find-AhtolaSqliteConfigurationFile'
+                'Import-AhtolaSqliteConfiguration'
+                'Initialize-AhtolaSqliteDatabase')) {
+            Get-Command $name -ErrorAction SilentlyContinue | Should-BeNull
+        }
     }
 
     It 'loads the binary assembly Devolutions.Ahtola.PowerShell' {
@@ -521,30 +527,32 @@ Describe 'Devolutions.Ahtola.Sqlite backup and table interchange' {
     }
 }
 
-Describe 'Devolutions.Ahtola.Sqlite YAML initialize and CRUD' {
+Describe 'Devolutions.Ahtola.Sqlite programmatic configuration and CRUD' {
     BeforeAll {
         $script:TempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ahtola-sqlite-pester-" + [guid]::NewGuid().ToString('N'))
         $script:DbPath = Join-Path $script:TempRoot 'db'
         New-Item -ItemType Directory -Path $script:DbPath -Force | Out-Null
-        $script:ConfigPath = Join-Path $script:TempRoot 'Database.yml'
-
-        @"
-DatabasePath: '$($script:DbPath.Replace('\', '/'))'
-DatabaseFile: 'pester.sqlite'
-Version: '1.0.0'
-Schema:
-  Tables:
-    Items:
-      Columns:
-        Id:
-          Type: INTEGER
-          PrimaryKey: true
-          AllowNull: false
-        Name:
-          Type: TEXT
-        Qty:
-          Type: INTEGER
-"@ | Set-Content -Path $script:ConfigPath -Encoding utf8
+        $script:Config = [Devolutions.Ahtola.Sqlite.SqliteDBConfig]::new([ordered]@{
+                DatabasePath = $script:DbPath
+                DatabaseFile = 'pester.sqlite'
+                Version = '1.0.0'
+                Schema = [ordered]@{
+                    Tables = [ordered]@{
+                        Items = [ordered]@{
+                            Columns = [ordered]@{
+                                Id = [ordered]@{
+                                    Type = 'INTEGER'
+                                    PrimaryKey = $true
+                                    AllowNull = $false
+                                }
+                                Name = [ordered]@{ Type = 'TEXT' }
+                                Qty = [ordered]@{ Type = 'INTEGER' }
+                            }
+                        }
+                    }
+                }
+            })
+        $script:Config.UpdateDatabaseSchema()
     }
 
     AfterAll {
@@ -560,28 +568,17 @@ Schema:
         }
     }
 
-    It 'initializes a database from YAML with CREATE migration' {
-        Initialize-AhtolaSqliteDatabase -Path $script:ConfigPath -MigrationMode CREATE
-
+    It 'creates a database from programmatic configuration' {
         $dbFile = Join-Path $script:DbPath 'pester.sqlite'
         Test-Path -LiteralPath $dbFile | Should-BeTrue
 
-        $config = Import-AhtolaSqliteConfiguration -Path $script:ConfigPath
-        $compare = Compare-AhtolaSqliteDatabaseVersion -Configuration $config -ExpectedVersion '1.0.0'
+        $compare = Compare-AhtolaSqliteDatabaseVersion -Configuration $script:Config -ExpectedVersion '1.0.0'
         $compare.IsDeployed | Should-BeTrue
         $compare.CurrentVersion | Should-BeString '1.0.0'
     }
 
-    It 'finds configuration files in an explicit folder' {
-        $found = Find-AhtolaSqliteConfigurationFile `
-            -ConfigFolder $script:TempRoot `
-            -ConfigFileName 'Database.yml'
-
-        $found | Should-BeString ([System.IO.Path]::GetFullPath($script:ConfigPath))
-    }
-
     It 'round-trips insert, select, update, and delete' {
-        $config = Import-AhtolaSqliteConfiguration -Path $script:ConfigPath
+        $config = $script:Config
         $connection = New-AhtolaSqliteConnection -DatabasePath $config.DatabasePath -DatabaseFile $config.DatabaseFile
 
         try {
@@ -669,7 +666,7 @@ Schema:
     }
 
     It 'honors WhatIf for row mutations' {
-        $config = Import-AhtolaSqliteConfiguration -Path $script:ConfigPath
+        $config = $script:Config
         $connection = New-AhtolaSqliteConnection -DatabasePath $config.DatabasePath -DatabaseFile $config.DatabaseFile
         try {
             New-AhtolaSqliteRow `
@@ -715,7 +712,7 @@ Schema:
     }
 
     It 'reads version metadata' {
-        $config = Import-AhtolaSqliteConfiguration -Path $script:ConfigPath
+        $config = $script:Config
         $connection = New-AhtolaSqliteConnection -DatabasePath $config.DatabasePath -DatabaseFile $config.DatabaseFile
         try {
             $metadata = Get-AhtolaSqliteDatabaseMetadata -Connection $connection -MetadataKey version

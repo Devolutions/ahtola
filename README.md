@@ -40,7 +40,8 @@ Targets: `net8.0`, `net9.0`, `net10.0`. No `net48` / .NET Framework assets.
 | Layer | Name |
 | --- | --- |
 | NuGet PackageId | `Devolutions.Ahtola.*` |
-| Namespaces / assemblies / types | `Ahtola.*` (`AhtolaConnection`, `UseAhtola`, …) |
+| Assemblies | `Devolutions.Ahtola.*` |
+| Namespaces / types | `Ahtola.*` (`AhtolaConnection`, `UseAhtola`, …) |
 | Project folders | `src/Ahtola.*` |
 
 ## Quick start
@@ -124,10 +125,10 @@ Wrong/missing password failures include the phrase
 ## PowerShell module
 
 `Devolutions.Ahtola.Sqlite` is a binary PowerShell module that exposes the
-Ahtola engine through `*-AhtolaSqlite*` cmdlets, including a YAML-driven schema /
-migration model. Its implementation is ported from synedgy.PSSqlite and
-re-backed onto `Ahtola.Data.Sqlite` instead of Microsoft.Data.Sqlite /
-SQLitePCLRaw — so importing it pulls in **no native SQLite assets**. The
+Ahtola engine through `*-AhtolaSqlite*` cmdlets. Its implementation is ported
+from synedgy.PSSqlite and re-backed onto `Ahtola.Data.Sqlite` instead of
+Microsoft.Data.Sqlite / SQLitePCLRaw — so importing it pulls in **no native
+SQLite assets**. The
 public command noun is `AhtolaSqlite` to avoid collisions with other SQLite
 PowerShell modules.
 
@@ -166,10 +167,8 @@ Model types are available as module-qualified type accelerators, e.g.
 | `Test-AhtolaSqliteIntegrity` / `Optimize-AhtolaSqliteDatabase` / `Checkpoint-AhtolaSqliteDatabase` / `Invoke-AhtolaSqliteMaintenance` | Run focused integrity, optimization, WAL checkpoint, and constrained maintenance operations |
 | `Export-AhtolaSqliteTable` / `Import-AhtolaSqliteTable` | Move table data as portable JSON or CSV; this is distinct from a database backup |
 | `Set-AhtolaSqlitePassword` / `Clear-AhtolaSqlitePassword` | Encrypt, rekey, or decrypt file-backed managed Ahtola databases using a `SecureString` passphrase |
-| `Get-AhtolaSqliteRow` / `New-AhtolaSqliteRow` / `Set-AhtolaSqliteRow` / `Remove-AhtolaSqliteRow` | CRUD driven by a `SQLiteDBConfig` + `-Table` (+ `-Values` / `-Where`); update/delete emit affected-row counts |
-| `Import-AhtolaSqliteConfiguration` / `Find-AhtolaSqliteConfigurationFile` | Load / locate the YAML database config |
-| `Initialize-AhtolaSqliteDatabase` | Apply the YAML schema (`-MigrationMode INCREMENTAL\|CREATE\|OVERWRITE`) |
-| `Get-AhtolaSqliteDatabaseMetadata` / `Compare-AhtolaSqliteDatabaseVersion` | Read stored metadata; compare deployed vs expected version |
+| `Get-AhtolaSqliteRow` / `New-AhtolaSqliteRow` / `Set-AhtolaSqliteRow` / `Remove-AhtolaSqliteRow` | CRUD driven by a programmatically constructed `SQLiteDBConfig` + `-Table` (+ `-Values` / `-Where`); update/delete emit affected-row counts |
+| `Get-AhtolaSqliteDatabaseMetadata` / `Compare-AhtolaSqliteDatabaseVersion` | Read stored metadata; compare deployed vs expected configuration version |
 
 `New-AhtolaSqliteConnection` returns an open connection. Every cmdlet that
 receives `-Connection` may open a closed connection but never closes or
@@ -199,11 +198,6 @@ Invoke-AhtolaSqliteQuery -Connection $connection `
     -CommandText 'SELECT id, name FROM t WHERE name = $name' `
     -Parameters @{ '$name' = 'b' }
 
-# YAML-defined schema + CRUD
-Initialize-AhtolaSqliteDatabase -Path ./Database.yml -MigrationMode CREATE
-$config = Import-AhtolaSqliteConfiguration -Path ./Database.yml
-New-AhtolaSqliteRow -Configuration $config -Table Items -Values @{ Id = 1; Name = 'widget' }
-Get-AhtolaSqliteRow -Configuration $config -Table Items -Where @{ Id = 1 }
 $transaction = Start-AhtolaSqliteTransaction -Connection $connection
 Invoke-AhtolaSqliteQuery -Connection $connection -Transaction $transaction `
     -CommandText 'UPDATE Items SET Name = $name WHERE Id = $id' `

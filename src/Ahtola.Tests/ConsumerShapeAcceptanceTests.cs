@@ -440,11 +440,9 @@ public sealed class ConsumerShapeAcceptanceTests
     [Test]
     public void PSSqliteOverwriteRecreatesAfterClearingPoolsAndDeletingSidecars()
     {
-        // Initialize-AhtolaSqliteDatabase OVERWRITE: Close-AhtolaSqliteConnection ->
-        // ClearAllPools() -> delete .db (+ -wal/-shm/-journal) -> recreate. The managed
+        // Overwrite a database after clearing pools and deleting its sidecars. The managed
         // engine must reopen a fresh file-backed database at the same path with no stale
-        // ownership or orphan lock errors after the previous connection released its
-        // locks.
+        // ownership or orphan lock errors after the previous connection released its locks.
         var path = CreateDatabasePath("pssqlite-overwrite");
         try
         {
