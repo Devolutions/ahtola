@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <!-- PowerShell 7+ only: Ahtola engines multi-target net8/9/10, not netstandard2.0/WinPS 5.1. -->
+    <TargetFrameworks>$(AhtolaTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <!-- Types stay in Ahtola.PSSqlite; project/assembly follow Devolutions package naming. -->
+    <RootNamespace>Ahtola.PSSqlite</RootNamespace>
+    <AssemblyName>Devolutions.Ahtola.PowerShell</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <IsPackable>false</IsPackable>
+    <!-- Published PowerShell module identity (PSGallery / Import-Module name). -->
+    <PSModuleName>Devolutions.Ahtola.Sqlite</PSModuleName>
+    <PSModuleOutputRoot>$(MSBuildThisFileDirectory)..\..\artifacts\powershell-modules\$(PSModuleName)</PSModuleOutputRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+      <!-- Data.Sqlite embeds Ahtola.Data (PrivateAssets=all), so reference both for compile + module staging. -->
+      <ProjectReference Include="..\Ahtola.Core\Ahtola.Core.csproj" />
+      <ProjectReference Include="..\Ahtola.Data\Ahtola.Data.csproj" />
+      <ProjectReference Include="..\Ahtola.Data.Sqlite\Ahtola.Data.Sqlite.csproj" />
+      <!-- Compile-only: host PowerShell supplies the real SMA at Import-Module time. -->
+      <PackageReference Include="PowerShellStandard.Library" Version="5.1.1">
+        <PrivateAssets>all</PrivateAssets>
+        <ExcludeAssets>runtime</ExcludeAssets>
+      </PackageReference>
+      <PackageReference Include="YamlDotNet" Version="16.3.0" />
+    </ItemGroup>
+
+  <ItemGroup>
+    <None Include="Module\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="StagePowerShellModule" AfterTargets="Build" Condition="'$(TargetFramework)' == 'net8.0'">
+    <PropertyGroup>
+      <_ModuleOut>$([System.IO.Path]::GetFullPath('$(PSModuleOutputRoot)'))</_ModuleOut>
+      <_BinOut>$(_ModuleOut)\bin</_BinOut>
+    </PropertyGroup>
+    <ItemGroup>
+      <_ModuleAssets Include="$(MSBuildProjectDirectory)\Module\**\*" />
+      <_RuntimeAssemblies Include="$(TargetDir)*.dll"
+                          Exclude="$(TargetDir)System.Management.Automation.dll;$(TargetDir)Microsoft.PowerShell.*.dll" />
+      <_RuntimeDocs Include="$(TargetDir)*.xml" />
+      <_RuntimeJson Include="$(TargetDir)*.deps.json" />
+    </ItemGroup>
+    <MakeDir Directories="$(_BinOut);$(_ModuleOut)\en-US;$(_ModuleOut)\ScriptsToProcess" />
+    <Copy SourceFiles="@(_ModuleAssets)" DestinationFiles="@(_ModuleAssets->'$(_ModuleOut)\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(_RuntimeAssemblies)" DestinationFolder="$(_BinOut)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(_RuntimeDocs)" DestinationFolder="$(_BinOut)" SkipUnchangedFiles="true" Condition="'@(_RuntimeDocs)' != ''" />
+    <Copy SourceFiles="@(_RuntimeJson)" DestinationFolder="$(_BinOut)" SkipUnchangedFiles="true" Condition="'@(_RuntimeJson)' != ''" />
+  </Target>
+
+</Project>

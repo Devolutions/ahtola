@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFrameworks>$(AhtolaTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Ahtola</RootNamespace>
+    <AssemblyName>Ahtola.Data</AssemblyName>
+
+    <Title>Ahtola ADO.NET Provider (embedded)</Title>
+    <Description>ADO.NET provider base for Ahtola (embedded inside Devolutions.Ahtola.Data.Sqlite). Exposes local and optional remote database access through System.Data.Common. Not shipped as a standalone package.</Description>
+    <Authors>Devolutions</Authors>
+    <Company>Devolutions</Company>
+    <Product>Ahtola</Product>
+    <PackageTags>ahtola;sqlite;database;ado.net;system.data;devolutions</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Devolutions/ahtola</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Devolutions/ahtola</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  
+  <ItemGroup>
+    <ProjectReference Include="..\Ahtola.Core\Ahtola.Core.csproj" />
+  </ItemGroup>
+
+</Project>

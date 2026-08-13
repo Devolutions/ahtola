@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFrameworks>$(AhtolaTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Ahtola.Data.Sqlite</RootNamespace>
+    <AssemblyName>Ahtola.Data.Sqlite</AssemblyName>
+
+    <PackageId>Devolutions.Ahtola.Data.Sqlite</PackageId>
+    <Title>Ahtola SQLite-compatible ADO.NET Provider</Title>
+    <Description>Managed ADO.NET provider for Ahtola: a Microsoft.Data.Sqlite-compatible facade over the pure managed Ahtola Core engine. No native companion required. Ahtola is a Devolutions project.</Description>
+    <Authors>Devolutions</Authors>
+    <PackageTags>ahtola;sqlite;database;ado.net;system.data;devolutions</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Devolutions/ahtola</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Devolutions/ahtola</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);AddProjectReferencesToPackage</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Core is a standalone package (Devolutions.Ahtola.Core); let it flow transitively. -->
+    <ProjectReference Include="..\Ahtola.Core\Ahtola.Core.csproj" />
+    <!-- Data stays embedded inside this package (not separately packaged). -->
+    <ProjectReference Include="..\Ahtola.Data\Ahtola.Data.csproj" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+
+  <Target Name="AddProjectReferencesToPackage">
+    <ItemGroup>
+      <BuildOutputInPackage Include="$(OutputPath)Ahtola.Data.dll"
+                            Condition="Exists('$(OutputPath)Ahtola.Data.dll')" />
+      <BuildOutputInPackage Include="$(OutputPath)Ahtola.Data.xml"
+                            Condition="Exists('$(OutputPath)Ahtola.Data.xml')" />
+    </ItemGroup>
+  </Target>
+</Project>

@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <!-- The libraries under test ship every framework in $(AhtolaTargetFrameworks), so the
+             suite is compiled and executed against each of them rather than only the newest. -->
+        <TargetFrameworks>$(AhtolaTargetFrameworks)</TargetFrameworks>
+        <LangVersion>latest</LangVersion>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
+        <RootNamespace>Ahtola.Tests</RootNamespace>
+        <AssemblyName>Ahtola.Tests</AssemblyName>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="AwesomeAssertions" Version="9.1.0" />
+        <PackageReference Include="coverlet.collector" Version="6.0.2"/>
+        <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.8" />
+        <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite.Core" Version="$(AhtolaEntityFrameworkCoreVersion)" />
+        <!-- Microsoft.Data.Sqlite 9.x transitively resolves vulnerable SQLitePCLRaw.lib.e_sqlite3 2.1.10. -->
+        <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" />
+        <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0"/>
+        <PackageReference Include="NUnit" Version="4.2.2"/>
+        <PackageReference Include="NUnit.Analyzers" Version="4.4.0"/>
+        <PackageReference Include="NUnit3TestAdapter" Version="4.6.0"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <Using Include="NUnit.Framework"/>
+    </ItemGroup>
+    
+    <ItemGroup>
+        <ProjectReference Include="..\Ahtola.Data\Ahtola.Data.csproj" />
+        <ProjectReference Include="..\Ahtola.Data.Sqlite\Ahtola.Data.Sqlite.csproj" />
+        <ProjectReference Include="..\Ahtola.EntityFrameworkCore.Sqlite\Ahtola.EntityFrameworkCore.Sqlite.csproj" />
+                <ProjectReference Include="..\Devolutions.Ahtola.PowerShell\Devolutions.Ahtola.PowerShell.csproj" />
+                <ProjectReference Include="..\Ahtola.Core\Ahtola.Core.csproj" />
+            </ItemGroup>
+
+    <ItemGroup>
+        <!-- The managed conformance runner discovers every case in the corpus, so the whole
+             corpus is copied rather than an individually maintained file list. The corpus is
+             vendored into the repo so it is self-contained. -->
+        <Content Include="..\..\conformance\sqlite-sqltests\**\*.sqltest"
+                 LinkBase="Conformance"
+                 CopyToOutputDirectory="PreserveNewest" />
+        <Content Include="Conformance\managed-sqltest-expected-failures.txt"
+                 CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+</Project>

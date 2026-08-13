@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>PageCodecExamples</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+      <!-- Project refs so samples exercise the local page-codec port without packing.
+           Ahtola.Data is PrivateAssets=all inside Data.Sqlite packaging, so reference it
+           directly for compile-time types (ILocalReaderConnection, etc.). -->
+      <ProjectReference Include="..\..\src\Ahtola.Core\Ahtola.Core.csproj" />
+      <ProjectReference Include="..\..\src\Ahtola.Data\Ahtola.Data.csproj" />
+      <ProjectReference Include="..\..\src\Ahtola.Data.Sqlite\Ahtola.Data.Sqlite.csproj" />
+    </ItemGroup>
+
+</Project>

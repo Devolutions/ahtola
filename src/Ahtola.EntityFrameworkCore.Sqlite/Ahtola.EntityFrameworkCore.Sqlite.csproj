@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFrameworks>$(AhtolaTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Ahtola.EntityFrameworkCore.Sqlite</RootNamespace>
+    <AssemblyName>Ahtola.EntityFrameworkCore.Sqlite</AssemblyName>
+
+    <PackageId>Devolutions.Ahtola.EntityFrameworkCore.Sqlite</PackageId>
+    <Title>Ahtola Entity Framework Core SQLite Provider</Title>
+    <Description>Entity Framework Core provider for Ahtola.Data.Sqlite (EF Core 9.x on net8.0/net9.0, EF Core 10.x on net10.0), the managed ADO.NET facade over the pure managed Ahtola Core engine. No native companion required. Ahtola is a Devolutions project.</Description>
+    <Authors>Devolutions</Authors>
+    <PackageTags>ahtola;sqlite;database;entity-framework-core;efcore;linq;devolutions</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Devolutions/ahtola</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Devolutions/ahtola</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591;EF1001</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite.Core" Version="$(AhtolaEntityFrameworkCoreVersionRange)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ahtola.Data\Ahtola.Data.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\Ahtola.Data.Sqlite\Ahtola.Data.Sqlite.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+</Project>

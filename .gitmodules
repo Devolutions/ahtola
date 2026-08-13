@@ -1,0 +1,4 @@
+[submodule "turso-src"]
+	path = turso-src
+	url = https://github.com/tursodatabase/turso.git
+	branch = main

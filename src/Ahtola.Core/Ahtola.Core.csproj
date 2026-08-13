@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>$(AhtolaTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Ahtola.Core</RootNamespace>
+    <AssemblyName>Ahtola.Core</AssemblyName>
+    <PackageId>Devolutions.Ahtola.Core</PackageId>
+    <Title>Ahtola Core — managed SQLite-compatible database engine</Title>
+    <Description>Ahtola Core is a pure managed (C#) SQLite-compatible database engine. No native companion required. Ahtola is a Devolutions project.</Description>
+    <Authors>Devolutions</Authors>
+    <Company>Devolutions</Company>
+    <Product>Ahtola</Product>
+    <PackageTags>ahtola;sqlite;database;managed;pure-managed;devolutions</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Devolutions/ahtola</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Devolutions/ahtola</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <IsAotCompatible>true</IsAotCompatible>
+    <IsTrimmable>true</IsTrimmable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+</Project>

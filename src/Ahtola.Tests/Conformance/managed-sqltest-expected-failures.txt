@@ -1,0 +1,10 @@
+# Cases in sqlite/conformance/sqlite-sqltests that the managed engine does not yet satisfy.
+# Format: <relative path>::<test name> | <summary of the observed difference>
+# Regenerate with:
+#   dotnet test src/Ahtola.Tests/Ahtola.Tests.csproj \
+#     --filter FullyQualifiedName~RegenerateExpectedFailures -- NUnit.Explicit=true
+
+# Phase 1 MVCC surface cleared the previous 11 MVCC-mode markers
+# (journal_mode=mvcc + BEGIN CONCURRENT + sequential DML under MvStore).
+# Remaining MVCC depth (row-version chains, durable logical log, checkpoint SM)
+# is tracked in docs/mvcc-port-contract.md — not as silent expected failures.

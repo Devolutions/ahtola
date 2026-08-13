@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AhtolaConsumerTargetFramework Condition="'$(AhtolaConsumerTargetFramework)' == ''">net9.0</AhtolaConsumerTargetFramework>
+    <TargetFramework>$(AhtolaConsumerTargetFramework)</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <WarningsAsErrors>$(WarningsAsErrors);NU1608</WarningsAsErrors>
+    <AhtolaPackageVersion Condition="'$(AhtolaPackageVersion)' == ''">0.0.0-managed-local</AhtolaPackageVersion>
+    <AhtolaConsumerEntityFrameworkCoreVersion Condition="'$(AhtolaConsumerEntityFrameworkCoreVersion)' == '' and '$(TargetFramework)' == 'net10.0'">10.0.10</AhtolaConsumerEntityFrameworkCoreVersion>
+    <AhtolaConsumerEntityFrameworkCoreVersion Condition="'$(AhtolaConsumerEntityFrameworkCoreVersion)' == ''">9.0.9</AhtolaConsumerEntityFrameworkCoreVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Devolutions.Ahtola.Data.Sqlite" Version="$(AhtolaPackageVersion)" />
+    <PackageReference Include="Devolutions.Ahtola.EntityFrameworkCore.Sqlite" Version="$(AhtolaPackageVersion)" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite.Core" Version="$(AhtolaConsumerEntityFrameworkCoreVersion)" />
+  </ItemGroup>
+</Project>

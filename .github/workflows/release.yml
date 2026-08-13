@@ -1,0 +1,408 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable release version without the v prefix
+        required: true
+        type: string
+      dry_run:
+        description: Build, sign, and validate release artifacts without creating a release or publishing
+        default: false
+        required: false
+        type: boolean
+      github_env:
+        description: Protected GitHub environment that owns publishing credentials
+        default: auto
+        required: false
+        type: choice
+        options:
+          - auto
+          - test
+          - prod
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  NUGET_SOURCE: https://api.nuget.org/v3/index.json
+  PSIGN_VERSION: 0.6.2
+  PSIGN_LINUX_X64_SHA256: f3694e723d270c632b7b104b781112f8d0ed28e9756662446a41e71c0eb26ead
+
+jobs:
+  preflight:
+    name: Validate release inputs
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      publish_env: ${{ steps.release.outputs.publish_env }}
+    steps:
+      - name: Validate version and resolve release environment
+        id: release
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REQUESTED_ENV: ${{ inputs.github_env }}
+        run: |
+          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+(?:\.\d+)?$') {
+            throw 'version must be a stable numeric PowerShell module version, for example 1.2.3.'
+          }
+
+          $dryRun = [System.Boolean]::Parse($env:DRY_RUN)
+          $isMaster = $env:GITHUB_REF -eq 'refs/heads/master'
+          if (-not $dryRun -and -not $isMaster) {
+            throw 'Non-dry-run releases must be dispatched from the master branch.'
+          }
+
+          $publishEnvironment = if (-not $isMaster) {
+            'publish-test'
+          } elseif ($env:REQUESTED_ENV -eq 'test') {
+            'publish-test'
+          } else {
+            'publish-prod'
+          }
+
+          "version=$env:RELEASE_VERSION" >> $env:GITHUB_OUTPUT
+          "tag=v$env:RELEASE_VERSION" >> $env:GITHUB_OUTPUT
+          "publish_env=$publishEnvironment" >> $env:GITHUB_OUTPUT
+
+  pack:
+    name: Build and package release artifacts
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Restore
+        shell: pwsh
+        run: ./build.ps1 restore
+
+      - name: Pack Release nupkgs
+        shell: pwsh
+        run: ./build.ps1 pack -Configuration Release -PackageVersion ${{ needs.preflight.outputs.version }}
+
+      - name: Pack PowerShell module
+        shell: pwsh
+        run: ./build.ps1 pack-powershell -Configuration Release -PackageVersion ${{ needs.preflight.outputs.version }}
+
+      - name: Validate packed closure
+        shell: pwsh
+        run: ./build.ps1 validate-packed-closure
+
+      - name: Upload nupkgs
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-packages
+          path: artifacts/managed-packages/*.nupkg
+          if-no-files-found: error
+
+      - name: Upload PowerShell module
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-powershell-module
+          path: artifacts/powershell-modules/Devolutions.Ahtola.Sqlite/**
+          if-no-files-found: error
+
+  sign_powershell_module:
+    name: Sign PowerShell module with Azure Artifact Signing
+    needs:
+      - preflight
+      - pack
+    runs-on: ubuntu-latest
+    environment: ${{ needs.preflight.outputs.publish_env }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      signed: ${{ steps.sign_plan.outputs.should_sign }}
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+      TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.TRUSTED_SIGNING_ACCOUNT_NAME }}
+      TRUSTED_SIGNING_PROFILE_NAME: ${{ secrets.TRUSTED_SIGNING_PROFILE_NAME }}
+      TRUSTED_SIGNING_TIMESTAMP_SERVER: ${{ vars.TRUSTED_SIGNING_TIMESTAMP_SERVER || 'http://timestamp.acs.microsoft.com/' }}
+    steps:
+      - name: Download PowerShell module
+        uses: actions/download-artifact@v8
+        with:
+          name: unsigned-powershell-module
+          path: artifacts/powershell-modules
+
+      - name: Determine signing mode
+        id: sign_plan
+        shell: pwsh
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          $required = @(
+            'AZURE_CLIENT_ID',
+            'AZURE_TENANT_ID',
+            'AZURE_SUBSCRIPTION_ID',
+            'TRUSTED_SIGNING_ENDPOINT',
+            'TRUSTED_SIGNING_ACCOUNT_NAME',
+            'TRUSTED_SIGNING_PROFILE_NAME'
+          )
+          $missing = $required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) }
+          $shouldSign = $env:DRY_RUN -eq 'false'
+
+          if ($shouldSign -and $missing.Count -gt 0) {
+            throw "Azure Artifact Signing requires: $($missing -join ', ')"
+          }
+
+          "should_sign=$($shouldSign.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Download released PSign executable
+        if: steps.sign_plan.outputs.should_sign == 'true'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'psign-tool-linux-x64.zip'
+          $uri = "https://github.com/Devolutions/psign/releases/download/v$env:PSIGN_VERSION/psign-tool-linux-x64.zip"
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:PSIGN_LINUX_X64_SHA256) {
+            throw "PSign checksum mismatch. Expected $env:PSIGN_LINUX_X64_SHA256, got $actualHash."
+          }
+
+          $toolDirectory = Join-Path $env:RUNNER_TEMP 'psign-tool'
+          Expand-Archive -LiteralPath $archive -DestinationPath $toolDirectory -Force
+          $toolPath = Join-Path $toolDirectory 'psign-tool'
+          if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
+            throw "Released PSign executable was not found at $toolPath."
+          }
+
+          & chmod +x $toolPath
+          $toolDirectory >> $env:GITHUB_PATH
+          & $toolPath --version
+
+      - name: Azure login
+        if: steps.sign_plan.outputs.should_sign == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign PowerShell scripts
+        if: steps.sign_plan.outputs.should_sign == 'true'
+        shell: pwsh
+        run: |
+          $accessToken = az account get-access-token `
+            --scope https://codesigning.azure.net/.default `
+            --query accessToken `
+            --output tsv
+          if ([string]::IsNullOrWhiteSpace($accessToken)) {
+            throw 'Could not obtain an Azure Artifact Signing access token.'
+          }
+
+          $manifests = @(
+            Get-ChildItem -LiteralPath artifacts/powershell-modules -Recurse `
+              -Filter Devolutions.Ahtola.Sqlite.psd1 -File
+          )
+          if ($manifests.Count -ne 1) {
+            throw "Expected exactly one module manifest, found $($manifests.Count)."
+          }
+
+          $moduleRoot = $manifests[0].DirectoryName
+          $targets = Get-ChildItem -LiteralPath $moduleRoot -Recurse -File |
+            Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1' }
+          if ($targets.Count -eq 0) {
+            throw "No PowerShell files were found to sign in $moduleRoot."
+          }
+
+          foreach ($target in $targets) {
+            psign-tool --mode portable --verbose sign `
+              --artifact-signing-endpoint "$env:TRUSTED_SIGNING_ENDPOINT" `
+              --artifact-signing-account-name "$env:TRUSTED_SIGNING_ACCOUNT_NAME" `
+              --artifact-signing-profile-name "$env:TRUSTED_SIGNING_PROFILE_NAME" `
+              --artifact-signing-access-token "$accessToken" `
+              --timestamp-url "$env:TRUSTED_SIGNING_TIMESTAMP_SERVER" `
+              --timestamp-digest sha256 `
+              --digest sha256 `
+              --exit-codes azure `
+              "$($target.FullName)"
+            if ($LASTEXITCODE -ne 0) {
+              throw "PSign failed to sign $($target.FullName)."
+            }
+          }
+
+      - name: Archive signed PowerShell module
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          $manifest = Get-ChildItem -LiteralPath artifacts/powershell-modules -Recurse `
+            -Filter Devolutions.Ahtola.Sqlite.psd1 -File |
+            Select-Object -First 1
+          if (-not $manifest) {
+            throw 'Signed PowerShell module manifest was not found.'
+          }
+
+          $moduleRoot = $manifest.DirectoryName
+          $archiveRoot = 'artifacts/release-assets'
+          New-Item -ItemType Directory -Path $archiveRoot -Force | Out-Null
+          Compress-Archive -LiteralPath $moduleRoot -DestinationPath "$archiveRoot/Devolutions.Ahtola.Sqlite.$env:RELEASE_VERSION.zip" -Force
+
+      - name: Upload signed PowerShell module
+        uses: actions/upload-artifact@v7
+        with:
+          name: signed-powershell-module
+          path: artifacts/powershell-modules/Devolutions.Ahtola.Sqlite/**
+          if-no-files-found: error
+
+      - name: Upload signed PowerShell module archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: signed-powershell-module-archive
+          path: artifacts/release-assets/*.zip
+          if-no-files-found: error
+
+  github_release:
+    name: Create GitHub release
+    needs:
+      - preflight
+      - pack
+      - sign_powershell_module
+    if: inputs.dry_run == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download nupkgs
+        uses: actions/download-artifact@v8
+        with:
+          name: release-packages
+          path: artifacts/managed-packages
+
+      - name: Download signed module archive
+        uses: actions/download-artifact@v8
+        with:
+          name: signed-powershell-module-archive
+          path: artifacts/release-assets
+
+      - name: Create or update release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          $assets = @(
+            Get-ChildItem -LiteralPath artifacts/managed-packages -Filter *.nupkg -File
+            Get-ChildItem -LiteralPath artifacts/release-assets -Filter *.zip -File
+          )
+          if ($assets.Count -eq 0) {
+            throw 'No release assets were found.'
+          }
+
+          $assetPaths = $assets | ForEach-Object FullName
+          gh release view $env:RELEASE_TAG 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG @assetPaths --clobber
+          } else {
+            gh release create $env:RELEASE_TAG @assetPaths `
+              --target $env:TARGET_SHA `
+              --title "v$env:RELEASE_VERSION" `
+              --generate-notes
+          }
+
+  publish_nuget:
+    name: Publish to NuGet.org
+    needs:
+      - preflight
+      - pack
+      - sign_powershell_module
+      - github_release
+    if: inputs.dry_run == false
+    runs-on: ubuntu-latest
+    environment: ${{ needs.preflight.outputs.publish_env }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download nupkgs
+        uses: actions/download-artifact@v8
+        with:
+          name: release-packages
+          path: artifacts/managed-packages
+
+      - name: NuGet login with OIDC
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push nupkgs
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)) {
+            throw 'NuGet/login did not return an API key.'
+          }
+
+          Get-ChildItem -LiteralPath artifacts/managed-packages -Filter *.nupkg -File |
+            Sort-Object Name |
+            ForEach-Object {
+              dotnet nuget push $_.FullName `
+                --api-key $env:NUGET_API_KEY `
+                --source $env:NUGET_SOURCE `
+                --skip-duplicate
+            }
+
+  publish_psgallery:
+    name: Publish to PowerShell Gallery
+    needs:
+      - preflight
+      - sign_powershell_module
+      - github_release
+    if: inputs.dry_run == false
+    runs-on: ubuntu-latest
+    environment: ${{ needs.preflight.outputs.publish_env }}
+    permissions:
+      contents: read
+    steps:
+      - name: Download signed PowerShell module
+        uses: actions/download-artifact@v8
+        with:
+          name: signed-powershell-module
+          path: artifacts/powershell-modules
+
+      - name: Publish signed module
+        shell: pwsh
+        env:
+          PSGALLERY_NUGET_API_KEY: ${{ secrets.PSGALLERY_NUGET_API_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PSGALLERY_NUGET_API_KEY)) {
+            throw 'PSGALLERY_NUGET_API_KEY is not configured for this environment.'
+          }
+
+          $manifests = @(
+            Get-ChildItem -LiteralPath artifacts/powershell-modules -Recurse `
+              -Filter Devolutions.Ahtola.Sqlite.psd1 -File
+          )
+          if ($manifests.Count -ne 1) {
+            throw "Expected exactly one signed module manifest, found $($manifests.Count)."
+          }
+
+          $manifest = $manifests[0].FullName
+          $moduleRoot = $manifests[0].DirectoryName
+          Test-ModuleManifest -Path $manifest -ErrorAction Stop | Out-Null
+          Publish-Module -Path $moduleRoot -NuGetApiKey $env:PSGALLERY_NUGET_API_KEY -Verbose

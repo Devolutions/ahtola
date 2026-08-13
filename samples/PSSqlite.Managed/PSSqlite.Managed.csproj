@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- This is a vendoring helper project, not a shipping app; no assembly output is consumed directly. -->
+    <OutputType>Library</OutputType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- Class libraries don't copy referenced package assemblies to the output dir by default; force it so the vendor target has something to copy. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <AhtolaPackageVersion Condition="'$(AhtolaPackageVersion)' == ''">$(Version)</AhtolaPackageVersion>
+    <AhtolaVendorLibDir>$(MSBuildThisFileDirectory)source\lib\net8.0</AhtolaVendorLibDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Devolutions.Ahtola.Data.Sqlite" Version="$(AhtolaPackageVersion)" />
+  </ItemGroup>
+
+  <!--
+    Vendors the managed Ahtola assemblies into source/lib/net8.0 so the PowerShell
+    module can load them directly via Assembly.LoadFrom without requiring consumers
+    to run `dotnet restore` or have a .NET SDK installed at module-import time.
+    Assembly file names remain Ahtola.*.dll until the namespace/assembly rename phase.
+  -->
+  <Target Name="VendorAhtolaManagedAssemblies" AfterTargets="Build">
+    <ItemGroup>
+      <AhtolaManagedAssembly Include="$(OutDir)Ahtola.Core.dll" />
+      <AhtolaManagedAssembly Include="$(OutDir)Ahtola.Data.dll" />
+      <AhtolaManagedAssembly Include="$(OutDir)Ahtola.Data.Sqlite.dll" />
+    </ItemGroup>
+    <MakeDir Directories="$(AhtolaVendorLibDir)" />
+    <Copy SourceFiles="@(AhtolaManagedAssembly)" DestinationFolder="$(AhtolaVendorLibDir)" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="Vendored Ahtola managed assemblies to $(AhtolaVendorLibDir)" />
+  </Target>
+
+</Project>
