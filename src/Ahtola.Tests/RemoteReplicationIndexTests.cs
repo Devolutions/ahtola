@@ -41,8 +41,9 @@ public sealed class RemoteReplicationIndexTests
     }
 
     [TestCase("\"not-an-index\"")]
-    [TestCase("1")]
-    public void RemoteBatchRejectsAnInvalidOrUnencodedReplicationIndex(string encodedIndex)
+    [TestCase("1.5")]
+    [TestCase("{}")]
+    public void RemoteBatchRejectsAnInvalidReplicationIndex(string encodedIndex)
     {
         using var handler = new ReplicationIndexHandler(
             """
@@ -61,6 +62,29 @@ public sealed class RemoteReplicationIndexTests
             closeAfter: true,
             CancellationToken.None))!
             .Message.Should().Be("Remote response returned an invalid replication_index.");
+    }
+
+    [Test]
+    public async Task RemoteBatchAcceptsLegacyNumericReplicationIndex()
+    {
+        using var handler = new ReplicationIndexHandler(
+            """
+            {"results":[{"type":"ok","response":{"type":"batch","result":{"step_results":[{"cols":[],"rows":[],"affected_row_count":0}],"step_errors":[null],"replication_index":42}}}]}
+            """,
+            """
+            {"results":[{"type":"ok","response":{"type":"batch","result":{"step_results":[{"cols":[],"rows":[],"affected_row_count":0}],"step_errors":[null]}}}]}
+            """);
+        using var httpClient = new HttpClient(handler);
+        using var client = new AhtolaRemoteClient(
+            httpClient,
+            new Uri("https://example.com"),
+            authToken: null);
+        var commands = new[] { new AhtolaBatchCommand("SELECT 1") };
+
+        await client.ExecuteBatchAsync(commands, 30, wantRows: true, closeAfter: true, CancellationToken.None);
+        await client.ExecuteBatchAsync(commands, 30, wantRows: true, closeAfter: true, CancellationToken.None);
+
+        handler.RequestReplicationIndexes.Should().Equal(null, "42");
     }
 
     private sealed class ReplicationIndexHandler(params string[] responses) : HttpMessageHandler

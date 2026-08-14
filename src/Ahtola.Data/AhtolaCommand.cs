@@ -192,6 +192,12 @@ public class AhtolaCommand : DbCommand
 
     public override void Prepare()
     {
+        using var replicaOperation = _connection?.EnterManagedReplicaOperation(CancellationToken.None);
+        PrepareCore();
+    }
+
+    private void PrepareCore()
+    {
         if (_connection is null)
             throw new InvalidOperationException("Connection must be set before preparing a command.");
         if (string.IsNullOrWhiteSpace(CommandText))
@@ -209,6 +215,9 @@ public class AhtolaCommand : DbCommand
             try
             {
                 var sql = RewriteFacadePragmas(CommandText, _connection);
+                _connection.ManagedConnection.BusyTimeout = CommandTimeout == 0
+                    ? Timeout.InfiniteTimeSpan
+                    : TimeSpan.FromSeconds(CommandTimeout);
                 managedStatement = _connection.ManagedConnection.Prepare(sql);
                 BindManagedParameters(managedStatement);
                 _ = managedStatement.ResultMetadata.ColumnCount;
@@ -401,23 +410,47 @@ public class AhtolaCommand : DbCommand
         if (_connection.IsRemote)
             return ExecuteRemoteAsync(behavior, cancellationToken).GetAwaiter().GetResult();
 
-        Prepare();
-        cancellationToken.ThrowIfCancellationRequested();
+        IDisposable? replicaOperation = null;
+        var beganManagedReplicaTransaction = false;
+        try
+        {
+            beganManagedReplicaTransaction =
+                _connection.BeginManagedReplicaSqlTransaction(CommandText, cancellationToken);
+            replicaOperation = _connection.EnterManagedReplicaOperation(cancellationToken);
+            Prepare();
+            cancellationToken.ThrowIfCancellationRequested();
 
-        var nativeStatement = _nativeStatement;
-        var managedStatement = _managedStatement;
-        if (managedStatement is null && nativeStatement is null)
-            throw new InvalidOperationException("Command was not prepared.");
-        _nativeStatement = null;
-        _managedStatement = null;
-        var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
-        var reader = new AhtolaDataReader(
-            this,
-            nativeStatement,
-            managedStatement,
-            behavior,
-            () => MarkTransactionCompletedExternally(transactionCompletion));
-        return reader;
+            var nativeStatement = _nativeStatement;
+            var managedStatement = _managedStatement;
+            if (managedStatement is null && nativeStatement is null)
+                throw new InvalidOperationException("Command was not prepared.");
+            _nativeStatement = null;
+            _managedStatement = null;
+            var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
+            _connection.ManagedReplicaStatementStarted(CommandText);
+            var reader = new AhtolaDataReader(
+                this,
+                nativeStatement,
+                managedStatement,
+                behavior,
+                () =>
+                {
+                    MarkTransactionCompletedExternally(transactionCompletion);
+                    _connection.ManagedReplicaStatementCompleted(CommandText);
+                },
+                _connection.ManagedReplicaStatementFailed,
+                _connection.ManagedReplicaStatementClosed,
+                replicaOperation);
+            replicaOperation = null;
+            return reader;
+        }
+        catch
+        {
+            replicaOperation?.Dispose();
+            if (beganManagedReplicaTransaction)
+                _connection.ManagedReplicaStatementFailed();
+            throw;
+        }
     }
 
     internal T RunOperation<T>(

@@ -2,10 +2,14 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Data;
+using System.Data.Common;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Security;
 using System.Text.RegularExpressions;
+using Ahtola;
 using Ahtola.Data.Sqlite;
 
 namespace Ahtola.PSSqlite;
@@ -23,6 +27,116 @@ internal static class StringExpansion
             expanded,
             match => Environment.GetEnvironmentVariable(match.Groups["name"].Value) ?? string.Empty);
         return expanded;
+    }
+}
+
+internal static class TursoCloudConnectionFactory
+{
+    internal const string RemoteUrlEnvironmentVariable = "TURSO_REMOTE_URL";
+    internal const string AuthTokenEnvironmentVariable = "TURSO_AUTH_TOKEN";
+
+    public static AhtolaCloudConnection Create(
+        string? remoteUrl,
+        SecureString? authToken,
+        string? replicaPath,
+        bool useTursoEnvironment,
+        int syncInterval)
+    {
+        var endpoint = ResolveEndpoint(remoteUrl, useTursoEnvironment);
+        var token = ResolveAuthToken(authToken, useTursoEnvironment);
+        string? resolvedReplicaPath = null;
+        try
+        {
+            AhtolaConnection connection;
+            if (string.IsNullOrWhiteSpace(replicaPath))
+            {
+                var builder = new AhtolaConnectionStringBuilder
+                {
+                    DataSource = endpoint.AbsoluteUri,
+                };
+                if (!string.IsNullOrWhiteSpace(token))
+                    builder.AuthToken = token;
+
+                connection = new AhtolaConnection(builder.ConnectionString);
+            }
+            else
+            {
+                resolvedReplicaPath = Path.GetFullPath(StringExpansion.Expand(replicaPath));
+                var options = new AhtolaReplicaOptions(resolvedReplicaPath, endpoint, token)
+                {
+                    SyncInterval = syncInterval,
+                };
+                connection = AhtolaConnection.CreateReplica(options);
+            }
+
+            try
+            {
+                connection.Open();
+                return new AhtolaCloudConnection(connection, endpoint, resolvedReplicaPath);
+            }
+            catch
+            {
+                try
+                {
+                    connection.Dispose();
+                }
+                catch
+                {
+                    // Keep credential-bearing provider failures out of the PowerShell error stream.
+                }
+                throw new InvalidOperationException("The Turso Cloud connection could not be opened.");
+            }
+        }
+        finally
+        {
+            token = string.Empty;
+        }
+    }
+
+    private static Uri ResolveEndpoint(string? remoteUrl, bool useTursoEnvironment)
+    {
+        var value = string.IsNullOrWhiteSpace(remoteUrl)
+            ? useTursoEnvironment
+                ? Environment.GetEnvironmentVariable(RemoteUrlEnvironmentVariable)
+                : null
+            : StringExpansion.Expand(remoteUrl);
+
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new ArgumentException(useTursoEnvironment
+                ? "TursoUrl must be supplied or TURSO_REMOTE_URL must be set when UseTursoEnvironment is specified."
+                : "TursoUrl is required unless UseTursoEnvironment is specified.");
+        }
+
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var endpoint)
+            || string.IsNullOrWhiteSpace(endpoint.Host)
+            || !string.IsNullOrEmpty(endpoint.UserInfo)
+            || !string.IsNullOrEmpty(endpoint.Query)
+            || !string.IsNullOrEmpty(endpoint.Fragment)
+            || !(endpoint.Scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase)
+                 || endpoint.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+                 || endpoint.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new ArgumentException(
+                "TursoUrl must be an absolute libsql, HTTPS, or HTTP URL without user information, a query string, or a fragment.");
+        }
+
+        return endpoint;
+    }
+
+    private static string? ResolveAuthToken(SecureString? authToken, bool useTursoEnvironment)
+    {
+        if (authToken is not null)
+        {
+            var value = new NetworkCredential(string.Empty, authToken).Password;
+            if (string.IsNullOrWhiteSpace(value))
+                throw new ArgumentException("AuthToken cannot be empty.");
+            return value;
+        }
+
+        return useTursoEnvironment
+            ? Environment.GetEnvironmentVariable(AuthTokenEnvironmentVariable)
+            : null;
     }
 }
 
@@ -368,13 +482,13 @@ public sealed class QueryOptions
     public string OutputFormat { get; set; } = "PSCustomObject";
     public int CommandTimeout { get; set; } = 30;
     public string? TableName { get; set; }
-    public SqliteTransaction? Transaction { get; set; }
+    public DbTransaction? Transaction { get; set; }
 }
 
 public static class QueryExecutor
 {
     public static object? Execute(
-        SqliteConnection connection,
+        DbConnection connection,
         string commandText,
         IDictionary? parameters,
         QueryOptions? options = null)
@@ -428,10 +542,10 @@ public static class QueryExecutor
     }
 
     public static DataTable ExecuteDataTable(
-        SqliteConnection connection,
+        DbConnection connection,
         string commandText,
         IDictionary? parameters = null,
-        SqliteTransaction? transaction = null)
+        DbTransaction? transaction = null)
     {
         return (DataTable)Execute(
             connection,
@@ -444,7 +558,7 @@ public static class QueryExecutor
             })!;
     }
 
-    private static void AddParameters(SqliteCommand command, IDictionary? parameters)
+    private static void AddParameters(DbCommand command, IDictionary? parameters)
     {
         if (parameters is null)
         {

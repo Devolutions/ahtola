@@ -8,6 +8,7 @@ public class AhtolaTransaction : DbTransaction
     private AhtolaConnection? _connection;
     private readonly IsolationLevel _isolationLevel;
     private readonly bool _supportsSavepoints;
+    private IDisposable? _managedReplicaOperation;
     private bool _completed;
 
     public AhtolaTransaction(AhtolaConnection connection, IsolationLevel isolationLevel)
@@ -27,12 +28,23 @@ public class AhtolaTransaction : DbTransaction
         if (_isolationLevel == IsolationLevel.ReadUncommitted)
             connection.ReadUncommitted = true;
 
-        if (beginTransaction)
+        try
         {
-            if (connection.IsRemote)
-                connection.BeginRemoteTransaction(_isolationLevel);
-            else
-                connection.ExecuteNonQuery("BEGIN");
+            if (beginTransaction)
+            {
+                if (connection.IsRemote)
+                    connection.BeginRemoteTransaction(_isolationLevel);
+                else
+                    connection.ExecuteNonQuery("BEGIN");
+            }
+
+            _managedReplicaOperation = connection.EnterManagedReplicaTransaction();
+        }
+        catch
+        {
+            _managedReplicaOperation?.Dispose();
+            _managedReplicaOperation = null;
+            throw;
         }
     }
 
@@ -60,6 +72,7 @@ public class AhtolaTransaction : DbTransaction
                     .ConfigureAwait(false);
             }
 
+            transaction._managedReplicaOperation = connection.EnterManagedReplicaTransaction();
             return transaction;
         }
         catch
@@ -274,6 +287,7 @@ public class AhtolaTransaction : DbTransaction
         _completed = true;
         _connection = null;
         connection.TransactionCompleted(this);
+        Interlocked.Exchange(ref _managedReplicaOperation, null)?.Dispose();
     }
 
     private void ThrowIfCompleted()

@@ -717,6 +717,35 @@ resolution, CDC capture — including `vdbe-cdc-opcode`'s `InitCdcVersion`) are
 but filed as `missing`/s2 since they are unshipped rather than rejected).
 2 `extension` entries cover Ahtola-only provider conveniences.
 
+### 9.1 Managed Cloud replica support matrix (Turso v0.7.2)
+
+This matrix applies only to the pure-managed `ManagedReplicaConnectionHost`
+fallback reached by `AhtolaConnection.CreateReplica`, not to an explicitly
+registered companion factory. It is deliberately narrower than both the
+general Hrana remote client and Turso's sync engine. Unsupported settings are
+rejected while validating the managed replica open request, before the path is
+opened or bootstrap state is created. Unsupported wire responses are rejected
+while staged, before either the database or its replica metadata is published.
+
+| Capability / option | Status | Managed behavior |
+| --- | --- | --- |
+| Complete raw 4 KiB page stream, legacy/unspecified or v1 `Pages` protocol | **Qualified** | The bootstrapper requests raw pages, requires every 4 KiB `PageData` chunk exactly once, stages and validates the SQLite image, then atomically publishes it. Incremental raw page sets follow the same staged path. |
+| Remote encryption (`RemoteEncryption`) | **Explicitly rejected** | No encrypted page decoder or encrypted local image support is present in the managed replica. This is distinct from encrypted **remote SQL** connections. |
+| Partial prefix bootstrap, query bootstrap, lazy loading (`PartialBootstrap`) | **Explicitly rejected** | The managed replica has neither the server page selector/query protocol nor lazy page storage. |
+| Chunked bootstrap (`PullBytesThreshold`) | **Explicitly rejected** | A complete initial image is the only bootstrap shape; a multi-request page-selection bootstrap is not implemented. |
+| zstd/compressed page sets | **Explicitly rejected** | The response must declare raw encoding and each page payload must be exactly 4 KiB. |
+| MVCC logical streams / `MvccLogical` protocol | **Explicitly rejected** | There is no managed portable logical-log decoder or replay path. |
+| Local divergence before an incremental pull | **Explicitly rejected** | A changed fingerprint or local WAL/journal state aborts synchronization before any HTTP pull or file replacement. A managed replica never overwrites unproven local state. |
+| Non-4 KiB Cloud page streams | **Unknown/deferred — rejected by the gate** | Turso v0.7.2's physical sync protocol uses `PAGE_SIZE = 4096` (`sync/engine/src/database_sync_operations.rs`); the managed decoder intentionally has the same fixed 4 KiB stream boundary. Ahtola's local SQLite engine can use other database page sizes, but that does not qualify them for Cloud replica streaming. |
+
+Turso v0.7.2 exposes the broader option surface in
+`sync/engine/src/database_sync_engine.rs` (`DatabaseSyncEngineOpts`) and
+defines partial strategies and physical/logical stream kinds in
+`sync/engine/src/types.rs` and `sync/engine/src/server_proto.rs`. Its logical
+mode also rejects partial sync and remote encryption
+(`ensure_logical_mvcc_pull_supported`). Those upstream capabilities are not
+claimed by the managed replica.
+
 | ID | Kind | Severity | Effort | Mapped fails | Cited | Summary |
 | --- | --- | --- | --- | ---: | ---: | --- |
 | `sync-no-cdc-capture-pragma` | missing | s2-capability | L | 1 | 0 | Turso captures local writes into a `turso_cdc` change-data-capture table (via a CDC pragma) so they can be diffed and pushed to the remote and replayed against a revert/s… |

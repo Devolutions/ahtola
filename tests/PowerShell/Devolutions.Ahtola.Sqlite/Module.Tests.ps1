@@ -51,6 +51,7 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
             'Invoke-AhtolaSqliteBulkCopy'
             'Invoke-AhtolaSqliteMaintenance'
             'Invoke-AhtolaSqliteQuery'
+            'Invoke-AhtolaSqliteReplicaSync'
             'New-AhtolaSqliteConnection'
             'New-AhtolaSqliteRow'
             'Optimize-AhtolaSqliteDatabase'
@@ -128,6 +129,47 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
 
         (Get-Command New-AhtolaSqliteRow).Parameters['Values'].Aliases | Should-ContainCollection 'RowData'
         (Get-Command Get-AhtolaSqliteRow).Parameters['Where'].Aliases | Should-ContainCollection 'ClauseData'
+    }
+
+    It 'offers opt-in secure Turso Cloud parameters without emitting credentials under WhatIf' {
+        $command = Get-Command New-AhtolaSqliteConnection
+        $parameters = $command.Parameters
+        $parameters['TursoUrl'] | Should-NotBeNull
+        $parameters['AuthToken'].ParameterType | Should-Be ([securestring])
+        $parameters['ReplicaPath'] | Should-NotBeNull
+        $parameters['UseTursoEnvironment'] | Should-NotBeNull
+        $parameters['SyncInterval'] | Should-NotBeNull
+        (Get-Command Invoke-AhtolaSqliteReplicaSync).Parameters['ReplicaConnection'].ParameterType |
+            Should-Be ([Ahtola.PSSqlite.AhtolaCloudConnection])
+
+        $originalUrl = $env:TURSO_REMOTE_URL
+        $originalToken = $env:TURSO_AUTH_TOKEN
+        $secret = 'module-test-secret'
+        try {
+            $env:TURSO_REMOTE_URL = 'libsql://example.turso.io'
+            $env:TURSO_AUTH_TOKEN = $secret
+            $output = @(
+                New-AhtolaSqliteConnection -UseTursoEnvironment -ReplicaPath ./replica.db -WhatIf 6>&1 |
+                    Out-String
+            ) -join [Environment]::NewLine
+
+            $output.Contains($secret) | Should-BeFalse
+            $output.Contains('TURSO_AUTH_TOKEN') | Should-BeFalse
+
+            $secureToken = ConvertTo-SecureString $secret -AsPlainText -Force
+            $errorText = try {
+                New-AhtolaSqliteConnection -TursoUrl 'http://127.0.0.1:1' -AuthToken $secureToken -ErrorAction Stop
+                throw 'Expected the unavailable local endpoint to fail.'
+            }
+            catch {
+                $_ | Out-String
+            }
+            $errorText.Contains($secret) | Should-BeFalse
+        }
+        finally {
+            $env:TURSO_REMOTE_URL = $originalUrl
+            $env:TURSO_AUTH_TOKEN = $originalToken
+        }
     }
 }
 

@@ -24,5 +24,17 @@ EXAMPLES
     Invoke-AhtolaSqliteQuery -Connection $connection -CommandText 'CREATE TABLE users (name TEXT)'
     Invoke-AhtolaSqliteQuery -Connection $connection -CommandText "INSERT INTO users VALUES ('Ada')"
 
+    # Direct Turso Cloud connection (token is a SecureString).
+    $token = Read-Host -AsSecureString
+    $cloud = New-AhtolaSqliteConnection -TursoUrl 'libsql://example.turso.io' -AuthToken $token
+
+    # Explicitly opt into standard Turso CLI environment variables.
+    $replica = New-AhtolaSqliteConnection -UseTursoEnvironment -ReplicaPath ./replica.db
+    Invoke-AhtolaSqliteReplicaSync -ReplicaConnection $replica
+
+    Cloud credentials are not emitted, serialized, or included in connection
+    descriptions. -UseTursoEnvironment is opt-in; it reads TURSO_REMOTE_URL
+    and TURSO_AUTH_TOKEN only when explicitly specified.
+
 KEYWORDS
     SQLite, PowerShell, CRUD, Ahtola, Devolutions

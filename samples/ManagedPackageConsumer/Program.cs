@@ -106,6 +106,7 @@ try
     EnsureNoNativeCompanionWasRestored();
     await VerifyEntityFrameworkIntegrationAsync(connection);
     VerifySourceFreeReplicaOptions();
+    await VerifyOptionalCloudRuntimeAsync();
 
     Console.WriteLine(
         $"Managed package consumer succeeded on {AppContext.TargetFrameworkName} with EF Core {typeof(DbContext).Assembly.GetName().Version}.");
@@ -172,17 +173,110 @@ static void VerifySourceFreeReplicaOptions()
         PullBytesThreshold = 1024 * 1024,
     };
     using var replica = AhtolaConnection.CreateReplica(options);
-    try
-    {
-        replica.Open();
-    }
-    catch (NotSupportedException exception) when (
-        exception.Message.Contains("Turso.Data.Sqlite.Sync", StringComparison.Ordinal))
+    if (!replica.Capabilities.SupportsSync)
+        throw new InvalidOperationException("The managed package did not expose managed embedded replica synchronization.");
+}
+
+static async Task VerifyOptionalCloudRuntimeAsync()
+{
+    if (!string.Equals(
+            Environment.GetEnvironmentVariable("AHTOLA_RUN_CLOUD_SMOKE"),
+            "1",
+            StringComparison.Ordinal))
     {
         return;
     }
 
-    throw new InvalidOperationException("The managed package unexpectedly activated embedded replica Sync.");
+    var remoteUrl = Environment.GetEnvironmentVariable("TURSO_REMOTE_URL");
+    var authToken = Environment.GetEnvironmentVariable("TURSO_AUTH_TOKEN");
+    if (string.IsNullOrWhiteSpace(remoteUrl) || string.IsNullOrWhiteSpace(authToken))
+    {
+        throw new InvalidOperationException(
+            "The opt-in cloud smoke requires TURSO_REMOTE_URL and TURSO_AUTH_TOKEN.");
+    }
+
+    var replicaPath = Path.GetFullPath($"managed-package-cloud-replica-{Guid.NewGuid():N}.db");
+    var tableName = $"ahtola_package_smoke_{Guid.NewGuid():N}";
+    var stage = "direct remote query";
+    try
+    {
+        var directConnectionString = new AhtolaConnectionStringBuilder
+        {
+            DataSource = remoteUrl,
+            AuthToken = authToken,
+            ReadYourWrites = false,
+        }.ConnectionString;
+
+        using (var direct = new AhtolaConnection(directConnectionString))
+        {
+            await direct.OpenAsync(CancellationToken.None);
+            if (await ExecuteOneAsync(direct) != 1)
+                throw new InvalidOperationException("Direct remote query returned an unexpected result.");
+        }
+
+        var replicaOptions = new AhtolaReplicaOptions(
+            replicaPath,
+            new Uri(remoteUrl, UriKind.Absolute),
+            authToken,
+            bootstrapIfEmpty: true);
+        using (var replica = AhtolaConnection.CreateReplica(replicaOptions))
+        {
+            stage = "embedded replica open";
+            await replica.OpenAsync(CancellationToken.None);
+            stage = "embedded replica query";
+            if (await ExecuteOneAsync(replica) != 1)
+                throw new InvalidOperationException("Embedded replica query returned an unexpected result.");
+
+            replica.ExecuteNonQuery($"CREATE TABLE {tableName}(value INTEGER NOT NULL);");
+            replica.ExecuteNonQuery($"INSERT INTO {tableName} VALUES (1);");
+            stage = "embedded replica sync";
+            _ = await replica.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+        }
+
+        stage = "remote cleanup";
+        using (var cleanup = new AhtolaConnection(directConnectionString))
+        {
+            await cleanup.OpenAsync(CancellationToken.None);
+            cleanup.ExecuteNonQuery($"DROP TABLE {tableName};");
+        }
+
+        Console.WriteLine("Opt-in cloud smoke succeeded.");
+    }
+    catch (Exception exception)
+    {
+        // Do not surface remote URLs, bearer tokens, or server response bodies in CI logs.
+        throw new InvalidOperationException(
+        $"The opt-in cloud smoke failed during {stage} ({exception.GetType().Name}).");
+    }
+    finally
+    {
+        DeleteReplicaFiles(replicaPath);
+    }
+}
+
+static async Task<long> ExecuteOneAsync(AhtolaConnection connection)
+{
+    using var command = connection.CreateCommand();
+    command.CommandText = "SELECT 1;";
+    return Convert.ToInt64(
+        await command.ExecuteScalarAsync(CancellationToken.None),
+        System.Globalization.CultureInfo.InvariantCulture);
+}
+
+static void DeleteReplicaFiles(string path)
+{
+    foreach (var suffix in new[]
+             {
+                 string.Empty,
+                 "-wal",
+                 "-shm",
+                 "-journal",
+                 ".ahtola-replica-meta",
+                 ".ahtola-replica-journal",
+             })
+    {
+        File.Delete(path + suffix);
+    }
 }
 
 static void VerifyPublicCapabilityContract()

@@ -48,18 +48,19 @@ public abstract class PSSqliteCmdlet : PSCmdlet
         return SessionState.InvokeCommand.ExpandString(value);
     }
 
-    protected static void DisposeOwnedConnection(SqliteConnection connection)
+    protected static void DisposeOwnedConnection(DbConnection connection)
     {
         if (connection.State == ConnectionState.Open)
         {
             connection.Close();
         }
 
-        SqliteConnection.ClearPool(connection);
+        if (connection is SqliteConnection sqliteConnection)
+            SqliteConnection.ClearPool(sqliteConnection);
         connection.Dispose();
     }
 
-    protected static void OpenIfNeeded(SqliteConnection connection)
+    protected static void OpenIfNeeded(DbConnection connection)
     {
         if (connection.State != ConnectionState.Open)
         {
@@ -68,8 +69,8 @@ public abstract class PSSqliteCmdlet : PSCmdlet
     }
 }
 
-[Cmdlet(VerbsCommon.New, "AhtolaSqliteConnection")]
-[OutputType(typeof(SqliteConnection))]
+[Cmdlet(VerbsCommon.New, "AhtolaSqliteConnection", DefaultParameterSetName = "byConnectionString", SupportsShouldProcess = true)]
+[OutputType(typeof(SqliteConnection), typeof(AhtolaCloudConnection))]
 public sealed class NewPSSqliteConnectionCommand : PSSqliteCmdlet
 {
     [Parameter(ParameterSetName = "byConnectionString")]
@@ -84,8 +85,43 @@ public sealed class NewPSSqliteConnectionCommand : PSSqliteCmdlet
     [Parameter]
     public SwitchParameter ReadOnly { get; set; }
 
+    [Parameter(ParameterSetName = "byTursoCloud")]
+    [Alias("RemoteUrl", "Url")]
+    public string? TursoUrl { get; set; }
+
+    [Parameter(ParameterSetName = "byTursoCloud")]
+    [Alias("Token")]
+    public SecureString? AuthToken { get; set; }
+
+    [Parameter(ParameterSetName = "byTursoCloud")]
+    public string? ReplicaPath { get; set; }
+
+    [Parameter(ParameterSetName = "byTursoCloud")]
+    public SwitchParameter UseTursoEnvironment { get; set; }
+
+    [Parameter(ParameterSetName = "byTursoCloud")]
+    [ValidateRange(0, int.MaxValue)]
+    public int SyncInterval { get; set; }
+
     protected override void ProcessRecord()
     {
+        if (ParameterSetName == "byTursoCloud")
+        {
+            var operation = string.IsNullOrWhiteSpace(ReplicaPath)
+                ? "Open Turso Cloud connection"
+                : "Open managed Turso Cloud replica";
+            if (!ShouldProcess("Turso Cloud endpoint", operation))
+                return;
+
+            WriteObject(TursoCloudConnectionFactory.Create(
+                TursoUrl,
+                AuthToken,
+                ReplicaPath,
+                UseTursoEnvironment.IsPresent,
+                SyncInterval));
+            return;
+        }
+
         var connection = ParameterSetName == "byDatabasePath"
             ? ConnectionFactory.Create(ExpandString(DatabasePath), ExpandString(DatabaseFile!))
             : ConnectionFactory.Create(ExpandString(ConnectionString));
@@ -108,7 +144,7 @@ public sealed class InvokePSSqliteQueryCommand : PSSqliteCmdlet
 {
     [Parameter(Mandatory = true, ValueFromPipeline = true)]
     [Alias("SqliteConnection")]
-    public SqliteConnection Connection { get; set; } = null!;
+    public DbConnection Connection { get; set; } = null!;
 
     [Parameter(Mandatory = true)]
     [Alias("Query")]
@@ -128,20 +164,28 @@ public sealed class InvokePSSqliteQueryCommand : PSSqliteCmdlet
     public int CommandTimeout { get; set; } = 30;
 
     [Parameter]
-    public SqliteTransaction? Transaction { get; set; }
+    public DbTransaction? Transaction { get; set; }
 
     protected override void ProcessRecord()
     {
-        var result = QueryExecutor.Execute(
-            Connection,
-            CommandText,
-            Parameters,
-            new QueryOptions
-            {
-                OutputFormat = As,
-                CommandTimeout = CommandTimeout,
-                Transaction = Transaction
-            });
+        object? result;
+        try
+        {
+            result = QueryExecutor.Execute(
+                Connection,
+                CommandText,
+                Parameters,
+                new QueryOptions
+                {
+                    OutputFormat = As,
+                    CommandTimeout = CommandTimeout,
+                    Transaction = Transaction
+                });
+        }
+        catch when (Connection is AhtolaCloudConnection)
+        {
+            throw new InvalidOperationException("The Turso Cloud query failed.");
+        }
 
         if (CastAs is not null && result is not null)
         {
@@ -386,7 +430,7 @@ public sealed class ClosePSSqliteConnectionCommand : PSSqliteCmdlet
 {
     [Parameter(ValueFromPipeline = true)]
     [Alias("SqliteConnection")]
-    public SqliteConnection? Connection { get; set; }
+    public DbConnection? Connection { get; set; }
 
     [Parameter]
     public SwitchParameter ClearPool { get; set; }
@@ -412,9 +456,9 @@ public sealed class ClosePSSqliteConnectionCommand : PSSqliteCmdlet
         }
 
         Connection.Close();
-        if (ClearPool.IsPresent)
+        if (ClearPool.IsPresent && Connection is SqliteConnection sqliteConnection)
         {
-            Ahtola.Data.Sqlite.SqliteConnection.ClearPool(Connection);
+            Ahtola.Data.Sqlite.SqliteConnection.ClearPool(sqliteConnection);
         }
 
         Connection.Dispose();

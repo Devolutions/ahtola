@@ -52,7 +52,15 @@ public sealed class AhtolaConnectionCapabilities
         supportsTransactions: true,
         supportsSavepoints: true);
 
-    private static readonly AhtolaConnectionCapabilities AhtolaEmbeddedReplica = new(
+    private static readonly AhtolaConnectionCapabilities AhtolaManagedEmbeddedReplica = new(
+        AhtolaConnectionFacade.AhtolaData,
+        AhtolaConnectionMode.EmbeddedReplica,
+        canCreateBatch: false,
+        supportsAsyncOperations: true,
+        supportsTransactions: true,
+        supportsSavepoints: true);
+
+    private static readonly AhtolaConnectionCapabilities AhtolaSyncEmbeddedReplica = new(
         AhtolaConnectionFacade.AhtolaData,
         AhtolaConnectionMode.EmbeddedReplica,
         canCreateBatch: false,
@@ -155,10 +163,14 @@ public sealed class AhtolaConnectionCapabilities
 
     public bool SupportsSync { get; }
 
-    internal static AhtolaConnectionCapabilities ForAhtola(AhtolaConnectionOptions options)
+    internal static AhtolaConnectionCapabilities ForAhtola(
+        AhtolaConnectionOptions options,
+        bool replicaSupportsSync = false)
     {
         if (options.IsReplica)
-            return AhtolaEmbeddedReplica;
+            return replicaSupportsSync
+                ? AhtolaSyncEmbeddedReplica
+                : AhtolaManagedEmbeddedReplica;
         if (options.IsRemote)
             return AhtolaRemoteHrana;
         return options.LocalProvider == AhtolaLocalProvider.Managed

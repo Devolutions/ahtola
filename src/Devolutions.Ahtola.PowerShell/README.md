@@ -79,6 +79,13 @@ pwsh ./scripts/Invoke-PowerShellModuleTests.ps1
 - `Invoke-AhtolaSqliteQuery` emits `PSCustomObject` rows by default. Use
   `-As Scalar` or `-As NonQuery` for direct values/counts and `-As DataTable`
   or `-As DataSet` only when those ADO.NET containers are required.
+- `New-AhtolaSqliteConnection -TursoUrl <libsql-url> -AuthToken <SecureString>`
+  opens a direct Turso Cloud connection. Add `-ReplicaPath <file>` for a
+  managed embedded replica, optionally with `-SyncInterval <seconds>`, then
+  use `Invoke-AhtolaSqliteReplicaSync` for an explicit sync. `-UseTursoEnvironment`
+  opts into `TURSO_REMOTE_URL` and `TURSO_AUTH_TOKEN` defaults; explicit
+  parameters take precedence. Cloud connections expose only a redacted
+  connection string and never serialize their token.
 - `Export-AhtolaSqliteTable` and `Import-AhtolaSqliteTable` infer `Json` or
   `Csv` from the file extension when `-Format` is omitted. Export can select a
   table or a parameterized `-Query`.

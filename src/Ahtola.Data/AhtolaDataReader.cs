@@ -16,6 +16,9 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
     private readonly IManagedStatementAdapter? _managedStatement;
     private readonly CommandBehavior _behavior;
     private readonly Action _completionCallback;
+    private readonly Action _failureCallback;
+    private readonly Action _closeCallback;
+    private IDisposable? _replicaOperation;
     private string?[]? _declaredColumnTypes;
     private bool _isClosed;
     private bool _hasCurrentRow;
@@ -87,7 +90,7 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         AhtolaNativeStatement? nativeStatement,
         IManagedStatementAdapter? managedStatement,
         CommandBehavior behavior)
-        : this(command, nativeStatement, managedStatement, behavior, static () => { })
+        : this(command, nativeStatement, managedStatement, behavior, static () => { }, static () => { }, static () => { }, null)
     {
     }
 
@@ -96,7 +99,10 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         AhtolaNativeStatement? nativeStatement,
         IManagedStatementAdapter? managedStatement,
         CommandBehavior behavior,
-        Action completionCallback)
+        Action completionCallback,
+        Action failureCallback,
+        Action closeCallback,
+        IDisposable? replicaOperation = null)
     {
         if ((nativeStatement is null) == (managedStatement is null))
             throw new ArgumentException("A reader requires exactly one statement implementation.");
@@ -108,6 +114,9 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         _managedStatement = managedStatement;
         _behavior = behavior;
         _completionCallback = completionCallback;
+        _failureCallback = failureCallback;
+        _closeCallback = closeCallback;
+        _replicaOperation = replicaOperation;
         ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
@@ -363,13 +372,21 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
     private bool NextResultCore(CancellationToken cancellationToken)
     {
         EnsureOpen();
-        while (Step(cancellationToken))
+        try
         {
-        }
+            while (Step(cancellationToken))
+            {
+            }
 
-        _hasCurrentRow = false;
-        NotifyCompletion();
-        return false;
+            _hasCurrentRow = false;
+            NotifyCompletion();
+            return false;
+        }
+        catch
+        {
+            NotifyFailure();
+            throw;
+        }
     }
 
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
@@ -393,10 +410,18 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
     private bool ReadCore(CancellationToken cancellationToken)
     {
         EnsureOpen();
-        _hasCurrentRow = Step(cancellationToken);
-        if (!_hasCurrentRow)
-            NotifyCompletion();
-        return _hasCurrentRow;
+        try
+        {
+            _hasCurrentRow = Step(cancellationToken);
+            if (!_hasCurrentRow)
+                NotifyCompletion();
+            return _hasCurrentRow;
+        }
+        catch
+        {
+            NotifyFailure();
+            throw;
+        }
     }
 
     public override Task<bool> ReadAsync(CancellationToken cancellationToken)
@@ -626,6 +651,15 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         _completionCallback();
     }
 
+    private void NotifyFailure()
+    {
+        if (_completionNotified)
+            return;
+
+        _completionNotified = true;
+        _failureCallback();
+    }
+
     private void CloseCore(bool closeConnection)
     {
         if (_isClosed)
@@ -634,6 +668,7 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         _command.Cancel();
         try
         {
+            NotifyFailure();
             _nativeStatement?.Dispose();
             _managedStatement?.Dispose();
         }
@@ -642,6 +677,8 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
             _hasCurrentRow = false;
             _isClosed = true;
             ((ILocalReaderConnection)_connection).ReaderClosed(this);
+            Interlocked.Exchange(ref _replicaOperation, null)?.Dispose();
+            _closeCallback();
             if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
                 _connection.Close();
         }
