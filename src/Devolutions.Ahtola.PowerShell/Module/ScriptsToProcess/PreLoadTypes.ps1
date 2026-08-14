@@ -9,10 +9,9 @@ if (-not (Test-Path -LiteralPath $binPath)) {
 
 # Load dependency assemblies before the binary module binds types.
 $preferredOrder = @(
-    'YamlDotNet.dll'
-    'Ahtola.Core.dll'
-    'Ahtola.Data.dll'
-    'Ahtola.Data.Sqlite.dll'
+    'Devolutions.Ahtola.Core.dll'
+    'Devolutions.Ahtola.Data.dll'
+    'Devolutions.Ahtola.Data.Sqlite.dll'
     'Devolutions.Ahtola.PowerShell.dll'
 )
 

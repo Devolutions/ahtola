@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>Ahtola.EntityFrameworkCore.Sqlite</RootNamespace>
-    <AssemblyName>Ahtola.EntityFrameworkCore.Sqlite</AssemblyName>
+    <AssemblyName>Devolutions.Ahtola.EntityFrameworkCore.Sqlite</AssemblyName>
 
     <PackageId>Devolutions.Ahtola.EntityFrameworkCore.Sqlite</PackageId>
     <Title>Ahtola Entity Framework Core SQLite Provider</Title>

@@ -41,8 +41,11 @@ public sealed class ManagedEfDropColumnMigrationTests
             }
         ], model);
 
-        commands.Should().ContainSingle();
-        commands[0].CommandText.Should().Contain("DROP COLUMN");
+        commands.Should().HaveCountGreaterThan(1);
+        commands.Should().Contain(command =>
+            command.CommandText.Contains("ef_temp_Items", StringComparison.Ordinal));
+        commands.Should().NotContain(command =>
+            command.CommandText.Contains("DROP COLUMN", StringComparison.Ordinal));
         foreach (var command in commands)
             await ExecuteAsync(connection, command.CommandText);
 

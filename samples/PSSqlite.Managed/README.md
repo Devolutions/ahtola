@@ -22,8 +22,8 @@ without needing the .NET SDK or any native SQLite binary at import time.
   `Devolutions.Ahtola.Data.Sqlite` packages live), alongside nuget.org.
 - `PSSqlite.Managed.csproj` — a `net8.0` helper project (the lowest TFM the
   package ships) that references `Devolutions.Ahtola.Data.Sqlite` and, after
-  building, copies `Ahtola.Core.dll`, `Ahtola.Data.dll`, and
-  `Ahtola.Data.Sqlite.dll` into `source/lib/net8.0/`.
+  building, copies `Devolutions.Ahtola.Core.dll`, `Devolutions.Ahtola.Data.dll`,
+  and `Devolutions.Ahtola.Data.Sqlite.dll` into `source/lib/net8.0/`.
 - `source/PSSqlite.Managed.psd1` — the module manifest (PowerShell 7+,
   `RootModule = 'PSSqlite.Managed.psm1'`,
   `ScriptsToProcess = 'ScriptsToProcess\PreLoadTypes.ps1'`).
@@ -37,8 +37,8 @@ without needing the .NET SDK or any native SQLite binary at import time.
     `[Ahtola.Data.Sqlite.SqliteConnection]::ClearAllPools()` on close.
 - `source/ScriptsToProcess/PreLoadTypes.ps1` — loads the three vendored
   assemblies via `[System.Reflection.Assembly]::LoadFrom()` from
-  `source/lib/net8.0`, in dependency order: `Ahtola.Core` → `Ahtola.Data` →
-  `Ahtola.Data.Sqlite`. No native library, no PATH/RID resolution, no net48
+  `source/lib/net8.0`, in dependency order: `Devolutions.Ahtola.Core` →
+  `Devolutions.Ahtola.Data` → `Devolutions.Ahtola.Data.Sqlite`. No native library, no PATH/RID resolution, no net48
   branch. Throws a clear error if any DLL is missing (run `build.ps1` first).
 - `build.ps1` — runs `dotnet build`, which triggers the restore + vendor
   copy, and prints where the DLLs landed.
@@ -52,7 +52,8 @@ without needing the .NET SDK or any native SQLite binary at import time.
 ```
 
 This restores `Devolutions.Ahtola.Data.Sqlite` from the local feed and vendors
-`Ahtola.Core.dll`, `Ahtola.Data.dll`, and `Ahtola.Data.Sqlite.dll` into
+`Devolutions.Ahtola.Core.dll`, `Devolutions.Ahtola.Data.dll`, and
+`Devolutions.Ahtola.Data.Sqlite.dll` into
 `source/lib/net8.0/`.
 
 ## Import and run the demo

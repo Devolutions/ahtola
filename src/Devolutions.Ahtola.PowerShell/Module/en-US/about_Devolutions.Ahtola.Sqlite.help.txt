@@ -11,18 +11,18 @@ LONG DESCRIPTION
     Project/assembly: Devolutions.Ahtola.PowerShell
     Published module: Devolutions.Ahtola.Sqlite
 
-    Cmdlet names and YAML config shapes are preserved (PSSqlite* surface) so
-    existing scripts can migrate with minimal changes. There is no native
-    SQLite companion binary; the engine is pure managed C#.
+    Cmdlets use the AhtolaSqlite noun to avoid collisions with other SQLite
+    modules. There is no native SQLite companion binary; the engine is pure
+    managed C#.
 
     Requires PowerShell 7.4+ (.NET 8). Windows PowerShell 5.1 is not supported
     because Ahtola targets net8.0/net9.0/net10.0 only.
 
 EXAMPLES
     Import-Module ./artifacts/powershell-modules/Devolutions.Ahtola.Sqlite
-    $config = Get-PSSqliteDBConfig -Path ./Database.yml
-    Initialize-PSSqliteDatabase -DatabaseConfig $config
-    New-PSSqliteRow -SqliteDBConfig $config -TableName users -RowData @{ name = 'Ada' }
+    $connection = New-AhtolaSqliteConnection -ConnectionString 'Data Source=app.db'
+    Invoke-AhtolaSqliteQuery -Connection $connection -CommandText 'CREATE TABLE users (name TEXT)'
+    Invoke-AhtolaSqliteQuery -Connection $connection -CommandText "INSERT INTO users VALUES ('Ada')"
 
 KEYWORDS
     SQLite, PowerShell, CRUD, Ahtola, Devolutions

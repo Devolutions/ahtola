@@ -21,13 +21,13 @@
     Vendors the managed Ahtola assemblies into source/lib/net8.0 so the PowerShell
     module can load them directly via Assembly.LoadFrom without requiring consumers
     to run `dotnet restore` or have a .NET SDK installed at module-import time.
-    Assembly file names remain Ahtola.*.dll until the namespace/assembly rename phase.
+    Assembly file names use the Devolutions.Ahtola.*.dll prefix.
   -->
   <Target Name="VendorAhtolaManagedAssemblies" AfterTargets="Build">
     <ItemGroup>
-      <AhtolaManagedAssembly Include="$(OutDir)Ahtola.Core.dll" />
-      <AhtolaManagedAssembly Include="$(OutDir)Ahtola.Data.dll" />
-      <AhtolaManagedAssembly Include="$(OutDir)Ahtola.Data.Sqlite.dll" />
+      <AhtolaManagedAssembly Include="$(OutDir)Devolutions.Ahtola.Core.dll" />
+      <AhtolaManagedAssembly Include="$(OutDir)Devolutions.Ahtola.Data.dll" />
+      <AhtolaManagedAssembly Include="$(OutDir)Devolutions.Ahtola.Data.Sqlite.dll" />
     </ItemGroup>
     <MakeDir Directories="$(AhtolaVendorLibDir)" />
     <Copy SourceFiles="@(AhtolaManagedAssembly)" DestinationFolder="$(AhtolaVendorLibDir)" SkipUnchangedFiles="true" />

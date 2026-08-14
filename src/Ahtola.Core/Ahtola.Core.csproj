@@ -4,7 +4,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>Ahtola.Core</RootNamespace>
-    <AssemblyName>Ahtola.Core</AssemblyName>
+    <AssemblyName>Devolutions.Ahtola.Core</AssemblyName>
     <PackageId>Devolutions.Ahtola.Core</PackageId>
     <Title>Ahtola Core — managed SQLite-compatible database engine</Title>
     <Description>Ahtola Core is a pure managed (C#) SQLite-compatible database engine. No native companion required. Ahtola is a Devolutions project.</Description>

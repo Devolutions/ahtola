@@ -80,36 +80,41 @@ public sealed class PSSqliteModuleTests
     }
 
     [Test]
-    public void Initialize_And_Crud_RoundTrip_From_Yaml_Config()
+    public void Initialize_And_Crud_RoundTrip_From_Programmatic_Config()
     {
         var root = Path.Combine(Path.GetTempPath(), "ahtola-pssqlite-" + Guid.NewGuid().ToString("N"));
         var dbPath = Path.Combine(root, "db");
-        var configPath = Path.Combine(root, "Pester.PSSqliteConfig.yml");
         Directory.CreateDirectory(dbPath);
 
         try
         {
-            File.WriteAllText(configPath, $"""
-                DatabasePath: '{dbPath.Replace('\\', '/')}'
-                DatabaseFile: 'Pester.sqlite'
-                Version: '1.2.3'
-                Schema:
-                  Tables:
-                    Cars:
-                      Columns:
-                        Id:
-                          Type: INTEGER
-                          PrimaryKey: true
-                          AllowNull: false
-                        Make:
-                          Type: TEXT
-                        Colour:
-                          Type: TEXT
-                        Year:
-                          Type: INTEGER
-                """);
-
-            var config = SQLiteDBConfig.Load(configPath);
+            var config = new SQLiteDBConfig(new Hashtable
+            {
+                ["DatabasePath"] = dbPath,
+                ["DatabaseFile"] = "Pester.sqlite",
+                ["Version"] = "1.2.3",
+                ["Schema"] = new Hashtable
+                {
+                    ["Tables"] = new Hashtable
+                    {
+                        ["Cars"] = new Hashtable
+                        {
+                            ["Columns"] = new Hashtable
+                            {
+                                ["Id"] = new Hashtable
+                                {
+                                    ["Type"] = "INTEGER",
+                                    ["PrimaryKey"] = true,
+                                    ["AllowNull"] = false
+                                },
+                                ["Make"] = new Hashtable { ["Type"] = "TEXT" },
+                                ["Colour"] = new Hashtable { ["Type"] = "TEXT" },
+                                ["Year"] = new Hashtable { ["Type"] = "INTEGER" }
+                            }
+                        }
+                    }
+                }
+            });
             config.Schema.Should().NotBeNull();
             config.Schema!.ValidateDefinition();
 

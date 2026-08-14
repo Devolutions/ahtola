@@ -239,7 +239,8 @@ props and the validator's expectation together.
 | Layer | Value |
 | --- | --- |
 | NuGet PackageId | `Devolutions.Ahtola.*` |
-| Namespaces / assemblies / types | `Ahtola.*` (`AhtolaConnection`, `UseAhtola`, …) |
+| Assemblies | `Devolutions.Ahtola.*` |
+| Namespaces / types | `Ahtola.*` (`AhtolaConnection`, `UseAhtola`, …) |
 | Project folders | `src/Ahtola.*` |
 
 Keep types in `Ahtola.*` namespaces. The shipped package IDs are
