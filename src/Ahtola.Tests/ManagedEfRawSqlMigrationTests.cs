@@ -9,7 +9,7 @@ namespace Ahtola.Tests;
 public class ManagedEfRawSqlMigrationTests
 {
     [Test]
-    public async Task MigrateRejectsRawSqlBeforeApplicationSchemaMutation()
+    public async Task MigrateAppliesRawSqlAfterApplicationSchemaMutation()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         await connection.OpenAsync();
@@ -19,16 +19,16 @@ public class ManagedEfRawSqlMigrationTests
             .Options;
         await using var context = new RawSqlMigrationContext(options);
 
-        var migrate = async () => await context.Database.MigrateAsync();
-
-        await migrate.Should().ThrowAsync<NotSupportedException>()
-            .WithMessage("*raw SQL migration operations*");
+        await context.Database.MigrateAsync();
 
         await using var command = connection.CreateCommand();
         command.CommandText =
             "SELECT COUNT(*) FROM \"sqlite_master\" WHERE \"type\" = 'table' AND \"name\" = 'Items';";
 
-        (await command.ExecuteScalarAsync()).Should().Be(0L);
+        (await command.ExecuteScalarAsync()).Should().Be(1L);
+
+        command.CommandText = "SELECT COUNT(*) FROM \"Items\";";
+        (await command.ExecuteScalarAsync()).Should().Be(1L);
     }
 
     private sealed class RawSqlMigrationContext(DbContextOptions<RawSqlMigrationContext> options) : DbContext(options);
