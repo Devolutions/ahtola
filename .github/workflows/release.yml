@@ -29,8 +29,8 @@ env:
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
   NUGET_SOURCE: https://api.nuget.org/v3/index.json
-  PSIGN_VERSION: 0.6.2
-  PSIGN_LINUX_X64_SHA256: f3694e723d270c632b7b104b781112f8d0ed28e9756662446a41e71c0eb26ead
+  PSIGN_MODULE_VERSION: 0.6.2
+  PSIGN_MODULE_SHA256: ec833a64291d3a3b0b95403d9b2235ef156c124899bb0031f0278ff01e32bc81
 
 jobs:
   preflight:
@@ -165,28 +165,32 @@ jobs:
 
           'should_sign=true' >> $env:GITHUB_OUTPUT
 
-      - name: Download released PSign executable
+      - name: Download released PSign PowerShell module
         shell: pwsh
         run: |
-          $archive = Join-Path $env:RUNNER_TEMP 'psign-tool-linux-x64.zip'
-          $uri = "https://github.com/Devolutions/psign/releases/download/v$env:PSIGN_VERSION/psign-tool-linux-x64.zip"
+          $archive = Join-Path $env:RUNNER_TEMP 'Devolutions.Psign.zip'
+          $uri = "https://github.com/Devolutions/psign/releases/download/v$env:PSIGN_MODULE_VERSION/Devolutions.Psign.$env:PSIGN_MODULE_VERSION.nupkg"
           Invoke-WebRequest -Uri $uri -OutFile $archive
 
           $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualHash -ne $env:PSIGN_LINUX_X64_SHA256) {
-            throw "PSign checksum mismatch. Expected $env:PSIGN_LINUX_X64_SHA256, got $actualHash."
+          if ($actualHash -ne $env:PSIGN_MODULE_SHA256) {
+            throw "PSign module checksum mismatch. Expected $env:PSIGN_MODULE_SHA256, got $actualHash."
           }
 
-          $toolDirectory = Join-Path $env:RUNNER_TEMP 'psign-tool'
+          $toolDirectory = Join-Path $env:RUNNER_TEMP 'psign-module'
           Expand-Archive -LiteralPath $archive -DestinationPath $toolDirectory -Force
-          $toolPath = Join-Path $toolDirectory 'psign-tool'
-          if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
-            throw "Released PSign executable was not found at $toolPath."
+          $manifestPath = Join-Path $toolDirectory 'Devolutions.Psign.psd1'
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw "Released PSign module manifest was not found at $manifestPath."
           }
 
-          & chmod +x $toolPath
-          $toolDirectory >> $env:GITHUB_PATH
-          & $toolPath --version
+          Import-Module $manifestPath -Force -ErrorAction Stop
+          foreach ($command in 'Set-PsignSignature', 'Get-PsignSignature') {
+            if (-not (Get-Command $command -Module Devolutions.Psign -ErrorAction SilentlyContinue)) {
+              throw "Released PSign module did not export $command."
+            }
+          }
+          "PSIGN_MODULE_MANIFEST=$manifestPath" >> $env:GITHUB_ENV
 
       - name: Azure login
         uses: azure/login@v2
@@ -195,9 +199,11 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Sign PowerShell scripts
+      - name: Sign PowerShell module payload
         shell: pwsh
         run: |
+          Import-Module $env:PSIGN_MODULE_MANIFEST -Force -ErrorAction Stop
+
           $accessToken = az account get-access-token `
             --scope https://codesigning.azure.net/.default `
             --query accessToken `
@@ -215,31 +221,39 @@ jobs:
           }
 
           $moduleRoot = $manifests[0].DirectoryName
+          $signableExtensions = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+          )
+          foreach ($extension in '.ps1', '.psm1', '.psd1', '.dll') {
+            [void]$signableExtensions.Add($extension)
+          }
+
           $targets = Get-ChildItem -LiteralPath $moduleRoot -Recurse -File |
-            Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1' }
+            Where-Object { $signableExtensions.Contains($_.Extension) } |
+            Sort-Object FullName
           if ($targets.Count -eq 0) {
-            throw "No PowerShell files were found to sign in $moduleRoot."
+            throw "No PowerShell module payload files were found to sign in $moduleRoot."
           }
 
           foreach ($target in $targets) {
-            $unsignedHash = (Get-FileHash -LiteralPath $target.FullName -Algorithm SHA256).Hash
-            psign-tool --mode portable --verbose sign `
-              --artifact-signing-endpoint "$env:TRUSTED_SIGNING_ENDPOINT" `
-              --artifact-signing-account-name "$env:TRUSTED_SIGNING_ACCOUNT_NAME" `
-              --artifact-signing-profile-name "$env:TRUSTED_SIGNING_PROFILE_NAME" `
-              --artifact-signing-access-token "$accessToken" `
-              --timestamp-url "$env:TRUSTED_SIGNING_TIMESTAMP_SERVER" `
-              --timestamp-digest sha256 `
-              --digest sha256 `
-              --exit-codes azure `
-              "$($target.FullName)"
-            if ($LASTEXITCODE -ne 0) {
-              throw "PSign failed to sign $($target.FullName)."
+            $signArgs = @{
+              LiteralPath = $target.FullName
+              ArtifactSigningEndpoint = $env:TRUSTED_SIGNING_ENDPOINT
+              ArtifactSigningAccountName = $env:TRUSTED_SIGNING_ACCOUNT_NAME
+              ArtifactSigningProfileName = $env:TRUSTED_SIGNING_PROFILE_NAME
+              ArtifactSigningAccessToken = $accessToken
+              TimestampServer = $env:TRUSTED_SIGNING_TIMESTAMP_SERVER
+              TimestampHashAlgorithm = 'Sha256'
+              HashAlgorithm = 'Sha256'
+              Force = $true
+              ErrorAction = 'Stop'
             }
+            Set-PsignSignature @signArgs | Out-Null
 
-            $signedHash = (Get-FileHash -LiteralPath $target.FullName -Algorithm SHA256).Hash
-            if ($unsignedHash -eq $signedHash) {
-              throw "PSign reported success but did not modify $($target.FullName)."
+            $signature = Get-PsignSignature -LiteralPath $target.FullName -ErrorAction Stop
+            if ($signature.SignatureType.ToString() -ne 'Authenticode' -or
+                $signature.Status.ToString() -notin 'Valid', 'NotTrusted') {
+              throw "Expected an intact Authenticode signature for $($target.FullName), got '$($signature.Status)': $($signature.StatusMessage)"
             }
           }
 
