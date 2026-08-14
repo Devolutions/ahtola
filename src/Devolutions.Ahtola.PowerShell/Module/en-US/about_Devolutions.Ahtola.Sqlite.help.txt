@@ -24,6 +24,10 @@ EXAMPLES
     Invoke-AhtolaSqliteQuery -Connection $connection -CommandText 'CREATE TABLE users (name TEXT)'
     Invoke-AhtolaSqliteQuery -Connection $connection -CommandText "INSERT INTO users VALUES ('Ada')"
 
+    Relative database, replica, import, and export paths resolve from the active
+    PowerShell filesystem location. Use -WhatIf to preview connection creation
+    without opening a connection or creating a local database file.
+
     # Direct Turso Cloud connection (token is a SecureString).
     $token = Read-Host -AsSecureString
     $cloud = New-AhtolaSqliteConnection -TursoUrl 'libsql://example.turso.io' -AuthToken $token

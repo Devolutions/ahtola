@@ -29,6 +29,7 @@ env:
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
   NUGET_SOURCE: https://api.nuget.org/v3/index.json
+  PLATYPS_VERSION: 1.0.3
   PSIGN_MODULE_VERSION: 0.6.2
   PSIGN_MODULE_SHA256: ec833a64291d3a3b0b95403d9b2235ef156c124899bb0031f0278ff01e32bc81
 
@@ -90,6 +91,13 @@ jobs:
       - name: Restore
         shell: pwsh
         run: ./build.ps1 restore
+
+      - name: Install PlatyPS
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Microsoft.PowerShell.PlatyPS -RequiredVersion $env:PLATYPS_VERSION `
+            -Force -Scope CurrentUser -SkipPublisherCheck -AllowClobber
 
       - name: Pack Release nupkgs
         shell: pwsh

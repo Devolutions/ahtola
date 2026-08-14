@@ -94,7 +94,7 @@ public sealed class InvokePSSqliteReplicaSyncCommand : PSSqliteCmdlet
     }
 }
 
-[Cmdlet(VerbsData.Save, "AhtolaSqliteTransaction")]
+[Cmdlet(VerbsData.Save, "AhtolaSqliteTransaction", SupportsShouldProcess = true)]
 public sealed class SavePSSqliteTransactionCommand : PSSqliteCmdlet
 {
     [Parameter(Mandatory = true, ValueFromPipeline = true)]
@@ -105,7 +105,12 @@ public sealed class SavePSSqliteTransactionCommand : PSSqliteCmdlet
 
     protected override void ProcessRecord()
     {
-        Transaction.Save(Name);
+        if (ShouldProcess(
+                Transaction.Connection?.DataSource ?? "SQLite transaction",
+                $"Create savepoint '{Name}'"))
+        {
+            Transaction.Save(Name);
+        }
     }
 }
 
@@ -235,6 +240,7 @@ public sealed class InvokePSSqliteMaintenanceCommand : PSSqliteCmdlet
     public string CheckpointMode { get; set; } = "Truncate";
 
     [Parameter]
+    [ValidateRange(0, int.MaxValue)]
     public int CommandTimeout { get; set; } = 30;
 
     [Parameter]
@@ -277,6 +283,7 @@ public sealed class TestAhtolaSqliteIntegrityCommand : PSSqliteCmdlet
     public SqliteConnection Connection { get; set; } = null!;
 
     [Parameter]
+    [ValidateRange(0, int.MaxValue)]
     public int CommandTimeout { get; set; } = 30;
 
     [Parameter]
@@ -308,6 +315,7 @@ public sealed class OptimizeAhtolaSqliteDatabaseCommand : PSSqliteCmdlet
     public SwitchParameter Analyze { get; set; }
 
     [Parameter]
+    [ValidateRange(0, int.MaxValue)]
     public int CommandTimeout { get; set; } = 30;
 
     protected override void ProcessRecord()
@@ -345,6 +353,7 @@ public sealed class CheckpointAhtolaSqliteDatabaseCommand : PSSqliteCmdlet
     public string Mode { get; set; } = "Truncate";
 
     [Parameter]
+    [ValidateRange(0, int.MaxValue)]
     public int CommandTimeout { get; set; } = 30;
 
     protected override void ProcessRecord()

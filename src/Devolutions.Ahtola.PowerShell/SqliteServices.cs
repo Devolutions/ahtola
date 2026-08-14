@@ -689,7 +689,19 @@ public static class MetadataStore
     public static OrderedDictionary? Get(string connectionString, IReadOnlyCollection<string> keys)
     {
         using var connection = ConnectionFactory.Create(connectionString);
-        connection.Open();
+        return Get(connection, keys);
+    }
+
+    public static OrderedDictionary? Get(SqliteConnection connection, IReadOnlyCollection<string> keys)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(keys);
+
+        if (connection.State != ConnectionState.Open)
+        {
+            connection.Open();
+        }
+
         using var tableCheck = connection.CreateCommand();
         tableCheck.CommandText = "SELECT name FROM sqlite_schema WHERE name = $name COLLATE NOCASE";
         tableCheck.Parameters.AddWithValue("$name", "_metadata");

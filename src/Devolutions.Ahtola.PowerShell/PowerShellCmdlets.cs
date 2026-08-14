@@ -48,6 +48,31 @@ public abstract class PSSqliteCmdlet : PSCmdlet
         return SessionState.InvokeCommand.ExpandString(value);
     }
 
+    protected string ResolveFileSystemPath(string value)
+    {
+        var expanded = ExpandString(value);
+        return string.IsNullOrWhiteSpace(expanded)
+            ? SessionState.Path.CurrentFileSystemLocation.Path
+            : SessionState.Path.GetUnresolvedProviderPathFromPSPath(expanded);
+    }
+
+    protected string ResolveConnectionString(string connectionString)
+    {
+        var builder = new SqliteConnectionStringBuilder(connectionString);
+        var dataSource = builder.DataSource;
+        if (string.IsNullOrWhiteSpace(dataSource)
+            || Path.IsPathRooted(dataSource)
+            || dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
+            || dataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase)
+            || dataSource.StartsWith("|DataDirectory|", StringComparison.OrdinalIgnoreCase))
+        {
+            return connectionString;
+        }
+
+        builder.DataSource = ResolveFileSystemPath(dataSource);
+        return builder.ToString();
+    }
+
     protected static void DisposeOwnedConnection(DbConnection connection)
     {
         if (connection.State == ConnectionState.Open)
@@ -67,6 +92,42 @@ public abstract class PSSqliteCmdlet : PSCmdlet
             connection.Open();
         }
     }
+
+    protected static SqliteConnection ResolveCrudConnection(
+        SqliteConnection? connection,
+        SqliteTransaction? transaction,
+        string connectionString,
+        out bool ownsConnection)
+    {
+        if (transaction is not null)
+        {
+            if (transaction.Connection is not SqliteConnection transactionConnection)
+            {
+                throw new ArgumentException(
+                    "Transaction must be active and belong to an Ahtola SQLite connection.",
+                    nameof(transaction));
+            }
+
+            if (connection is not null && !ReferenceEquals(connection, transactionConnection))
+            {
+                throw new ArgumentException(
+                    "Connection must match the connection that owns Transaction.",
+                    nameof(connection));
+            }
+
+            ownsConnection = false;
+            return transactionConnection;
+        }
+
+        if (connection is not null)
+        {
+            ownsConnection = false;
+            return connection;
+        }
+
+        ownsConnection = true;
+        return ConnectionFactory.Create(connectionString);
+    }
 }
 
 [Cmdlet(VerbsCommon.New, "AhtolaSqliteConnection", DefaultParameterSetName = "byConnectionString", SupportsShouldProcess = true)]
@@ -77,12 +138,13 @@ public sealed class NewPSSqliteConnectionCommand : PSSqliteCmdlet
     public string ConnectionString { get; set; } = "Data Source=:memory:;Cache=Shared;";
 
     [Parameter(ParameterSetName = "byDatabasePath")]
-    public string DatabasePath { get; set; } = Directory.GetCurrentDirectory();
+    public string DatabasePath { get; set; } = string.Empty;
 
     [Parameter(Mandatory = true, ParameterSetName = "byDatabasePath")]
     public string? DatabaseFile { get; set; }
 
-    [Parameter]
+    [Parameter(ParameterSetName = "byConnectionString")]
+    [Parameter(ParameterSetName = "byDatabasePath")]
     public SwitchParameter ReadOnly { get; set; }
 
     [Parameter(ParameterSetName = "byTursoCloud")]
@@ -107,6 +169,9 @@ public sealed class NewPSSqliteConnectionCommand : PSSqliteCmdlet
     {
         if (ParameterSetName == "byTursoCloud")
         {
+            var replicaPath = string.IsNullOrWhiteSpace(ReplicaPath)
+                ? null
+                : ResolveFileSystemPath(ReplicaPath);
             var operation = string.IsNullOrWhiteSpace(ReplicaPath)
                 ? "Open Turso Cloud connection"
                 : "Open managed Turso Cloud replica";
@@ -116,15 +181,34 @@ public sealed class NewPSSqliteConnectionCommand : PSSqliteCmdlet
             WriteObject(TursoCloudConnectionFactory.Create(
                 TursoUrl,
                 AuthToken,
-                ReplicaPath,
+                replicaPath,
                 UseTursoEnvironment.IsPresent,
                 SyncInterval));
             return;
         }
 
-        var connection = ParameterSetName == "byDatabasePath"
-            ? ConnectionFactory.Create(ExpandString(DatabasePath), ExpandString(DatabaseFile!))
-            : ConnectionFactory.Create(ExpandString(ConnectionString));
+        string connectionString;
+        if (ParameterSetName == "byDatabasePath")
+        {
+            var databasePath = ResolveFileSystemPath(DatabasePath);
+            var databaseFile = ExpandString(DatabaseFile!);
+            connectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = Path.Combine(databasePath, databaseFile)
+            }.ToString();
+        }
+        else
+        {
+            connectionString = ResolveConnectionString(ExpandString(ConnectionString));
+        }
+
+        var target = new SqliteConnectionStringBuilder(connectionString).DataSource;
+        if (!ShouldProcess(target, "Open Ahtola SQLite connection"))
+        {
+            return;
+        }
+
+        var connection = ConnectionFactory.Create(connectionString);
         if (ReadOnly.IsPresent)
         {
             var builder = new SqliteConnectionStringBuilder(connection.ConnectionString)
@@ -134,8 +218,16 @@ public sealed class NewPSSqliteConnectionCommand : PSSqliteCmdlet
             connection.ConnectionString = builder.ToString();
         }
 
-        connection.Open();
-        WriteObject(connection);
+        try
+        {
+            connection.Open();
+            WriteObject(connection);
+        }
+        catch
+        {
+            connection.Dispose();
+            throw;
+        }
     }
 }
 
@@ -161,6 +253,7 @@ public sealed class InvokePSSqliteQueryCommand : PSSqliteCmdlet
     public IDictionary? Parameters { get; set; }
 
     [Parameter]
+    [ValidateRange(0, int.MaxValue)]
     public int CommandTimeout { get; set; } = 30;
 
     [Parameter]
@@ -228,8 +321,11 @@ public sealed class GetPSSqliteRowCommand : PSSqliteCmdlet
 
     protected override void ProcessRecord()
     {
-        var ownsConnection = Connection is null;
-        var connection = Connection ?? ConnectionFactory.Create(Configuration.ConnectionString!);
+        var connection = ResolveCrudConnection(
+            Connection,
+            Transaction,
+            Configuration.ConnectionString!,
+            out var ownsConnection);
         try
         {
             var result = CrudSqlBuilder.ExecuteSelect(
@@ -282,8 +378,11 @@ public sealed class NewPSSqliteRowCommand : PSSqliteCmdlet
             return;
         }
 
-        var ownsConnection = Connection is null;
-        var connection = Connection ?? ConnectionFactory.Create(Configuration.ConnectionString!);
+        var connection = ResolveCrudConnection(
+            Connection,
+            Transaction,
+            Configuration.ConnectionString!,
+            out var ownsConnection);
         try
         {
             var result = CrudSqlBuilder.ExecuteInsert(
@@ -345,8 +444,11 @@ public sealed class SetPSSqliteRowCommand : PSSqliteCmdlet
             return;
         }
 
-        var ownsConnection = Connection is null;
-        var connection = Connection ?? ConnectionFactory.Create(Configuration.ConnectionString!);
+        var connection = ResolveCrudConnection(
+            Connection,
+            Transaction,
+            Configuration.ConnectionString!,
+            out var ownsConnection);
         try
         {
             WriteObject(CrudSqlBuilder.ExecuteUpdate(
@@ -402,8 +504,11 @@ public sealed class RemovePSSqliteRowCommand : PSSqliteCmdlet
             return;
         }
 
-        var ownsConnection = Connection is null;
-        var connection = Connection ?? ConnectionFactory.Create(Configuration.ConnectionString!);
+        var connection = ResolveCrudConnection(
+            Connection,
+            Transaction,
+            Configuration.ConnectionString!,
+            out var ownsConnection);
         try
         {
             WriteObject(CrudSqlBuilder.ExecuteDelete(
@@ -481,8 +586,7 @@ public sealed class GetPSSqliteDBMetadataCommand : PSSqliteCmdlet
 
     protected override void ProcessRecord()
     {
-        var connectionString = Connection.ConnectionString;
-        var metadata = MetadataStore.Get(connectionString, MetadataKey);
+        var metadata = MetadataStore.Get(Connection, MetadataKey);
         if (metadata is not null)
         {
             WriteObject(metadata);

@@ -48,7 +48,7 @@ param(
 
         # Floor for Pester module tests (test-powershell). Keep in sync with
         # tests/PowerShell/Devolutions.Ahtola.Sqlite/Module.Tests.ps1.
-        [int]$PowerShellMinimumExecutedTests = 25
+        [int]$PowerShellMinimumExecutedTests = 34
     )
 
 Set-StrictMode -Version Latest
@@ -67,6 +67,8 @@ $Solution = './Ahtola.slnx'
 $PowerShellModuleName = 'Devolutions.Ahtola.Sqlite'
 $PowerShellModuleOutput = "./artifacts/powershell-modules/$PowerShellModuleName"
 $PowerShellAssemblyName = 'Devolutions.Ahtola.PowerShell'
+$PowerShellHelpMarkdown = Join-Path $RepoRoot "docs/powershell-help/$PowerShellModuleName"
+$PowerShellHelpBuilder = Join-Path $RepoRoot 'scripts/Build-PowerShellHelp.ps1'
 $PowerShellTestRunner = Join-Path $RepoRoot 'scripts/Invoke-PowerShellModuleTests.ps1'
 $ConsumerProject = './samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj'
 $ConsumerNugetConfig = './samples/ManagedPackageConsumer/obj/managed-package-consumer.nuget.config'
@@ -187,6 +189,14 @@ function Invoke-Build {
         if (-not (Test-Path -LiteralPath $assemblyPath)) {
             throw "Expected staged module assembly at $assemblyPath"
         }
+        if (-not (Test-Path -LiteralPath $PowerShellHelpBuilder -PathType Leaf)) {
+            throw "PowerShell help builder not found: $PowerShellHelpBuilder"
+        }
+
+        Invoke-PwshScript -Path $PowerShellHelpBuilder -Arguments @(
+            '-ModulePath', $moduleAbsolute,
+            '-MarkdownPath', $PowerShellHelpMarkdown
+        )
 
         if (-not [string]::IsNullOrWhiteSpace($Version)) {
             if ($Version -notmatch '^\d+\.\d+\.\d+(?:\.\d+)?$') {
