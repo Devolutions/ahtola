@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       dry_run:
-        description: Build, sign, and validate release artifacts without creating a release or publishing
+        description: Build and validate unsigned release artifacts without creating a release or publishing
         default: false
         required: false
         type: boolean
@@ -118,7 +118,7 @@ jobs:
           if-no-files-found: error
 
   sign_powershell_module:
-    name: Sign PowerShell module with Azure Artifact Signing
+    name: Prepare PowerShell module for release
     needs:
       - preflight
       - pack
@@ -229,6 +229,7 @@ jobs:
           }
 
           foreach ($target in $targets) {
+            $unsignedHash = (Get-FileHash -LiteralPath $target.FullName -Algorithm SHA256).Hash
             psign-tool --mode portable --verbose sign `
               --artifact-signing-endpoint "$env:TRUSTED_SIGNING_ENDPOINT" `
               --artifact-signing-account-name "$env:TRUSTED_SIGNING_ACCOUNT_NAME" `
@@ -242,9 +243,15 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "PSign failed to sign $($target.FullName)."
             }
+
+            $signedHash = (Get-FileHash -LiteralPath $target.FullName -Algorithm SHA256).Hash
+            if ($unsignedHash -eq $signedHash) {
+              throw "PSign reported success but did not modify $($target.FullName)."
+            }
           }
 
       - name: Archive signed PowerShell module
+        if: steps.sign_plan.outputs.should_sign == 'true'
         shell: pwsh
         env:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
@@ -262,6 +269,7 @@ jobs:
           Compress-Archive -LiteralPath $moduleRoot -DestinationPath "$archiveRoot/Devolutions.Ahtola.Sqlite.$env:RELEASE_VERSION.zip" -Force
 
       - name: Upload signed PowerShell module
+        if: steps.sign_plan.outputs.should_sign == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: signed-powershell-module
@@ -269,6 +277,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload signed PowerShell module archive
+        if: steps.sign_plan.outputs.should_sign == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: signed-powershell-module-archive
