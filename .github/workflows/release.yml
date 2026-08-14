@@ -257,10 +257,8 @@ jobs:
             }
           }
 
-      - name: Archive signed PowerShell module
+      - name: Package signed PowerShell module for PSGallery
         shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           $manifest = Get-ChildItem -LiteralPath artifacts/powershell-modules -Recurse `
             -Filter Devolutions.Ahtola.Sqlite.psd1 -File |
@@ -270,9 +268,19 @@ jobs:
           }
 
           $moduleRoot = $manifest.DirectoryName
-          $archiveRoot = 'artifacts/release-assets'
-          New-Item -ItemType Directory -Path $archiveRoot -Force | Out-Null
-          Compress-Archive -LiteralPath $moduleRoot -DestinationPath "$archiveRoot/Devolutions.Ahtola.Sqlite.$env:RELEASE_VERSION.zip" -Force
+          Test-ModuleManifest -Path $manifest.FullName -ErrorAction Stop | Out-Null
+          $packageRoot = 'artifacts/release-assets'
+          New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+
+          Import-Module Microsoft.PowerShell.PSResourceGet -MinimumVersion 1.1.0 -Force -ErrorAction Stop
+          $modulePackage = Compress-PSResource `
+            -Path $moduleRoot `
+            -DestinationPath $packageRoot `
+            -PassThru `
+            -ErrorAction Stop
+          if (-not (Test-Path -LiteralPath $modulePackage -PathType Leaf)) {
+            throw "PowerShell module package was not created at $modulePackage."
+          }
 
       - name: Upload signed PowerShell module
         uses: actions/upload-artifact@v7
@@ -281,11 +289,11 @@ jobs:
           path: artifacts/powershell-modules/Devolutions.Ahtola.Sqlite/**
           if-no-files-found: error
 
-      - name: Upload signed PowerShell module archive
+      - name: Upload signed PowerShell module package
         uses: actions/upload-artifact@v7
         with:
-          name: signed-powershell-module-archive
-          path: artifacts/release-assets/*.zip
+          name: signed-powershell-module-package
+          path: artifacts/release-assets/*.nupkg
           if-no-files-found: error
 
   github_release:
@@ -305,10 +313,10 @@ jobs:
           name: release-packages
           path: artifacts/managed-packages
 
-      - name: Download signed module archive
+      - name: Download signed PowerShell module package
         uses: actions/download-artifact@v8
         with:
-          name: signed-powershell-module-archive
+          name: signed-powershell-module-package
           path: artifacts/release-assets
 
       - name: Create or update release
@@ -321,7 +329,7 @@ jobs:
         run: |
           $assets = @(
             Get-ChildItem -LiteralPath artifacts/managed-packages -Filter *.nupkg -File
-            Get-ChildItem -LiteralPath artifacts/release-assets -Filter *.zip -File
+            Get-ChildItem -LiteralPath artifacts/release-assets -Filter *.nupkg -File
           )
           if ($assets.Count -eq 0) {
             throw 'No release assets were found.'
@@ -394,13 +402,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Download signed PowerShell module
+      - name: Download signed PowerShell module package
         uses: actions/download-artifact@v8
         with:
-          name: signed-powershell-module
-          path: artifacts/powershell-modules
+          name: signed-powershell-module-package
+          path: artifacts/release-assets
 
-      - name: Publish signed module
+      - name: Publish signed module package
         shell: pwsh
         env:
           PSGALLERY_NUGET_API_KEY: ${{ secrets.PSGALLERY_NUGET_API_KEY }}
@@ -409,15 +417,18 @@ jobs:
             throw 'PSGALLERY_NUGET_API_KEY is not configured for this environment.'
           }
 
-          $manifests = @(
-            Get-ChildItem -LiteralPath artifacts/powershell-modules -Recurse `
-              -Filter Devolutions.Ahtola.Sqlite.psd1 -File
+          $packages = @(
+            Get-ChildItem -LiteralPath artifacts/release-assets `
+              -Filter Devolutions.Ahtola.Sqlite.*.nupkg -File
           )
-          if ($manifests.Count -ne 1) {
-            throw "Expected exactly one signed module manifest, found $($manifests.Count)."
+          if ($packages.Count -ne 1) {
+            throw "Expected exactly one signed PowerShell module package, found $($packages.Count)."
           }
 
-          $manifest = $manifests[0].FullName
-          $moduleRoot = $manifests[0].DirectoryName
-          Test-ModuleManifest -Path $manifest -ErrorAction Stop | Out-Null
-          Publish-Module -Path $moduleRoot -NuGetApiKey $env:PSGALLERY_NUGET_API_KEY -Verbose
+          Import-Module Microsoft.PowerShell.PSResourceGet -MinimumVersion 1.1.0 -Force -ErrorAction Stop
+          Publish-PSResource `
+            -NupkgPath $packages[0].FullName `
+            -Repository PSGallery `
+            -ApiKey $env:PSGALLERY_NUGET_API_KEY `
+            -Verbose `
+            -ErrorAction Stop
