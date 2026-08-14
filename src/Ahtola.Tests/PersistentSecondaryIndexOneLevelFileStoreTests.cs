@@ -212,10 +212,11 @@ public class PersistentSecondaryIndexOneLevelFileStoreTests
     [Test]
     public void PersistsIndexWithAtLeastThreeInteriorLevelsAcrossReopenAndSqliteIntegrityCheck()
     {
-        const int deepRowCount = 60_000;
+        const int deepRowCount = 4_000;
         var path = CreateDatabasePath();
         try
         {
+            CreatePageSizeDatabase(path, pageSize: 512);
             using (var database = EmbeddedDatabase.OpenFile(path))
             using (var connection = database.Connect())
             {
@@ -246,11 +247,11 @@ public class PersistentSecondaryIndexOneLevelFileStoreTests
             using (var connection = reopened.Connect())
             {
                 Query(connection, "SELECT COUNT(*) FROM t;").Single()[0].AsInteger().Should().Be(deepRowCount);
-                Query(connection, $"SELECT id FROM t WHERE value = '{IndexValue(47_321)}';")
+                Query(connection, $"SELECT id FROM t WHERE value = '{IndexValue(3_217)}';")
                     .Single()[0]
                     .AsInteger()
                     .Should()
-                    .Be(47_321);
+                    .Be(3_217);
             }
 
             var verificationPath = path + ".verify.db";
@@ -409,6 +410,19 @@ public class PersistentSecondaryIndexOneLevelFileStoreTests
     }
 
     private static string IndexValue(int id) => $"value-{id:D4}-{new string('x', 96)}";
+
+    private static void CreatePageSizeDatabase(string path, int pageSize)
+    {
+        var header = SqliteDatabaseHeader.CreateDefault() with { PageSize = pageSize };
+        using (SqlitePager.Create(
+                   PhysicalFileSystem.Instance,
+                   path,
+                   path + "-wal",
+                   SqliteWalHeader.Create(pageSize, salt1: 101, salt2: 103),
+                   header))
+        {
+        }
+    }
 
     private static void Execute(EmbeddedConnection connection, string sql)
     {

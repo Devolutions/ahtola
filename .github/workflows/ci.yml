@@ -90,13 +90,15 @@ jobs:
         id: managed-test
         continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
         shell: pwsh
-        run: ./build.ps1 test -Framework net10.0 -MinimumExecutedTests $env:MINIMUM_EXECUTED_TESTS
+        # Packaging and consumer validation run once in the package job. Keep this
+        # job focused on the managed suite instead of repeating that full gate.
+        run: ./scripts/Invoke-ManagedTestSuite.ps1 -Framework net10.0 -MinimumExecutedTests $env:MINIMUM_EXECUTED_TESTS
 
       - name: Report Ubuntu cross-process WAL gap
         if: always() && steps.managed-test.outcome == 'failure'
         shell: pwsh
         run: |
-          Write-Host "::warning::Ubuntu managed suite failed known cross-process WAL byte-range-lock isolation tests. Windows remains the hard test gate."
+          Write-Host "::notice::Ubuntu managed suite failed known cross-process WAL byte-range-lock isolation tests. Windows remains the hard test gate."
 
       - name: Upload test results
         if: always() && matrix.os != 'macos-latest'
@@ -201,13 +203,13 @@ jobs:
         # is hardened for GitHub-hosted runners.
         continue-on-error: true
         shell: pwsh
-        run: ./build.ps1 test -Framework ${{ matrix.framework }} -MinimumExecutedTests $env:MINIMUM_EXECUTED_TESTS
+        run: ./scripts/Invoke-ManagedTestSuite.ps1 -Framework ${{ matrix.framework }} -MinimumExecutedTests $env:MINIMUM_EXECUTED_TESTS
 
       - name: Report downlevel cross-process WAL gap
         if: always() && steps.managed-test.outcome == 'failure'
         shell: pwsh
         run: |
-          Write-Host "::warning::Downlevel managed suite failed known cross-process WAL byte-range-lock isolation tests on GitHub-hosted Linux."
+          Write-Host "::notice::Downlevel managed suite failed known cross-process WAL byte-range-lock isolation tests on GitHub-hosted Linux."
 
   package:
     name: Package and validate closure
