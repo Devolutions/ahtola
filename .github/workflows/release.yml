@@ -8,12 +8,12 @@ on:
         required: true
         type: string
       dry_run:
-        description: Build, sign, and validate release artifacts without creating a release or publishing
+        description: Build, sign, and validate artifacts without creating a release or publishing; choose test signing with github_env=test
         default: false
         required: false
         type: boolean
       github_env:
-        description: Protected GitHub environment that owns publishing credentials
+        description: Protected GitHub environment that owns signing and publishing credentials; select test for test signing
         default: auto
         required: false
         type: choice
@@ -146,11 +146,9 @@ jobs:
           # in /**. Restore that directory before signing and re-uploading it.
           path: artifacts/powershell-modules/Devolutions.Ahtola.Sqlite
 
-      - name: Determine signing mode
+      - name: Validate signing configuration
         id: sign_plan
         shell: pwsh
-        env:
-          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           $required = @(
             'AZURE_CLIENT_ID',
@@ -161,16 +159,13 @@ jobs:
             'TRUSTED_SIGNING_PROFILE_NAME'
           )
           $missing = $required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) }
-          $shouldSign = $env:DRY_RUN -eq 'false'
-
-          if ($shouldSign -and $missing.Count -gt 0) {
+          if ($missing.Count -gt 0) {
             throw "Azure Artifact Signing requires: $($missing -join ', ')"
           }
 
-          "should_sign=$($shouldSign.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          'should_sign=true' >> $env:GITHUB_OUTPUT
 
       - name: Download released PSign executable
-        if: steps.sign_plan.outputs.should_sign == 'true'
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'psign-tool-linux-x64.zip'
@@ -194,7 +189,6 @@ jobs:
           & $toolPath --version
 
       - name: Azure login
-        if: steps.sign_plan.outputs.should_sign == 'true'
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -202,7 +196,6 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign PowerShell scripts
-        if: steps.sign_plan.outputs.should_sign == 'true'
         shell: pwsh
         run: |
           $accessToken = az account get-access-token `
@@ -229,6 +222,7 @@ jobs:
           }
 
           foreach ($target in $targets) {
+            $unsignedHash = (Get-FileHash -LiteralPath $target.FullName -Algorithm SHA256).Hash
             psign-tool --mode portable --verbose sign `
               --artifact-signing-endpoint "$env:TRUSTED_SIGNING_ENDPOINT" `
               --artifact-signing-account-name "$env:TRUSTED_SIGNING_ACCOUNT_NAME" `
@@ -241,6 +235,11 @@ jobs:
               "$($target.FullName)"
             if ($LASTEXITCODE -ne 0) {
               throw "PSign failed to sign $($target.FullName)."
+            }
+
+            $signedHash = (Get-FileHash -LiteralPath $target.FullName -Algorithm SHA256).Hash
+            if ($unsignedHash -eq $signedHash) {
+              throw "PSign reported success but did not modify $($target.FullName)."
             }
           }
 
