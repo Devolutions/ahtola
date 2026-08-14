@@ -13,7 +13,9 @@ namespace Ahtola.PSSqlite;
 [OutputType(typeof(int))]
 public sealed class InvokePSSqliteBulkCopyCommand : PSSqliteCmdlet
 {
-    private readonly List<OrderedDictionary> _rows = new();
+    private readonly List<OrderedDictionary> _batch = new();
+    private BulkCopySession? _session;
+    private bool? _shouldProcess;
 
     [Parameter(Mandatory = true, ValueFromPipeline = true)]
     public object InputObject { get; set; } = null!;
@@ -35,22 +37,80 @@ public sealed class InvokePSSqliteBulkCopyCommand : PSSqliteCmdlet
 
     protected override void ProcessRecord()
     {
-        _rows.Add(PowerShellRow.ToDictionary(InputObject));
-    }
+        if (_shouldProcess is null)
+        {
+            _shouldProcess = ShouldProcess(Table, "Bulk copy piped rows");
+        }
 
-    protected override void EndProcessing()
-    {
-        if (_rows.Count == 0 || !ShouldProcess(Table, $"Bulk copy {_rows.Count} row(s)"))
+        if (!_shouldProcess.Value)
         {
             return;
         }
 
-        WriteObject(BulkCopyExecutor.Execute(
-            Connection,
-            Table,
-            _rows,
-            BatchSize,
-            Transaction));
+        try
+        {
+            _batch.Add(PowerShellRow.ToDictionary(InputObject));
+            if (_batch.Count >= BatchSize)
+            {
+                FlushBatch();
+            }
+        }
+        catch
+        {
+            Abort();
+            throw;
+        }
+    }
+
+    protected override void EndProcessing()
+    {
+        try
+        {
+            if (_shouldProcess is not true)
+            {
+                return;
+            }
+
+            FlushBatch();
+            if (_session is null)
+            {
+                return;
+            }
+
+            _session.Complete();
+            WriteObject(_session.RowsWritten);
+        }
+        catch
+        {
+            Abort();
+            throw;
+        }
+        finally
+        {
+            _session?.Dispose();
+            _session = null;
+            _batch.Clear();
+        }
+    }
+
+    private void FlushBatch()
+    {
+        if (_batch.Count == 0)
+        {
+            return;
+        }
+
+        _session ??= new BulkCopySession(Connection, Table, Transaction);
+        _session.WriteBatch(_batch);
+        _batch.Clear();
+    }
+
+    private void Abort()
+    {
+        _session?.Abort();
+        _session?.Dispose();
+        _session = null;
+        _batch.Clear();
     }
 }
 
@@ -80,7 +140,7 @@ public sealed class ExportPSSqliteTableCommand : PSSqliteCmdlet
 
     protected override void ProcessRecord()
     {
-        var outputPath = System.IO.Path.GetFullPath(ExpandString(Path));
+        var outputPath = ResolveFileSystemPath(Path);
         var format = TableInterchange.ResolveFormat(outputPath, Format);
         var commandText = ParameterSetName == "Query"
             ? Query!
@@ -129,7 +189,7 @@ public sealed class ImportPSSqliteTableCommand : PSSqliteCmdlet
 
     protected override void ProcessRecord()
     {
-        var inputPath = System.IO.Path.GetFullPath(ExpandString(Path));
+        var inputPath = ResolveFileSystemPath(Path);
         if (!File.Exists(inputPath))
         {
             throw new FileNotFoundException($"Import file not found: {inputPath}", inputPath);
@@ -230,83 +290,171 @@ internal static class BulkCopyExecutor
             return 0;
         }
 
-        var columns = rows[0].Keys.Cast<string>().ToArray();
-        if (columns.Length == 0)
+        using var session = new BulkCopySession(connection, tableName, transaction);
+        try
         {
-            throw new ArgumentException("Bulk-copy rows must have at least one column.", nameof(rows));
+            for (var offset = 0; offset < rows.Count; offset += batchSize)
+            {
+                var count = Math.Min(batchSize, rows.Count - offset);
+                session.WriteBatch(rows.Skip(offset).Take(count).ToArray());
+            }
+
+            session.Complete();
+            return session.RowsWritten;
+        }
+        catch
+        {
+            session.Abort();
+            throw;
+        }
+    }
+}
+
+internal sealed class BulkCopySession : IDisposable
+{
+    private readonly SqliteConnection _connection;
+    private readonly string _tableName;
+    private readonly SqliteTransaction? _providedTransaction;
+    private SqliteTransaction? _transaction;
+    private SqliteCommand? _command;
+    private string[]? _columns;
+    private string? _savepointName;
+    private bool _ownsTransaction;
+    private bool _completed;
+    private bool _aborted;
+
+    public BulkCopySession(
+        SqliteConnection connection,
+        string tableName,
+        SqliteTransaction? transaction)
+    {
+        _connection = connection ?? throw new ArgumentNullException(nameof(connection));
+        _tableName = string.IsNullOrWhiteSpace(tableName)
+            ? throw new ArgumentException("Table name is required.", nameof(tableName))
+            : tableName;
+        _providedTransaction = transaction;
+    }
+
+    public int RowsWritten { get; private set; }
+
+    public void WriteBatch(IReadOnlyList<OrderedDictionary> rows)
+    {
+        ObjectDisposedException.ThrowIf(_completed || _aborted, this);
+        if (rows.Count == 0)
+        {
+            return;
+        }
+
+        EnsureInitialized(rows[0]);
+        foreach (var row in rows)
+        {
+            ValidateRowColumns(row, _columns!);
         }
 
         foreach (var row in rows)
         {
-            ValidateRowColumns(row, columns);
-        }
+            _command!.Parameters.Clear();
+            foreach (var column in _columns!.Select((name, index) => (name, index)))
+            {
+                _command.Parameters.AddWithValue("$value" + column.index, row[column.name] ?? DBNull.Value);
+            }
 
-        if (connection.State != ConnectionState.Open)
+            _ = _command.ExecuteNonQuery();
+            RowsWritten++;
+        }
+    }
+
+    public void Complete()
+    {
+        ObjectDisposedException.ThrowIf(_completed || _aborted, this);
+        if (_transaction is null)
         {
-            connection.Open();
+            _completed = true;
+            return;
         }
 
-        var ownsTransaction = transaction is null;
-        var activeTransaction = transaction ?? connection.BeginTransaction();
-        if (transaction is not null && !ReferenceEquals(transaction.Connection, connection))
+        if (_ownsTransaction)
         {
-            throw new ArgumentException("Transaction must belong to SqliteConnection.", nameof(transaction));
+            _transaction.Commit();
         }
-
-        var savepointName = ownsTransaction ? null : $"ps_bulk_{Guid.NewGuid():N}";
-        try
+        else
         {
-            if (savepointName is not null)
-            {
-                activeTransaction.Save(savepointName);
-            }
-
-            using var command = connection.CreateCommand();
-            command.Transaction = activeTransaction;
-            command.CommandText =
-                $"INSERT INTO {SqlIdentifier.QuoteQualified(tableName)} ({string.Join(", ", columns.Select(SqlIdentifier.Quote))}) " +
-                $"VALUES ({string.Join(", ", columns.Select((_, index) => "$value" + index))});";
-            for (var index = 0; index < rows.Count; index++)
-            {
-                command.Parameters.Clear();
-                foreach (var column in columns.Select((name, columnIndex) => (name, columnIndex)))
-                {
-                    command.Parameters.AddWithValue("$value" + column.columnIndex, rows[index][column.name] ?? DBNull.Value);
-                }
-
-                _ = command.ExecuteNonQuery();
-                if ((index + 1) % batchSize == 0 && savepointName is not null)
-                {
-                    activeTransaction.Release(savepointName);
-                    activeTransaction.Save(savepointName);
-                }
-            }
-
-            if (ownsTransaction)
-            {
-                activeTransaction.Commit();
-            }
-            else if (savepointName is not null)
-            {
-                activeTransaction.Release(savepointName);
-            }
-
-            return rows.Count;
+            _transaction.Release(_savepointName!);
         }
-        catch
+
+        _completed = true;
+    }
+
+    public void Abort()
+    {
+        if (_completed || _aborted || _transaction is null)
         {
-            if (ownsTransaction)
-            {
-                activeTransaction.Rollback();
-            }
-            else if (savepointName is not null)
-            {
-                activeTransaction.Rollback(savepointName);
-                activeTransaction.Release(savepointName);
-            }
-
-            throw;
+            return;
         }
+
+        if (_ownsTransaction)
+        {
+            _transaction.Rollback();
+        }
+        else
+        {
+            _transaction.Rollback(_savepointName!);
+            _transaction.Release(_savepointName!);
+        }
+
+        _aborted = true;
+    }
+
+    public void Dispose()
+    {
+        if (!_completed && !_aborted)
+        {
+            Abort();
+        }
+
+        _command?.Dispose();
+        if (_ownsTransaction)
+        {
+            _transaction?.Dispose();
+        }
+    }
+
+    private void EnsureInitialized(OrderedDictionary firstRow)
+    {
+        if (_command is not null)
+        {
+            return;
+        }
+
+        if (_providedTransaction is not null && !ReferenceEquals(_providedTransaction.Connection, _connection))
+        {
+            throw new ArgumentException("Transaction must belong to SqliteConnection.", nameof(_providedTransaction));
+        }
+
+        _columns = firstRow.Keys.Cast<string>().ToArray();
+        if (_columns.Length == 0)
+        {
+            throw new ArgumentException("Bulk-copy rows must have at least one column.", nameof(firstRow));
+        }
+
+        if (_connection.State != ConnectionState.Open)
+        {
+            _connection.Open();
+        }
+
+        _ownsTransaction = _providedTransaction is null;
+        _transaction = _providedTransaction ?? _connection.BeginTransaction();
+        _savepointName = _ownsTransaction ? null : $"ps_bulk_{Guid.NewGuid():N}";
+        if (_savepointName is not null)
+        {
+            _transaction.Save(_savepointName);
+        }
+
+        _command = _connection.CreateCommand();
+        _command.Transaction = _transaction;
+        _command.CommandText =
+            $"INSERT INTO {SqlIdentifier.QuoteQualified(_tableName)} ({string.Join(", ", _columns.Select(SqlIdentifier.Quote))}) " +
+            $"VALUES ({string.Join(", ", _columns.Select((_, index) => "$value" + index))});";
     }
 
     private static void ValidateRowColumns(OrderedDictionary row, IReadOnlyCollection<string> columns)

@@ -45,6 +45,8 @@ Get-Command -Module Devolutions.Ahtola.Sqlite
 ```
 
 No native SQLite assets are required; PreLoadTypes loads the managed Ahtola assemblies from `bin/`.
+The staged module includes offline MAML command help; use `Get-Help <cmdlet> -Full`
+or `Get-Help <cmdlet> -Examples` after import.
 
 ## Tests
 
@@ -76,6 +78,9 @@ pwsh ./scripts/Invoke-PowerShellModuleTests.ps1
   never closes or disposes it. `New-AhtolaSqliteConnection` returns an open
   connection, and `Close-AhtolaSqliteConnection` is the explicit disposal
   command.
+- Relative database, replica, import, and export paths resolve from the active
+  PowerShell filesystem location. `-WhatIf` previews connection creation
+  without opening a connection or creating a local database file.
 - `Invoke-AhtolaSqliteQuery` emits `PSCustomObject` rows by default. Use
   `-As Scalar` or `-As NonQuery` for direct values/counts and `-As DataTable`
   or `-As DataSet` only when those ADO.NET containers are required.

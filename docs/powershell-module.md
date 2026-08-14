@@ -49,6 +49,13 @@ source. To update later:
 Update-Module -Name Devolutions.Ahtola.Sqlite
 ```
 
+The module bundles offline command help:
+
+```powershell
+Get-Help New-AhtolaSqliteConnection -Full
+Get-Help Invoke-AhtolaSqliteQuery -Examples
+```
+
 Model types are available as module-qualified type accelerators once the
 module is imported, e.g. `[Devolutions.Ahtola.Sqlite.SqliteDBConfig]` for the
 CRUD-row cmdlets below.
@@ -73,10 +80,12 @@ may open it if it's closed, but never closes or disposes it for you.
 | `byTursoCloud` | `-TursoUrl`/`-RemoteUrl`/`-Url`, `-AuthToken`/`-Token`, `-ReplicaPath`, `-UseTursoEnvironment`, `-SyncInterval` | `AhtolaCloudConnection` |
 
 `-ReadOnly` applies to the first two sets and sets `Mode=ReadOnly` on the
-connection string before opening. `-DatabasePath`/`-DatabaseFile` and
-`-ConnectionString` support PowerShell string expansion (`$env:...`,
-`$variable`) via `ExpandString`, so you can pass `'$env:USERPROFILE\data.db'`
-directly.
+connection string before opening. Relative `Data Source`, `-DatabasePath`, and
+`-ReplicaPath` values resolve from the active PowerShell filesystem location.
+`-DatabasePath`/`-DatabaseFile` and `-ConnectionString` support PowerShell
+string expansion (`$env:...`, `$variable`) via `ExpandString`, so you can pass
+`'$env:USERPROFILE\data.db'` directly. `-WhatIf` previews local and Cloud
+connection creation without opening a connection or creating a database file.
 
 ```powershell
 # In-memory, shared cache (default)
@@ -250,9 +259,12 @@ Export-AhtolaSqliteTable -Connection $file -Query 'SELECT * FROM Items WHERE Qty
 Import-AhtolaSqliteTable -Connection $file -Table Items -Path ./items.csv -BatchSize 500
 ```
 
-`Invoke-AhtolaSqliteBulkCopy` inserts all pipelined rows in one
+Relative import and export `-Path` values resolve from the active PowerShell
+filesystem location. `Invoke-AhtolaSqliteBulkCopy` inserts all pipelined rows in one
 all-or-nothing transaction (or savepoint, with a caller-owned `-Transaction`)
-and fails/rolls back on the first conflicting row. `Export-AhtolaSqliteTable`
+takes at most `-BatchSize` rows from the pipeline at a time, so large pipeline
+inputs do not accumulate in memory. A failed later batch still rolls back every
+row inserted by the bulk copy. `Export-AhtolaSqliteTable`
 takes either `-Table` or `-Query`+`-Parameters` (mutually exclusive parameter
 sets) and writes `Json` or `Csv` (`-Format` overrides extension inference).
 `Import-AhtolaSqliteTable` reads the same two formats back in with the same
@@ -279,8 +291,9 @@ Get-AhtolaSqliteDatabaseMetadata -Connection $file -MetadataKey SchemaVersion, A
 Compare-AhtolaSqliteDatabaseVersion -Configuration $config -ExpectedVersion '2'
 ```
 
-`Get-AhtolaSqliteDatabaseMetadata` reads stored key/value metadata for a
-connection string (`-MetadataKey` defaults to `*`, i.e. everything).
+`Get-AhtolaSqliteDatabaseMetadata` reads stored key/value metadata from the
+supplied connection (`-MetadataKey` defaults to `*`, i.e. everything), so it
+also sees in-memory databases and uncommitted metadata changes.
 `Compare-AhtolaSqliteDatabaseVersion` compares a `SQLiteDBConfig`'s deployed
 version against an expected one (defaulting to `$Configuration.Version`) —
 useful as a gate before running schema-migration scripts.

@@ -30,6 +30,23 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
         Test-Path -LiteralPath $script:ManifestPath | Should-BeTrue
     }
 
+    It 'ships complete MAML help for every exported cmdlet' {
+        $mamlPath = Join-Path $script:ModulePath 'en-US\Devolutions.Ahtola.PowerShell.dll-Help.xml'
+        Test-Path -LiteralPath $mamlPath -PathType Leaf | Should-BeTrue
+
+        foreach ($command in Get-Command -Module $script:ModuleName | Sort-Object Name) {
+            $help = Get-Help -Name $command.Name -Full
+            $rendered = $help | Out-String -Width 200
+
+            [string]::IsNullOrWhiteSpace([string]$help.Synopsis) | Should-BeFalse
+            @($help.Description).Count | Should-BeGreaterThan 0
+            @($help.Examples.Example).Count | Should-BeGreaterThan 0
+            @($help.Parameters.Parameter).Count | Should-BeGreaterThan 0
+            $rendered.Contains('{{') | Should-BeFalse
+            $rendered.Contains('Fill in the') | Should-BeFalse
+        }
+    }
+
     It 'exports the expected AhtolaSqlite cmdlets' {
         $commands = @(Get-Command -Module $script:ModuleName | Select-Object -ExpandProperty Name)
         $expected = @(
@@ -139,6 +156,13 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
         $parameters['ReplicaPath'] | Should-NotBeNull
         $parameters['UseTursoEnvironment'] | Should-NotBeNull
         $parameters['SyncInterval'] | Should-NotBeNull
+        $readOnlySets = @(
+            $command.ParameterSets |
+                Where-Object { $_.Parameters.Name -contains 'ReadOnly' } |
+                Select-Object -ExpandProperty Name
+        )
+        $readOnlySets | Should-ContainCollection 'byConnectionString', 'byDatabasePath'
+        ($readOnlySets -contains 'byTursoCloud') | Should-BeFalse
         (Get-Command Invoke-AhtolaSqliteReplicaSync).Parameters['ReplicaConnection'].ParameterType |
             Should-Be ([Ahtola.PSSqlite.AhtolaCloudConnection])
 
@@ -206,6 +230,106 @@ Describe 'Devolutions.Ahtola.Sqlite connections and queries' {
         $table | Should-NotBeNull
         $table.Rows.Count | Should-Be 1
         [int]$table.Rows[0]['value'] | Should-Be 1
+    }
+
+    It 'reads metadata from the supplied in-memory connection' {
+        $null = Invoke-AhtolaSqliteQuery `
+            -Connection $script:Connection `
+            -CommandText "CREATE TABLE _metadata(key TEXT PRIMARY KEY, value TEXT); INSERT INTO _metadata VALUES ('version', '1');" `
+            -As NonQuery
+
+        $metadata = Get-AhtolaSqliteDatabaseMetadata -Connection $script:Connection
+
+        $metadata | Should-NotBeNull
+        [string]$metadata['version'] | Should-BeString '1'
+    }
+
+    It 'resolves a relative data source from the current PowerShell location' {
+        $directory = Join-Path ([System.IO.Path]::GetTempPath()) ("ahtola-relative-" + [guid]::NewGuid().ToString('N'))
+        $database = Join-Path $directory 'items.sqlite'
+        $connection = $null
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+
+        try {
+            Push-Location -LiteralPath $directory
+            $connection = New-AhtolaSqliteConnection -ConnectionString 'Data Source=items.sqlite;Pooling=False'
+
+            $connection.DataSource | Should-Be $database
+            Invoke-AhtolaSqliteQuery -Connection $connection -CommandText 'CREATE TABLE Items(Id INTEGER PRIMARY KEY, Name TEXT);' -As NonQuery | Should-Be 0
+            Invoke-AhtolaSqliteQuery -Connection $connection -CommandText "INSERT INTO Items(Name) VALUES ('Widget');" -As NonQuery | Should-Be 1
+            [int](Invoke-AhtolaSqliteQuery -Connection $connection -CommandText 'SELECT COUNT(*) FROM Items;' -As Scalar) | Should-Be 1
+        }
+        finally {
+            if ($null -ne $connection) {
+                $connection | Close-AhtolaSqliteConnection -Confirm:$false
+            }
+
+            Pop-Location
+            Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'resolves DatabasePath from the current PowerShell location' {
+        $directory = Join-Path ([System.IO.Path]::GetTempPath()) ("ahtola-database-path-" + [guid]::NewGuid().ToString('N'))
+        $database = Join-Path $directory 'items.sqlite'
+        $connection = $null
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+
+        try {
+            Push-Location -LiteralPath $directory
+            $connection = New-AhtolaSqliteConnection -DatabasePath . -DatabaseFile 'items.sqlite'
+
+            $connection.DataSource | Should-Be $database
+            Test-Path -LiteralPath $database | Should-BeTrue
+        }
+        finally {
+            if ($null -ne $connection) {
+                $connection | Close-AhtolaSqliteConnection -Confirm:$false
+            }
+
+            Pop-Location
+            Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'does not create a local database under WhatIf' {
+        $directory = Join-Path ([System.IO.Path]::GetTempPath()) ("ahtola-what-if-" + [guid]::NewGuid().ToString('N'))
+        $database = Join-Path $directory 'items.sqlite'
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+
+        try {
+            Push-Location -LiteralPath $directory
+            @(New-AhtolaSqliteConnection -ConnectionString 'Data Source=items.sqlite;Pooling=False' -WhatIf).Count | Should-Be 0
+            Test-Path -LiteralPath $database | Should-BeFalse
+        }
+        finally {
+            Pop-Location
+            Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'validates non-negative command timeouts' {
+        $timeoutCommands = @(
+            'Invoke-AhtolaSqliteQuery'
+            'Invoke-AhtolaSqliteMaintenance'
+            'Test-AhtolaSqliteIntegrity'
+            'Optimize-AhtolaSqliteDatabase'
+            'Checkpoint-AhtolaSqliteDatabase'
+        )
+
+        foreach ($name in $timeoutCommands) {
+            $validation = @(
+                (Get-Command $name).Parameters['CommandTimeout'].Attributes |
+                    Where-Object { $_ -is [System.Management.Automation.ValidateRangeAttribute] }
+            )
+
+            $validation.Count | Should-Be 1
+            [int]$validation[0].MinRange | Should-Be 0
+        }
+
+        {
+            Invoke-AhtolaSqliteQuery -Connection $script:Connection -CommandText 'SELECT 1;' -CommandTimeout -1
+        } | Should-Throw
     }
 
     It 'opens a caller-owned closed pipeline connection and returns PowerShell objects by default' {
@@ -349,6 +473,7 @@ Describe 'Devolutions.Ahtola.Sqlite connections and queries' {
             -As NonQuery
 
         $transaction = $script:Connection | Start-AhtolaSqliteTransaction
+        @(Save-AhtolaSqliteTransaction -Transaction $transaction -Name previewed -WhatIf).Count | Should-Be 0
         $transaction | Save-AhtolaSqliteTransaction -Name discarded
         $null = Invoke-AhtolaSqliteQuery -Connection $script:Connection `
             -Transaction $transaction `
@@ -396,7 +521,7 @@ Describe 'Devolutions.Ahtola.Sqlite connections and queries' {
             @(
                 [pscustomobject]@{ id = 3; name = 'three' }
                 [pscustomobject]@{ id = 1; name = 'duplicate' }
-            ) | Invoke-AhtolaSqliteBulkCopy -Connection $script:Connection -Table bulk
+            ) | Invoke-AhtolaSqliteBulkCopy -Connection $script:Connection -Table bulk -BatchSize 1
         } | Should-Throw
         [int](Invoke-AhtolaSqliteQuery -SqliteConnection $script:Connection -CommandText 'SELECT COUNT(*) FROM bulk;' -As Scalar) | Should-Be 2
 
@@ -460,6 +585,36 @@ Describe 'Devolutions.Ahtola.Sqlite backup and table interchange' {
         finally {
             $source | Close-AhtolaSqliteConnection -Confirm:$false
             $destination | Close-AhtolaSqliteConnection -Confirm:$false
+        }
+    }
+
+    It 'resolves import and export paths from the current PowerShell location' {
+        $directory = Join-Path ([System.IO.Path]::GetTempPath()) ("ahtola-transfer-path-" + [guid]::NewGuid().ToString('N'))
+        $path = Join-Path $directory 'items.json'
+        $source = New-AhtolaSqliteConnection -ConnectionString 'Data Source=:memory:'
+        $destination = New-AhtolaSqliteConnection -ConnectionString 'Data Source=:memory:'
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+
+        try {
+            $null = Invoke-AhtolaSqliteQuery -Connection $source `
+                -CommandText "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO items VALUES (1, 'Widget');" `
+                -As NonQuery
+            $null = Invoke-AhtolaSqliteQuery -Connection $destination `
+                -CommandText 'CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);' `
+                -As NonQuery
+
+            Push-Location -LiteralPath $directory
+            Export-AhtolaSqliteTable -Connection $source -Table items -Path 'items.json' -Confirm:$false | Should-Be $path
+            Import-AhtolaSqliteTable -Connection $destination -Table items -Path 'items.json' -Confirm:$false | Should-Be 1
+
+            Test-Path -LiteralPath $path | Should-BeTrue
+            [int](Invoke-AhtolaSqliteQuery -Connection $destination -CommandText 'SELECT COUNT(*) FROM items;' -As Scalar) | Should-Be 1
+        }
+        finally {
+            Pop-Location
+            $source | Close-AhtolaSqliteConnection -Confirm:$false
+            $destination | Close-AhtolaSqliteConnection -Confirm:$false
+            Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -704,6 +859,64 @@ Describe 'Devolutions.Ahtola.Sqlite programmatic configuration and CRUD' {
             }
 
             Close-AhtolaSqliteConnection
+        }
+    }
+
+    It 'uses the transaction connection for CRUD when Connection is omitted' {
+        $config = $script:Config
+        $connection = New-AhtolaSqliteConnection -DatabasePath $config.DatabasePath -DatabaseFile $config.DatabaseFile
+        $otherConnection = New-AhtolaSqliteConnection -ConnectionString 'Data Source=:memory:'
+        $transaction = $null
+        try {
+            $transaction = Start-AhtolaSqliteTransaction -Connection $connection
+
+            {
+                Get-AhtolaSqliteRow `
+                    -Configuration $config `
+                    -Table Items `
+                    -Connection $otherConnection `
+                    -Transaction $transaction
+            } | Should-Throw
+
+            New-AhtolaSqliteRow `
+                -Configuration $config `
+                -Table Items `
+                -Values @{ Id = 100; Name = 'transactional'; Qty = 1 } `
+                -Transaction $transaction | Should-NotBeNull
+
+            Set-AhtolaSqliteRow `
+                -Configuration $config `
+                -Table Items `
+                -Values @{ Qty = 2 } `
+                -Where @{ Id = 100 } `
+                -Transaction $transaction | Should-Be 1
+
+            $rows = @(Get-AhtolaSqliteRow `
+                    -Configuration $config `
+                    -Table Items `
+                    -Where @{ Id = 100 } `
+                    -Transaction $transaction `
+                    -As OrderedDictionary)
+            $rows.Count | Should-Be 1
+            [int]$rows[0]['Qty'] | Should-Be 2
+
+            Remove-AhtolaSqliteRow `
+                -Configuration $config `
+                -Table Items `
+                -Where @{ Id = 100 } `
+                -Transaction $transaction | Should-Be 1
+
+            Complete-AhtolaSqliteTransaction -Transaction $transaction -Confirm:$false
+            $transaction = $null
+            [int](Invoke-AhtolaSqliteQuery -Connection $connection -CommandText 'SELECT COUNT(*) FROM Items WHERE Id = 100;' -As Scalar) | Should-Be 0
+        }
+        finally {
+            if ($null -ne $transaction) {
+                Undo-AhtolaSqliteTransaction -Transaction $transaction -Confirm:$false
+            }
+
+            $otherConnection | Close-AhtolaSqliteConnection -Confirm:$false
+            $connection | Close-AhtolaSqliteConnection -Confirm:$false
         }
     }
 
