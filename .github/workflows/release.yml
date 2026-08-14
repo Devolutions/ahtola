@@ -142,7 +142,9 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: unsigned-powershell-module
-          path: artifacts/powershell-modules
+          # upload-artifact strips the module directory because its path ends
+          # in /**. Restore that directory before signing and re-uploading it.
+          path: artifacts/powershell-modules/Devolutions.Ahtola.Sqlite
 
       - name: Determine signing mode
         id: sign_plan
