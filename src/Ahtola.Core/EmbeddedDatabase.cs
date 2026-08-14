@@ -2429,7 +2429,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 throw new EmbeddedSqlException("cannot change journal mode while a SQL statement is in progress");
             if (_activeBlobMutations.Count != 0)
                 throw new EmbeddedSqlException("cannot change journal mode while a blob handle is active");
-            if (_fileSystem is null || _fileCatalogWriteLock is null)
+            var fileSystem = _fileSystem;
+            var fileCatalogWriteLock = _fileCatalogWriteLock;
+            if (fileSystem is null || fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
             // Leaving MVCC returns to the requested durable pager mode (header 2 or 1).
@@ -2444,13 +2446,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 _mvStore = null;
             }
 
-            lock (_fileCatalogWriteLock)
+            lock (fileCatalogWriteLock)
             {
-                using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
+                using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(fileSystem, _databasePath);
                 EnsureFileCatalogVersionCurrent(busyTimeout);
                 using var writeRegistration = RegisterCatalogWrite(_databasePath);
                 var result = _fileStore.SwitchJournalMode(journalMode);
-                _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
+                _fileCatalogVersion = ReadFileCatalogVersion(fileSystem, _databasePath);
                 _version++;
                 return result;
             }
