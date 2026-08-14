@@ -14,9 +14,9 @@ automatically vibe-ported from Turso’s Rust core, as a fun experiment. It is
 companion, P/Invoke SDK, or Rust toolchain is required to restore, build, pack,
 or run.
 
-- [Install](#install)
+- [Install](#install) ([full guide](docs/dotnet-packages.md))
 - [Quick start](#quick-start)
-- [PowerShell module](#powershell-module)
+- [PowerShell module](#powershell-module) ([full guide](docs/powershell-module.md))
 - [What this is good for](#what-this-is-good-for)
 - [Important limits](#important-limits)
 - [Building from source](#building-from-source)
@@ -31,11 +31,15 @@ dotnet add package Devolutions.Ahtola.EntityFrameworkCore.Sqlite
 
 Targets: `net8.0`, `net9.0`, `net10.0`. No `net48` / .NET Framework assets.
 
-| Package | Role |
-| --- | --- |
-| `Devolutions.Ahtola.Core` | Managed engine |
-| `Devolutions.Ahtola.Data.Sqlite` | ADO.NET provider + `Microsoft.Data.Sqlite`-compatible facade; embeds `Ahtola.Data` |
-| `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | EF Core provider (`UseAhtola`) |
+| Package | Role | NuGet |
+| --- | --- | --- |
+| `Devolutions.Ahtola.Core` | Managed engine | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Core) |
+| `Devolutions.Ahtola.Data.Sqlite` | ADO.NET provider + `Microsoft.Data.Sqlite`-compatible facade; embeds `Ahtola.Data` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Data.Sqlite) |
+| `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | EF Core provider (`UseAhtola`) | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.EntityFrameworkCore.Sqlite) |
+
+`Devolutions.Ahtola.Core` flows in transitively via `Devolutions.Ahtola.Data.Sqlite`
+— most consumers never add it directly unless they implement an `IPageCodec`
+or touch `Ahtola.Core.Storage` types directly.
 
 | Layer | Name |
 | --- | --- |
@@ -43,6 +47,10 @@ Targets: `net8.0`, `net9.0`, `net10.0`. No `net48` / .NET Framework assets.
 | Assemblies | `Devolutions.Ahtola.*` |
 | Namespaces / types | `Ahtola.*` (`AhtolaConnection`, `UseAhtola`, …) |
 | Project folders | `src/Ahtola.*` |
+
+For connection strings, Turso Cloud (direct + managed embedded replica),
+concurrent writes (MVCC), encryption, and EF Core in more depth, see the
+[**.NET packages guide**](docs/dotnet-packages.md).
 
 ## Quick start
 
@@ -136,18 +144,17 @@ Requires PowerShell **7.4+**. Windows PowerShell 5.1 is not supported.
 
 ### Getting the module
 
-It isn't on the PowerShell Gallery yet, so build it from a clone:
+Install it from the [PowerShell Gallery](https://www.powershellgallery.com/packages/Devolutions.Ahtola.Sqlite):
 
 ```powershell
-./build.ps1 pack-powershell
-# -> artifacts/powershell-modules/Devolutions.Ahtola.Sqlite
+Install-Module -Name Devolutions.Ahtola.Sqlite -Scope CurrentUser
 ```
 
 Then import it from anywhere pwsh 7 runs — no native SQLite binary, no .NET SDK
 needed at import time:
 
 ```powershell
-Import-Module ./artifacts/powershell-modules/Devolutions.Ahtola.Sqlite
+Import-Module Devolutions.Ahtola.Sqlite
 Get-Command -Module Devolutions.Ahtola.Sqlite
 ```
 
@@ -212,6 +219,11 @@ $connection | Close-AhtolaSqliteConnection -ClearPool
 
 If you'd rather call the ADO.NET provider from a plain script module instead of
 using these cmdlets, see [samples/PSSqlite.Managed](samples/PSSqlite.Managed).
+
+For a deeper cmdlet reference plus worked walkthroughs — a local SQLite file,
+local concurrent writes with MVCC/`BEGIN CONCURRENT`, a direct Turso Cloud
+connection, and a managed embedded replica — see
+[docs/powershell-module.md](docs/powershell-module.md).
 
 ## What this is good for
 

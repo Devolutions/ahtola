@@ -1,0 +1,448 @@
+# NuGet packages guide
+
+Ahtola ships as three NuGet packages that build directly on top of each
+other. This guide goes deeper than the [top-level README](../README.md#install):
+which package to install for a given scenario, the full ADO.NET / EF Core API
+surface, connection-string keywords, and end-to-end walkthroughs for a
+**local SQLite file**, **local concurrent writes (MVCC / `BEGIN CONCURRENT`)**,
+and **Turso Cloud** — both a direct connection and a **managed embedded
+replica**.
+
+- [Packages and installation](#packages-and-installation)
+- [Which package do I need?](#which-package-do-i-need)
+- [The SQLite-compatible facade](#the-sqlite-compatible-facade)
+- [Native Ahtola types](#native-ahtola-types)
+- [Connection string reference](#connection-string-reference)
+- [Working with a local SQLite file](#working-with-a-local-sqlite-file)
+- [Concurrent writes on a local file (MVCC)](#concurrent-writes-on-a-local-file-mvcc)
+- [Encryption](#encryption)
+- [Entity Framework Core](#entity-framework-core)
+- [Turso Cloud: direct connection](#turso-cloud-direct-connection)
+- [Turso Cloud: managed embedded replica](#turso-cloud-managed-embedded-replica)
+- [Error handling patterns](#error-handling-patterns)
+
+## Packages and installation
+
+| Package | NuGet | Role |
+| --- | --- | --- |
+| `Devolutions.Ahtola.Core` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Core) | Pure-managed engine (pager, b-tree, WAL, VDBE). Rarely referenced directly — it flows in transitively — unless you need engine-level types such as `IPageCodec`. |
+| `Devolutions.Ahtola.Data.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Data.Sqlite) | ADO.NET provider: the `Microsoft.Data.Sqlite`-compatible facade (`Ahtola.Data.Sqlite.SqliteConnection`, …) plus the native `Ahtola.AhtolaConnection` types (local files, MVCC, Turso Cloud direct/replica). Embeds `Ahtola.Data`. |
+| `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.EntityFrameworkCore.Sqlite) | EF Core provider (`UseAhtola`), **local databases only** (see [Entity Framework Core](#entity-framework-core)). |
+
+```bash
+# ADO.NET only
+dotnet add package Devolutions.Ahtola.Data.Sqlite
+
+# + EF Core (9.x on net8.0/net9.0, 10.x on net10.0)
+dotnet add package Devolutions.Ahtola.EntityFrameworkCore.Sqlite
+```
+
+Targets `net8.0`, `net9.0`, `net10.0` — no `net48` / .NET Framework assets, no
+native SQLite binary, and no P/Invoke SDK to restore. All three packages are
+`IsAotCompatible`/`IsTrimmable` in `Ahtola.Core`, and the shipped
+provider/EF Core packages publish and trim cleanly on every supported TFM.
+
+Adding `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` automatically brings in
+`Devolutions.Ahtola.Data.Sqlite`, which in turn brings in
+`Devolutions.Ahtola.Core` — you rarely need to `dotnet add package
+Devolutions.Ahtola.Core` yourself. Add it directly only if you're writing an
+`IPageCodec` implementation or otherwise coding straight against
+`Ahtola.Core.Storage` types.
+
+## Which package do I need?
+
+- **Drop-in replacement for `Microsoft.Data.Sqlite`** → `Devolutions.Ahtola.Data.Sqlite`,
+  `using Ahtola.Data.Sqlite;` — see [The SQLite-compatible facade](#the-sqlite-compatible-facade).
+- **Native Ahtola API, or you need Turso Cloud (direct connection or embedded
+  replica)** → same package, `using Ahtola;` — see
+  [Native Ahtola types](#native-ahtola-types) and the Turso Cloud sections below.
+  EF Core's `UseAhtola` does **not** support Turso Cloud URLs; use
+  `AhtolaConnection` directly for that.
+- **EF Core** → also add `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` and call
+  `optionsBuilder.UseAhtola(...)` — local SQLite files only.
+
+## The SQLite-compatible facade
+
+`Ahtola.Data.Sqlite` mirrors `Microsoft.Data.Sqlite`'s public shape closely
+enough that most code only needs a `using` swap:
+
+```csharp
+using Ahtola.Data.Sqlite;
+
+using var connection = new SqliteConnection("Data Source=app.db");
+connection.Open();
+connection.ExecuteNonQuery("CREATE TABLE t(a INTEGER, b TEXT)");
+connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 'hello')");
+
+using var command = connection.CreateCommand();
+command.CommandText = "SELECT a, b FROM t";
+using var reader = command.ExecuteReader();
+while (reader.Read())
+    Console.WriteLine($"{reader.GetInt32(0)} {reader.GetString(1)}");
+```
+
+`ExecuteNonQuery(string)`, `ExecuteReader(string)`, and `ExecuteScalar(string)`
+/ `ExecuteScalar<T>(string)` are convenience extension methods on
+`SqliteConnection` for one-shot statements without allocating a `SqliteCommand`
+yourself. `SqliteFactory.Instance` is the `DbProviderFactory` if you need
+provider-agnostic construction (e.g. `DbProviderFactories.RegisterFactory`).
+
+This facade is **local-file only** — its `SqliteConnectionStringBuilder` does
+not accept Turso Cloud keywords (`Auth Token`, `Replica Path`, …). Use the
+native `Ahtola.AhtolaConnection` (below) for Turso Cloud.
+
+### Standard SQLite files
+
+Managed open of **unencrypted** SQLite databases created by System.Data.SQLite
+/ Microsoft.Data.Sqlite / native `sqlite3` is supported (`Data Source=path`
+only; no special flags). Ahtola is byte-compatible with the on-disk format for
+normal read/write workloads.
+
+## Native Ahtola types
+
+`using Ahtola;` exposes `AhtolaConnection`, `AhtolaCommand`, `AhtolaParameter`,
+`AhtolaTransaction`, `AhtolaBatch`/`AhtolaBatchCommand`, and
+`AhtolaFactory.Instance`. This is the same package
+(`Devolutions.Ahtola.Data.Sqlite`) as the facade above — pick whichever set of
+types fits your code, or mix them (both wrap the same engine and honor the
+same connection string):
+
+```csharp
+using Ahtola;
+
+using var connection = new AhtolaConnection("Data Source=:memory:");
+connection.Open();
+connection.ExecuteNonQuery("CREATE TABLE t(a, b)");
+```
+
+Use the native types when you need capabilities the facade doesn't surface:
+Turso Cloud direct connections, managed embedded replicas, `Sync`/`SyncAsync`,
+and `Capabilities` (e.g. `CanCreateBatch`, `SupportsSync`) for feature-testing
+a connection before using it.
+
+## Connection string reference
+
+Common keywords accepted by both `Ahtola.Data.Sqlite.SqliteConnectionStringBuilder`
+and `Ahtola.AhtolaConnectionStringBuilder`:
+
+| Keyword | Notes |
+| --- | --- |
+| `Data Source` (`Filename`) | File path, `:memory:`, or (native types only) a Turso Cloud URL (`libsql://…` / `https://…`) |
+| `Mode` | `ReadWriteCreate` (default), `ReadWrite`, `ReadOnly`, `Memory` |
+| `Cache` | `Private` (default) / `Shared` |
+| `Pooling` | Connection pooling (default `true`) |
+| `Foreign Keys` | `PRAGMA foreign_keys` |
+| `Default Timeout` / `Command Timeout` | Busy timeout in seconds |
+| `Vfs` | Named VFS registration |
+| `Password` / `Password Scheme` | Passphrase-based encryption (see [Encryption](#encryption)) |
+| `Encryption Cipher` / `Encryption Key` | Raw-key encryption (hex AES-128/256-GCM) |
+| `Local Provider` | `Managed` (default) or `Native` |
+| `Foreign Read Only` | Read another engine's open database without taking main-file locks (`Mode=ReadOnly` + `Pooling=False`) |
+| `DateTimeKind`, `BinaryGUID` | Facade-only ADO.NET conversion behavior |
+
+Native-types-only keywords for Turso Cloud (see the Turso Cloud sections
+below): `Auth Token`, `Replica Path`, `Sync Interval`, `Read Your Writes`,
+`Tls`.
+
+## Working with a local SQLite file
+
+```csharp
+using Ahtola.Data.Sqlite;
+
+using var connection = new SqliteConnection("Data Source=app.db");
+connection.Open();
+connection.ExecuteNonQuery(
+    "CREATE TABLE IF NOT EXISTS Items(Id INTEGER PRIMARY KEY, Name TEXT, Qty INTEGER)");
+
+using (var transaction = connection.BeginTransaction())
+{
+    using var insert = connection.CreateCommand();
+    insert.Transaction = transaction;
+    insert.CommandText = "INSERT INTO Items(Name, Qty) VALUES ($name, $qty)";
+    var name = insert.CreateParameter();
+    name.ParameterName = "$name";
+    insert.Parameters.Add(name);
+    var qty = insert.CreateParameter();
+    qty.ParameterName = "$qty";
+    insert.Parameters.Add(qty);
+
+    foreach (var (itemName, itemQty) in new[] { ("Widget", 3), ("Gadget", 7) })
+    {
+        name.Value = itemName;
+        qty.Value = itemQty;
+        insert.ExecuteNonQuery();
+    }
+
+    transaction.Commit();
+}
+
+using var reader = connection.ExecuteReader("SELECT Id, Name, Qty FROM Items");
+while (reader.Read())
+    Console.WriteLine($"{reader.GetInt64(0)}: {reader.GetString(1)} x{reader.GetInt32(2)}");
+```
+
+Everything here works identically with `Ahtola.AhtolaConnection` /
+`AhtolaCommand` / `AhtolaTransaction` if you prefer the native types.
+
+## Concurrent writes on a local file (MVCC)
+
+`PRAGMA journal_mode=mvcc` plus `BEGIN CONCURRENT` lets multiple **in-process**
+connections write to disjoint rows of the same local file without contending
+on the classic single-writer lock:
+
+```csharp
+using Ahtola.Data.Sqlite;
+
+using var a = new SqliteConnection("Data Source=app.db");
+using var b = new SqliteConnection("Data Source=app.db");
+a.Open();
+b.Open();
+
+a.ExecuteNonQuery("PRAGMA journal_mode=mvcc");
+a.ExecuteNonQuery("CREATE TABLE IF NOT EXISTS t(v INTEGER)");
+
+// Two writers, two disjoint rows: both commit without contending on a lock.
+a.ExecuteNonQuery("BEGIN CONCURRENT");
+b.ExecuteNonQuery("BEGIN CONCURRENT");
+a.ExecuteNonQuery("INSERT INTO t VALUES (10)");
+b.ExecuteNonQuery("INSERT INTO t VALUES (20)");
+a.ExecuteNonQuery("COMMIT");
+b.ExecuteNonQuery("COMMIT");
+```
+
+Notes and limits (see [`docs/mvcc-port-contract.md`](mvcc-port-contract.md)
+for the full port contract):
+
+- **`PRAGMA journal_mode=mvcc` gates everything.** Without it, `BEGIN
+  CONCURRENT` fails immediately with *"Concurrent transaction mode is only
+  supported when MVCC is enabled"* — it never silently falls back to a
+  classic transaction. Once one connection enables MVCC on a database path,
+  peers opened against the same path observe `journal_mode` as `mvcc` too
+  (one shared version store per path, keyed by canonical physical path).
+- **Same-row writes still conflict.** Two `BEGIN CONCURRENT` transactions
+  that write the *same* row, or a stale snapshot that tries to commit past a
+  peer's commit, fail with the ordinary busy exception (message contains
+  `database is locked`) at whichever statement/`COMMIT` first detects the
+  conflict — catch it the same way as any other busy error (see
+  [Error handling patterns](#error-handling-patterns)). This is a **must
+  roll back** state: execute `ROLLBACK` (or call `transaction.Rollback()` if
+  you used `BeginTransaction`/`BeginTransaction(deferred: true)` instead of
+  raw `BEGIN CONCURRENT` text) before reusing the connection.
+- **Savepoints work as expected** inside a concurrent transaction
+  (`DbTransaction.Save`/`Release`/`Rollback(savepointName)`, or raw
+  `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` text), including rolling back
+  version-store inserts made after the savepoint.
+- **Main database only.** A concurrent transaction rejects writes to an
+  `ATTACH`ed or temp database ("only supports mutations on the main
+  database"); attach a second file if you need it, but keep writes to `main`
+  while `BEGIN CONCURRENT` is open.
+- **`REINDEX` is rejected** while MVCC is enabled.
+- **`PRAGMA wal_checkpoint(...)`** runs a dedicated MVCC checkpoint state
+  machine; it reports busy (no truncate) while concurrent transactions are
+  still open, and garbage-collects the version store once they've all
+  finished.
+- **This is process-local, not cross-process or cross-machine.** It gives you
+  concurrent writers within one process (e.g. a pooled multi-threaded service
+  or a background job set). It is unrelated to the multi-engine file-sharing
+  support described in the README's *Multi-engine files* limit, and it is a
+  different mechanism from the Turso Cloud replica sync described next.
+
+## Encryption
+
+Encryption is layered so new recipes can be added without rewriting the pager:
+
+| Layer | Role | Extension point |
+| --- | --- | --- |
+| **Passphrase scheme** | Password to AES key | `IAhtolaPassphraseScheme` + `AhtolaPassphraseSchemes`; CS `Password Scheme=` |
+| **Built-in AHTLA page crypto** | On-disk AES-GCM pages (`AHTLA` header) | `AhtolaEncryptionOptions` / `Encryption Cipher` + `Encryption Key` |
+| **External page codec** | Entirely different page layout | `IPageCodec` (mutually exclusive with built-in encryption; see [`samples/PageCodecExamples`](../samples/PageCodecExamples)) |
+
+```csharp
+using Ahtola.Data.Sqlite;
+
+var passphrase = GetPassphraseFromSecretManager();
+using var connection = new SqliteConnection(
+    $"Data Source=app.db;Password Scheme=Ahtola.Password.v1;Password={passphrase}");
+connection.Open();
+
+// Rekey later without recreating the connection string:
+connection.ChangePassword(newPassphrase);
+// ...or decrypt in place, moving the file to plaintext:
+connection.ClearPassword();
+// ...or encrypt a currently-plaintext, already-open connection:
+connection.SetPassword(newPassphrase);
+```
+
+Built-in scheme `Ahtola.Password.v1`: PBKDF2-HMAC-SHA256, fixed domain salt
+`Ahtola.Password.v1`, 210k iterations to AES-256-GCM. Raw-key encryption
+(`Encryption Cipher=Aes256Gcm; Encryption Key=<64 hex chars>`) uses the same
+on-disk AHTLA format without a passphrase KDF. Do **not** combine `Password`
+and `Encryption Key`. Legacy SEE/SQLCipher files are **not** opened by
+passphrase schemes — use a dedicated `IPageCodec` or export/recreate under
+Ahtola password or plain SQLite. Wrong/missing password failures include the
+phrase `file is encrypted or is not a database`.
+
+## Entity Framework Core
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+
+var options = new DbContextOptionsBuilder<AppDbContext>()
+    .UseAhtola("Data Source=app.db")
+    .Options;
+
+using var context = new AppDbContext(options);
+context.Database.EnsureCreated(); // or context.Database.Migrate();
+```
+
+`UseAhtola` overloads accept a connection string, an already-constructed
+`Ahtola.Data.Sqlite.SqliteConnection` (optionally with `contextOwnsConnection`),
+and an optional `Action<SqliteDbContextOptionsBuilder>` — the same shape as
+`UseSqlite`, since the provider is layered directly on top of
+`Microsoft.EntityFrameworkCore.Sqlite.Core` (9.x on net8.0/net9.0, 10.x on
+net10.0; the pinned range is enforced at load time and throws
+`NotSupportedException` on a mismatched EF Core version).
+
+**`UseAhtola` supports local Ahtola databases only.** Passing a Turso Cloud
+`Data Source` (`libsql://`, `http(s)://`, `ws(s)://`) throws
+`NotSupportedException` at options-build time — Turso Cloud's retry and
+transaction semantics aren't modeled by the EF Core provider yet. Use
+`AhtolaConnection` directly (see the Turso Cloud sections below) for that
+scenario. Migrations, `EnsureCreated`/`EnsureDeleted`, and querying all work
+normally against a local file or `:memory:`.
+
+## Turso Cloud: direct connection
+
+`AhtolaConnection` opens a connection straight against Turso Cloud
+(`libsql://` is normalized to `https://`) with no local file at all — every
+read and write is a remote round trip.
+
+```csharp
+using Ahtola;
+
+using var cloud = new AhtolaConnection(
+    "Data Source=libsql://my-db.turso.io;Auth Token=" + authToken);
+cloud.Open();
+
+using var command = cloud.CreateCommand();
+command.CommandText = "SELECT 1";
+var result = command.ExecuteScalar();
+
+cloud.Close();
+```
+
+Network and provider failures for cloud connections are wrapped in a generic
+`InvalidOperationException`, specifically so a credential never leaks into an
+error message. `connection.ConnectionString` is always redacted
+(`Data Source=...;Auth Token=***`) — the bearer token is never exposed or
+serialized. Never hardcode the token; read it from a secret manager or
+environment variable at runtime.
+
+## Turso Cloud: managed embedded replica
+
+Add `Replica Path=<file>` to get a **managed embedded replica**: a local
+SQLite file that bootstraps from Turso Cloud, serves reads/writes locally (no
+network round trip per statement), and pushes/pulls changes on an explicit or
+interval-based sync. Local writes are captured into a durable on-disk change
+journal (`<path>.ahtola-replica-journal` alongside the database file) as soon
+as they commit, and are replayed to the remote on the next sync — the replica
+does not need to be online to accept writes.
+
+```csharp
+using Ahtola;
+
+using var replica = new AhtolaConnection(
+    "Data Source=libsql://my-db.turso.io;Auth Token=" + authToken + ";Replica Path=./replica.db");
+replica.Open();
+
+// Reads and writes hit the local file directly.
+replica.ExecuteNonQuery("INSERT INTO events(name) VALUES ('local-write')");
+
+// Explicit sync: pushes the local change journal, then pulls remote changes.
+AhtolaSyncResult result = replica.Sync(new AhtolaSyncOptions());
+Console.WriteLine(result.Outcome);              // UpToDate | RemoteChangesApplied
+Console.WriteLine(result.Statistics.LastPush);
+Console.WriteLine(result.Statistics.LastPull);
+
+// Async overloads are also available:
+await replica.SyncAsync(cancellationToken);
+```
+
+`Sync Interval=<seconds>` (positive integer, connection-string only) starts a
+background synchronization loop as soon as the connection opens, instead of
+(or in addition to) calling `Sync`/`SyncAsync` yourself:
+
+```csharp
+using var replica = new AhtolaConnection(
+    "Data Source=libsql://my-db.turso.io;Auth Token=" + authToken +
+    ";Replica Path=./replica.db;Sync Interval=30");
+```
+
+Server-side rejection of a replayed local change surfaces as
+`Ahtola.AhtolaReplicaConflictException`: `ConflictKind`
+(`RowWrite`/`SchemaChange`/`Unknown`), `RemoteErrorCode`, and
+`LocalChangeSequence` for programmatic handling. Synchronization never
+rebases or auto-merges — the journal is retained on conflict so the
+application can resolve it explicitly (e.g. read the remote state, decide
+whether to discard or replay the conflicting local change).
+
+### Concurrent writes with an embedded replica
+
+Each embedded replica keeps its own local change journal, so "concurrent
+writes" here means **multiple independent replicas (processes/machines)**
+writing locally and periodically reconciling through the server — not
+in-process MVCC:
+
+- Writes against **the same replica connection** are ordinary local SQLite
+  transactions (`BeginTransaction()`, or `PRAGMA journal_mode=mvcc` +
+  `BEGIN CONCURRENT` if you also want process-local concurrent writers
+  against that one replica file, exactly as in the
+  [local-file MVCC section](#concurrent-writes-on-a-local-file-mvcc)).
+- Writes made **between two different replicas** (or a replica and the
+  primary) are only reconciled when each side calls `Sync`/`SyncAsync` (or
+  its `Sync Interval` background loop). Synchronization never rebases or
+  auto-merges: if the server rejects a replayed change, catch
+  `AhtolaReplicaConflictException` and decide how to reconcile.
+
+## Error handling patterns
+
+```csharp
+try
+{
+    connection.ExecuteNonQuery("INSERT INTO t VALUES (1)");
+}
+catch (Exception ex) when (ex.Message.Contains("database is locked"))
+{
+    // Local busy/lock conflict — classic single-writer contention, or a
+    // same-row MVCC conflict. Retry with backoff, or roll back an open
+    // transaction before retrying.
+}
+catch (Ahtola.AhtolaReplicaConflictException ex)
+{
+    Console.WriteLine($"{ex.ConflictKind}: {ex.Message} (remote code {ex.RemoteErrorCode})");
+    // Journal is retained; decide whether to discard or replay the change.
+}
+catch (InvalidOperationException)
+{
+    // Turso Cloud / embedded-replica network and provider failures are
+    // wrapped this way to keep credentials and provider internals out of
+    // the error message.
+}
+```
+
+- Local busy/lock conflicts (classic single-writer contention, or a same-row
+  MVCC conflict) surface as an exception whose message contains `database is
+  locked`; `Default Timeout` / `Command Timeout` on the connection string
+  (and `PRAGMA busy_timeout`) control how long a statement waits before
+  giving up.
+- Turso Cloud / embedded-replica network and provider failures are wrapped as
+  `InvalidOperationException` with a generic message, to keep credentials and
+  provider internals out of the error stream.
+- Embedded-replica sync conflicts are `Ahtola.AhtolaReplicaConflictException`
+  (see above) and expose `ConflictKind`, `RemoteErrorCode`, and
+  `LocalChangeSequence` for programmatic handling.
+
+See the top-level [README's "Important limits"](../README.md#important-limits)
+section for what Ahtola does *not* yet implement, and
+[docs/powershell-module.md](powershell-module.md) if you'd rather drive Ahtola
+from PowerShell instead of C#.
