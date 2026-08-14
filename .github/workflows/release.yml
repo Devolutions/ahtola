@@ -307,44 +307,52 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download nupkgs
-        uses: actions/download-artifact@v8
-        with:
-          name: release-packages
-          path: artifacts/managed-packages
+          # gh release create/view resolve the repo via local git; without a
+          # checkout they fail with "fatal: not a git repository".
+          - name: Checkout
+            uses: actions/checkout@v6
+            with:
+              fetch-depth: 0
 
-      - name: Download signed PowerShell module package
-        uses: actions/download-artifact@v8
-        with:
-          name: signed-powershell-module-package
-          path: artifacts/release-assets
+          - name: Download nupkgs
+            uses: actions/download-artifact@v8
+            with:
+              name: release-packages
+              path: artifacts/managed-packages
 
-      - name: Create or update release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
-          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
-          TARGET_SHA: ${{ github.sha }}
-        run: |
-          $assets = @(
-            Get-ChildItem -LiteralPath artifacts/managed-packages -Filter *.nupkg -File
-            Get-ChildItem -LiteralPath artifacts/release-assets -Filter *.nupkg -File
-          )
-          if ($assets.Count -eq 0) {
-            throw 'No release assets were found.'
-          }
+          - name: Download signed PowerShell module package
+            uses: actions/download-artifact@v8
+            with:
+              name: signed-powershell-module-package
+              path: artifacts/release-assets
 
-          $assetPaths = $assets | ForEach-Object FullName
-          gh release view $env:RELEASE_TAG 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:RELEASE_TAG @assetPaths --clobber
-          } else {
-            gh release create $env:RELEASE_TAG @assetPaths `
-              --target $env:TARGET_SHA `
-              --title "v$env:RELEASE_VERSION" `
-              --generate-notes
-          }
+          - name: Create or update release
+            shell: pwsh
+            env:
+              GH_TOKEN: ${{ github.token }}
+              GH_REPO: ${{ github.repository }}
+              RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+              RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+              TARGET_SHA: ${{ github.sha }}
+            run: |
+              $assets = @(
+                Get-ChildItem -LiteralPath artifacts/managed-packages -Filter *.nupkg -File
+                Get-ChildItem -LiteralPath artifacts/release-assets -Filter *.nupkg -File
+              )
+              if ($assets.Count -eq 0) {
+                throw 'No release assets were found.'
+              }
+
+              $assetPaths = $assets | ForEach-Object FullName
+              gh release view $env:RELEASE_TAG 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                gh release upload $env:RELEASE_TAG @assetPaths --clobber
+              } else {
+                gh release create $env:RELEASE_TAG @assetPaths `
+                  --target $env:TARGET_SHA `
+                  --title "v$env:RELEASE_VERSION" `
+                  --generate-notes
+              }
 
   publish_nuget:
     name: Publish to NuGet.org
