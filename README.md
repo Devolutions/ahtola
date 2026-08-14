@@ -273,6 +273,7 @@ Requires the .NET SDK and PowerShell 7+:
 ./build.ps1 test
 ./build.ps1 pack              # -> ./artifacts/managed-packages
 ./build.ps1 pack-powershell   # -> ./artifacts/powershell-modules
+./build.ps1 validate-runtime  # packed consumer trim + NativeAOT publish
 ```
 
 Contributor details — the full task list, validation gates, conformance suite,

@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.Data;
+using System.Data.Common;
 using System.Management.Automation;
 using System.Net;
 using System.Security;
@@ -14,15 +15,22 @@ public sealed class TestPSSqliteConnectionCommand : PSSqliteCmdlet
 {
     [Parameter(Mandatory = true, ValueFromPipeline = true)]
     [Alias("SqliteConnection")]
-    public SqliteConnection Connection { get; set; } = null!;
+    public DbConnection Connection { get; set; } = null!;
 
     protected override void ProcessRecord()
     {
-        OpenIfNeeded(Connection);
-        using var command = Connection.CreateCommand();
-        command.CommandText = "SELECT 1;";
-        _ = command.ExecuteScalar();
-        WriteObject(true);
+        try
+        {
+            OpenIfNeeded(Connection);
+            using var command = Connection.CreateCommand();
+            command.CommandText = "SELECT 1;";
+            _ = command.ExecuteScalar();
+            WriteObject(true);
+        }
+        catch when (Connection is AhtolaCloudConnection)
+        {
+            throw new InvalidOperationException("The Turso Cloud connection test failed.");
+        }
     }
 }
 
@@ -43,12 +51,12 @@ public sealed class ClearPSSqliteConnectionPoolCommand : PSSqliteCmdlet
 }
 
 [Cmdlet(VerbsLifecycle.Start, "AhtolaSqliteTransaction")]
-[OutputType(typeof(SqliteTransaction))]
+[OutputType(typeof(DbTransaction))]
 public sealed class StartPSSqliteTransactionCommand : PSSqliteCmdlet
 {
     [Parameter(Mandatory = true, ValueFromPipeline = true)]
     [Alias("SqliteConnection")]
-    public SqliteConnection Connection { get; set; } = null!;
+    public DbConnection Connection { get; set; } = null!;
 
     [Parameter]
     public IsolationLevel IsolationLevel { get; set; } = IsolationLevel.Serializable;
@@ -59,7 +67,30 @@ public sealed class StartPSSqliteTransactionCommand : PSSqliteCmdlet
     protected override void ProcessRecord()
     {
         OpenIfNeeded(Connection);
-        WriteObject(Connection.BeginTransaction(IsolationLevel, Deferred.IsPresent));
+        if (Deferred.IsPresent && Connection is not SqliteConnection)
+            throw new NotSupportedException("Deferred transactions are supported only by local Ahtola SQLite connections.");
+
+        var transaction = Connection is SqliteConnection sqliteConnection
+            ? sqliteConnection.BeginTransaction(IsolationLevel, Deferred.IsPresent)
+            : Connection.BeginTransaction(IsolationLevel);
+        WriteObject(transaction);
+    }
+}
+
+[Cmdlet(VerbsLifecycle.Invoke, "AhtolaSqliteReplicaSync", SupportsShouldProcess = true)]
+[OutputType(typeof(Ahtola.AhtolaSyncResult))]
+public sealed class InvokePSSqliteReplicaSyncCommand : PSSqliteCmdlet
+{
+    [Parameter(Mandatory = true, ValueFromPipeline = true)]
+    [Alias("Connection")]
+    public AhtolaCloudConnection ReplicaConnection { get; set; } = null!;
+
+    protected override void ProcessRecord()
+    {
+        if (!ShouldProcess(ReplicaConnection.Endpoint, "Synchronize managed Turso Cloud replica"))
+            return;
+
+        WriteObject(ReplicaConnection.Synchronize());
     }
 }
 
@@ -67,7 +98,7 @@ public sealed class StartPSSqliteTransactionCommand : PSSqliteCmdlet
 public sealed class SavePSSqliteTransactionCommand : PSSqliteCmdlet
 {
     [Parameter(Mandatory = true, ValueFromPipeline = true)]
-    public SqliteTransaction Transaction { get; set; } = null!;
+    public DbTransaction Transaction { get; set; } = null!;
 
     [Parameter(Mandatory = true)]
     public string Name { get; set; } = string.Empty;
@@ -82,7 +113,7 @@ public sealed class SavePSSqliteTransactionCommand : PSSqliteCmdlet
 public sealed class CompletePSSqliteTransactionCommand : PSSqliteCmdlet
 {
     [Parameter(Mandatory = true, ValueFromPipeline = true)]
-    public SqliteTransaction Transaction { get; set; } = null!;
+    public DbTransaction Transaction { get; set; } = null!;
 
     [Parameter]
     public string? SavepointName { get; set; }
@@ -110,7 +141,7 @@ public sealed class CompletePSSqliteTransactionCommand : PSSqliteCmdlet
 public sealed class UndoPSSqliteTransactionCommand : PSSqliteCmdlet
 {
     [Parameter(Mandatory = true, ValueFromPipeline = true)]
-    public SqliteTransaction Transaction { get; set; } = null!;
+    public DbTransaction Transaction { get; set; } = null!;
 
     [Parameter]
     public string? SavepointName { get; set; }

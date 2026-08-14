@@ -1,0 +1,43 @@
+name: Cloud runtime qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: Packed consumer runtime qualification
+    runs-on: windows-latest
+    environment: cloud-runtime-qualification
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Validate packaged trim and NativeAOT consumers
+        shell: pwsh
+        run: ./build.ps1 validate-runtime -Framework net10.0
+
+      - name: Run opt-in live cloud smoke
+        shell: pwsh
+        env:
+          AHTOLA_RUN_CLOUD_SMOKE: "1"
+          TURSO_REMOTE_URL: ${{ secrets.TURSO_REMOTE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TURSO_REMOTE_URL) -or
+              [string]::IsNullOrWhiteSpace($env:TURSO_AUTH_TOKEN)) {
+            Write-Host "Live cloud smoke skipped because its protected environment secrets are unavailable."
+            exit 0
+          }
+
+          ./build.ps1 cloud-smoke -Framework net10.0

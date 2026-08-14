@@ -6,14 +6,9 @@ using System.Text.Json.Serialization;
 
 namespace Ahtola;
 
-internal sealed class AhtolaRemoteClient : IDisposable
+internal sealed partial class AhtolaRemoteClient : IDisposable
 {
     private const string EncryptionKeyHeaderName = "x-turso-encryption-key";
-
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    };
 
     private readonly HttpClient _httpClient;
     private readonly string? _authToken;
@@ -122,6 +117,118 @@ internal sealed class AhtolaRemoteClient : IDisposable
         return ExtractBatchResults(response, commands.Count, stepSucceeded);
     }
 
+    /// <summary>
+    /// Replays a durably captured managed-replica batch using the same guarded Hrana batch
+    /// shape as Turso v0.7.2's <c>send_push_batch</c>. A caller acknowledges its local journal
+    /// only after this method returns successfully.
+    /// </summary>
+    internal async Task PushReplicaChangesAsync(
+        ReplicaLocalChangeBatch changes,
+        string clientId,
+        long sourcePullGeneration,
+        int commandTimeout,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
+        if (changes.Changes.Count == 0)
+            return;
+
+        var guarded = new RemoteBatchCondition
+        {
+            Type = "not",
+            Condition = new RemoteBatchCondition { Type = "is_autocommit" },
+        };
+        var steps = new List<RemoteBatchStep>(checked(changes.Changes.Count + 4))
+        {
+            new()
+            {
+                Statement = BuildStatement("BEGIN IMMEDIATE", new AhtolaParameterCollection(), wantRows: false),
+            },
+            new()
+            {
+                Condition = guarded,
+                Statement = BuildStatement(
+                    "CREATE TABLE IF NOT EXISTS turso_sync_last_change_id (client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)",
+                    new AhtolaParameterCollection(),
+                    wantRows: false),
+            },
+        };
+
+        var replayedChangeSteps = new List<int>(changes.Changes.Count);
+        var replayedChangeContexts = new Dictionary<int, ReplicaPushConflictContext>();
+        foreach (var change in changes.Changes)
+        {
+            // A multi-row statement is represented by more than one update hook record. Only
+            // its first record carries SQL, while all of its records advance together on ACK.
+            if (string.IsNullOrWhiteSpace(change.Sql))
+                continue;
+
+            var step = steps.Count;
+            replayedChangeSteps.Add(step);
+            replayedChangeContexts.Add(
+                step,
+                new ReplicaPushConflictContext(
+                    change.Kind == ReplicaLocalChangeKind.Schema
+                        ? AhtolaReplicaConflictKind.SchemaChange
+                        : AhtolaReplicaConflictKind.RowWrite,
+                    change.Sequence));
+            steps.Add(new RemoteBatchStep
+            {
+                Condition = guarded,
+                Statement = BuildStatement(change.Sql, new AhtolaParameterCollection(), wantRows: false),
+            });
+        }
+
+        if (replayedChangeSteps.Count == 0)
+            throw new InvalidDataException("Managed replica journal batch has no replayable SQL.");
+
+        var watermarkStep = steps.Count;
+        var watermarkStatement = BuildStatement(
+            "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, ?, ?) ON CONFLICT(client_id) DO UPDATE SET pull_gen=excluded.pull_gen, change_id=excluded.change_id",
+            new AhtolaParameterCollection(),
+            wantRows: false);
+        watermarkStatement.Args.Add(new RemoteRequestValue { Type = "text", Value = clientId });
+        watermarkStatement.Args.Add(new RemoteRequestValue
+        {
+            Type = "integer",
+            Value = sourcePullGeneration.ToString(CultureInfo.InvariantCulture),
+        });
+        watermarkStatement.Args.Add(new RemoteRequestValue
+        {
+            Type = "integer",
+            Value = changes.Changes[^1].Sequence.ToString(CultureInfo.InvariantCulture),
+        });
+        steps.Add(new RemoteBatchStep { Condition = guarded, Statement = watermarkStatement });
+
+        var commitStep = steps.Count;
+        steps.Add(new RemoteBatchStep
+        {
+            Statement = BuildStatement("COMMIT", new AhtolaParameterCollection(), wantRows: false),
+        });
+
+        var request = new RemotePipelineRequest
+        {
+            Requests = [RemoteStreamRequest.Batch(new RemoteBatch { Steps = steps })],
+        };
+        var response = await SendPipelineAsync(request, commandTimeout, cancellationToken).ConfigureAwait(false);
+        UpdateSession(response, closeAfter: false);
+
+        var succeeded = new bool[steps.Count];
+        _ = ExtractBatchResults(
+            response,
+            steps.Count,
+            step => succeeded[step] = true,
+            replicaPush: true,
+            replayedChangeContexts: replayedChangeContexts);
+        foreach (var step in replayedChangeSteps)
+        {
+            if (!succeeded[step])
+                throw new AhtolaException("Remote replica push skipped a local change.");
+        }
+        if (!succeeded[watermarkStep] || !succeeded[commitStep])
+            throw new AhtolaException("Remote replica push did not commit its acknowledgement watermark.");
+    }
+
     public async Task CloseAsync(int commandTimeout, CancellationToken cancellationToken)
     {
         if (_baton is null)
@@ -153,7 +260,9 @@ internal sealed class AhtolaRemoteClient : IDisposable
         using var timeout = CreateTimeout(commandTimeout, cancellationToken);
         var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
 
-        var json = JsonSerializer.Serialize(request, JsonOptions);
+        var json = JsonSerializer.Serialize(
+            request,
+            AhtolaRemoteJsonContext.Default.RemotePipelineRequest);
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, _pipelineUri)
         {
@@ -172,13 +281,19 @@ internal sealed class AhtolaRemoteClient : IDisposable
         var body = await response.Content.ReadAsStringAsync(effectiveCancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
+            if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+                throw new AhtolaReplicaConflictException(
+                    $"Remote replica push conflicted with HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {body}");
             throw new AhtolaException(
-                $"Remote request failed with HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {body}");
+                $"Remote request failed with HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {body}",
+                response.StatusCode);
         }
 
         try
         {
-            return JsonSerializer.Deserialize<RemotePipelineResponse>(body, JsonOptions)
+            return JsonSerializer.Deserialize(
+                       body,
+                       AhtolaRemoteJsonContext.Default.RemotePipelineResponse)
                    ?? throw new AhtolaException("Remote request returned an empty response.");
         }
         catch (JsonException ex)
@@ -195,6 +310,19 @@ internal sealed class AhtolaRemoteClient : IDisposable
         var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(commandTimeout));
         return timeout;
+    }
+
+    internal static T DeserializeRemoteResult<T>(JsonElement result)
+    {
+        try
+        {
+            return result.Deserialize<T>(AhtolaRemoteJsonContext.Default.Options)
+                   ?? throw new AhtolaException("Remote response returned an empty result.");
+        }
+        catch (JsonException ex)
+        {
+            throw new AhtolaException($"Unable to parse remote response: {ex.Message}");
+        }
     }
 
     private static void ValidateAuthTokenTransport(Uri endpoint, string? authToken)
@@ -286,7 +414,9 @@ internal sealed class AhtolaRemoteClient : IDisposable
     private IReadOnlyList<RemoteStatementResult> ExtractBatchResults(
         RemotePipelineResponse response,
         int expectedCount,
-        Action<int>? stepSucceeded)
+        Action<int>? stepSucceeded,
+        bool replicaPush = false,
+        IReadOnlyDictionary<int, ReplicaPushConflictContext>? replayedChangeContexts = null)
     {
         if (response.Results.Count == 0)
             throw new AhtolaException("Remote batch returned no results.");
@@ -309,11 +439,16 @@ internal sealed class AhtolaRemoteClient : IDisposable
                         UpdateReplicationIndex(statementResult.ReplicationIndex);
                 }
 
-                statementResults = ExtractBatchStepResults(batch, expectedCount, stepSucceeded);
+                statementResults = ExtractBatchStepResults(
+                    batch,
+                    expectedCount,
+                    stepSucceeded,
+                    replicaPush,
+                    replayedChangeContexts);
                 break;
 
             case "error":
-                throw CreateRemoteError(result.Error);
+                throw CreateRemoteError(result.Error, replicaPush);
 
             default:
                 throw new AhtolaException($"Remote batch returned unexpected result type: {result.Type}");
@@ -328,12 +463,24 @@ internal sealed class AhtolaRemoteClient : IDisposable
         if (encodedIndex.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
             return;
 
-        if (encodedIndex.ValueKind is not JsonValueKind.String
-            || !ulong.TryParse(
+        ulong index;
+        if (encodedIndex.ValueKind == JsonValueKind.String)
+        {
+            if (!ulong.TryParse(
                 encodedIndex.GetString(),
                 NumberStyles.None,
                 CultureInfo.InvariantCulture,
-                out var index))
+                out index))
+            {
+                throw new AhtolaException("Remote response returned an invalid replication_index.");
+            }
+        }
+        else if (encodedIndex.ValueKind == JsonValueKind.Number)
+        {
+            if (!encodedIndex.TryGetUInt64(out index))
+                throw new AhtolaException("Remote response returned an invalid replication_index.");
+        }
+        else
         {
             throw new AhtolaException("Remote response returned an invalid replication_index.");
         }
@@ -368,7 +515,9 @@ internal sealed class AhtolaRemoteClient : IDisposable
     private static List<RemoteStatementResult> ExtractBatchStepResults(
         RemoteBatchResult batch,
         int expectedCount,
-        Action<int>? stepSucceeded)
+        Action<int>? stepSucceeded,
+        bool replicaPush,
+        IReadOnlyDictionary<int, ReplicaPushConflictContext>? replayedChangeContexts)
     {
         if (batch.StepErrors.Count != expectedCount || batch.StepResults.Count != expectedCount)
         {
@@ -385,7 +534,17 @@ internal sealed class AhtolaRemoteClient : IDisposable
         for (var i = 0; i < batch.StepErrors.Count; i++)
         {
             if (batch.StepErrors[i] is { } error)
-                throw CreateRemoteError(error);
+            {
+                var context = replayedChangeContexts is not null
+                    && replayedChangeContexts.TryGetValue(i, out var value)
+                    ? value
+                    : default;
+                throw CreateRemoteError(
+                    error,
+                    replicaPush,
+                    context.Kind,
+                    context.LocalChangeSequence);
+            }
         }
 
         var statementResults = new List<RemoteStatementResult>(expectedCount);
@@ -419,15 +578,37 @@ internal sealed class AhtolaRemoteClient : IDisposable
         }
     }
 
-    private static AhtolaException CreateRemoteError(RemoteError? error)
+    private static AhtolaException CreateRemoteError(
+        RemoteError? error,
+        bool replicaPush = false,
+        AhtolaReplicaConflictKind conflictKind = AhtolaReplicaConflictKind.Unknown,
+        long? localChangeSequence = null)
     {
         if (error is null)
             return new AhtolaRemoteSqlException("Remote SQL execution failed.");
+
+        if (replicaPush && IsConflict(error))
+        {
+            return new AhtolaReplicaConflictException(
+                $"Remote replica push conflicted: {error.Message}",
+                error.Code,
+                conflictKind,
+                localChangeSequence);
+        }
 
         return string.IsNullOrWhiteSpace(error.Code)
             ? new AhtolaRemoteSqlException($"Remote SQL execution failed: {error.Message}")
             : new AhtolaRemoteSqlException($"Remote SQL execution failed: {error.Message} ({error.Code})");
     }
+
+    private static bool IsConflict(RemoteError error)
+        => error.Code?.Contains("CONSTRAINT", StringComparison.OrdinalIgnoreCase) == true
+           || error.Code?.Contains("CONFLICT", StringComparison.OrdinalIgnoreCase) == true
+           || error.Message.Contains("conflict", StringComparison.OrdinalIgnoreCase);
+
+    private readonly record struct ReplicaPushConflictContext(
+        AhtolaReplicaConflictKind Kind,
+        long? LocalChangeSequence);
 
     private void UpdateSession(RemotePipelineResponse response, bool closeAfter)
     {
@@ -611,6 +792,13 @@ internal sealed class AhtolaRemoteClient : IDisposable
             };
         }
     }
+
+    [JsonSourceGenerationOptions(DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonSerializable(typeof(RemotePipelineRequest))]
+    [JsonSerializable(typeof(RemotePipelineResponse))]
+    [JsonSerializable(typeof(RemoteBatchResult))]
+    [JsonSerializable(typeof(RemoteStatementResult))]
+    private sealed partial class AhtolaRemoteJsonContext : JsonSerializerContext;
 }
 
 internal sealed class RemotePipelineResponse
@@ -650,15 +838,7 @@ internal sealed class RemoteStreamResponse
         if (Result.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
             throw new AhtolaException($"Remote response {Type} did not include a result.");
 
-        try
-        {
-            return Result.Deserialize<T>()
-                   ?? throw new AhtolaException($"Remote response {Type} returned an empty result.");
-        }
-        catch (JsonException ex)
-        {
-            throw new AhtolaException($"Unable to parse remote {Type} response: {ex.Message}");
-        }
+        return AhtolaRemoteClient.DeserializeRemoteResult<T>(Result);
     }
 }
 

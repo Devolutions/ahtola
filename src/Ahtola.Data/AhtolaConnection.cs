@@ -8,8 +8,11 @@ namespace Ahtola;
 
 public class AhtolaConnection : DbConnection, ILocalReaderConnection
 {
+    internal const int AutomaticSyncMaximumAttempts = 3;
+
     private AhtolaNativeDatabase? _nativeDatabase;
     private AhtolaReplicaDatabase? _replicaDatabase;
+    private ManagedReplicaConnectionHost? _managedReplicaHost;
     private IManagedDatabaseAdapter? _managedDatabase;
     private ManagedConnectionPoolLease? _managedPoolLease;
     private ManagedConnectionPoolKey? _managedPoolKey;
@@ -17,6 +20,9 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     private AhtolaConnectionOptions _connectionOptions;
     private AhtolaReplicaOptions? _replicaOptions;
     private HttpMessageHandler? _ownedReplicaHttpHandler;
+    private readonly object _automaticSyncLock = new();
+    private CancellationTokenSource? _automaticSyncCancellation;
+    private Task? _automaticSyncTask;
     private AhtolaEncryptionFileSystem? _managedEncryptionFileSystem;
     private AhtolaPageCodecFileSystem? _managedPageCodecFileSystem;
     private IPageCodec? _pageCodec;
@@ -28,6 +34,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     private readonly HashSet<IConnectionOwnedReader> _openReaders = [];
     private readonly object _readerLock = new();
     private readonly HashSet<AhtolaCommand> _openCommands = [];
+    private readonly object _commandLock = new();
     private AhtolaTransaction? _transaction;
 
     [AllowNull]
@@ -56,7 +63,9 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         : ConnectionState.Closed;
 
     public AhtolaConnectionCapabilities Capabilities
-        => AhtolaConnectionCapabilities.ForAhtola(_connectionOptions);
+        => AhtolaConnectionCapabilities.ForAhtola(
+            _connectionOptions,
+            replicaSupportsSync: _connectionOptions.IsReplica);
 
     public override bool CanCreateBatch => Capabilities.CanCreateBatch;
 
@@ -121,7 +130,6 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         if (_connectionOptions.IsRemote && _connectionOptions.IsReplica)
         {
             ValidateCanOpen();
-            ValidateReplicaLocalProvider();
             return OpenRemoteReplicaAsync(GetReplicaOptions(), cancellationToken);
         }
 
@@ -154,6 +162,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     public override void Close()
     {
         _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: true);
+        var automaticSyncError = StopAutomaticManagedReplicaSync();
         if (_remoteClient is not null)
         {
             try
@@ -165,6 +174,8 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 CloseRemote();
                 _transaction = null;
             }
+            if (automaticSyncError is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(automaticSyncError).Throw();
             return;
         }
 
@@ -173,6 +184,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         try
         {
             var nativeDatabase = _nativeDatabase;
+            var managedReplicaHost = _managedReplicaHost;
             var managedDatabase = _managedDatabase;
             var managedPoolLease = _managedPoolLease;
             var managedEncryptionFileSystem = _managedEncryptionFileSystem;
@@ -189,6 +201,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             {
                 _nativeDatabase = null;
                 _replicaDatabase = null;
+                _managedReplicaHost = null;
                 _managedDatabase = null;
                 _managedPoolLease = null;
                 _managedEncryptionFileSystem = null;
@@ -203,6 +216,11 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                     {
                         if (managedPoolLease is not null)
                             managedPoolLease.Release(reusable);
+                        else if (managedReplicaHost is not null)
+                        {
+                            managedReplicaHost.DetachConnection(this);
+                            managedReplicaHost.Dispose();
+                        }
                         else
                             managedDatabase?.Dispose();
                     }
@@ -218,14 +236,28 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 }
             }
         }
-        catch (Exception cleanupError) when (cancellationError is not null)
+        catch (Exception cleanupError) when (cancellationError is not null || automaticSyncError is not null)
         {
+            var errors = new List<Exception>();
+            if (automaticSyncError is not null)
+                errors.Add(automaticSyncError);
+            if (cancellationError is not null)
+                errors.Add(cancellationError);
+            errors.Add(cleanupError);
             throw new AggregateException(
-                "Embedded replica cancellation and connection cleanup both failed.",
-                cancellationError,
-                cleanupError);
+                "Embedded replica background synchronization, cancellation, and connection cleanup failed.",
+                errors);
         }
 
+        if (automaticSyncError is not null && cancellationError is not null)
+        {
+            throw new AggregateException(
+                "Embedded replica background synchronization and cancellation both failed.",
+                automaticSyncError,
+                cancellationError);
+        }
+        if (automaticSyncError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(automaticSyncError).Throw();
         if (cancellationError is not null)
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cancellationError).Throw();
     }
@@ -339,6 +371,8 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             return Task.FromCanceled(cancellationToken);
         if (State != ConnectionState.Open)
             throw new InvalidOperationException("Ahtola database is closed.");
+        if (_managedReplicaHost is { } managedReplicaHost)
+            return SyncManagedReplicaAsync(managedReplicaHost, new AhtolaSyncOptions(), cancellationToken);
         if (!Capabilities.SupportsSync)
             throw new NotSupportedException("Sync requires an embedded replica connection.");
 
@@ -357,11 +391,55 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             return Task.FromCanceled<AhtolaSyncResult>(cancellationToken);
         if (State != ConnectionState.Open)
             throw new InvalidOperationException("Ahtola database is closed.");
+        if (_managedReplicaHost is { } managedReplicaHost)
+            return SyncManagedReplicaAsync(managedReplicaHost, options, cancellationToken);
         if (!Capabilities.SupportsSync)
             throw new NotSupportedException("Sync requires an embedded replica connection.");
 
         return (_replicaDatabase ?? throw new InvalidOperationException("Ahtola database is closed."))
             .SyncAsync(options, cancellationToken);
+    }
+
+    internal async Task QuiesceManagedReplicaAsync(
+        Func<CancellationToken, Task> stagedOperation,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(stagedOperation);
+        if (_managedReplicaHost is not { } host || State != ConnectionState.Open)
+            throw new InvalidOperationException("Ahtola database is closed.");
+        if (_transaction is not null)
+            throw new InvalidOperationException("Managed embedded replica sync cannot run while a transaction is active.");
+        lock (_readerLock)
+        {
+            if (_openReaders.Count != 0)
+                throw new InvalidOperationException("Managed embedded replica sync cannot run while a data reader is active.");
+        }
+
+        await host.QuiesceAndReopenAsync(stagedOperation, cancellationToken).ConfigureAwait(false);
+        _managedDatabase = host.Database;
+    }
+
+    private async Task<AhtolaSyncResult> SyncManagedReplicaAsync(
+        ManagedReplicaConnectionHost host,
+        AhtolaSyncOptions options,
+        CancellationToken cancellationToken)
+    {
+        if (_transaction is not null)
+            throw new InvalidOperationException("Managed embedded replica sync cannot run while a transaction is active.");
+        lock (_readerLock)
+        {
+            if (_openReaders.Count != 0)
+                throw new InvalidOperationException("Managed embedded replica sync cannot run while a data reader is active.");
+        }
+
+        try
+        {
+            return await host.SyncAsync(options, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _managedDatabase = host.Database;
+        }
     }
 
     public override void ChangeDatabase(string databaseName)
@@ -401,7 +479,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     internal bool IsManagedReadOnly => _managedReadOnly;
 
-    internal bool IsManaged => _managedDatabase is not null;
+    internal bool IsManaged => _managedReplicaHost is not null || _managedDatabase is not null;
 
     internal AhtolaTransaction? Transaction => _transaction;
 
@@ -427,7 +505,58 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     }
 
     internal IManagedConnectionAdapter ManagedConnection
-        => _managedDatabase?.Connection ?? throw new InvalidOperationException("Ahtola database is closed.");
+        => _managedReplicaHost?.Database.Connection
+           ?? _managedDatabase?.Connection
+           ?? throw new InvalidOperationException("Ahtola database is closed.");
+
+    internal IDisposable? EnterManagedReplicaOperation(CancellationToken cancellationToken)
+    {
+        if (_managedReplicaHost is not { } host)
+            return null;
+
+        // The transaction owns the path lease until it completes, so commands in that
+        // transaction must be allowed to finish after a sync has begun waiting.
+        if (_transaction is { IsCompleted: false } || host.HasSqlTransactionOperation)
+            return null;
+
+        return host.EnterLocalOperation(cancellationToken);
+    }
+
+    internal IDisposable? EnterManagedReplicaTransaction()
+        => _managedReplicaHost?.EnterLocalOperation(CancellationToken.None);
+
+    internal void ManagedReplicaStatementStarted(string sql)
+        => _managedReplicaHost?.StatementStarted(sql);
+
+    internal bool BeginManagedReplicaSqlTransaction(string sql, CancellationToken cancellationToken)
+    {
+        if (SqlTransactionControl.GetFirstKeyword(sql)?.Equals("BEGIN", StringComparison.OrdinalIgnoreCase) != true
+            || _managedReplicaHost is not { } host)
+        {
+            return false;
+        }
+
+        host.BeginSqlTransaction(cancellationToken);
+        return true;
+    }
+
+    internal void ManagedReplicaStatementCompleted(string sql)
+        => _managedReplicaHost?.StatementCompleted(sql);
+
+    internal void ManagedReplicaStatementFailed()
+        => _managedReplicaHost?.StatementFailed();
+
+    internal void ManagedReplicaStatementClosed()
+        => _managedReplicaHost?.StatementClosed();
+
+    /// <summary>
+    /// Returns committed local replica changes at a durable, exclusive watermark boundary.
+    /// This is an internal hand-off to the following push implementation; it performs no network I/O.
+    /// </summary>
+    internal ReplicaLocalChangeBatch ReadManagedReplicaLocalChanges(int maximumChanges)
+        => (_managedReplicaHost ?? throw new InvalidOperationException(
+                "Local replica changes are available only for managed embedded replica connections."))
+            .ReadLocalChanges(maximumChanges);
 
     void ILocalReaderConnection.ReaderOpened(IConnectionOwnedReader reader)
     {
@@ -441,9 +570,19 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             _openReaders.Remove(reader);
     }
 
-    internal void CommandOpened(AhtolaCommand command) => _openCommands.Add(command);
+    internal void CommandOpened(AhtolaCommand command)
+    {
+        lock (_commandLock)
+            _openCommands.Add(command);
+    }
 
-    internal void CommandClosed(AhtolaCommand command) => _openCommands.Remove(command);
+    internal void CommandClosed(AhtolaCommand command)
+    {
+        lock (_commandLock)
+            _openCommands.Remove(command);
+    }
+
+    internal void ResetManagedReplicaCommandsForPublication() => ResetOpenCommands();
 
     internal void TransactionCompleted(AhtolaTransaction transaction)
     {
@@ -711,14 +850,13 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     private void OpenRemote()
     {
-        ValidateReplicaLocalProvider();
-
         if (_connectionOptions.IsReplica)
         {
-            SetReplicaDatabase(AhtolaReplicaProvider.OpenReplica(GetReplicaOptions()));
+            OpenReplica(GetReplicaOptions());
             return;
         }
 
+        ValidateDirectRemoteLocalProvider();
         _remoteClient = new AhtolaRemoteClient(
             _connectionOptions.GetRemoteUri(),
             _connectionOptions.AuthToken,
@@ -729,16 +867,66 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         AhtolaReplicaOptions options,
         CancellationToken cancellationToken)
     {
-        var ValidateRemoteLocalProvider = await AhtolaReplicaProvider
-            .OpenReplicaAsync(options, cancellationToken)
+        if (!AhtolaReplicaProvider.HasRegisteredFactory)
+        {
+            await OpenManagedReplicaAsync(options, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var replicaDatabase = await AhtolaReplicaProvider
+            .OpenRegisteredReplicaAsync(options, cancellationToken)
             .ConfigureAwait(false);
-        SetReplicaDatabase(ValidateRemoteLocalProvider);
+        SetReplicaDatabase(replicaDatabase);
     }
 
-    private void ValidateReplicaLocalProvider()
+    private void OpenReplica(AhtolaReplicaOptions options)
+    {
+        if (AhtolaReplicaProvider.HasRegisteredFactory)
+        {
+            SetReplicaDatabase(AhtolaReplicaProvider.OpenRegisteredReplica(options));
+            return;
+        }
+
+        OpenManagedReplica(options);
+    }
+
+    private void OpenManagedReplica(AhtolaReplicaOptions options)
+    {
+        var replicaHost = ManagedReplicaConnectionHost.Open(options);
+        try
+        {
+            SetManagedReplicaHost(replicaHost);
+            StartAutomaticManagedReplicaSync(replicaHost);
+        }
+        catch
+        {
+            replicaHost.Dispose();
+            throw;
+        }
+    }
+
+    private async Task OpenManagedReplicaAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
+    {
+        var replicaHost = await ManagedReplicaConnectionHost.OpenAsync(options, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            SetManagedReplicaHost(replicaHost);
+            StartAutomaticManagedReplicaSync(replicaHost);
+        }
+        catch
+        {
+            replicaHost.Dispose();
+            throw;
+        }
+    }
+
+    private void ValidateDirectRemoteLocalProvider()
     {
         if (_connectionOptions.LocalProvider == AhtolaLocalProvider.Managed)
-            throw new NotSupportedException("Local Provider=Managed is supported only for local database connections.");
+        {
+            throw new NotSupportedException(
+                "Local Provider=Managed is supported only for local database and embedded replica connections.");
+        }
     }
 
     private AhtolaReplicaOptions GetReplicaOptions()
@@ -768,11 +956,24 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         _nativeDatabase = replicaDatabase;
     }
 
+    private void SetManagedReplicaHost(ManagedReplicaConnectionHost replicaHost)
+    {
+        if (_disposed)
+        {
+            replicaHost.Dispose();
+            throw new ObjectDisposedException(nameof(AhtolaConnection));
+        }
+
+        _managedReplicaHost = replicaHost;
+        _managedDatabase = replicaHost.Database;
+        replicaHost.AttachConnection(this);
+    }
+
     private void ValidateCanOpen()
     {
         _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_nativeDatabase is not null || _managedDatabase is not null || _remoteClient is not null)
+        if (_nativeDatabase is not null || _managedReplicaHost is not null || _managedDatabase is not null || _remoteClient is not null)
             throw new InvalidOperationException("The connection is already open.");
         ValidateAutomaticSyncPolicy();
                 if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
@@ -791,7 +992,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     private void ValidateCanBeginTransaction()
     {
         _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
-        if (_nativeDatabase is null && _managedDatabase is null && _remoteClient is null)
+        if (_nativeDatabase is null && _managedReplicaHost is null && _managedDatabase is null && _remoteClient is null)
             throw new InvalidOperationException("Ahtola database is closed.");
         if (_transaction is not null)
             throw new InvalidOperationException("Parallel transactions are not supported.");
@@ -829,10 +1030,127 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 "Sync Interval cannot be negative.");
         }
 
-        if (syncInterval > 0)
+        if (syncInterval > 0
+            && (!_connectionOptions.IsReplica
+                || _connectionOptions.LocalProvider != AhtolaLocalProvider.Managed
+                || AhtolaReplicaProvider.HasRegisteredFactory))
         {
             throw new NotSupportedException(
-                "Automatic synchronization is not supported. Sync Interval must be 0. Call Sync or SyncAsync explicitly.");
+                "Sync Interval requires a managed embedded replica connection.");
+        }
+    }
+
+    private void StartAutomaticManagedReplicaSync(ManagedReplicaConnectionHost replicaHost)
+    {
+        var syncInterval = _connectionOptions.SyncInterval;
+        if (syncInterval <= 0 || !replicaHost.SupportsSync)
+            return;
+
+        var cancellation = new CancellationTokenSource();
+        lock (_automaticSyncLock)
+        {
+            if (_automaticSyncTask is not null)
+            {
+                cancellation.Dispose();
+                throw new InvalidOperationException("Automatic managed replica synchronization is already running.");
+            }
+
+            _automaticSyncCancellation = cancellation;
+            _automaticSyncTask = RunAutomaticManagedReplicaSyncAsync(
+                replicaHost,
+                TimeSpan.FromSeconds(syncInterval),
+                cancellation.Token);
+        }
+    }
+
+    private static async Task RunAutomaticManagedReplicaSyncAsync(
+        ManagedReplicaConnectionHost replicaHost,
+        TimeSpan interval,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
+            await SynchronizeManagedReplicaWithRetryAsync(replicaHost, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task SynchronizeManagedReplicaWithRetryAsync(
+        ManagedReplicaConnectionHost replicaHost,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                _ = await replicaHost.SyncAsync(new AhtolaSyncOptions(), cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception exception) when (
+                attempt < AutomaticSyncMaximumAttempts
+                && IsTransientAutomaticSyncFailure(exception, cancellationToken))
+            {
+                await Task.Delay(GetAutomaticSyncRetryDelay(attempt - 1), cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    internal static TimeSpan GetAutomaticSyncRetryDelay(int retryIndex)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(retryIndex);
+        return TimeSpan.FromMilliseconds(50 * (1 << Math.Min(retryIndex, 2)));
+    }
+
+    internal static bool IsTransientAutomaticSyncFailure(Exception exception, CancellationToken cancellationToken)
+    {
+        if (exception is AhtolaReplicaConflictException || cancellationToken.IsCancellationRequested)
+            return false;
+
+        return exception switch
+        {
+            AhtolaException ahtolaException => ahtolaException.IsTransientRemoteHttpFailure,
+            HttpRequestException requestException => requestException.StatusCode is null
+                or System.Net.HttpStatusCode.RequestTimeout
+                or System.Net.HttpStatusCode.TooManyRequests
+                || requestException.StatusCode is { } status
+                && (int)status is >= 500 and <= 599,
+            TaskCanceledException => true,
+            _ => false,
+        };
+    }
+
+    private Exception? StopAutomaticManagedReplicaSync()
+    {
+        CancellationTokenSource? cancellation;
+        Task? syncTask;
+        lock (_automaticSyncLock)
+        {
+            cancellation = _automaticSyncCancellation;
+            syncTask = _automaticSyncTask;
+            _automaticSyncCancellation = null;
+            _automaticSyncTask = null;
+        }
+
+        if (cancellation is null || syncTask is null)
+            return null;
+
+        try
+        {
+            cancellation.Cancel();
+            syncTask.GetAwaiter().GetResult();
+            return null;
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch (Exception exception)
+        {
+            return exception;
+        }
+        finally
+        {
+            cancellation.Dispose();
         }
     }
 
@@ -1076,7 +1394,10 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     private void ResetOpenCommands()
     {
-        foreach (var command in _openCommands.ToArray())
+        AhtolaCommand[] commands;
+        lock (_commandLock)
+            commands = _openCommands.ToArray();
+        foreach (var command in commands)
             command.ResetFromConnection();
     }
 }

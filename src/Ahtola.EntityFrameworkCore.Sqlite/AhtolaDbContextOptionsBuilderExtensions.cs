@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Query;
@@ -75,6 +76,16 @@ public static class AhtolaDbContextOptionsBuilderExtensions
         where TContext : DbContext
         => (DbContextOptionsBuilder<TContext>)UseAhtola((DbContextOptionsBuilder)optionsBuilder, connection, contextOwnsConnection, sqliteOptionsAction);
 
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteRelationalConnection))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteDatabaseCreator))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteQuerySqlGeneratorFactory))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteUpdateSqlGenerator))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteQuerySqlGeneratorFactory))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteHistoryRepository))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteMigrationsSqlGenerator))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteParameterBasedSqlProcessorFactory))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteQueryableMethodTranslatingExpressionVisitorFactory))]
     private static DbContextOptionsBuilder UseAhtolaServices(
         DbContextOptionsBuilder optionsBuilder,
         bool usesManagedLocalProvider)

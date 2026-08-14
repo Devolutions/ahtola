@@ -25,6 +25,8 @@ param(
                 'pack-powershell',
                 'test-powershell',
                 'validate-package',
+                'validate-runtime',
+                'cloud-smoke',
                 'validate-project-closure',
                 'validate-packed-closure',
                 'format-check'
@@ -350,6 +352,94 @@ function Invoke-ValidatePackage {
     }
 }
 
+function Invoke-ValidateRuntime {
+    Invoke-ValidatePackage
+
+    if ($Framework -ne 'net10.0') {
+        Write-Step "Skipping NativeAOT consumer publish because $Framework is not net10.0"
+        return
+    }
+
+    $localVersion = '0.0.0-managed-local'
+    $packageOutputAbsolute = Get-AbsolutePath $PackageOutput
+    $consumerNugetConfigAbsolute = Get-AbsolutePath $ConsumerNugetConfig
+    $consumerProjectAbsolute = Get-AbsolutePath $ConsumerProject
+    $globalPackages = Join-Path $packageOutputAbsolute '.nuget-packages'
+    $runtimeOutputRoot = Get-AbsolutePath './artifacts/managed-package-runtime'
+    $trimmedOutput = Join-Path $runtimeOutputRoot 'trimmed'
+    $nativeAotOutput = Join-Path $runtimeOutputRoot 'nativeaot'
+    $runtimeIdentifier = if ($IsWindows) { 'win-x64' } elseif ($IsLinux) { 'linux-x64' } elseif ($IsMacOS) { 'osx-x64' } else {
+        throw "NativeAOT consumer publish is not configured for this host OS."
+    }
+
+    Remove-PathIfExists $trimmedOutput
+    Remove-PathIfExists $nativeAotOutput
+
+    Write-Step "Publishing trimmed packed consumer ($Framework)"
+    Invoke-DotNet @(
+        'restore', $ConsumerProject,
+        '--configfile', $consumerNugetConfigAbsolute,
+        '--packages', $globalPackages,
+        "-p:AhtolaPackageVersion=$localVersion",
+        "-p:AhtolaConsumerTargetFramework=$Framework",
+        '-p:PublishTrimmed=true'
+    )
+    Invoke-DotNet @(
+        'publish',
+        '--configuration', 'Release',
+        '--no-restore',
+        '--framework', $Framework,
+        '--output', $trimmedOutput,
+        $ConsumerProject,
+        "-p:AhtolaPackageVersion=$localVersion",
+        "-p:AhtolaConsumerTargetFramework=$Framework",
+        '-p:PublishTrimmed=true'
+    )
+    Invoke-PwshScript -Path $ClosureValidator -Arguments @(
+        '-PublishOutput', $trimmedOutput
+    )
+
+    Write-Step "Publishing NativeAOT packed consumer ($Framework/$runtimeIdentifier)"
+    Invoke-DotNet @(
+        'restore', $ConsumerProject,
+        '--runtime', $runtimeIdentifier,
+        '--configfile', $consumerNugetConfigAbsolute,
+        '--packages', $globalPackages,
+        "-p:AhtolaPackageVersion=$localVersion",
+        "-p:AhtolaConsumerTargetFramework=$Framework",
+        '-p:PublishAot=true'
+    )
+    Invoke-DotNet @(
+        'publish',
+        '--configuration', 'Release',
+        '--no-restore',
+        '--framework', $Framework,
+        '--runtime', $runtimeIdentifier,
+        '--output', $nativeAotOutput,
+        $ConsumerProject,
+        "-p:AhtolaPackageVersion=$localVersion",
+        "-p:AhtolaConsumerTargetFramework=$Framework",
+        '-p:PublishAot=true'
+    )
+    Invoke-PwshScript -Path $ClosureValidator -Arguments @(
+        '-PublishOutput', $nativeAotOutput,
+        '-NativeAot'
+    )
+}
+
+function Invoke-CloudSmoke {
+    if ($env:AHTOLA_RUN_CLOUD_SMOKE -ne '1') {
+        throw 'Cloud smoke requires AHTOLA_RUN_CLOUD_SMOKE=1.'
+    }
+    foreach ($name in 'TURSO_REMOTE_URL', 'TURSO_AUTH_TOKEN') {
+        if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+            throw "Cloud smoke requires $name."
+        }
+    }
+
+    Invoke-ValidatePackage
+}
+
 function Invoke-Test {
     Invoke-ValidatePackage
     Write-Step "Running managed test suite ($Framework)"
@@ -375,6 +465,8 @@ switch ($Task) {
         'validate-project-closure' { Assert-ManagedProjectClosure }
         'validate-packed-closure' { Invoke-ValidatePackedClosure }
         'validate-package' { Invoke-ValidatePackage }
+        'validate-runtime' { Invoke-ValidateRuntime }
+        'cloud-smoke' { Invoke-CloudSmoke }
         'test' { Invoke-Test }
         'format-check' { Invoke-FormatCheck }
         default { throw "Unknown task '$Task'" }

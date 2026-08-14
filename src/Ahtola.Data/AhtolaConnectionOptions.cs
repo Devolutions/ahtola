@@ -227,10 +227,11 @@ public class AhtolaConnectionOptions
         {
             DataSource = options.RemoteUri.AbsoluteUri,
             ReplicaPath = options.Path,
-            LocalProvider = AhtolaLocalProvider.Native,
+            LocalProvider = AhtolaLocalProvider.Managed,
         };
         if (!string.IsNullOrWhiteSpace(options.AuthToken))
             builder.AuthToken = options.AuthToken;
+        builder.SyncInterval = options.SyncInterval;
         return new AhtolaConnectionOptions(builder);
     }
 

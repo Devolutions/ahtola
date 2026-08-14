@@ -29,6 +29,7 @@
         'Invoke-AhtolaSqliteBulkCopy'
         'Invoke-AhtolaSqliteMaintenance'
         'Invoke-AhtolaSqliteQuery'
+        'Invoke-AhtolaSqliteReplicaSync'
         'New-AhtolaSqliteConnection'
         'New-AhtolaSqliteRow'
         'Optimize-AhtolaSqliteDatabase'

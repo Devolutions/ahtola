@@ -8,6 +8,20 @@ public class AhtolaException : Exception
     {
     }
 
+    internal AhtolaException(string message, System.Net.HttpStatusCode remoteStatusCode)
+        : base(message)
+    {
+        RemoteStatusCode = remoteStatusCode;
+    }
+
+    internal System.Net.HttpStatusCode? RemoteStatusCode { get; }
+
+    internal bool IsTransientRemoteHttpFailure
+        => RemoteStatusCode is System.Net.HttpStatusCode.RequestTimeout
+            or System.Net.HttpStatusCode.TooManyRequests
+            || RemoteStatusCode is { } status
+            && (int)status is >= 500 and <= 599;
+
     internal AhtolaException(string message, Exception innerException) : base(message, innerException)
     {
     }

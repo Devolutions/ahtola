@@ -1,6 +1,3 @@
-using System.Reflection;
-using System.Runtime.Loader;
-
 namespace Ahtola;
 
 /// <summary>
@@ -8,31 +5,31 @@ namespace Ahtola;
 /// </summary>
 public static class AhtolaReplicaProvider
 {
-    private const string ReplicaProviderAssemblyName = "Turso.Data.Sync";
-    private const string ReplicaProviderRegistrationTypeName = "Turso.Data.Sync.ReplicaProviderRegistration";
     private static AhtolaReplicaProviderFactory? s_factory;
 
     /// <summary>
-    /// Registers the embedded-replica factory supplied by the optional companion assembly.
+    /// Registers an explicitly supplied embedded-replica factory.
     /// </summary>
     public static void Register(AhtolaReplicaProviderFactory factory)
     {
         ArgumentNullException.ThrowIfNull(factory);
 
         var registeredFactory = Interlocked.CompareExchange(ref s_factory, factory, null);
-        if (registeredFactory is not null && registeredFactory.GetType() != factory.GetType())
+        if (registeredFactory is not null && !ReferenceEquals(registeredFactory, factory))
         {
             throw new InvalidOperationException(
-                $"An embedded replica provider factory of type {registeredFactory.GetType().FullName} is already registered.");
+                "An embedded replica provider factory is already registered.");
         }
     }
 
-    internal static AhtolaReplicaDatabase OpenReplica(AhtolaReplicaOptions options)
+    internal static bool HasRegisteredFactory => Volatile.Read(ref s_factory) is not null;
+
+    internal static AhtolaReplicaDatabase OpenRegisteredReplica(AhtolaReplicaOptions options)
     {
         return GetFactory().OpenReplica(options);
     }
 
-    internal static Task<AhtolaReplicaDatabase> OpenReplicaAsync(
+    internal static Task<AhtolaReplicaDatabase> OpenRegisteredReplicaAsync(
         AhtolaReplicaOptions options,
         CancellationToken cancellationToken)
     {
@@ -41,36 +38,9 @@ public static class AhtolaReplicaProvider
 
     private static AhtolaReplicaProviderFactory GetFactory()
     {
-        var factory = Volatile.Read(ref s_factory);
-        if (factory is null)
-        {
-            TryRegisterCompanion();
-            factory = Volatile.Read(ref s_factory);
-        }
-
-        return factory
+        return Volatile.Read(ref s_factory)
             ?? throw new NotSupportedException(
-                "Embedded replica connections are not supported yet by the .NET provider. " +
-                "Add the matching Turso.Data.Sqlite.Sync companion package to enable them.");
-    }
-
-    private static void TryRegisterCompanion()
-    {
-        try
-        {
-            var loadContext = AssemblyLoadContext.GetLoadContext(typeof(AhtolaReplicaProvider).Assembly);
-            var assembly = loadContext?.LoadFromAssemblyName(new AssemblyName(ReplicaProviderAssemblyName))
-                ?? Assembly.Load(new AssemblyName(ReplicaProviderAssemblyName));
-            var registrationType = assembly.GetType(ReplicaProviderRegistrationTypeName, throwOnError: true)!;
-            var register = registrationType.GetMethod(
-                "Register",
-                BindingFlags.Public | BindingFlags.Static)
-                ?? throw new MissingMethodException(ReplicaProviderRegistrationTypeName, "Register");
-            register.Invoke(null, null);
-        }
-        catch (FileNotFoundException)
-        {
-        }
+                "No embedded replica factory has been registered.");
     }
 }
 
@@ -105,7 +75,7 @@ public sealed class AhtolaReplicaOptions
         ArgumentNullException.ThrowIfNull(remoteUri);
 
         Path = path;
-        RemoteUri = remoteUri;
+        RemoteUri = NormalizeRemoteUri(remoteUri);
         AuthToken = authToken;
         BootstrapIfEmpty = bootstrapIfEmpty;
     }
@@ -156,19 +126,18 @@ public sealed class AhtolaReplicaOptions
     public long? PullBytesThreshold { get; init; }
 
     /// <summary>
+    /// Gets or initializes the managed embedded-replica synchronization interval in seconds.
+    /// A positive value starts a background synchronization loop after the connection opens.
+    /// </summary>
+    public int SyncInterval { get; init; }
+
+    /// <summary>
     /// Gets or initializes the HTTP transport policy.
     /// </summary>
     public AhtolaSyncHttpPolicy HttpPolicy { get; init; } = new();
 
     internal void Validate()
     {
-        if (!RemoteUri.IsAbsoluteUri
-            || (!RemoteUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
-                && !RemoteUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
-        {
-            throw new ArgumentException("Embedded replica remote URLs must use HTTP or HTTPS.", nameof(RemoteUri));
-        }
-
         if (LongPollTimeout is { } longPollTimeout
             && (longPollTimeout < TimeSpan.FromMilliseconds(1)
                 || longPollTimeout.TotalMilliseconds > int.MaxValue))
@@ -181,6 +150,7 @@ public sealed class AhtolaReplicaOptions
 
         ValidateNativeSize(PushOperationsThreshold, nameof(PushOperationsThreshold));
         ValidateNativeSize(PullBytesThreshold, nameof(PullBytesThreshold));
+        ArgumentOutOfRangeException.ThrowIfNegative(SyncInterval);
         if (PartialBootstrap?.SegmentSize is { } segmentSize)
             ValidateNativeSize(segmentSize, nameof(AhtolaPartialBootstrapOptions.SegmentSize));
 
@@ -201,8 +171,34 @@ public sealed class AhtolaReplicaOptions
             throw new InvalidOperationException(
                 "PullBytesThreshold cannot be combined with query partial bootstrap because the server selects the query page set.");
         }
-
         ArgumentNullException.ThrowIfNull(HttpPolicy);
+        ArgumentNullException.ThrowIfNull(HttpPolicy);
+    }
+
+    private static Uri NormalizeRemoteUri(Uri remoteUri)
+    {
+        if (!remoteUri.IsAbsoluteUri)
+            throw new ArgumentException("Embedded replica remote URLs must be absolute.", nameof(remoteUri));
+
+        if (remoteUri.Scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase))
+        {
+            var builder = new UriBuilder(remoteUri)
+            {
+                Scheme = Uri.UriSchemeHttps,
+                Port = remoteUri.IsDefaultPort ? -1 : remoteUri.Port,
+                UserName = string.Empty,
+                Password = string.Empty,
+            };
+            return builder.Uri;
+        }
+
+        if (remoteUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            || remoteUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return remoteUri;
+        }
+
+        throw new ArgumentException("Embedded replica remote URLs must use libsql, HTTP, or HTTPS.", nameof(remoteUri));
     }
 
     internal IDisposable EnterApplicationHttpScope()
@@ -222,6 +218,7 @@ public sealed class AhtolaReplicaOptions
             RemoteEncryption = RemoteEncryption,
             PushOperationsThreshold = PushOperationsThreshold,
             PullBytesThreshold = PullBytesThreshold,
+            SyncInterval = SyncInterval,
             HttpPolicy = HttpPolicy,
         };
     }

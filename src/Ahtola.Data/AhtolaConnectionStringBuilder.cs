@@ -157,11 +157,11 @@ public sealed class AhtolaConnectionStringBuilder : DbConnectionStringBuilder
     }
 
     /// <summary>
-    /// Gets or sets the reserved automatic synchronization interval.
+    /// Gets or sets the managed embedded-replica automatic synchronization interval.
     /// </summary>
     /// <remarks>
-    /// Only zero is supported. Positive values are preserved for connection-string
-    /// compatibility but are rejected when the connection opens.
+    /// Positive values are measured in seconds and are supported only by managed
+    /// embedded replica connections.
     /// </remarks>
     public int SyncInterval
     {
