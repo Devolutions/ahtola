@@ -573,9 +573,10 @@ public sealed class ExpressionOperatorParityTests
         using var unregistered = new EmbeddedDatabase().Connect();
         Assert.Throws<EmbeddedSqlException>(() => ReadManaged(unregistered, "SELECT 'x' MATCH 'x';"))
             !.Message.Should().Be("no such function: MATCH");
-        Assert.Throws<EmbeddedSqlException>(
-                () => unregistered.Prepare("CREATE VIRTUAL TABLE docs USING fts5(body);"))
-            !.Message.Should().Contain("CREATE VIRTUAL TABLE modules are not supported");
+        ExecuteManaged(unregistered, "CREATE VIRTUAL TABLE docs USING fts5(body);");
+        ExecuteManaged(unregistered, "INSERT INTO docs(body) VALUES ('alphabet');");
+        ReadManaged(unregistered, "SELECT body FROM docs WHERE docs MATCH 'alphabet';")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("alphabet"));
     }
 
     [Test]
