@@ -161,6 +161,83 @@ public sealed class MvccSelectDualCursorRoutingTests
         Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
     }
 
+    [TestCase("INSERT INTO t VALUES (1, 'insert');")]
+    [TestCase("UPDATE t SET value = 'update';")]
+    [TestCase("DELETE FROM t;")]
+    public void ConcurrentDmlAgainstWithoutRowidTableFailsClosed(string sql)
+    {
+        using var db = new RoutingFileDatabase(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID;");
+        using var connection = db.Connect();
+
+        connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+
+        var error = Capture(() => connection.ExecuteNonQuery(sql));
+        error.Should().NotBeNull();
+        error!.Message.Should().ContainEquivalentOf("rowid user tables");
+
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(0L);
+        connection.ExecuteNonQuery("ROLLBACK;");
+
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 'outside');");
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
+    }
+
+    [Test]
+    public void ConcurrentRowTriggerDmlAgainstWithoutRowidTableFailsClosed()
+    {
+        using var db = new RoutingFileDatabase();
+        using var connection = db.Connect();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE sink(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID;
+            CREATE TRIGGER t_after_insert AFTER INSERT ON t BEGIN
+                INSERT INTO sink VALUES (NEW.v, 'trigger');
+            END;
+            """);
+
+        connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+
+        var error = Capture(() => connection.ExecuteNonQuery("INSERT INTO t VALUES (1);"));
+        error.Should().NotBeNull();
+        error!.Message.Should().ContainEquivalentOf("rowid user tables");
+
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(0L);
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM sink;")).Should().Be(0L);
+        connection.ExecuteNonQuery("ROLLBACK;");
+    }
+
+    [Test]
+    public void ConcurrentForeignKeyCascadeAgainstWithoutRowidTableFailsClosed()
+    {
+        using var db = new RoutingFileDatabase();
+        using var connection = db.Connect();
+        connection.ExecuteNonQuery(
+            """
+            PRAGMA foreign_keys=ON;
+            CREATE TABLE parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE child(
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE
+            ) WITHOUT ROWID;
+            INSERT INTO parent VALUES (1);
+            INSERT INTO child VALUES (1, 1);
+            """);
+
+        connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+
+        var error = Capture(() => connection.ExecuteNonQuery("DELETE FROM parent WHERE id = 1;"));
+        error.Should().NotBeNull();
+        error!.Message.Should().ContainEquivalentOf("rowid user tables");
+
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM parent;")).Should().Be(1L);
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM child;")).Should().Be(1L);
+        connection.ExecuteNonQuery("ROLLBACK;");
+    }
+
     private static object? Scalar(SqliteConnection connection, string sql)
     {
         using var command = connection.CreateCommand();
@@ -188,7 +265,7 @@ public sealed class MvccSelectDualCursorRoutingTests
     {
         private readonly List<SqliteConnection> _connections = [];
 
-        public RoutingFileDatabase()
+        public RoutingFileDatabase(string schema = "CREATE TABLE t(v INTEGER);")
         {
             Path = System.IO.Path.Combine(
                 System.IO.Path.GetTempPath(),
@@ -196,7 +273,7 @@ public sealed class MvccSelectDualCursorRoutingTests
 
             using var seed = new SqliteConnection($"Data Source={Path};Local Provider=Managed");
             seed.Open();
-            seed.ExecuteNonQuery("CREATE TABLE t(v INTEGER);");
+            seed.ExecuteNonQuery(schema);
         }
 
         public string Path { get; }

@@ -218,7 +218,6 @@ public static class ManagedVirtualTableModuleRegistry
         Register(ManagedRTreeModule.Instance);
         Register(ManagedRTreeI32Module.Instance);
     }
-
     public static void Register(ManagedVirtualTableModule module)
     {
         ArgumentNullException.ThrowIfNull(module);
