@@ -161,6 +161,29 @@ public sealed class MvccSelectDualCursorRoutingTests
         Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
     }
 
+    [TestCase("INSERT INTO t VALUES (1, 'insert');")]
+    [TestCase("UPDATE t SET value = 'update';")]
+    [TestCase("DELETE FROM t;")]
+    public void ConcurrentDmlAgainstWithoutRowidTableFailsClosed(string sql)
+    {
+        using var db = new RoutingFileDatabase(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID;");
+        using var connection = db.Connect();
+
+        connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+
+        var error = Capture(() => connection.ExecuteNonQuery(sql));
+        error.Should().NotBeNull();
+        error!.Message.Should().ContainEquivalentOf("rowid user tables");
+
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(0L);
+        connection.ExecuteNonQuery("ROLLBACK;");
+
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 'outside');");
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
+    }
+
     private static object? Scalar(SqliteConnection connection, string sql)
     {
         using var command = connection.CreateCommand();
@@ -188,7 +211,7 @@ public sealed class MvccSelectDualCursorRoutingTests
     {
         private readonly List<SqliteConnection> _connections = [];
 
-        public RoutingFileDatabase()
+        public RoutingFileDatabase(string schema = "CREATE TABLE t(v INTEGER);")
         {
             Path = System.IO.Path.Combine(
                 System.IO.Path.GetTempPath(),
@@ -196,7 +219,7 @@ public sealed class MvccSelectDualCursorRoutingTests
 
             using var seed = new SqliteConnection($"Data Source={Path};Local Provider=Managed");
             seed.Open();
-            seed.ExecuteNonQuery("CREATE TABLE t(v INTEGER);");
+            seed.ExecuteNonQuery(schema);
         }
 
         public string Path { get; }

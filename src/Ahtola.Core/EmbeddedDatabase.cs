@@ -1658,6 +1658,44 @@ public sealed partial class EmbeddedDatabase : IDisposable
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableAlterColumnStatement or AlterTableDropColumnStatement;
 
+    private static void EnsureConcurrentMvccDmlTargetIsSupported(
+        ParsedStatement statement,
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        QueryContext context)
+    {
+        if (context.ConcurrentMvStore is null || context.ConcurrentMvccTxId is null)
+            return;
+
+        var tableName = GetConcurrentMvccDmlTargetName(statement);
+        if (tableName is null)
+            return;
+
+        if (ManagedSchemaName.TrySplit(tableName, out _, out var unqualifiedName))
+            tableName = unqualifiedName;
+
+        if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new EmbeddedSqlException(
+                "Concurrent MVCC DML is supported only for rowid user tables; sqlite_* tables require system-table dual-cursor routing.");
+        }
+
+        if (tables.TryGetValue(tableName, out var table) && !table.HasRowid)
+        {
+            throw new EmbeddedSqlException(
+                "Concurrent MVCC DML is supported only for rowid user tables; WITHOUT ROWID tables require composite-key dual-cursor routing.");
+        }
+    }
+
+    private static string? GetConcurrentMvccDmlTargetName(ParsedStatement statement)
+        => statement switch
+        {
+            InsertStatement insert => insert.TableName,
+            UpdateStatement update => update.TableName,
+            DeleteStatement delete => delete.TableName,
+            WithDmlStatement with => GetConcurrentMvccDmlTargetName(with.Dml),
+            _ => null,
+        };
+
     /// <summary>
     /// A read-only view over the live schema, used to resolve column ownership while an
     /// authorizer inspects a statement. It deliberately does not clone, does not take a
@@ -3315,6 +3353,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ExecuteTableList: executeTableList,
             ConcurrentMvStore: concurrentMvStore,
             ConcurrentMvccTxId: concurrentMvccTxId);
+        EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
@@ -13712,6 +13751,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
                 foreach (var bodyStatement in trigger.Body)
                 {
+                    EnsureConcurrentMvccDmlTargetIsSupported(bodyStatement, triggerContext.Tables, triggerContext);
                     var result = bodyStatement switch
                     {
                         InsertStatement insert => ExecuteInsert(insert, EmptyParameters, triggerContext),

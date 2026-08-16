@@ -57,6 +57,9 @@ Pinned submodule: `turso-src/` @ **v0.7.2** (`046e9cbf6`).
 - **UPDATE of base-only row:** `UpdateIncludingBase` = tombstone prior + insert new cells.
 - **WW on concurrent base tombstones:** `ThrowIfConcurrentWriterOnRow` — pure tombstones share `End=null`, so classic chain WW alone is insufficient.
 - **SELECT:** dual-cursor path is rowid tables only; `sqlite_*` and WITHOUT ROWID stay catalog-only.
+  Concurrent DML against those catalog-only targets fails before mutation until system-table and
+  composite-key dual-cursor routing exists, preventing a transaction-local catalog change from
+  being dropped during the store-to-catalog merge.
 - **Process-local:** store is not cross-process (same as Turso process MVCC scope here).
 
 ## Checkpoint notes
