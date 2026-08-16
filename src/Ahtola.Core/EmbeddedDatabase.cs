@@ -7094,8 +7094,201 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    private ExecutionResult ExecuteVirtualTableInsert(
+        InsertStatement statement,
+        VirtualTableDefinition definition,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (statement.Source is not null
+            || statement.Returning is not null
+            || statement.Upsert is not null
+            || statement.ConflictAlgorithm is not null)
+        {
+            throw new EmbeddedSqlException(
+                "managed virtual-table INSERT does not support INSERT ... SELECT, RETURNING, or conflict clauses");
+        }
+
+        var schema = definition.Table.Schema;
+        var columns = statement.Columns ?? schema.Columns.Select(static column => column.Name).ToArray();
+        var assignments = ResolveVirtualTableColumns(schema, columns);
+        var mutations = new List<IReadOnlyList<SqlValue>>(statement.Rows.Count);
+        foreach (var row in statement.Rows)
+        {
+            if (row.Length != assignments.Length)
+                throw new EmbeddedSqlException($"table {statement.TableName} has {schema.Columns.Count} columns but {row.Length} values were supplied");
+
+            var values = Enumerable.Repeat(SqlValue.Null, schema.Columns.Count).ToArray();
+            for (var index = 0; index < row.Length; index++)
+                values[assignments[index]] = Evaluate(row[index], parameters, null, context);
+            mutations.Add(BuildVirtualTableUpdateArguments(null, null, values));
+        }
+
+        return ExecuteVirtualTableMutations(definition.Table, mutations);
+    }
+
+    private ExecutionResult ExecuteVirtualTableUpdate(
+        UpdateStatement statement,
+        VirtualTableDefinition definition,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (statement.Returning is not null
+            || statement.EffectiveOrderBy.Count != 0
+            || statement.Limit is not null
+            || statement.Offset is not null
+            || statement.From is not null
+            || statement.ConflictAlgorithm is not null)
+        {
+            throw new EmbeddedSqlException(
+                "managed virtual-table UPDATE does not support RETURNING, ORDER BY/LIMIT, FROM, or conflict clauses");
+        }
+
+        var source = new NamedTableSource(statement.TableName, statement.Alias);
+        var rows = GetVirtualTableRows(
+            source,
+            definition,
+            parameters,
+            context,
+            maximumRows: null,
+            outerRow: null,
+            statement.Where,
+            []);
+        var assignments = ResolveVirtualTableColumns(
+            definition.Table.Schema,
+            statement.Assignments.Select(static assignment => assignment.Column).ToArray());
+        var mutations = new List<IReadOnlyList<SqlValue>>();
+        foreach (var row in rows.Rows)
+        {
+            if (statement.Where is not null
+                && !IsVirtualTableResidualTrue(
+                    statement.Where,
+                    rows.OmittedVirtualTablePredicates,
+                    parameters,
+                    row,
+                    context))
+            {
+                continue;
+            }
+
+            var values = row.Values.ToArray();
+            for (var index = 0; index < statement.Assignments.Count; index++)
+                values[assignments[index]] = Evaluate(statement.Assignments[index].Value, parameters, row, context);
+            mutations.Add(BuildVirtualTableUpdateArguments(row.RowId, row.RowId, values));
+        }
+
+        return ExecuteVirtualTableMutations(definition.Table, mutations);
+    }
+
+    private ExecutionResult ExecuteVirtualTableDelete(
+        DeleteStatement statement,
+        VirtualTableDefinition definition,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (statement.Returning is not null
+            || statement.EffectiveOrderBy.Count != 0
+            || statement.Limit is not null
+            || statement.Offset is not null)
+        {
+            throw new EmbeddedSqlException(
+                "managed virtual-table DELETE does not support RETURNING or ORDER BY/LIMIT");
+        }
+
+        var source = new NamedTableSource(statement.TableName, statement.Alias);
+        var rows = GetVirtualTableRows(
+            source,
+            definition,
+            parameters,
+            context,
+            maximumRows: null,
+            outerRow: null,
+            statement.Where,
+            []);
+        var mutations = rows.Rows
+            .Where(row => statement.Where is null
+                || IsVirtualTableResidualTrue(
+                    statement.Where,
+                    rows.OmittedVirtualTablePredicates,
+                    parameters,
+                    row,
+                    context))
+            .Select(row => BuildVirtualTableUpdateArguments(row.RowId, null, row.Values))
+            .ToArray();
+        return ExecuteVirtualTableMutations(definition.Table, mutations);
+    }
+
+    private static int[] ResolveVirtualTableColumns(
+        ManagedVirtualTableSchema schema,
+        IReadOnlyList<string> names)
+    {
+        var indexes = new int[names.Count];
+        var seen = new HashSet<int>();
+        for (var index = 0; index < names.Count; index++)
+        {
+            var columnIndex = -1;
+            for (var candidate = 0; candidate < schema.Columns.Count; candidate++)
+            {
+                if (string.Equals(schema.Columns[candidate].Name, names[index], StringComparison.OrdinalIgnoreCase))
+                {
+                    columnIndex = candidate;
+                    break;
+                }
+            }
+
+            if (columnIndex < 0
+                || !seen.Add(columnIndex))
+            {
+                throw new EmbeddedSqlException($"no such column: {names[index]}");
+            }
+
+            indexes[index] = columnIndex;
+        }
+
+        return indexes;
+    }
+
+    private static IReadOnlyList<SqlValue> BuildVirtualTableUpdateArguments(
+        long? oldRowId,
+        long? newRowId,
+        IReadOnlyList<SqlValue> values)
+    {
+        var arguments = new SqlValue[values.Count + 2];
+        arguments[0] = oldRowId is { } oldValue ? SqlValue.Integer(oldValue) : SqlValue.Null;
+        arguments[1] = newRowId is { } newValue ? SqlValue.Integer(newValue) : SqlValue.Null;
+        for (var index = 0; index < values.Count; index++)
+            arguments[index + 2] = values[index];
+        return arguments;
+    }
+
+    private static ExecutionResult ExecuteVirtualTableMutations(
+        ManagedVirtualTable table,
+        IReadOnlyList<IReadOnlyList<SqlValue>> mutations)
+    {
+        if (mutations.Count == 0)
+            return ExecutionResult.Empty;
+
+        table.Begin();
+        try
+        {
+            foreach (var mutation in mutations)
+                table.Update(mutation);
+            table.Sync();
+            table.Commit();
+            return new ExecutionResult([], [], mutations.Count, true);
+        }
+        catch
+        {
+            table.Rollback();
+            throw;
+        }
+    }
+
     private ExecutionResult ExecuteInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
+        if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName), out var virtualTable))
+            return ExecuteVirtualTableInsert(statement, virtualTable, parameters, context);
+
         if (context.InsideTrigger && context.TriggerConflictAlgorithm is { } triggerConflictAlgorithm)
             statement = statement with { ConflictAlgorithm = triggerConflictAlgorithm };
         else if (context.InsideTrigger
@@ -10722,6 +10915,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName, statement.Alias), out var virtualTable))
+            return ExecuteVirtualTableUpdate(statement, virtualTable, parameters, context);
+
         ValidateDmlTargetIndexDirective(statement.TableName, statement.IndexDirective, context);
         var updatedColumns = statement.Assignments
             .Select(assignment => assignment.Column)
@@ -13151,6 +13347,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName, statement.Alias), out var virtualTable))
+            return ExecuteVirtualTableDelete(statement, virtualTable, parameters, context);
+
         ValidateDmlTargetIndexDirective(statement.TableName, statement.IndexDirective, context);
         ValidateForeignKeyActionTriggerPrograms(
             context,
@@ -22778,14 +22977,26 @@ out bool hasReturning)
                         context,
                         sourceLimit,
                         outerRow)
-                    : GetSourceRows(statement.Source, parameters, context, sourceLimit, outerRow));
+                    : GetSourceRows(
+                        statement.Source,
+                        parameters,
+                        context,
+                        sourceLimit,
+                        outerRow,
+                        statement.Where,
+                        resolvedOrderBy));
         var selectedRows = new List<SourceRow>();
         foreach (var row in source.Rows)
         {
             context.CheckInterrupt();
             if (streamProjectionRows
                 || statement.Where is null
-                || IsTrue(Evaluate(statement.Where, parameters, row, context)))
+                || IsVirtualTableResidualTrue(
+                    statement.Where,
+                    source.OmittedVirtualTablePredicates,
+                    parameters,
+                    row,
+                    context))
                 selectedRows.Add(row);
         }
 
@@ -25637,7 +25848,9 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context,
         long? maximumRows,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        Expression? sourcePredicate = null,
+        IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
         if (source is null)
             return new SourceData([], [new SourceRow([], [], Parent: outerRow)]);
@@ -25649,7 +25862,15 @@ out bool hasReturning)
             NamedTableSource named when TryGetView(context, named.Name, out var view)
                 => GetViewRows(named, view, parameters, context, maximumRows, outerRow),
             NamedTableSource named when TryGetVirtualTable(context, named, out var virtualTable)
-                => GetVirtualTableRows(named, virtualTable, context, maximumRows, outerRow),
+                => GetVirtualTableRows(
+                    named,
+                    virtualTable,
+                    parameters,
+                    context,
+                    maximumRows,
+                    outerRow,
+                    sourcePredicate,
+                    sourceOrderBy ?? []),
             NamedTableSource { IndexDirective: IndexedByDirective } named
                 => GetManagedIndexRows(
                     CreateForcedIndexScanPlan(
@@ -27613,20 +27834,27 @@ out bool hasReturning)
         return new SourceData(columns, rows);
     }
 
-    private static SourceData GetVirtualTableRows(
+    private SourceData GetVirtualTableRows(
         NamedTableSource source,
         VirtualTableDefinition definition,
+        SqlValue[] parameters,
         QueryContext context,
         long? maximumRows,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        Expression? sourcePredicate,
+        IReadOnlyList<OrderByTerm> sourceOrderBy)
     {
         var schema = definition.Table.Schema;
-        var constraints = Array.Empty<ManagedVirtualTableConstraint>();
-        var plan = definition.Table.BestIndex(constraints, []);
-        plan.ValidateFor(constraints);
+        var plannerInput = ExtractVirtualTablePlannerInput(source, schema, sourcePredicate, sourceOrderBy);
+        var plan = definition.Table.BestIndex(plannerInput.Constraints, plannerInput.OrderBy);
+        plan.ValidateFor(plannerInput.Constraints);
+        var arguments = BuildVirtualTableFilterArguments(plan, plannerInput.Expressions, parameters, outerRow, context);
+        var omittedPredicates = plannerInput.Predicates
+            .Where((_, index) => plan.ConstraintUsages[index].Omit)
+            .ToArray();
 
         using var cursor = definition.Table.Open();
-        var positioned = cursor.Filter(plan, []);
+        var positioned = cursor.Filter(plan, arguments);
         var columns = schema.Columns.Select(static column => column.Name).ToArray();
         var qualifier = source.Alias ?? source.Name;
         var qualifiedColumns = BuildQualifiedColumns(qualifier, columns);
@@ -27661,8 +27889,236 @@ out bool hasReturning)
             cursor.Next();
         }
 
-        return new SourceData(columns, rows);
+        return new SourceData(columns, rows, OmittedVirtualTablePredicates: omittedPredicates);
     }
+
+    private IReadOnlyList<SqlValue> BuildVirtualTableFilterArguments(
+        ManagedVirtualTablePlan plan,
+        IReadOnlyList<Expression> expressions,
+        SqlValue[] parameters,
+        SourceRow? outerRow,
+        QueryContext context)
+    {
+        if (plan.ConstraintUsages.Count == 0)
+            return [];
+
+        var maximumArgumentIndex = plan.ConstraintUsages.Max(static usage => usage.ArgumentIndex);
+        if (maximumArgumentIndex == 0)
+            return [];
+
+        var arguments = new SqlValue[maximumArgumentIndex];
+        for (var index = 0; index < plan.ConstraintUsages.Count; index++)
+        {
+            var argumentIndex = plan.ConstraintUsages[index].ArgumentIndex;
+            if (argumentIndex != 0)
+                arguments[argumentIndex - 1] = Evaluate(expressions[index], parameters, outerRow, context);
+        }
+
+        return arguments;
+    }
+
+    private static VirtualTablePlannerInput ExtractVirtualTablePlannerInput(
+        NamedTableSource source,
+        ManagedVirtualTableSchema schema,
+        Expression? predicate,
+        IReadOnlyList<OrderByTerm> orderBy)
+    {
+        var columnIndexes = schema.Columns
+            .Select((column, index) => (column.Name, Index: index))
+            .ToDictionary(static pair => pair.Name, static pair => pair.Index, StringComparer.OrdinalIgnoreCase);
+        var constraints = new List<ManagedVirtualTableConstraint>();
+        var expressions = new List<Expression>();
+        var predicates = new List<Expression>();
+        if (predicate is not null)
+        {
+            foreach (var conjunct in EnumerateConjuncts(predicate))
+            {
+                if (TryExtractVirtualTableConstraint(source, columnIndexes, conjunct, out var constraint, out var argument))
+                {
+                    constraints.Add(constraint);
+                    expressions.Add(argument);
+                    predicates.Add(conjunct);
+                }
+            }
+        }
+
+        var orders = new List<ManagedVirtualTableOrderBy>();
+        foreach (var term in orderBy)
+        {
+            if (TryGetVirtualTableColumnIndex(source, columnIndexes, term.Expression, out var columnIndex))
+                orders.Add(new ManagedVirtualTableOrderBy(columnIndex, term.Descending));
+            else
+            {
+                orders.Clear();
+                break;
+            }
+        }
+
+        return new VirtualTablePlannerInput(constraints, expressions, predicates, orders);
+    }
+
+    private static bool TryExtractVirtualTableConstraint(
+        NamedTableSource source,
+        IReadOnlyDictionary<string, int> columnIndexes,
+        Expression predicate,
+        out ManagedVirtualTableConstraint constraint,
+        out Expression argument)
+    {
+        if (predicate is LikeExpression { Negated: false } like
+            && TryGetVirtualTableColumnIndex(source, columnIndexes, like.Value, out var likeColumn)
+            && !ReferencesVirtualTableColumn(source, columnIndexes, like.Pattern))
+        {
+            constraint = new ManagedVirtualTableConstraint(likeColumn, ManagedVirtualTableConstraintOperator.Like);
+            argument = like.Pattern;
+            return true;
+        }
+        if (predicate is GlobExpression { Negated: false } glob
+            && TryGetVirtualTableColumnIndex(source, columnIndexes, glob.Value, out var globColumn)
+            && !ReferencesVirtualTableColumn(source, columnIndexes, glob.Pattern))
+        {
+            constraint = new ManagedVirtualTableConstraint(globColumn, ManagedVirtualTableConstraintOperator.Glob);
+            argument = glob.Pattern;
+            return true;
+        }
+        if (predicate is FunctionExpression { Name: "MATCH", Arguments.Count: 2 } match
+            && TryGetVirtualTableColumnIndex(source, columnIndexes, match.Arguments[1], out var matchColumn)
+            && !ReferencesVirtualTableColumn(source, columnIndexes, match.Arguments[0]))
+        {
+            constraint = new ManagedVirtualTableConstraint(matchColumn, ManagedVirtualTableConstraintOperator.Match);
+            argument = match.Arguments[0];
+            return true;
+        }
+        if (predicate is BinaryExpression binary
+            && TryMapVirtualTableOperator(binary.Operator, out var operation))
+        {
+            if (TryGetVirtualTableColumnIndex(source, columnIndexes, binary.Left, out var leftColumn)
+                && !ReferencesVirtualTableColumn(source, columnIndexes, binary.Right))
+            {
+                constraint = new ManagedVirtualTableConstraint(leftColumn, operation);
+                argument = binary.Right;
+                return true;
+            }
+            if (TryGetVirtualTableColumnIndex(source, columnIndexes, binary.Right, out var rightColumn)
+                && !ReferencesVirtualTableColumn(source, columnIndexes, binary.Left)
+                && TryReverseVirtualTableOperator(operation, out var reversed))
+            {
+                constraint = new ManagedVirtualTableConstraint(rightColumn, reversed);
+                argument = binary.Left;
+                return true;
+            }
+        }
+
+        constraint = default;
+        argument = null!;
+        return false;
+    }
+
+    private static IEnumerable<Expression> EnumerateConjuncts(Expression expression)
+    {
+        if (expression is BinaryExpression { Operator: BinaryOperator.And } and)
+        {
+            foreach (var conjunct in EnumerateConjuncts(and.Left))
+                yield return conjunct;
+            foreach (var conjunct in EnumerateConjuncts(and.Right))
+                yield return conjunct;
+            yield break;
+        }
+
+        yield return expression;
+    }
+
+    private bool IsVirtualTableResidualTrue(
+        Expression predicate,
+        IReadOnlyList<Expression>? omittedPredicates,
+        SqlValue[] parameters,
+        SourceRow row,
+        QueryContext context)
+        => EnumerateConjuncts(predicate)
+            .Where(conjunct => omittedPredicates is null || !omittedPredicates.Contains(conjunct))
+            .All(conjunct => IsTrue(Evaluate(conjunct, parameters, row, context)));
+
+    private static bool TryGetVirtualTableColumnIndex(
+        NamedTableSource source,
+        IReadOnlyDictionary<string, int> columnIndexes,
+        Expression expression,
+        out int columnIndex)
+    {
+        if (expression is ColumnExpression column
+            && (column.Qualifier is null
+                || string.Equals(column.Qualifier, source.Alias ?? source.Name, StringComparison.OrdinalIgnoreCase))
+            && columnIndexes.TryGetValue(column.Name, out columnIndex))
+        {
+            return true;
+        }
+
+        columnIndex = default;
+        return false;
+    }
+
+    private static bool ReferencesVirtualTableColumn(
+        NamedTableSource source,
+        IReadOnlyDictionary<string, int> columnIndexes,
+        Expression expression)
+        => expression switch
+        {
+            ColumnExpression => TryGetVirtualTableColumnIndex(source, columnIndexes, expression, out _),
+            BinaryExpression binary => ReferencesVirtualTableColumn(source, columnIndexes, binary.Left)
+                || ReferencesVirtualTableColumn(source, columnIndexes, binary.Right),
+            UnaryExpression unary => ReferencesVirtualTableColumn(source, columnIndexes, unary.Operand),
+            LikeExpression like => ReferencesVirtualTableColumn(source, columnIndexes, like.Value)
+                || ReferencesVirtualTableColumn(source, columnIndexes, like.Pattern),
+            GlobExpression glob => ReferencesVirtualTableColumn(source, columnIndexes, glob.Value)
+                || ReferencesVirtualTableColumn(source, columnIndexes, glob.Pattern),
+            FunctionExpression function => function.Arguments.Any(argument =>
+                ReferencesVirtualTableColumn(source, columnIndexes, argument)),
+            _ => false,
+        };
+
+    private static bool TryMapVirtualTableOperator(
+        BinaryOperator operation,
+        out ManagedVirtualTableConstraintOperator virtualOperation)
+    {
+        virtualOperation = operation switch
+        {
+            BinaryOperator.Equal => ManagedVirtualTableConstraintOperator.Equal,
+            BinaryOperator.GreaterThan => ManagedVirtualTableConstraintOperator.GreaterThan,
+            BinaryOperator.GreaterThanOrEqual => ManagedVirtualTableConstraintOperator.GreaterThanOrEqual,
+            BinaryOperator.LessThan => ManagedVirtualTableConstraintOperator.LessThan,
+            BinaryOperator.LessThanOrEqual => ManagedVirtualTableConstraintOperator.LessThanOrEqual,
+            _ => default,
+        };
+        return operation is BinaryOperator.Equal
+            or BinaryOperator.GreaterThan
+            or BinaryOperator.GreaterThanOrEqual
+            or BinaryOperator.LessThan
+            or BinaryOperator.LessThanOrEqual;
+    }
+
+    private static bool TryReverseVirtualTableOperator(
+        ManagedVirtualTableConstraintOperator operation,
+        out ManagedVirtualTableConstraintOperator reversed)
+    {
+        reversed = operation switch
+        {
+            ManagedVirtualTableConstraintOperator.Equal => ManagedVirtualTableConstraintOperator.Equal,
+            ManagedVirtualTableConstraintOperator.GreaterThan => ManagedVirtualTableConstraintOperator.LessThan,
+            ManagedVirtualTableConstraintOperator.GreaterThanOrEqual => ManagedVirtualTableConstraintOperator.LessThanOrEqual,
+            ManagedVirtualTableConstraintOperator.LessThan => ManagedVirtualTableConstraintOperator.GreaterThan,
+            ManagedVirtualTableConstraintOperator.LessThanOrEqual => ManagedVirtualTableConstraintOperator.GreaterThanOrEqual,
+            _ => default,
+        };
+        return operation is ManagedVirtualTableConstraintOperator.Equal
+            or ManagedVirtualTableConstraintOperator.GreaterThan
+            or ManagedVirtualTableConstraintOperator.GreaterThanOrEqual
+            or ManagedVirtualTableConstraintOperator.LessThan
+            or ManagedVirtualTableConstraintOperator.LessThanOrEqual;
+    }
+
+    private sealed record VirtualTablePlannerInput(
+        IReadOnlyList<ManagedVirtualTableConstraint> Constraints,
+        IReadOnlyList<Expression> Expressions,
+        IReadOnlyList<Expression> Predicates,
+        IReadOnlyList<ManagedVirtualTableOrderBy> OrderBy);
 
     private static IReadOnlyList<QueryAffinityColumn> BuildTableValuedFunctionAffinities(
         TableValuedFunctionSource source)
@@ -49528,4 +49984,5 @@ internal sealed record SourceData(
     string[] Columns,
     IReadOnlyList<SourceRow> Rows,
     IReadOnlyList<string?>? Collations = null,
-    IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null);
+    IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null,
+    IReadOnlyList<Expression>? OmittedVirtualTablePredicates = null);
