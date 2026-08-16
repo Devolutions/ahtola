@@ -178,6 +178,11 @@ public abstract class ManagedVirtualTable
     public virtual long? Update(IReadOnlyList<SqlValue> arguments)
         => throw new EmbeddedSqlException("attempt to write a readonly virtual table");
 
+    /// <summary>
+    /// Begins one autocommit virtual-table mutation statement. Explicit SQL transactions and
+    /// savepoints are not supported for managed virtual-table mutations because the generic ABI
+    /// has no reversible module-state contract.
+    /// </summary>
     public virtual void Begin() { }
     public virtual void Sync() { }
     public virtual void Commit() { }
