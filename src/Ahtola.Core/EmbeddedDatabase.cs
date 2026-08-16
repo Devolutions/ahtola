@@ -399,6 +399,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ThrowIfRecursiveTriggerCallbackReentry();
         lock (_gate)
         {
+            foreach (var virtualTable in _virtualTables.Values)
+                virtualTable.Table.Destroy();
+            _virtualTables.Clear();
+
             if (_mvStore is not null && _fileSystem is not null && !string.IsNullOrEmpty(_databasePath))
             {
                 var last = EmbeddedMvStoreRegistry.Release(_fileSystem, _databasePath);
@@ -3336,7 +3340,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
-            CreateVirtualTableStatement createVirtual => ExecuteCreateVirtualTable(createVirtual, catalog),
+            CreateVirtualTableStatement createVirtual => ExecuteCreateVirtualTable(
+                createVirtual,
+                catalog,
+                context.InTransaction),
             CreateTableAsSelectStatement => throw new InvalidOperationException(
                 "CREATE TABLE AS SELECT must be materialized by the owning connection."),
             DropTableStatement drop => ExecuteDmlWithAutoIncrementState(
@@ -4137,8 +4144,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private ExecutionResult ExecuteCreateVirtualTable(
         CreateVirtualTableStatement statement,
-        SchemaCatalog catalog)
+        SchemaCatalog catalog,
+        bool inTransaction)
     {
+        ThrowIfVirtualTableSchemaChangeInTransaction(inTransaction);
         if (_fileStore is not null)
         {
             throw new EmbeddedSqlException(
@@ -4264,6 +4273,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (catalog.VirtualTables.Remove(statement.Name, out var virtualTable))
         {
+            ThrowIfVirtualTableSchemaChangeInTransaction(context.InTransaction);
             virtualTable.Table.Destroy();
             RemoveTriggersForTable(catalog, statement.Name);
             return new ExecutionResult([], [], 0, true);
@@ -5221,6 +5231,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var tables = catalog.Tables;
         if (catalog.VirtualTables.TryGetValue(statement.TableName, out var virtualTable))
         {
+            ThrowIfVirtualTableSchemaChangeInTransaction(context.InTransaction);
             if (IsReservedObjectName(statement.NewName))
                 throw new EmbeddedSqlException($"object name reserved for internal use: {statement.NewName}");
             if (catalog.VirtualTables.ContainsKey(statement.NewName)
@@ -7100,6 +7111,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        ThrowIfVirtualTableMutationInTransaction(context);
         if (statement.Source is not null
             || statement.Returning is not null
             || statement.Upsert is not null
@@ -7133,6 +7145,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        ThrowIfVirtualTableMutationInTransaction(context);
         if (statement.Returning is not null
             || statement.EffectiveOrderBy.Count != 0
             || statement.Limit is not null
@@ -7186,6 +7199,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        ThrowIfVirtualTableMutationInTransaction(context);
         if (statement.Returning is not null
             || statement.EffectiveOrderBy.Count != 0
             || statement.Limit is not null
@@ -7261,6 +7275,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return arguments;
     }
 
+    private static void ThrowIfVirtualTableMutationInTransaction(QueryContext context)
+    {
+        if (context.InTransaction)
+        {
+            throw new EmbeddedSqlException(
+                "managed virtual-table mutations are not supported inside explicit transactions or savepoints");
+        }
+    }
+
+    private static void ThrowIfVirtualTableSchemaChangeInTransaction(bool inTransaction)
+    {
+        if (inTransaction)
+        {
+            throw new EmbeddedSqlException(
+                "managed virtual-table schema changes are not supported inside explicit transactions or savepoints");
+        }
+    }
+
     private static ExecutionResult ExecuteVirtualTableMutations(
         ManagedVirtualTable table,
         IReadOnlyList<IReadOnlyList<SqlValue>> mutations)
@@ -7278,14 +7310,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             for (var index = 0; index < mutation.Count; index++)
                 instructions.Add(new LoadConstantInstruction(new Register(index), mutation[index]));
-            instructions.Add(new VUpdateInstruction(cursor, new RegisterRange(new Register(0), mutation.Count)));
+            instructions.Add(new VUpdateInstruction(
+                cursor,
+                new RegisterRange(new Register(0), mutation.Count),
+                new Register(mutation.Count)));
         }
         instructions.Add(new VSyncInstruction(cursor));
         instructions.Add(new VCommitInstruction(cursor));
         instructions.Add(new HaltInstruction());
 
         var program = new VdbeProgram(
-            registerCount: mutations[0].Count,
+            registerCount: mutations[0].Count + 1,
             cursorCount: 1,
             instructions: instructions);
         try
@@ -7296,7 +7331,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (statement.StepResumable() != ResumableStatementStepResult.Done)
                 throw new InvalidOperationException("A managed virtual-table mutation program yielded unexpectedly.");
 
-            return new ExecutionResult([], [], statement.RowsAffected, true);
+            return new ExecutionResult([], [], statement.RowsAffected, true)
+            {
+                LastInsertRowId = statement.LastInsertRowId,
+            };
         }
         catch
         {
@@ -27985,7 +28023,7 @@ out bool hasReturning)
         out ManagedVirtualTableConstraint constraint,
         out Expression argument)
     {
-        if (predicate is LikeExpression { Negated: false } like
+        if (predicate is LikeExpression { Negated: false, Escape: null } like
             && TryGetVirtualTableColumnIndex(source, columnIndexes, like.Value, out var likeColumn)
             && !ReferencesVirtualTableColumn(source, columnIndexes, like.Pattern))
         {

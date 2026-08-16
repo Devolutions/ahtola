@@ -813,9 +813,12 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case VUpdateInstruction vUpdate:
                     {
-                        var rowId = RequireVirtualTable(vUpdate.Cursor).Update(ReadRegisters(vUpdate.Arguments));
+                        var arguments = ReadRegisters(vUpdate.Arguments);
+                        var rowId = RequireVirtualTable(vUpdate.Cursor).Update(arguments);
                         if (vUpdate.NewRowIdDestination is { } destination)
                             _registers[destination.Index] = rowId is { } value ? SqlValue.Integer(value) : SqlValue.Null;
+                        if (arguments[0].Kind == SqlValueKind.Null && rowId is { } insertedRowId)
+                            LastInsertRowId = insertedRowId;
                         RowsAffected = checked(RowsAffected + 1);
                         AdvanceInstructionPointer();
                         break;

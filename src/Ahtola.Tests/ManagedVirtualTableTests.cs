@@ -124,6 +124,101 @@ public sealed class ManagedVirtualTableTests
         Module.LastCreated.RollbackCalls.Should().Be(1);
     }
 
+    [Test]
+    public void VirtualTableDmlRejectsExplicitTransactionsBeforeMutatingTheModule()
+    {
+        _ = Module;
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, $"CREATE VIRTUAL TABLE entries USING {ModuleName};");
+        var table = Module.LastCreated!;
+
+        Execute(connection, "BEGIN;");
+        Action insert = () => Execute(connection, "INSERT INTO entries(value) VALUES (7);");
+        insert.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*not supported inside explicit transactions or savepoints");
+        Execute(connection, "ROLLBACK;");
+
+        Execute(connection, "SAVEPOINT virtual_table_write;");
+        insert.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*not supported inside explicit transactions or savepoints");
+        Execute(connection, "ROLLBACK TO virtual_table_write;");
+        Execute(connection, "RELEASE virtual_table_write;");
+
+        table.BeginCalls.Should().Be(0);
+        table.Updates.Should().BeEmpty();
+        table.RollbackCalls.Should().Be(0);
+    }
+
+    [Test]
+    public void VirtualTableSchemaChangesRejectExplicitTransactionsBeforeLifecycleCallbacks()
+    {
+        _ = Module;
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, $"CREATE VIRTUAL TABLE entries USING {ModuleName};");
+        var table = Module.LastCreated!;
+
+        Execute(connection, "BEGIN;");
+        Action create = () => Execute(connection, $"CREATE VIRTUAL TABLE other_entries USING {ModuleName};");
+        create.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*not supported inside explicit transactions or savepoints");
+        Action drop = () => Execute(connection, "DROP TABLE entries;");
+        drop.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*not supported inside explicit transactions or savepoints");
+        Action rename = () => Execute(connection, "ALTER TABLE entries RENAME TO renamed_entries;");
+        rename.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*not supported inside explicit transactions or savepoints");
+        Execute(connection, "ROLLBACK;");
+
+        table.Destroyed.Should().BeFalse();
+        ReadRows(connection, "SELECT value FROM entries;").Should().HaveCount(2);
+    }
+
+    [Test]
+    public void EscapedLikeConstraintRemainsAnEngineResidual()
+    {
+        _ = Module;
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, $"CREATE VIRTUAL TABLE entries USING {ModuleName};");
+
+        ReadRows(connection, "SELECT value FROM entries WHERE value LIKE '1' ESCAPE '#';")
+            .Select(static row => row.Single())
+            .Should().Equal(SqlValue.Integer(1));
+
+        Module.LastCreated!.LastConstraints.Should().BeEmpty();
+    }
+
+    [Test]
+    public void VirtualTableInsertPropagatesTheModuleAssignedRowId()
+    {
+        _ = Module;
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, $"CREATE VIRTUAL TABLE entries USING {ModuleName};");
+        Module.LastCreated!.InsertedRowId = 42;
+
+        Execute(connection, "INSERT INTO entries(value) VALUES (7);");
+
+        ReadRows(connection, "SELECT last_insert_rowid();").Single().Single().Should().Be(SqlValue.Integer(42));
+    }
+
+    [Test]
+    public void DisposingDatabaseDestroysRemainingVirtualTableInstances()
+    {
+        _ = Module;
+        var database = new EmbeddedDatabase();
+        var connection = database.Connect();
+        Execute(connection, $"CREATE VIRTUAL TABLE entries USING {ModuleName};");
+        var table = Module.LastCreated!;
+
+        database.Dispose();
+
+        table.Destroyed.Should().BeTrue();
+        connection.Dispose();
+    }
+
     private static TestModule RegisterModule()
     {
         var module = new TestModule();
@@ -187,6 +282,7 @@ public sealed class ManagedVirtualTableTests
         public int CommitCalls { get; private set; }
         public int RollbackCalls { get; private set; }
         public bool ThrowOnUpdate { get; set; }
+        public long? InsertedRowId { get; set; }
 
         public override ManagedVirtualTableSchema Schema => TestSchema;
 
@@ -212,6 +308,8 @@ public sealed class ManagedVirtualTableTests
             Updates.Add(arguments.ToArray());
             if (ThrowOnUpdate)
                 throw new EmbeddedSqlException("virtual update failed");
+            if (arguments[0].Kind == SqlValueKind.Null && InsertedRowId is { } insertedRowId)
+                return insertedRowId;
             return arguments[1].Kind == SqlValueKind.Integer ? arguments[1].AsInteger() : null;
         }
 
