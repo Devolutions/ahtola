@@ -157,6 +157,9 @@ internal sealed class ManagedRTreeIndex
     public IReadOnlyList<long> SearchContaining(ManagedRTreeBounds bounds)
         => Search(bounds, static (candidate, query) => candidate.Contains(query));
 
+    public IReadOnlyList<KeyValuePair<long, ManagedRTreeBounds>> Snapshot()
+        => _entries.OrderBy(static entry => entry.Key).ToArray();
+
     private IReadOnlyList<long> Search(
         ManagedRTreeBounds bounds,
         Func<ManagedRTreeBounds, ManagedRTreeBounds, bool> predicate)

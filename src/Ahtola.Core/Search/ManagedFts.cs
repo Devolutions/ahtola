@@ -288,6 +288,12 @@ internal sealed class ManagedFtsIndex
 
     public int Count => _documents.Count;
 
+    public void Clear()
+    {
+        _documents.Clear();
+        _postings.Clear();
+    }
+
     public void Upsert(long rowId, IReadOnlyList<string?> columns)
     {
         ArgumentNullException.ThrowIfNull(columns);

@@ -10,101 +10,72 @@ constraints and ordering, then sends the plan and bound arguments to cursor
 fts`), not an FTS5 virtual table (`turso-src/core/index_method/fts.rs`), and
 is implemented with Tantivy. The pinned source has no R-Tree module.
 
-The managed port must preserve the planner lifecycle, but it must not copy the
-native/unsafe extension ABI or Tantivy dependency. All module discovery and
-dispatch must be static so NativeAOT and trimming retain every implementation.
+The managed implementation follows the lifecycle shape without copying the
+native extension ABI or Tantivy dependency. Turso's index-method FTS remains a
+separate, possible future alignment path; this module is not an FTS5-parity
+claim.
 
-## Required foundation contract
+## Implemented modules
 
-The virtual-table foundation should expose these internal, managed contracts
-in `Ahtola.Core.VirtualTables`. The names may differ, but the data and
-lifecycle are required for FTS and R-Tree integration:
+`ManagedVirtualTableModuleRegistry` statically registers direct singleton
+instances of these NativeAOT-safe modules:
 
-```csharp
-internal interface IManagedVirtualTableModule
-{
-    string Name { get; }
-    ManagedVirtualTableDefinition Create(ManagedVirtualTableCreateContext context);
-}
+| Module | Accepted declaration | Initial scope |
+| --- | --- | --- |
+| `fts5` | One or more identifier column names | Managed token/posting index with term, phrase, prefix, AND/OR/NOT queries through the virtual-table cursor contract |
+| `rtree` | `id, min0, max0, ...` | Finite floating-point bounds and equality/range cursor constraints |
+| `rtree_i32` | `id, min0, max0, ...` | Integer-only coordinates and equality/range cursor constraints |
 
-internal interface IManagedVirtualTable
-{
-    ManagedVirtualTableSchema Schema { get; }
-    ManagedVirtualTablePlan BestIndex(in ManagedVirtualTableBestIndexRequest request);
-    IManagedVirtualTableCursor Open(ManagedVirtualTableOpenContext context);
-    long? Update(in ManagedVirtualTableUpdate update);
-    void Begin();
-    void Commit();
-    void Rollback();
-}
+The modules use the canonical `ManagedVirtualTableModule`,
+`ManagedVirtualTable`, `ManagedVirtualTableCursor`, and
+`ManagedVirtualTableModuleRegistry` APIs. Registration happens in the
+registry's static constructor, uses no reflection or assembly scanning, and
+directly roots every module implementation for trimming and NativeAOT.
 
-internal interface IManagedVirtualTableCursor : IDisposable
-{
-    void Filter(in ManagedVirtualTablePlan plan, ReadOnlySpan<SqlValue> arguments);
-    bool MoveNext();
-    long RowId { get; }
-    SqlValue GetColumn(int ordinal);
-}
-```
+`ManagedFtsTokenizer`, `ManagedFtsQueryParser`, and `ManagedFtsIndex` provide
+the FTS module's reusable tokenization, query parsing, and posting store.
+`ManagedRTreeBounds` and `ManagedRTreeIndex` provide inclusive
+N-dimensional bounds and deterministic spatial storage. The module adapters
+own virtual-table schema validation, `VUpdate` argument conversion, and
+transaction snapshots; the reusable components do not own catalog state.
 
-`ManagedVirtualTableBestIndexRequest` must retain each constraint's column
-ordinal, SQLite operation (including `Match`, equality, and all range
-operations), usability, collation, and requested ordering. The returned plan
-must specify a stable opaque plan identifier, an ordinal `argv` mapping, which
-constraints are omitted after filtering, estimated cost, estimated rows, and
-whether order is consumed. `Filter` receives arguments in exactly that `argv`
-order.
+## Current integration scope
 
-`ManagedVirtualTableUpdate` must distinguish insert, delete, and update; carry
-the old rowid, requested new rowid, and all declared column values. The
-foundation must invoke it under the same savepoint/rollback lifecycle as
-ordinary table writes. A module does not discover a transaction through an
-ambient connection.
+The initial modules are in-memory only. The current foundation intentionally
+rejects managed virtual tables on file-backed databases because it has no
+module-specific persistence/reopen contract. Consequently, managed FTS/R-Tree
+content is not durable, is not included in backup/catalog recovery, and must
+not be represented as persistent SQLite-compatible shadow tables yet.
 
-The create context must include the virtual-table name, schema, `IF NOT
-EXISTS`, and the raw comma-separated module arguments without interpreting
-them. FTS5 column declarations and tokenizer options are module grammar;
-R-Tree's `id, minX, maxX, ...` declaration is module grammar. The definition
-must provide declared visible/hidden columns and a durable module-specific
-storage handle. It must also serialize the original `CREATE VIRTUAL TABLE`
-statement into `sqlite_schema`, making `DROP`, `ALTER ... RENAME`, backups,
-and attached schemas behave as normal catalog objects.
+`CREATE VIRTUAL TABLE`, `SELECT` scans, `DROP`, module creation, cursors, and
+direct `Update` lifecycle calls use the canonical foundation. Ordinary SQL
+`INSERT`, `UPDATE`, and `DELETE` are not yet lowered to the foundation's
+`ManagedVirtualTable.Update` contract, so writes are currently exercised at
+that contract boundary rather than asserted as SQL DML behavior.
 
-Registration must be compile-time static:
+The modules already implement `BestIndex` and cursor `Filter` for FTS `MATCH`
+and R-Tree equality/range constraints. The present
+`EmbeddedDatabase.GetVirtualTableRows` calls `BestIndex` with an empty
+constraint/order list and `Filter` with no arguments. Thus SQL predicates
+currently execute only after an unfiltered virtual scan and cannot drive FTS
+`MATCH` or R-Tree range pushdown.
 
-```csharp
-internal static partial class ManagedVirtualTableModuleRegistry
-{
-    public static IManagedVirtualTableModule Resolve(string name) => name switch
-    {
-        "fts5" => ManagedFts5Module.Instance,
-        "rtree" => ManagedRTreeModule.Instance,
-        "rtree_i32" => ManagedRTreeI32Module.Instance,
-        _ => throw new EmbeddedSqlException($"no such module: {name}"),
-    };
-}
-```
+## Smallest follow-up foundation change
 
-No reflection, assembly loading, native extension ABI, or P/Invoke is
-permitted. If the static registry is source-generated, its generated calls
-must still directly reference every module type.
+No second module API is needed. To enable SQL predicate integration, extend
+only the existing virtual-table scan path to:
 
-## Components supplied by this change
+1. Collect source-local, conjunctive `WHERE` constraints with column ordinal,
+   operator (`MATCH`, equality, and ranges), and usability.
+2. Pass those constraints and source-local `ORDER BY` terms to `BestIndex`.
+3. Evaluate the selected constraint expressions in the returned ordinal
+   argument order and pass the resulting `SqlValue` values to `Filter`.
+4. Honor `ManagedVirtualTableConstraintUsage.Omit` when deciding which
+   predicates the engine evaluates after the scan.
 
-`Ahtola.Core.Search.ManagedFtsTokenizer`, `ManagedFtsQueryParser`, and
-`ManagedFtsIndex` supply deterministic tokenization, term/phrase/prefix
-boolean parsing, and an updateable posting store. An FTS5 module should call
-`Upsert`/`Remove` only after durable shadow-storage changes have entered the
-same transaction, and rebuild its in-memory index from that storage when
-opened.
-
-`Ahtola.Core.Spatial.ManagedRTreeBounds` and `ManagedRTreeIndex` supply
-inclusive N-dimensional geometry, deterministic tree splitting, updates, and
-intersection/containment filtering. An R-Tree module supplies the schema
-validation, exact SQLite R-Tree shadow-table layout, and numeric affinity
-rules; it should translate usable range constraints into a plan before calling
-the index.
-
-Neither component registers a module or changes SQL parsing. They can land
-before the generic foundation without creating a competing virtual-table
-stack.
+That incremental change preserves the existing static module/table/cursor
+contracts and lets the implemented FTS/R-Tree plans become SQL-visible without
+an alternate parser, catalog, registry, or dispatch stack. SQL DML lowering
+should then route VUpdate-style old rowid, new rowid, and declared columns to
+the already implemented `Update` methods under the existing
+begin/sync/commit/rollback lifecycle.
