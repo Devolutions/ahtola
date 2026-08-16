@@ -48,34 +48,26 @@ content is not durable, is not included in backup/catalog recovery, and must
 not be represented as persistent SQLite-compatible shadow tables yet.
 
 `CREATE VIRTUAL TABLE`, `SELECT` scans, `DROP`, module creation, cursors, and
-direct `Update` lifecycle calls use the canonical foundation. Ordinary SQL
-`INSERT`, `UPDATE`, and `DELETE` are not yet lowered to the foundation's
-`ManagedVirtualTable.Update` contract, so writes are currently exercised at
-that contract boundary rather than asserted as SQL DML behavior.
+SQL `INSERT`, `UPDATE`, and `DELETE` use the canonical foundation. The
+foundation extracts source-local conjunctive predicates and ordering, passes
+the selected `SqlValue` arguments to `Filter`, and honors
+`ManagedVirtualTableConstraintUsage.Omit`. FTS `MATCH` and R-Tree
+equality/range plans are therefore available through ordinary SQL, while DML
+uses the VUpdate old-rowid/new-rowid/declared-column layout under
+begin/sync/commit/rollback.
 
-The modules already implement `BestIndex` and cursor `Filter` for FTS `MATCH`
-and R-Tree equality/range constraints. The present
-`EmbeddedDatabase.GetVirtualTableRows` calls `BestIndex` with an empty
-constraint/order list and `Filter` with no arguments. Thus SQL predicates
-currently execute only after an unfiltered virtual scan and cannot drive FTS
-`MATCH` or R-Tree range pushdown.
+## Remaining product limitations
 
-## Smallest follow-up foundation change
-
-No second module API is needed. To enable SQL predicate integration, extend
-only the existing virtual-table scan path to:
-
-1. Collect source-local, conjunctive `WHERE` constraints with column ordinal,
-   operator (`MATCH`, equality, and ranges), and usability.
-2. Pass those constraints and source-local `ORDER BY` terms to `BestIndex`.
-3. Evaluate the selected constraint expressions in the returned ordinal
-   argument order and pass the resulting `SqlValue` values to `Filter`.
-4. Honor `ManagedVirtualTableConstraintUsage.Omit` when deciding which
-   predicates the engine evaluates after the scan.
-
-That incremental change preserves the existing static module/table/cursor
-contracts and lets the implemented FTS/R-Tree plans become SQL-visible without
-an alternate parser, catalog, registry, or dispatch stack. SQL DML lowering
-should then route VUpdate-style old rowid, new rowid, and declared columns to
-the already implemented `Update` methods under the existing
-begin/sync/commit/rollback lifecycle.
+- The modules remain in-memory only; no file-backed catalog reopen, shadow
+  storage, backup, or recovery support exists.
+- `fts5` is a small managed query/tokenizer subset, not FTS5 compatibility:
+  tokenizer options, external/contentless tables, auxiliary functions,
+  ranking, snippets, and FTS5-specific command syntax are unsupported.
+- `rtree` does not yet persist shadow tables or expose SQLite's full R-Tree
+  auxiliary/geometry callback surface. `rtree_i32` accepts only signed
+  32-bit integer coordinates.
+- The current generic DML path auto-assigns FTS rowids; explicitly naming
+  `rowid` in an `INSERT` column list is not supported yet.
+- Planner extraction is deliberately limited to source-local conjunctive
+  predicates. The modules do not consume ordering, so the engine remains
+  responsible for applying `ORDER BY`.

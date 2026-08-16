@@ -11,7 +11,7 @@ internal sealed class ManagedFts5Module : ManagedVirtualTableModule
     public override string Name => "fts5";
 
     public override ManagedVirtualTable Create(ManagedVirtualTableCreateContext context)
-        => new ManagedFts5Table(ParseColumnNames(context));
+        => new ManagedFts5Table(context.TableName, ParseColumnNames(context));
 
     private static IReadOnlyList<string> ParseColumnNames(ManagedVirtualTableCreateContext context)
     {
@@ -92,13 +92,16 @@ internal sealed class ManagedFts5Table : ManagedVirtualTable
     private long? _transactionNextRowId;
     private long _nextRowId = 1;
 
-    public ManagedFts5Table(IReadOnlyList<string> columnNames)
+    public ManagedFts5Table(string tableName, IReadOnlyList<string> columnNames)
     {
         _columnNames = [.. columnNames];
+        if (_columnNames.Contains(tableName, StringComparer.OrdinalIgnoreCase))
+            throw new EmbeddedSqlException("an fts5 column cannot have the same name as its table");
+
         _schema = new ManagedVirtualTableSchema(
-            _columnNames.Select(static name => new ManagedVirtualTableColumn(
-                name,
-                ManagedVirtualTableAffinity.Text)));
+            _columnNames
+                .Select(static name => new ManagedVirtualTableColumn(name, ManagedVirtualTableAffinity.Text))
+                .Append(new ManagedVirtualTableColumn(tableName, ManagedVirtualTableAffinity.Text, IsHidden: true)));
     }
 
     public override ManagedVirtualTableSchema Schema => _schema;
@@ -229,7 +232,9 @@ internal sealed class ManagedFts5Table : ManagedVirtualTable
         public override bool Eof => _position >= _matches.Count;
 
         public override SqlValue Column(int columnIndex)
-            => _matches[_position].Value[columnIndex];
+            => columnIndex == _matches[_position].Value.Length
+                ? SqlValue.Null
+                : _matches[_position].Value[columnIndex];
 
         public override long RowId => _matches[_position].Key;
 
