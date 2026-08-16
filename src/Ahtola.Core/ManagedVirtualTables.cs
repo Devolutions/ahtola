@@ -131,6 +131,11 @@ public sealed class ManagedVirtualTablePlan
         {
             if (usage.ArgumentIndex < 0)
                 throw new InvalidOperationException("A virtual-table constraint argument index cannot be negative.");
+            if (usage.Omit && usage.ArgumentIndex == 0)
+            {
+                throw new InvalidOperationException(
+                    "A virtual-table plan can omit a constraint only when it receives that constraint's filter argument.");
+            }
             if (usage.ArgumentIndex > 0 && !usedArguments.Add(usage.ArgumentIndex))
                 throw new InvalidOperationException("A virtual-table plan cannot assign one filter argument to multiple constraints.");
         }
