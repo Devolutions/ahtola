@@ -179,6 +179,8 @@ public sealed partial class EmbeddedDatabase
                 foreach (var bodyStatement in trigger.Body)
                 {
                     var localStatement = LocalizeTriggerBodyStatement(context, trigger, bodyStatement);
+                    if (localStatement is not null)
+                        EnsureConcurrentMvccDmlTargetIsSupported(localStatement, triggerContext.Tables, triggerContext);
                     var result = localStatement is null
                         ? context.TempTriggers!.ExecuteForeign(bodyStatement, triggerContext)
                         : localStatement switch

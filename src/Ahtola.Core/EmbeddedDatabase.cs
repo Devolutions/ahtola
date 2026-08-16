@@ -1658,6 +1658,59 @@ public sealed partial class EmbeddedDatabase : IDisposable
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableAlterColumnStatement or AlterTableDropColumnStatement;
 
+    private static void EnsureConcurrentMvccDmlTargetIsSupported(
+        ParsedStatement statement,
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        QueryContext context)
+    {
+        if (context.ConcurrentMvStore is null || context.ConcurrentMvccTxId is null)
+            return;
+
+        var tableName = GetConcurrentMvccDmlTargetName(statement);
+        if (tableName is null)
+            return;
+
+        if (ManagedSchemaName.TrySplit(tableName, out _, out var unqualifiedName))
+            tableName = unqualifiedName;
+
+        if (tables.TryGetValue(tableName, out var table))
+            EnsureConcurrentMvccTableIsSupported(tableName, table, context);
+        else if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+            ThrowUnsupportedConcurrentMvccSystemTableDml();
+    }
+
+    private static void EnsureConcurrentMvccTableIsSupported(
+        string tableName,
+        EmbeddedTable table,
+        QueryContext context)
+    {
+        if (context.ConcurrentMvStore is null || context.ConcurrentMvccTxId is null)
+            return;
+
+        if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+            ThrowUnsupportedConcurrentMvccSystemTableDml();
+
+        if (!table.HasRowid)
+        {
+            throw new EmbeddedSqlException(
+                "Concurrent MVCC DML is supported only for rowid user tables; WITHOUT ROWID tables require composite-key dual-cursor routing.");
+        }
+    }
+
+    private static void ThrowUnsupportedConcurrentMvccSystemTableDml()
+        => throw new EmbeddedSqlException(
+            "Concurrent MVCC DML is supported only for rowid user tables; sqlite_* tables require system-table dual-cursor routing.");
+
+    private static string? GetConcurrentMvccDmlTargetName(ParsedStatement statement)
+        => statement switch
+        {
+            InsertStatement insert => insert.TableName,
+            UpdateStatement update => update.TableName,
+            DeleteStatement delete => delete.TableName,
+            WithDmlStatement with => GetConcurrentMvccDmlTargetName(with.Dml),
+            _ => null,
+        };
+
     /// <summary>
     /// A read-only view over the live schema, used to resolve column ownership while an
     /// authorizer inspects a statement. It deliberately does not clone, does not take a
@@ -3315,6 +3368,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ExecuteTableList: executeTableList,
             ConcurrentMvStore: concurrentMvStore,
             ConcurrentMvccTxId: concurrentMvccTxId);
+        EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
@@ -11679,6 +11733,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         switch (action)
         {
             case ForeignKeyAction.Cascade when newParentValues is null:
+                EnsureConcurrentMvccTableIsSupported(childTableName, childTable, context);
                 ExecuteForeignKeyDelete(
                     context,
                     childTableName,
@@ -11688,6 +11743,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     oldParentValues);
                 return;
             case ForeignKeyAction.Cascade:
+                EnsureConcurrentMvccTableIsSupported(childTableName, childTable, context);
                 ExecuteForeignKeyUpdate(
                     context,
                     childTableName,
@@ -11700,6 +11756,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return;
             case ForeignKeyAction.SetNull:
             case ForeignKeyAction.SetDefault:
+                EnsureConcurrentMvccTableIsSupported(childTableName, childTable, context);
                 ExecuteForeignKeyUpdate(
                     context,
                     childTableName,
@@ -13712,6 +13769,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
                 foreach (var bodyStatement in trigger.Body)
                 {
+                    EnsureConcurrentMvccDmlTargetIsSupported(bodyStatement, triggerContext.Tables, triggerContext);
                     var result = bodyStatement switch
                     {
                         InsertStatement insert => ExecuteInsert(insert, EmptyParameters, triggerContext),
