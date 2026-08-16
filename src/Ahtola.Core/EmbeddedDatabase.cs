@@ -6542,9 +6542,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ambiguousQualifiedColumns = GetAmbiguousQualifiedColumns(source, context);
             AppendSchemaRowidBindings(source, context, values, qualifiedColumns);
             if (source is NamedTableSource named
-                && !IsCommonTableExpression(named, context)
-                && context.Tables.TryGetValue(named.Name, out var table)
-                && table.HasRowid)
+                && ((!IsCommonTableExpression(named, context)
+                     && context.Tables.TryGetValue(named.Name, out var table)
+                     && table.HasRowid)
+                    || TryGetVirtualTable(context, named, out _)))
             {
                 rowId = 0;
                 rowIdQualifier = named.Alias ?? named.Name;
@@ -6571,9 +6572,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         switch (source)
         {
             case NamedTableSource named
-                when !IsCommonTableExpression(named, context)
+                when (!IsCommonTableExpression(named, context)
                      && context.Tables.TryGetValue(named.Name, out var table)
-                     && table.HasRowid:
+                     && table.HasRowid)
+                     || TryGetVirtualTable(context, named, out _):
                 var rowIdIndex = values.Count;
                 values.Add(SqlValue.Integer(0));
                 var qualifier = named.Alias ?? named.Name;
@@ -23035,7 +23037,8 @@ out bool hasReturning)
                         parameters,
                         context,
                         sourceLimit,
-                        outerRow)
+                        outerRow,
+                        resolvedOrderBy)
                     : GetSourceRows(
                         statement.Source,
                         parameters,
@@ -25744,6 +25747,18 @@ out bool hasReturning)
         }
     }
 
+    // Hidden virtual-table columns participate in WHERE/planner constraints even though they
+    // are excluded from SELECT *. Keep them available while classifying join-local predicates.
+    private static IReadOnlyList<OutputColumn> GetJoinSidePredicateColumns(
+        TableSource source,
+        QueryContext context)
+        => source is NamedTableSource named && TryGetVirtualTable(context, named, out var virtualTable)
+            ? BuildOutputColumns(
+                named.Alias ?? named.Name,
+                virtualTable.Table.Schema.Columns.Select(static column => column.Name).ToArray(),
+                source)
+            : GetOutputColumns(source, context);
+
     private static IReadOnlyList<OutputColumn> GetRawOutputColumns(TableSource? source, QueryContext context)
     {
         if (source is not JoinTableSource join)
@@ -25948,7 +25963,21 @@ out bool hasReturning)
                 maximumRows,
                 outerRow),
             DerivedTableSource derived => GetDerivedTableRows(derived, parameters, context, outerRow, maximumRows),
-            JoinTableSource join => GetJoinRows(join, parameters, context, maximumRows, outerRow),
+            JoinTableSource join when sourcePredicate is not null => GetJoinRowsWithPredicatePushdown(
+                join,
+                sourcePredicate,
+                parameters,
+                context,
+                maximumRows,
+                outerRow,
+                sourceOrderBy),
+            JoinTableSource join => GetJoinRows(
+                join,
+                parameters,
+                context,
+                maximumRows,
+                outerRow,
+                sourceOrderBy: sourceOrderBy),
             _ => throw new EmbeddedSqlException($"Unsupported table source {source.GetType().Name}."),
         };
     }
@@ -25989,7 +26018,8 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context,
         long? maximumRows,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
         var (leftPredicate, rightPredicate) = SplitJoinSidePredicates(where, source, context);
 
@@ -26002,7 +26032,7 @@ out bool hasReturning)
         var leftPush = source.Kind is JoinKind.Inner or JoinKind.Left ? leftPredicate : null;
         var rightPush = source.Kind is JoinKind.Inner or JoinKind.Right ? rightPredicate : null;
         return leftPush is null && rightPush is null
-            ? GetJoinRows(source, parameters, context, maximumRows, outerRow)
+            ? GetJoinRows(source, parameters, context, maximumRows, outerRow, sourceOrderBy: sourceOrderBy)
             : GetJoinRows(
                 source,
                 parameters,
@@ -26010,7 +26040,8 @@ out bool hasReturning)
                 maximumRows,
                 outerRow,
                 leftPush,
-                rightPush);
+                rightPush,
+                sourceOrderBy);
     }
 
     private static (Expression? Left, Expression? Right) SplitJoinSidePredicates(
@@ -26018,8 +26049,8 @@ out bool hasReturning)
         JoinTableSource join,
         QueryContext context)
     {
-        var leftColumns = GetOutputColumns(join.Left, context);
-        var rightColumns = GetOutputColumns(join.Right, context);
+        var leftColumns = GetJoinSidePredicateColumns(join.Left, context);
+        var rightColumns = GetJoinSidePredicateColumns(join.Right, context);
         List<Expression>? leftConjuncts = null;
         List<Expression>? rightConjuncts = null;
         var pending = new Stack<Expression>();
@@ -26139,8 +26170,13 @@ out bool hasReturning)
                     foreach (var value in rowValue.Values)
                         pending.Push(value);
                     break;
+                case FunctionExpression { Name: "MATCH" } match:
+                    foreach (var argument in match.Arguments)
+                        pending.Push(argument);
+                    break;
                 default:
-                    // Functions, subqueries, CURRENT_* and anything else not on the
+                    // MATCH is a virtual-table constraint that must reach BestIndex. Other
+                    // functions, subqueries, CURRENT_* and anything else not on the
                     // deterministic allowlist stays out of the pushed predicate.
                     return JoinSidePredicate.None;
             }
@@ -26163,11 +26199,16 @@ out bool hasReturning)
         foreach (var row in data.Rows)
         {
             context.CheckInterrupt();
-            if (IsTrue(Evaluate(predicate, parameters, row, context)))
+            if (IsVirtualTableResidualTrue(
+                    predicate,
+                    data.OmittedVirtualTablePredicates,
+                    parameters,
+                    row,
+                    context))
                 rows.Add(row);
         }
 
-        return new SourceData(data.Columns, rows);
+        return data with { Rows = rows };
     }
 
     // Narrow a plain table scan through a statement-cached hash probe when the
@@ -26183,10 +26224,18 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context,
         long? maximumRows,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
         var probed = TryGetTransientLookupRows(source, predicate, parameters, context, outerRow);
-        return probed ?? GetSourceRows(source, parameters, context, maximumRows, outerRow);
+        return probed ?? GetSourceRows(
+            source,
+            parameters,
+            context,
+            maximumRows,
+            outerRow,
+            predicate,
+            sourceOrderBy);
     }
 
     // Returns the probed rows when the scan can use a transient lookup - including an
@@ -26460,7 +26509,8 @@ out bool hasReturning)
         Expression? sidePredicate,
         SqlValue[] parameters,
         QueryContext context,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
         var rows = sidePredicate is not null && side is JoinTableSource nestedJoin
             ? GetJoinRowsWithPredicatePushdown(
@@ -26469,14 +26519,16 @@ out bool hasReturning)
                 parameters,
                 context,
                 maximumRows: null,
-                outerRow)
+                outerRow,
+                sourceOrderBy)
             : GetSourceRowsWithTransientIndex(
                 side,
                 sidePredicate,
                 parameters,
                 context,
                 maximumRows: null,
-                outerRow);
+                outerRow,
+                sourceOrderBy);
 
         return sidePredicate is null ? rows : FilterSourceRows(rows, sidePredicate, parameters, context);
     }
@@ -26488,13 +26540,26 @@ out bool hasReturning)
         long? maximumRows,
         SourceRow? outerRow,
         Expression? leftPredicate = null,
-        Expression? rightPredicate = null)
+        Expression? rightPredicate = null,
+        IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
-        var left = GetSideSourceRows(source.Left, leftPredicate, parameters, context, outerRow);
+        var left = GetSideSourceRows(
+            source.Left,
+            leftPredicate,
+            parameters,
+            context,
+            outerRow,
+            sourceOrderBy);
         var rightIsCorrelatedTableFunction = source.Right is TableValuedFunctionSource { Arguments.Count: > 0 };
         var right = rightIsCorrelatedTableFunction
             ? new SourceData(GetSourceColumns(source.Right, context), [])
-            : GetSideSourceRows(source.Right, rightPredicate, parameters, context, outerRow);
+            : GetSideSourceRows(
+                source.Right,
+                rightPredicate,
+                parameters,
+                context,
+                outerRow,
+                sourceOrderBy);
         var leftQualifiedColumns = GetQualifiedColumns(source.Left, context);
         var rightQualifiedColumns = GetQualifiedColumns(source.Right, context);
         var leftQualifiedRowIds = GetQualifiedRowIdPlaceholders(source.Left, context);
@@ -26512,12 +26577,42 @@ out bool hasReturning)
         IEnumerable<int>? allRightIndices = null;
 
         var rows = new List<SourceRow>();
+        List<Expression>? omittedPredicates = null;
+        AddOmittedPredicates(left.OmittedVirtualTablePredicates);
+        AddOmittedPredicates(right.OmittedVirtualTablePredicates);
+
+        void AddOmittedPredicates(IReadOnlyList<Expression>? predicates)
+        {
+            if (predicates is null)
+                return;
+
+            omittedPredicates ??= [];
+            foreach (var predicate in predicates)
+            {
+                if (!omittedPredicates.Contains(predicate))
+                    omittedPredicates.Add(predicate);
+            }
+        }
+
+        SourceData CreateResult(IReadOnlyList<SourceRow> result)
+            => new(
+                columns,
+                result,
+                OmittedVirtualTablePredicates: omittedPredicates);
+
         var rightMatched = new bool[right.Rows.Count];
         foreach (var leftRow in left.Rows)
         {
             var rowsForLeft = rightIsCorrelatedTableFunction
-                ? GetSideSourceRows(source.Right, rightPredicate, parameters, context, leftRow)
+                ? GetSideSourceRows(
+                    source.Right,
+                    rightPredicate,
+                    parameters,
+                    context,
+                    leftRow,
+                    sourceOrderBy)
                 : right;
+            AddOmittedPredicates(rowsForLeft.OmittedVirtualTablePredicates);
             var matched = false;
             var candidateIndices = joinHashIndex is not null
                 ? joinHashIndex.Probe(leftRow)
@@ -26562,7 +26657,7 @@ out bool hasReturning)
                     rightMatched[rightIndex] = true;
                 rows.Add(row);
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
-                    return new SourceData(columns, rows);
+                    return CreateResult(rows);
             }
 
             if (!matched && source.Kind is JoinKind.Left or JoinKind.Full)
@@ -26588,7 +26683,7 @@ out bool hasReturning)
                     QualifiedColumnDefinitions: qualifiedColumnDefinitions,
                     AmbiguousQualifiedColumns: ambiguousQualifiedColumns));
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
-                    return new SourceData(columns, rows);
+                    return CreateResult(rows);
             }
         }
 
@@ -26621,12 +26716,12 @@ out bool hasReturning)
                     QualifiedColumnDefinitions: qualifiedColumnDefinitions,
                     AmbiguousQualifiedColumns: ambiguousQualifiedColumns));
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
-                    return new SourceData(columns, rows);
+                    return CreateResult(rows);
             }
 
         }
 
-        return new SourceData(columns, rows);
+        return CreateResult(rows);
     }
 
     private static IReadOnlyList<EmbeddedColumn?>? CombineColumnDefinitions(
@@ -27125,7 +27220,8 @@ out bool hasReturning)
         switch (source)
         {
             case NamedTableSource named
-                when context.Tables.TryGetValue(named.Name, out var table) && table.HasRowid:
+                when (context.Tables.TryGetValue(named.Name, out var table) && table.HasRowid)
+                     || TryGetVirtualTable(context, named, out _):
                 return new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase)
                 {
                     [named.Alias ?? named.Name] = null,
@@ -28105,7 +28201,7 @@ out bool hasReturning)
         if (expression is ColumnExpression column
             && (column.Qualifier is null
                 || string.Equals(column.Qualifier, source.Alias ?? source.Name, StringComparison.OrdinalIgnoreCase))
-            && columnIndexes.TryGetValue(column.Name, out columnIndex))
+            && columnIndexes.TryGetValue(column.UnqualifiedName ?? column.Name, out columnIndex))
         {
             return true;
         }

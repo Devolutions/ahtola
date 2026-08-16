@@ -82,6 +82,43 @@ public sealed class ManagedVirtualTableTests
     }
 
     [Test]
+    public void JoinPushdownPreservesVirtualMatchConstraintsOrderAndOmittedResiduals()
+    {
+        _ = Module;
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, $"CREATE VIRTUAL TABLE entries USING {ModuleName};");
+        Execute(connection, "CREATE TABLE anchors(id INTEGER);");
+        Execute(connection, "INSERT INTO anchors VALUES (1);");
+
+        ReadRows(
+                connection,
+                "SELECT entries.value FROM entries JOIN anchors ON 1 = 1 WHERE entries.query MATCH 'needle' ORDER BY entries.value DESC;")
+            .Select(static row => row.Single())
+            .Should().Equal(SqlValue.Integer(2), SqlValue.Integer(1));
+
+        Module.LastCreated!.LastConstraints.Should().Equal(
+            new ManagedVirtualTableConstraint(1, ManagedVirtualTableConstraintOperator.Match));
+        Module.LastCreated.LastOrderBy.Should().Equal(new ManagedVirtualTableOrderBy(0, Descending: true));
+        Module.LastCreated.FilterArguments.Should().Equal(SqlValue.Text("needle"));
+    }
+
+    [Test]
+    public void VirtualTableRowIdAliasesResolveInSelectAndWhere()
+    {
+        _ = Module;
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, $"CREATE VIRTUAL TABLE entries USING {ModuleName};");
+
+        ReadRows(
+                connection,
+                "SELECT entries.rowid, entries._rowid_, entries.oid FROM entries WHERE entries._rowid_ = 2;")
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2), SqlValue.Integer(2));
+    }
+
+    [Test]
     public void VirtualTableDmlUsesVUpdateArgumentLayoutAndTransactionLifecycle()
     {
         _ = Module;
