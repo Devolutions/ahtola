@@ -1673,18 +1673,33 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (ManagedSchemaName.TrySplit(tableName, out _, out var unqualifiedName))
             tableName = unqualifiedName;
 
-        if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new EmbeddedSqlException(
-                "Concurrent MVCC DML is supported only for rowid user tables; sqlite_* tables require system-table dual-cursor routing.");
-        }
+        if (tables.TryGetValue(tableName, out var table))
+            EnsureConcurrentMvccTableIsSupported(tableName, table, context);
+        else if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+            ThrowUnsupportedConcurrentMvccSystemTableDml();
+    }
 
-        if (tables.TryGetValue(tableName, out var table) && !table.HasRowid)
+    private static void EnsureConcurrentMvccTableIsSupported(
+        string tableName,
+        EmbeddedTable table,
+        QueryContext context)
+    {
+        if (context.ConcurrentMvStore is null || context.ConcurrentMvccTxId is null)
+            return;
+
+        if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+            ThrowUnsupportedConcurrentMvccSystemTableDml();
+
+        if (!table.HasRowid)
         {
             throw new EmbeddedSqlException(
                 "Concurrent MVCC DML is supported only for rowid user tables; WITHOUT ROWID tables require composite-key dual-cursor routing.");
         }
     }
+
+    private static void ThrowUnsupportedConcurrentMvccSystemTableDml()
+        => throw new EmbeddedSqlException(
+            "Concurrent MVCC DML is supported only for rowid user tables; sqlite_* tables require system-table dual-cursor routing.");
 
     private static string? GetConcurrentMvccDmlTargetName(ParsedStatement statement)
         => statement switch
@@ -11718,6 +11733,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         switch (action)
         {
             case ForeignKeyAction.Cascade when newParentValues is null:
+                EnsureConcurrentMvccTableIsSupported(childTableName, childTable, context);
                 ExecuteForeignKeyDelete(
                     context,
                     childTableName,
@@ -11727,6 +11743,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     oldParentValues);
                 return;
             case ForeignKeyAction.Cascade:
+                EnsureConcurrentMvccTableIsSupported(childTableName, childTable, context);
                 ExecuteForeignKeyUpdate(
                     context,
                     childTableName,
@@ -11739,6 +11756,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return;
             case ForeignKeyAction.SetNull:
             case ForeignKeyAction.SetDefault:
+                EnsureConcurrentMvccTableIsSupported(childTableName, childTable, context);
                 ExecuteForeignKeyUpdate(
                     context,
                     childTableName,

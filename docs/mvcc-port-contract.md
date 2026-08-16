@@ -59,7 +59,8 @@ Pinned submodule: `turso-src/` @ **v0.7.2** (`046e9cbf6`).
 - **SELECT:** dual-cursor path is rowid tables only; `sqlite_*` and WITHOUT ROWID stay catalog-only.
   Concurrent DML against those catalog-only targets fails before mutation until system-table and
   composite-key dual-cursor routing exists, preventing a transaction-local catalog change from
-  being dropped during the store-to-catalog merge.
+  being dropped during the store-to-catalog merge. The same gate applies to row-trigger bodies
+  and foreign-key CASCADE/SET NULL/SET DEFAULT actions.
 - **Process-local:** store is not cross-process (same as Turso process MVCC scope here).
 
 ## Checkpoint notes
