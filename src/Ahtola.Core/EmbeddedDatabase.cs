@@ -260,6 +260,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private Dictionary<string, EmbeddedTable> _tables = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, ViewDefinition> _views = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, TriggerDefinition> _triggers = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, VirtualTableDefinition> _virtualTables = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<(string Name, int Arity), Func<IReadOnlyList<SqlValue>, SqlValue>> _scalarFunctions = new();
     private readonly Dictionary<(string Name, int Arity), ManagedAggregateFunction> _aggregateFunctions = new();
     private readonly Dictionary<string, Func<string, string, int>> _collations = new(StringComparer.OrdinalIgnoreCase);
@@ -628,7 +629,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool PreserveSubqueryMemoSnapshot = false,
         ReturningCteScope? ReturningCteScope = null,
         MvStore? ConcurrentMvStore = null,
-        MvccTxId? ConcurrentMvccTxId = null)
+        MvccTxId? ConcurrentMvccTxId = null,
+        IReadOnlyDictionary<string, VirtualTableDefinition>? VirtualTables = null)
     {
         /// <summary>
         /// Row-loop checkpoint. It honors cooperative cancellation exactly as before and
@@ -853,11 +855,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
         public SchemaCatalog(
             Dictionary<string, EmbeddedTable> tables,
             Dictionary<string, ViewDefinition> views,
-            Dictionary<string, TriggerDefinition> triggers)
+            Dictionary<string, TriggerDefinition> triggers,
+            Dictionary<string, VirtualTableDefinition>? virtualTables = null)
         {
             Tables = tables;
             Views = views;
             Triggers = triggers;
+            VirtualTables = virtualTables ?? new Dictionary<string, VirtualTableDefinition>(
+                StringComparer.OrdinalIgnoreCase);
         }
 
         public Dictionary<string, EmbeddedTable> Tables { get; }
@@ -866,11 +871,22 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         public Dictionary<string, TriggerDefinition> Triggers { get; }
 
+        // Module instances are intentionally shared across transaction catalog snapshots. A virtual
+        // table owns its mutable state, so cloning it here would make rollback semantics misleading.
+        public Dictionary<string, VirtualTableDefinition> VirtualTables { get; }
+
         public SchemaCatalog Clone() => new(
             CloneTables(Tables),
             new Dictionary<string, ViewDefinition>(Views, StringComparer.OrdinalIgnoreCase),
-            new Dictionary<string, TriggerDefinition>(Triggers, StringComparer.OrdinalIgnoreCase));
+            new Dictionary<string, TriggerDefinition>(Triggers, StringComparer.OrdinalIgnoreCase),
+            new Dictionary<string, VirtualTableDefinition>(VirtualTables, StringComparer.OrdinalIgnoreCase));
     }
+
+    internal sealed record VirtualTableDefinition(
+        string Name,
+        string ModuleName,
+        IReadOnlyList<string> Arguments,
+        ManagedVirtualTable Table);
 
     internal sealed class AutoIncrementStatementState
     {
@@ -1295,7 +1311,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     var commitGate = hooks?.CommitGate;
                     if ((cancellationToken.CanBeCanceled || commitGate is not null) && MayMutate(statement))
                     {
-                        var cancellableWorking = new SchemaCatalog(_tables, _views, _triggers).Clone();
+                        var cancellableWorking = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
                         ExecutionResult cancellableResult;
                         try
                         {
@@ -1370,7 +1386,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             inMemoryResult = Execute(
                                 statement,
                                 parameters,
-                                new SchemaCatalog(_tables, _views, _triggers),
+                                new SchemaCatalog(_tables, _views, _triggers, _virtualTables),
                                 lastInsertRowId,
                                 foreignKeysEnabled,
                                 recursiveTriggersEnabled,
@@ -1410,7 +1426,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         return Execute(
                             statement,
                             parameters,
-                            new SchemaCatalog(_tables, _views, _triggers),
+                            new SchemaCatalog(_tables, _views, _triggers, _virtualTables),
                             lastInsertRowId,
                             foreignKeysEnabled,
                             recursiveTriggersEnabled,
@@ -1424,7 +1440,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             executeTableList,
                             externalTables);
 
-                    var working = new SchemaCatalog(_tables, _views, _triggers).Clone();
+                    var working = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
                     ExecutionResult result;
                     try
                     {
@@ -1562,7 +1578,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         get
         {
             lock (_gate)
-                return new SchemaCatalog(_tables, _views, _triggers);
+                return new SchemaCatalog(_tables, _views, _triggers, _virtualTables);
         }
     }
 
@@ -1570,7 +1586,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         lock (_gate)
         {
-            return new SchemaCatalog(_tables, _views, _triggers).Clone();
+            return new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
         }
     }
 
@@ -1640,7 +1656,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     internal static bool MayMutate(ParsedStatement statement) => statement is
-        CreateTableStatement or CreateTableAsSelectStatement
+        CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
         or DropTableStatement or CreateIndexStatement or DropIndexStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
@@ -1652,7 +1668,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         or PragmaMaxPageCountStatement;
 
     internal static bool MayChangeSchema(ParsedStatement statement) => statement is
-        CreateTableStatement or CreateTableAsSelectStatement
+        CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
         or DropTableStatement or CreateIndexStatement or DropIndexStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
@@ -1666,7 +1682,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     internal SchemaCatalog CreateAuthorizationCatalog()
     {
         lock (_gate)
-            return new SchemaCatalog(_tables, _views, _triggers);
+            return new SchemaCatalog(_tables, _views, _triggers, _virtualTables);
     }
 
     internal TransactionSnapshot CreateTransactionSnapshot(TimeSpan busyTimeout = default)
@@ -1714,7 +1730,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     unchecked((int)_fileCatalogVersion.SchemaCookie),
                     _fileCatalogVersion.UserVersion,
                     _fileCatalogVersion.ApplicationId);
-            var catalog = new SchemaCatalog(_tables, _views, _triggers).Clone();
+            var catalog = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
             _activeTransactions = checked(_activeTransactions + 1);
             return new TransactionSnapshot(
                 catalog,
@@ -1791,7 +1807,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return MaterializeCreateTableAs(
                 statement,
                 parameters,
-                new SchemaCatalog(_tables, _views, _triggers),
+                new SchemaCatalog(_tables, _views, _triggers, _virtualTables),
                 lastInsertRowId,
                 foreignKeysEnabled,
                 recursiveTriggersEnabled,
@@ -1909,7 +1925,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         lock (_gate)
         {
-            return DescribeReturning(tableName, returning, new SchemaCatalog(_tables, _views, _triggers));
+            return DescribeReturning(tableName, returning, new SchemaCatalog(_tables, _views, _triggers, _virtualTables));
         }
     }
 
@@ -2987,6 +3003,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         _tables = catalog.Tables;
         _views = catalog.Views;
         _triggers = catalog.Triggers;
+        _virtualTables = catalog.VirtualTables;
         if (fileCatalogVersion is { } version)
             _fileCatalogVersion = version;
         else if (_fileStore is null)
@@ -3314,10 +3331,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             IgnoreCheckConstraints: ignoreCheckConstraints,
             ExecuteTableList: executeTableList,
             ConcurrentMvStore: concurrentMvStore,
-            ConcurrentMvccTxId: concurrentMvccTxId);
+            ConcurrentMvccTxId: concurrentMvccTxId,
+            VirtualTables: catalog.VirtualTables);
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
+            CreateVirtualTableStatement createVirtual => ExecuteCreateVirtualTable(createVirtual, catalog),
             CreateTableAsSelectStatement => throw new InvalidOperationException(
                 "CREATE TABLE AS SELECT must be materialized by the owning connection."),
             DropTableStatement drop => ExecuteDmlWithAutoIncrementState(
@@ -4116,6 +4135,44 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return new ExecutionResult([], [], 0, true);
     }
 
+    private ExecutionResult ExecuteCreateVirtualTable(
+        CreateVirtualTableStatement statement,
+        SchemaCatalog catalog)
+    {
+        if (_fileStore is not null)
+        {
+            throw new EmbeddedSqlException(
+                "persistent managed virtual tables require a module-specific persistence implementation");
+        }
+
+        if (IsReservedObjectName(statement.Name))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {statement.Name}");
+        if (catalog.VirtualTables.ContainsKey(statement.Name))
+        {
+            if (statement.IfNotExists)
+                return ExecutionResult.Empty;
+
+            throw new EmbeddedSqlException($"table {statement.Name} already exists");
+        }
+        if (catalog.Tables.ContainsKey(statement.Name))
+            throw new EmbeddedSqlException($"there is already a table named {statement.Name}");
+        if (catalog.Views.ContainsKey(statement.Name))
+            throw new EmbeddedSqlException($"there is already a view named {statement.Name}");
+        if (catalog.Triggers.ContainsKey(statement.Name)
+            || TryFindIndex(catalog.Tables, statement.Name, out _, out _))
+        {
+            throw new EmbeddedSqlException($"there is already an object named {statement.Name}");
+        }
+
+        var table = ManagedVirtualTableModuleRegistry.Resolve(statement.ModuleName).Create(
+            new ManagedVirtualTableCreateContext(statement.Name, statement.Arguments));
+        ArgumentNullException.ThrowIfNull(table);
+        catalog.VirtualTables.Add(
+            statement.Name,
+            new VirtualTableDefinition(statement.Name, statement.ModuleName, statement.Arguments, table));
+        return new ExecutionResult([], [], 0, true);
+    }
+
     // SQLite resolves functions in CHECK constraints when the CREATE TABLE statement is
     // prepared, so unknown names fail immediately with "no such function" instead of
     // surfacing when a row is written. A name resolves when the engine implements it
@@ -4204,6 +4261,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be dropped");
         if (catalog.Views.ContainsKey(statement.Name))
             throw new EmbeddedSqlException($"use DROP VIEW to delete view {statement.Name}");
+
+        if (catalog.VirtualTables.Remove(statement.Name, out var virtualTable))
+        {
+            virtualTable.Table.Destroy();
+            RemoveTriggersForTable(catalog, statement.Name);
+            return new ExecutionResult([], [], 0, true);
+        }
 
         if (tables.TryGetValue(statement.Name, out var table))
         {
@@ -5155,6 +5219,27 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context)
     {
         var tables = catalog.Tables;
+        if (catalog.VirtualTables.TryGetValue(statement.TableName, out var virtualTable))
+        {
+            if (IsReservedObjectName(statement.NewName))
+                throw new EmbeddedSqlException($"object name reserved for internal use: {statement.NewName}");
+            if (catalog.VirtualTables.ContainsKey(statement.NewName)
+                || tables.ContainsKey(statement.NewName)
+                || catalog.Views.ContainsKey(statement.NewName)
+                || catalog.Triggers.ContainsKey(statement.NewName)
+                || TryFindIndex(tables, statement.NewName, out _, out _))
+            {
+                throw new EmbeddedSqlException($"there is already an object named {statement.NewName}");
+            }
+
+            virtualTable.Table.Rename(statement.NewName);
+            catalog.VirtualTables.Remove(statement.TableName);
+            catalog.VirtualTables.Add(
+                statement.NewName,
+                virtualTable with { Name = statement.NewName });
+            return new ExecutionResult([], [], 0, true);
+        }
+
         if (IsSqliteSequenceTable(statement.TableName) && tables.ContainsKey(statement.TableName))
             throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
         if (IsSqliteSequenceTable(statement.NewName))
@@ -25341,6 +25426,8 @@ out bool hasReturning)
                 => ResolveViewColumns(view, EnterView(context, view.Name)),
             NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare)
                 => GetSourceColumns(bare, context),
+            NamedTableSource named when TryGetVirtualTable(context, named, out var virtualTable)
+                => virtualTable.Table.Schema.Columns.Select(static column => column.Name).ToArray(),
             NamedTableSource named => GetTable(named, context.Tables).Columns,
             TableValuedFunctionSource function
                 => [.. TableValuedFunctionRegistry.Resolve(function.Name).Schema.AllColumns],
@@ -25366,6 +25453,11 @@ out bool hasReturning)
                 return BuildOutputColumns(named.Alias ?? view.Name, ResolveViewColumns(view, EnterView(context, view.Name)), source);
             case NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare):
                 return GetOutputColumns(bare, context);
+            case NamedTableSource named when TryGetVirtualTable(context, named, out var virtualTable):
+                return BuildOutputColumns(
+                    named.Alias ?? named.Name,
+                    virtualTable.Table.Schema.VisibleColumns.Select(static column => column.Name).ToArray(),
+                    source);
             case NamedTableSource named:
                 return BuildOutputColumns(named.Alias ?? named.Name, GetTable(named, context.Tables).Columns, source);
             case TableValuedFunctionSource function:
@@ -25556,6 +25648,8 @@ out bool hasReturning)
                 => GetCommonTableExpressionRows(named, commonTableExpression, outerRow, maximumRows),
             NamedTableSource named when TryGetView(context, named.Name, out var view)
                 => GetViewRows(named, view, parameters, context, maximumRows, outerRow),
+            NamedTableSource named when TryGetVirtualTable(context, named, out var virtualTable)
+                => GetVirtualTableRows(named, virtualTable, context, maximumRows, outerRow),
             NamedTableSource { IndexDirective: IndexedByDirective } named
                 => GetManagedIndexRows(
                     CreateForcedIndexScanPlan(
@@ -25577,6 +25671,32 @@ out bool hasReturning)
             JoinTableSource join => GetJoinRows(join, parameters, context, maximumRows, outerRow),
             _ => throw new EmbeddedSqlException($"Unsupported table source {source.GetType().Name}."),
         };
+    }
+
+    private static bool TryGetVirtualTable(
+        QueryContext context,
+        NamedTableSource source,
+        out VirtualTableDefinition virtualTable)
+    {
+        if (context.VirtualTables is null)
+        {
+            virtualTable = null!;
+            return false;
+        }
+
+        var name = source.Name;
+        if (ManagedSchemaName.TrySplit(name, out var schema, out var localName))
+        {
+            if (!string.Equals(schema, "main", StringComparison.OrdinalIgnoreCase))
+            {
+                virtualTable = null!;
+                return false;
+            }
+
+            name = localName;
+        }
+
+        return context.VirtualTables.TryGetValue(name, out virtualTable!);
     }
 
     // Pushes WHERE conjuncts that reference only one side of an inner join down to that side,
@@ -26754,6 +26874,10 @@ out bool hasReturning)
                 => BuildQualifiedColumns(named.Alias ?? view.Name, ResolveViewColumns(view, EnterView(context, view.Name))),
             NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare)
                 => GetQualifiedColumns(bare, context),
+            NamedTableSource named when TryGetVirtualTable(context, named, out var virtualTable)
+                => BuildQualifiedColumns(
+                    named.Alias ?? named.Name,
+                    virtualTable.Table.Schema.Columns.Select(static column => column.Name).ToArray()),
             NamedTableSource named => BuildQualifiedColumns(
                 named.Alias ?? named.Name,
                 GetTable(named, context.Tables).Columns),
@@ -27489,6 +27613,57 @@ out bool hasReturning)
         return new SourceData(columns, rows);
     }
 
+    private static SourceData GetVirtualTableRows(
+        NamedTableSource source,
+        VirtualTableDefinition definition,
+        QueryContext context,
+        long? maximumRows,
+        SourceRow? outerRow)
+    {
+        var schema = definition.Table.Schema;
+        var constraints = Array.Empty<ManagedVirtualTableConstraint>();
+        var plan = definition.Table.BestIndex(constraints, []);
+        plan.ValidateFor(constraints);
+
+        using var cursor = definition.Table.Open();
+        var positioned = cursor.Filter(plan, []);
+        var columns = schema.Columns.Select(static column => column.Name).ToArray();
+        var qualifier = source.Alias ?? source.Name;
+        var qualifiedColumns = BuildQualifiedColumns(qualifier, columns);
+        var outputColumns = BuildOutputColumns(
+            qualifier,
+            schema.VisibleColumns.Select(static column => column.Name).ToArray(),
+            source);
+        var rows = new List<SourceRow>();
+
+        while (positioned && !cursor.Eof)
+        {
+            context.CheckInterrupt();
+            if (maximumRows is { } limit && rows.Count >= limit)
+                break;
+
+            var values = new SqlValue[columns.Length];
+            for (var index = 0; index < values.Length; index++)
+                values[index] = cursor.Column(index);
+
+            rows.Add(new SourceRow(
+                columns,
+                values,
+                qualifiedColumns,
+                outerRow,
+                outputColumns,
+                cursor.RowId,
+                qualifier,
+                new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [qualifier] = cursor.RowId,
+                }));
+            cursor.Next();
+        }
+
+        return new SourceData(columns, rows);
+    }
+
     private static IReadOnlyList<QueryAffinityColumn> BuildTableValuedFunctionAffinities(
         TableValuedFunctionSource source)
     {
@@ -27499,6 +27674,24 @@ out bool hasReturning)
             columns[index] = new QueryAffinityColumn(qualifier, schema.AllColumns[index], schema.AffinityAt(index));
 
         return columns;
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> BuildVirtualTableAffinities(
+        NamedTableSource source,
+        ManagedVirtualTableSchema schema)
+    {
+        var qualifier = source.Alias ?? source.Name;
+        return schema.Columns.Select(column => new QueryAffinityColumn(
+            qualifier,
+            column.Name,
+            column.Affinity switch
+            {
+                ManagedVirtualTableAffinity.Text => ColumnAffinity.Text,
+                ManagedVirtualTableAffinity.Numeric => ColumnAffinity.Numeric,
+                ManagedVirtualTableAffinity.Integer => ColumnAffinity.Integer,
+                ManagedVirtualTableAffinity.Real => ColumnAffinity.Real,
+                _ => ColumnAffinity.Blob,
+            })).ToArray();
     }
 
     private static SqlValue GetOutputValue(SourceRow row, OutputColumn column)
@@ -28102,6 +28295,8 @@ out bool hasReturning)
                     named.Alias ?? view.Name),
             NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare)
                 => BuildTableValuedFunctionAffinities(bare),
+            NamedTableSource named when TryGetVirtualTable(context, named, out var virtualTable)
+                => BuildVirtualTableAffinities(named, virtualTable.Table.Schema),
             NamedTableSource named => GetTableAffinityColumns(named, context.Tables),
             TableValuedFunctionSource function => BuildTableValuedFunctionAffinities(function),
             DerivedTableSource derived => QualifyAffinityColumns(

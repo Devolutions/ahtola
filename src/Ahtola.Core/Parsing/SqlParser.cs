@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 using Ahtola.Core;
 
@@ -766,12 +767,59 @@ internal sealed class SqlParser
         if (ConsumeKeyword("VIRTUAL"))
         {
             ExpectKeyword("TABLE");
-            throw Error(
-                "Managed virtual tables are not supported: no module registration, planner, or execution contract is available. "
-                + "Managed CREATE VIRTUAL TABLE modules are not supported.");
+            return ParseCreateVirtualTable();
         }
 
         return ParseCreateTable(temporary: false);
+    }
+
+    private ParsedStatement ParseCreateVirtualTable()
+    {
+        var ifNotExists = false;
+        if (ConsumeKeyword("IF"))
+        {
+            ExpectKeyword("NOT");
+            ExpectKeyword("EXISTS");
+            ifNotExists = true;
+        }
+
+        var name = ParseSchemaQualifiedName(out _);
+        ExpectKeyword("USING");
+        var moduleName = ExpectIdentifier();
+        var arguments = new List<string>();
+        if (Consume(TokenKind.LeftParen))
+        {
+            var argument = new StringBuilder();
+            var depth = 0;
+            while (_lexer.Current.Kind != TokenKind.RightParen || depth != 0)
+            {
+                if (_lexer.Current.Kind == TokenKind.End)
+                    throw Error("unterminated virtual-table module argument list");
+                if (_lexer.Current.Kind == TokenKind.Comma && depth == 0)
+                {
+                    arguments.Add(argument.ToString().Trim());
+                    argument.Clear();
+                    _lexer.Next();
+                    continue;
+                }
+
+                if (_lexer.Current.Kind == TokenKind.LeftParen)
+                    depth++;
+                else if (_lexer.Current.Kind == TokenKind.RightParen)
+                    depth--;
+
+                if (argument.Length != 0)
+                    argument.Append(' ');
+                argument.Append(_lexer.Current.Text);
+                _lexer.Next();
+            }
+
+            if (argument.Length != 0)
+                arguments.Add(argument.ToString().Trim());
+            Expect(TokenKind.RightParen);
+        }
+
+        return new CreateVirtualTableStatement(name, moduleName, arguments, ifNotExists);
     }
 
     private ParsedStatement ParseCreateTable(bool temporary)
