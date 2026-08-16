@@ -280,6 +280,24 @@ public enum VdbeOpcode
     IdxDelete = 96,
     /// <summary>Reject a candidate row that fails its de-duplication/membership guards, without emitting it.</summary>
     RowGate = 97,
+    /// <summary>Open a managed virtual-table cursor (Turso <c>VOpen</c>).</summary>
+    VOpen = 98,
+    /// <summary>Filter and position a managed virtual-table cursor (Turso <c>VFilter</c>).</summary>
+    VFilter = 99,
+    /// <summary>Read a managed virtual-table column (Turso <c>VColumn</c>).</summary>
+    VColumn = 100,
+    /// <summary>Apply a managed virtual-table mutation (Turso <c>VUpdate</c>).</summary>
+    VUpdate = 101,
+    /// <summary>Advance a managed virtual-table cursor (Turso <c>VNext</c>).</summary>
+    VNext = 102,
+    /// <summary>Begin a managed virtual-table transaction.</summary>
+    VBegin = 103,
+    /// <summary>Synchronize pending managed virtual-table changes.</summary>
+    VSync = 104,
+    /// <summary>Commit a managed virtual-table transaction.</summary>
+    VCommit = 105,
+    /// <summary>Rollback a managed virtual-table transaction.</summary>
+    VRollback = 106,
 }
 
 /// <summary>Key-order seek comparison used by SeekGE/GT/LE/LT and IdxGE/GT/LE/LT.</summary>
@@ -785,6 +803,18 @@ public sealed class VdbeCursorSource
     /// these is a value-only cursor and cannot satisfy <see cref="RowIdInstruction"/>.
     /// </summary>
     public IReadOnlyList<long>? RowIds { get; }
+}
+
+/// <summary>
+/// Runtime binding for a VDBE virtual-table cursor. It carries a concrete table instance instead of
+/// a module name so bytecode never uses reflection or string-based type activation.
+/// </summary>
+public sealed class VdbeVirtualTableBinding
+{
+    public VdbeVirtualTableBinding(ManagedVirtualTable table)
+        => Table = table ?? throw new ArgumentNullException(nameof(table));
+
+    public ManagedVirtualTable Table { get; }
 }
 
 public enum VdbeJoinKind
@@ -1539,6 +1569,69 @@ public sealed record OpenWriteCursorInstruction(Cursor Cursor, string TableName,
     : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.OpenWriteCursor;
+}
+
+/// <summary>Opens the statically bound managed virtual table associated with <paramref name="Cursor"/>.</summary>
+public sealed record VOpenInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VOpen;
+}
+
+/// <summary>
+/// Passes the module-selected plan and its argument registers to a managed virtual-table cursor.
+/// Filter positions on the first row and branches when the module reports EOF.
+/// </summary>
+public sealed record VFilterInstruction(
+    Cursor Cursor,
+    ManagedVirtualTablePlan Plan,
+    RegisterRange Arguments,
+    ProgramCounter EmptyTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VFilter;
+}
+
+/// <summary>Copies one managed virtual-table column into a register.</summary>
+public sealed record VColumnInstruction(Cursor Cursor, int ColumnIndex, Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VColumn;
+}
+
+/// <summary>
+/// Applies SQLite's VUpdate argv layout from a contiguous register range and optionally receives
+/// the module-provided rowid for INSERT.
+/// </summary>
+public sealed record VUpdateInstruction(
+    Cursor Cursor,
+    RegisterRange Arguments,
+    Register? NewRowIdDestination = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VUpdate;
+}
+
+/// <summary>Advances a virtual cursor and loops while it has another row.</summary>
+public sealed record VNextInstruction(Cursor Cursor, ProgramCounter LoopTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VNext;
+}
+
+public sealed record VBeginInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VBegin;
+}
+
+public sealed record VSyncInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VSync;
+}
+
+public sealed record VCommitInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VCommit;
+}
+
+public sealed record VRollbackInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VRollback;
 }
 
 public sealed record CloseCursorInstruction(Cursor Cursor) : VdbeInstruction
@@ -2906,6 +2999,64 @@ public sealed class VdbeProgram
 
                     openCursors[openWrite.Cursor.Index] = true;
                     cursorColumnCounts[openWrite.Cursor.Index] = openWrite.ColumnCount;
+                    break;
+                case VOpenInstruction vOpen:
+                    ValidateCursor(vOpen.Cursor, instructionIndex);
+                    if (openCursors[vOpen.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {vOpen.Cursor.Index} twice.");
+                    }
+                    openCursors[vOpen.Cursor.Index] = true;
+                    break;
+                case VFilterInstruction vFilter:
+                    ValidateOpenCursor(vFilter.Cursor, openCursors, instructionIndex);
+                    ValidateRegisterRange(vFilter.Arguments, instructionIndex);
+                    ValidateJumpTarget(vFilter.EmptyTarget, instructionIndex);
+                    if (vFilter.Plan is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} filters with a null virtual-table plan.");
+                    }
+
+                    break;
+                case VColumnInstruction vColumn:
+                    ValidateOpenCursor(vColumn.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(vColumn.Destination, instructionIndex);
+                    if (vColumn.ColumnIndex < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} reads a negative virtual-table column.");
+                    }
+
+                    break;
+                case VUpdateInstruction vUpdate:
+                    ValidateOpenCursor(vUpdate.Cursor, openCursors, instructionIndex);
+                    ValidateRegisterRange(vUpdate.Arguments, instructionIndex);
+                    if (vUpdate.Arguments.Count < 2)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} VUpdate requires old and new rowid arguments.");
+                    }
+
+                    if (vUpdate.NewRowIdDestination is { } destination)
+                        ValidateRegister(destination, instructionIndex);
+                    break;
+                case VNextInstruction vNext:
+                    ValidateOpenCursor(vNext.Cursor, openCursors, instructionIndex);
+                    ValidateJumpTarget(vNext.LoopTarget, instructionIndex);
+                    break;
+                case VBeginInstruction vBegin:
+                    ValidateCursor(vBegin.Cursor, instructionIndex);
+                    break;
+                case VSyncInstruction vSync:
+                    ValidateCursor(vSync.Cursor, instructionIndex);
+                    break;
+                case VCommitInstruction vCommit:
+                    ValidateCursor(vCommit.Cursor, instructionIndex);
+                    break;
+                case VRollbackInstruction vRollback:
+                    ValidateCursor(vRollback.Cursor, instructionIndex);
                     break;
                 case OpenEphemeralInstruction openEphemeral:
                     ValidateCursor(openEphemeral.Cursor, instructionIndex);

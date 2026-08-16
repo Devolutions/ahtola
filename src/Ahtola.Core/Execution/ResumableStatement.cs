@@ -53,8 +53,10 @@ public sealed class ResumableStatement : IDisposable
     private readonly WorkTableRuntime?[] _workTables;
     private readonly WindowBufferRuntime?[] _windowBuffers;
     private readonly EphemeralTableRuntime?[] _ephemeralTables;
+    private readonly ManagedVirtualTableCursor?[] _virtualCursors;
     private readonly IReadOnlyList<VdbeCursorSource?>? _cursorSources;
     private readonly IReadOnlyList<VdbeWriteTarget?>? _writeTargets;
+    private readonly IReadOnlyList<VdbeVirtualTableBinding?>? _virtualTableBindings;
     private readonly VdbeTransactionContext _transaction;
     private readonly bool _ownsTransaction;
     private VdbeParameterBinding? _binding;
@@ -70,7 +72,8 @@ public sealed class ResumableStatement : IDisposable
         IReadOnlyList<VdbeCursorSource?>? cursorSources = null,
         IReadOnlyList<VdbeWriteTarget?>? writeTargets = null,
         VdbeParameterBinding? parameterBinding = null,
-        VdbeTransactionContext? sharedTransaction = null)
+        VdbeTransactionContext? sharedTransaction = null,
+        IReadOnlyList<VdbeVirtualTableBinding?>? virtualTableBindings = null)
     {
         ArgumentNullException.ThrowIfNull(program);
         if (cursorSources is not null && cursorSources.Count != program.CursorCount)
@@ -85,6 +88,12 @@ public sealed class ResumableStatement : IDisposable
             throw new ArgumentException(
                 $"Expected {program.CursorCount} write targets but received {writeTargets.Count}.",
                 nameof(writeTargets));
+        }
+        if (virtualTableBindings is not null && virtualTableBindings.Count != program.CursorCount)
+        {
+            throw new ArgumentException(
+                $"Expected {program.CursorCount} virtual-table bindings but received {virtualTableBindings.Count}.",
+                nameof(virtualTableBindings));
         }
 
         if (parameterBinding is not null)
@@ -107,8 +116,10 @@ public sealed class ResumableStatement : IDisposable
         _workTables = new WorkTableRuntime?[program.WorkTableCount];
         _windowBuffers = new WindowBufferRuntime?[program.WindowBufferCount];
         _ephemeralTables = new EphemeralTableRuntime?[program.CursorCount];
+        _virtualCursors = new ManagedVirtualTableCursor?[program.CursorCount];
         _cursorSources = cursorSources;
         _writeTargets = writeTargets;
+        _virtualTableBindings = virtualTableBindings;
         _binding = parameterBinding;
         _ownsTransaction = sharedTransaction is null;
         _transaction = sharedTransaction ?? new VdbeTransactionContext();
@@ -284,6 +295,14 @@ public sealed class ResumableStatement : IDisposable
                     _materializedRows[openWrite.Cursor.Index] = null;
                     AdvanceInstructionPointer();
                     break;
+                case VOpenInstruction vOpen:
+                    {
+                        OpenCursor(vOpen.Cursor);
+                        _virtualCursors[vOpen.Cursor.Index] = RequireVirtualTable(vOpen.Cursor).Open();
+                        _cursorPositions[vOpen.Cursor.Index] = -1;
+                        AdvanceInstructionPointer();
+                        break;
+                    }
                 case OpenEphemeralInstruction openEphemeral:
                     OpenCursor(openEphemeral.Cursor);
                     _ephemeralTables[openEphemeral.Cursor.Index] = new EphemeralTableRuntime(openEphemeral.ColumnCount);
@@ -301,6 +320,8 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case CloseCursorInstruction close:
                     CloseCursor(close.Cursor);
+                    _virtualCursors[close.Cursor.Index]?.Dispose();
+                    _virtualCursors[close.Cursor.Index] = null;
                     _joinCursorStates[close.Cursor.Index]?.Close();
                     _joinCursorStates[close.Cursor.Index] = null;
                     _ephemeralTables[close.Cursor.Index] = null;
@@ -365,6 +386,12 @@ public sealed class ResumableStatement : IDisposable
                         AdvanceInstructionPointer();
                         break;
                     }
+                case VColumnInstruction vColumn:
+                    {
+                        _registers[vColumn.Destination.Index] = RequireVirtualCursor(vColumn.Cursor).Column(vColumn.ColumnIndex);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
                 case RowIdInstruction rowId:
                     {
                         _registers[rowId.Destination.Index] = SqlValue.Integer(CurrentCursorRowId(rowId.Cursor));
@@ -395,6 +422,16 @@ public sealed class ResumableStatement : IDisposable
                         else
                             _instructionPointer = filter.FalseTarget;
 
+                        break;
+                    }
+                case VFilterInstruction vFilter:
+                    {
+                        var cursor = RequireVirtualCursor(vFilter.Cursor);
+                        var positioned = cursor.Filter(vFilter.Plan, ReadRegisters(vFilter.Arguments));
+                        if (positioned && !cursor.Eof)
+                            AdvanceInstructionPointer();
+                        else
+                            _instructionPointer = vFilter.EmptyTarget;
                         break;
                     }
                 case FilterRowIdInstruction filterRowId:
@@ -714,6 +751,16 @@ public sealed class ResumableStatement : IDisposable
 
                         break;
                     }
+                case VNextInstruction vNext:
+                    {
+                        var cursor = RequireVirtualCursor(vNext.Cursor);
+                        cursor.Next();
+                        if (!cursor.Eof)
+                            _instructionPointer = vNext.LoopTarget;
+                        else
+                            AdvanceInstructionPointer();
+                        break;
+                    }
                 case PrevInstruction prev:
                     {
                         _materializedRows[prev.Cursor.Index] = null;
@@ -764,6 +811,34 @@ public sealed class ResumableStatement : IDisposable
                         AdvanceInstructionPointer();
                         break;
                     }
+                case VUpdateInstruction vUpdate:
+                    {
+                        var arguments = ReadRegisters(vUpdate.Arguments);
+                        var rowId = RequireVirtualTable(vUpdate.Cursor).Update(arguments);
+                        if (vUpdate.NewRowIdDestination is { } destination)
+                            _registers[destination.Index] = rowId is { } value ? SqlValue.Integer(value) : SqlValue.Null;
+                        if (arguments[0].Kind == SqlValueKind.Null && rowId is { } insertedRowId)
+                            LastInsertRowId = insertedRowId;
+                        RowsAffected = checked(RowsAffected + 1);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case VBeginInstruction vBegin:
+                        RequireVirtualTable(vBegin.Cursor).Begin();
+                        AdvanceInstructionPointer();
+                        break;
+                case VSyncInstruction vSync:
+                        RequireVirtualTable(vSync.Cursor).Sync();
+                        AdvanceInstructionPointer();
+                        break;
+                case VCommitInstruction vCommit:
+                        RequireVirtualTable(vCommit.Cursor).Commit();
+                        AdvanceInstructionPointer();
+                        break;
+                case VRollbackInstruction vRollback:
+                        RequireVirtualTable(vRollback.Cursor).Rollback();
+                        AdvanceInstructionPointer();
+                        break;
                 case ProgramInstruction program:
                     if (ExecuteSubprogram(program, cancellationToken))
                         return ResumableStatementStepResult.Yielded;
@@ -1298,6 +1373,7 @@ public sealed class ResumableStatement : IDisposable
                         Array.Clear(_openCursors);
                         DisposeAllJoinCursors();
                         DisposeAllSorters();
+                        DisposeAllVirtualCursors();
                         Array.Clear(_windowBuffers);
                         Array.Clear(_ephemeralTables);
                         if (halt.ErrorCode != 0)
@@ -1314,6 +1390,7 @@ public sealed class ResumableStatement : IDisposable
                             Array.Clear(_openCursors);
                             DisposeAllJoinCursors();
                             DisposeAllSorters();
+                            DisposeAllVirtualCursors();
                             Array.Clear(_windowBuffers);
                             Array.Clear(_ephemeralTables);
                             throw CreateHaltIfNullException(haltIfNull);
@@ -1352,6 +1429,7 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_materializedRowIds);
         DisposeAllJoinCursors();
         DisposeAllSorters();
+        DisposeAllVirtualCursors();
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
@@ -1436,6 +1514,7 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_materializedRows);
         DisposeAllJoinCursors();
         DisposeAllSorters();
+        DisposeAllVirtualCursors();
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
@@ -1469,6 +1548,8 @@ public sealed class ResumableStatement : IDisposable
             throw new InvalidOperationException($"Cursor {cursor.Index} is not open.");
 
         _openCursors[cursor.Index] = false;
+        _virtualCursors[cursor.Index]?.Dispose();
+        _virtualCursors[cursor.Index] = null;
     }
 
     private bool ExecuteSubprogram(ProgramInstruction instruction, CancellationToken cancellationToken)
@@ -1562,6 +1643,15 @@ public sealed class ResumableStatement : IDisposable
         {
             _joinCursorStates[index]?.Close();
             _joinCursorStates[index] = null;
+        }
+    }
+
+    private void DisposeAllVirtualCursors()
+    {
+        for (var index = 0; index < _virtualCursors.Length; index++)
+        {
+            _virtualCursors[index]?.Dispose();
+            _virtualCursors[index] = null;
         }
     }
 
@@ -1662,6 +1752,21 @@ public sealed class ResumableStatement : IDisposable
         => WriteTargetOrNull(cursor)
             ?? throw new InvalidOperationException(
                 $"Cursor {cursor.Index} has no bound write target.");
+
+    private ManagedVirtualTable RequireVirtualTable(Cursor cursor)
+    {
+        var binding = _virtualTableBindings is not null && cursor.Index < _virtualTableBindings.Count
+            ? _virtualTableBindings[cursor.Index]
+            : null;
+        return binding?.Table
+            ?? throw new InvalidOperationException(
+                $"Cursor {cursor.Index} has no bound managed virtual table.");
+    }
+
+    private ManagedVirtualTableCursor RequireVirtualCursor(Cursor cursor)
+        => _virtualCursors[cursor.Index]
+            ?? throw new InvalidOperationException(
+                $"Cursor {cursor.Index} is not an open managed virtual-table cursor.");
 
     // A cursor's iteration length comes from its write target (INSERT value rows or
     // scanned UPDATE/DELETE rows) or, failing that, its read source. Streaming join
@@ -1765,6 +1870,9 @@ public sealed class ResumableStatement : IDisposable
 
     private long CurrentCursorRowId(Cursor cursor)
     {
+        if (_virtualCursors[cursor.Index] is { } virtualCursor)
+            return virtualCursor.RowId;
+
         if (_joinCursorStates[cursor.Index] is not null)
         {
             throw new InvalidOperationException(

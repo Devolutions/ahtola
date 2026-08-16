@@ -264,7 +264,7 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   (`PRAGMA wal_checkpoint` in MVCC mode). Not cross-process; residual schema-
   cookie polish and full per-page b-tree checkpoint SM remain open — see
   [docs/mvcc-port-contract.md](docs/mvcc-port-contract.md).
-- **Not implemented** — virtual tables / FTS / R-Tree, loadable extensions, raw
+- **Not implemented** — FTS / R-Tree modules, loadable extensions, raw
   `sqlite3*` handles (`Handle` is null), AEGIS encryption ciphers, sync engine /
   CDC, CREATE SEQUENCE, typed-value extensions.
 - **Native / Sync companions** — not shipped. Connection-string paths that need

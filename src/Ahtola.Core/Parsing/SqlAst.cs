@@ -22,6 +22,17 @@ internal sealed record CreateTableStatement(
     IReadOnlyList<SqlValue[]>? InitialRows = null,
     string? Sql = null) : ParsedStatement;
 
+/// <summary>
+/// A module-backed catalog table. Module arguments deliberately retain SQL text rather than
+/// being evaluated expressions: SQLite passes the CREATE VIRTUAL TABLE argument list to the module
+/// at connect/create time, not once per scanned row.
+/// </summary>
+internal sealed record CreateVirtualTableStatement(
+    string Name,
+    string ModuleName,
+    IReadOnlyList<string> Arguments,
+    bool IfNotExists) : ParsedStatement;
+
 internal sealed record CreateTableAsSelectStatement(
     string Name,
     QueryStatement Query,

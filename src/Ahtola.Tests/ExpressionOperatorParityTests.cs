@@ -574,8 +574,12 @@ public sealed class ExpressionOperatorParityTests
         Assert.Throws<EmbeddedSqlException>(() => ReadManaged(unregistered, "SELECT 'x' MATCH 'x';"))
             !.Message.Should().Be("no such function: MATCH");
         Assert.Throws<EmbeddedSqlException>(
-                () => unregistered.Prepare("CREATE VIRTUAL TABLE docs USING fts5(body);"))
-            !.Message.Should().Contain("CREATE VIRTUAL TABLE modules are not supported");
+                () =>
+                {
+                    using var statement = unregistered.Prepare("CREATE VIRTUAL TABLE docs USING fts5(body);");
+                    statement.Step();
+                })
+            !.Message.Should().Be("no such virtual table module: fts5");
     }
 
     [Test]
