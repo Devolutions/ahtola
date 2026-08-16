@@ -36,11 +36,13 @@ public sealed class ManagedSearchVirtualTableTests
         using var connection = database.Connect();
         Execute(connection, "CREATE VIRTUAL TABLE documents USING fts5(title, body);");
         Execute(connection, "CREATE VIRTUAL TABLE bounds USING rtree(id, min_x, max_x, min_y, max_y);");
+        Execute(connection, "CREATE TABLE metadata(tag TEXT);");
 
         Execute(connection, "INSERT INTO documents(title, body) VALUES ('Orchid', 'Purple flower');");
         Execute(connection, "INSERT INTO documents(title, body) VALUES ('Rose', 'Red flower');");
         Execute(connection, "INSERT INTO bounds(id, min_x, max_x, min_y, max_y) VALUES (3, 0, 10, 0, 10);");
         Execute(connection, "INSERT INTO bounds(id, min_x, max_x, min_y, max_y) VALUES (5, 20, 30, 20, 30);");
+        Execute(connection, "INSERT INTO metadata(tag) VALUES ('flora');");
 
         ReadRows(connection, "SELECT title FROM documents WHERE documents MATCH 'orchid';")
             .Should().ContainSingle()
@@ -48,6 +50,25 @@ public sealed class ManagedSearchVirtualTableTests
         ReadRows(connection, "SELECT id FROM bounds WHERE max_x >= 5 AND min_x <= 5;")
             .Should().ContainSingle()
             .Which.Should().Equal(SqlValue.Integer(3));
+        ReadRows(
+                connection,
+                "SELECT d.rowid, d.title, m.tag "
+                + "FROM documents d JOIN metadata m ON m.tag = 'flora' "
+                + "WHERE documents MATCH 'orchid';")
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Text("Orchid"), SqlValue.Text("flora"));
+        ReadRows(
+                connection,
+                "SELECT b.rowid, b.id "
+                + "FROM bounds b JOIN metadata m ON m.tag = 'flora' "
+                + "WHERE b.max_x >= 5 AND b.min_x <= 5;")
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(3), SqlValue.Integer(3));
+        ReadRows(
+                connection,
+                "SELECT d.rowid, d._rowid_, d.oid FROM documents d WHERE d._rowid_ = 1;")
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1), SqlValue.Integer(1));
 
         Execute(connection, "UPDATE documents SET body = 'White flower' WHERE title = 'Orchid';");
         Execute(connection, "DELETE FROM bounds WHERE id = 5;");
