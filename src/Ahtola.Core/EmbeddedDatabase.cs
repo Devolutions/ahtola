@@ -7268,14 +7268,35 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (mutations.Count == 0)
             return ExecutionResult.Empty;
 
-        table.Begin();
+        var cursor = new Cursor(0);
+        var instructions = new List<VdbeInstruction>
+        {
+            new VBeginInstruction(cursor),
+            new VOpenInstruction(cursor),
+        };
+        foreach (var mutation in mutations)
+        {
+            for (var index = 0; index < mutation.Count; index++)
+                instructions.Add(new LoadConstantInstruction(new Register(index), mutation[index]));
+            instructions.Add(new VUpdateInstruction(cursor, new RegisterRange(new Register(0), mutation.Count)));
+        }
+        instructions.Add(new VSyncInstruction(cursor));
+        instructions.Add(new VCommitInstruction(cursor));
+        instructions.Add(new HaltInstruction());
+
+        var program = new VdbeProgram(
+            registerCount: mutations[0].Count,
+            cursorCount: 1,
+            instructions: instructions);
         try
         {
-            foreach (var mutation in mutations)
-                table.Update(mutation);
-            table.Sync();
-            table.Commit();
-            return new ExecutionResult([], [], mutations.Count, true);
+            using var statement = new ResumableStatement(
+                program,
+                virtualTableBindings: [new VdbeVirtualTableBinding(table)]);
+            if (statement.StepResumable() != ResumableStatementStepResult.Done)
+                throw new InvalidOperationException("A managed virtual-table mutation program yielded unexpectedly.");
+
+            return new ExecutionResult([], [], statement.RowsAffected, true);
         }
         catch
         {
