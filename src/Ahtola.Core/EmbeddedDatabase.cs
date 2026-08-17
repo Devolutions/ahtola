@@ -23338,11 +23338,12 @@ out bool hasReturning)
                     limit,
                     statement.Where is null
                         ? null
-                        : (row, cancellationToken) => IsTrue(Evaluate(
+                        : (row, cancellationToken) => IsVirtualTableResidualTrue(
                             statement.Where,
+                            source.OmittedVirtualTablePredicates,
                             parameters,
                             row,
-                            context with { CancellationToken = cancellationToken })),
+                            context with { CancellationToken = cancellationToken }),
                     (row, cancellationToken) => EvaluateProjectionRow(
                         statement,
                         row,

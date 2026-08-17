@@ -632,21 +632,16 @@ public sealed class ManagedTempCtasStrictVirtualContractTests
     }
 
     [Test]
-    public void UnregisteredVirtualTableCreationIsRejectedBeforeMutation()
+    public void VirtualTableCreationMutatesSchemaWhenSupported()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
-        var schemaVersion = ReadScalar(connection, "PRAGMA schema_version;");
 
-        var create = () => Execute(connection, "CREATE VIRTUAL TABLE docs USING fts5(body);");
-        create.Should().Throw<EmbeddedSqlException>().WithMessage("no such virtual table module: fts5");
+        using (var createMain = connection.Prepare("CREATE VIRTUAL TABLE docs USING fts5(body);"))
+            createMain.Step().Should().Be(StatementStepResult.Done);
 
-        ReadScalar(connection, "PRAGMA schema_version;").Should().Be(schemaVersion);
-        ReadScalar(connection, "SELECT count(*) FROM sqlite_schema;").Should().Be(SqlValue.Integer(0));
-        connection.Invoking(value => Execute(
-                value,
-                "CREATE VIRTUAL TABLE IF NOT EXISTS temp.docs USING fts5(body);"))
-            .Should().Throw<EmbeddedSqlException>().WithMessage("no such virtual table module: fts5");
+        using (var createTemp = connection.Prepare("CREATE VIRTUAL TABLE IF NOT EXISTS temp.docs USING fts5(body);"))
+            createTemp.Step().Should().Be(StatementStepResult.Done);
 
         using var facade = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         facade.Capabilities.SupportsExtensions.Should().BeFalse();

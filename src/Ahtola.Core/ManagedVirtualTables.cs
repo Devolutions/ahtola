@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using Ahtola.Core.Search;
+using Ahtola.Core.Spatial;
 
 namespace Ahtola.Core;
 
@@ -210,6 +212,12 @@ public static class ManagedVirtualTableModuleRegistry
     private static readonly Dictionary<string, ManagedVirtualTableModule> Modules =
         new(StringComparer.OrdinalIgnoreCase);
 
+    static ManagedVirtualTableModuleRegistry()
+    {
+        Register(ManagedFts5Module.Instance);
+        Register(ManagedRTreeModule.Instance);
+        Register(ManagedRTreeI32Module.Instance);
+    }
     public static void Register(ManagedVirtualTableModule module)
     {
         ArgumentNullException.ThrowIfNull(module);

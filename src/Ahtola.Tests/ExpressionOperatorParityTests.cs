@@ -573,13 +573,10 @@ public sealed class ExpressionOperatorParityTests
         using var unregistered = new EmbeddedDatabase().Connect();
         Assert.Throws<EmbeddedSqlException>(() => ReadManaged(unregistered, "SELECT 'x' MATCH 'x';"))
             !.Message.Should().Be("no such function: MATCH");
-        Assert.Throws<EmbeddedSqlException>(
-                () =>
-                {
-                    using var statement = unregistered.Prepare("CREATE VIRTUAL TABLE docs USING fts5(body);");
-                    statement.Step();
-                })
-            !.Message.Should().Be("no such virtual table module: fts5");
+        ExecuteManaged(unregistered, "CREATE VIRTUAL TABLE docs USING fts5(body);");
+        ExecuteManaged(unregistered, "INSERT INTO docs(body) VALUES ('alphabet');");
+        ReadManaged(unregistered, "SELECT body FROM docs WHERE docs MATCH 'alphabet';")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("alphabet"));
     }
 
     [Test]
