@@ -13,6 +13,15 @@ internal sealed class ManagedFts5Module : ManagedVirtualTableModule
     public override ManagedVirtualTable Create(ManagedVirtualTableCreateContext context)
         => new ManagedFts5Table(context.TableName, ParseColumnNames(context));
 
+    public override ManagedVirtualTable Create(
+        ManagedVirtualTableCreateContext context,
+        ManagedVirtualTablePersistencePayload payload)
+    {
+        var table = new ManagedFts5Table(context.TableName, ParseColumnNames(context));
+        table.RestorePersistencePayload(payload);
+        return table;
+    }
+
     private static IReadOnlyList<string> ParseColumnNames(ManagedVirtualTableCreateContext context)
     {
         if (context.Arguments.Count == 0)
@@ -75,6 +84,15 @@ internal abstract class ManagedRTreeModuleBase(string name, bool requireIntegerC
         return new ManagedRTreeTable(columns, _requireIntegerCoordinates);
     }
 
+    public override ManagedVirtualTable Create(
+        ManagedVirtualTableCreateContext context,
+        ManagedVirtualTablePersistencePayload payload)
+    {
+        var table = Create(context);
+        ((ManagedRTreeTable)table).RestorePersistencePayload(payload);
+        return table;
+    }
+
     private static bool IsIdentifier(string value)
         => value.All(static character => char.IsLetterOrDigit(character) || character == '_')
             && !char.IsDigit(value[0]);
@@ -83,9 +101,11 @@ internal abstract class ManagedRTreeModuleBase(string name, bool requireIntegerC
 internal sealed class ManagedFts5Table : ManagedVirtualTable
 {
     private const int MatchPlan = 1;
+    private const int PersistenceVersion = 1;
 
     private readonly string[] _columnNames;
-    private readonly ManagedVirtualTableSchema _schema;
+    private string _tableName;
+    private ManagedVirtualTableSchema _schema;
     private readonly Dictionary<long, SqlValue[]> _rows = [];
     private readonly ManagedFtsIndex _index = new();
     private Dictionary<long, SqlValue[]>? _transactionSnapshot;
@@ -98,11 +118,15 @@ internal sealed class ManagedFts5Table : ManagedVirtualTable
         if (_columnNames.Contains(tableName, StringComparer.OrdinalIgnoreCase))
             throw new EmbeddedSqlException("an fts5 column cannot have the same name as its table");
 
-        _schema = new ManagedVirtualTableSchema(
+        _tableName = tableName;
+        _schema = CreateSchema(tableName);
+    }
+
+    private ManagedVirtualTableSchema CreateSchema(string tableName)
+        => new(
             _columnNames
                 .Select(static name => new ManagedVirtualTableColumn(name, ManagedVirtualTableAffinity.Text))
                 .Append(new ManagedVirtualTableColumn(tableName, ManagedVirtualTableAffinity.Text, IsHidden: true)));
-    }
 
     public override ManagedVirtualTableSchema Schema => _schema;
 
@@ -182,6 +206,68 @@ internal sealed class ManagedFts5Table : ManagedVirtualTable
         _transactionSnapshot = null;
         _nextRowId = _transactionNextRowId!.Value;
         _transactionNextRowId = null;
+    }
+
+    public override ManagedVirtualTablePersistencePayload GetPersistencePayload()
+    {
+        var writer = new ManagedVirtualTablePayloadWriter();
+        writer.WriteInt32(_columnNames.Length);
+        writer.WriteInt64(_nextRowId);
+        writer.WriteInt32(_rows.Count);
+        foreach (var (rowId, values) in _rows.OrderBy(static entry => entry.Key))
+        {
+            writer.WriteInt64(rowId);
+            foreach (var value in values)
+                ManagedVirtualTablePayloadValues.Write(writer, value);
+        }
+
+        return new ManagedVirtualTablePersistencePayload(PersistenceVersion, writer.ToArray());
+    }
+
+    public override void Rename(string newName)
+    {
+        if (string.IsNullOrWhiteSpace(newName))
+            throw new EmbeddedSqlException("virtual table name cannot be empty");
+
+        _tableName = newName;
+        _schema = CreateSchema(_tableName);
+    }
+
+    internal void RestorePersistencePayload(ManagedVirtualTablePersistencePayload payload)
+    {
+        if (payload.Version != PersistenceVersion)
+        {
+            throw new EmbeddedSqlException(
+                $"unsupported fts5 managed virtual-table persistence payload version {payload.Version}");
+        }
+
+        var reader = new ManagedVirtualTablePayloadReader(payload.Bytes.Span);
+        if (reader.ReadCount() != _columnNames.Length)
+            throw new EmbeddedSqlException("fts5 persistence payload column count does not match the declaration");
+        var nextRowId = reader.ReadInt64();
+        if (nextRowId < 1)
+            throw new EmbeddedSqlException("fts5 persistence payload has an invalid next rowid");
+
+        var rows = new Dictionary<long, SqlValue[]>();
+        var count = reader.ReadCount();
+        for (var index = 0; index < count; index++)
+        {
+            var rowId = reader.ReadInt64();
+            var values = new SqlValue[_columnNames.Length];
+            for (var column = 0; column < values.Length; column++)
+                values[column] = ManagedVirtualTablePayloadValues.Read(ref reader);
+            if (!rows.TryAdd(rowId, values))
+                throw new EmbeddedSqlException("fts5 persistence payload contains duplicate rowids");
+            if (rowId >= nextRowId)
+                throw new EmbeddedSqlException("fts5 persistence payload has an invalid next rowid");
+        }
+        reader.RequireEnd();
+
+        _rows.Clear();
+        foreach (var (rowId, values) in rows)
+            _rows.Add(rowId, values);
+        _nextRowId = nextRowId;
+        RebuildIndex();
     }
 
     private void Remove(long rowId)
@@ -267,6 +353,7 @@ internal sealed class ManagedFts5Table : ManagedVirtualTable
 internal sealed class ManagedRTreeTable : ManagedVirtualTable
 {
     private const int ConstraintPlan = 1;
+    private const int PersistenceVersion = 1;
 
     private readonly bool _requireIntegerCoordinates;
     private readonly ManagedVirtualTableSchema _schema;
@@ -380,6 +467,83 @@ internal sealed class ManagedRTreeTable : ManagedVirtualTable
         _transactionSnapshot = null;
         _nextRowId = _transactionNextRowId!.Value;
         _transactionNextRowId = null;
+    }
+
+    public override ManagedVirtualTablePersistencePayload GetPersistencePayload()
+    {
+        var writer = new ManagedVirtualTablePayloadWriter();
+        writer.WriteInt32(_schema.Columns.Count);
+        writer.WriteInt64(_nextRowId);
+        writer.WriteInt32(_rows.Count);
+        foreach (var (rowId, bounds) in _rows.OrderBy(static entry => entry.Key))
+        {
+            writer.WriteInt64(rowId);
+            for (var coordinate = 0; coordinate < _schema.Columns.Count - 1; coordinate++)
+            {
+                var value = coordinate % 2 == 0
+                    ? bounds.Minimum(coordinate / 2)
+                    : bounds.Maximum(coordinate / 2);
+                if (_requireIntegerCoordinates)
+                    writer.WriteInt32(checked((int)value));
+                else
+                    writer.WriteDouble(value);
+            }
+        }
+
+        return new ManagedVirtualTablePersistencePayload(PersistenceVersion, writer.ToArray());
+    }
+
+    internal void RestorePersistencePayload(ManagedVirtualTablePersistencePayload payload)
+    {
+        if (payload.Version != PersistenceVersion)
+        {
+            throw new EmbeddedSqlException(
+                $"unsupported {(_requireIntegerCoordinates ? "rtree_i32" : "rtree")} managed virtual-table persistence payload version {payload.Version}");
+        }
+
+        var reader = new ManagedVirtualTablePayloadReader(payload.Bytes.Span);
+        if (reader.ReadCount() != _schema.Columns.Count)
+            throw new EmbeddedSqlException("rtree persistence payload column count does not match the declaration");
+        var nextRowId = reader.ReadInt64();
+        if (nextRowId < 1)
+            throw new EmbeddedSqlException("rtree persistence payload has an invalid next rowid");
+
+        var rows = new Dictionary<long, ManagedRTreeBounds>();
+        var count = reader.ReadCount();
+        for (var index = 0; index < count; index++)
+        {
+            var rowId = reader.ReadInt64();
+            var coordinates = new double[_schema.Columns.Count - 1];
+            for (var coordinate = 0; coordinate < coordinates.Length; coordinate++)
+            {
+                coordinates[coordinate] = _requireIntegerCoordinates
+                    ? reader.ReadInt32()
+                    : reader.ReadDouble();
+                if (!double.IsFinite(coordinates[coordinate]))
+                    throw new EmbeddedSqlException("rtree persistence payload contains a non-finite coordinate");
+            }
+
+            ManagedRTreeBounds bounds;
+            try
+            {
+                bounds = new ManagedRTreeBounds(coordinates);
+            }
+            catch (ArgumentOutOfRangeException exception)
+            {
+                throw new EmbeddedSqlException("rtree persistence payload contains invalid bounds", exception);
+            }
+            if (!rows.TryAdd(rowId, bounds))
+                throw new EmbeddedSqlException("rtree persistence payload contains duplicate rowids");
+            if (rowId >= nextRowId)
+                throw new EmbeddedSqlException("rtree persistence payload has an invalid next rowid");
+        }
+        reader.RequireEnd();
+
+        _rows.Clear();
+        foreach (var (rowId, bounds) in rows)
+            _rows.Add(rowId, bounds);
+        _nextRowId = nextRowId;
+        RebuildIndex();
     }
 
     private static bool IsRangeOperator(ManagedVirtualTableConstraintOperator value)

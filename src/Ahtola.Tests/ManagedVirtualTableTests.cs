@@ -162,53 +162,50 @@ public sealed class ManagedVirtualTableTests
     }
 
     [Test]
-    public void VirtualTableDmlRejectsExplicitTransactionsBeforeMutatingTheModule()
+    public void VirtualTableDmlParticipatesInExplicitTransactionsAndSavepoints()
     {
         _ = Module;
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, $"CREATE VIRTUAL TABLE entries USING {ModuleName};");
-        var table = Module.LastCreated!;
 
         Execute(connection, "BEGIN;");
-        Action insert = () => Execute(connection, "INSERT INTO entries(value) VALUES (7);");
-        insert.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*not supported inside explicit transactions or savepoints");
+        Execute(connection, "INSERT INTO entries(value) VALUES (7);");
+        var transactionTable = Module.LastCreated!;
+        transactionTable.Updates.Should().ContainSingle();
         Execute(connection, "ROLLBACK;");
 
         Execute(connection, "SAVEPOINT virtual_table_write;");
-        insert.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*not supported inside explicit transactions or savepoints");
+        Execute(connection, "INSERT INTO entries(value) VALUES (8);");
+        Module.LastCreated!.Updates.Should().ContainSingle();
         Execute(connection, "ROLLBACK TO virtual_table_write;");
         Execute(connection, "RELEASE virtual_table_write;");
 
-        table.BeginCalls.Should().Be(0);
-        table.Updates.Should().BeEmpty();
-        table.RollbackCalls.Should().Be(0);
+        ReadRows(connection, "SELECT value FROM entries;").Should().HaveCount(2);
     }
 
     [Test]
-    public void VirtualTableSchemaChangesRejectExplicitTransactionsBeforeLifecycleCallbacks()
+    public void VirtualTableSchemaChangesRollBackWithTheirTransaction()
     {
         _ = Module;
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, $"CREATE VIRTUAL TABLE entries USING {ModuleName};");
-        var table = Module.LastCreated!;
 
         Execute(connection, "BEGIN;");
-        Action create = () => Execute(connection, $"CREATE VIRTUAL TABLE other_entries USING {ModuleName};");
-        create.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*not supported inside explicit transactions or savepoints");
-        Action drop = () => Execute(connection, "DROP TABLE entries;");
-        drop.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*not supported inside explicit transactions or savepoints");
-        Action rename = () => Execute(connection, "ALTER TABLE entries RENAME TO renamed_entries;");
-        rename.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*not supported inside explicit transactions or savepoints");
+        Execute(connection, $"CREATE VIRTUAL TABLE other_entries USING {ModuleName};");
         Execute(connection, "ROLLBACK;");
+        Action selectCreated = () => ReadRows(connection, "SELECT * FROM other_entries;");
+        selectCreated.Should().Throw<EmbeddedSqlException>().WithMessage("*no such table*");
 
-        table.Destroyed.Should().BeFalse();
+        Execute(connection, "BEGIN;");
+        Execute(connection, "ALTER TABLE entries RENAME TO renamed_entries;");
+        Execute(connection, "ROLLBACK;");
+        ReadRows(connection, "SELECT value FROM entries;").Should().HaveCount(2);
+
+        Execute(connection, "BEGIN;");
+        Execute(connection, "DROP TABLE entries;");
+        Execute(connection, "ROLLBACK;");
         ReadRows(connection, "SELECT value FROM entries;").Should().HaveCount(2);
     }
 
@@ -294,6 +291,15 @@ public sealed class ManagedVirtualTableTests
 
         public override ManagedVirtualTable Create(ManagedVirtualTableCreateContext context)
             => LastCreated = new TestTable();
+
+        public override ManagedVirtualTable Create(
+            ManagedVirtualTableCreateContext context,
+            ManagedVirtualTablePersistencePayload payload)
+        {
+            if (payload.Version != 1 || !payload.Bytes.Span.SequenceEqual(new byte[] { 1 }))
+                throw new EmbeddedSqlException("invalid test virtual-table persistence payload");
+            return LastCreated = new TestTable();
+        }
     }
 
     private sealed class TestTable : ManagedVirtualTable
@@ -322,6 +328,8 @@ public sealed class ManagedVirtualTableTests
         public long? InsertedRowId { get; set; }
 
         public override ManagedVirtualTableSchema Schema => TestSchema;
+
+        public override ManagedVirtualTablePersistencePayload GetPersistencePayload() => new(1, new byte[] { 1 });
 
         public override ManagedVirtualTablePlan BestIndex(
             IReadOnlyList<ManagedVirtualTableConstraint> constraints,

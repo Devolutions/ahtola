@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Collections.ObjectModel;
+using System.Text;
 using Ahtola.Core.Search;
 using Ahtola.Core.Spatial;
 
@@ -146,6 +148,35 @@ public sealed class ManagedVirtualTablePlan
 public sealed record ManagedVirtualTableCreateContext(string TableName, IReadOnlyList<string> Arguments);
 
 /// <summary>
+/// Opaque, module-owned state that the managed catalog persists for a virtual table. The engine
+/// transports this value unchanged; a module owns both the version number and binary layout.
+/// </summary>
+public sealed class ManagedVirtualTablePersistencePayload
+{
+    internal const int MaximumLength = 64 * 1024 * 1024;
+    private readonly byte[] _bytes;
+
+    public ManagedVirtualTablePersistencePayload(int version, ReadOnlySpan<byte> bytes)
+    {
+        if (version <= 0)
+            throw new ArgumentOutOfRangeException(nameof(version));
+        if (bytes.Length > MaximumLength)
+            throw new ArgumentOutOfRangeException(nameof(bytes));
+
+        Version = version;
+        _bytes = bytes.ToArray();
+    }
+
+    /// <summary>The module-defined, positive serialization version.</summary>
+    public int Version { get; }
+
+    /// <summary>A read-only view of the opaque module-owned state.</summary>
+    public ReadOnlyMemory<byte> Bytes => _bytes;
+
+    internal ManagedVirtualTablePersistencePayload Clone() => new(Version, _bytes);
+}
+
+/// <summary>
 /// Explicit module registration contract. Implementations are instantiated directly and registered through
 /// <see cref="ManagedVirtualTableModuleRegistry.Register"/>; the engine never discovers modules by reflection.
 /// This keeps the mechanism NativeAOT and trimming safe.
@@ -155,6 +186,16 @@ public abstract class ManagedVirtualTableModule
     public abstract string Name { get; }
 
     public abstract ManagedVirtualTable Create(ManagedVirtualTableCreateContext context);
+
+    /// <summary>
+    /// Recreates a table from the payload that this module previously produced. Modules that support
+    /// durable or transactional virtual tables must override this method without reflection.
+    /// </summary>
+    public virtual ManagedVirtualTable Create(
+        ManagedVirtualTableCreateContext context,
+        ManagedVirtualTablePersistencePayload payload)
+        => throw new EmbeddedSqlException(
+            $"managed virtual table module '{Name}' does not support persistence payload version {payload.Version}");
 }
 
 /// <summary>
@@ -170,6 +211,14 @@ public abstract class ManagedVirtualTable
         IReadOnlyList<ManagedVirtualTableOrderBy> orderBy);
 
     public abstract ManagedVirtualTableCursor Open();
+
+    /// <summary>
+    /// Captures all module-owned mutable state in a deterministic, versioned payload. The catalog
+    /// uses this snapshot for file persistence, transaction rollback, and savepoints.
+    /// </summary>
+    public virtual ManagedVirtualTablePersistencePayload GetPersistencePayload()
+        => throw new EmbeddedSqlException(
+            "managed virtual table does not support persistence; override GetPersistencePayload and Create(context, payload)");
 
     /// <summary>
     /// Receives SQLite's VUpdate argv layout: old rowid, new rowid, then declared column values.
@@ -189,6 +238,183 @@ public abstract class ManagedVirtualTable
     public virtual void Rollback() { }
     public virtual void Rename(string newName) { }
     public virtual void Destroy() { }
+}
+
+/// <summary>Small deterministic binary writer shared by the built-in module payloads.</summary>
+internal sealed class ManagedVirtualTablePayloadWriter
+{
+    private readonly MemoryStream _stream = new();
+
+    public void WriteByte(byte value) => _stream.WriteByte(value);
+
+    public void WriteInt32(int value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
+        _stream.Write(bytes);
+    }
+
+    public void WriteInt64(long value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(long)];
+        BinaryPrimitives.WriteInt64LittleEndian(bytes, value);
+        _stream.Write(bytes);
+    }
+
+    public void WriteDouble(double value) => WriteInt64(BitConverter.DoubleToInt64Bits(value));
+
+    public void WriteBytes(ReadOnlySpan<byte> bytes)
+    {
+        WriteInt32(bytes.Length);
+        _stream.Write(bytes);
+    }
+
+    public void WriteText(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        WriteBytes(Encoding.UTF8.GetBytes(value));
+    }
+
+    public byte[] ToArray() => _stream.ToArray();
+}
+
+/// <summary>Strict bounds-checked reader shared by the built-in module payloads.</summary>
+internal ref struct ManagedVirtualTablePayloadReader
+{
+    private static readonly Encoding StrictUtf8 = new UTF8Encoding(
+        encoderShouldEmitUTF8Identifier: false,
+        throwOnInvalidBytes: true);
+
+    private readonly ReadOnlySpan<byte> _bytes;
+    private int _position;
+
+    public ManagedVirtualTablePayloadReader(ReadOnlySpan<byte> bytes)
+    {
+        _bytes = bytes;
+        _position = 0;
+    }
+
+    public byte ReadByte()
+    {
+        Require(sizeof(byte));
+        return _bytes[_position++];
+    }
+
+    public int ReadInt32()
+    {
+        Require(sizeof(int));
+        var value = BinaryPrimitives.ReadInt32LittleEndian(_bytes.Slice(_position, sizeof(int)));
+        _position += sizeof(int);
+        return value;
+    }
+
+    public long ReadInt64()
+    {
+        Require(sizeof(long));
+        var value = BinaryPrimitives.ReadInt64LittleEndian(_bytes.Slice(_position, sizeof(long)));
+        _position += sizeof(long);
+        return value;
+    }
+
+    public double ReadDouble() => BitConverter.Int64BitsToDouble(ReadInt64());
+
+    public byte[] ReadBytes()
+    {
+        var length = ReadLength();
+        Require(length);
+        var value = _bytes.Slice(_position, length).ToArray();
+        _position += length;
+        return value;
+    }
+
+    public string ReadText()
+    {
+        try
+        {
+            return StrictUtf8.GetString(ReadBytes());
+        }
+        catch (DecoderFallbackException exception)
+        {
+            throw new EmbeddedSqlException("invalid managed virtual-table persistence payload text", exception);
+        }
+    }
+
+    public void RequireEnd()
+    {
+        if (_position != _bytes.Length)
+            throw new EmbeddedSqlException("invalid managed virtual-table persistence payload trailing bytes");
+    }
+
+    public int ReadCount()
+    {
+        var value = ReadInt32();
+        if (value < 0 || value > ManagedVirtualTablePersistencePayload.MaximumLength)
+            throw new EmbeddedSqlException("invalid managed virtual-table persistence payload count");
+        return value;
+    }
+
+    private int ReadLength()
+    {
+        var length = ReadInt32();
+        if (length < 0 || length > ManagedVirtualTablePersistencePayload.MaximumLength)
+            throw new EmbeddedSqlException("invalid managed virtual-table persistence payload length");
+        return length;
+    }
+
+    private void Require(int length)
+    {
+        if (length < 0 || _position > _bytes.Length - length)
+            throw new EmbeddedSqlException("truncated managed virtual-table persistence payload");
+    }
+}
+
+/// <summary>Canonical value encoding used only inside module-private virtual-table payloads.</summary>
+internal static class ManagedVirtualTablePayloadValues
+{
+    private const byte Null = 0;
+    private const byte Integer = 1;
+    private const byte Real = 2;
+    private const byte Text = 3;
+    private const byte Blob = 4;
+
+    public static void Write(ManagedVirtualTablePayloadWriter writer, SqlValue value)
+    {
+        switch (value.Kind)
+        {
+            case SqlValueKind.Null:
+                writer.WriteByte(Null);
+                return;
+            case SqlValueKind.Integer:
+                writer.WriteByte(Integer);
+                writer.WriteInt64(value.AsInteger());
+                return;
+            case SqlValueKind.Real:
+                writer.WriteByte(Real);
+                writer.WriteDouble(value.AsReal());
+                return;
+            case SqlValueKind.Text:
+                writer.WriteByte(Text);
+                writer.WriteText(value.AsText());
+                return;
+            case SqlValueKind.Blob:
+                writer.WriteByte(Blob);
+                writer.WriteBytes(value.AsBlob().Span);
+                return;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(value));
+        }
+    }
+
+    public static SqlValue Read(ref ManagedVirtualTablePayloadReader reader)
+        => reader.ReadByte() switch
+        {
+            Null => SqlValue.Null,
+            Integer => SqlValue.Integer(reader.ReadInt64()),
+            Real => SqlValue.Real(reader.ReadDouble()),
+            Text => SqlValue.Text(reader.ReadText()),
+            Blob => SqlValue.Blob(reader.ReadBytes()),
+            _ => throw new EmbeddedSqlException("invalid managed virtual-table persistence payload value type"),
+        };
 }
 
 /// <summary>One open virtual-table scan. Filter positions on the first row, if any.</summary>
