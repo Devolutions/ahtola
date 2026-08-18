@@ -8,6 +8,58 @@ namespace Ahtola.Core.Mvcc;
 /// </summary>
 internal static class MvccDualCursor
 {
+    internal readonly record struct Row(MvccKey Key, SqlValue[] Cells);
+
+    /// <summary>
+    /// Merges an ordered base image with typed MVCC overlays. The supplied
+    /// comparison must be the owning table's SQLite key comparison, including
+    /// collations and directions for a WITHOUT ROWID primary key.
+    /// </summary>
+    internal static IReadOnlyList<Row> MergeVisibleRows(
+        MvStore store,
+        MvccTxId txId,
+        long tableId,
+        IReadOnlyList<Row> baseRows,
+        Comparison<MvccKey> compare)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(baseRows);
+        ArgumentNullException.ThrowIfNull(compare);
+
+        var results = new List<Row>(baseRows.Count);
+        var covered = new HashSet<MvccKey>();
+
+        foreach (var baseRow in baseRows)
+        {
+            var identity = new MvccRowId(tableId, baseRow.Key);
+            if (store.TryRead(txId, identity, out var overlay) && overlay is not null)
+            {
+                results.Add(new Row(baseRow.Key, overlay));
+                covered.Add(baseRow.Key);
+                continue;
+            }
+
+            if (store.IsBaseRowInvalidated(txId, identity))
+            {
+                covered.Add(baseRow.Key);
+                continue;
+            }
+
+            results.Add(new Row(baseRow.Key, (SqlValue[])baseRow.Cells.Clone()));
+            covered.Add(baseRow.Key);
+        }
+
+        foreach (var (identity, cells) in store.ScanVisible(txId))
+        {
+            if (identity.TableId != tableId || covered.Contains(identity.Key))
+                continue;
+            results.Add(new Row(identity.Key, cells));
+        }
+
+        results.Sort((left, right) => compare(left.Key, right.Key));
+        return results;
+    }
+
     /// <summary>
     /// Returns the row set visible to <paramref name="txId"/>: base rows not
     /// invalidated by the store, plus live store versions for this table id.
@@ -25,39 +77,19 @@ internal static class MvccDualCursor
         if (baseRowIds.Count != baseRows.Count)
             throw new ArgumentException("Base row id and cell lists must have equal length.");
 
-        var results = new List<(long, SqlValue[])>(baseRowIds.Count);
-        var covered = new HashSet<long>();
-
+        var typedBaseRows = new Row[baseRowIds.Count];
         for (var i = 0; i < baseRowIds.Count; i++)
         {
-            var rowId = baseRowIds[i];
-            var key = new MvccRowId(tableId, rowId);
-            if (store.TryRead(txId, key, out var overlay) && overlay is not null)
-            {
-                // Live store version (insert or update) overrides the base image.
-                results.Add((rowId, overlay));
-                covered.Add(rowId);
-                continue;
-            }
-
-            if (store.IsBaseRowInvalidated(txId, key))
-            {
-                // Deleted or otherwise invalidated for this snapshot.
-                covered.Add(rowId);
-                continue;
-            }
-
-            results.Add((rowId, (SqlValue[])baseRows[i].Clone()));
-            covered.Add(rowId);
+            typedBaseRows[i] = new Row(MvccKey.FromInteger(baseRowIds[i]), baseRows[i]);
         }
 
-        foreach (var (key, cells) in store.ScanVisible(txId))
-        {
-            if (key.TableId != tableId || covered.Contains(key.RowId))
-                continue;
-            results.Add((key.RowId, cells));
-        }
-
-        return results;
+        return MergeVisibleRows(
+                store,
+                txId,
+                tableId,
+                typedBaseRows,
+                static (left, right) => left.Integer.CompareTo(right.Integer))
+            .Select(static row => (row.Key.Integer, row.Cells))
+            .ToArray();
     }
 }

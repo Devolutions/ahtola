@@ -12,7 +12,8 @@ internal sealed class MvccLogicalLog : IDisposable
 {
     // Turso logical_log.rs constants.
     private const uint LogMagic = 0x4C4D4C32; // "LML2"
-    private const byte LogVersion = 3;
+    private const byte LegacyLogVersion = 3;
+    private const byte CurrentLogVersion = 4;
     private const int LogHeaderSize = 56;
     private const int LogHeaderSaltStart = 8;
     private const int LogHeaderCrcStart = 52;
@@ -22,6 +23,7 @@ internal sealed class MvccLogicalLog : IDisposable
     private const int TxTrailerSize = 8; // crc(4)+end_magic(4)
     private const byte OpUpsertTable = 0;
     private const byte OpDeleteTable = 1;
+    private const byte OpBaseTombstone = 0x80;
 
     private readonly IFileSystem _fileSystem;
     private readonly string _path;
@@ -29,15 +31,23 @@ internal sealed class MvccLogicalLog : IDisposable
     private IFile? _file;
     private long _offset;
     private ulong _salt;
+    private byte _version;
     private bool _disposed;
 
-    private MvccLogicalLog(IFileSystem fileSystem, string path, IFile file, long offset, ulong salt)
+    private MvccLogicalLog(
+        IFileSystem fileSystem,
+        string path,
+        IFile file,
+        long offset,
+        ulong salt,
+        byte version)
     {
         _fileSystem = fileSystem;
         _path = path;
         _file = file;
         _offset = offset;
         _salt = salt;
+        _version = version;
     }
 
     internal string Path => _path;
@@ -45,6 +55,15 @@ internal sealed class MvccLogicalLog : IDisposable
     internal long Offset
     {
         get { lock (_gate) return _offset; }
+    }
+
+    /// <summary>
+    /// Whether this log needs the exclusive materializing checkpoint that upgrades
+    /// legacy rowid-only frames before typed keys can be appended.
+    /// </summary>
+    internal bool RequiresVersion4Upgrade
+    {
+        get { lock (_gate) return _version < CurrentLogVersion; }
     }
 
     /// <summary>Bytes past the log header (approximate "frames" size for checkpoint stats).</summary>
@@ -81,8 +100,21 @@ internal sealed class MvccLogicalLog : IDisposable
 
                 Span<byte> header = stackalloc byte[LogHeaderSize];
                 ReadExact(existing, 0, header);
-                var salt = ValidateHeader(header);
-                return new MvccLogicalLog(fileSystem, path, existing, existing.Length, salt);
+                try
+                {
+                    var (salt, version) = ValidateHeader(header);
+                    return new MvccLogicalLog(fileSystem, path, existing, existing.Length, salt, version);
+                }
+                catch (InvalidDataException) when (existing.Length == LogHeaderSize)
+                {
+                    // A header-only log has no committed frame to lose. This is
+                    // the recoverable interruption point of a non-atomic V3→V4
+                    // header rewrite, so recreate it instead of making a valid
+                    // catalog permanently unopenable.
+                    existing.Dispose();
+                    fileSystem.DeleteFile(path);
+                    return CreateNew(fileSystem, path);
+                }
             }
             catch
             {
@@ -101,10 +133,16 @@ internal sealed class MvccLogicalLog : IDisposable
         {
             var salt = unchecked((ulong)Random.Shared.NextInt64());
             Span<byte> header = stackalloc byte[LogHeaderSize];
-            WriteHeader(header, salt);
+            WriteHeader(header, salt, CurrentLogVersion);
             file.Write(0, header);
             file.FlushToDisk();
-            return new MvccLogicalLog(fileSystem, path, file, LogHeaderSize, salt);
+            return new MvccLogicalLog(
+                fileSystem,
+                path,
+                file,
+                LogHeaderSize,
+                salt,
+                CurrentLogVersion);
         }
         catch
         {
@@ -122,7 +160,13 @@ internal sealed class MvccLogicalLog : IDisposable
             ThrowIfDisposed();
             var file = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
 
-            var payload = EncodeOps(ops);
+            if (RequiresVersion4(ops) && _version < CurrentLogVersion)
+            {
+                throw new MvccLogicalLogUpgradeRequiredException(
+                    "MVCC typed keys require an exclusive checkpoint before upgrading the logical log to version 4.");
+            }
+
+            var payload = EncodeOps(ops, _version);
             var frameSize = TxHeaderSize + payload.Length + TxTrailerSize;
             var frame = new byte[frameSize];
             BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(0, 4), FrameMagic);
@@ -138,8 +182,18 @@ internal sealed class MvccLogicalLog : IDisposable
                 frame.AsSpan(TxHeaderSize + payload.Length + 4, 4),
                 EndMagic);
 
-            file.Write(_offset, frame);
-            file.FlushToDisk();
+            try
+            {
+                file.Write(_offset, frame);
+                file.FlushToDisk();
+            }
+            catch (Exception exception)
+            {
+                // The frame may have reached durable storage even when the
+                // caller receives an I/O failure. The commit path must not
+                // silently abort it in memory and disagree with recovery.
+                throw new MvccLogicalLogCommitIndeterminateException(exception);
+            }
             _offset += frame.Length;
         }
     }
@@ -186,12 +240,25 @@ internal sealed class MvccLogicalLog : IDisposable
                 if (actualCrc != expectedCrc)
                     throw new InvalidDataException("MVCC log frame CRC mismatch.");
 
-                var ops = DecodeOps(frame.AsSpan(TxHeaderSize, (int)payloadSize), (int)opCount);
+                var ops = DecodeOps(
+                    frame.AsSpan(TxHeaderSize, (int)payloadSize),
+                    (int)opCount,
+                    _version);
                 store.ApplyRecoveredCommit(commitTs, ops);
                 position += frameLen;
             }
 
-            _offset = Math.Max(_offset, position);
+            // A short final frame is a torn append, not a valid durability
+            // boundary. Retain the validated prefix and physically remove the
+            // tail before accepting another commit; otherwise every later reopen
+            // would stop at the same bytes and lose valid frames appended after it.
+            if (position != file.Length)
+            {
+                file.SetLength(position);
+                file.FlushToDisk();
+            }
+
+            _offset = position;
         }
     }
 
@@ -203,11 +270,85 @@ internal sealed class MvccLogicalLog : IDisposable
             ThrowIfDisposed();
             var file = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
             Span<byte> header = stackalloc byte[LogHeaderSize];
-            WriteHeader(header, _salt);
+            WriteHeader(header, _salt, _version);
             file.SetLength(0);
             file.Write(0, header);
             file.FlushToDisk();
             _offset = LogHeaderSize;
+        }
+    }
+
+    /// <summary>
+    /// Rewrites a legacy header only after its frames were materialized into the
+    /// SQLite catalog. This is intentionally forbidden while a frame remains,
+    /// avoiding a mixed V3/V4 log after interruption.
+    /// </summary>
+    internal void UpgradeToVersion4AfterCheckpoint()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_version >= CurrentLogVersion)
+                return;
+            if (_offset != LogHeaderSize)
+            {
+                throw new InvalidOperationException(
+                    "The MVCC logical log must be checkpointed to a header-only state before its version is upgraded.");
+            }
+
+            Span<byte> header = stackalloc byte[LogHeaderSize];
+            WriteHeader(header, _salt, CurrentLogVersion);
+            if (_fileSystem is IAtomicFileSystem atomicFileSystem)
+            {
+                var temporaryPath = _path + ".v4-upgrade";
+                if (_fileSystem.FileExists(temporaryPath))
+                    _fileSystem.DeleteFile(temporaryPath);
+                using (var replacement = _fileSystem.OpenFile(
+                           temporaryPath,
+                           FileOpenMode.CreateNew,
+                           readOnly: false))
+                {
+                    replacement.Write(0, header);
+                    replacement.FlushToDisk();
+                }
+
+                var current = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
+                // The catalog checkpoint already made every V3 frame durable in
+                // SQLite pages. Clearing the destination first gives every
+                // IAtomicFileSystem the same safe replacement contract: if the
+                // process stops here, reopen recreates a harmless empty V4 log.
+                current.SetLength(0);
+                current.FlushToDisk();
+                current.Dispose();
+                _file = null;
+                try
+                {
+                    atomicFileSystem.ReplaceFileAtomically(
+                        temporaryPath,
+                        _path,
+                        replaceEmptyDestination: true);
+                    _file = _fileSystem.OpenFile(_path, FileOpenMode.OpenExisting, readOnly: false);
+                }
+                catch
+                {
+                    if (_fileSystem.FileExists(_path))
+                        _file = _fileSystem.OpenFile(_path, FileOpenMode.OpenExisting, readOnly: false);
+                    throw;
+                }
+            }
+            else
+            {
+                // The fallback first makes the old header disappear durably.
+                // CreateOrOpen treats a short or invalid header-only file as an
+                // empty log, so an interruption here cannot strand catalog data.
+                var file = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
+                file.SetLength(0);
+                file.FlushToDisk();
+                file.Write(0, header);
+                file.FlushToDisk();
+            }
+
+            _version = CurrentLogVersion;
         }
     }
 
@@ -228,11 +369,11 @@ internal sealed class MvccLogicalLog : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
     }
 
-    private static void WriteHeader(Span<byte> header, ulong salt)
+    private static void WriteHeader(Span<byte> header, ulong salt, byte version)
     {
         header.Clear();
         BinaryPrimitives.WriteUInt32LittleEndian(header, LogMagic);
-        header[4] = LogVersion;
+        header[4] = version;
         header[5] = 0;
         BinaryPrimitives.WriteUInt16LittleEndian(header[6..], (ushort)LogHeaderSize);
         BinaryPrimitives.WriteUInt64LittleEndian(header[LogHeaderSaltStart..], salt);
@@ -240,13 +381,13 @@ internal sealed class MvccLogicalLog : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(header[LogHeaderCrcStart..], crc);
     }
 
-    private static ulong ValidateHeader(ReadOnlySpan<byte> header)
+    private static (ulong Salt, byte Version) ValidateHeader(ReadOnlySpan<byte> header)
     {
         var magic = BinaryPrimitives.ReadUInt32LittleEndian(header);
         if (magic != LogMagic)
             throw new InvalidDataException("Invalid MVCC logical log magic.");
         var version = header[4];
-        if (version is not (2 or 3))
+        if (version is not (2 or LegacyLogVersion or CurrentLogVersion))
             throw new InvalidDataException($"Unsupported MVCC logical log version {version}.");
         var hdrLen = BinaryPrimitives.ReadUInt16LittleEndian(header[6..]);
         if (hdrLen != LogHeaderSize)
@@ -260,18 +401,41 @@ internal sealed class MvccLogicalLog : IDisposable
         if (expected != actual)
             throw new InvalidDataException("MVCC logical log header CRC mismatch.");
 
-        return BinaryPrimitives.ReadUInt64LittleEndian(header[LogHeaderSaltStart..]);
+        return (BinaryPrimitives.ReadUInt64LittleEndian(header[LogHeaderSaltStart..]), version);
     }
 
-    private static byte[] EncodeOps(IReadOnlyList<MvccLogOp> ops)
+    private static bool RequiresVersion4(IReadOnlyList<MvccLogOp> ops)
+        => ops.Any(static op => !op.RowId.Key.IsInteger);
+
+    private static byte[] EncodeOps(IReadOnlyList<MvccLogOp> ops, byte version)
     {
         using var buffer = new MemoryStream();
         using var writer = new BinaryWriter(buffer);
         foreach (var op in ops)
         {
-            writer.Write(op.IsDelete ? OpDeleteTable : OpUpsertTable);
+            writer.Write((byte)(
+                (op.IsDelete ? OpDeleteTable : OpUpsertTable)
+                | (op.IsBaseTombstone ? OpBaseTombstone : 0)));
             writer.Write(op.RowId.TableId);
-            writer.Write(op.RowId.RowId);
+            if (version >= CurrentLogVersion)
+            {
+                WriteObjectName(writer, op.ObjectName);
+                writer.Write((byte)op.RowId.Key.Kind);
+                if (op.RowId.Key.IsInteger)
+                {
+                    writer.Write(op.RowId.Key.Integer);
+                }
+                else
+                {
+                    var key = op.RowId.Key.Record;
+                    writer.Write(key.Length);
+                    writer.Write(key.Span);
+                }
+            }
+            else
+            {
+                writer.Write(op.RowId.RowId);
+            }
             if (op.IsDelete)
             {
                 writer.Write(0);
@@ -287,7 +451,7 @@ internal sealed class MvccLogicalLog : IDisposable
         return buffer.ToArray();
     }
 
-    private static List<MvccLogOp> DecodeOps(ReadOnlySpan<byte> payload, int opCount)
+    private static List<MvccLogOp> DecodeOps(ReadOnlySpan<byte> payload, int opCount, byte version)
     {
         var ops = new List<MvccLogOp>(opCount);
         var offset = 0;
@@ -295,30 +459,110 @@ internal sealed class MvccLogicalLog : IDisposable
         {
             if (offset >= payload.Length)
                 throw new InvalidDataException("MVCC log op truncated.");
-            var kind = payload[offset++];
-            if (offset + 16 > payload.Length)
+            var encodedKind = payload[offset++];
+            var isBaseTombstone = version >= CurrentLogVersion
+                && (encodedKind & OpBaseTombstone) != 0;
+            var kind = (byte)(encodedKind & ~OpBaseTombstone);
+            if (isBaseTombstone && kind != OpDeleteTable)
+                throw new InvalidDataException("MVCC log base-tombstone flag requires a delete operation.");
+            if (offset + sizeof(long) > payload.Length)
                 throw new InvalidDataException("MVCC log op row id truncated.");
             var tableId = BinaryPrimitives.ReadInt64LittleEndian(payload[offset..]);
             offset += 8;
-            var rowId = BinaryPrimitives.ReadInt64LittleEndian(payload[offset..]);
-            offset += 8;
+            string? objectName = null;
+            if (version >= CurrentLogVersion)
+                objectName = ReadObjectName(payload, ref offset);
+            MvccKey key;
+            if (version >= CurrentLogVersion)
+            {
+                if (offset >= payload.Length)
+                    throw new InvalidDataException("MVCC log key kind truncated.");
+                var keyKind = (MvccKeyKind)payload[offset++];
+                key = keyKind switch
+                {
+                    MvccKeyKind.Integer => ReadIntegerKey(payload, ref offset),
+                    MvccKeyKind.Record => ReadRecordKey(payload, ref offset),
+                    _ => throw new InvalidDataException($"Unknown MVCC log key kind {(byte)keyKind}."),
+                };
+            }
+            else
+            {
+                if (offset + sizeof(long) > payload.Length)
+                    throw new InvalidDataException("MVCC log integer row id truncated.");
+                key = MvccKey.FromInteger(BinaryPrimitives.ReadInt64LittleEndian(payload[offset..]));
+                offset += sizeof(long);
+            }
             if (offset + 4 > payload.Length)
                 throw new InvalidDataException("MVCC log op cell count truncated.");
             var cellCount = BinaryPrimitives.ReadInt32LittleEndian(payload[offset..]);
             offset += 4;
             if (kind == OpDeleteTable)
             {
-                ops.Add(MvccLogOp.Delete(new MvccRowId(tableId, rowId)));
+                ops.Add(isBaseTombstone
+                    ? MvccLogOp.BaseTombstone(new MvccRowId(tableId, key), objectName)
+                    : MvccLogOp.Delete(new MvccRowId(tableId, key), objectName));
                 continue;
             }
 
             var cells = new SqlValue[cellCount];
             for (var c = 0; c < cellCount; c++)
                 cells[c] = ReadCell(payload, ref offset);
-            ops.Add(MvccLogOp.Upsert(new MvccRowId(tableId, rowId), cells));
+            ops.Add(MvccLogOp.Upsert(new MvccRowId(tableId, key), cells, objectName));
         }
 
         return ops;
+    }
+
+    private static MvccKey ReadIntegerKey(ReadOnlySpan<byte> payload, ref int offset)
+    {
+        if (offset + sizeof(long) > payload.Length)
+            throw new InvalidDataException("MVCC log integer key truncated.");
+        var value = BinaryPrimitives.ReadInt64LittleEndian(payload[offset..]);
+        offset += sizeof(long);
+        return MvccKey.FromInteger(value);
+    }
+
+    private static MvccKey ReadRecordKey(ReadOnlySpan<byte> payload, ref int offset)
+    {
+        if (offset + sizeof(int) > payload.Length)
+            throw new InvalidDataException("MVCC log record-key length truncated.");
+        var length = BinaryPrimitives.ReadInt32LittleEndian(payload[offset..]);
+        offset += sizeof(int);
+        if (length < 0 || offset + length > payload.Length)
+            throw new InvalidDataException("MVCC log record key truncated.");
+        var key = MvccKey.FromRecord(payload.Slice(offset, length));
+        offset += length;
+        return key;
+    }
+
+    private static void WriteObjectName(BinaryWriter writer, string? objectName)
+    {
+        if (objectName is null)
+        {
+            writer.Write(-1);
+            return;
+        }
+
+        var bytes = System.Text.Encoding.UTF8.GetBytes(objectName);
+        writer.Write(bytes.Length);
+        writer.Write(bytes);
+    }
+
+    private static string? ReadObjectName(ReadOnlySpan<byte> payload, ref int offset)
+    {
+        if (offset + sizeof(int) > payload.Length)
+            throw new InvalidDataException("MVCC log object-name length truncated.");
+        var length = BinaryPrimitives.ReadInt32LittleEndian(payload[offset..]);
+        offset += sizeof(int);
+        if (length == -1)
+            return null;
+        if (length < 0 || offset + length > payload.Length)
+            throw new InvalidDataException("MVCC log object name truncated.");
+        var name = System.Text.Encoding.UTF8.GetString(payload.Slice(offset, length));
+        offset += length;
+        if (string.IsNullOrWhiteSpace(name))
+            throw new InvalidDataException("MVCC log object name is empty.");
+        return name;
     }
 
     private static void WriteCell(BinaryWriter writer, SqlValue value)
@@ -352,6 +596,7 @@ internal sealed class MvccLogicalLog : IDisposable
                 writer.Write((byte)0);
                 break;
         }
+
     }
 
     private static SqlValue ReadCell(ReadOnlySpan<byte> payload, ref int offset)
@@ -427,25 +672,55 @@ internal sealed class MvccLogicalLog : IDisposable
     }
 }
 
+internal sealed class MvccLogicalLogUpgradeRequiredException : EmbeddedSqlException
+{
+    internal MvccLogicalLogUpgradeRequiredException(string message)
+        : base(message)
+    {
+    }
+}
+
+internal sealed class MvccLogicalLogCommitIndeterminateException : EmbeddedSqlException
+{
+    internal MvccLogicalLogCommitIndeterminateException(Exception innerException)
+        : base(
+            "The MVCC logical-log commit may have reached durable storage. Dispose and reopen the database before retrying.",
+            innerException)
+    {
+    }
+}
+
 /// <summary>One recovered or to-be-logged MVCC operation.</summary>
 internal readonly struct MvccLogOp
 {
-    private MvccLogOp(MvccRowId rowId, SqlValue[]? cells, bool isDelete)
+    private MvccLogOp(
+        MvccRowId rowId,
+        SqlValue[]? cells,
+        bool isDelete,
+        bool isBaseTombstone,
+        string? objectName)
     {
         RowId = rowId;
         Cells = cells;
         IsDelete = isDelete;
+        IsBaseTombstone = isBaseTombstone;
+        ObjectName = objectName;
     }
 
     internal MvccRowId RowId { get; }
     internal SqlValue[]? Cells { get; }
     internal bool IsDelete { get; }
+    internal bool IsBaseTombstone { get; }
+    internal string? ObjectName { get; }
 
-    internal static MvccLogOp Upsert(MvccRowId rowId, SqlValue[] cells)
-        => new(rowId, cells, isDelete: false);
+    internal static MvccLogOp Upsert(MvccRowId rowId, SqlValue[] cells, string? objectName = null)
+        => new(rowId, cells, isDelete: false, isBaseTombstone: false, objectName);
 
-    internal static MvccLogOp Delete(MvccRowId rowId)
-        => new(rowId, cells: null, isDelete: true);
+    internal static MvccLogOp Delete(MvccRowId rowId, string? objectName = null)
+        => new(rowId, cells: null, isDelete: true, isBaseTombstone: false, objectName);
+
+    internal static MvccLogOp BaseTombstone(MvccRowId rowId, string? objectName = null)
+        => new(rowId, cells: null, isDelete: true, isBaseTombstone: true, objectName);
 }
 
 /// <summary>CRC-32C (Castagnoli) used by Turso logical log framing.</summary>

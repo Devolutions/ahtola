@@ -7,7 +7,41 @@ internal readonly record struct MvccTxId(ulong Value)
 }
 
 /// <summary>Row identity within an MVCC table (Turso <c>RowID</c>).</summary>
-internal readonly record struct MvccRowId(long TableId, long RowId);
+internal readonly struct MvccRowId : IEquatable<MvccRowId>
+{
+    internal MvccRowId(long tableId, long rowId)
+        : this(tableId, MvccKey.FromInteger(rowId))
+    {
+    }
+
+    internal MvccRowId(long tableId, MvccKey key)
+    {
+        TableId = tableId;
+        Key = key;
+    }
+
+    internal long TableId { get; }
+
+    internal MvccKey Key { get; }
+
+    /// <summary>
+    /// Compatibility projection for the rowid-table path. Composite and typed
+    /// keys must use <see cref="Key"/> instead.
+    /// </summary>
+    internal long RowId => Key.Integer;
+
+    public bool Equals(MvccRowId other) => TableId == other.TableId && Key.Equals(other.Key);
+
+    public override bool Equals(object? obj) => obj is MvccRowId other && Equals(other);
+
+    public static bool operator ==(MvccRowId left, MvccRowId right) => left.Equals(right);
+
+    public static bool operator !=(MvccRowId left, MvccRowId right) => !left.Equals(right);
+
+    public override int GetHashCode() => HashCode.Combine(TableId, Key);
+
+    public override string ToString() => $"{TableId}:{Key}";
+}
 
 /// <summary>Lifecycle state of an MVCC transaction (Turso <c>TransactionState</c>).</summary>
 internal enum MvccTransactionState : byte
@@ -29,16 +63,20 @@ internal sealed class MvccTransaction
     private readonly List<MvccSavepointMark> _savepoints = [];
     private MvccTransactionState _state = MvccTransactionState.Active;
     private ulong? _commitTimestamp;
+    private bool _schemaChange;
 
-    internal MvccTransaction(MvccTxId id, ulong beginTimestamp)
+    internal MvccTransaction(MvccTxId id, ulong beginTimestamp, ulong beginCommitGeneration)
     {
         Id = id;
         BeginTimestamp = beginTimestamp;
+        BeginCommitGeneration = beginCommitGeneration;
     }
 
     internal MvccTxId Id { get; }
 
     internal ulong BeginTimestamp { get; }
+
+    internal ulong BeginCommitGeneration { get; }
 
     internal MvccTransactionState State
     {
@@ -48,6 +86,20 @@ internal sealed class MvccTransaction
     internal ulong? CommitTimestamp
     {
         get { lock (_gate) return _commitTimestamp; }
+    }
+
+    internal bool HasSchemaChange
+    {
+        get { lock (_gate) return _schemaChange; }
+    }
+
+    internal void MarkSchemaChange()
+    {
+        lock (_gate)
+        {
+            ThrowIfNotActive();
+            _schemaChange = true;
+        }
     }
 
     internal void RecordWrite(MvccRowId rowId)
@@ -215,6 +267,11 @@ internal sealed class MvStore
     private ulong _nextTxId = 1;
     private ulong _nextVersionId = 1;
     private ulong? _exclusiveTxId;
+    private ulong _schemaGeneration;
+    private ulong _commitGeneration;
+    private ulong? _schemaChangeTransaction;
+    private bool _hasUnresolvedLegacyRows;
+    private bool _hasIndeterminateCommit;
     private MvccLogicalLog? _logicalLog;
 
     internal MvStore(ILogicalClock? clock = null, MvccLogicalLog? logicalLog = null)
@@ -226,6 +283,31 @@ internal sealed class MvStore
     internal ILogicalClock Clock => _clock;
 
     internal MvccLogicalLog? LogicalLog => _logicalLog;
+
+    /// <summary>
+    /// A V3 frame does not carry the object name needed to bind its negative table
+    /// id after a cold reopen. Such a log cannot be materialized safely, so the
+    /// V3-to-V4 checkpoint upgrade must fail rather than discard its rows.
+    /// </summary>
+    internal bool CanUpgradeLegacyLog
+    {
+        get { lock (_gate) return !_hasUnresolvedLegacyRows; }
+    }
+
+    /// <summary>
+    /// Monotonic in-process schema generation. Connections use it to fail a
+    /// concurrent DDL attempt rather than applying a catalog mutation against an
+    /// older MVCC snapshot.
+    /// </summary>
+    internal ulong SchemaGeneration
+    {
+        get { lock (_gate) return _schemaGeneration; }
+    }
+
+    internal ulong CommitGeneration
+    {
+        get { lock (_gate) return _commitGeneration; }
+    }
 
     /// <summary>Attach durable log after construction (file-backed enable path).</summary>
     internal void AttachLogicalLog(MvccLogicalLog log)
@@ -243,6 +325,14 @@ internal sealed class MvStore
         {
             foreach (var op in ops)
             {
+                if (op.ObjectName is { } objectName)
+                {
+                    RegisterRecoveredTableId(op.RowId.TableId, objectName);
+                }
+                else if (!_tableNames.ContainsKey(op.RowId.TableId))
+                {
+                    _hasUnresolvedLegacyRows = true;
+                }
                 if (!_rows.TryGetValue(op.RowId, out var chain))
                 {
                     chain = [];
@@ -251,6 +341,17 @@ internal sealed class MvStore
 
                 if (op.IsDelete)
                 {
+                    if (op.IsBaseTombstone && chain.Count == 0)
+                    {
+                        chain.Add(new MvccRowVersion(
+                            _nextVersionId++,
+                            begin: MvccStamp.FromTimestamp(commitTs),
+                            end: null,
+                            cells: [],
+                            isTombstone: true));
+                        continue;
+                    }
+
                     // End the latest live version at commitTs.
                     for (var i = chain.Count - 1; i >= 0; i--)
                     {
@@ -297,6 +398,41 @@ internal sealed class MvStore
             return _tableNames.TryGetValue(tableId, out name);
     }
 
+    private void RegisterRecoveredTableId(long tableId, string tableName)
+    {
+        if (_tableNames.TryGetValue(tableId, out var existingName)
+            && !string.Equals(existingName, tableName, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                $"MVCC logical log maps table id {tableId} to both '{existingName}' and '{tableName}'.");
+        }
+        if (_tableIds.TryGetValue(tableName, out var existingId) && existingId != tableId)
+        {
+            throw new InvalidDataException(
+                $"MVCC logical log maps table '{tableName}' to both {existingId} and {tableId}.");
+        }
+
+        _tableIds[tableName] = tableId;
+        _tableNames[tableId] = tableName;
+        _nextTableId = Math.Min(_nextTableId, checked(tableId - 1));
+    }
+
+    private MvccLogOp CreateLogUpsert(MvccRowId rowId, SqlValue[] cells)
+        => MvccLogOp.Upsert(
+            rowId,
+            cells,
+            _tableNames.TryGetValue(rowId.TableId, out var objectName) ? objectName : null);
+
+    private MvccLogOp CreateLogDelete(MvccRowId rowId)
+        => MvccLogOp.Delete(
+            rowId,
+            _tableNames.TryGetValue(rowId.TableId, out var objectName) ? objectName : null);
+
+    private MvccLogOp CreateLogBaseTombstone(MvccRowId rowId)
+        => MvccLogOp.BaseTombstone(
+            rowId,
+            _tableNames.TryGetValue(rowId.TableId, out var objectName) ? objectName : null);
+
     /// <summary>
     /// Process-wide unique rowid allocator for concurrent writers that each hold
     /// a private classic catalog snapshot (pooled connections).
@@ -341,12 +477,17 @@ internal sealed class MvStore
     {
         lock (_gate)
         {
-            if (_exclusiveTxId is not null)
+            if (_hasIndeterminateCommit)
+            {
+                throw new EmbeddedSqlException(
+                    "The MVCC store has an indeterminate logical-log commit; dispose and reopen the database before starting another transaction.");
+            }
+            if (_exclusiveTxId is not null || _schemaChangeTransaction is not null)
                 throw new EmbeddedBusyException();
 
             var beginTs = NextBeginTimestamp();
             var id = new MvccTxId(_nextTxId++);
-            var tx = new MvccTransaction(id, beginTs);
+            var tx = new MvccTransaction(id, beginTs, _commitGeneration);
             _transactions.Add(id.Value, tx);
             return tx;
         }
@@ -356,6 +497,11 @@ internal sealed class MvStore
     {
         lock (_gate)
         {
+            if (_hasIndeterminateCommit)
+            {
+                throw new EmbeddedSqlException(
+                    "The MVCC store has an indeterminate logical-log commit; dispose and reopen the database before starting another transaction.");
+            }
             if (_exclusiveTxId is { } held
                 && (existing is null || held != existing.Value.Value))
             {
@@ -371,7 +517,7 @@ internal sealed class MvStore
 
             var beginTs = NextBeginTimestamp();
             var id = new MvccTxId(_nextTxId++);
-            var tx = new MvccTransaction(id, beginTs);
+            var tx = new MvccTransaction(id, beginTs, _commitGeneration);
             _transactions.Add(id.Value, tx);
             _exclusiveTxId = id.Value;
             return tx;
@@ -384,6 +530,102 @@ internal sealed class MvStore
             return _transactions.TryGetValue(id.Value, out transaction);
     }
 
+    internal bool HasPendingWrites(MvccTxId id)
+    {
+        lock (_gate)
+            return RequireActive(id).SnapshotWriteSet().Count != 0;
+    }
+
+    /// <summary>
+    /// Reserves the schema publication slot for an active concurrent transaction.
+    /// DDL deliberately fails busy when another reader or writer has already
+    /// pinned an MVCC snapshot; publishing a schema against that snapshot would
+    /// otherwise leave compiled cursors with stale object bindings.
+    /// </summary>
+    internal void BeginSchemaChange(MvccTxId id)
+    {
+        lock (_gate)
+        {
+            var tx = RequireActive(id);
+            if (tx.BeginCommitGeneration != _commitGeneration)
+                throw new EmbeddedBusyException();
+            if (_schemaChangeTransaction is { } owner && owner != id.Value)
+                throw new EmbeddedBusyException();
+
+            foreach (var candidate in _transactions.Values)
+            {
+                if (candidate.Id != id
+                    && candidate.State is MvccTransactionState.Active or MvccTransactionState.Preparing)
+                {
+                    throw new EmbeddedBusyException();
+                }
+            }
+
+            tx.MarkSchemaChange();
+            _schemaChangeTransaction = id.Value;
+        }
+    }
+
+    internal bool HasSchemaChange(MvccTxId id)
+    {
+        lock (_gate)
+        {
+            return _transactions.TryGetValue(id.Value, out var tx)
+                ? tx.HasSchemaChange
+                : _schemaChangeTransaction == id.Value;
+        }
+    }
+
+    /// <summary>
+    /// Publishes a schema generation only after the catalog and page-one cookie
+    /// have committed through the normal pager/WAL path.
+    /// </summary>
+    internal void PublishSchemaChange(MvccTxId id)
+    {
+        lock (_gate)
+        {
+            if (_schemaChangeTransaction != id.Value)
+                throw new InvalidOperationException("The MVCC transaction does not own a pending schema publication.");
+            _schemaGeneration = checked(_schemaGeneration + 1);
+            _schemaChangeTransaction = null;
+        }
+    }
+
+    internal void CancelSchemaChange(MvccTxId id)
+    {
+        lock (_gate)
+        {
+            if (_schemaChangeTransaction == id.Value)
+                _schemaChangeTransaction = null;
+        }
+    }
+
+    /// <summary>
+    /// A schema catalog was durably rewritten after all concurrent snapshots were
+    /// excluded. Its catalog already contains every committed logical row, so
+    /// retire the old object identities and their log prefix before a table name
+    /// can be reused by CREATE/RENAME.
+    /// </summary>
+    internal void CompleteSchemaCheckpoint()
+    {
+        lock (_gate)
+        {
+            if (HasActiveTransactionsLocked())
+            {
+                throw new InvalidOperationException(
+                    "Cannot retire MVCC object identities while a transaction is active.");
+            }
+
+            _rows.Clear();
+            _tableIds.Clear();
+            _tableNames.Clear();
+            _nextRowIds.Clear();
+            _nextTableId = -2;
+            _logicalLog?.TruncateAfterCheckpoint();
+            if (_logicalLog is { RequiresVersion4Upgrade: true })
+                _logicalLog.UpgradeToVersion4AfterCheckpoint();
+        }
+    }
     /// <summary>Insert a new live version created by <paramref name="txId"/>.</summary>
     internal void Insert(MvccTxId txId, MvccRowId rowId, SqlValue[] cells)
     {
@@ -401,9 +643,13 @@ internal sealed class MvStore
                 chain = [];
                 _rows[rowId] = chain;
             }
+            else if (!rowId.Key.IsInteger)
+            {
+                ThrowIfTypedKeyInsertConflict(tx, chain);
+            }
 
             chain.Add(version);
-            tx.RecordLogOp(MvccLogOp.Upsert(rowId, version.Cells));
+            tx.RecordLogOp(CreateLogUpsert(rowId, version.Cells));
         }
     }
 
@@ -428,7 +674,7 @@ internal sealed class MvStore
                     throw new EmbeddedWriteWriteConflictException();
 
                 version.End = MvccStamp.FromTxId(txId);
-                tx.RecordLogOp(MvccLogOp.Delete(rowId));
+                tx.RecordLogOp(CreateLogDelete(rowId));
                 return true;
             }
 
@@ -465,7 +711,7 @@ internal sealed class MvStore
                     }
 
                     version.End = MvccStamp.FromTxId(txId);
-                    tx.RecordLogOp(MvccLogOp.Delete(rowId));
+                    tx.RecordLogOp(CreateLogDelete(rowId));
                     return;
                 }
 
@@ -483,7 +729,7 @@ internal sealed class MvStore
                 end: null,
                 cells: [],
                 isTombstone: true));
-            tx.RecordLogOp(MvccLogOp.Delete(rowId));
+            tx.RecordLogOp(CreateLogBaseTombstone(rowId));
         }
     }
 
@@ -689,6 +935,13 @@ internal sealed class MvStore
         {
             tx = RequireActive(id);
             writes = tx.SnapshotWriteSet().ToHashSet();
+            var preflightOps = tx.SnapshotLogOps();
+            if (_logicalLog is { RequiresVersion4Upgrade: true }
+                && preflightOps.Any(static op => !op.RowId.Key.IsInteger))
+            {
+                throw new MvccLogicalLogUpgradeRequiredException(
+                    "MVCC typed-key writes require a checkpoint that upgrades the logical log before commit.");
+            }
 
             foreach (var rowId in writes)
             {
@@ -699,6 +952,8 @@ internal sealed class MvStore
                     if (IsWriteWriteConflict(tx, version))
                         throw new EmbeddedWriteWriteConflictException();
                 }
+                if (!rowId.Key.IsInteger)
+                    ThrowIfTypedKeyInsertConflict(tx, chain);
             }
         }
 
@@ -723,19 +978,38 @@ internal sealed class MvStore
                 }
             }
 
-            RewriteStampsLocked(id, commitTs);
             var logOps = tx.SnapshotLogOps();
+            MvccLogicalLogCommitIndeterminateException? indeterminateCommit = null;
+            try
+            {
+                if (logOps.Count != 0)
+                    _logicalLog?.AppendCommit(commitTs, logOps);
+            }
+            catch (MvccLogicalLogCommitIndeterminateException exception)
+            {
+                indeterminateCommit = exception;
+            }
+            catch
+            {
+                AbortLocked(id, tx);
+                throw;
+            }
+
+            RewriteStampsLocked(id, commitTs);
             tx.MarkCommitted();
             _finalizedStates[id.Value] = MvccTransactionState.Committed;
             _finalizedCommitTimestamps[id.Value] = commitTs;
             ClearExclusive(id);
             _transactions.Remove(id.Value);
+            if (writes.Count != 0)
+                _commitGeneration = checked(_commitGeneration + 1);
             PruneHistoryLocked(tx.BeginTimestamp);
+            if (indeterminateCommit is not null)
+            {
+                _hasIndeterminateCommit = true;
+                throw indeterminateCommit;
+            }
 
-            // Durable log after in-memory commit is published (Turso flushes then
-            // advances visibility; we keep the store already committed and append).
-            if (logOps.Count != 0)
-                _logicalLog?.AppendCommit(commitTs, logOps);
         }
     }
 
@@ -851,6 +1125,8 @@ internal sealed class MvStore
         }
 
         tx.MarkAborted();
+        if (_schemaChangeTransaction == id.Value)
+            _schemaChangeTransaction = null;
         _finalizedStates[id.Value] = MvccTransactionState.Aborted;
         ClearExclusive(id);
         _transactions.Remove(id.Value);
@@ -996,6 +1272,30 @@ internal sealed class MvStore
             {
                 throw new EmbeddedWriteWriteConflictException();
             }
+        }
+    }
+
+    /// <summary>
+    /// A rowid allocator makes ordinary concurrent inserts distinct. A typed
+    /// primary key has no such allocator: two live versions for the same key
+    /// would violate the table's uniqueness contract even when the writers
+    /// started from independent catalog snapshots.
+    /// </summary>
+    private static void ThrowIfTypedKeyInsertConflict(
+        MvccTransaction tx,
+        IReadOnlyList<MvccRowVersion> chain)
+    {
+        foreach (var version in chain)
+        {
+            if (version.IsTombstone || version.End is not null)
+                continue;
+            if (version.Begin is { IsTimestamp: false, Value: var beginTx }
+                && beginTx == tx.Id.Value)
+            {
+                continue;
+            }
+
+            throw new EmbeddedWriteWriteConflictException();
         }
     }
 

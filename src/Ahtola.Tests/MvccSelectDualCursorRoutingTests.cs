@@ -137,34 +137,195 @@ public sealed class MvccSelectDualCursorRoutingTests
         Convert.ToInt64(Scalar(a, "SELECT v FROM t;")).Should().Be(200L);
     }
 
-    [TestCase("CREATE TABLE other(value INTEGER);")]
-    [TestCase("CREATE TABLE other AS SELECT v FROM t;")]
-    [TestCase("DROP TABLE t;")]
-    [TestCase("ALTER TABLE t ADD COLUMN other INTEGER;")]
-    [TestCase("CREATE INDEX ix_t_v ON t(v);")]
-    [TestCase("CREATE VIEW t_view AS SELECT v FROM t;")]
-    [TestCase("CREATE TRIGGER t_insert AFTER INSERT ON t BEGIN SELECT new.v; END;")]
-    public void ConcurrentSchemaChangesFailClosed(string sql)
+    [Test]
+    public void ConcurrentIndexScanMergesVersionStoreRowsAtThePinnedSnapshot()
+    {
+        using var db = new RoutingFileDatabase(
+            """
+            CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);
+            CREATE INDEX ix_t_value ON t(value);
+            """);
+        using var seeder = db.Connect();
+        using var writer = db.Connect();
+        using var reader = db.Connect();
+
+        seeder.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        seeder.ExecuteNonQuery("INSERT INTO t VALUES (1, 'base');");
+
+        writer.ExecuteNonQuery("BEGIN CONCURRENT;");
+        reader.ExecuteNonQuery("BEGIN CONCURRENT;");
+        writer.ExecuteNonQuery("INSERT INTO t VALUES (2, 'overlay');");
+
+        Convert.ToInt64(Scalar(
+            writer,
+            "SELECT id FROM t INDEXED BY ix_t_value WHERE value = 'overlay';")).Should().Be(2L);
+        Convert.ToInt64(Scalar(
+            reader,
+            "SELECT COUNT(*) FROM t INDEXED BY ix_t_value WHERE value = 'overlay';")).Should().Be(0L);
+
+        writer.ExecuteNonQuery("COMMIT;");
+        Convert.ToInt64(Scalar(
+            reader,
+            "SELECT COUNT(*) FROM t INDEXED BY ix_t_value WHERE value = 'overlay';")).Should().Be(0L);
+        reader.ExecuteNonQuery("COMMIT;");
+
+        Convert.ToInt64(Scalar(
+            reader,
+            "SELECT id FROM t INDEXED BY ix_t_value WHERE value = 'overlay';")).Should().Be(2L);
+    }
+
+    [Test]
+    public void ConcurrentIndexScanSuppressesTheOldKeyAfterAnUpdate()
+    {
+        using var db = new RoutingFileDatabase(
+            """
+            CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);
+            CREATE INDEX ix_t_value ON t(value);
+            """);
+        using var connection = db.Connect();
+
+        connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 'before');");
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+        connection.ExecuteNonQuery("UPDATE t SET value = 'after' WHERE id = 1;");
+
+        Convert.ToInt64(Scalar(
+            connection,
+            "SELECT COUNT(*) FROM t INDEXED BY ix_t_value WHERE value = 'before';")).Should().Be(0L);
+        Convert.ToInt64(Scalar(
+            connection,
+            "SELECT id FROM t INDEXED BY ix_t_value WHERE value = 'after';")).Should().Be(1L);
+        connection.ExecuteNonQuery("COMMIT;");
+    }
+
+    [Test]
+    public void ConcurrentSchemaChangePublishesItsCookieAfterTheCatalogCommit()
+    {
+        using var db = new RoutingFileDatabase();
+        using var connection = db.Connect();
+
+        connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        var before = Convert.ToInt64(Scalar(connection, "PRAGMA schema_version;"));
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+        connection.ExecuteNonQuery("CREATE INDEX ix_t_v ON t(v);");
+        connection.ExecuteNonQuery("COMMIT;");
+
+        Convert.ToInt64(Scalar(connection, "PRAGMA schema_version;")).Should().Be(before + 1);
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (1);");
+        Convert.ToInt64(Scalar(
+            connection,
+            "SELECT v FROM t INDEXED BY ix_t_v WHERE v = 1;")).Should().Be(1L);
+    }
+
+    [Test]
+    public void ConcurrentSchemaChangeFailsBusyWhileAPeerSnapshotIsOpen()
+    {
+        using var db = new RoutingFileDatabase();
+        using var writer = db.Connect();
+        using var schemaWriter = db.Connect();
+
+        writer.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        writer.ExecuteNonQuery("BEGIN CONCURRENT;");
+        schemaWriter.ExecuteNonQuery("BEGIN CONCURRENT;");
+
+        var error = Capture(() => schemaWriter.ExecuteNonQuery("CREATE INDEX ix_t_v ON t(v);"));
+        error.Should().NotBeNull();
+        error!.Message.Should().ContainEquivalentOf("locked");
+
+        schemaWriter.ExecuteNonQuery("ROLLBACK;");
+        writer.ExecuteNonQuery("ROLLBACK;");
+    }
+
+    [Test]
+    public void FailedOrSavepointRolledBackConcurrentDdlReleasesTheSchemaGate()
+    {
+        using var db = new RoutingFileDatabase();
+        using var writer = db.Connect();
+        using var peer = db.Connect();
+
+        writer.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        writer.ExecuteNonQuery("BEGIN CONCURRENT;");
+        var failure = Capture(() => writer.ExecuteNonQuery("CREATE INDEX ix_bad ON t(no_such_column);"));
+        failure.Should().NotBeNull();
+
+        peer.ExecuteNonQuery("BEGIN CONCURRENT;");
+        peer.ExecuteNonQuery("ROLLBACK;");
+
+        writer.ExecuteNonQuery("SAVEPOINT ddl;");
+        writer.ExecuteNonQuery("CREATE INDEX ix_t_v ON t(v);");
+        writer.ExecuteNonQuery("ROLLBACK TO ddl;");
+
+        peer.ExecuteNonQuery("BEGIN CONCURRENT;");
+        peer.ExecuteNonQuery("ROLLBACK;");
+        writer.ExecuteNonQuery("ROLLBACK;");
+    }
+
+    [Test]
+    public void ConcurrentDdlRejectsATransactionWhoseDataSnapshotIsStale()
+    {
+        using var db = new RoutingFileDatabase();
+        using var stale = db.Connect();
+        using var writer = db.Connect();
+
+        stale.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        stale.ExecuteNonQuery("BEGIN CONCURRENT;");
+        writer.ExecuteNonQuery("BEGIN CONCURRENT;");
+        writer.ExecuteNonQuery("INSERT INTO t VALUES (1);");
+        writer.ExecuteNonQuery("COMMIT;");
+
+        var error = Capture(() => stale.ExecuteNonQuery("CREATE INDEX ix_t_v ON t(v);"));
+        error.Should().NotBeNull();
+        error!.Message.Should().ContainEquivalentOf("locked");
+        stale.ExecuteNonQuery("ROLLBACK;");
+    }
+
+    [Test]
+    public void ConcurrentDropAndRecreateRetiresThePriorTableIdentity()
     {
         using var db = new RoutingFileDatabase();
         using var connection = db.Connect();
 
         connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
         connection.ExecuteNonQuery("BEGIN CONCURRENT;");
-
-        var error = Capture(() => connection.ExecuteNonQuery(sql));
-        error.Should().NotBeNull();
-        error!.Message.Should().ContainEquivalentOf("schema changes");
-
         connection.ExecuteNonQuery("INSERT INTO t VALUES (1);");
         connection.ExecuteNonQuery("COMMIT;");
-        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
+
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+        connection.ExecuteNonQuery("DROP TABLE t;");
+        connection.ExecuteNonQuery("CREATE TABLE t(v INTEGER);");
+        connection.ExecuteNonQuery("COMMIT;");
+
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(0L);
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (2);");
+        Convert.ToInt64(Scalar(connection, "SELECT v FROM t;")).Should().Be(2L);
     }
 
-    [TestCase("INSERT INTO t VALUES (1, 'insert');")]
-    [TestCase("UPDATE t SET value = 'update';")]
-    [TestCase("DELETE FROM t;")]
-    public void ConcurrentDmlAgainstWithoutRowidTableFailsClosed(string sql)
+    [Test]
+    public void AbortedConcurrentTriggerStatementRollsBackItsMvccOverlay()
+    {
+        using var db = new RoutingFileDatabase(
+            """
+            CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);
+            CREATE TRIGGER abort_insert AFTER INSERT ON t WHEN NEW.id = 1 BEGIN
+                SELECT RAISE(ABORT, 'abort-trigger');
+            END;
+            """);
+        using var connection = db.Connect();
+
+        connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+        var error = Capture(() => connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 1);"));
+        error.Should().NotBeNull();
+
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (2, 2);");
+        connection.ExecuteNonQuery("COMMIT;");
+
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
+        Convert.ToInt64(Scalar(connection, "SELECT id FROM t;")).Should().Be(2L);
+    }
+
+    [Test]
+    public void ConcurrentInsertAgainstWithoutRowidTableIsVisibleToWriterAndSurvivesCommit()
     {
         using var db = new RoutingFileDatabase(
             "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID;");
@@ -172,20 +333,62 @@ public sealed class MvccSelectDualCursorRoutingTests
 
         connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
         connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 'insert');");
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
+        Convert.ToString(Scalar(connection, "SELECT value FROM t WHERE id = 1;")).Should().Be("insert");
+        connection.ExecuteNonQuery("COMMIT;");
 
-        var error = Capture(() => connection.ExecuteNonQuery(sql));
-        error.Should().NotBeNull();
-        error!.Message.Should().ContainEquivalentOf("rowid user tables");
+        Convert.ToString(Scalar(connection, "SELECT value FROM t WHERE id = 1;")).Should().Be("insert");
+    }
 
-        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(0L);
-        connection.ExecuteNonQuery("ROLLBACK;");
+    [Test]
+    public void ConcurrentUpdateAndDeleteAgainstWithoutRowidTableUseThePrimaryKeyIdentity()
+    {
+        using var db = new RoutingFileDatabase(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID;");
+        using var connection = db.Connect();
 
-        connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 'outside');");
+        connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 'before');");
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (2, 'stable');");
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+        // Move the first key after an untouched key so clustered primary-key
+        // sorting cannot change the row identity reported to MVCC.
+        connection.ExecuteNonQuery("UPDATE t SET id = 3, value = 'after' WHERE id = 1;");
+        Convert.ToString(Scalar(connection, "SELECT value FROM t WHERE id = 3;")).Should().Be("after");
+        connection.ExecuteNonQuery("COMMIT;");
+
+        connection.ExecuteNonQuery("BEGIN CONCURRENT;");
+        connection.ExecuteNonQuery("DELETE FROM t WHERE id = 3;");
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
+        connection.ExecuteNonQuery("COMMIT;");
         Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
     }
 
     [Test]
-    public void ConcurrentRowTriggerDmlAgainstWithoutRowidTableFailsClosed()
+    public void ConcurrentDuplicateWithoutRowidInsertRaisesAWriteConflict()
+    {
+        using var db = new RoutingFileDatabase(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID;");
+        using var first = db.Connect();
+        using var second = db.Connect();
+
+        first.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        first.ExecuteNonQuery("BEGIN CONCURRENT;");
+        second.ExecuteNonQuery("BEGIN CONCURRENT;");
+        first.ExecuteNonQuery("INSERT INTO t VALUES (1, 'first');");
+
+        var error = Capture(() => second.ExecuteNonQuery("INSERT INTO t VALUES (1, 'second');"));
+        error.Should().NotBeNull();
+        error!.Message.Should().ContainEquivalentOf("write-write conflict");
+        second.ExecuteNonQuery("ROLLBACK;");
+        first.ExecuteNonQuery("COMMIT;");
+
+        Convert.ToString(Scalar(first, "SELECT value FROM t WHERE id = 1;")).Should().Be("first");
+    }
+
+    [Test]
+    public void ConcurrentRowTriggerDmlAgainstWithoutRowidTableIsVersioned()
     {
         using var db = new RoutingFileDatabase();
         using var connection = db.Connect();
@@ -194,23 +397,25 @@ public sealed class MvccSelectDualCursorRoutingTests
             CREATE TABLE sink(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID;
             CREATE TRIGGER t_after_insert AFTER INSERT ON t BEGIN
                 INSERT INTO sink VALUES (NEW.v, 'trigger');
+                UPDATE sink SET id = id + 10 WHERE id = NEW.v;
             END;
             """);
 
         connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
         connection.ExecuteNonQuery("BEGIN CONCURRENT;");
 
-        var error = Capture(() => connection.ExecuteNonQuery("INSERT INTO t VALUES (1);"));
-        error.Should().NotBeNull();
-        error!.Message.Should().ContainEquivalentOf("rowid user tables");
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (1);");
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(1L);
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM sink;")).Should().Be(1L);
+        Convert.ToInt64(Scalar(connection, "SELECT id FROM sink;")).Should().Be(11L);
+        connection.ExecuteNonQuery("COMMIT;");
 
-        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM t;")).Should().Be(0L);
-        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM sink;")).Should().Be(0L);
-        connection.ExecuteNonQuery("ROLLBACK;");
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM sink;")).Should().Be(1L);
+        Convert.ToInt64(Scalar(connection, "SELECT id FROM sink;")).Should().Be(11L);
     }
 
     [Test]
-    public void ConcurrentForeignKeyCascadeAgainstWithoutRowidTableFailsClosed()
+    public void ConcurrentForeignKeyCascadeAgainstWithoutRowidTableUsesPrimaryKeyIdentity()
     {
         using var db = new RoutingFileDatabase();
         using var connection = db.Connect();
@@ -229,13 +434,13 @@ public sealed class MvccSelectDualCursorRoutingTests
         connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
         connection.ExecuteNonQuery("BEGIN CONCURRENT;");
 
-        var error = Capture(() => connection.ExecuteNonQuery("DELETE FROM parent WHERE id = 1;"));
-        error.Should().NotBeNull();
-        error!.Message.Should().ContainEquivalentOf("rowid user tables");
+        connection.ExecuteNonQuery("DELETE FROM parent WHERE id = 1;");
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM parent;")).Should().Be(0L);
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM child;")).Should().Be(0L);
+        connection.ExecuteNonQuery("COMMIT;");
 
-        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM parent;")).Should().Be(1L);
-        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM child;")).Should().Be(1L);
-        connection.ExecuteNonQuery("ROLLBACK;");
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM parent;")).Should().Be(0L);
+        Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM child;")).Should().Be(0L);
     }
 
     private static object? Scalar(SqliteConnection connection, string sql)
