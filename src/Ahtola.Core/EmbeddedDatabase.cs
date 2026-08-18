@@ -46291,6 +46291,7 @@ Func<string, ParsedStatement> rewrite)
             EmbeddedDatabase Database,
             MvccTxId TxId,
             bool Publish)>();
+        var mvccWriteWasPublished = false;
         try
         {
             foreach (var (database, txId) in _mvccTransactions.ToArray())
@@ -46303,7 +46304,9 @@ Func<string, ParsedStatement> rewrite)
                             && state.HasSchemaChanges;
                         pendingSchemaPublications.Add((database, txId, publish));
                     }
+                    var hasPendingWrites = store.HasPendingWrites(txId);
                     store.Commit(txId);
+                    mvccWriteWasPublished |= hasPendingWrites;
                 }
                 _mvccTransactions.Remove(database);
             }
@@ -46371,6 +46374,8 @@ Func<string, ParsedStatement> rewrite)
         {
             foreach (var (database, txId, _) in pendingSchemaPublications)
                 database.MvStore?.CancelSchemaChange(txId);
+            if (!mvccWriteWasPublished)
+                throw;
             ResetTransactionState();
             throw new EmbeddedPostCommitMaintenanceException(failure);
         }

@@ -530,6 +530,12 @@ internal sealed class MvStore
             return _transactions.TryGetValue(id.Value, out transaction);
     }
 
+    internal bool HasPendingWrites(MvccTxId id)
+    {
+        lock (_gate)
+            return RequireActive(id).SnapshotWriteSet().Count != 0;
+    }
+
     /// <summary>
     /// Reserves the schema publication slot for an active concurrent transaction.
     /// DDL deliberately fails busy when another reader or writer has already
