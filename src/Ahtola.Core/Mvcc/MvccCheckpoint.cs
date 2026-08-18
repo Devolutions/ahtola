@@ -12,9 +12,11 @@ internal enum MvccCheckpointPhase : byte
     CollectRows = 2,
     MaterializeCatalog = 3,
     PersistCatalog = 4,
-    TruncateLogicalLog = 5,
-    GarbageCollect = 6,
-    Finalize = 7,
+    BackfillMainStore = 5,
+    TruncateLogicalLog = 6,
+    ResetWal = 7,
+    GarbageCollect = 8,
+    Finalize = 9,
 }
 
 /// <summary>Outcome of a managed MVCC checkpoint attempt.</summary>
@@ -25,11 +27,9 @@ internal readonly record struct MvccCheckpointResult(
     MvccCheckpointPhase CompletedThrough);
 
 /// <summary>
-/// Skeleton port of Turso <c>CheckpointStateMachine</c>:
-/// materialize committed version-store rows into the classic catalog, durably
-/// persist, truncate the logical log (TRUNCATE/RESTART), then GC history past
-/// the reader low-water mark. PASSIVE skips truncate when concurrent txs are
-/// still open.
+/// Synchronous managed port of Turso's checkpoint durability sequence:
+/// materialize into WAL pages, backfill and flush the main file, retire the
+/// logical log, then reset the WAL last.
 /// </summary>
 internal static class MvccCheckpoint
 {

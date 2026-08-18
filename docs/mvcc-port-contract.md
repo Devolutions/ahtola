@@ -47,7 +47,7 @@ Pinned submodule: `turso-src/` @ **v0.7.2** (`046e9cbf6`).
 | **2** | Durable logical log (`*.db-log`) with Turso LML2/MVTX framing constants, CRC32C, upsert/delete ops, replay into `MvStore` on enable; checkpoint TRUNCATE clears log |
 | **3** | Header version **255** via pager `SwitchJournalMode(Mvcc)`; cold open restores `MvStore`; `MvccDualCursor` merge primitive; **shared `MvStore`/log per path** (`EmbeddedMvStoreRegistry`) so pooled multi-connection concurrent writers share one version store + rowid allocator; concurrent commit reloads durable catalog then merges store snapshots |
 | **3.5** | **SQL dual-cursor routing:** under `BEGIN CONCURRENT`, `GetNamedTableRows` merges base catalog + store via `MvccDualCursor.MergeVisibleRows`; DML records versions via `ReportRowChange` → `DeleteOrTombstoneBase` / `UpdateIncludingBase` (DELETE/UPDATE) and connection `RecordConcurrentMvccMutation` (INSERT + global rowid); peer uncommitted writes invisible; SI after peer commit; same-row WW on SQL path |
-| **3.6 (current)** | **Checkpoint SM skeleton:** `PRAGMA wal_checkpoint` in MVCC mode runs `RunMvccCheckpoint` — AcquireLock → Collect/Materialize (reuse `MergeConcurrentCatalogFromStoreLocked`) → Persist catalog → Truncate logical log (TRUNCATE/RESTART/FULL) → `GarbageCollectAfterCheckpoint` (clear store when no active txs; else prune past reader LWM). Active concurrent txs → busy=1, no truncate. Not a full Turso cooperative btree page walk. |
+| **3.6 (current)** | **Synchronous page-WAL checkpoint state machine:** `PRAGMA wal_checkpoint` in MVCC mode runs `RunMvccCheckpoint` — AcquireLock → Collect/Materialize (reuse `MergeConcurrentCatalogFromStoreLocked`) → persist pages to WAL **without automatic reset** → backfill and flush the main store → retire/upgrade the logical log → reset the WAL last for TRUNCATE/RESTART/FULL → `GarbageCollectAfterCheckpoint`. Active concurrent txs return busy before mutation. PASSIVE retains both WAL and logical-log recovery evidence. This adapts Turso's cooperative b-tree I/O state machine to managed synchronous `IFileSystem` operations. |
 | **Open** | MVCC-versioned schema rows (concurrent DDL currently fails closed); schema generation cookie polish; full per-page btree checkpoint SM / WAL TRUNCATE interleave parity with Turso if product requires it |
 
 ## Dual-cursor SQL routing notes
@@ -65,9 +65,10 @@ Pinned submodule: `turso-src/` @ **v0.7.2** (`046e9cbf6`).
 
 ## Checkpoint notes
 
-- Concurrent **commit** already merges store → catalog; checkpoint re-merges for safety then persists so TRUNCATE cannot drop the only durable copy of rows.
-- After successful truncate with no active readers, version chains are dropped (`GarbageCollectAfterCheckpoint`); dual-cursor defers to catalog.
-- PASSIVE/busy with open concurrent txs does **not** truncate the log (avoids losing unrecovered store-only frames if materialize is skipped).
+- Concurrent **commit** already merges store → catalog; checkpoint re-merges for safety, then writes a fresh page-WAL transaction without resetting it.
+- **Durable ordering:** WAL page transaction → main-store backfill/flush → logical-log retirement/flush → WAL reset. A logical-log retirement or WAL-reset failure leaves validated WAL recovery evidence; the latter may leave a header-only log with a retained WAL, which cold reopen accepts.
+- After successful restart/truncate with no active readers, version chains are dropped (`GarbageCollectAfterCheckpoint`); dual-cursor defers to catalog.
+- PASSIVE/busy with open concurrent txs does **not** mutate or truncate recovery artifacts. A successful passive checkpoint retains WAL and logical-log evidence rather than attempting a destructive reset.
 
 ## Testing
 
