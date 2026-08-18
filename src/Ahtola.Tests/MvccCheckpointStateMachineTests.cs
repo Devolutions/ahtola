@@ -116,6 +116,126 @@ public sealed class MvccCheckpointStateMachineTests
     }
 
     [Test]
+    public void TruncateRetainsWalWhenLogicalLogRetirementFails()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "mvcc-log-retirement-failure.db";
+        long logLength;
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(v INTEGER);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO t VALUES (41);");
+            Execute(connection, "COMMIT;");
+
+            logLength = ReadFileLength(fileSystem, path + "-log");
+            logLength.Should().BeGreaterThan(56);
+            faults.FailNext(FileSystemOperation.SetLength);
+
+            Assert.Throws<IOException>(() => database.RunMvccCheckpoint("TRUNCATE"));
+
+            ReadFileLength(fileSystem, path + "-log").Should().Be(logLength);
+            AssertCommittedWal(fileSystem, path + "-wal");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadScalar(reopenedConnection, "SELECT v FROM t;").Should().Be(41L);
+    }
+
+    [Test]
+    public void TruncateRetiresLogicalLogBeforeWalResetAndRecoversAfterResetFault()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "mvcc-wal-reset-failure.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(v INTEGER);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO t VALUES (73);");
+            Execute(connection, "COMMIT;");
+
+            // The first SetLength retires the logical log; the next one is the
+            // WAL reset. A failure there must leave the durable WAL recoverable.
+            faults.FailNextAfter(FileSystemOperation.SetLength, FileSystemOperation.SetLength);
+
+            Assert.Throws<IOException>(() => database.RunMvccCheckpoint("TRUNCATE"));
+
+            ReadFileLength(fileSystem, path + "-log").Should().Be(56);
+            AssertCommittedWal(fileSystem, path + "-wal");
+        }
+
+        using (var reopened = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = reopened.Connect())
+        {
+            ReadScalar(connection, "SELECT v FROM t;").Should().Be(73L);
+            reopened.RunMvccCheckpoint("TRUNCATE").Busy.Should().BeFalse();
+        }
+
+        using var finalWal = SqliteWalFile.Open(fileSystem, path + "-wal", readOnly: true);
+        finalWal.ScanRecovery().LastCommittedFrameNumber.Should().Be(0);
+    }
+
+    [Test]
+    public void ActiveConcurrentReaderPreventsLogicalLogRetirement()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "mvcc-reader-floor.db";
+
+        using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var writer = database.Connect();
+        using var reader = database.Connect();
+        Execute(writer, "CREATE TABLE t(v INTEGER);");
+        Execute(writer, "PRAGMA journal_mode=mvcc;");
+        Execute(writer, "BEGIN CONCURRENT;");
+        Execute(writer, "INSERT INTO t VALUES (91);");
+        Execute(writer, "COMMIT;");
+
+        var logLength = ReadFileLength(fileSystem, path + "-log");
+        Execute(reader, "BEGIN CONCURRENT;");
+
+        var blocked = database.RunMvccCheckpoint("TRUNCATE");
+        blocked.Busy.Should().BeTrue();
+        blocked.CompletedThrough.Should().Be(MvccCheckpointPhase.AcquireLock);
+        ReadFileLength(fileSystem, path + "-log").Should().Be(logLength);
+
+        Execute(reader, "ROLLBACK;");
+        database.RunMvccCheckpoint("TRUNCATE").Busy.Should().BeFalse();
+        ReadFileLength(fileSystem, path + "-log").Should().Be(56);
+    }
+
+    [Test]
+    public void TruncatePreservesTypedObjectRowsAcrossColdReopen()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "mvcc-typed-checkpoint.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO t VALUES ('tenant', 'value');");
+            Execute(connection, "COMMIT;");
+
+            database.RunMvccCheckpoint("TRUNCATE").Busy.Should().BeFalse();
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadText(reopenedConnection, "SELECT v FROM t WHERE k = 'tenant';").Should().Be("value");
+    }
+
+    [Test]
     public void CheckpointUpgradesAHeaderOnlyLegacyLogicalLogBeforeTypedWrites()
     {
         const string path = "mvcc-v3-checkpoint-upgrade.db";
@@ -162,6 +282,35 @@ public sealed class MvccCheckpointStateMachineTests
 
     private static string ReadValue(SqliteConnection connection, string sql)
         => Convert.ToString(Scalar(connection, sql)) ?? string.Empty;
+
+    private static long ReadScalar(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        return statement.GetValue(0).AsInteger();
+    }
+
+    private static string ReadText(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        return statement.GetValue(0).AsText();
+    }
+
+    private static long ReadFileLength(IFileSystem fileSystem, string path)
+    {
+        using var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly: true);
+        return file.Length;
+    }
+
+    private static void AssertCommittedWal(IFileSystem fileSystem, string path)
+    {
+        using var wal = SqliteWalFile.Open(fileSystem, path, readOnly: true);
+        var recovery = wal.ScanRecovery();
+        recovery.StopReason.Should().Be(SqliteWalRecoveryStopReason.EndOfFile);
+        recovery.LastCommittedFrameNumber.Should().BeGreaterThan(0);
+        recovery.LastCommittedFrameNumber.Should().Be(recovery.LastValidFrameNumber);
+    }
 
     private sealed class CheckpointFileDatabase : IDisposable
     {

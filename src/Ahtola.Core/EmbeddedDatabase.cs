@@ -2565,9 +2565,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     /// <summary>
-    /// Runs the managed MVCC checkpoint skeleton (Turso
-    /// <c>CheckpointStateMachine</c> phases, synchronous):
-    /// materialize store → catalog, persist, optional log truncate, GC.
+    /// Runs the managed synchronous MVCC checkpoint state machine. Page changes
+    /// first become durable in the WAL, then the main file; only then may the
+    /// logical log retire its frames and the WAL be reset.
     /// </summary>
     internal MvccCheckpointResult RunMvccCheckpoint(string? mode, TimeSpan busyTimeout = default)
     {
@@ -2596,8 +2596,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             phase = MvccCheckpointPhase.AcquireLock;
             var wantTruncate = MvccCheckpoint.ShouldTruncateLog(mode);
 
-            // Active concurrent txs: report busy and skip materialize/truncate
-            // (Turso PASSIVE defers; FULL waits — managed skeleton does not block).
+            // An active concurrent transaction pins an MVCC reader floor. Do not
+            // materialize, retire the log, or reset the WAL beneath that snapshot.
             if (store.HasActiveTransactions())
             {
                 return new MvccCheckpointResult(
@@ -2620,10 +2620,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
             else
             {
-                // PersistFileCatalog takes _fileCatalogWriteLock; release _gate first?
-                // Commit path holds _gate then PersistFileCatalog which locks write lock —
-                // same order as CommitTransaction. Keep _gate held.
-                PersistFileCatalog(merged, pragmaHeader: null, forceFullRewrite: false, busyTimeout);
+                PersistFileCatalog(
+                    merged,
+                    pragmaHeader: null,
+                    forceFullRewrite: false,
+                    busyTimeout,
+                    checkpointAfterCommit: false);
+
+                phase = MvccCheckpointPhase.BackfillMainStore;
+                try
+                {
+                    _ = _fileStore.BackfillMvccCheckpoint(busyTimeout);
+                }
+                catch (SqlitePagerBusyException)
+                {
+                    return new MvccCheckpointResult(
+                        Busy: true,
+                        LogFramesBefore: logBefore,
+                        CheckpointedFrames: 0,
+                        CompletedThrough: phase);
+                }
             }
 
             var checkpointed = logBefore;
@@ -2635,6 +2651,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     log.UpgradeToVersion4AfterCheckpoint();
                 if (wantTruncate)
                     checkpointed = logBefore;
+            }
+
+            if (wantTruncate && _fileStore is not null)
+            {
+                phase = MvccCheckpointPhase.ResetWal;
+                try
+                {
+                    _ = _fileStore.ResetMvccCheckpointWal(busyTimeout);
+                }
+                catch (SqlitePagerBusyException)
+                {
+                    // The main store and logical log are already durable. Retain the
+                    // validated WAL for a later restart rather than losing reader data.
+                    return new MvccCheckpointResult(
+                        Busy: true,
+                        LogFramesBefore: logBefore,
+                        CheckpointedFrames: checkpointed,
+                        CompletedThrough: phase);
+                }
             }
 
             phase = MvccCheckpointPhase.GarbageCollect;
@@ -2908,7 +2943,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog,
         PragmaHeaderMetadata? pragmaHeader = null,
         bool forceFullRewrite = false,
-        TimeSpan busyTimeout = default)
+        TimeSpan busyTimeout = default,
+        bool checkpointAfterCommit = true)
     {
         if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
             throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
@@ -2920,14 +2956,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
             using var writeRegistration = RegisterCatalogWrite(_databasePath);
             try
             {
-                var committedVersion = _fileStore.Persist(
-                    catalog.Tables,
-                    catalog.Views,
-                    catalog.Triggers,
-                    catalog.VirtualTables,
-                    pragmaHeader,
-                    forceFullRewrite,
-                    previousTables: _tables);
+                var committedVersion = checkpointAfterCommit
+                    ? _fileStore.Persist(
+                        catalog.Tables,
+                        catalog.Views,
+                        catalog.Triggers,
+                        catalog.VirtualTables,
+                        pragmaHeader,
+                        forceFullRewrite,
+                        previousTables: _tables)
+                    : _fileStore.PersistForMvccCheckpoint(
+                        catalog.Tables,
+                        catalog.Views,
+                        catalog.Triggers,
+                        catalog.VirtualTables,
+                        pragmaHeader,
+                        forceFullRewrite,
+                        previousTables: _tables);
                 PublishCatalog(catalog, committedVersion);
             }
             catch (EmbeddedPostCommitMaintenanceException)
@@ -46792,8 +46837,8 @@ Func<string, ParsedStatement> rewrite)
         var database = ResolvePragmaDatabase(statement.Schema);
         if (database.IsMvccEnabled)
         {
-            // Turso CheckpointStateMachine skeleton: materialize → persist →
-            // truncate logical log (TRUNCATE/RESTART/FULL) → GC past reader LWM.
+            // Managed MVCC checkpoint: materialize WAL pages -> backfill/flush
+            // main storage -> retire the logical log -> reset the WAL last.
             var result = database.RunMvccCheckpoint(statement.Mode, BusyTimeout);
             return new ExecutionResult(
                 columns,

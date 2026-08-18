@@ -1350,6 +1350,31 @@ internal sealed class EmbeddedFileStore : IDisposable
             forceFullRewrite,
             previousTables);
 
+    /// <summary>
+    /// Materializes an MVCC checkpoint into pager WAL pages without reclaiming
+    /// those frames. The checkpoint state machine must first backfill the main
+    /// store and retire the logical log before it resets the WAL.
+    /// </summary>
+    internal FileCatalogVersion PersistForMvccCheckpoint(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
+        PragmaHeaderMetadata? pragmaHeader = null,
+        bool forceFullRewrite = false,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
+        => PersistCore(
+            tables,
+            views,
+            triggers,
+            virtualTables,
+            reclaimTrailingPages: false,
+            incrementSchemaCookie: false,
+            pragmaHeader,
+            forceFullRewrite,
+            previousTables,
+            checkpointAfterCommit: false);
+
     internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header);
 
     /// <summary>
@@ -1408,6 +1433,25 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     internal SqliteJournalMode JournalMode => _pager.JournalMode;
+
+    /// <summary>Backfills the WAL pages materialized by an MVCC checkpoint.</summary>
+    internal SqliteCheckpointResult BackfillMvccCheckpoint(TimeSpan busyTimeout)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        return _pager.CheckpointToMainStore(busyTimeout);
+    }
+
+    /// <summary>
+    /// Reclaims a previously backfilled MVCC checkpoint WAL only after the
+    /// logical log has been durably retired.
+    /// </summary>
+    internal SqliteCheckpointResult ResetMvccCheckpointWal(TimeSpan busyTimeout)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        return _pager.CheckpointToMainStoreAndResetWal(busyTimeout);
+    }
 
     internal SqliteJournalMode SwitchJournalMode(SqliteJournalMode journalMode)
     {
@@ -1607,7 +1651,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         bool incrementSchemaCookie,
         PragmaHeaderMetadata? pragmaHeader,
         bool forceFullRewrite,
-        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null,
+        bool checkpointAfterCommit = true)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -1624,13 +1669,25 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             if (previousTables is not null
                 && ReferenceEquals(previousTables, _committedTables)
-                && TryPersistIncrementalRowMutation(tables, views, triggers, virtualTables, previousTables))
+                && TryPersistIncrementalRowMutation(
+                    tables,
+                    views,
+                    triggers,
+                    virtualTables,
+                    previousTables,
+                    checkpointAfterCommit))
             {
                 _committedTables = tables;
                 return CommittedCatalogVersion;
             }
 
-            if (TryPersistBoundedTableLeafMutation(tables, views, triggers, virtualTables))
+            if (checkpointAfterCommit
+                && TryPersistBoundedTableLeafMutation(
+                    tables,
+                    views,
+                    triggers,
+                    virtualTables,
+                    checkpointAfterCommit))
             {
                 _committedTables = tables;
                 return CommittedCatalogVersion;
@@ -1778,7 +1835,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         // checkpoint has durably installed that view, retain neither its WAL frames
         // nor overlay so later rewrites do not rescan an unbounded history.
         _header = newHeader;
-        CheckpointCommittedMutation(reclaimTrailingPages);
+        if (checkpointAfterCommit)
+            CheckpointCommittedMutation(reclaimTrailingPages);
         _tableRootPages = rootPages;
         _indexRootPages = indexRootPages;
         _lastSchemaSignature = signature;
@@ -1854,7 +1912,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
         IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
-        IReadOnlyDictionary<string, EmbeddedTable> previousTables)
+        IReadOnlyDictionary<string, EmbeddedTable> previousTables,
+        bool checkpointAfterCommit)
     {
         if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables))
             return false;
@@ -1945,7 +2004,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         _header = newHeader;
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
+        if (checkpointAfterCommit)
+            CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -2206,7 +2266,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
-        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
+        bool checkpointAfterCommit)
     {
         var schemaPage = _pager.ReadCommittedPage(SchemaRootPage);
         var currentHeader = SqliteDatabaseHeader.Parse(schemaPage);
