@@ -635,6 +635,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ReturningCteScope? ReturningCteScope = null,
         MvStore? ConcurrentMvStore = null,
         MvccTxId? ConcurrentMvccTxId = null,
+        IReadOnlyDictionary<string, EmbeddedTable>? ConcurrentBaseTables = null,
+        ConcurrentMvccIdentityTracker? ConcurrentMvccIdentityTracker = null,
+        SqliteTextEncoding MvccTextEncoding = SqliteTextEncoding.Utf8,
         IReadOnlyDictionary<string, VirtualTableDefinition>? VirtualTables = null)
     {
         /// <summary>
@@ -711,6 +714,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         }
                 }
             }
+            else if (ConcurrentMvStore is { } typedStore
+                && ConcurrentMvccTxId is { } typedTxId
+                && !tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+            {
+                ReportWithoutRowidMvccChange(typedStore, typedTxId, operation, tableName, table, rowId);
+            }
 
             if (Hooks?.RowChanged is not { } rowChanged || !table.HasRowid)
                 return;
@@ -718,6 +727,127 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return;
 
             rowChanged(operation, tableName, rowId);
+        }
+
+        private void ReportWithoutRowidMvccChange(
+            MvStore store,
+            MvccTxId txId,
+            SqliteChangeOperation operation,
+            string tableName,
+            EmbeddedTable table,
+            long rowId)
+        {
+            if (table.PrimaryKeySchema is null)
+            {
+                throw new EmbeddedSqlException(
+                    $"WITHOUT ROWID table '{tableName}' is missing primary-key metadata for concurrent MVCC.");
+            }
+
+            var tableId = store.GetOrCreateTableId(tableName);
+            var current = TryFindRow(table, rowId);
+            var baseline = ConcurrentBaseTables is not null
+                && ConcurrentBaseTables.TryGetValue(tableName, out var baseTable)
+                ? TryFindRow(baseTable, rowId)
+                : null;
+            var knownKey = ConcurrentMvccIdentityTracker?.TryGet(tableName, rowId);
+
+            switch (operation)
+            {
+                case SqliteChangeOperation.Insert when current is not null:
+                    var insertedKey = CreatePrimaryKey(current.Value.Table, current.Value.Row);
+                    store.Insert(
+                        txId,
+                        new MvccRowId(tableId, insertedKey),
+                        current.Value.Row);
+                    ConcurrentMvccIdentityTracker?.Set(tableName, rowId, insertedKey);
+                    return;
+
+                case SqliteChangeOperation.Delete:
+                    var deletedKey = knownKey
+                        ?? (baseline is not null
+                            ? CreatePrimaryKey(baseline.Value.Table, baseline.Value.Row)
+                            : (MvccKey?)null);
+                    if (deletedKey is null)
+                        break;
+                    store.DeleteOrTombstoneBase(
+                        txId,
+                        new MvccRowId(tableId, deletedKey.Value));
+                    ConcurrentMvccIdentityTracker?.Remove(tableName, rowId);
+                    return;
+
+                case SqliteChangeOperation.Update when current is not null:
+                    {
+                        var currentKey = CreatePrimaryKey(current.Value.Table, current.Value.Row);
+                        var baseKey = knownKey
+                            ?? (baseline is null
+                                ? currentKey
+                                : CreatePrimaryKey(baseline.Value.Table, baseline.Value.Row));
+                        if (baseKey == currentKey)
+                        {
+                            store.UpdateIncludingBase(
+                                txId,
+                                new MvccRowId(tableId, currentKey),
+                                current.Value.Row);
+                        }
+                        else
+                        {
+                            store.DeleteOrTombstoneBase(txId, new MvccRowId(tableId, baseKey));
+                            store.Insert(txId, new MvccRowId(tableId, currentKey), current.Value.Row);
+                        }
+
+                        ConcurrentMvccIdentityTracker?.Set(tableName, rowId, currentKey);
+                        return;
+                    }
+            }
+
+            throw new EmbeddedSqlException(
+                $"Concurrent MVCC could not resolve the primary-key identity for {operation} on WITHOUT ROWID table '{tableName}'.");
+        }
+
+        private MvccKey CreatePrimaryKey(EmbeddedTable table, SqlValue[] row)
+            => MvccKey.FromPrimaryKey(
+                table.PrimaryKeySchema
+                    ?? throw new InvalidOperationException("WITHOUT ROWID table lost its primary-key schema."),
+                row,
+                MvccTextEncoding);
+
+        private static (EmbeddedTable Table, SqlValue[] Row)? TryFindRow(EmbeddedTable table, long rowId)
+        {
+            var index = table.RowIds.IndexOf(rowId);
+            return index >= 0 && index < table.Rows.Count
+                ? (table, table.Rows[index])
+                : null;
+        }
+    }
+
+    internal sealed class ConcurrentMvccIdentityTracker
+    {
+        private readonly Dictionary<string, Dictionary<long, MvccKey>> _keys =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        internal MvccKey? TryGet(string tableName, long rowId)
+            => _keys.TryGetValue(tableName, out var rows) && rows.TryGetValue(rowId, out var key)
+                ? key
+                : null;
+
+        internal void Set(string tableName, long rowId, MvccKey key)
+        {
+            if (!_keys.TryGetValue(tableName, out var rows))
+            {
+                rows = [];
+                _keys.Add(tableName, rows);
+            }
+
+            rows[rowId] = key;
+        }
+
+        internal void Remove(string tableName, long rowId)
+        {
+            if (!_keys.TryGetValue(tableName, out var rows))
+                return;
+            rows.Remove(rowId);
+            if (rows.Count == 0)
+                _keys.Remove(tableName);
         }
     }
 
@@ -1575,7 +1705,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 Hooks: hooks,
                 IgnoreCheckConstraints: outer.IgnoreCheckConstraints,
                 ConcurrentMvStore: outer.ConcurrentMvStore,
-                ConcurrentMvccTxId: outer.ConcurrentMvccTxId);
+                ConcurrentMvccTxId: outer.ConcurrentMvccTxId,
+                ConcurrentBaseTables: outer.ConcurrentBaseTables,
+                ConcurrentMvccIdentityTracker: outer.ConcurrentMvccIdentityTracker,
+                MvccTextEncoding: outer.MvccTextEncoding);
             return statement switch
             {
                 InsertStatement insert => ExecuteDmlWithAutoIncrementState(
@@ -1728,11 +1861,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
             ThrowUnsupportedConcurrentMvccSystemTableDml();
 
-        if (!table.HasRowid)
-        {
-            throw new EmbeddedSqlException(
-                "Concurrent MVCC DML is supported only for rowid user tables; WITHOUT ROWID tables require composite-key dual-cursor routing.");
-        }
     }
 
     private static void ThrowUnsupportedConcurrentMvccSystemTableDml()
@@ -2022,7 +2150,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         PragmaHeaderMetadata? pragmaHeader = null,
         bool forceFullRewrite = false,
         TimeSpan busyTimeout = default,
-        bool concurrent = false)
+        bool concurrent = false,
+        bool containsSchemaChanges = false)
     {
         lock (_gate)
         {
@@ -2037,7 +2166,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 // so concurrent writers do not clobber each other.
                 if (_fileStore is not null)
                     TryReloadFileCatalogIfChanged();
-                publishCatalog = MergeConcurrentCatalogFromStoreLocked(catalog);
+                publishCatalog = containsSchemaChanges
+                    ? catalog.Clone()
+                    : MergeConcurrentCatalogFromStoreLocked(catalog);
             }
             else if (_version != version)
             {
@@ -2085,25 +2216,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
 
             var liveForTable = liveRows
-                .Where(r => r.RowId.TableId == tableId)
-                .ToDictionary(r => r.RowId.RowId, r => r.Cells);
+                .Where(row => row.RowId.TableId == tableId)
+                .ToDictionary(row => row.RowId.Key, row => row.Cells);
             var deletedForTable = deleted
-                .Where(d => d.TableId == tableId)
-                .Select(d => d.RowId)
+                .Where(row => row.TableId == tableId)
+                .Select(row => row.Key)
                 .ToHashSet();
 
             var nextRows = new List<SqlValue[]>();
             var nextIds = new List<long>();
-            for (var i = 0; i < target.RowIds.Count; i++)
+            var nextSyntheticId = target.RowIds.Count == 0
+                ? 1L
+                : checked(target.RowIds.Max() + 1);
+            for (var i = 0; i < target.Rows.Count; i++)
             {
-                var rowId = target.RowIds[i];
-                if (deletedForTable.Contains(rowId))
+                var rowId = i < target.RowIds.Count ? target.RowIds[i] : nextSyntheticId++;
+                var key = GetMvccTableKey(target, target.Rows[i], rowId);
+                if (deletedForTable.Contains(key))
                     continue;
-                if (liveForTable.TryGetValue(rowId, out var cells))
+                if (liveForTable.TryGetValue(key, out var cells))
                 {
                     nextRows.Add(cells);
                     nextIds.Add(rowId);
-                    liveForTable.Remove(rowId);
+                    liveForTable.Remove(key);
                     continue;
                 }
 
@@ -2111,10 +2246,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 nextIds.Add(rowId);
             }
 
-            foreach (var (rowId, cells) in liveForTable.OrderBy(pair => pair.Key))
+            foreach (var (key, cells) in liveForTable)
             {
                 nextRows.Add(cells);
-                nextIds.Add(rowId);
+                nextIds.Add(target.HasRowid ? key.Integer : nextSyntheticId++);
             }
 
             target.Rows.Clear();
@@ -2124,6 +2259,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 target.Rows.Add(nextRows[i]);
                 target.RowIds.Add(nextIds[i]);
             }
+
+            if (!target.HasRowid)
+                SortWithoutRowid(target);
         }
 
         foreach (var (name, table) in txCatalog.Tables)
@@ -2138,6 +2276,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
             merged.Triggers[name] = trigger;
 
         return merged;
+    }
+
+    private MvccKey GetMvccTableKey(EmbeddedTable table, SqlValue[] row, long rowId)
+    {
+        if (table.HasRowid)
+            return MvccKey.FromInteger(rowId);
+
+        return MvccKey.FromPrimaryKey(
+            table.PrimaryKeySchema
+                ?? throw new EmbeddedSqlException(
+                    $"WITHOUT ROWID table '{table.Name}' is missing primary-key metadata for concurrent MVCC."),
+            row,
+            GetTextEncoding());
     }
 
     internal PragmaHeaderMetadata GetPragmaHeaderMetadata()
@@ -2390,6 +2541,30 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     /// <summary>
+    /// A legacy rowid-only log must be materialized before a concurrent
+    /// transaction can stage a typed primary-key operation. This runs before the
+    /// transaction enters the store, so the checkpoint can take its required
+    /// exclusive boundary without invalidating an active MVCC snapshot.
+    /// </summary>
+    internal void EnsureMvccLogVersion4()
+    {
+        lock (_gate)
+        {
+            if (_mvStore?.LogicalLog is not { RequiresVersion4Upgrade: true })
+                return;
+            if (!_mvStore.CanUpgradeLegacyLog)
+            {
+                throw new EmbeddedSqlException(
+                    "cannot safely migrate a legacy MVCC logical log with unresolved table identities; restore it with a version that can materialize its catalog first.");
+            }
+
+            var result = RunMvccCheckpoint("TRUNCATE", BusyTimeout);
+            if (result.Busy)
+                throw new EmbeddedBusyException();
+        }
+    }
+
+    /// <summary>
     /// Runs the managed MVCC checkpoint skeleton (Turso
     /// <c>CheckpointStateMachine</c> phases, synchronous):
     /// materialize store → catalog, persist, optional log truncate, GC.
@@ -2411,6 +2586,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var phase = MvccCheckpointPhase.Prepare;
             var log = store.LogicalLog;
             var logBefore = log?.ApproximatePayloadBytes ?? 0L;
+            var requiresLogUpgrade = log?.RequiresVersion4Upgrade == true;
+            if (requiresLogUpgrade && !store.CanUpgradeLegacyLog)
+            {
+                throw new EmbeddedSqlException(
+                    "cannot safely checkpoint a legacy MVCC logical log with unresolved table identities.");
+            }
 
             phase = MvccCheckpointPhase.AcquireLock;
             var wantTruncate = MvccCheckpoint.ShouldTruncateLog(mode);
@@ -2446,11 +2627,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
 
             var checkpointed = logBefore;
-            if (wantTruncate && log is not null)
+            if ((wantTruncate || requiresLogUpgrade) && log is not null)
             {
                 phase = MvccCheckpointPhase.TruncateLogicalLog;
                 log.TruncateAfterCheckpoint();
-                checkpointed = logBefore;
+                if (requiresLogUpgrade)
+                    log.UpgradeToVersion4AfterCheckpoint();
+                if (wantTruncate)
+                    checkpointed = logBefore;
             }
 
             phase = MvccCheckpointPhase.GarbageCollect;
@@ -3426,6 +3610,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ExecuteTableList: executeTableList,
             ConcurrentMvStore: concurrentMvStore,
             ConcurrentMvccTxId: concurrentMvccTxId,
+            ConcurrentBaseTables: concurrentMvStore is null ? null : CloneTablesShallow(catalog.Tables),
+            ConcurrentMvccIdentityTracker: concurrentMvStore is null ? null : new ConcurrentMvccIdentityTracker(),
+            MvccTextEncoding: GetTextEncoding(),
             VirtualTables: catalog.VirtualTables);
         EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
         return statement switch
@@ -11972,6 +12159,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var originalRowIds = table.HasRowid
             ? updatedPositions.Select(position => table.RowIds[position]).ToArray()
             : [];
+        // WITHOUT ROWID sorting moves rows after the mutation. Keep the synthetic
+        // identity selected by the update before restoring clustered key order so
+        // the MVCC mirror updates the row that was actually changed.
+        var updatedRowIds = updatedPositions.Select(position => rowIds[position]).ToArray();
         table.Rows.Clear();
         table.Rows.AddRange(rows);
         table.RowIds.Clear();
@@ -11997,8 +12188,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         // SQLite reports the post-update rowid, so an UPDATE that rewrites an INTEGER PRIMARY
         // KEY notifies with the new value rather than the one the row had before.
-        foreach (var position in updatedPositions)
-            context.ReportRowChange(SqliteChangeOperation.Update, tableName, table, rowIds[position]);
+        foreach (var rowId in updatedRowIds)
+            context.ReportRowChange(SqliteChangeOperation.Update, tableName, table, rowId);
     }
 
     // Foreign-key checks run against the complete post-statement image, but only inspect
@@ -22823,15 +23014,23 @@ out bool hasReturning)
         SourceRow? outerRow)
     {
         var table = plan.Table;
-        var entries = new List<(int Position, SqlValue[] Key)>(table.Rows.Count);
-        for (var position = 0; position < table.Rows.Count; position++)
+        // The managed index executor is materialized today. Build it from the
+        // MVCC table dual cursor rather than the catalog backing list so an index
+        // scan never returns a stale base row or misses a version-store insert.
+        var visibleRows = GetNamedTableRows(
+            plan.Source,
+            context,
+            maximumRows: null,
+            outerRow).Rows;
+        var entries = new List<(SourceRow Row, SqlValue[] Key)>(visibleRows.Count);
+        foreach (var row in visibleRows)
         {
             context.CheckInterrupt();
-            var rowId = table.HasRowid ? table.RowIds[position] : (long?)null;
+            var rowId = table.HasRowid ? row.RowId : null;
             if (!IndexExpressionSemantics.Qualifies(
                     plan.Index,
                     table,
-                    table.Rows[position],
+                    row.Values,
                     rowId,
                     EvaluateIndexExpression))
             {
@@ -22839,11 +23038,11 @@ out bool hasReturning)
             }
 
             entries.Add((
-                position,
+                row,
                 IndexExpressionSemantics.ProjectKey(
                     plan.Index,
                     table,
-                    table.Rows[position],
+                    row.Values,
                     rowId,
                     EvaluateIndexExpression)));
         }
@@ -22851,23 +23050,16 @@ out bool hasReturning)
         entries.Sort((left, right) => CompareManagedIndexEntries(table, plan.Index, left, right));
         var qualifier = plan.Source.Alias ?? plan.Source.Name;
         var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
-        var rows = new SourceRow[entries.Count];
-        for (var index = 0; index < entries.Count; index++)
+        var rows = entries.Select(entry => entry.Row with
         {
-            var position = entries[index].Position;
-            var rowId = table.HasRowid ? table.RowIds[position] : (long?)null;
-            rows[index] = new SourceRow(
-                table.Columns,
-                table.Rows[position],
-                qualifiedColumns,
-                outerRow,
-                RowId: rowId,
-                RowIdQualifier: qualifier,
-                ColumnDefinitions: table.ColumnDefinitions,
-                QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
-                    qualifier,
-                    table.ColumnDefinitions));
-        }
+            QualifiedColumns = qualifiedColumns,
+            Parent = outerRow,
+            RowIdQualifier = qualifier,
+            ColumnDefinitions = table.ColumnDefinitions,
+            QualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(
+                qualifier,
+                table.ColumnDefinitions),
+        }).ToArray();
 
         return new SourceData(table.Columns, rows);
     }
@@ -22997,61 +23189,57 @@ out bool hasReturning)
         SourceRow? outerRow)
     {
         var table = plan.Table;
-        var positions = new SortedSet<int>();
+        var visibleRows = GetNamedTableRows(
+            plan.Source,
+            context,
+            maximumRows: null,
+            outerRow).Rows;
+        var selected = new HashSet<MvccKey>();
+        var selectedRows = new List<SourceRow>();
         foreach (var (index, branch) in plan.Branches)
         {
-            for (var position = 0; position < table.Rows.Count; position++)
+            foreach (var row in visibleRows)
             {
                 context.CheckInterrupt();
-                var rowId = table.HasRowid ? table.RowIds[position] : (long?)null;
+                var rowId = table.HasRowid ? row.RowId : null;
                 if (!IndexExpressionSemantics.Qualifies(
                         index,
                         table,
-                        table.Rows[position],
+                        row.Values,
                         rowId,
                         EvaluateIndexExpression))
                 {
                     continue;
                 }
 
-                var probeRow = new SourceRow(
-                    table.Columns,
-                    table.Rows[position],
-                    BuildQualifiedColumns(plan.Source.Alias ?? plan.Source.Name, table.Columns),
-                    outerRow,
-                    RowId: rowId,
-                    RowIdQualifier: plan.Source.Alias ?? plan.Source.Name,
-                    ColumnDefinitions: table.ColumnDefinitions,
-                    QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
-                        plan.Source.Alias ?? plan.Source.Name,
-                        table.ColumnDefinitions));
                 // Branch equality is re-checked so non-matching keys on this index are skipped.
-                if (!IsTrue(Evaluate(branch, parameters, probeRow, context)))
+                if (!IsTrue(Evaluate(branch, parameters, row, context)))
                     continue;
 
-                positions.Add(position);
+                var identity = table.HasRowid
+                    ? MvccKey.FromInteger(rowId!.Value)
+                    : MvccKey.FromPrimaryKey(
+                        table.PrimaryKeySchema
+                            ?? throw new InvalidOperationException("WITHOUT ROWID table has no primary-key metadata."),
+                        row.Values,
+                        context.MvccTextEncoding);
+                if (selected.Add(identity))
+                    selectedRows.Add(row);
             }
         }
 
         var qualifier = plan.Source.Alias ?? plan.Source.Name;
         var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
-        var rows = new SourceRow[positions.Count];
-        var write = 0;
-        foreach (var position in positions)
+        var rows = selectedRows.Select(row => row with
         {
-            var rowId = table.HasRowid ? table.RowIds[position] : (long?)null;
-            rows[write++] = new SourceRow(
-                table.Columns,
-                table.Rows[position],
-                qualifiedColumns,
-                outerRow,
-                RowId: rowId,
-                RowIdQualifier: qualifier,
-                ColumnDefinitions: table.ColumnDefinitions,
-                QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
-                    qualifier,
-                    table.ColumnDefinitions));
-        }
+            QualifiedColumns = qualifiedColumns,
+            Parent = outerRow,
+            RowIdQualifier = qualifier,
+            ColumnDefinitions = table.ColumnDefinitions,
+            QualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(
+                qualifier,
+                table.ColumnDefinitions),
+        }).ToArray();
 
         return new SourceData(table.Columns, rows);
     }
@@ -23068,8 +23256,8 @@ out bool hasReturning)
     private int CompareManagedIndexEntries(
         EmbeddedTable table,
         EmbeddedIndex index,
-        (int Position, SqlValue[] Key) left,
-        (int Position, SqlValue[] Key) right)
+        (SourceRow Row, SqlValue[] Key) left,
+        (SourceRow Row, SqlValue[] Key) right)
     {
         for (var position = 0; position < index.Columns.Count; position++)
         {
@@ -23083,7 +23271,7 @@ out bool hasReturning)
         }
 
         if (table.HasRowid)
-            return table.RowIds[left.Position].CompareTo(table.RowIds[right.Position]);
+            return left.Row.RowId!.Value.CompareTo(right.Row.RowId!.Value);
 
         var primaryKey = table.PrimaryKeySchema
             ?? throw new InvalidOperationException("WITHOUT ROWID table has no primary-key metadata.");
@@ -23100,8 +23288,8 @@ out bool hasReturning)
                 continue;
 
             var comparison = Compare(
-                table.Rows[left.Position][suffix.ColumnIndex],
-                table.Rows[right.Position][suffix.ColumnIndex],
+                left.Row.Values[suffix.ColumnIndex],
+                right.Row.Values[suffix.ColumnIndex],
                 suffix.Collation.Name);
             if (comparison != 0)
             {
@@ -27592,38 +27780,59 @@ out bool hasReturning)
             qualifier,
             table.ColumnDefinitions);
 
-        // Concurrent MVCC: merge classic base snapshot with version-store overlays
-        // (Turso dual-cursor). Rowid tables only; WITHOUT ROWID stays catalog-only.
-        if (table.HasRowid
-            && context.ConcurrentMvStore is { } store
+        // Concurrent MVCC: merge a classic base snapshot with typed version-store
+        // overlays. WITHOUT ROWID identities are complete primary-key records.
+        if (context.ConcurrentMvStore is { } store
             && context.ConcurrentMvccTxId is { } txId)
         {
-            var baseIds = new long[table.Rows.Count];
+            SqliteIndexRecordComparer? primaryKeyComparer = null;
+            if (!table.HasRowid)
+            {
+                var primaryKey = table.PrimaryKeySchema
+                    ?? throw new EmbeddedSqlException(
+                        $"WITHOUT ROWID table '{source.Name}' is missing primary-key metadata for concurrent MVCC.");
+                primaryKeyComparer = new SqliteIndexRecordComparer(
+                    context.MvccTextEncoding,
+                    primaryKey.Terms.Select(term =>
+                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+            }
+
+            var baseRows = new MvccDualCursor.Row[table.Rows.Count];
             for (var i = 0; i < table.Rows.Count; i++)
-                baseIds[i] = i < table.RowIds.Count ? table.RowIds[i] : i + 1;
+            {
+                var rowId = i < table.RowIds.Count ? table.RowIds[i] : i + 1;
+                var key = table.HasRowid
+                    ? MvccKey.FromInteger(rowId)
+                    : MvccKey.FromPrimaryKey(
+                        table.PrimaryKeySchema!,
+                        table.Rows[i],
+                        context.MvccTextEncoding);
+                baseRows[i] = new MvccDualCursor.Row(key, table.Rows[i]);
+            }
 
             var tableId = store.GetOrCreateTableId(source.Name);
             var merged = MvccDualCursor.MergeVisibleRows(
                 store,
                 txId,
                 tableId,
-                baseIds,
-                table.Rows);
-            var ordered = merged.OrderBy(row => row.RowId).ToList();
-            var count = ordered.Count;
+                baseRows,
+                (left, right) => table.HasRowid
+                    ? left.Integer.CompareTo(right.Integer)
+                    : primaryKeyComparer!.Compare(left.Record.Span, right.Record.Span));
+            var count = merged.Count;
             if (maximumRows is { } maximum && maximum < count)
                 count = (int)maximum;
 
             var dualSourceRows = new SourceRow[count];
             for (var outputIndex = 0; outputIndex < count; outputIndex++)
             {
-                var (rowId, cells) = ordered[outputIndex];
+                var row = merged[outputIndex];
                 dualSourceRows[outputIndex] = new SourceRow(
                     table.Columns,
-                    cells,
+                    row.Cells,
                     qualifiedColumns,
                     outerRow,
-                    RowId: rowId,
+                    RowId: table.HasRowid ? row.Key.Integer : null,
                     RowIdQualifier: qualifier,
                     ColumnDefinitions: table.ColumnDefinitions,
                     QualifiedColumnDefinitions: qualifiedColumnDefinitions);
@@ -41326,6 +41535,7 @@ public sealed class EmbeddedConnection : IDisposable
     /// <summary>When set, the open SQL transaction is a Turso <c>BEGIN CONCURRENT</c> MVCC tx.</summary>
     private bool _transactionIsConcurrent;
     private readonly Dictionary<EmbeddedDatabase, MvccTxId> _mvccTransactions = [];
+    private long _nextMvccStatementSavepoint;
     private readonly List<SavepointEntry> _savepoints = [];
     private long _lastInsertRowId;
     private bool _queryOnly;
@@ -42135,6 +42345,7 @@ public sealed class EmbeddedConnection : IDisposable
         public PragmaHeaderMetadata PragmaHeader { get; set; } = pragmaHeader;
         public bool HasChanges { get; set; }
         public bool HasSnapshotPragmaHeader { get; set; }
+        public bool HasSchemaChanges { get; set; }
         public bool ForceFullCatalogRewrite { get; set; }
         public HashSet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations { get; } = [];
     }
@@ -42651,8 +42862,7 @@ public sealed class EmbeddedConnection : IDisposable
             && _transactionDatabases is not null
             && EmbeddedDatabase.MayChangeSchema(statement))
         {
-            throw new EmbeddedSqlException(
-                "Schema changes are not supported in concurrent transactions");
+            BeginConcurrentSchemaChange();
         }
 
         if (_transactionDatabases is null)
@@ -42787,6 +42997,9 @@ public sealed class EmbeddedConnection : IDisposable
                 var pendingTempTriggerRewrite = PrepareTempTriggerTableRename(routed, cancellationToken)
                     ?? PrepareTempTriggerColumnRename(routed, cancellationToken);
                 ValidateTempTriggersAfterDropColumn(routed, cancellationToken);
+                MvStore? concurrentStore = null;
+                MvccTxId? concurrentTxId = null;
+                string? mvccStatementSavepoint = null;
                 try
                 {
                     ExecutionResult result;
@@ -42800,7 +43013,15 @@ public sealed class EmbeddedConnection : IDisposable
                             includeImmediate: _deferForeignKeys);
                     }
                     var mutationReserved = ReserveTransactionMutation(routed.Database, routed.Statement);
-                    TryGetConcurrentMvccScope(routed.Database, out var concurrentStore, out var concurrentTxId);
+                    TryGetConcurrentMvccScope(routed.Database, out concurrentStore, out concurrentTxId);
+                    if (EmbeddedDatabase.MayMutate(routed.Statement)
+                        && concurrentStore is not null
+                        && concurrentTxId is not null)
+                    {
+                        mvccStatementSavepoint = BeginConcurrentStatementSavepoint(
+                            concurrentStore,
+                            concurrentTxId.Value);
+                    }
                     try
                     {
                         if (routed.ReadCatalog is not null)
@@ -42919,6 +43140,7 @@ public sealed class EmbeddedConnection : IDisposable
                                 {
                                     SchemaVersion = unchecked(transactionState.PragmaHeader.SchemaVersion + 1),
                                 };
+                                transactionState.HasSchemaChanges = true;
                             }
 
                             RecordConcurrentMvccMutation(
@@ -42940,6 +43162,10 @@ public sealed class EmbeddedConnection : IDisposable
                     if (result.Changed && pendingTempTriggerRewrite is not null)
                         PublishTempTriggerCatalogRewrite(pendingTempTriggerRewrite);
 
+                    ReleaseConcurrentStatementSavepoint(
+                        concurrentStore,
+                        concurrentTxId,
+                        mvccStatementSavepoint);
                     tempTriggerSession?.Commit();
                     return result;
                 }
@@ -42958,11 +43184,21 @@ public sealed class EmbeddedConnection : IDisposable
                 catch (EmbeddedStatementAbortException exception)
                 {
                     _lastInsertRowId = exception.LastInsertRowId;
+                    RollbackConcurrentStatementSavepoint(
+                        concurrentStore,
+                        concurrentTxId,
+                        mvccStatementSavepoint);
+                    ReleaseConcurrentSchemaGateIfUnused();
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
                 catch (EmbeddedStatementFailureException exception)
                 {
                     _lastInsertRowId = exception.LastInsertRowId;
+                    RollbackConcurrentStatementSavepoint(
+                        concurrentStore,
+                        concurrentTxId,
+                        mvccStatementSavepoint);
+                    ReleaseConcurrentSchemaGateIfUnused();
                     ExceptionDispatchInfo.Capture(exception.Failure).Throw();
                     throw new InvalidOperationException("ExceptionDispatchInfo.Throw unexpectedly returned.");
                 }
@@ -42988,6 +43224,11 @@ public sealed class EmbeddedConnection : IDisposable
                         _tempInitialized = true;
 
                     tempTriggerSession?.Commit();
+                    ReleaseConcurrentStatementSavepoint(
+                        concurrentStore,
+                        concurrentTxId,
+                        mvccStatementSavepoint);
+                    ReleaseConcurrentSchemaGateIfUnused();
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
                 catch (EmbeddedTriggerDepthException exception)
@@ -43013,15 +43254,44 @@ public sealed class EmbeddedConnection : IDisposable
                     if (ReferenceEquals(routed.Database, _tempDatabase))
                         _tempInitialized = true;
 
+                    if (!exception.PreserveChanges)
+                    {
+                        RollbackConcurrentStatementSavepoint(
+                            concurrentStore,
+                            concurrentTxId,
+                            mvccStatementSavepoint);
+                    }
+                    else
+                    {
+                        ReleaseConcurrentStatementSavepoint(
+                            concurrentStore,
+                            concurrentTxId,
+                            mvccStatementSavepoint);
+                    }
+                    ReleaseConcurrentSchemaGateIfUnused();
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
                 catch (OperationCanceledException)
                 {
+                    RollbackConcurrentStatementSavepoint(
+                        concurrentStore,
+                        concurrentTxId,
+                        mvccStatementSavepoint);
                     if (transactionState is not null && EmbeddedDatabase.MayMutate(routed.Statement))
                     {
                         ResetTransactionState();
                         FireRollbackHook();
                     }
+                    ReleaseConcurrentSchemaGateIfUnused();
+                    throw;
+                }
+                catch
+                {
+                    RollbackConcurrentStatementSavepoint(
+                        concurrentStore,
+                        concurrentTxId,
+                        mvccStatementSavepoint);
+                    ReleaseConcurrentSchemaGateIfUnused();
                     throw;
                 }
         }
@@ -45665,6 +45935,8 @@ Func<string, ParsedStatement> rewrite)
                 throw new EmbeddedSqlException(
                     "Concurrent transaction mode is only supported when MVCC is enabled");
             }
+
+            _database.EnsureMvccLogVersion4();
         }
 
         var databases = _attachedDatabases.Values
@@ -45955,6 +46227,44 @@ Func<string, ParsedStatement> rewrite)
         return true;
     }
 
+    private void BeginConcurrentSchemaChange()
+    {
+        if (!_transactionIsConcurrent
+            || !_mvccTransactions.TryGetValue(_database, out var txId)
+            || _database.MvStore is not { } store)
+        {
+            throw new EmbeddedSqlException(
+                "Concurrent schema changes require an active main-database MVCC transaction.");
+        }
+
+        store.BeginSchemaChange(txId);
+    }
+
+    private string BeginConcurrentStatementSavepoint(MvStore store, MvccTxId txId)
+    {
+        var name = "\u0001ahtola-mvcc-statement-" + checked(++_nextMvccStatementSavepoint);
+        store.BeginNamedSavepoint(txId, name);
+        return name;
+    }
+
+    private static void ReleaseConcurrentStatementSavepoint(
+        MvStore? store,
+        MvccTxId? txId,
+        string? name)
+    {
+        if (store is not null && txId is { } id && name is not null)
+            store.ReleaseNamedSavepoint(id, name);
+    }
+
+    private static void RollbackConcurrentStatementSavepoint(
+        MvStore? store,
+        MvccTxId? txId,
+        string? name)
+    {
+        if (store is not null && txId is { } id && name is not null)
+            store.RollbackToNamedSavepoint(id, name);
+    }
+
     private void CommitTransaction()
     {
         if (_transactionDatabases is null)
@@ -45975,11 +46285,33 @@ Func<string, ParsedStatement> rewrite)
         }
 
         // MVCC commit protocol first (clock + WW conflict), then classic catalog publish.
-        foreach (var (database, txId) in _mvccTransactions.ToArray())
+        // A schema generation stays pending across that boundary so no new BEGIN
+        // can capture old bindings while the page-one cookie is landing.
+        var pendingSchemaPublications = new List<(
+            EmbeddedDatabase Database,
+            MvccTxId TxId,
+            bool Publish)>();
+        try
         {
-            if (database.MvStore is { } store)
-                store.Commit(txId);
-            _mvccTransactions.Remove(database);
+            foreach (var (database, txId) in _mvccTransactions.ToArray())
+            {
+                if (database.MvStore is { } store)
+                {
+                    if (store.HasSchemaChange(txId))
+                    {
+                        var publish = _transactionDatabases.TryGetValue(database, out var state)
+                            && state.HasSchemaChanges;
+                        pendingSchemaPublications.Add((database, txId, publish));
+                    }
+                    store.Commit(txId);
+                }
+                _mvccTransactions.Remove(database);
+            }
+        }
+        catch (MvccLogicalLogCommitIndeterminateException)
+        {
+            ResetTransactionState();
+            throw;
         }
 
         var persistentChanges = changed
@@ -45992,27 +46324,55 @@ Func<string, ParsedStatement> rewrite)
             .Where(pair => ReferenceEquals(pair.Key, _tempDatabase))
             .Select(pair => pair.Value)
             .SingleOrDefault();
-        if (persistentChanges.Length == 1)
+        try
         {
-            var (database, state) = persistentChanges[0];
-            try
+            if (persistentChanges.Length == 1)
             {
+                var (database, state) = persistentChanges[0];
                 database.CommitTransaction(
                     state.Catalog,
                     state.Version,
-                    database.IsFileBacked && !state.HasSnapshotPragmaHeader
+                    database.IsFileBacked && !state.HasSnapshotPragmaHeader && !state.HasSchemaChanges
                         ? null
                         : state.PragmaHeader,
                     state.ForceFullCatalogRewrite,
                     busyTimeout: BusyTimeout,
-                    concurrent: _transactionIsConcurrent);
+                    concurrent: _transactionIsConcurrent,
+                    containsSchemaChanges: state.HasSchemaChanges);
             }
-            catch (EmbeddedPostCommitMaintenanceException)
+
+            foreach (var (database, txId, publish) in pendingSchemaPublications)
             {
-                CommitTemporaryTransaction(tempChange);
-                ResetTransactionState();
-                throw;
+                if (publish)
+                {
+                    database.MvStore?.CompleteSchemaCheckpoint();
+                    database.MvStore?.PublishSchemaChange(txId);
+                }
+                else
+                    database.MvStore?.CancelSchemaChange(txId);
             }
+        }
+        catch (EmbeddedPostCommitMaintenanceException)
+        {
+            foreach (var (database, txId, _) in pendingSchemaPublications)
+                database.MvStore?.CancelSchemaChange(txId);
+            CommitTemporaryTransaction(tempChange);
+            ResetTransactionState();
+            throw;
+        }
+        catch (MvccLogicalLogCommitIndeterminateException)
+        {
+            foreach (var (database, txId, _) in pendingSchemaPublications)
+                database.MvStore?.CancelSchemaChange(txId);
+            ResetTransactionState();
+            throw;
+        }
+        catch (Exception failure)
+        {
+            foreach (var (database, txId, _) in pendingSchemaPublications)
+                database.MvStore?.CancelSchemaChange(txId);
+            ResetTransactionState();
+            throw new EmbeddedPostCommitMaintenanceException(failure);
         }
 
         CommitTemporaryTransaction(tempChange);
@@ -46890,6 +47250,7 @@ Func<string, ParsedStatement> rewrite)
                     pair.Value.HasChanges,
                     pair.Value.PragmaHeader,
                     pair.Value.HasSnapshotPragmaHeader,
+                    pair.Value.HasSchemaChanges,
                     pair.Value.ForceFullCatalogRewrite,
                     new HashSet<EmbeddedDatabase.ForeignKeyViolation>(
                         pair.Value.PendingDeferredViolations))),
@@ -46931,6 +47292,7 @@ Func<string, ParsedStatement> rewrite)
             state.HasChanges = savedState.HasChanges;
             state.PragmaHeader = savedState.PragmaHeader;
             state.HasSnapshotPragmaHeader = savedState.HasSnapshotPragmaHeader;
+            state.HasSchemaChanges = savedState.HasSchemaChanges;
             state.ForceFullCatalogRewrite = savedState.ForceFullCatalogRewrite;
             state.PendingDeferredViolations.Clear();
             state.PendingDeferredViolations.UnionWith(savedState.PendingDeferredViolations);
@@ -46940,6 +47302,7 @@ Func<string, ParsedStatement> rewrite)
         // Undo concurrent version-store ops after the named mark (Turso MVCC savepoints).
         foreach (var (database, txId) in _mvccTransactions)
             database.MvStore?.RollbackToNamedSavepoint(txId, name);
+        ReleaseConcurrentSchemaGateIfUnused();
 
         // ROLLBACK TO keeps the named savepoint but cancels any created after it.
         if (index + 1 < _savepoints.Count)
@@ -46955,6 +47318,19 @@ Func<string, ParsedStatement> rewrite)
         }
 
         throw new EmbeddedSqlException($"no such savepoint: {name}");
+    }
+
+    private void ReleaseConcurrentSchemaGateIfUnused()
+    {
+        if (!_transactionIsConcurrent
+            || _transactionDatabases is null
+            || _transactionDatabases.Values.Any(state => state.HasSchemaChanges))
+        {
+            return;
+        }
+
+        foreach (var (database, txId) in _mvccTransactions)
+            database.MvStore?.CancelSchemaChange(txId);
     }
 
     private void ResetTransactionState()
@@ -46992,6 +47368,7 @@ Func<string, ParsedStatement> rewrite)
         bool HasChanges,
         PragmaHeaderMetadata PragmaHeader,
         bool HasSnapshotPragmaHeader,
+        bool HasSchemaChanges,
         bool ForceFullCatalogRewrite,
         IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations);
 

@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using Ahtola.Core;
 using Ahtola.Core.Mvcc;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
 
@@ -187,5 +188,45 @@ public sealed class MvccStoreUnitTests
 
         store.SnapshotLiveCommittedRows().Should().ContainSingle(row =>
             row.RowId == key && row.Cells[0].Equals(SqlValue.Text("new")));
+    }
+
+    [Test]
+    public void TypedPrimaryKeyCanonicalizationMatchesBuiltInSqliteCollations()
+    {
+        var noCase = new SqlitePrimaryKeySchema(
+        [
+            new SqlitePrimaryKeyTerm(
+                0,
+                "key",
+                SqliteKeySortOrder.Ascending,
+                SqliteKeyCollation.FromName("NOCASE")),
+        ]);
+        var rtrim = new SqlitePrimaryKeySchema(
+        [
+            new SqlitePrimaryKeyTerm(
+                0,
+                "key",
+                SqliteKeySortOrder.Ascending,
+                SqliteKeyCollation.FromName("RTRIM")),
+        ]);
+
+        MvccKey.FromPrimaryKey(noCase, [SqlValue.Text("Alpha")], SqliteTextEncoding.Utf8)
+            .Should()
+            .Be(MvccKey.FromPrimaryKey(noCase, [SqlValue.Text("alpha")], SqliteTextEncoding.Utf8));
+        MvccKey.FromPrimaryKey(rtrim, [SqlValue.Text("key")], SqliteTextEncoding.Utf8)
+            .Should()
+            .Be(MvccKey.FromPrimaryKey(rtrim, [SqlValue.Text("key   ")], SqliteTextEncoding.Utf8));
+    }
+
+    [Test]
+    public void LegacyRecoveryWithoutAnObjectNameFailsClosedForTheV4Upgrade()
+    {
+        var store = new MvStore();
+
+        store.ApplyRecoveredCommit(
+            1,
+            [MvccLogOp.Upsert(new MvccRowId(-2, 1), [SqlValue.Text("legacy")])]);
+
+        store.CanUpgradeLegacyLog.Should().BeFalse();
     }
 }

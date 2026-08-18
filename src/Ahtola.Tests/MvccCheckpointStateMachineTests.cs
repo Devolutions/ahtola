@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using Ahtola.Core;
 using Ahtola.Core.Mvcc;
+using Ahtola.Core.Storage;
 using Ahtola.Data.Sqlite;
 
 namespace Ahtola.Tests;
@@ -114,11 +115,49 @@ public sealed class MvccCheckpointStateMachineTests
         store.VersionChainCount.Should().Be(0);
     }
 
+    [Test]
+    public void CheckpointUpgradesAHeaderOnlyLegacyLogicalLogBeforeTypedWrites()
+    {
+        const string path = "mvcc-v3-checkpoint-upgrade.db";
+        var fileSystem = new InMemoryFileSystem();
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+        }
+
+        var logPath = MvccLogicalLog.LogPathForDatabase(path);
+        using (var file = fileSystem.OpenFile(logPath, FileOpenMode.OpenExisting))
+        {
+            var header = new byte[56];
+            file.Read(0, header).Should().Be(header.Length);
+            header[4] = 3;
+            header.AsSpan(52).Clear();
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
+                header.AsSpan(52),
+                Crc32C.Compute(header));
+            file.Write(0, header);
+            file.FlushToDisk();
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        reopened.MvStore!.LogicalLog!.RequiresVersion4Upgrade.Should().BeTrue();
+        reopened.RunMvccCheckpoint("PASSIVE").Busy.Should().BeFalse();
+        reopened.MvStore!.LogicalLog!.RequiresVersion4Upgrade.Should().BeFalse();
+    }
+
     private static object? Scalar(SqliteConnection connection, string sql)
     {
         using var command = connection.CreateCommand();
         command.CommandText = sql;
         return command.ExecuteScalar();
+    }
+
+    private static void Execute(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        _ = statement.Step();
     }
 
     private static string ReadValue(SqliteConnection connection, string sql)

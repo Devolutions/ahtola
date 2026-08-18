@@ -130,7 +130,7 @@ Additional current behavior:
    readers, the single writer, and checkpoints inside the process; the shm bytes
    are a secondary boundary layered underneath it.
 
-### 1.4 MVCC mode (Phase 1)
+### 1.4 MVCC mode (Phase 2)
 
 `PRAGMA journal_mode=mvcc` enables Turso-aligned main-memory MVCC on the
 connection's main database (including in-memory databases). The engine attaches
@@ -139,18 +139,39 @@ clock and write-set conflict detection. `BEGIN CONCURRENT` is accepted only when
 MVCC is enabled; nested `BEGIN` still fails with
 `cannot start a transaction within a transaction`.
 
-Phase 1 scope and limits:
+Phase 2 scope and limits:
 
 - Concurrent transactions skip the classic single-writer reservation and use
   MVCC transaction IDs + first-committer-wins write-write conflicts.
-- Classic catalog DML still mutates `EmbeddedDatabase` table snapshots; full
-  row-version chains and dual-cursor isolation land in later phases.
+- Row identities are either integer rowids or canonical SQLite primary-key
+  records. The record form supports composite `WITHOUT ROWID` primary keys and
+  preserves built-in BINARY/NOCASE/RTRIM equality plus numeric equivalence.
+- Table scans and materialized managed-index scans merge the transaction's
+  version-store rows with its catalog snapshot. A base row shadowed by a
+  visible update/delete is never emitted; an own or committed overlay insert
+  appears once in key order.
+- `WITHOUT ROWID` INSERT/UPDATE/DELETE, trigger bodies, and foreign-key
+  cascades are routed through the typed-key overlay. They continue to expose
+  no hidden rowid and do not affect update hooks or `last_insert_rowid()`.
+- Concurrent DDL is admitted only through a fail-closed schema gate: no other
+  MVCC snapshot may be active. The catalog, `sqlite_schema` rows, and schema
+  cookie are persisted before the store publishes its next schema generation.
+  A conflicting DDL attempt reports busy rather than running against stale
+  object bindings.
 - File-backed MVCC keeps a WAL open underneath for page durability (matching
   Turso). Enabling MVCC persists SQLite header read/write version **255** and
-  opens a durable logical log (`<db>-log`, Turso LML2/MVTX framing). Cold open
-  of a version-255 database restores the in-process `MvStore` from that log.
-  Full checkpoint-into-b-tree state machine and dual-cursor SQL routing remain
-  incomplete; `MvccDualCursor` provides the merge primitive for later wiring.
+  opens a durable logical log (`<db>-log`, Turso LML2/MVTX framing). New logs
+  use V4 typed-key frames and include their logical object name so recovery
+  restores the object-id mapping. V3 rowid-only logs are upgraded only by an
+  exclusive materializing checkpoint; a cold V3 log whose table identities
+  cannot be proven fails closed instead of losing frames.
+- A logical-log write/flush failure after frame construction is an
+  indeterminate commit. The live MVCC store rejects further transactions and
+  callers must dispose and reopen; recovery then accepts a fully framed commit
+  or discards a torn tail before a later append.
+- Checkpointing folds typed table rows into the catalog and persists the
+  resulting secondary indexes through the normal pager/WAL write path before
+  truncating or upgrading the logical log.
 - `PRAGMA temp.journal_mode=mvcc` is ignored (temp stays `wal`), matching Turso.
 - MVCC is process-local and does not replace Stage 6 WAL interop. Cross-process
   MVCC is unsupported (same as Turso v0.7.2).
