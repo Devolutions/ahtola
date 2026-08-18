@@ -1,5 +1,6 @@
 using AwesomeAssertions;
 using Ahtola.Core;
+using MsData = Microsoft.Data.Sqlite;
 
 namespace Ahtola.Tests;
 
@@ -217,6 +218,223 @@ public sealed class ManagedSearchVirtualTableTests
             .WithMessage("*signed 32-bit integer*");
     }
 
+    [Test]
+    public void ManagedFtsAndRTreePersistAcrossFileReopenAndVacuumInto()
+    {
+        var sourcePath = CreateDatabasePath("managed-vtab-source");
+        var backupPath = CreateDatabasePath("managed-vtab-backup");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(sourcePath))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE VIRTUAL TABLE documents USING fts5(title, body);");
+                Execute(connection, "CREATE VIRTUAL TABLE bounds USING rtree(id, min_x, max_x, min_y, max_y);");
+                Execute(connection, "CREATE TABLE metadata(value INTEGER);");
+                Execute(connection, "ALTER TABLE metadata RENAME TO renamed_metadata;");
+                Execute(connection, "INSERT INTO documents(title, body) VALUES ('Orchid', 'Purple flower');");
+                Execute(connection, "INSERT INTO bounds VALUES (7, 0, 10, 0, 10);");
+                Execute(connection, $"VACUUM INTO '{EscapeSqlLiteral(backupPath)}';");
+            }
+
+            AssertPersistedSearchState(sourcePath);
+            AssertPersistedSearchState(backupPath);
+        }
+        finally
+        {
+            DeleteDatabase(sourcePath);
+            DeleteDatabase(backupPath);
+        }
+    }
+
+    [Test]
+    public void ManagedVirtualTableDmlAndSchemaChangesRollBackAtTransactionAndSavepointBoundaries()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE VIRTUAL TABLE documents USING fts5(title, body);");
+        Execute(connection, "CREATE VIRTUAL TABLE bounds USING rtree(id, min_x, max_x);");
+
+        Execute(connection, "BEGIN;");
+        Execute(connection, "INSERT INTO documents(title, body) VALUES ('Orchid', 'Purple flower');");
+        Execute(connection, "INSERT INTO bounds VALUES (1, 0, 10);");
+        ReadRows(connection, "SELECT title FROM documents WHERE documents MATCH 'orchid';").Should().ContainSingle();
+        Execute(connection, "ROLLBACK;");
+        ReadRows(connection, "SELECT title FROM documents WHERE documents MATCH 'orchid';").Should().BeEmpty();
+        ReadRows(connection, "SELECT id FROM bounds;").Should().BeEmpty();
+
+        Execute(connection, "SAVEPOINT vtab_state;");
+        Execute(connection, "INSERT INTO documents(title, body) VALUES ('Rose', 'Red flower');");
+        Execute(connection, "CREATE VIRTUAL TABLE transient_bounds USING rtree(id, min_x, max_x);");
+        Execute(connection, "ALTER TABLE bounds RENAME TO renamed_bounds;");
+        Execute(connection, "ROLLBACK TO vtab_state;");
+        Execute(connection, "RELEASE vtab_state;");
+
+        ReadRows(connection, "SELECT title FROM documents WHERE documents MATCH 'rose';").Should().BeEmpty();
+        ReadRows(connection, "SELECT id FROM bounds;").Should().BeEmpty();
+        Action readRenamed = () => ReadRows(connection, "SELECT id FROM renamed_bounds;");
+        readRenamed.Should().Throw<EmbeddedSqlException>().WithMessage("*no such table*");
+        Action readCreated = () => ReadRows(connection, "SELECT id FROM transient_bounds;");
+        readCreated.Should().Throw<EmbeddedSqlException>().WithMessage("*no such table*");
+    }
+
+    [Test]
+    public void RenamingManagedVirtualTableRewritesDependentViews()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE VIRTUAL TABLE documents USING fts5(title);");
+        Execute(connection, "INSERT INTO documents(title) VALUES ('Orchid');");
+        Execute(connection, "CREATE VIEW document_titles AS SELECT title FROM documents;");
+
+        Execute(connection, "ALTER TABLE documents RENAME TO renamed_documents;");
+
+        ReadRows(connection, "SELECT title FROM document_titles;")
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Text("Orchid"));
+    }
+
+    [Test]
+    public void ManagedVirtualTableStatementFailureRestoresThePriorModulePayload()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE VIRTUAL TABLE bounds USING rtree(id, min_x, max_x);");
+
+        Action insert = () => Execute(
+            connection,
+            "INSERT INTO bounds VALUES (1, 0, 10), (2, 'not-a-coordinate', 20);");
+
+        insert.Should().Throw<EmbeddedSqlException>().WithMessage("*rtree coordinates must be numeric*");
+        ReadRows(connection, "SELECT id FROM bounds;").Should().BeEmpty();
+    }
+
+    [Test]
+    public void ManagedFtsAndRTreeRejectUnsupportedAndMalformedPersistencePayloads()
+    {
+        var fts5 = ManagedVirtualTableModuleRegistry.Resolve("fts5");
+        var rtree = ManagedVirtualTableModuleRegistry.Resolve("rtree");
+
+        Action unsupportedFtsVersion = () => fts5.Create(
+            new ManagedVirtualTableCreateContext("documents", ["title"]),
+            new ManagedVirtualTablePersistencePayload(2, []));
+        unsupportedFtsVersion.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*unsupported fts5*version 2");
+
+        Action truncatedFts = () => fts5.Create(
+            new ManagedVirtualTableCreateContext("documents", ["title"]),
+            new ManagedVirtualTablePersistencePayload(1, []));
+        truncatedFts.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*truncated managed virtual-table persistence payload*");
+
+        Action unsupportedRtreeVersion = () => rtree.Create(
+            new ManagedVirtualTableCreateContext("bounds", ["id", "min_x", "max_x"]),
+            new ManagedVirtualTablePersistencePayload(2, []));
+        unsupportedRtreeVersion.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*unsupported rtree*version 2");
+
+        Action truncatedRtree = () => rtree.Create(
+            new ManagedVirtualTableCreateContext("bounds", ["id", "min_x", "max_x"]),
+            new ManagedVirtualTablePersistencePayload(1, []));
+        truncatedRtree.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*truncated managed virtual-table persistence payload*");
+
+        var table = fts5.Create(new ManagedVirtualTableCreateContext("documents", ["title"]));
+        try
+        {
+            var declaration = new EmbeddedDatabase.VirtualTableDefinition(
+                "documents",
+                "fts5",
+                ["title"],
+                new ManagedVirtualTablePersistencePayload(1, []),
+                table);
+            var (_, emptyPayload) = ManagedVirtualTableSchemaSql.Parse(
+                ManagedVirtualTableSchemaSql.Build(declaration));
+            emptyPayload.Version.Should().Be(1);
+            emptyPayload.Bytes.Length.Should().Be(0);
+        }
+        finally
+        {
+            table.Destroy();
+        }
+    }
+
+    [Test]
+    public void ManagedVirtualTableCatalogRejectsMalformedOpaquePayloadOnReopen()
+    {
+        var path = CreateDatabasePath("managed-vtab-malformed");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE VIRTUAL TABLE documents USING fts5(title);");
+                Execute(connection, "INSERT INTO documents(title) VALUES ('Orchid');");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                using var command = sqlite.CreateCommand();
+                command.CommandText = """
+                    PRAGMA writable_schema=ON;
+                    UPDATE sqlite_schema
+                    SET sql = 'CREATE VIRTUAL TABLE "documents" USING "fts5"(title) /*ahtola-managed-vtab:1:not-base64*/'
+                    WHERE type = 'table' AND name = 'documents';
+                    PRAGMA writable_schema=OFF;
+                    """;
+                command.ExecuteNonQuery();
+            }
+
+            Action reopen = () =>
+            {
+                using var database = EmbeddedDatabase.OpenFile(path);
+            };
+            reopen.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("*persistence payload is not valid base64*");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void ClassicSqliteCanEnumerateTheRootpageZeroVirtualTableDeclaration()
+    {
+        var path = CreateDatabasePath("managed-vtab-schema");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+                Execute(connection, "CREATE VIRTUAL TABLE documents USING fts5(title);");
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Mode=ReadOnly");
+            sqlite.Open();
+            using var command = sqlite.CreateCommand();
+            command.CommandText = """
+                SELECT type, name, tbl_name, rootpage, sql
+                FROM sqlite_schema
+                WHERE name = 'documents';
+                """;
+            using var reader = command.ExecuteReader();
+            reader.Read().Should().BeTrue();
+            reader.GetString(0).Should().Be("table");
+            reader.GetString(1).Should().Be("documents");
+            reader.GetString(2).Should().Be("documents");
+            reader.GetInt64(3).Should().Be(0);
+            reader.GetString(4).Should().Contain("CREATE VIRTUAL TABLE");
+            reader.GetString(4).Should().Contain("ahtola-managed-vtab:1:");
+            reader.Read().Should().BeFalse();
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     private static IReadOnlyList<SqlValue[]> ReadRows(
         ManagedVirtualTable table,
         ManagedVirtualTablePlan plan,
@@ -259,5 +477,31 @@ public sealed class ManagedSearchVirtualTableTests
         }
 
         return rows;
+    }
+
+    private static void AssertPersistedSearchState(string path)
+    {
+        using var database = EmbeddedDatabase.OpenFile(path);
+        using var connection = database.Connect();
+        ReadRows(connection, "SELECT title FROM documents WHERE documents MATCH 'orchid';")
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Text("Orchid"));
+        ReadRows(connection, "SELECT id FROM bounds WHERE max_x >= 5 AND min_x <= 5;")
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(7));
+    }
+
+    private static string CreateDatabasePath(string name)
+        => Path.Combine(Path.GetTempPath(), $"{name}-{Guid.NewGuid():N}.db");
+
+    private static string EscapeSqlLiteral(string value) => value.Replace("'", "''", StringComparison.Ordinal);
+
+    private static void DeleteDatabase(string path)
+    {
+        foreach (var candidate in new[] { path, path + "-wal", path + "-shm", path + "-journal" })
+        {
+            if (File.Exists(candidate))
+                File.Delete(candidate);
+        }
     }
 }

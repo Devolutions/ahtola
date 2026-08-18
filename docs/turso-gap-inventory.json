@@ -29,7 +29,8 @@
       },
       "by_kind": {
         "extension": 8,
-        "missing": 79,
+        "missing": 77,
+        "partial": 2,
         "divergent": 71,
         "parity": 53
       },
@@ -90,13 +91,13 @@
     {
       "id": "vdbe-virtual-table-opcodes",
       "layer": "vdbe",
-      "kind": "missing",
+      "kind": "partial",
       "turso_ref": "turso-src/core/vdbe/insn.rs::Insn::VOpen, VFilter, VColumn, VNext, VUpdate, VDestroy, VBegin, VRename (turso-src/core/vtab.rs)",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Core/Execution/VdbeProgram.cs::VOpenInstruction/VFilterInstruction/VColumnInstruction/VUpdateInstruction/VNextInstruction/VBeginInstruction; src/Ahtola.Core/EmbeddedDatabase.cs::ExecuteCreateVirtualTable/ExecuteDropTable/ExecuteAlterTableRename",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional product skip with parser-create-virtual-table-not-parsed. No VOpen/VFilter/VColumn/VUpdate family; no CreateModule surface (ManagedDocumentedBoundaryTests.NoModuleSurfaceIsPublished). Classic managed SQLite path does not ship FTS/R-Tree/modules.",
+      "notes": "P1 durable managed virtual tables (2026-08-18): direct, statically registered modules now run through VOpen/VFilter/VColumn/VUpdate/VNext/VBegin and tree-walker CREATE/DROP/RENAME. File-backed catalogs persist rootpage-zero CREATE VIRTUAL TABLE declarations plus opaque module-owned payloads; reopen, VACUUM INTO, statement failure, transactions, and savepoints restore them. This remains a managed subset: no native extension ABI, arbitrary loadable modules, FTS5 shadow tables, or Turso index-method parity.",
       "status": "closed"
     },
     {
@@ -1333,13 +1334,13 @@
     {
       "id": "parser-create-virtual-table-not-parsed",
       "layer": "parser",
-      "kind": "missing",
+      "kind": "partial",
       "turso_ref": "turso-src/sqlite/parser/src/ast.rs::CreateVirtualTable { if_not_exists, tbl_name, module_name, args }",
-      "ahtola_ref": "none — src/Ahtola.Core/Parsing/SqlParser.cs line 512 detects the VIRTUAL keyword only to immediately throw",
+      "ahtola_ref": "src/Ahtola.Core/Parsing/SqlAst.cs::CreateVirtualTableStatement; src/Ahtola.Core/Parsing/SqlParser.cs::ParseCreateVirtualTable",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional product skip (paired with vdbe-virtual-table-opcodes). CREATE VIRTUAL TABLE is rejected fail-closed (ManagedDocumentedBoundaryTests, README Not implemented: virtual tables/FTS/R-Tree). No module registry or AST node by design until a full module API is a product goal; do not add a parse-only stub.",
+      "notes": "P1 durable managed virtual tables (2026-08-18): CREATE VIRTUAL TABLE parses into a dedicated AST node and dispatches only to the reflection-free static module registry. The file-backed catalog stores the declaration plus an opaque versioned payload. This does not expose SQLite's native/loadable module ABI.",
       "status": "closed"
     },
     {
@@ -1730,7 +1731,7 @@
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as no-action until FTS virtual tables exist. The scalar helpers have no managed consumer; the actual virtual-table/parser surface remains tracked by parser-create-virtual-table-not-parsed and vdbe-virtual-table-opcodes.",
+      "notes": "A managed fts5 virtual-table subset now exists, but the Turso/SQLite FTS scalar, ranking, snippet, and auxiliary-function surfaces remain unimplemented. The managed virtual-table/parser surface is tracked separately by parser-create-virtual-table-not-parsed and vdbe-virtual-table-opcodes.",
       "status": "closed"
     },
     {

@@ -332,6 +332,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         _tables = catalog.Tables;
         _views = catalog.Views;
         _triggers = catalog.Triggers;
+        _virtualTables = catalog.VirtualTables;
         _transactionLock = EmbeddedTransactionLockRegistry.Get(fileSystem, databasePath);
     }
 
@@ -875,22 +876,39 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         public Dictionary<string, TriggerDefinition> Triggers { get; }
 
-        // Module instances are intentionally shared across transaction catalog snapshots. A virtual
-        // table owns its mutable state, so cloning it here would make rollback semantics misleading.
         public Dictionary<string, VirtualTableDefinition> VirtualTables { get; }
 
         public SchemaCatalog Clone() => new(
             CloneTables(Tables),
             new Dictionary<string, ViewDefinition>(Views, StringComparer.OrdinalIgnoreCase),
             new Dictionary<string, TriggerDefinition>(Triggers, StringComparer.OrdinalIgnoreCase),
-            new Dictionary<string, VirtualTableDefinition>(VirtualTables, StringComparer.OrdinalIgnoreCase));
+            VirtualTables.ToDictionary(
+                static entry => entry.Key,
+                static entry => entry.Value.CreateSnapshot(),
+                StringComparer.OrdinalIgnoreCase));
     }
 
     internal sealed record VirtualTableDefinition(
         string Name,
         string ModuleName,
         IReadOnlyList<string> Arguments,
-        ManagedVirtualTable Table);
+        ManagedVirtualTablePersistencePayload PersistencePayload,
+        ManagedVirtualTable Table)
+    {
+        public VirtualTableDefinition CreateSnapshot()
+        {
+            var payload = PersistencePayload.Clone();
+            var arguments = Arguments.ToArray();
+            var table = ManagedVirtualTableModuleRegistry.Resolve(ModuleName).Create(
+                new ManagedVirtualTableCreateContext(Name, arguments),
+                payload);
+            ArgumentNullException.ThrowIfNull(table);
+            return new VirtualTableDefinition(Name, ModuleName, arguments, payload, table);
+        }
+
+        public VirtualTableDefinition WithCurrentPersistencePayload()
+            => this with { PersistencePayload = Table.GetPersistencePayload() };
+    }
 
     internal sealed class AutoIncrementStatementState
     {
@@ -2557,7 +2575,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (pageSize == _fileCatalogVersion.PageSize)
                     _fileStore.Compact();
                 else
-                    _fileStore.MigratePageSize(pageSize, _tables, _views, _triggers);
+                    _fileStore.MigratePageSize(pageSize, _tables, _views, _triggers, _virtualTables);
                 _fileStore.AdoptCommittedTables(_tables);
                 _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
                 _version++;
@@ -2628,7 +2646,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             pageSize,
             _tables,
             _views,
-            _triggers);
+            _triggers,
+            _virtualTables);
     }
 
     internal void SetPragmaHeaderInteger(
@@ -2721,6 +2740,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     catalog.Tables,
                     catalog.Views,
                     catalog.Triggers,
+                    catalog.VirtualTables,
                     pragmaHeader,
                     forceFullRewrite,
                     previousTables: _tables);
@@ -2817,7 +2837,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var previous = _fileStore!;
             _fileStore = replacement;
             replacement = null;
-            PublishCatalog(new SchemaCatalog(catalog.Tables, catalog.Views, catalog.Triggers), loadedVersion);
+            PublishCatalog(new SchemaCatalog(
+                catalog.Tables,
+                catalog.Views,
+                catalog.Triggers,
+                catalog.VirtualTables),
+                loadedVersion);
             previous.Dispose();
             return true;
         }
@@ -2901,7 +2926,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
             _fileStore = replacement;
             replacement = null;
             _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath, foreignReadOnly: true);
-            PublishCatalog(new SchemaCatalog(catalog.Tables, catalog.Views, catalog.Triggers));
+            PublishCatalog(new SchemaCatalog(
+                catalog.Tables,
+                catalog.Views,
+                catalog.Triggers,
+                catalog.VirtualTables));
             _foreignViewToken = _fileStore.CaptureCommittedViewToken();
             previous.Dispose();
         }
@@ -2975,7 +3004,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     _fileStore = replacement;
                     replacement = null;
                     _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
-                    PublishCatalog(new SchemaCatalog(catalog.Tables, catalog.Views, catalog.Triggers));
+                    PublishCatalog(new SchemaCatalog(
+                        catalog.Tables,
+                        catalog.Views,
+                        catalog.Triggers,
+                        catalog.VirtualTables));
                     previous.Dispose();
                 }
                 finally
@@ -3043,7 +3076,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     _fileStore = replacement;
                     replacement = null;
                     PublishCatalog(
-                        new SchemaCatalog(catalog.Tables, catalog.Views, catalog.Triggers),
+                        new SchemaCatalog(
+                            catalog.Tables,
+                            catalog.Views,
+                            catalog.Triggers,
+                            catalog.VirtualTables),
                         loadedVersion);
                     previous.Dispose();
                 }
@@ -4201,13 +4238,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog,
         bool inTransaction)
     {
-        ThrowIfVirtualTableSchemaChangeInTransaction(inTransaction);
-        if (_fileStore is not null)
-        {
-            throw new EmbeddedSqlException(
-                "persistent managed virtual tables require a module-specific persistence implementation");
-        }
-
         if (IsReservedObjectName(statement.Name))
             throw new EmbeddedSqlException($"object name reserved for internal use: {statement.Name}");
         if (catalog.VirtualTables.ContainsKey(statement.Name))
@@ -4232,7 +4262,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ArgumentNullException.ThrowIfNull(table);
         catalog.VirtualTables.Add(
             statement.Name,
-            new VirtualTableDefinition(statement.Name, statement.ModuleName, statement.Arguments, table));
+            new VirtualTableDefinition(
+                statement.Name,
+                statement.ModuleName,
+                statement.Arguments.ToArray(),
+                table.GetPersistencePayload(),
+                table));
         return new ExecutionResult([], [], 0, true);
     }
 
@@ -4327,7 +4362,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (catalog.VirtualTables.Remove(statement.Name, out var virtualTable))
         {
-            ThrowIfVirtualTableSchemaChangeInTransaction(context.InTransaction);
             virtualTable.Table.Destroy();
             RemoveTriggersForTable(catalog, statement.Name);
             return new ExecutionResult([], [], 0, true);
@@ -5285,7 +5319,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var tables = catalog.Tables;
         if (catalog.VirtualTables.TryGetValue(statement.TableName, out var virtualTable))
         {
-            ThrowIfVirtualTableSchemaChangeInTransaction(context.InTransaction);
             if (IsReservedObjectName(statement.NewName))
                 throw new EmbeddedSqlException($"object name reserved for internal use: {statement.NewName}");
             if (catalog.VirtualTables.ContainsKey(statement.NewName)
@@ -5297,11 +5330,114 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 throw new EmbeddedSqlException($"there is already an object named {statement.NewName}");
             }
 
-            virtualTable.Table.Rename(statement.NewName);
-            catalog.VirtualTables.Remove(statement.TableName);
-            catalog.VirtualTables.Add(
+            var candidatePayload = virtualTable.PersistencePayload.Clone();
+            var virtualCandidateTable = ManagedVirtualTableModuleRegistry.Resolve(virtualTable.ModuleName).Create(
+                new ManagedVirtualTableCreateContext(statement.NewName, virtualTable.Arguments),
+                candidatePayload);
+            ArgumentNullException.ThrowIfNull(virtualCandidateTable);
+            var candidateVirtualTables = new Dictionary<string, VirtualTableDefinition>(
+                catalog.VirtualTables,
+                StringComparer.OrdinalIgnoreCase);
+            candidateVirtualTables.Remove(statement.TableName);
+            candidateVirtualTables.Add(
                 statement.NewName,
-                virtualTable with { Name = statement.NewName });
+                new VirtualTableDefinition(
+                    statement.NewName,
+                    virtualTable.ModuleName,
+                    virtualTable.Arguments.ToArray(),
+                    candidatePayload,
+                    virtualCandidateTable));
+
+            try
+            {
+                Dictionary<string, ViewDefinition>? virtualCandidateViews = null;
+                Dictionary<string, TriggerDefinition>? virtualCandidateTriggers = null;
+                foreach (var view in catalog.Views.Values)
+                {
+                    context.CheckInterrupt();
+                    var rewritten = AlterTableSqlRewriter.RenameTableReferences(
+                        view.Sql, statement.TableName, statement.NewName);
+                    if (rewritten is null || string.Equals(rewritten, view.Sql, StringComparison.Ordinal))
+                        continue;
+
+                    virtualCandidateViews ??= new Dictionary<string, ViewDefinition>(
+                        catalog.Views,
+                        StringComparer.OrdinalIgnoreCase);
+                    var parsed = (CreateViewStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+                    virtualCandidateViews[view.Name] = view with { Query = parsed.Query, Sql = parsed.Sql };
+                }
+
+                foreach (var trigger in catalog.Triggers.Values)
+                {
+                    context.CheckInterrupt();
+                    var rewritten = AlterTableSqlRewriter.RenameTableReferences(
+                        trigger.Sql, statement.TableName, statement.NewName);
+                    if (rewritten is null || string.Equals(rewritten, trigger.Sql, StringComparison.Ordinal))
+                        continue;
+
+                    virtualCandidateTriggers ??= new Dictionary<string, TriggerDefinition>(
+                        catalog.Triggers,
+                        StringComparer.OrdinalIgnoreCase);
+                    var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+                    var parsedTableName = ManagedSchemaName.TrySplit(parsed.TableName, out var parsedSchema, out var parsedLocalName)
+                        && parsedSchema.Equals("main", StringComparison.OrdinalIgnoreCase)
+                        ? parsedLocalName
+                        : parsed.TableName;
+                    virtualCandidateTriggers[trigger.Name] = trigger with
+                    {
+                        TableName = parsedTableName,
+                        UpdateOfColumns = parsed.UpdateOfColumns,
+                        When = parsed.When,
+                        Body = parsed.Body,
+                        Sql = parsed.Sql,
+                    };
+                }
+
+                var virtualCandidateCatalog = new SchemaCatalog(
+                    tables,
+                    virtualCandidateViews ?? catalog.Views,
+                    virtualCandidateTriggers ?? catalog.Triggers,
+                    candidateVirtualTables);
+                ValidateDependentSchema(
+                    virtualCandidateCatalog,
+                    context with
+                    {
+                        Tables = tables,
+                        Views = virtualCandidateCatalog.Views,
+                        Triggers = virtualCandidateCatalog.Triggers,
+                        VirtualTables = virtualCandidateCatalog.VirtualTables,
+                        SchemaValidation = true,
+                    },
+                    context.CancellationToken,
+                    "rename table",
+                    catalog,
+                    context with
+                    {
+                        Views = catalog.Views,
+                        Triggers = catalog.Triggers,
+                        SchemaValidation = true,
+                    });
+
+                virtualTable.Table.Rename(statement.NewName);
+                catalog.VirtualTables.Remove(statement.TableName);
+                catalog.VirtualTables.Add(
+                    statement.NewName,
+                    (virtualTable with { Name = statement.NewName }).WithCurrentPersistencePayload());
+                if (virtualCandidateViews is not null)
+                {
+                    foreach (var entry in virtualCandidateViews)
+                        catalog.Views[entry.Key] = entry.Value;
+                }
+                if (virtualCandidateTriggers is not null)
+                {
+                    foreach (var entry in virtualCandidateTriggers)
+                        catalog.Triggers[entry.Key] = entry.Value;
+                }
+            }
+            finally
+            {
+                virtualCandidateTable.Destroy();
+            }
             return new ExecutionResult([], [], 0, true);
         }
 
@@ -5388,7 +5524,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             : new SchemaCatalog(
                 candidateTables,
                 candidateViews ?? catalog.Views,
-                candidateTriggers ?? catalog.Triggers);
+                candidateTriggers ?? catalog.Triggers,
+                catalog.VirtualTables);
         ValidateDependentSchema(
             candidateCatalog,
             context with
@@ -5737,7 +5874,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             : new SchemaCatalog(
                 candidateTables,
                 candidateViews ?? catalog.Views,
-                candidateTriggers ?? catalog.Triggers);
+                candidateTriggers ?? catalog.Triggers,
+                catalog.VirtualTables);
 
         ValidateDependentSchema(
             candidateCatalog,
@@ -5901,7 +6039,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var candidateCatalog = new SchemaCatalog(
             candidateTables,
             candidateViews ?? catalog.Views,
-            candidateTriggers ?? catalog.Triggers);
+            candidateTriggers ?? catalog.Triggers,
+            catalog.VirtualTables);
         var candidateContext = context with
         {
             Tables = candidateTables,
@@ -7167,7 +7306,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        ThrowIfVirtualTableMutationInTransaction(context);
         if (statement.Source is not null
             || statement.Returning is not null
             || statement.Upsert is not null
@@ -7192,7 +7330,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             mutations.Add(BuildVirtualTableUpdateArguments(null, null, values));
         }
 
-        return ExecuteVirtualTableMutations(definition.Table, mutations);
+        return ExecuteVirtualTableMutations(context.VirtualTables!, definition, mutations);
     }
 
     private ExecutionResult ExecuteVirtualTableUpdate(
@@ -7201,7 +7339,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        ThrowIfVirtualTableMutationInTransaction(context);
         if (statement.Returning is not null
             || statement.EffectiveOrderBy.Count != 0
             || statement.Limit is not null
@@ -7246,7 +7383,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             mutations.Add(BuildVirtualTableUpdateArguments(row.RowId, row.RowId, values));
         }
 
-        return ExecuteVirtualTableMutations(definition.Table, mutations);
+        return ExecuteVirtualTableMutations(context.VirtualTables!, definition, mutations);
     }
 
     private ExecutionResult ExecuteVirtualTableDelete(
@@ -7255,7 +7392,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        ThrowIfVirtualTableMutationInTransaction(context);
         if (statement.Returning is not null
             || statement.EffectiveOrderBy.Count != 0
             || statement.Limit is not null
@@ -7285,7 +7421,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     context))
             .Select(row => BuildVirtualTableUpdateArguments(row.RowId, null, row.Values))
             .ToArray();
-        return ExecuteVirtualTableMutations(definition.Table, mutations);
+        return ExecuteVirtualTableMutations(context.VirtualTables!, definition, mutations);
     }
 
     private static int[] ResolveVirtualTableColumns(
@@ -7331,26 +7467,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return arguments;
     }
 
-    private static void ThrowIfVirtualTableMutationInTransaction(QueryContext context)
-    {
-        if (context.InTransaction)
-        {
-            throw new EmbeddedSqlException(
-                "managed virtual-table mutations are not supported inside explicit transactions or savepoints");
-        }
-    }
-
-    private static void ThrowIfVirtualTableSchemaChangeInTransaction(bool inTransaction)
-    {
-        if (inTransaction)
-        {
-            throw new EmbeddedSqlException(
-                "managed virtual-table schema changes are not supported inside explicit transactions or savepoints");
-        }
-    }
-
     private static ExecutionResult ExecuteVirtualTableMutations(
-        ManagedVirtualTable table,
+        IReadOnlyDictionary<string, VirtualTableDefinition> virtualTables,
+        VirtualTableDefinition definition,
         IReadOnlyList<IReadOnlyList<SqlValue>> mutations)
     {
         if (mutations.Count == 0)
@@ -7383,10 +7502,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             using var statement = new ResumableStatement(
                 program,
-                virtualTableBindings: [new VdbeVirtualTableBinding(table)]);
+                virtualTableBindings: [new VdbeVirtualTableBinding(definition.Table)]);
             if (statement.StepResumable() != ResumableStatementStepResult.Done)
                 throw new InvalidOperationException("A managed virtual-table mutation program yielded unexpectedly.");
 
+            var mutableVirtualTables = virtualTables as Dictionary<string, VirtualTableDefinition>
+                ?? throw new InvalidOperationException("Managed virtual-table catalog must be mutable.");
+            mutableVirtualTables[definition.Name] = definition.WithCurrentPersistencePayload();
             return new ExecutionResult([], [], statement.RowsAffected, true)
             {
                 LastInsertRowId = statement.LastInsertRowId,
@@ -7394,7 +7516,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
         catch
         {
-            table.Rollback();
+            definition.Table.Rollback();
             throw;
         }
     }

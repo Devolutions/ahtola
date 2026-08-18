@@ -251,15 +251,15 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 28 | `If` | consolidated | JumpIf |  |
 | 29 | `IfNot` | consolidated | JumpIf / JumpIfNotTrue |  |
 | 30 | `OpenRead` | direct | OpenReadCursor |  |
-| 31 | `VOpen` | missing | — | `vdbe-virtual-table-opcodes` |
-| 32 | `VCreate` | missing | — | `vdbe-virtual-table-opcodes` |
-| 33 | `VFilter` | missing | — | `vdbe-virtual-table-opcodes` |
-| 34 | `VColumn` | missing | — | `vdbe-virtual-table-opcodes` |
-| 35 | `VUpdate` | missing | — | `vdbe-virtual-table-opcodes` |
-| 36 | `VNext` | missing | — | `vdbe-virtual-table-opcodes` |
-| 37 | `VDestroy` | missing | — | `vdbe-virtual-table-opcodes` |
-| 38 | `VBegin` | missing | — | `vdbe-virtual-table-opcodes` |
-| 39 | `VRename` | missing | — | `vdbe-virtual-table-opcodes` |
+| 31 | `VOpen` | direct | `VOpenInstruction` | `vdbe-virtual-table-opcodes` |
+| 32 | `VCreate` | treewalker | `ExecuteCreateVirtualTable` | `vdbe-virtual-table-opcodes` |
+| 33 | `VFilter` | direct | `VFilterInstruction` | `vdbe-virtual-table-opcodes` |
+| 34 | `VColumn` | direct | `VColumnInstruction` | `vdbe-virtual-table-opcodes` |
+| 35 | `VUpdate` | direct | `VUpdateInstruction` | `vdbe-virtual-table-opcodes` |
+| 36 | `VNext` | direct | `VNextInstruction` | `vdbe-virtual-table-opcodes` |
+| 37 | `VDestroy` | treewalker | `ExecuteDropTable` | `vdbe-virtual-table-opcodes` |
+| 38 | `VBegin` | direct | `VBeginInstruction` | `vdbe-virtual-table-opcodes` |
+| 39 | `VRename` | treewalker | `ExecuteAlterTableRename` | `vdbe-virtual-table-opcodes` |
 | 40 | `OpenPseudo` | missing | — | `vdbe-open-ephemeral` |
 | 41 | `Rewind` | direct | Rewind |  |
 | 42 | `Last` | direct | Last |  |
@@ -466,7 +466,7 @@ Status totals: bydesign 24, consolidated 40, direct 26, divergent 10, missing 10
 | `vdbe-schema-cookie-opcodes` | missing | s2-capability | M | 0 | 0 | No cookie opcodes: user_version/application_id read-write and schema-cookie validation (stale-schema detection, 'database schema has changed' errors) are not modeled at t… |
 | `vdbe-sequence-opcode-family` | missing | s4-intentional | M | 0 | 0 | Turso's CREATE SEQUENCE extension (8 opcodes), not SQLite syntax. Note: distinct from AUTOINCREMENT support (sqlite_sequence), which Ahtola partially has — see vdbe-newro… |
 | `vdbe-typed-value-opcode-family` | missing | s4-intentional | L | 0 | 0 | Turso's typed-values extension (arrays/structs/unions/UDTs) — 17 opcodes, none SQLite. Ahtola has not adopted the extension; no conformance corpus coverage. Record as ups… |
-| `vdbe-virtual-table-opcodes` | missing | s2-capability | L | 0 | 0 | No virtual-table opcode family at all: modules cannot be opened, filtered with constraint push-down (xBestIndex), column-read, updated, or renamed. Blocks the entire epon… |
+| `vdbe-virtual-table-opcodes` | partial | s2-capability | L | 0 | 0 | Managed VOpen/VFilter/VColumn/VUpdate/VNext/VBegin instructions and tree-walker create/drop/rename now support statically registered modules with durable private payloads. The native extension ABI, arbitrary loadable modules, and Turso index-method parity remain out of scope. |
 
 ## 4. Compilation / translate layer
 The largest layer by entry count (38). Turso's `core/translate/` is a full
@@ -584,7 +584,7 @@ The distribution is wildly skewed by one entry:
 | `parser-bracket-quoted-identifiers` | missing | s2-capability | S | 3 | 1 | Square-bracket quoted identifiers not lexed. |
 | `parser-pragma-unrecognized-name-hard-rejection` | missing | s2-capability | M | 2 | 14 | The turso-parser grammar's `Stmt::Pragma` accepts *any* identifier as `name`, with an arbitrary optional body (`= value`, `(value)`, or none); SQLite's own behavior for a… |
 | `parser-begin-commit-transaction-name` | missing | s2-capability | S | 0 | 1 | SQLite's grammar for BEGIN/COMMIT/END admits an optional transaction name after the TRANSACTION keyword (`trans_opt ::= \| TRANSACTION \| TRANSACTION nm`), which is accep… |
-| `parser-create-virtual-table-not-parsed` | missing | s2-capability | L | 0 | 0 | Turso's Stmt::CreateVirtualTable(CreateVirtualTable) is a first-class AST node capturing module name and raw argument strings. Ahtola's SqlAst.cs has no corresponding sta… |
+| `parser-create-virtual-table-not-parsed` | partial | s2-capability | L | 0 | 0 | Ahtola now parses `CREATE VIRTUAL TABLE` into `CreateVirtualTableStatement` with module name and raw argument strings. The managed contract is intentionally limited to statically registered modules; no native/loadable module ABI is exposed. |
 | `parser-trailing-named-constraint-without-body` | divergent | s3-perf | S | 0 | 3 | SQLite's own LALR grammar happens to accept a dangling `CONSTRAINT c` at the very end of a column/ADD COLUMN definition with no constraint keyword following it (an accept… |
 | `parser-turso-only-ddl-extensions-absent` | missing | s4-intentional | L | 0 | 0 | Turso's ast.rs Stmt enum includes several experimental statement kinds that are not part of SQLite's own grammar: CREATE MATERIALIZED VIEW, CREATE/DROP TYPE (custom scala… |
 | `parser-turso-only-sequence-and-optimize-statements` | missing | s4-intentional | M | 0 | 0 | CREATE/DROP SEQUENCE (standalone integer sequences, distinct from AUTOINCREMENT) and OPTIMIZE INDEX are Turso-only statement kinds with no SQLite equivalent and no hits i… |
@@ -617,7 +617,7 @@ than absent subsystems.
 | `func-array-postgres-family` | missing | s3-perf | L | 0 | 0 | Postgres-style ARRAY(...)/array_element/array_append/etc. scalar family, always compiled (not behind a cargo feature flag) but not part of stock SQLite semantics and not… |
 | `func-extension-format-btrim` | extension | s4-intentional | S | 0 | 0 | FORMAT (an alias for PRINTF, matching real SQLite's built-in but not present as a distinct entry in Turso's from_str dispatch table) and BTRIM (Postgres-style alias for T… |
 | `func-extension-uuid-family` | extension | s4-intentional | S | 0 | 0 | Ahtola registers a full UUID v4/v7 generation family (text and blob forms, plus gen_random_uuid() for Postgres compatibility) that has no counterpart anywhere in turso-sr… |
-| `func-fts-scalar-family` | missing | s3-perf | L | 0 | 0 | FTS-related scalar helpers used with Turso's fts5-style virtual tables; no equivalent in Ahtola.Core (no FTS virtual table support at all in this layer). Out of primary s… |
+| `func-fts-scalar-family` | missing | s3-perf | L | 0 | 0 | A managed `fts5` virtual-table subset now exists, but Turso/SQLite FTS scalar helpers, ranking, snippets, and auxiliary-function surfaces remain unimplemented. |
 | `func-gcd-lcm-missing` | missing | s3-perf | S | 0 | 0 | gcd()/lcm() (Turso/SQLite-3.41+-style math helpers) have no hits anywhere in src/Ahtola.Core or Ahtola.Core/EmbeddedDatabase.MathFunctions.cs. Not covered by the vendored… |
 | `func-numeric-boolean-ip-helpers-missing` | missing | s4-intentional | M | 0 | 0 | Internal-flavored helper functions supporting Turso's typed BOOLEAN/NUMERIC column extensions and validated IP address type; no SQLite equivalent and no corpus coverage.… |
 | `func-octet-length-missing` | missing | s1-correctness | S | 0 | 0 | octet_length is absent from SqliteBuiltinFunctions.Names and from EmbeddedDatabase.StringFunctions.cs / EmbeddedDatabase.cs (no case-insensitive hit for 'octet' anywhere… |

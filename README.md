@@ -264,9 +264,12 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   (`PRAGMA wal_checkpoint` in MVCC mode). Not cross-process; residual schema-
   cookie polish and full per-page b-tree checkpoint SM remain open — see
   [docs/mvcc-port-contract.md](docs/mvcc-port-contract.md).
-- **Not implemented** — FTS / R-Tree modules, loadable extensions, raw
-  `sqlite3*` handles (`Handle` is null), AEGIS encryption ciphers, sync engine /
-  CDC, CREATE SEQUENCE, typed-value extensions.
+- **Managed virtual-table subset** — statically registered `fts5`, `rtree`, and
+  `rtree_i32` modules persist module-owned state in the managed catalog, but are
+  not full SQLite FTS5/R-Tree implementations and do not create interoperable
+  FTS/R-Tree shadow tables. Loadable extensions, raw `sqlite3*` handles
+  (`Handle` is null), AEGIS encryption ciphers, sync engine / CDC, CREATE
+  SEQUENCE, and typed-value extensions remain unavailable.
 - **Native / Sync companions** — not shipped. Connection-string paths that need
   them fail closed. OS P/Invoke in the pager for locks/WAL is intentional engine
   code, not a Rust SDK binding.

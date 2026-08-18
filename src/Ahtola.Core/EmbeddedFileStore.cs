@@ -10,7 +10,76 @@ namespace Ahtola.Core;
 internal sealed record EmbeddedFileCatalog(
     Dictionary<string, EmbeddedTable> Tables,
     Dictionary<string, ViewDefinition> Views,
-    Dictionary<string, TriggerDefinition> Triggers);
+    Dictionary<string, TriggerDefinition> Triggers,
+    Dictionary<string, EmbeddedDatabase.VirtualTableDefinition> VirtualTables);
+
+internal static class ManagedVirtualTableSchemaSql
+{
+    private const string PayloadMarker = "/*ahtola-managed-vtab:";
+    private const string PayloadTerminator = "*/";
+
+    public static string Build(EmbeddedDatabase.VirtualTableDefinition definition)
+    {
+        var arguments = definition.Arguments.Count == 0
+            ? string.Empty
+            : "(" + string.Join(", ", definition.Arguments) + ")";
+        return "CREATE VIRTUAL TABLE "
+            + QuoteIdentifier(definition.Name)
+            + " USING "
+            + QuoteIdentifier(definition.ModuleName)
+            + arguments
+            + " "
+            + PayloadMarker
+            + definition.PersistencePayload.Version.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            + ":"
+            + Convert.ToBase64String(definition.PersistencePayload.Bytes.Span)
+            + PayloadTerminator;
+    }
+
+    public static (
+        CreateVirtualTableStatement Declaration,
+        ManagedVirtualTablePersistencePayload Payload) Parse(string sql)
+    {
+        var marker = sql.LastIndexOf(PayloadMarker, StringComparison.Ordinal);
+        if (marker <= 0 || !sql.EndsWith(PayloadTerminator, StringComparison.Ordinal))
+            throw new EmbeddedSqlException("managed virtual-table sqlite_schema SQL is missing its persistence payload");
+
+        var declarationSql = sql[..marker].TrimEnd();
+        var statement = SqlParser.Parse(declarationSql, SqlParameterMap.Parse(declarationSql));
+        if (statement is not CreateVirtualTableStatement declaration)
+            throw new EmbeddedSqlException("managed virtual-table sqlite_schema SQL is not a CREATE VIRTUAL TABLE statement");
+
+        var encoded = sql.AsSpan(marker + PayloadMarker.Length, sql.Length - marker - PayloadMarker.Length - PayloadTerminator.Length);
+        var separator = encoded.IndexOf(':');
+        if (separator <= 0
+            || !int.TryParse(
+                encoded[..separator],
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var version)
+            || version <= 0)
+        {
+            throw new EmbeddedSqlException("managed virtual-table persistence payload version is invalid");
+        }
+
+        byte[] bytes;
+        try
+        {
+            bytes = encoded.Length == separator + 1
+                ? []
+                : Convert.FromBase64String(encoded[(separator + 1)..].ToString());
+        }
+        catch (FormatException exception)
+        {
+            throw new EmbeddedSqlException("managed virtual-table persistence payload is not valid base64", exception);
+        }
+
+        return (declaration, new ManagedVirtualTablePersistencePayload(version, bytes));
+    }
+
+    private static string QuoteIdentifier(string identifier)
+        => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+}
 
 /// <summary>
 /// Bridges the managed <see cref="EmbeddedDatabase"/> catalog to durable,
@@ -183,6 +252,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         var tables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
         var views = new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase);
         var triggers = new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase);
+        var virtualTables = new Dictionary<string, EmbeddedDatabase.VirtualTableDefinition>(
+            StringComparer.OrdinalIgnoreCase);
         var rootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         var indexRootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         var loadedIndexes = new Dictionary<string, EmbeddedIndex>(StringComparer.OrdinalIgnoreCase);
@@ -193,7 +264,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         var occupiedBtreePages = new HashSet<uint>(
             schemaEntries
-                .Where(entry => entry.Type is "table" or "index")
+                .Where(entry => entry.Type is "table" or "index" && entry.RootPage != 0)
                 .Select(entry => entry.RootPage));
 
         // Materialize tables first so views and triggers can be parsed afterwards.
@@ -201,6 +272,31 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             if (!string.Equals(entry.Type, "table", StringComparison.Ordinal))
                 continue;
+
+            if (entry.RootPage == 0)
+            {
+                var (declaration, payload) = ManagedVirtualTableSchemaSql.Parse(entry.Sql!);
+                if (!string.Equals(declaration.Name, entry.Name, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(entry.Name, entry.TableName, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new EmbeddedSqlException(
+                        $"Stored virtual table '{entry.Name}' does not match its sqlite_schema metadata.");
+                }
+
+                var virtualTable = ManagedVirtualTableModuleRegistry.Resolve(declaration.ModuleName).Create(
+                    new ManagedVirtualTableCreateContext(declaration.Name, declaration.Arguments),
+                    payload);
+                ArgumentNullException.ThrowIfNull(virtualTable);
+                virtualTables.Add(
+                    entry.Name,
+                    new EmbeddedDatabase.VirtualTableDefinition(
+                        declaration.Name,
+                        declaration.ModuleName,
+                        declaration.Arguments.ToArray(),
+                        payload,
+                        virtualTable));
+                continue;
+            }
 
             var statement = SqlParser.Parse(entry.Sql!, SqlParameterMap.Parse(entry.Sql!));
             if (statement is not CreateTableStatement create)
@@ -306,7 +402,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
-        ValidateAllocationMap(schemaEntries, tables, loadedIndexes);
+        ValidateAllocationMap(schemaEntries, tables, loadedIndexes, virtualTables);
 
         foreach (var entry in schemaEntries)
         {
@@ -344,13 +440,14 @@ internal sealed class EmbeddedFileStore : IDisposable
         _indexRootPages = indexRootPages;
         _lastSchemaSignature = ComputeSchemaSignature(schemaEntries);
         _committedTables = tables;
-        return new EmbeddedFileCatalog(tables, views, triggers);
+        return new EmbeddedFileCatalog(tables, views, triggers, virtualTables);
     }
 
     private void ValidateAllocationMap(
         IReadOnlyList<SchemaEntry> schemaEntries,
         IReadOnlyDictionary<string, EmbeddedTable> tables,
-        IReadOnlyDictionary<string, EmbeddedIndex> loadedIndexes)
+        IReadOnlyDictionary<string, EmbeddedIndex> loadedIndexes,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
     {
         try
         {
@@ -378,6 +475,15 @@ internal sealed class EmbeddedFileStore : IDisposable
                 switch (entry.Type)
                 {
                     case "table":
+                        if (entry.RootPage == 0)
+                        {
+                            if (!virtualTables.ContainsKey(entry.Name))
+                            {
+                                throw new InvalidDataException(
+                                    $"Managed file database is missing virtual table '{entry.Name}'.");
+                            }
+                            break;
+                        }
                         if (!tables.TryGetValue(entry.Name, out var table))
                         {
                             throw new InvalidDataException(
@@ -1229,6 +1335,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
         PragmaHeaderMetadata? pragmaHeader = null,
         bool forceFullRewrite = false,
         IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
@@ -1236,6 +1343,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             tables,
             views,
             triggers,
+            virtualTables,
             reclaimTrailingPages: false,
             incrementSchemaCookie: false,
             pragmaHeader,
@@ -1257,6 +1365,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             catalog.Tables,
             catalog.Views,
             catalog.Triggers,
+            catalog.VirtualTables,
             reclaimTrailingPages: true,
             incrementSchemaCookie: true,
             pragmaHeader: null,
@@ -1313,7 +1422,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         int pageSize,
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
-        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -1338,7 +1448,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                        initialPageSize: pageSize,
                        initialTextEncoding: _textEncoding))
             {
-                replacement.Persist(tables, views, triggers);
+                replacement.Persist(tables, views, triggers, virtualTables);
                 replacement.SwitchJournalMode(SqliteJournalMode.Delete);
                 replacement.RewriteVacuumHeader(_header);
             }
@@ -1367,7 +1477,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         int pageSize,
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
-        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -1417,7 +1528,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                        initialPageSize: pageSize,
                        initialTextEncoding: _textEncoding))
             {
-                replacement.Persist(tables, views, triggers);
+                replacement.Persist(tables, views, triggers, virtualTables);
                 replacement.SwitchJournalMode(SqliteJournalMode.Delete);
                 replacement.RewriteVacuumHeader(_header);
             }
@@ -1491,6 +1602,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
         bool reclaimTrailingPages,
         bool incrementSchemaCookie,
         PragmaHeaderMetadata? pragmaHeader,
@@ -1504,7 +1616,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         foreach (var (name, table) in tables)
             EmbeddedFileStore.ValidateTableRepresentable(name, table);
         EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
-        ValidateSchemaDefinitions(tables, views, triggers);
+        ValidateSchemaDefinitions(tables, views, triggers, virtualTables);
 
         if (!forceFullRewrite
             && !reclaimTrailingPages
@@ -1512,13 +1624,13 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             if (previousTables is not null
                 && ReferenceEquals(previousTables, _committedTables)
-                && TryPersistIncrementalRowMutation(tables, views, triggers, previousTables))
+                && TryPersistIncrementalRowMutation(tables, views, triggers, virtualTables, previousTables))
             {
                 _committedTables = tables;
                 return CommittedCatalogVersion;
             }
 
-            if (TryPersistBoundedTableLeafMutation(tables, views, triggers))
+            if (TryPersistBoundedTableLeafMutation(tables, views, triggers, virtualTables))
             {
                 _committedTables = tables;
                 return CommittedCatalogVersion;
@@ -1537,7 +1649,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             currentFreelist.LeafPageNumbers,
             reclaimTrailingPages);
         var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
-        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers);
+        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables);
         var rootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         var indexRootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         foreach (var name in tableNames)
@@ -1564,7 +1676,13 @@ internal sealed class EmbeddedFileStore : IDisposable
                 allocator);
         }
 
-        var schemaEntries = BuildSchemaEntries(tables, views, triggers, rootPages, indexRootPages);
+        var schemaEntries = BuildSchemaEntries(
+            tables,
+            views,
+            triggers,
+            virtualTables,
+            rootPages,
+            indexRootPages);
         var schemaTree = BuildSchemaTree(schemaEntries, allocator);
         var activePages = CollectRewriteActivePages(
             schemaTree,
@@ -1735,9 +1853,10 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
         IReadOnlyDictionary<string, EmbeddedTable> previousTables)
     {
-        if (!HasCurrentSchemaShape(tables, views, triggers))
+        if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables))
             return false;
 
         var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
@@ -1758,7 +1877,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             return false;
 
         var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
-        var indexesByTable = GetIndexDefinitions(tableNames, tables, views, triggers)
+        var indexesByTable = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables)
             .GroupBy(definition => definition.TableName, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(
                 group => group.Key,
@@ -2086,16 +2205,17 @@ internal sealed class EmbeddedFileStore : IDisposable
     private bool TryPersistBoundedTableLeafMutation(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
-        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
     {
         var schemaPage = _pager.ReadCommittedPage(SchemaRootPage);
         var currentHeader = SqliteDatabaseHeader.Parse(schemaPage);
 
-        if (!HasCurrentSchemaShape(tables, views, triggers))
+        if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables))
             return false;
 
         var persisted = Load();
-        if (!HasCurrentSchemaShape(tables, views, triggers)
+        if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables)
             || !TryGetSingleChangedTable(tables, persisted.Tables, out var tableName, out var table))
         {
             return false;
@@ -2111,7 +2231,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
-        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers)
+        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables)
             .Where(index => string.Equals(index.TableName, tableName, StringComparison.OrdinalIgnoreCase))
             .ToArray();
         if (indexes.Length != table.Indexes.Count
@@ -7155,7 +7275,8 @@ internal sealed class EmbeddedFileStore : IDisposable
     private bool HasCurrentSchemaShape(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
-        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
     {
         if (tables.Count != _tableRootPages.Count
             || tables.Keys.Any(name => !_tableRootPages.ContainsKey(name)))
@@ -7164,14 +7285,20 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
-        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers);
+        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables);
         if (indexes.Count != _indexRootPages.Count
             || indexes.Any(index => !_indexRootPages.ContainsKey(index.Index.Name)))
         {
             return false;
         }
 
-        var entries = BuildSchemaEntries(tables, views, triggers, _tableRootPages, _indexRootPages);
+        var entries = BuildSchemaEntries(
+            tables,
+            views,
+            triggers,
+            virtualTables,
+            _tableRootPages,
+            _indexRootPages);
         return string.Equals(
             ComputeSchemaSignature(entries),
             _lastSchemaSignature,
@@ -7905,8 +8032,20 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static void ValidateSchemaDefinitions(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
-        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
     {
+        foreach (var (catalogName, definition) in virtualTables)
+        {
+            if (!string.Equals(catalogName, definition.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new EmbeddedSqlException(
+                    $"The managed file engine cannot persist virtual table '{catalogName}' because its catalog key and definition name differ.");
+            }
+
+            _ = ManagedVirtualTableSchemaSql.Parse(ManagedVirtualTableSchemaSql.Build(definition));
+        }
+
         foreach (var (catalogName, view) in views)
             ValidateViewDefinition(catalogName, view);
 
@@ -10115,6 +10254,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
         IReadOnlyDictionary<string, uint> rootPages,
         IReadOnlyDictionary<string, uint> indexRootPages)
     {
@@ -10127,6 +10267,18 @@ internal sealed class EmbeddedFileStore : IDisposable
                 name,
                 rootPages[name],
                 tables[name].Sql ?? EmbeddedDatabase.BuildCreateTableSql(name, tables[name])));
+        }
+
+        foreach (var definition in virtualTables.Values.OrderBy(
+                     static value => value.Name,
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            entries.Add(new SchemaEntry(
+                "table",
+                definition.Name,
+                definition.Name,
+                0,
+                ManagedVirtualTableSchemaSql.Build(definition)));
         }
 
         foreach (var tableName in tables.Keys.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
@@ -10170,7 +10322,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyList<string> tableNames,
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
-        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
     {
         var names = new HashSet<string>(tables.Keys, StringComparer.OrdinalIgnoreCase);
         foreach (var name in views.Keys)
@@ -10179,6 +10332,11 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new EmbeddedSqlException($"The managed file engine cannot persist duplicate schema name '{name}'.");
         }
         foreach (var name in triggers.Keys)
+        {
+            if (!names.Add(name))
+                throw new EmbeddedSqlException($"The managed file engine cannot persist duplicate schema name '{name}'.");
+        }
+        foreach (var name in virtualTables.Keys)
         {
             if (!names.Add(name))
                 throw new EmbeddedSqlException($"The managed file engine cannot persist duplicate schema name '{name}'.");
@@ -10577,6 +10735,16 @@ internal sealed class EmbeddedFileStore : IDisposable
                     {
                         throw new EmbeddedSqlException(
                             $"Managed file database table '{entry.Name}' has a mismatched sqlite_schema table name.");
+                    }
+                    if (entry.RootPage == 0)
+                    {
+                        var (declaration, _) = ManagedVirtualTableSchemaSql.Parse(entry.Sql);
+                        if (!string.Equals(declaration.Name, entry.Name, StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new EmbeddedSqlException(
+                                $"Managed file database virtual table '{entry.Name}' has mismatched CREATE VIRTUAL TABLE SQL.");
+                        }
+                        break;
                     }
                     goto case "index";
                 case "index":

@@ -39,13 +39,29 @@ N-dimensional bounds and deterministic spatial storage. The module adapters
 own virtual-table schema validation, `VUpdate` argument conversion, and
 transaction snapshots; the reusable components do not own catalog state.
 
-## Current integration scope
+## Durable managed catalog contract
 
-The initial modules are in-memory only. The current foundation intentionally
-rejects managed virtual tables on file-backed databases because it has no
-module-specific persistence/reopen contract. Consequently, managed FTS/R-Tree
-content is not durable, is not included in backup/catalog recovery, and must
-not be represented as persistent SQLite-compatible shadow tables yet.
+Each managed virtual table returns a
+`ManagedVirtualTablePersistencePayload`: a positive module-defined version and
+an opaque byte payload. The engine never reflects over modules or interprets
+their bytes. Instead, it gives the payload back to the statically registered
+module through `ManagedVirtualTableModule.Create(context, payload)` when it
+recreates a catalog snapshot, opens a file, or rolls back a
+transaction/savepoint.
+
+For file-backed databases, the catalog writes a real `sqlite_schema` row with
+`type='table'`, `rootpage=0`, and a `CREATE VIRTUAL TABLE ... USING ...`
+declaration. An Ahtola-private comment on that declaration carries the
+versioned, base64-encoded module payload. This keeps the payload in the
+SQLite-format catalog and makes full catalog rewrites, `VACUUM INTO`, reopen,
+and pager/WAL recovery restore the same registered module and state. Invalid,
+unsupported-version, truncated, or malformed payloads fail closed during
+catalog reconstruction.
+
+This is deliberately **not** an emulation of FTS5 or R-Tree shadow tables.
+Classic SQLite readers can enumerate the rootpage-zero declaration in
+`sqlite_schema`, but the private payload is meaningful only to Ahtola and
+other engines must not be expected to query or maintain these tables.
 
 `CREATE VIRTUAL TABLE`, `SELECT` scans, `DROP`, module creation, cursors, and
 SQL `INSERT`, `UPDATE`, and `DELETE` use the canonical foundation. The
@@ -56,16 +72,21 @@ equality/range plans are therefore available through ordinary SQL, while DML
 uses the VUpdate old-rowid/new-rowid/declared-column layout under
 begin/sync/commit/rollback.
 
+Every successful virtual-table DML statement publishes a new payload in the
+working catalog. Failed statements retain the prior payload; explicit
+transactions and savepoints use independent module instances recreated from
+their saved payloads, so `ROLLBACK` and `ROLLBACK TO` restore module state as
+well as schema state for `CREATE`, `DROP`, and `RENAME`.
+
 ## Remaining product limitations
 
-- The modules remain in-memory only; no file-backed catalog reopen, shadow
-  storage, backup, or recovery support exists.
 - `fts5` is a small managed query/tokenizer subset, not FTS5 compatibility:
   tokenizer options, external/contentless tables, auxiliary functions,
   ranking, snippets, and FTS5-specific command syntax are unsupported.
-- `rtree` does not yet persist shadow tables or expose SQLite's full R-Tree
-  auxiliary/geometry callback surface. `rtree_i32` accepts only signed
-  32-bit integer coordinates.
+- `rtree` does not expose SQLite's full R-Tree auxiliary/geometry callback
+  surface. `rtree_i32` accepts only signed 32-bit integer coordinates.
+- The private payload is a managed catalog extension, not a portable FTS5/R-Tree
+  file representation. Ahtola intentionally does not synthesize shadow tables.
 - The current generic DML path auto-assigns FTS rowids; explicitly naming
   `rowid` in an `INSERT` column list is not supported yet.
 - Planner extraction is deliberately limited to source-local conjunctive
