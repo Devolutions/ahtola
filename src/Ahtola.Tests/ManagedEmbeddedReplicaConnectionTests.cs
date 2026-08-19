@@ -503,7 +503,12 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                 steps[index].GetProperty("condition").GetProperty("cond").GetProperty("type").GetString()
                     .Should().Be("is_autocommit");
             }
+            steps[3].GetProperty("stmt").GetProperty("args")[0].GetProperty("type").GetString().Should().Be("text");
+            steps[3].GetProperty("stmt").GetProperty("args")[0].GetProperty("value").GetString().Should()
+                .MatchRegex("^[0-9a-f]{32}$");
+            steps[3].GetProperty("stmt").GetProperty("args")[1].GetProperty("type").GetString().Should().Be("integer");
             steps[3].GetProperty("stmt").GetProperty("args")[1].GetProperty("value").GetString().Should().Be("0");
+            steps[3].GetProperty("stmt").GetProperty("args")[2].GetProperty("type").GetString().Should().Be("integer");
             steps[3].GetProperty("stmt").GetProperty("args")[2].GetProperty("value").GetString().Should().Be("1");
         }
         finally

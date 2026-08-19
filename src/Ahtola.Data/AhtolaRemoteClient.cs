@@ -190,21 +190,14 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             throw new InvalidDataException("Managed replica journal batch has no replayable SQL.");
 
         var watermarkStep = steps.Count;
+        var watermarkParameters = new AhtolaParameterCollection();
+        watermarkParameters.Add(clientId);
+        watermarkParameters.Add(sourcePullGeneration);
+        watermarkParameters.Add(changes.Changes[^1].Sequence);
         var watermarkStatement = BuildStatement(
             "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, ?, ?) ON CONFLICT(client_id) DO UPDATE SET pull_gen=excluded.pull_gen, change_id=excluded.change_id",
-            new AhtolaParameterCollection(),
+            watermarkParameters,
             wantRows: false);
-        watermarkStatement.Args.Add(new RemoteRequestValue { Type = "text", StringValue = clientId });
-        watermarkStatement.Args.Add(new RemoteRequestValue
-        {
-            Type = "integer",
-            StringValue = sourcePullGeneration.ToString(CultureInfo.InvariantCulture),
-        });
-        watermarkStatement.Args.Add(new RemoteRequestValue
-        {
-            Type = "integer",
-            StringValue = changes.Changes[^1].Sequence.ToString(CultureInfo.InvariantCulture),
-        });
         steps.Add(new RemoteBatchStep { Condition = guarded, Statement = watermarkStatement });
 
         var commitStep = steps.Count;
