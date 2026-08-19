@@ -215,16 +215,24 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
                 var appended = new List<SqliteWalFrame>(pages.Count);
                 try
                 {
+                    var firstFrameNumber = 0L;
+                    var lastFrameNumber = 0L;
                     for (var index = 0; index < pages.Count; index++)
                     {
                         var page = pages[index];
-                        var frameNumber = _wal.AppendFrame(
+                        lastFrameNumber = _wal.AppendFrame(
                             page.PageNumber,
                             page.PageData.Span,
                             index == pages.Count - 1 ? databasePageCount : 0);
-                        appended.Add(_wal.ReadFrame(frameNumber));
+                        if (index == 0)
+                            firstFrameNumber = lastFrameNumber;
                         AfterDetachedWalFrameAppendForTesting?.Invoke();
                     }
+
+                    // Materialize the appended run in one chain walk: ReadFrame
+                    // revalidates the whole prefix per call, so reading them back
+                    // one at a time is O(P^2).
+                    appended.AddRange(_wal.ReadFrameRange(firstFrameNumber, lastFrameNumber));
 
                     // The header publication is the visibility point. Reaching it
                     // without a durable WAL commit would expose non-recoverable data.
@@ -569,13 +577,8 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
 
         var targetPageCount = finalFrame.Header.DatabaseSizeInPages;
         var latestFrames = new Dictionary<uint, SqliteWalFrame>();
-        for (var frameNumber = 1U; ; frameNumber++)
-        {
-            var frame = _wal.ReadFrame(frameNumber);
+        foreach (var frame in _wal.ReadFrameRange(1, safeFrame))
             latestFrames[frame.Header.PageNumber] = frame;
-            if (frameNumber == safeFrame)
-                break;
-        }
 
         var originalPageCount = _mainStore.PageCount;
         if (targetPageCount > originalPageCount)
@@ -955,8 +958,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         }
     }
 
-    private static void ValidateWrite(IReadOnlyList<SqliteWalWritePage> pages, uint databasePageCount)
-    {
+    private static void ValidateWrite(IReadOnlyList<SqliteWalWritePage> pages, uint databasePageCount)    {
         if (pages.Count == 0)
             throw new ArgumentException("A SQLite WAL transaction requires at least one page.", nameof(pages));
         if (databasePageCount == 0)

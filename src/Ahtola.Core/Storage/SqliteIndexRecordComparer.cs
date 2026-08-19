@@ -81,6 +81,33 @@ public sealed class SqliteIndexRecordComparer
         => Compare(SqliteRecordCodec.Decode(leftRecord, TextEncoding), SqliteRecordCodec.Decode(rightRecord, TextEncoding));
 
     /// <summary>Compares two decoded SQLite records.</summary>
+    /// <remarks>
+    /// The array overload exists because this is the sort comparator for index
+    /// builds; the <see cref="IReadOnlyList{T}"/> form pays an interface dispatch
+    /// per element on a path that runs O(n log n) times.
+    /// </remarks>
+    public int Compare(SqlValue[] left, SqlValue[] right)
+    {
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+
+        var count = Math.Min(left.Length, right.Length);
+        for (var index = 0; index < count; index++)
+        {
+            var term = index < _terms.Length
+                ? _terms[index]
+                : SqliteIndexComparisonTerm.BinaryAscending;
+            var result = CompareValue(left[index], right[index], term.Collation);
+            if (result != 0)
+                return term.SortOrder == SqliteKeySortOrder.Descending
+                    ? -Math.Sign(result)
+                    : result;
+        }
+
+        return left.Length.CompareTo(right.Length);
+    }
+
+    /// <summary>Compares two decoded SQLite records.</summary>
     public int Compare(IReadOnlyList<SqlValue> left, IReadOnlyList<SqlValue> right)
     {
         ArgumentNullException.ThrowIfNull(left);

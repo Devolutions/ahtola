@@ -1,4 +1,6 @@
-﻿
 using BenchmarkDotNet.Running;
 
-BenchmarkRunner.Run<Benchmarks.Benchmarks>();
+BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
+
+/// <summary>Entry-point anchor for <see cref="BenchmarkSwitcher.FromAssembly"/>.</summary>
+public partial class Program;

@@ -82,6 +82,26 @@ public sealed class SqliteIndexLeafCell
             Math.Max(contentLength, MinimumStorageLength));
     }
 
+    /// <summary>
+    /// The byte count an index-leaf cell would occupy for a record of
+    /// <paramref name="payloadLength"/> bytes, without materializing the cell.
+    /// </summary>
+    /// <remarks>
+    /// Page-packing decides leaf boundaries from this length alone; building a
+    /// throwaway cell copies the whole payload just to read it back.
+    /// </remarks>
+    public static int CalculateEncodedLength(ulong payloadLength, int usableSpace)
+    {
+        var layout = SqlitePayloadLayout.Calculate(
+            SqliteBtreePageType.IndexLeaf,
+            payloadLength,
+            usableSpace);
+        var contentLength = checked(
+            SqliteVarint.GetLength(payloadLength)
+            + layout.StoredPayloadLength);
+        return Math.Max(contentLength, MinimumStorageLength);
+    }
+
     /// <summary>Decodes one index-leaf cell from the start of <paramref name="source"/>.</summary>
     public static SqliteIndexLeafCell Decode(ReadOnlySpan<byte> source, int usableSpace)
     {

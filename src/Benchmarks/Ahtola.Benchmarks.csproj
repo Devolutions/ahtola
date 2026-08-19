@@ -2,7 +2,12 @@
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
-        <TargetFramework>net9.0</TargetFramework>
+        <!--
+          Single-TFM projects evaluate Directory.Build.props before TargetFramework
+          is defined, so $(AhtolaEntityFrameworkCoreVersion) resolves to the net10.0
+          pin. Track the repository default framework so that pin stays restorable.
+        -->
+        <TargetFramework>net10.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
     </PropertyGroup>

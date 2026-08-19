@@ -413,6 +413,74 @@ public sealed class SqlitePageStore : IDisposable
     }
 
     /// <summary>
+    /// Writes a complete, final-numbered page image sequentially into a private
+    /// store that has not been published yet, then makes it durable once.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the VACUUM destination sink. An ordinary commit routes every page
+    /// through the WAL and a later checkpoint, so the image is written twice and
+    /// read back once. A vacuum target is a private temporary file that nothing
+    /// can observe until it is atomically published, so the intermediate WAL copy
+    /// buys no recoverability — a crash simply discards the temporary file.
+    /// </para>
+    /// <para>
+    /// Pages are still encoded through the page codec with their final page
+    /// numbers, so encrypted and page-number-dependent encodings are unchanged.
+    /// The file length is set once up front and flushed once at the end.
+    /// </para>
+    /// </remarks>
+    internal void WriteUnpublishedImage(
+        uint pageCount,
+        Func<uint, ReadOnlyMemory<byte>> getPageImage)
+    {
+        ArgumentNullException.ThrowIfNull(getPageImage);
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+        if (pageCount == 0)
+            throw new ArgumentOutOfRangeException(nameof(pageCount), pageCount, "A SQLite database has at least one page.");
+
+        var targetLength = checked((long)pageCount * PageSize);
+        _file.SetLength(targetLength);
+        if (_file.Length != targetLength)
+            throw new InvalidDataException("Preallocating the vacuum destination did not reach its page boundary.");
+
+        SqliteDatabaseHeader? firstPageHeader = null;
+        for (var pageNumber = 1U; pageNumber <= pageCount; pageNumber++)
+        {
+            var page = getPageImage(pageNumber);
+            if (page.Length != PageSize)
+            {
+                throw new InvalidDataException(
+                    $"Vacuum destination page {pageNumber} is {page.Length} bytes; expected {PageSize}.");
+            }
+
+            if (pageNumber == 1)
+            {
+                firstPageHeader = SqliteDatabaseHeader.Parse(page.Span);
+                if (firstPageHeader.PageSize != PageSize)
+                    throw new InvalidDataException("Vacuum destination page 1 does not declare the store's page size.");
+                if (firstPageHeader.DatabaseSizeInPages != pageCount
+                    || firstPageHeader.VersionValidFor != firstPageHeader.ChangeCounter)
+                {
+                    throw new InvalidDataException(
+                        "Vacuum destination page 1 must authoritatively declare its own page count.");
+                }
+            }
+
+            WriteRawPage(pageNumber, page.Span);
+        }
+
+        AssertPageAligned();
+        if (_file.Length != targetLength)
+            throw new InvalidDataException("Writing the vacuum destination changed its expected file length.");
+
+        _file.FlushToDisk();
+        _header = firstPageHeader
+            ?? throw new InvalidDataException("Vacuum destination did not receive a first page.");
+    }
+
+    /// <summary>
     /// Writes <paramref name="source"/> (exactly <see cref="PageSize"/> bytes) to
     /// page <paramref name="pageNumber"/> (1-based). Existing pages are overwritten
     /// in place; a page number one past the end appends a single page. Writing
