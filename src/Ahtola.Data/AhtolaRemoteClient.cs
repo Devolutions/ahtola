@@ -46,6 +46,11 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
 
     public bool HasOpenSession => _baton is not null;
 
+    public void ResetSession()
+    {
+        _baton = null;
+    }
+
     public async Task<RemoteStatementResult> ExecuteAsync(
         string sql,
         AhtolaParameterCollection parameters,
@@ -341,16 +346,22 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
 
     private static RemoteStatement BuildStatement(string sql, AhtolaParameterCollection parameters, bool wantRows)
     {
+        var bindings = AhtolaParameterBindings.Create(sql, parameters);
         var statement = new RemoteStatement
         {
             Sql = sql,
             WantRows = wantRows,
         };
 
-        foreach (AhtolaParameter parameter in parameters)
+        for (var index = 1; index <= bindings.Map.Count; index++)
         {
+            if (!bindings.Map.IsReferenced(index))
+                continue;
+
+            var parameter = bindings.GetParameter(index);
             var value = RemoteRequestValue.FromAhtolaValue(parameter.ToValue());
-            if (string.IsNullOrEmpty(parameter.ParameterName))
+            var sqlName = bindings.Map.GetName(index);
+            if (sqlName is null)
             {
                 statement.Args.Add(value);
             }
@@ -358,7 +369,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             {
                 statement.NamedArgs.Add(new RemoteNamedArg
                 {
-                    Name = parameter.ParameterName,
+                    Name = sqlName,
                     Value = value,
                 });
             }
@@ -607,7 +618,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         long? localChangeSequence = null)
     {
         if (error is null)
-            return new AhtolaRemoteSqlException("Remote SQL execution failed.");
+            return new AhtolaRemoteSqlException("Remote SQL execution failed.", null, null);
 
         if (replicaPush && IsConflict(error))
         {
@@ -618,9 +629,10 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                 localChangeSequence);
         }
 
-        return string.IsNullOrWhiteSpace(error.Code)
-            ? new AhtolaRemoteSqlException($"Remote SQL execution failed: {error.Message}")
-            : new AhtolaRemoteSqlException($"Remote SQL execution failed: {error.Message} ({error.Code})");
+        var message = string.IsNullOrWhiteSpace(error.Code)
+            ? $"Remote SQL execution failed: {error.Message}"
+            : $"Remote SQL execution failed: {error.Message} ({error.Code})";
+        return new AhtolaRemoteSqlException(message, error.Code, error.Message);
     }
 
     private static bool IsConflict(RemoteError error)
@@ -893,7 +905,35 @@ internal sealed class RemoteError
     public string? Code { get; init; }
 }
 
-internal sealed class AhtolaRemoteSqlException(string message) : AhtolaException(message);
+internal sealed class AhtolaRemoteSqlException : AhtolaException
+{
+    public AhtolaRemoteSqlException(string message, string? remoteErrorCode, string? remoteErrorMessage)
+        : base(message)
+    {
+        RemoteErrorCode = remoteErrorCode;
+        RemoteErrorMessage = remoteErrorMessage;
+    }
+
+    public string? RemoteErrorCode { get; }
+
+    public string? RemoteErrorMessage { get; }
+
+    public bool IsStreamExpired
+        => RemoteErrorCode is not null
+               && (RemoteErrorCode.Equals("STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorCode.Equals("STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorCode.Equals("BATON_EXPIRED", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorCode.Equals("HRANA_STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorCode.Equals("HRANA_STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorCode.Equals("BA_STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorCode.Equals("BA_STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase))
+           || RemoteErrorMessage is not null
+               && (RemoteErrorMessage.Contains("stream expired", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorMessage.Contains("stream has expired", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorMessage.Contains("stream not found", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorMessage.Contains("baton expired", StringComparison.OrdinalIgnoreCase)
+                   || RemoteErrorMessage.Contains("baton has expired", StringComparison.OrdinalIgnoreCase));
+}
 
 internal sealed class RemoteBatchResult
 {

@@ -224,10 +224,11 @@ public sealed class AhtolaBatch : DbBatch
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var connection = _connection ?? throw new InvalidOperationException("Connection must be set before executing a batch.");
-        if (connection.State != ConnectionState.Open)
-            throw new InvalidOperationException("Ahtola database is closed.");
         if (_transaction is { IsCompleted: true })
             throw new InvalidOperationException("The transaction associated with this batch has completed.");
+        _transaction?.ThrowIfFaulted();
+        if (connection.State != ConnectionState.Open)
+            throw new InvalidOperationException("Ahtola database is closed.");
         if (_transaction is not null && !ReferenceEquals(_transaction.Connection, connection))
             throw new InvalidOperationException("The transaction is not associated with the batch's connection.");
         if (connection.Transaction is not null && !ReferenceEquals(_transaction, connection.Transaction))

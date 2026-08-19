@@ -1,4 +1,5 @@
 using System.Data.Common;
+using System.Runtime.ExceptionServices;
 using IsolationLevel = System.Data.IsolationLevel;
 
 namespace Ahtola;
@@ -8,7 +9,9 @@ public class AhtolaTransaction : DbTransaction
     private AhtolaConnection? _connection;
     private readonly IsolationLevel _isolationLevel;
     private readonly bool _supportsSavepoints;
+    private readonly bool _isRemote;
     private IDisposable? _managedReplicaOperation;
+    private ExceptionDispatchInfo? _rootFailure;
     private bool _completed;
 
     public AhtolaTransaction(AhtolaConnection connection, IsolationLevel isolationLevel)
@@ -24,6 +27,7 @@ public class AhtolaTransaction : DbTransaction
         _connection = connection;
         _isolationLevel = NormalizeIsolationLevel(isolationLevel);
         _supportsSavepoints = connection.Capabilities.SupportsSavepoints;
+        _isRemote = connection.IsRemote;
 
         if (_isolationLevel == IsolationLevel.ReadUncommitted)
             connection.ReadUncommitted = true;
@@ -32,7 +36,7 @@ public class AhtolaTransaction : DbTransaction
         {
             if (beginTransaction)
             {
-                if (connection.IsRemote)
+                if (_isRemote)
                     connection.BeginRemoteTransaction(_isolationLevel);
                 else
                     connection.ExecuteNonQuery("BEGIN");
@@ -59,7 +63,7 @@ public class AhtolaTransaction : DbTransaction
             beginTransaction: false);
         try
         {
-            if (connection.IsRemote)
+            if (transaction._isRemote)
             {
                 await connection
                     .BeginRemoteTransactionAsync(transaction._isolationLevel, cancellationToken)
@@ -86,10 +90,19 @@ public class AhtolaTransaction : DbTransaction
     {
         if (!_completed)
         {
-            if (_connection is null || _connection.State == System.Data.ConnectionState.Closed)
+            if (_rootFailure is not null || _connection is null || _connection.State == System.Data.ConnectionState.Closed)
                 CompleteTransaction();
             else
-                Rollback();
+            {
+                try
+                {
+                    Rollback();
+                }
+                catch
+                {
+                    CompleteTransaction();
+                }
+            }
         }
 
         base.Dispose(disposing);
@@ -100,6 +113,17 @@ public class AhtolaTransaction : DbTransaction
     public override bool SupportsSavepoints => _supportsSavepoints;
 
     internal bool IsCompleted => _completed;
+
+    internal bool IsRemote => _isRemote;
+
+    internal void RecordFailure(Exception exception)
+        => _rootFailure ??= ExceptionDispatchInfo.Capture(exception);
+
+    internal void ThrowIfFaulted()
+    {
+        if (_rootFailure is not null)
+            throw new InvalidOperationException("The transaction has failed and is unusable.", _rootFailure.SourceException);
+    }
 
     internal void MarkCompletedExternally()
     {
@@ -112,8 +136,9 @@ public class AhtolaTransaction : DbTransaction
     public override void Commit()
     {
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent();
         var connection = GetConnection();
-        if (connection.IsRemote)
+        if (_isRemote)
         {
             try
             {
@@ -121,6 +146,8 @@ public class AhtolaTransaction : DbTransaction
             }
             catch (AhtolaRemoteSqlException)
             {
+                if (_rootFailure is not null)
+                    CompleteTransaction();
                 throw;
             }
             catch
@@ -143,8 +170,9 @@ public class AhtolaTransaction : DbTransaction
     public override void Rollback()
     {
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent();
         var connection = GetConnection();
-        if (connection.IsRemote)
+        if (_isRemote)
         {
             try
             {
@@ -173,8 +201,9 @@ public class AhtolaTransaction : DbTransaction
     {
         cancellationToken.ThrowIfCancellationRequested();
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent();
         var connection = GetConnection();
-        if (connection.IsRemote)
+        if (_isRemote)
         {
             try
             {
@@ -182,6 +211,8 @@ public class AhtolaTransaction : DbTransaction
             }
             catch (AhtolaRemoteSqlException)
             {
+                if (_rootFailure is not null)
+                    CompleteTransaction();
                 throw;
             }
             catch
@@ -203,8 +234,9 @@ public class AhtolaTransaction : DbTransaction
     {
         cancellationToken.ThrowIfCancellationRequested();
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent();
         var connection = GetConnection();
-        if (connection.IsRemote)
+        if (_isRemote)
         {
             try
             {
@@ -233,6 +265,7 @@ public class AhtolaTransaction : DbTransaction
     {
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent(completeTransaction: false);
         GetConnection().ExecuteNonQuery("SAVEPOINT " + QuoteIdentifier(savepointName) + ";");
     }
 
@@ -240,6 +273,7 @@ public class AhtolaTransaction : DbTransaction
     {
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent(completeTransaction: false);
         return ExecuteNonQueryAsync(
             "SAVEPOINT " + QuoteIdentifier(savepointName) + ";",
             cancellationToken);
@@ -249,6 +283,7 @@ public class AhtolaTransaction : DbTransaction
     {
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent(completeTransaction: false);
         GetConnection().ExecuteNonQuery("ROLLBACK TO SAVEPOINT " + QuoteIdentifier(savepointName) + ";");
     }
 
@@ -256,6 +291,7 @@ public class AhtolaTransaction : DbTransaction
     {
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent(completeTransaction: false);
         return ExecuteNonQueryAsync(
             "ROLLBACK TO SAVEPOINT " + QuoteIdentifier(savepointName) + ";",
             cancellationToken);
@@ -265,6 +301,7 @@ public class AhtolaTransaction : DbTransaction
     {
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent(completeTransaction: false);
         GetConnection().ExecuteNonQuery("RELEASE SAVEPOINT " + QuoteIdentifier(savepointName) + ";");
     }
 
@@ -272,6 +309,7 @@ public class AhtolaTransaction : DbTransaction
     {
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
+        ThrowRootFailureIfPresent(completeTransaction: false);
         return ExecuteNonQueryAsync(
             "RELEASE SAVEPOINT " + QuoteIdentifier(savepointName) + ";",
             cancellationToken);
@@ -294,6 +332,17 @@ public class AhtolaTransaction : DbTransaction
     {
         if (_completed)
             throw new InvalidOperationException("This transaction has already completed.");
+    }
+
+    private void ThrowRootFailureIfPresent(bool completeTransaction = true)
+    {
+        var rootFailure = _rootFailure;
+        if (rootFailure is null)
+            return;
+
+        if (completeTransaction)
+            CompleteTransaction();
+        rootFailure.Throw();
     }
 
     private AhtolaConnection GetConnection()

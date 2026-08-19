@@ -272,7 +272,11 @@ public class SqliteParameter : DbParameter
         return value switch
         {
             ulong u64 => unchecked((long)u64),
-            Enum enumValue => Convert.ToInt64(enumValue, CultureInfo.InvariantCulture),
+            Enum enumValue => Type.GetTypeCode(Enum.GetUnderlyingType(enumValue.GetType())) switch
+            {
+                TypeCode.UInt64 => unchecked((long)Convert.ToUInt64(enumValue, CultureInfo.InvariantCulture)),
+                _ => Convert.ToInt64(enumValue, CultureInfo.InvariantCulture),
+            },
             _ => Convert.ToInt64(value, CultureInfo.InvariantCulture),
         };
     }

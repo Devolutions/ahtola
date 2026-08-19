@@ -219,7 +219,7 @@ public class AhtolaCommand : DbCommand
                     ? Timeout.InfiniteTimeSpan
                     : TimeSpan.FromSeconds(CommandTimeout);
                 managedStatement = _connection.ManagedConnection.Prepare(sql);
-                BindManagedParameters(managedStatement);
+                BindManagedParameters(managedStatement, sql);
                 _ = managedStatement.ResultMetadata.ColumnCount;
 
                 _nativeStatement?.Dispose();
@@ -248,44 +248,25 @@ public class AhtolaCommand : DbCommand
                     ? TimeSpan.MaxValue
                     : TimeSpan.FromSeconds(CommandTimeout));
             preparedStatement = _connection.NativeDatabase.PrepareStatement(sql);
-            var parameterCount = preparedStatement.ParameterCount;
-            var boundParameters = new bool[parameterCount + 1];
-
-            for (var i = 0; i < _parameterCollection.Count; i++)
+            var bindings = AhtolaParameterBindings.Create(sql, _parameterCollection);
+            if (preparedStatement.ParameterCount != bindings.Map.Count)
             {
-                var parameter = _parameterCollection[i] as AhtolaParameter;
-                if (parameter == null)
-                    throw new ArgumentException("Parameter must be of type AhtolaParameter");
-
-                if (!string.IsNullOrEmpty(parameter.ParameterName))
-                {
-                    var parameterIndex = preparedStatement.BindNamedParameter(parameter.ParameterName, parameter.ToValue());
-                    if (parameterIndex == 0)
-                        throw new InvalidOperationException($"Parameter {parameter.ParameterName} was not found in the SQL statement.");
-
-                    boundParameters[parameterIndex] = true;
-                }
-                else
-                {
-                    var parameterIndex = i + 1;
-                    if (parameterIndex > parameterCount)
-                        throw new InvalidOperationException($"Parameter at position {parameterIndex} was not found in the SQL statement.");
-
-                    preparedStatement.BindParameter(parameterIndex, parameter.ToValue());
-                    boundParameters[parameterIndex] = true;
-                }
+                throw new InvalidOperationException(
+                    "The native provider reported parameter metadata that does not match the SQL statement.");
             }
 
-            for (var i = 1; i <= parameterCount; i++)
+            for (var index = 1; index <= bindings.Map.Count; index++)
             {
-                if (!boundParameters[i])
+                var lexerName = bindings.Map.GetName(index);
+                var nativeName = preparedStatement.GetParameterName(index);
+                if (bindings.Map.IsReferenced(index)
+                    && !string.Equals(lexerName, nativeName, StringComparison.Ordinal))
                 {
-                    var parameterName = preparedStatement.GetParameterName(i);
                     throw new InvalidOperationException(
-                        parameterName is null
-                            ? $"Missing value for parameter ?{i}."
-                            : $"Missing value for parameter {parameterName}.");
+                        $"The native provider reported parameter {nativeName ?? $"?{index}"} where the SQL statement references {lexerName ?? $"?{index}"}.");
                 }
+                if (bindings.Map.IsReferenced(index))
+                    preparedStatement.BindParameter(index, bindings.GetParameter(index).ToValue());
             }
 
             _nativeStatement?.Dispose();
@@ -463,47 +444,13 @@ public class AhtolaCommand : DbCommand
         CancellationToken cancellationToken = default)
         => _cancellation.RunAsync(operation, cancellationToken);
 
-    private void BindManagedParameters(IManagedStatementAdapter statement)
+    private void BindManagedParameters(IManagedStatementAdapter statement, string sql)
     {
-        var parameterMetadata = statement.ParameterMetadata;
-        var parameterCount = parameterMetadata.Count;
-        var boundParameters = new bool[parameterCount + 1];
-
-        for (var i = 0; i < _parameterCollection.Count; i++)
+        var bindings = AhtolaParameterBindings.Create(sql, _parameterCollection);
+        for (var index = 1; index <= bindings.Map.Count; index++)
         {
-            var parameter = _parameterCollection[i] as AhtolaParameter
-                ?? throw new ArgumentException("Parameter must be of type AhtolaParameter");
-
-            if (!string.IsNullOrEmpty(parameter.ParameterName))
-            {
-                var parameterIndex = parameterMetadata.GetParameterIndex(parameter.ParameterName);
-                if (parameterIndex == 0)
-                    throw new InvalidOperationException($"Parameter {parameter.ParameterName} was not found in the SQL statement.");
-
-                statement.Bind(parameterIndex, parameter.ToSqlValue());
-                boundParameters[parameterIndex] = true;
-            }
-            else
-            {
-                var parameterIndex = i + 1;
-                if (parameterIndex > parameterCount)
-                    throw new InvalidOperationException($"Parameter at position {parameterIndex} was not found in the SQL statement.");
-
-                statement.Bind(parameterIndex, parameter.ToSqlValue());
-                boundParameters[parameterIndex] = true;
-            }
-        }
-
-        for (var i = 1; i <= parameterCount; i++)
-        {
-            if (boundParameters[i])
-                continue;
-
-            var parameterName = parameterMetadata.GetParameter(i).Name;
-            throw new InvalidOperationException(
-                parameterName is null
-                    ? $"Missing value for parameter ?{i}."
-                    : $"Missing value for parameter {parameterName}.");
+            if (bindings.Map.IsReferenced(index))
+                statement.Bind(index, bindings.GetParameter(index).ToSqlValue());
         }
     }
 
@@ -558,6 +505,7 @@ public class AhtolaCommand : DbCommand
             return;
         if (_transaction.IsCompleted)
             throw new InvalidOperationException("The transaction associated with this command has completed.");
+        _transaction.ThrowIfFaulted();
         if (!ReferenceEquals(_transaction.Connection, _connection))
             throw new InvalidOperationException("The transaction is not associated with the command's connection.");
     }
