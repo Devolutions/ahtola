@@ -149,6 +149,14 @@ internal static class ManagedReplicaBootstrapper
         var message = await reader.ReadAsync(MaxHeaderLength, effectiveToken).ConfigureAwait(false)
             ?? throw new InvalidDataException("The pull-updates response did not contain a protobuf header.");
         var header = ParseHeader(message);
+        if (header.RemoteUsesLogicalProtocol)
+        {
+            throw new NotSupportedException(
+                "Incremental synchronization requires the MVCC logical pull protocol, which this provider does not "
+                + "implement. The remote can still be bootstrapped as a full page stream, so refresh the replica by "
+                + "bootstrapping it again instead of synchronizing it.");
+        }
+
         var pages = new List<PullPage>();
         while (await reader.ReadAsync(MaxPageMessageLength, effectiveToken).ConfigureAwait(false) is { } page)
         {
@@ -460,10 +468,10 @@ internal static class ManagedReplicaBootstrapper
             throw new InvalidDataException("Managed embedded replica bootstrap supports only page streams.");
         if (applyMode is > 1)
             throw new InvalidDataException("The pull-updates response has an unsupported apply mode.");
-        if (protocol is > 1)
-            throw new InvalidDataException("Managed embedded replica bootstrap does not support logical pull protocols.");
-
-        return new PullHeader(revision, pageCount);
+        // A logical-protocol remote still bootstraps as a raw page stream - the field describes the incremental
+        // pulls that follow, which CheckForUpdatesAsync refuses explicitly. The payload itself is already
+        // constrained to raw pages by the checks above.
+        return new PullHeader(revision, pageCount, protocol is > 1);
     }
 
     private static PullPage ParsePage(byte[] payload)
@@ -631,7 +639,7 @@ internal static class ManagedReplicaBootstrapper
         => value.Length == 64 && value.All(static c => c is >= '0' and <= '9' or >= 'A' and <= 'F');
 
     public readonly record struct ManagedReplicaMetadata(string Revision, string DatabaseSha256, string ClientId);
-    private readonly record struct PullHeader(string Revision, ulong DatabasePages);
+    private readonly record struct PullHeader(string Revision, ulong DatabasePages, bool RemoteUsesLogicalProtocol);
     private readonly record struct PullPage(ulong PageId, byte[] Data);
 
     private sealed class DelimitedProtobufReader(Stream stream)

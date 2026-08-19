@@ -297,6 +297,101 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    // protocol=2 (MvccLogical) describes the incremental pulls that follow, not the bootstrap, which the server
+    // still ships as a raw page stream.
+    [Test]
+    public void CreateReplicaBootstrapsRawPagesFromALogicalProtocolRemote()
+    {
+        var path = Path.Combine(
+            TestContext.CurrentContext.WorkDirectory,
+            $"managed-embedded-replica-logical-bootstrap-{Guid.NewGuid():N}.db");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", databaseImage, protocol: 2));
+        var options = new AhtolaReplicaOptions(
+            path,
+            new Uri("https://example.test"),
+            authToken: null,
+            bootstrapIfEmpty: true)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM bootstrap_marker;";
+            command.ExecuteScalar().Should().Be(42L);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void SyncAgainstALogicalProtocolRemoteReportsThatBootstrapIsTheRefreshPath()
+    {
+        var path = Path.Combine(
+            TestContext.CurrentContext.WorkDirectory,
+            $"managed-embedded-replica-logical-sync-{Guid.NewGuid():N}.db");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        // One response for the bootstrap, a second for the sync attempt.
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreatePullResponse("revision-43", databaseImage, protocol: 2),
+        ]);
+        var options = new AhtolaReplicaOptions(
+            path,
+            new Uri("https://example.test"),
+            authToken: null,
+            bootstrapIfEmpty: true)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            Action sync = () => connection.Sync();
+
+            // Without this the caller saw an opaque revision-consistency failure instead of the real reason.
+            sync.Should().Throw<NotSupportedException>()
+                .WithMessage("*MVCC logical pull protocol*")
+                .And.Message.Should().Contain("bootstrapping it again");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
     [Test]
     public async Task ManagedReplicaAcceptsRawLegacyAndV1PageStreams()
     {
