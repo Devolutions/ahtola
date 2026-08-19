@@ -12,6 +12,7 @@ namespace Ahtola.Core.Storage;
 public sealed partial class PhysicalFileSystem :
     IFileSystem,
     IAtomicFileSystem,
+    ITemporaryFileSystem,
     ISqliteWalSharedMemoryFileSystem
 {
     private const uint ReplaceFileWriteThrough = 0x00000001;
@@ -36,6 +37,18 @@ public sealed partial class PhysicalFileSystem :
 
     public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
         => OpenFile(path, mode, readOnly, FileShare.Read);
+
+    IFile ITemporaryFileSystem.OpenTemporaryFile(string path)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        var handle = File.OpenHandle(
+            path,
+            FileMode.CreateNew,
+            FileAccess.ReadWrite,
+            FileShare.Read,
+            FileOptions.DeleteOnClose);
+        return new PhysicalFile(handle, readOnly: false);
+    }
 
     internal IFile OpenPagerFile(string path, FileOpenMode mode, bool readOnly = false)
         => OpenFile(path, mode, readOnly, FileShare.ReadWrite | FileShare.Delete);

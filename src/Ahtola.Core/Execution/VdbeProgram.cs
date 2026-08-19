@@ -1418,14 +1418,24 @@ public sealed class VdbeSubprogram
 
     internal bool RequiresFreshRuntime => _dynamicWriteTargets is not null;
 
-    internal ResumableStatement CreateRuntime(VdbeParameterBinding? parameterBinding)
+    internal ResumableStatement CreateRuntime(
+        VdbeParameterBinding? parameterBinding,
+        VdbeExecutionOptions executionOptions)
     {
+        ArgumentNullException.ThrowIfNull(executionOptions);
         lock (_syncRoot)
         {
             var program = _program ?? throw new InvalidOperationException(
                 "The recursive VDBE subprogram was not resolved before execution.");
             var writeTargets = _dynamicWriteTargets?.Invoke(parameterBinding) ?? _writeTargets;
-            return new ResumableStatement(program, _cursorSources, writeTargets, parameterBinding);
+            return new ResumableStatement(
+                program,
+                _cursorSources,
+                writeTargets,
+                parameterBinding,
+                sharedTransaction: null,
+                virtualTableBindings: null,
+                executionOptions: executionOptions);
         }
     }
 }
@@ -1641,12 +1651,12 @@ public sealed record CloseCursorInstruction(Cursor Cursor) : VdbeInstruction
 
 /// <summary>Opens a sorter that materializes rows and orders them with
 /// <paramref name="Comparer"/> when <c>SorterSort</c> runs. <paramref name="ColumnCount"/>
-/// is the fixed width of every record the sorter stores. When the buffered row count
-/// exceeds <paramref name="BufferRowCapacity"/> (if positive), the sorter spills to a
-/// temp file and drains via a k-way merge so large <c>ORDER BY</c>/<c>DISTINCT</c>/
-/// <c>GROUP BY</c> result sets do not OOM — mirroring SQLite's external merge sort.
-/// The default <c>0</c> means no spill (in-memory only), preserving the historical
-/// behavior for every existing call site.</summary>
+/// is the fixed width of every record the sorter stores. The owning
+/// <see cref="ResumableStatement"/> spills buffered payloads at its
+/// <see cref="VdbeExecutionOptions.SorterMemoryLimitBytes"/> and drains through
+/// a k-way merge, so large <c>ORDER BY</c>/<c>GROUP BY</c> result sets do not
+/// materialize in memory. A positive <paramref name="BufferRowCapacity"/> is a
+/// stricter deterministic row-cap override used by opcode-level tests.</summary>
 public sealed record OpenSorterInstruction(
     Sorter Sorter,
     VdbeRowComparer Comparer,

@@ -5,6 +5,7 @@ using System.IO;
 using System.Runtime.ExceptionServices;
 using System.Text;
 using Ahtola.Core.Parsing;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Core.Execution;
 
@@ -57,6 +58,7 @@ public sealed class ResumableStatement : IDisposable
     private readonly IReadOnlyList<VdbeCursorSource?>? _cursorSources;
     private readonly IReadOnlyList<VdbeWriteTarget?>? _writeTargets;
     private readonly IReadOnlyList<VdbeVirtualTableBinding?>? _virtualTableBindings;
+    private readonly VdbeExecutionOptions _executionOptions;
     private readonly VdbeTransactionContext _transaction;
     private readonly bool _ownsTransaction;
     private VdbeParameterBinding? _binding;
@@ -74,8 +76,49 @@ public sealed class ResumableStatement : IDisposable
         VdbeParameterBinding? parameterBinding = null,
         VdbeTransactionContext? sharedTransaction = null,
         IReadOnlyList<VdbeVirtualTableBinding?>? virtualTableBindings = null)
+        : this(
+            program,
+            cursorSources,
+            writeTargets,
+            parameterBinding,
+            sharedTransaction,
+            virtualTableBindings,
+            VdbeExecutionOptions.Default)
+    {
+    }
+
+    /// <summary>
+    /// Creates a statement with explicit temporary execution resources without changing
+    /// the legacy constructor's positional parameter contract.
+    /// </summary>
+    public static ResumableStatement CreateWithExecutionOptions(
+        VdbeProgram program,
+        VdbeExecutionOptions executionOptions,
+        IReadOnlyList<VdbeCursorSource?>? cursorSources = null,
+        IReadOnlyList<VdbeWriteTarget?>? writeTargets = null,
+        VdbeParameterBinding? parameterBinding = null,
+        VdbeTransactionContext? sharedTransaction = null,
+        IReadOnlyList<VdbeVirtualTableBinding?>? virtualTableBindings = null)
+        => new(
+            program,
+            cursorSources,
+            writeTargets,
+            parameterBinding,
+            sharedTransaction,
+            virtualTableBindings,
+            executionOptions);
+
+    internal ResumableStatement(
+        VdbeProgram program,
+        IReadOnlyList<VdbeCursorSource?>? cursorSources,
+        IReadOnlyList<VdbeWriteTarget?>? writeTargets,
+        VdbeParameterBinding? parameterBinding,
+        VdbeTransactionContext? sharedTransaction,
+        IReadOnlyList<VdbeVirtualTableBinding?>? virtualTableBindings,
+        VdbeExecutionOptions executionOptions)
     {
         ArgumentNullException.ThrowIfNull(program);
+        ArgumentNullException.ThrowIfNull(executionOptions);
         if (cursorSources is not null && cursorSources.Count != program.CursorCount)
         {
             throw new ArgumentException(
@@ -120,6 +163,7 @@ public sealed class ResumableStatement : IDisposable
         _cursorSources = cursorSources;
         _writeTargets = writeTargets;
         _virtualTableBindings = virtualTableBindings;
+        _executionOptions = executionOptions;
         _binding = parameterBinding;
         _ownsTransaction = sharedTransaction is null;
         _transaction = sharedTransaction ?? new VdbeTransactionContext();
@@ -869,7 +913,7 @@ public sealed class ResumableStatement : IDisposable
                 case SorterInsertInstruction sorterInsert:
                     {
                         var runtime = RequireOpenSorter(sorterInsert.Sorter);
-                        runtime.Insert(ReadRegisters(sorterInsert.Record));
+                        runtime.Insert(ReadRegisters(sorterInsert.Record), cancellationToken);
                         AdvanceInstructionPointer();
                         break;
                     }
@@ -894,7 +938,7 @@ public sealed class ResumableStatement : IDisposable
                 case SorterNextInstruction sorterNext:
                     {
                         var runtime = RequireOpenSorter(sorterNext.Sorter);
-                        if (runtime.MoveNext())
+                        if (runtime.MoveNext(cancellationToken))
                             _instructionPointer = sorterNext.LoopTarget;
                         else
                             AdvanceInstructionPointer();
@@ -1561,7 +1605,9 @@ public sealed class ResumableStatement : IDisposable
                 && subprogram!.State != ResumableStatementState.Yielded))
         {
             subprogram?.Dispose();
-            subprogram = instruction.Subprogram.CreateRuntime(CreateSubprogramBinding(instruction));
+            subprogram = instruction.Subprogram.CreateRuntime(
+                CreateSubprogramBinding(instruction),
+                _executionOptions);
             _subprogramStatements[instructionOffset] = subprogram;
         }
         else if (subprogram!.State == ResumableStatementState.Yielded)
@@ -1612,7 +1658,8 @@ public sealed class ResumableStatement : IDisposable
         _sorters[instruction.Sorter.Index] = new SorterRuntime(
             instruction.Comparer,
             instruction.ColumnCount,
-            instruction.BufferRowCapacity);
+            instruction.BufferRowCapacity,
+            _executionOptions);
     }
 
     private void CloseSorter(Sorter sorter)
@@ -1630,11 +1677,26 @@ public sealed class ResumableStatement : IDisposable
     // temp file, even when the program ends mid-drain or is aborted.
     private void DisposeAllSorters()
     {
+        Exception? cleanupFailure = null;
         for (var index = 0; index < _sorters.Length; index++)
         {
-            _sorters[index]?.Dispose();
-            _sorters[index] = null;
+            var sorter = _sorters[index];
+            if (sorter is null)
+                continue;
+
+            try
+            {
+                sorter.Dispose();
+                _sorters[index] = null;
+            }
+            catch (Exception exception)
+            {
+                cleanupFailure ??= exception;
+            }
         }
+
+        if (cleanupFailure is not null)
+            ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
     }
 
     private void DisposeAllJoinCursors()
@@ -2449,7 +2511,10 @@ public sealed class ResumableStatement : IDisposable
         private readonly VdbeRowComparer _comparer;
         private readonly int _columnCount;
         private readonly int _bufferRowCapacity;
+        private readonly long _bufferMemoryLimitBytes;
+        private readonly VdbeExecutionOptions _executionOptions;
         private readonly List<SqlValue[]> _rows = [];
+        private long _bufferedBytes;
         private SorterSpill? _spill;
         private bool _sorted;
         private int _position = -1;
@@ -2458,17 +2523,23 @@ public sealed class ResumableStatement : IDisposable
         private SqlValue[]? _pending;
         private int _pendingRunIndex;
 
-        public SorterRuntime(VdbeRowComparer comparer, int columnCount, int bufferRowCapacity)
+        public SorterRuntime(
+            VdbeRowComparer comparer,
+            int columnCount,
+            int bufferRowCapacity,
+            VdbeExecutionOptions executionOptions)
         {
             _comparer = comparer;
             _columnCount = columnCount;
+            _executionOptions = executionOptions;
             // 0 means "no spill" (the historical in-memory default). Treat anything
             // non-positive the same way so a stray negative capacity can never force a
             // single-row spill loop.
             _bufferRowCapacity = bufferRowCapacity > 0 ? bufferRowCapacity : int.MaxValue;
+            _bufferMemoryLimitBytes = executionOptions.SorterMemoryLimitBytes;
         }
 
-        public void Insert(SqlValue[] record)
+        public void Insert(SqlValue[] record, CancellationToken cancellationToken)
         {
             if (_sorted)
                 throw new InvalidOperationException("Cannot insert into a sorter after it has been sorted.");
@@ -2478,16 +2549,16 @@ public sealed class ResumableStatement : IDisposable
                     $"Sorter stores {_columnCount}-column records but received {record.Length} values.");
             }
 
-            _rows.Add(record);
-
-            // Spill when the in-memory buffer exceeds the capacity. Each run is stably
-            // sorted before flushing so the k-way merge over runs is globally stable.
-            if (_rows.Count > _bufferRowCapacity && _bufferRowCapacity != int.MaxValue)
+            var recordBytes = EstimateRecordBytes(record);
+            if (_rows.Count > 0
+                && (_rows.Count >= _bufferRowCapacity
+                    || _bufferedBytes > _bufferMemoryLimitBytes - recordBytes))
             {
-                _spill ??= new SorterSpill(_columnCount);
-                _spill.WriteRun(SortBufferedRows(CancellationToken.None), CancellationToken.None);
-                _rows.Clear();
+                FlushBuffered(cancellationToken);
             }
+
+            _rows.Add(record);
+            _bufferedBytes = checked(_bufferedBytes + recordBytes);
         }
 
         // Sorts the buffered records and positions on the first one. Returns false (and
@@ -2498,10 +2569,9 @@ public sealed class ResumableStatement : IDisposable
 
             // Flush the final partial buffer as one more run so Sort always drains from
             // the spill when any runs exist. An empty tail is skipped (no zero-row run).
-            if (_spill is not null && _rows.Count > 0)
+            if ((_spill is not null || _bufferedBytes > _bufferMemoryLimitBytes) && _rows.Count > 0)
             {
-                _spill.WriteRun(SortBufferedRows(cancellationToken), cancellationToken);
-                _rows.Clear();
+                FlushBuffered(cancellationToken);
             }
 
             if (_spill is not null)
@@ -2513,6 +2583,10 @@ public sealed class ResumableStatement : IDisposable
                     return false;
                 }
 
+                _spill.ConsolidateRuns(
+                    _comparer,
+                    _executionOptions.SorterMergeFanIn,
+                    cancellationToken);
                 StartMerge(cancellationToken);
                 _position = 0;
                 return true;
@@ -2552,7 +2626,7 @@ public sealed class ResumableStatement : IDisposable
         }
 
         // Advances to the next ordered record, returning whether one remains.
-        public bool MoveNext()
+        public bool MoveNext(CancellationToken cancellationToken)
         {
             if (!_sorted)
                 throw new InvalidOperationException("Sorter must be sorted before advancing.");
@@ -2563,7 +2637,7 @@ public sealed class ResumableStatement : IDisposable
             // drops the run association and would emit at most one record per run.
             if (_merge is not null)
             {
-                if (_readers![_pendingRunIndex].TryReadNext(out var next))
+                if (_readers![_pendingRunIndex].TryReadNext(out var next, cancellationToken))
                     _merge.Enqueue(_pendingRunIndex, new MergeKey(next, _pendingRunIndex, _comparer));
 
                 if (!_merge.TryDequeue(out _pendingRunIndex, out var key))
@@ -2630,7 +2704,7 @@ public sealed class ResumableStatement : IDisposable
                 cancellationToken.ThrowIfCancellationRequested();
                 var reader = _spill.OpenRunReader(runIndex);
                 _readers[runIndex] = reader;
-                if (reader.TryReadNext(out var first))
+                if (reader.TryReadNext(out var first, cancellationToken))
                     _merge.Enqueue(runIndex, new MergeKey(first, runIndex, _comparer));
             }
 
@@ -2656,8 +2730,38 @@ public sealed class ResumableStatement : IDisposable
             _spill?.Dispose();
             _spill = null;
             _rows.Clear();
+            _bufferedBytes = 0;
             _merge = null;
             _pending = null;
+        }
+
+        private void FlushBuffered(CancellationToken cancellationToken)
+        {
+            if (_rows.Count == 0)
+                return;
+
+            _spill ??= new SorterSpill(_columnCount, _executionOptions);
+            _spill.WriteRun(SortBufferedRows(cancellationToken), cancellationToken);
+            _rows.Clear();
+            _bufferedBytes = 0;
+        }
+
+        private static long EstimateRecordBytes(SqlValue[] record)
+        {
+            long total = 0;
+            foreach (var value in record)
+            {
+                total = checked(total + value.Kind switch
+                {
+                    SqlValueKind.Null => 1,
+                    SqlValueKind.Integer or SqlValueKind.Real => 9,
+                    SqlValueKind.Text => 5L + Encoding.UTF8.GetByteCount(value.AsText()),
+                    SqlValueKind.Blob => 5L + value.AsBlob().Length,
+                    _ => throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}."),
+                });
+            }
+
+            return total;
         }
 
         // Heap priority: orders by the row comparer, then by RunIndex so equal-key rows
@@ -2685,27 +2789,23 @@ public sealed class ResumableStatement : IDisposable
         }
     }
 
-    // Backing store for spilled sorter runs: one temp file holding any number of sorted
-    // runs concatenated end-to-end. DeleteOnClose makes the OS reclaim the file on
-    // dispose/close, so a sorter that is abandoned mid-drain cannot leak a temp file.
+    // Backing store for spilled sorter runs: one transient IFileSystem file holding
+    // concatenated runs. Every handle is explicitly disposed before DeleteFile so the
+    // cleanup path works uniformly on Windows, Unix, and InMemoryFileSystem.
     private sealed class SorterSpill : IDisposable
     {
         private readonly int _columnCount;
-        private readonly FileStream _stream;
+        private readonly IFileSystem _fileSystem;
+        private readonly string _path;
+        private readonly IFile _file;
         private readonly List<(long Offset, int RowCount)> _runs = [];
         private long _writePosition;
 
-        public SorterSpill(int columnCount)
+        public SorterSpill(int columnCount, VdbeExecutionOptions executionOptions)
         {
             _columnCount = columnCount;
-            var path = Path.Combine(Path.GetTempPath(), "Ahtola-sorter-" + Path.GetRandomFileName());
-            _stream = new FileStream(
-                path,
-                FileMode.Create,
-                FileAccess.ReadWrite,
-                FileShare.None,
-                bufferSize: 8192,
-                FileOptions.DeleteOnClose);
+            _fileSystem = executionOptions.TemporaryFileSystem;
+            (_path, _file) = CreateFile(executionOptions);
         }
 
         public int RunCount => _runs.Count;
@@ -2715,60 +2815,189 @@ public sealed class ResumableStatement : IDisposable
         public void WriteRun(List<SqlValue[]> sorted, CancellationToken cancellationToken)
         {
             var offset = _writePosition;
-            Span<byte> header = stackalloc byte[8];
-            foreach (var row in sorted)
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                for (var column = 0; column < _columnCount; column++)
-                    WriteValue(_stream, row[column], header);
-            }
+                Span<byte> header = stackalloc byte[8];
+                foreach (var row in sorted)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    for (var column = 0; column < _columnCount; column++)
+                        WriteValue(_file, ref _writePosition, row[column], header);
+                }
 
-            _stream.Flush();
-            _runs.Add((offset, sorted.Count));
-            _writePosition = _stream.Position;
+                _file.FlushToDisk();
+                _runs.Add((offset, sorted.Count));
+            }
+            catch
+            {
+                _file.SetLength(offset);
+                _writePosition = offset;
+                throw;
+            }
+        }
+
+        public void ConsolidateRuns(
+            VdbeRowComparer comparer,
+            int maximumFanIn,
+            CancellationToken cancellationToken)
+        {
+            while (_runs.Count > maximumFanIn)
+            {
+                var passOffset = _writePosition;
+                try
+                {
+                    var consolidated = new List<(long Offset, int RowCount)>();
+                    for (var start = 0; start < _runs.Count; start += maximumFanIn)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var count = Math.Min(maximumFanIn, _runs.Count - start);
+                        if (count == 1)
+                        {
+                            consolidated.Add(_runs[start]);
+                            continue;
+                        }
+
+                        consolidated.Add(MergeRunGroup(
+                            _runs.GetRange(start, count),
+                            comparer,
+                            cancellationToken));
+                    }
+
+                    _runs.Clear();
+                    _runs.AddRange(consolidated);
+                }
+                catch
+                {
+                    _file.SetLength(passOffset);
+                    _writePosition = passOffset;
+                    throw;
+                }
+            }
+        }
+
+        private (long Offset, int RowCount) MergeRunGroup(
+            IReadOnlyList<(long Offset, int RowCount)> inputs,
+            VdbeRowComparer comparer,
+            CancellationToken cancellationToken)
+        {
+            var offset = _writePosition;
+            var readers = new RunReader[inputs.Count];
+            try
+            {
+                var heap = new PriorityQueue<int, SpillMergeKey>(SpillMergeKey.Comparer);
+                for (var index = 0; index < inputs.Count; index++)
+                {
+                    var input = inputs[index];
+                    var reader = new RunReader(_file, input.Offset, input.RowCount, _columnCount);
+                    readers[index] = reader;
+                    if (reader.TryReadNext(out var row, cancellationToken))
+                        heap.Enqueue(index, new SpillMergeKey(row, index, comparer));
+                }
+
+                var rowsWritten = 0;
+                Span<byte> header = stackalloc byte[8];
+                while (heap.TryDequeue(out var readerIndex, out var key))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    for (var column = 0; column < _columnCount; column++)
+                        WriteValue(_file, ref _writePosition, key.Record[column], header);
+                    rowsWritten = checked(rowsWritten + 1);
+
+                    if (readers[readerIndex].TryReadNext(out var next, cancellationToken))
+                        heap.Enqueue(readerIndex, new SpillMergeKey(next, readerIndex, comparer));
+                }
+
+                _file.FlushToDisk();
+                return (offset, rowsWritten);
+            }
+            catch
+            {
+                _file.SetLength(offset);
+                _writePosition = offset;
+                throw;
+            }
+            finally
+            {
+                foreach (var reader in readers)
+                    reader?.Dispose();
+            }
         }
 
         public RunReader OpenRunReader(int runIndex)
         {
             var (offset, rowCount) = _runs[runIndex];
-            return new RunReader(_stream, offset, rowCount, _columnCount);
+            return new RunReader(_file, offset, rowCount, _columnCount);
         }
 
-        public void Dispose() => _stream.Dispose();
+        public void Dispose()
+        {
+            try
+            {
+                _file.Dispose();
+            }
+            finally
+            {
+                _fileSystem.DeleteFile(_path);
+            }
+        }
 
-        private static void WriteValue(FileStream stream, SqlValue value, Span<byte> header)
+        private static (string Path, IFile File) CreateFile(VdbeExecutionOptions executionOptions)
+        {
+            for (var attempt = 0; attempt < 16; attempt++)
+            {
+                var path = Path.Combine(
+                    executionOptions.TemporaryDirectory,
+                    "ahtola-sorter-" + Guid.NewGuid().ToString("N") + ".run");
+                try
+                {
+                    var fileSystem = executionOptions.TemporaryFileSystem;
+                    var file = fileSystem is ITemporaryFileSystem temporaryFileSystem
+                        ? temporaryFileSystem.OpenTemporaryFile(path)
+                        : fileSystem.OpenFile(path, FileOpenMode.CreateNew);
+                    return (path, file);
+                }
+                catch (IOException) when (executionOptions.TemporaryFileSystem.FileExists(path))
+                {
+                    // Extremely unlikely name collision: select another statement-local name.
+                }
+            }
+
+            throw new IOException("Unable to allocate a unique temporary sorter run file.");
+        }
+
+        private static void WriteValue(IFile file, ref long position, SqlValue value, Span<byte> header)
         {
             switch (value.Kind)
             {
                 case SqlValueKind.Null:
-                    stream.WriteByte(0x00);
+                    WriteByte(file, ref position, 0x00);
                     break;
                 case SqlValueKind.Integer:
-                    stream.WriteByte(0x01);
+                    WriteByte(file, ref position, 0x01);
                     BinaryPrimitives.WriteInt64LittleEndian(header, value.AsInteger());
-                    stream.Write(header);
+                    Write(file, ref position, header);
                     break;
                 case SqlValueKind.Real:
-                    stream.WriteByte(0x02);
+                    WriteByte(file, ref position, 0x02);
                     BinaryPrimitives.WriteDoubleLittleEndian(header, value.AsReal());
-                    stream.Write(header);
+                    Write(file, ref position, header);
                     break;
                 case SqlValueKind.Text:
                     {
                         var bytes = Encoding.UTF8.GetBytes(value.AsText());
-                        stream.WriteByte(value.IsJson ? (byte)0x83 : (byte)0x03);
+                        WriteByte(file, ref position, value.IsJson ? (byte)0x83 : (byte)0x03);
                         BinaryPrimitives.WriteInt32LittleEndian(header, bytes.Length);
-                        stream.Write(header[..4]);
-                        stream.Write(bytes);
+                        Write(file, ref position, header[..4]);
+                        Write(file, ref position, bytes);
                         break;
                     }
                 case SqlValueKind.Blob:
                     {
                         var bytes = value.AsBlob().ToArray();
-                        stream.WriteByte(0x04);
+                        WriteByte(file, ref position, 0x04);
                         BinaryPrimitives.WriteInt32LittleEndian(header, bytes.Length);
-                        stream.Write(header[..4]);
-                        stream.Write(bytes);
+                        Write(file, ref position, header[..4]);
+                        Write(file, ref position, bytes);
                         break;
                     }
                 default:
@@ -2776,19 +3005,50 @@ public sealed class ResumableStatement : IDisposable
             }
         }
 
-        // Reads one run's records back one at a time from a shared FileStream. Each read
-        // seeks to the run's cursor so multiple readers can share the stream without a
-        // BinaryReader buffering conflict.
+        private static void WriteByte(IFile file, ref long position, byte value)
+        {
+            Span<byte> bytes = stackalloc byte[1] { value };
+            Write(file, ref position, bytes);
+        }
+
+        private static void Write(IFile file, ref long position, ReadOnlySpan<byte> source)
+        {
+            file.Write(position, source);
+            position = checked(position + source.Length);
+        }
+
+        private readonly struct SpillMergeKey
+        {
+            public readonly SqlValue[] Record;
+            public readonly int InputIndex;
+            private readonly VdbeRowComparer _comparer;
+
+            public SpillMergeKey(SqlValue[] record, int inputIndex, VdbeRowComparer comparer)
+            {
+                Record = record;
+                InputIndex = inputIndex;
+                _comparer = comparer;
+            }
+
+            public static IComparer<SpillMergeKey> Comparer { get; } =
+                Comparer<SpillMergeKey>.Create((left, right) =>
+                {
+                    var comparison = left._comparer(left.Record, right.Record);
+                    return comparison != 0 ? comparison : left.InputIndex.CompareTo(right.InputIndex);
+                });
+        }
+
+        // Reads one run's records back one at a time using positional IFile access. Multiple
+        // readers share the file safely because each carries its own explicit offset.
         public sealed class RunReader : IDisposable
         {
-            private readonly FileStream _stream;
+            private readonly IFile _file;
             private readonly int _columnCount;
             private long _position;
-            private int _rowsRead;
 
-            public RunReader(FileStream stream, long offset, int rowCount, int columnCount)
+            public RunReader(IFile file, long offset, int rowCount, int columnCount)
             {
-                _stream = stream;
+                _file = file;
                 _columnCount = columnCount;
                 _position = offset;
                 RowsRemaining = rowCount;
@@ -2796,7 +3056,7 @@ public sealed class ResumableStatement : IDisposable
 
             public int RowsRemaining { get; private set; }
 
-            public bool TryReadNext(out SqlValue[] row)
+            public bool TryReadNext(out SqlValue[] row, CancellationToken cancellationToken)
             {
                 if (RowsRemaining <= 0)
                 {
@@ -2804,29 +3064,36 @@ public sealed class ResumableStatement : IDisposable
                     return false;
                 }
 
-                _stream.Seek(_position, SeekOrigin.Begin);
-                row = new SqlValue[_columnCount];
-                Span<byte> header = stackalloc byte[8];
+                var rowStart = _position;
+                try
+                {
+                    row = new SqlValue[_columnCount];
+                    Span<byte> header = stackalloc byte[8];
 
-                for (var column = 0; column < _columnCount; column++)
-                    ReadValue(_stream, header, out row[column]);
+                    for (var column = 0; column < _columnCount; column++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        ReadValue(_file, ref _position, header, out row[column]);
+                    }
 
-                _position = _stream.Position;
-                _rowsRead++;
-                RowsRemaining--;
-                return true;
+                    RowsRemaining--;
+                    return true;
+                }
+                catch
+                {
+                    _position = rowStart;
+                    throw;
+                }
             }
 
             public void Dispose()
             {
-                // The FileStream is shared (owned by SorterSpill); nothing to release here.
+                // The IFile is shared and owned by SorterSpill.
             }
 
-            private static void ReadValue(FileStream stream, Span<byte> header, out SqlValue value)
+            private static void ReadValue(IFile file, ref long position, Span<byte> header, out SqlValue value)
             {
-                var kindByte = stream.ReadByte();
-                if (kindByte < 0)
-                    throw new EndOfStreamException("Sorter spill stream ended mid-record.");
+                var kindByte = ReadByte(file, ref position);
 
                 var isJson = (kindByte & 0x80) != 0;
                 var kind = (SqlValueKind)(kindByte & 0x0F);
@@ -2836,26 +3103,30 @@ public sealed class ResumableStatement : IDisposable
                         value = SqlValue.Null;
                         break;
                     case SqlValueKind.Integer:
-                        ReadExact(stream, header[..8]);
+                        ReadExact(file, ref position, header[..8]);
                         value = SqlValue.Integer(BinaryPrimitives.ReadInt64LittleEndian(header));
                         break;
                     case SqlValueKind.Real:
-                        ReadExact(stream, header[..8]);
+                        ReadExact(file, ref position, header[..8]);
                         value = SqlValue.Real(BinaryPrimitives.ReadDoubleLittleEndian(header));
                         break;
                     case SqlValueKind.Text:
-                        ReadExact(stream, header[..4]);
+                        ReadExact(file, ref position, header[..4]);
                         var textLength = BinaryPrimitives.ReadInt32LittleEndian(header);
+                        if (textLength < 0)
+                            throw new InvalidDataException("Sorter spill text length is negative.");
                         var textBytes = new byte[textLength];
-                        ReadExact(stream, textBytes);
+                        ReadExact(file, ref position, textBytes);
                         var text = Encoding.UTF8.GetString(textBytes);
                         value = isJson ? SqlValue.JsonText(text) : SqlValue.Text(text);
                         break;
                     case SqlValueKind.Blob:
-                        ReadExact(stream, header[..4]);
+                        ReadExact(file, ref position, header[..4]);
                         var blobLength = BinaryPrimitives.ReadInt32LittleEndian(header);
+                        if (blobLength < 0)
+                            throw new InvalidDataException("Sorter spill blob length is negative.");
                         var blob = new byte[blobLength];
-                        ReadExact(stream, blob);
+                        ReadExact(file, ref position, blob);
                         value = SqlValue.Blob(blob);
                         break;
                     default:
@@ -2863,16 +3134,25 @@ public sealed class ResumableStatement : IDisposable
                 }
             }
 
-            private static void ReadExact(FileStream stream, Span<byte> buffer)
+            private static byte ReadByte(IFile file, ref long position)
+            {
+                Span<byte> value = stackalloc byte[1];
+                ReadExact(file, ref position, value);
+                return value[0];
+            }
+
+            private static void ReadExact(IFile file, ref long position, Span<byte> buffer)
             {
                 var total = 0;
                 while (total < buffer.Length)
                 {
-                    var read = stream.Read(buffer[total..]);
+                    var read = file.Read(checked(position + total), buffer[total..]);
                     if (read <= 0)
                         throw new EndOfStreamException("Sorter spill stream ended mid-record.");
                     total += read;
                 }
+
+                position = checked(position + total);
             }
         }
     }

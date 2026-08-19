@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using Ahtola.Core;
 using Ahtola.Core.Execution;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
 
@@ -264,6 +265,115 @@ public class SorterOpcodeExecutionTests
     }
 
     [Test]
+    public void SorterUsesConfiguredByteBudgetAndCleansUpIFileSystemRuns()
+    {
+        var fileSystem = new TrackingFileSystem();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: 1,
+            temporaryDirectory: "sorter-byte-budget");
+        var program = SingleColumnSorterProgram(AscendingFirstColumn, 3, 1, 2);
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(program, options))
+        {
+            DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(1, 2, 3);
+        }
+
+        fileSystem.Created.Should().NotBeEmpty();
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+        fileSystem.Created.Should().OnlyContain(path => !fileSystem.FileExists(path));
+    }
+
+    [Test]
+    public void SorterConsolidatesManyRunsWithinConfiguredMergeFanIn()
+    {
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 1024,
+            temporaryDirectory: "sorter-fan-in",
+            sorterMergeFanIn: 2);
+        var values = Enumerable.Range(1, 40).Select(static value => (long)(41 - value)).ToArray();
+        var program = SingleColumnSpillSorterProgram(AscendingFirstColumn, 1, values);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+
+        DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(Enumerable.Range(1, 40).Select(static value => (long)value));
+    }
+
+    [Test]
+    public void SpillWriteFailureDeletesTheAllocatedIFileSystemRunOnDispose()
+    {
+        var faults = new DeterministicFaultInjector();
+        var backing = new InMemoryFileSystem(faults);
+        var fileSystem = new TrackingFileSystem(backing);
+        faults.FailNextAfter(FileSystemOperation.Open, FileSystemOperation.Write);
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: 1,
+            temporaryDirectory: "sorter-write-fault");
+        var program = SingleColumnSorterProgram(AscendingFirstColumn, 2, 1);
+        var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+
+        Assert.Throws<IOException>(() => statement.StepResumable());
+        faults.ClearScheduled();
+        DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(1, 2);
+        statement.Dispose();
+
+        fileSystem.Created.Should().HaveCount(1);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+        fileSystem.FileExists(fileSystem.Created[0]).Should().BeFalse();
+    }
+
+    [Test]
+    public void SpillCancellationDeletesTheAllocatedIFileSystemRunOnDispose()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var fileSystem = new TrackingFileSystem();
+        VdbeRowComparer comparer = (left, right) =>
+        {
+            cancellation.Cancel();
+            return left[0].AsInteger().CompareTo(right[0].AsInteger());
+        };
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: 1024,
+            temporaryDirectory: "sorter-cancellation");
+        var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnSpillSorterProgram(comparer, 2, 3, 2, 1),
+            options);
+
+        Assert.Throws<OperationCanceledException>(() => statement.StepResumable(cancellation.Token));
+        statement.Dispose();
+
+        fileSystem.Created.Should().HaveCount(1);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void SpillReadFailureDeletesTheAllocatedIFileSystemRunOnDispose()
+    {
+        var faults = new DeterministicFaultInjector();
+        var backing = new InMemoryFileSystem(faults);
+        var fileSystem = new TrackingFileSystem(backing);
+        faults.FailNext(FileSystemOperation.Read);
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: 1,
+            temporaryDirectory: "sorter-read-fault");
+        var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnSorterProgram(AscendingFirstColumn, 3, 1, 2),
+            options);
+
+        Assert.Throws<IOException>(() => statement.StepResumable());
+        faults.ClearScheduled();
+        DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(1, 2, 3);
+        statement.Dispose();
+
+        fileSystem.Created.Should().HaveCount(1);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
     public void ValidationRejectsMalformedSorterBytecode()
     {
         var comparer = AscendingFirstColumn;
@@ -464,6 +574,33 @@ public class SorterOpcodeExecutionTests
         instructions.Add(new HaltInstruction());
 
         return new VdbeProgram(registerCount: 1, cursorCount: 0, instructions, sorterCount: 1);
+    }
+
+    private sealed class TrackingFileSystem : IFileSystem
+    {
+        private readonly IFileSystem _inner;
+
+        public TrackingFileSystem(IFileSystem? inner = null) => _inner = inner ?? new InMemoryFileSystem();
+
+        public List<string> Created { get; } = [];
+
+        public List<string> Deleted { get; } = [];
+
+        public bool FileExists(string path) => _inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+        {
+            var file = _inner.OpenFile(path, mode, readOnly);
+            if (mode == FileOpenMode.CreateNew)
+                Created.Add(path);
+            return file;
+        }
+
+        public void DeleteFile(string path)
+        {
+            Deleted.Add(path);
+            _inner.DeleteFile(path);
+        }
     }
 
     private static List<SqlValue[]> RunToCompletion(VdbeProgram program, params VdbeCursorSource[] cursorSources)
