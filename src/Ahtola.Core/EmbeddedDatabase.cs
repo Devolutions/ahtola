@@ -638,7 +638,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable>? ConcurrentBaseTables = null,
         ConcurrentMvccIdentityTracker? ConcurrentMvccIdentityTracker = null,
         SqliteTextEncoding MvccTextEncoding = SqliteTextEncoding.Utf8,
-        IReadOnlyDictionary<string, VirtualTableDefinition>? VirtualTables = null)
+        IReadOnlyDictionary<string, VirtualTableDefinition>? VirtualTables = null,
+        ChangeDataCaptureSession? ChangeDataCapture = null)
     {
         /// <summary>
         /// Row-loop checkpoint. It honors cooperative cancellation exactly as before and
@@ -658,9 +659,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
         /// Concurrent MVCC transactions also mirror INSERT/DELETE/UPDATE into the version
         /// store here (including trigger-body and multi-row inserts).
         /// </summary>
-        internal void ReportRowChange(SqliteChangeOperation operation, string tableName, EmbeddedTable table, long rowId)
+        internal void ReportRowChange(
+            SqliteChangeOperation operation,
+            string tableName,
+            EmbeddedTable table,
+            long rowId,
+            SqlValue[]? before = null,
+            SqlValue[]? after = null,
+            bool recordChangeDataCapture = true,
+            bool recordMvcc = true,
+            bool reportUpdateHook = true)
         {
-            if (table.HasRowid
+            if (recordMvcc
+                && table.HasRowid
                 && ConcurrentMvStore is { } store
                 && ConcurrentMvccTxId is { } txId
                 && !tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
@@ -714,14 +725,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         }
                 }
             }
-            else if (ConcurrentMvStore is { } typedStore
+            else if (recordMvcc
+                && ConcurrentMvStore is { } typedStore
                 && ConcurrentMvccTxId is { } typedTxId
                 && !tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
             {
                 ReportWithoutRowidMvccChange(typedStore, typedTxId, operation, tableName, table, rowId);
             }
 
-            if (Hooks?.RowChanged is not { } rowChanged || !table.HasRowid)
+            if (recordChangeDataCapture)
+                ChangeDataCapture?.RecordRow(this, operation, tableName, table, rowId, before, after);
+
+            if (!reportUpdateHook || Hooks?.RowChanged is not { } rowChanged || !table.HasRowid)
                 return;
             if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
                 return;
@@ -1365,7 +1380,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ManagedStatementHooks? hooks = null,
         bool ignoreCheckConstraints = false,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
-        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null)
+        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
+        ChangeDataCaptureSession? changeDataCapture = null)
     {
         var result = ExecuteCore(
             statement,
@@ -1381,7 +1397,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             hooks,
             ignoreCheckConstraints,
             executeTableList,
-            externalTables);
+            externalTables,
+            changeDataCapture);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -1414,7 +1431,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ManagedStatementHooks? hooks = null,
         bool ignoreCheckConstraints = false,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
-        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null)
+        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
+        ChangeDataCaptureSession? changeDataCapture = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -1436,7 +1454,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 hooks,
                 ignoreCheckConstraints,
                 executeTableList,
-                externalTables));
+                externalTables,
+                changeDataCapture));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -1482,7 +1501,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 hooks,
                                 ignoreCheckConstraints,
                                 executeTableList,
-                                externalTables);
+                                externalTables,
+                                changeDataCapture: changeDataCapture);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -1550,7 +1570,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 hooks,
                                 ignoreCheckConstraints,
                                 executeTableList,
-                                externalTables);
+                                externalTables,
+                                changeDataCapture: changeDataCapture);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -1590,7 +1611,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             hooks,
                             ignoreCheckConstraints,
                             executeTableList,
-                            externalTables);
+                            externalTables,
+                            changeDataCapture: changeDataCapture);
 
                     var working = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
                     ExecutionResult result;
@@ -1611,7 +1633,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             hooks,
                             ignoreCheckConstraints,
                             executeTableList,
-                            externalTables);
+                            externalTables,
+                            changeDataCapture: changeDataCapture);
                     }
                     catch (EmbeddedConflictFailException)
                     {
@@ -1708,7 +1731,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ConcurrentMvccTxId: outer.ConcurrentMvccTxId,
                 ConcurrentBaseTables: outer.ConcurrentBaseTables,
                 ConcurrentMvccIdentityTracker: outer.ConcurrentMvccIdentityTracker,
-                MvccTextEncoding: outer.MvccTextEncoding);
+                MvccTextEncoding: outer.MvccTextEncoding,
+                ChangeDataCapture: outer.ChangeDataCapture);
             return statement switch
             {
                 InsertStatement insert => ExecuteDmlWithAutoIncrementState(
@@ -3602,7 +3626,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         Func<string?, string?, ExecutionResult>? executeTableList = null,
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
         MvStore? concurrentMvStore = null,
-        MvccTxId? concurrentMvccTxId = null)
+        MvccTxId? concurrentMvccTxId = null,
+        ChangeDataCaptureSession? changeDataCapture = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -3627,13 +3652,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 executeTableList,
                 externalTables,
                 concurrentMvStore,
-                concurrentMvccTxId));
+                concurrentMvccTxId,
+                changeDataCapture));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
         if (_readOnly && MayMutate(statement))
             throw new EmbeddedSqlException("attempt to write a readonly database");
 
+        var cdcSchemaBefore = changeDataCapture is not null
+            && MayChangeSchema(statement)
+                ? catalog.Clone()
+                : null;
         var tables = CreateExecutionTables(catalog.Tables, externalTables);
         var context = new QueryContext(
             tables,
@@ -3658,9 +3688,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ConcurrentBaseTables: concurrentMvStore is null ? null : CloneTablesShallow(catalog.Tables),
             ConcurrentMvccIdentityTracker: concurrentMvStore is null ? null : new ConcurrentMvccIdentityTracker(),
             MvccTextEncoding: GetTextEncoding(),
-            VirtualTables: catalog.VirtualTables);
+            VirtualTables: catalog.VirtualTables,
+            ChangeDataCapture: changeDataCapture);
         EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
-        return statement switch
+        var result = statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
             CreateVirtualTableStatement createVirtual => ExecuteCreateVirtualTable(
@@ -3740,6 +3771,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             RollbackToSavepointStatement => ExecutionResult.Empty,
             _ => throw new EmbeddedSqlException($"Unsupported statement type {statement.GetType().Name}."),
         };
+        if (cdcSchemaBefore is not null && result.Changed)
+            changeDataCapture!.RecordSchemaChanges(context, cdcSchemaBefore, catalog, statement);
+        if (!inTransaction && changeDataCapture?.CompleteAutocommit(context) == true && !result.Changed)
+            result = result with { Changed = true };
+
+        return result;
     }
 
     private static ExecutionResult ExecutePragmaTableInfo(
@@ -4625,6 +4662,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
 
             tables.Remove(statement.Name);
+            RemoveChangeDataCaptureVersion(tables, statement.Name);
             if (table.IsAutoIncrement)
             {
                 DeleteSqliteSequenceRows(tables, table.Name);
@@ -4651,6 +4689,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
             .ToArray();
         foreach (var trigger in orphaned)
             catalog.Triggers.Remove(trigger);
+    }
+
+    private static void RemoveChangeDataCaptureVersion(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        string tableName)
+    {
+        if (tableName.Equals(ChangeDataCaptureConfiguration.VersionTableName, StringComparison.OrdinalIgnoreCase)
+            || !tables.TryGetValue(ChangeDataCaptureConfiguration.VersionTableName, out var versions))
+        {
+            return;
+        }
+
+        for (var index = versions.Rows.Count - 1; index >= 0; index--)
+        {
+            var row = versions.Rows[index];
+            if (row.Length != 0
+                && row[0].Kind == SqlValueKind.Text
+                && string.Equals(row[0].AsText(), tableName, StringComparison.Ordinal))
+            {
+                versions.Rows.RemoveAt(index);
+                versions.RowIds.RemoveAt(index);
+            }
+        }
     }
 
     private static void EnsureSqliteSequenceTable(SchemaCatalog catalog)
@@ -9288,11 +9349,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     TriggerMutationKind.Update,
                     updatePlan);
                 ApplyUpsertRows(table, updatedRows, updatedRowIds);
-                updateContext.ReportRowChange(
-                    SqliteChangeOperation.Update,
+                ReportUpdateChange(
+                    updateContext,
                     statement.TableName,
                     table,
-                    updatedRowIds[conflictPosition]);
+                    originalRowId,
+                    updatedRowIds[conflictPosition],
+                    originalRows[conflictPosition],
+                    updatedRows[conflictPosition]);
                 ValidateForeignKeysAfterUpdate(
                     updateContext,
                     statement.TableName,
@@ -12233,8 +12297,62 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         // SQLite reports the post-update rowid, so an UPDATE that rewrites an INTEGER PRIMARY
         // KEY notifies with the new value rather than the one the row had before.
-        foreach (var rowId in updatedRowIds)
-            context.ReportRowChange(SqliteChangeOperation.Update, tableName, table, rowId);
+        for (var index = 0; index < updatedRowIds.Length; index++)
+        {
+            var position = updatedPositions[index];
+            ReportUpdateChange(
+                context,
+                tableName,
+                table,
+                table.HasRowid ? originalRowIds[index] : updatedRowIds[index],
+                updatedRowIds[index],
+                originalRowSnapshot[position],
+                postUpdateRowSnapshot[position]);
+        }
+    }
+
+    private static void ReportUpdateChange(
+        QueryContext context,
+        string tableName,
+        EmbeddedTable table,
+        long oldRowId,
+        long newRowId,
+        SqlValue[] before,
+        SqlValue[] after)
+    {
+        if (table.HasRowid && oldRowId != newRowId)
+        {
+            context.ReportRowChange(
+                SqliteChangeOperation.Delete,
+                tableName,
+                table,
+                oldRowId,
+                before,
+                reportUpdateHook: false);
+            context.ReportRowChange(
+                SqliteChangeOperation.Insert,
+                tableName,
+                table,
+                newRowId,
+                after: after,
+                reportUpdateHook: false);
+            context.ReportRowChange(
+                SqliteChangeOperation.Update,
+                tableName,
+                table,
+                newRowId,
+                recordChangeDataCapture: false,
+                recordMvcc: false);
+            return;
+        }
+
+        context.ReportRowChange(
+            SqliteChangeOperation.Update,
+            tableName,
+            table,
+            newRowId,
+            before,
+            after);
     }
 
     // Foreign-key checks run against the complete post-statement image, but only inspect
@@ -13759,7 +13877,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     SqliteChangeOperation.Delete,
                     statement.TableName,
                     table,
-                    selectedRowId);
+                    selectedRowId,
+                    deletedRow);
                 deletedRows.Add(deletedRow);
                 deletedRowIds.Add(selectedRowId);
                 if (afterTriggers.Count > 0)
@@ -13999,8 +14118,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 RecordBlobMutation(statement.TableName, rowId);
         }
 
-        foreach (var rowId in deletedRowIds)
-            context.ReportRowChange(SqliteChangeOperation.Delete, statement.TableName, table, rowId);
+        for (var index = 0; index < deletedRowIds.Count; index++)
+        {
+            context.ReportRowChange(
+                SqliteChangeOperation.Delete,
+                statement.TableName,
+                table,
+                deletedRowIds[index],
+                deletedRows[index]);
+        }
         if (statement.Returning is not null)
             return returningResult!;
 
@@ -20352,7 +20478,7 @@ out bool hasReturning)
             GetRowId = index => index < table.RowIds.Count ? table.RowIds[index] : index + 1,
             MutateRow = index =>
             {
-                var original = table.Rows[index];
+                var original = table.Rows[index].ToArray();
                 var rowid = index < table.RowIds.Count ? table.RowIds[index] : index + 1;
                 var (updated, newRowid) = BuildUpdatedRow(statement, table, plan, original, rowid, parameters, context);
                 newRows[index] = updated;
@@ -20449,6 +20575,7 @@ out bool hasReturning)
 
         var rowCount = table.Rows.Count;
         var deleted = new bool[rowCount];
+        var deletedRows = new Dictionary<long, SqlValue[]>();
         var returningRows = hasReturning ? new List<SqlValue[]>(rowCount) : null;
         var returningRowIds = hasReturning ? new List<long>(rowCount) : null;
         var writeTarget = new VdbeWriteTarget
@@ -20474,6 +20601,7 @@ out bool hasReturning)
                     if (index < deleted.Length && deleted[index])
                     {
                         deletedRowIds.Add(rowId);
+                        deletedRows[rowId] = table.Rows[index].ToArray();
                         continue;
                     }
                     keptRows.Add(table.Rows[index]);
@@ -20490,7 +20618,8 @@ out bool hasReturning)
                         SqliteChangeOperation.Delete,
                         statement.TableName,
                         table,
-                        deletedRowId);
+                        deletedRowId,
+                        deletedRows[deletedRowId]);
                 }
 
                 return (long?)null;
@@ -20682,7 +20811,14 @@ out bool hasReturning)
                 table.Rows[index] = updated;
                 if (table.HasRowid)
                     table.RowIds[index] = newRowid;
-                context.ReportRowChange(SqliteChangeOperation.Update, statement.TableName, table, newRowid);
+                ReportUpdateChange(
+                    context,
+                    statement.TableName,
+                    table,
+                    rowid,
+                    newRowid,
+                    original,
+                    updated);
                 return new VdbeRowMutation(updated, newRowid);
             },
             Commit = () =>
@@ -20781,11 +20917,18 @@ out bool hasReturning)
                     if (position < 0)
                         return new VdbeRowMutation(new SqlValue[table.Columns.Length], sourceRowIds[index]);
 
-                    var updated = (SqlValue[])table.Rows[position].Clone();
+                    var original = table.Rows[position].ToArray();
+                    var updated = (SqlValue[])original.Clone();
                     for (var key = 0; key < childColumns.Length; key++)
                         updated[childColumns[key]] = setNull ? SqlValue.Null : newValues[key];
                     table.Rows[position] = updated;
-                    context.ReportRowChange(SqliteChangeOperation.Update, tableName, table, sourceRowIds[index]);
+                    context.ReportRowChange(
+                        SqliteChangeOperation.Update,
+                        tableName,
+                        table,
+                        sourceRowIds[index],
+                        original,
+                        updated);
                     _totalChanges++;
                     return new VdbeRowMutation(updated, sourceRowIds[index]);
                 },
@@ -21071,11 +21214,18 @@ out bool hasReturning)
                     if (position < 0)
                         return new VdbeRowMutation(new SqlValue[table.Columns.Length], sourceRowIds[index]);
 
-                    var updated = (SqlValue[])table.Rows[position].Clone();
+                    var original = table.Rows[position].ToArray();
+                    var updated = (SqlValue[])original.Clone();
                     foreach (var column in childColumns)
                         updated[column] = SqlValue.Null;
                     table.Rows[position] = updated;
-                    context.ReportRowChange(SqliteChangeOperation.Update, tableName, table, sourceRowIds[index]);
+                    context.ReportRowChange(
+                        SqliteChangeOperation.Update,
+                        tableName,
+                        table,
+                        sourceRowIds[index],
+                        original,
+                        updated);
                     _totalChanges++;
                     return new VdbeRowMutation(updated, sourceRowIds[index]);
                 },
@@ -21095,9 +21245,10 @@ out bool hasReturning)
         if (position < 0)
             return false;
 
+        var deletedRow = table.Rows[position].ToArray();
         table.Rows.RemoveAt(position);
         table.RowIds.RemoveAt(position);
-        context.ReportRowChange(SqliteChangeOperation.Delete, tableName, table, rowId);
+        context.ReportRowChange(SqliteChangeOperation.Delete, tableName, table, rowId, deletedRow);
         if (countAsCascade)
             _totalChanges++;
         return true;
@@ -41561,7 +41712,7 @@ out bool hasReturning)
     }
 }
 
-public sealed class EmbeddedConnection : IDisposable
+public sealed partial class EmbeddedConnection : IDisposable
 {
     private const int MaximumAttachedDatabases = 10;
     private const char UnqualifiedSchemaMarker = '\0';
@@ -41602,6 +41753,8 @@ public sealed class EmbeddedConnection : IDisposable
     private bool _tempInitialized;
     private readonly Dictionary<EmbeddedDatabase, int> _pendingPageSizes = [];
     private readonly ManagedConnectionHooks _hooks = new();
+    private ChangeDataCaptureSession? _changeDataCapture;
+    private bool _suppressUpdateHook;
     private bool _insideHookCallback;
     private bool _disposed;
     private TimeSpan _busyTimeout = TimeSpan.Zero;
@@ -42558,7 +42711,7 @@ public sealed class EmbeddedConnection : IDisposable
         var schema = ResolveSchemaName(database);
         return new ManagedStatementHooks
         {
-            RowChanged = updateHook is null
+            RowChanged = updateHook is null || _suppressUpdateHook
                 ? null
                 : (operation, table, rowId) => InvokeHook(
                     () => updateHook(new SqliteRowChange(operation, schema, table, rowId))),
@@ -42696,6 +42849,8 @@ public sealed class EmbeddedConnection : IDisposable
         _mvccGcThreshold = DefaultMvccGcThreshold;
         _tempInitialized = false;
         _pendingPageSizes.Clear();
+        _changeDataCapture = null;
+        _suppressUpdateHook = false;
         _hooks.UpdateHook = null;
         _hooks.CommitHook = null;
         _hooks.RollbackHook = null;
@@ -42972,6 +43127,8 @@ public sealed class EmbeddedConnection : IDisposable
                 return ExecutePragmaDeferForeignKeys(deferForeignKeys);
             case PragmaRecursiveTriggersStatement recursiveTriggers:
                 return ExecutePragmaRecursiveTriggers(recursiveTriggers);
+            case PragmaCaptureDataChangesConnectionStatement captureDataChanges:
+                return ExecutePragmaCaptureDataChangesConnection(captureDataChanges);
             case PragmaHeaderIntegerStatement headerInteger:
                 return ExecutePragmaHeaderInteger(headerInteger, cancellationToken);
             case PragmaJournalModeStatement journalMode:
@@ -43039,6 +43196,9 @@ public sealed class EmbeddedConnection : IDisposable
                 EmbeddedDatabase.SchemaCatalog? statementCatalog = null;
                 HashSet<EmbeddedDatabase.ForeignKeyViolation>? deferredBefore = null;
                 var tempTriggers = CreateTempTriggerBridge(routed.Database, out var tempTriggerSession);
+                var changeDataCapture = _changeDataCapture;
+                changeDataCapture?.BeginStatement(routed.Statement);
+                var changeDataCaptureSnapshot = changeDataCapture?.Snapshot();
                 var pendingTempTriggerRewrite = PrepareTempTriggerTableRename(routed, cancellationToken)
                     ?? PrepareTempTriggerColumnRename(routed, cancellationToken);
                 ValidateTempTriggersAfterDropColumn(routed, cancellationToken);
@@ -43087,7 +43247,8 @@ public sealed class EmbeddedConnection : IDisposable
                                 ignoreCheckConstraints: _ignoreCheckConstraints,
                                 executeTableList: ExecutePragmaTableList,
                                 concurrentMvStore: concurrentStore,
-                                concurrentMvccTxId: concurrentTxId);
+                                concurrentMvccTxId: concurrentTxId,
+                                changeDataCapture: changeDataCapture);
                         }
                         else if (transactionState is null)
                         {
@@ -43108,7 +43269,8 @@ public sealed class EmbeddedConnection : IDisposable
                                     CreateStatementHooks(routed.Database, includeCommitGate: true),
                                     ignoreCheckConstraints: _ignoreCheckConstraints,
                                     executeTableList: ExecutePragmaTableList,
-                                    externalTables: routed.ExternalTables);
+                                    externalTables: routed.ExternalTables,
+                                    changeDataCapture: changeDataCapture);
                             }
                             catch (Exception failure)
                                 when (failure is not EmbeddedConflictFailException
@@ -43145,7 +43307,8 @@ public sealed class EmbeddedConnection : IDisposable
                                 executeTableList: ExecutePragmaTableList,
                                 externalTables: routed.ExternalTables,
                                 concurrentMvStore: concurrentStore,
-                                concurrentMvccTxId: concurrentTxId);
+                                concurrentMvccTxId: concurrentTxId,
+                                changeDataCapture: changeDataCapture);
                             if (EmbeddedDatabase.MayMutate(routed.Statement))
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not
@@ -43216,6 +43379,8 @@ public sealed class EmbeddedConnection : IDisposable
                 }
                 catch (EmbeddedConflictRollbackException exception)
                 {
+                    if (changeDataCaptureSnapshot is { } snapshot)
+                        changeDataCapture?.Restore(snapshot);
                     if (exception.LastInsertRowId is { } rolledBackInsertRowId)
                         _lastInsertRowId = rolledBackInsertRowId;
                     if (_transactionDatabases is not null)
@@ -43228,6 +43393,8 @@ public sealed class EmbeddedConnection : IDisposable
                 }
                 catch (EmbeddedStatementAbortException exception)
                 {
+                    if (changeDataCaptureSnapshot is { } snapshot)
+                        changeDataCapture?.Restore(snapshot);
                     _lastInsertRowId = exception.LastInsertRowId;
                     RollbackConcurrentStatementSavepoint(
                         concurrentStore,
@@ -43238,6 +43405,8 @@ public sealed class EmbeddedConnection : IDisposable
                 }
                 catch (EmbeddedStatementFailureException exception)
                 {
+                    if (changeDataCaptureSnapshot is { } snapshot)
+                        changeDataCapture?.Restore(snapshot);
                     _lastInsertRowId = exception.LastInsertRowId;
                     RollbackConcurrentStatementSavepoint(
                         concurrentStore,
@@ -43301,6 +43470,8 @@ public sealed class EmbeddedConnection : IDisposable
 
                     if (!exception.PreserveChanges)
                     {
+                        if (changeDataCaptureSnapshot is { } snapshot)
+                            changeDataCapture?.Restore(snapshot);
                         RollbackConcurrentStatementSavepoint(
                             concurrentStore,
                             concurrentTxId,
@@ -43318,6 +43489,8 @@ public sealed class EmbeddedConnection : IDisposable
                 }
                 catch (OperationCanceledException)
                 {
+                    if (changeDataCaptureSnapshot is { } snapshot)
+                        changeDataCapture?.Restore(snapshot);
                     RollbackConcurrentStatementSavepoint(
                         concurrentStore,
                         concurrentTxId,
@@ -43332,6 +43505,8 @@ public sealed class EmbeddedConnection : IDisposable
                 }
                 catch
                 {
+                    if (changeDataCaptureSnapshot is { } snapshot)
+                        changeDataCapture?.Restore(snapshot);
                     RollbackConcurrentStatementSavepoint(
                         concurrentStore,
                         concurrentTxId,
@@ -46049,6 +46224,7 @@ Func<string, ParsedStatement> rewrite)
         foreach (var pair in mvccTxs)
             _mvccTransactions[pair.Key] = pair.Value;
         _savepoints.Clear();
+        _changeDataCapture?.StartTransaction();
     }
 
     /// <summary>
@@ -46316,6 +46492,16 @@ Func<string, ParsedStatement> rewrite)
             throw new InvalidOperationException("No managed transaction is active.");
 
         ValidateDeferredForeignKeys();
+        if (_changeDataCapture is { } changeDataCapture
+            && _transactionDatabases.TryGetValue(_database, out var cdcState))
+        {
+            TryGetConcurrentMvccScope(_database, out var cdcStore, out var cdcTxId);
+            if (changeDataCapture.CompleteExplicitTransaction(cdcState.Catalog.Tables, cdcStore, cdcTxId))
+            {
+                cdcState.HasChanges = true;
+                _transactionWriteDatabase = _database;
+            }
+        }
         var changed = _transactionDatabases
             .Where(pair => pair.Value.HasChanges)
             .ToArray();
@@ -47214,6 +47400,8 @@ Func<string, ParsedStatement> rewrite)
             return ["defer_foreign_keys"];
         if (statement is PragmaRecursiveTriggersStatement { Enabled: null })
             return ["recursive_triggers"];
+        if (statement is PragmaCaptureDataChangesConnectionStatement { Value: null })
+            return ["capture_data_changes_conn", "table_name", "version"];
         if (statement is PragmaHeaderIntegerStatement { Value: null } headerInteger)
         {
             return headerInteger.Kind switch
@@ -47304,7 +47492,8 @@ Func<string, ParsedStatement> rewrite)
                     pair.Value.ForceFullCatalogRewrite,
                     new HashSet<EmbeddedDatabase.ForeignKeyViolation>(
                         pair.Value.PendingDeferredViolations))),
-            _transactionWriteDatabase));
+            _transactionWriteDatabase,
+            _changeDataCapture?.Snapshot()));
     }
 
     private void ReleaseSavepoint(string name)
@@ -47348,6 +47537,11 @@ Func<string, ParsedStatement> rewrite)
             state.PendingDeferredViolations.UnionWith(savedState.PendingDeferredViolations);
         }
         _transactionWriteDatabase = savepoint.WriteDatabase;
+        if (_changeDataCapture is { } changeDataCapture
+            && savepoint.ChangeDataCapture is { } changeDataCaptureSnapshot)
+        {
+            changeDataCapture.Restore(changeDataCaptureSnapshot);
+        }
 
         // Undo concurrent version-store ops after the named mark (Turso MVCC savepoints).
         foreach (var (database, txId) in _mvccTransactions)
@@ -47399,6 +47593,7 @@ Func<string, ParsedStatement> rewrite)
         }
 
         _savepoints.Clear();
+        _changeDataCapture?.ResetTransaction();
         _deferForeignKeys = false;
         ReleaseTransactionWriteReservations();
         if (transactionDatabases is not null)
@@ -47411,7 +47606,8 @@ Func<string, ParsedStatement> rewrite)
     private sealed record SavepointEntry(
         string Name,
         IReadOnlyDictionary<EmbeddedDatabase, SavepointDatabaseState> Databases,
-        EmbeddedDatabase? WriteDatabase);
+        EmbeddedDatabase? WriteDatabase,
+        ChangeDataCaptureTransactionSnapshot? ChangeDataCapture);
 
     private sealed record SavepointDatabaseState(
         EmbeddedDatabase.SchemaCatalog Catalog,

@@ -260,6 +260,9 @@ internal static class SqlAuthorization
                 PragmaForeignKeysStatement pragma => ("foreign_keys", Flag(pragma.Enabled)),
                 PragmaDeferForeignKeysStatement pragma => ("defer_foreign_keys", Flag(pragma.Enabled)),
                 PragmaRecursiveTriggersStatement pragma => ("recursive_triggers", Flag(pragma.Enabled)),
+                PragmaCaptureDataChangesConnectionStatement pragma => (
+                    "capture_data_changes_conn",
+                    pragma.Value),
                 PragmaSynchronousStatement pragma => ("synchronous", pragma.Value),
                 PragmaLockingModeStatement pragma => ("locking_mode", pragma.Value),
                 PragmaAutoVacuumStatement pragma => ("auto_vacuum", pragma.Value),

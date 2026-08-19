@@ -1083,7 +1083,12 @@ public sealed partial class EmbeddedDatabase
             [deletedRow]);
         if (table.HasRowid)
             RecordBlobMutation(tableName, deletedRowId);
-        context.ReportRowChange(SqliteChangeOperation.Delete, tableName, table, deletedRowId);
+        context.ReportRowChange(
+            SqliteChangeOperation.Delete,
+            tableName,
+            table,
+            deletedRowId,
+            deletedRow);
     }
 
     private void AppendReturningRow(

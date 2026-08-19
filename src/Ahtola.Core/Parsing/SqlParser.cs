@@ -257,6 +257,13 @@ internal sealed class SqlParser
             return new PragmaDeferForeignKeysStatement(ParseOptionalPragmaBoolean(name), schema);
         if (name.Equals("recursive_triggers", StringComparison.OrdinalIgnoreCase))
             return new PragmaRecursiveTriggersStatement(ParseOptionalPragmaBoolean(name), schema);
+        if (name.Equals("capture_data_changes_conn", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("unstable_capture_data_changes_conn", StringComparison.OrdinalIgnoreCase))
+        {
+            return new PragmaCaptureDataChangesConnectionStatement(
+                ParseOptionalPragmaCaptureDataChangesValue(name),
+                schema);
+        }
         if (name.Equals("schema_version", StringComparison.OrdinalIgnoreCase))
         {
             return new PragmaHeaderIntegerStatement(
@@ -657,6 +664,36 @@ internal sealed class SqlParser
     }
 
     private string ParsePragmaMode(string name)
+    {
+        var token = _lexer.Current;
+        if (token.Kind is not (TokenKind.Identifier or TokenKind.String))
+            throw Error($"Invalid value for PRAGMA {name}.");
+
+        _lexer.Next();
+        return token.Text;
+    }
+
+    private string? ParseOptionalPragmaCaptureDataChangesValue(string name)
+    {
+        if (_lexer.Current.Kind is TokenKind.Semicolon or TokenKind.End)
+            return null;
+
+        var parenthesized = !Consume(TokenKind.Equal);
+        if (parenthesized)
+            Expect(TokenKind.LeftParen);
+
+        var mode = ParsePragmaCaptureDataChangesPart(name);
+        string? table = null;
+        if (Consume(TokenKind.Comma))
+            table = ParsePragmaCaptureDataChangesPart(name);
+
+        if (parenthesized)
+            Expect(TokenKind.RightParen);
+
+        return table is null ? mode : mode + "," + table;
+    }
+
+    private string ParsePragmaCaptureDataChangesPart(string name)
     {
         var token = _lexer.Current;
         if (token.Kind is not (TokenKind.Identifier or TokenKind.String))

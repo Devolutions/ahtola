@@ -424,9 +424,9 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 201 | `HashGraceAdvancePartition` | missing | — | `vdbe-hash-join-opcodes` |
 | 202 | `VacuumInto` | bydesign | — (tree-walked; file-backed source only) | `vdbe-ddl-executed-by-treewalker` |
 | 203 | `Vacuum` | bydesign | — (tree-walked) | `vdbe-ddl-executed-by-treewalker` |
-| 204 | `InitCdcVersion` | missing | — | `vdbe-cdc-opcode` |
+| 204 | `InitCdcVersion` | bydesign | — (tree-walked connection CDC) | `vdbe-cdc-opcode` |
 
-Status totals: bydesign 24, consolidated 40, direct 26, divergent 10, missing 104 (of 204).
+Status totals: bydesign 25, consolidated 40, direct 26, divergent 10, missing 103 (of 204).
 
 ### 3.7 VDBE gap inventory
 
@@ -448,7 +448,7 @@ Status totals: bydesign 24, consolidated 40, direct 26, divergent 10, missing 10
 | `vdbe-autoindex-for-joins` | missing | s3-perf | M | 3 | 3 | Turso can build a transient auto-index when no usable index exists for a join. Combined with the missing cost-based join order (compilation entry), Ahtola's joins are O(N… |
 | `vdbe-checkpoint-opcode` | missing | s2-capability | S | 3 | 1 | Checkpoint coordination exists internally (storage layer) but there is no Checkpoint opcode, so `PRAGMA wal_checkpoint(...)` has no execution path — directly causes the t… |
 | `vdbe-comparison-opcode-consolidation` | divergent | s4-intentional | S | 2 | 0 | Verified near-parity consolidation: Ahtola evaluates the comparison to a tri-state value (IS/IS NOT handled null-safely; NULL -> NULL; affinities applied per side; collat… |
-| `vdbe-cdc-opcode` | missing | s2-capability | M | 1 | 0 | CDC bootstrap opcode; feeds Turso's CDC capture consumed by sync. No Ahtola counterpart (sync layer lacks CDC too — see sync entries). |
+| `vdbe-cdc-opcode` | bydesign | s4-intentional | M | 0 | 0 | Public SQL CDC is implemented by the managed tree-walking connection: `capture_data_changes_conn` provisions pinned Turso V1/V2 tables, captures transactional rows/schema changes, and writes V2 COMMIT records. It deliberately has no VDBE `InitCdcVersion` opcode because Ahtola's DDL/connection-state execution is tree-walked. The managed replica journal remains separate. |
 | `vdbe-explain-output-parity` | partial | s3-perf | M | 1 | 0 | Ahtola has a real EXPLAIN implementation over its own opcode set, so output necessarily diverges from SQLite/Turso text (different opcode names, no p1-p5 operand columns)… |
 | `vdbe-open-ephemeral` | missing | s2-capability | M | 1 | 0 | No general-purpose ephemeral btree opcode: Turso materializes IN (...) sets, DISTINCT intermediates, subquery results, and auto-indexes into ephemeral tables with full cu… |
 | `vdbe-bloom-filter-opcodes` | missing | s3-perf | M | 0 | 0 | Turso builds a bloom filter over a join/IN side and probes it to skip btree seeks. Ahtola has no bloom machinery. NAME COLLISION: Ahtola's VdbeOpcode.Filter (12) is a row… |
@@ -705,14 +705,14 @@ The earlier behavioral gaps below are closed or reduced:
 ## 9. Sync / replication & provider surface
 18 entries, 1 mapped failure line — expected: the conformance suite exercises
 the local engine, not replication. Turso's `sync/engine/` (logical
-replication, CDC capture, bootstrap/apply, conflict policy) has **no managed
+replication, CDC replay, bootstrap/apply, conflict policy) has **no managed
 counterpart**; Ahtola.Data instead provides the Hrana remote client and
 optional-companion dispatch (`AhtolaNativeProvider`/`AhtolaReplicaProvider`/
 `SqliteNativeProvider` load `Turso.Data.Native`/`Turso.Data.Sync` by name and
 fail closed when absent — an intentional product decision, not a gap to
 "fix" by renaming).
 The 11 `missing` entries (sync engine core, bootstrap protocol, conflict
-resolution, CDC capture — including `vdbe-cdc-opcode`'s `InitCdcVersion`) are
+resolution, CDC replay) are
 **upstream-ahead features**; adopting them is a roadmap decision (s4-adjacent
 but filed as `missing`/s2 since they are unshipped rather than rejected).
 2 `extension` entries cover Ahtola-only provider conveniences.
@@ -748,7 +748,7 @@ claimed by the managed replica.
 
 | ID | Kind | Severity | Effort | Mapped fails | Cited | Summary |
 | --- | --- | --- | --- | ---: | ---: | --- |
-| `sync-no-cdc-capture-pragma` | missing | s2-capability | L | 1 | 0 | Turso captures local writes into a `turso_cdc` change-data-capture table (via a CDC pragma) so they can be diffed and pushed to the remote and replayed against a revert/s… |
+| `sync-no-cdc-capture-pragma` | divergent | s2-capability | L | 0 | 0 | Ahtola implements the public pinned-Turso `capture_data_changes_conn` V1/V2 table surface, but its managed replica intentionally continues to capture committed local changes in the private `<db>.ahtola-replica-journal`. Public CDC is not yet consumed by replica push/pull or logical replay. |
 | `sync-checkpoint-mode-mismatch-vs-managed-storage` | divergent | s2-capability | M | 0 | 0 | Turso's sync checkpoint explicitly composes Passive (checkpoint only the already-synced WAL prefix, tracked by a watermark) followed by Truncate (once fully synced) to ke… |
 | `sync-conflict-error-surfaced-not-handled` | missing | s2-capability | M | 0 | 0 | Turso's push path distinguishes a specific 'conflict' HTTP status from the remote wal_push endpoint and surfaces a typed DatabaseSyncEngineConflict error that callers can… |
 | `sync-connection-pooling-no-replica-awareness` | partial | s3-perf | M | 0 | 0 | Turso's engine has a wait_changes_from_remote long-poll loop that lets a replica connection block until the server reports new changes, enabling push-driven refresh inste… |
