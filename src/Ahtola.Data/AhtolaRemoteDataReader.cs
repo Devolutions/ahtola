@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
 using System.Globalization;
+using System.Text;
 
 namespace Ahtola;
 
@@ -110,18 +111,34 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
         EnsureOpen();
         ValidateOrdinal(ordinal);
 
-        if (HasCurrentRow)
-            return GetClrType(CurrentResult.Rows[_rowIndex][ordinal].Type);
-
+        // Declared type first: DbDataAdapter types one DataTable column from this call, so it must be stable across
+        // rows. Microsoft.Data.Sqlite answers from the declared type for the same reason.
         if (ordinal < CurrentResult.Columns.Count
             && TryGetClrTypeFromDeclaredType(CurrentResult.Columns[ordinal].DeclType, out var declaredType))
         {
             return declaredType;
         }
 
-        return CurrentResult.Rows.Count > 0 && ordinal < CurrentResult.Rows[0].Count
-            ? GetClrType(CurrentResult.Rows[0][ordinal].Type)
-            : typeof(object);
+        // No declared type (expression or aggregate): use the data, skipping NULLs. DataTable rejects DBNull as a
+        // column type.
+        if (HasCurrentRow)
+        {
+            var currentType = GetClrType(CurrentResult.Rows[_rowIndex][ordinal].Type);
+            if (currentType != typeof(DBNull))
+                return currentType;
+        }
+
+        foreach (var row in CurrentResult.Rows)
+        {
+            if (ordinal >= row.Count)
+                continue;
+
+            var rowType = GetClrType(row[ordinal].Type);
+            if (rowType != typeof(DBNull))
+                return rowType;
+        }
+
+        return typeof(object);
     }
 
     public override float GetFloat(int ordinal)
@@ -131,7 +148,26 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
 
     public override Guid GetGuid(int ordinal)
     {
-        return Guid.Parse(GetString(ordinal));
+        // Mirrors AhtolaDataReader.ToGuid. Both storage classes occur, and Microsoft.Data.Sqlite reads either.
+        var value = CurrentValue(ordinal);
+        if (value.Type == "blob")
+        {
+            var blob = (byte[])value.ToClrValue();
+            if (blob.Length == 16)
+                return new Guid(blob);
+
+            if (Guid.TryParse(Encoding.UTF8.GetString(blob), out var blobGuid))
+                return blobGuid;
+
+            throw new InvalidOperationException(
+                $"Unable to parse GUID for column '{GetName(ordinal)}' (ordinal {ordinal}, storage BLOB ({blob.Length} bytes)).");
+        }
+
+        if (value.Type == "text" && Guid.TryParse(GetString(ordinal), out var textGuid))
+            return textGuid;
+
+        throw new InvalidOperationException(
+            $"Unable to parse GUID for column '{GetName(ordinal)}' (ordinal {ordinal}, storage {value.Type.ToUpperInvariant()}).");
     }
 
     public override short GetInt16(int ordinal)
