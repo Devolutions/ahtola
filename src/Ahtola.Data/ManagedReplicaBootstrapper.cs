@@ -11,8 +11,13 @@ internal static class ManagedReplicaBootstrapper
     private const int MaxHeaderLength = 64 * 1024;
     private const int MaxPageMessageLength = PageSize + 1024;
     internal const string MetadataSuffix = ".ahtola-replica-meta";
+    private const int MaxMetadataFileLength = 1024 * 1024;
+    private const int MaxTableMapEntries = 100_000;
+    private const int MaxStringBytes = 64 * 1024;
+    private const int MaxLogicalBodyLength = 256 * 1024 * 1024;
     private static readonly byte[] SqliteHeader = "SQLite format 3\0"u8.ToArray();
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+    private static readonly IReadOnlyDictionary<ulong, string> EmptyTableMap = new Dictionary<ulong, string>();
 
     public static async Task BootstrapAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
     {
@@ -50,7 +55,7 @@ internal static class ManagedReplicaBootstrapper
         var databaseInstalled = false;
         try
         {
-            var revision = await DownloadDatabaseAsync(options, stagingPath, cancellationToken).ConfigureAwait(false);
+            var (revision, protocol) = await DownloadDatabaseAsync(options, stagingPath, cancellationToken).ConfigureAwait(false);
             ValidateStagedDatabase(stagingPath);
 
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapStagedDatabase);
@@ -60,11 +65,14 @@ internal static class ManagedReplicaBootstrapper
 
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapDatabasePublished);
             cancellationToken.ThrowIfCancellationRequested();
+            var tableMap = RebuildTableMapFromSchema(options.Path);
             await WriteMetadataAsync(
                 metadataStagingPath,
                 metadataPath,
                 revision,
                 ComputeDatabaseFingerprint(options.Path),
+                protocol,
+                tableMap,
                 cancellationToken).ConfigureAwait(false);
         }
         catch
@@ -83,12 +91,37 @@ internal static class ManagedReplicaBootstrapper
         }
     }
 
+    /// <summary>
+    /// Rebuilds the portable logical-replay table-id-to-name map from the current local schema,
+    /// keyed by each table's b-tree rootpage (the same stable, structurally reconstructible
+    /// identifier Turso's <c>read_logical_replay_table_map</c> uses). Used after any page-based
+    /// apply path (bootstrap, incremental pages, replace-base), where no logical schema identity
+    /// operations are decoded but a future logical pull may depend on an existing map.
+    /// </summary>
+    private static IReadOnlyDictionary<ulong, string> RebuildTableMapFromSchema(string databasePath)
+    {
+        using var database = ManagedDatabaseAdapter.Open(databasePath);
+        var connection = database.Connect();
+        using var statement = connection.Prepare(
+            "SELECT rootpage, name FROM sqlite_schema WHERE type = 'table' AND rootpage != 0");
+        var map = new Dictionary<ulong, string>();
+        while (statement.Step() == StatementStepResult.Row)
+        {
+            var rootpage = statement.GetValue(0).AsInteger();
+            if (rootpage <= 0)
+                continue;
+            map[unchecked((ulong)rootpage)] = statement.GetValue(1).AsText();
+        }
+
+        return map;
+    }
+
     public static ManagedReplicaMetadata? LoadMetadata(string databasePath)
     {
         var path = databasePath + MetadataSuffix;
         if (!File.Exists(path))
             return null;
-        if (new FileInfo(path).Length is <= 0 or > 8192)
+        if (new FileInfo(path).Length is <= 0 or > MaxMetadataFileLength)
             throw new InvalidDataException("Managed embedded replica metadata has an invalid size.");
 
         var values = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -99,11 +132,72 @@ internal static class ManagedReplicaBootstrapper
                 throw new InvalidDataException("Managed embedded replica metadata is malformed.");
         }
 
-        if (!values.TryGetValue("version", out var version) || version != "2"
-            || !values.TryGetValue("server_revision_base64", out var encodedRevision)
+        if (!values.TryGetValue("version", out var version))
+            throw new InvalidDataException("Managed embedded replica metadata is incomplete.");
+
+        return version switch
+        {
+            "2" => LoadV2Metadata(values),
+            "3" => LoadV3Metadata(values),
+            _ => throw new InvalidDataException($"Managed embedded replica metadata has an unsupported version '{version}'."),
+        };
+    }
+
+    private static ManagedReplicaMetadata LoadV2Metadata(Dictionary<string, string> values)
+    {
+        if (!values.TryGetValue("server_revision_base64", out var encodedRevision)
             || !values.TryGetValue("database_sha256", out var fingerprint)
             || !values.TryGetValue("client_id", out var clientId) || values.Count != 4)
             throw new InvalidDataException("Managed embedded replica metadata is incomplete.");
+
+        var (revision, validatedFingerprint) = DecodeCommonFields(encodedRevision, fingerprint, clientId);
+        // A v2 file always carries a synced revision: it has already talked to a page-protocol
+        // remote (MVCC logical sync never shipped without the v3 protocol field), so it is pinned
+        // to Pages rather than left Unknown, matching Turso's DatabaseMetadata::load back-compat rule.
+        return new ManagedReplicaMetadata(
+            revision,
+            validatedFingerprint,
+            clientId,
+            RemotePullProtocol.Pages,
+            EmptyTableMap);
+    }
+
+    private static ManagedReplicaMetadata LoadV3Metadata(Dictionary<string, string> values)
+    {
+        if (!values.TryGetValue("server_revision_base64", out var encodedRevision)
+            || !values.TryGetValue("database_sha256", out var fingerprint)
+            || !values.TryGetValue("client_id", out var clientId)
+            || !values.TryGetValue("protocol", out var protocolText)
+            || !values.TryGetValue("table_map_base64", out var tableMapEncoded)
+            || values.Count != 6)
+        {
+            throw new InvalidDataException("Managed embedded replica metadata is incomplete.");
+        }
+
+        var (revision, validatedFingerprint) = DecodeCommonFields(encodedRevision, fingerprint, clientId);
+        var protocol = protocolText switch
+        {
+            "unknown" => RemotePullProtocol.Unknown,
+            "pages" => RemotePullProtocol.Pages,
+            "mvcc_logical" => RemotePullProtocol.MvccLogical,
+            _ => throw new InvalidDataException("Managed embedded replica metadata has an unsupported protocol value."),
+        };
+
+        IReadOnlyDictionary<ulong, string> tableMap;
+        try
+        {
+            tableMap = DecodeTableMap(Convert.FromBase64String(tableMapEncoded));
+        }
+        catch (FormatException exception)
+        {
+            throw new InvalidDataException("Managed embedded replica metadata is invalid.", exception);
+        }
+
+        return new ManagedReplicaMetadata(revision, validatedFingerprint, clientId, protocol, tableMap);
+    }
+
+    private static (string Revision, string Fingerprint) DecodeCommonFields(string encodedRevision, string fingerprint, string clientId)
+    {
         try
         {
             var revision = StrictUtf8.GetString(Convert.FromBase64String(encodedRevision));
@@ -111,12 +205,92 @@ internal static class ManagedReplicaBootstrapper
                 throw new InvalidDataException("Managed embedded replica metadata is invalid.");
             if (!IsSha256Hex(fingerprint))
                 throw new InvalidDataException("Managed embedded replica metadata is invalid.");
-            return new ManagedReplicaMetadata(revision, fingerprint, clientId);
+            return (revision, fingerprint);
         }
         catch (FormatException exception)
         {
             throw new InvalidDataException("Managed embedded replica metadata is invalid.", exception);
         }
+    }
+
+    /// <summary>
+    /// Encodes the stable table-id-to-name map as a small deterministic binary blob (never
+    /// text), avoiding any escaping ambiguity for table names: a 4-byte LE entry count, followed
+    /// by, per entry, an 8-byte LE stable id, a 4-byte LE UTF-8 byte length, and the UTF-8 bytes.
+    /// </summary>
+    private static byte[] EncodeTableMap(IReadOnlyDictionary<ulong, string> tableNamesByStableId)
+    {
+        using var buffer = new MemoryStream();
+        using var writer = new BinaryWriter(buffer);
+        writer.Write(tableNamesByStableId.Count);
+        foreach (var (stableId, name) in tableNamesByStableId.OrderBy(pair => pair.Key))
+        {
+            var nameBytes = StrictUtf8.GetBytes(name);
+            writer.Write(stableId);
+            writer.Write(nameBytes.Length);
+            writer.Write(nameBytes);
+        }
+
+        return buffer.ToArray();
+    }
+
+    private static IReadOnlyDictionary<ulong, string> DecodeTableMap(byte[] bytes)
+    {
+        using var stream = new MemoryStream(bytes);
+        using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
+        int count;
+        try
+        {
+            count = reader.ReadInt32();
+        }
+        catch (EndOfStreamException exception)
+        {
+            throw new InvalidDataException("Managed embedded replica table map is truncated.", exception);
+        }
+
+        if (count < 0 || count > MaxTableMapEntries)
+            throw new InvalidDataException("Managed embedded replica table map has an invalid entry count.");
+
+        var map = new Dictionary<ulong, string>(count);
+        for (var i = 0; i < count; i++)
+        {
+            ulong stableId;
+            int nameLength;
+            try
+            {
+                stableId = reader.ReadUInt64();
+                nameLength = reader.ReadInt32();
+            }
+            catch (EndOfStreamException exception)
+            {
+                throw new InvalidDataException("Managed embedded replica table map is truncated.", exception);
+            }
+
+            if (nameLength < 0 || nameLength > MaxStringBytes)
+                throw new InvalidDataException("Managed embedded replica table map contains an invalid name length.");
+
+            var nameBytes = reader.ReadBytes(nameLength);
+            if (nameBytes.Length != nameLength)
+                throw new InvalidDataException("Managed embedded replica table map is truncated.");
+
+            string name;
+            try
+            {
+                name = StrictUtf8.GetString(nameBytes);
+            }
+            catch (DecoderFallbackException exception)
+            {
+                throw new InvalidDataException("Managed embedded replica table map contains invalid UTF-8.", exception);
+            }
+
+            if (!map.TryAdd(stableId, name))
+                throw new InvalidDataException("Managed embedded replica table map contains a duplicate stable table id.");
+        }
+
+        if (stream.Position != stream.Length)
+            throw new InvalidDataException("Managed embedded replica table map has trailing bytes.");
+
+        return map;
     }
 
     public static async Task<AhtolaSyncResult> CheckForUpdatesAsync(
@@ -126,7 +300,8 @@ internal static class ManagedReplicaBootstrapper
         ManagedReplicaSupportMatrix.ValidateOptions(options);
         EnsureNoLocalDivergence(options.Path, metadata);
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pulling));
-        var payload = CreatePullRequest(metadata.Revision, options.LongPollTimeout);
+        var requestLogical = metadata.Protocol == RemotePullProtocol.MvccLogical;
+        var payload = CreatePullRequest(metadata.Revision, options.LongPollTimeout, requestLogical);
         using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
         using var scope = options.EnterApplicationHttpScope();
         using var client = options.HttpPolicy.MessageHandler is { } handler ? new HttpClient(handler, false) : new HttpClient();
@@ -149,14 +324,29 @@ internal static class ManagedReplicaBootstrapper
         var message = await reader.ReadAsync(MaxHeaderLength, effectiveToken).ConfigureAwait(false)
             ?? throw new InvalidDataException("The pull-updates response did not contain a protobuf header.");
         var header = ParseHeader(message);
-        if (header.RemoteUsesLogicalProtocol)
+
+        if (header.StreamKind == PullStreamKind.MvccLogicalLog)
         {
-            throw new NotSupportedException(
-                "Incremental synchronization requires the MVCC logical pull protocol, which this provider does not "
-                + "implement. The remote can still be bootstrapped as a full page stream, so refresh the replica by "
-                + "bootstrapping it again instead of synchronizing it.");
+            if (header.ApplyMode == PullApplyMode.ReplaceBase)
+            {
+                throw new InvalidDataException(
+                    "The pull-updates response returned replace_base apply mode with an MVCC logical-log stream.");
+            }
+            if (!requestLogical)
+            {
+                throw new InvalidDataException(
+                    "The pull-updates response returned an MVCC logical-log stream, but a logical pull was not requested.");
+            }
+
+            var body = await ReadRemainingBytesAsync(stream, effectiveToken).ConfigureAwait(false);
+            var (outcome, statistics) = await ApplyLogicalUpdatesAsync(
+                options, metadata, header, body, syncOptions, payload.Length, reader.BytesRead + body.Length, effectiveToken)
+                .ConfigureAwait(false);
+            return new AhtolaSyncResult(outcome, statistics);
         }
 
+        // Pages stream (Incremental or ReplaceBase for a page-protocol remote, or a protocol-2
+        // remote using Pages+ReplaceBase for a validated full atomic replacement).
         var pages = new List<PullPage>();
         while (await reader.ReadAsync(MaxPageMessageLength, effectiveToken).ConfigureAwait(false) is { } page)
         {
@@ -173,6 +363,11 @@ internal static class ManagedReplicaBootstrapper
             throw new InvalidDataException("The pull-updates response changed revision without returning page data.");
         if (string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
             throw new InvalidDataException("The pull-updates response returned page data without changing revision.");
+        if (header.ApplyMode == PullApplyMode.ReplaceBase && (ulong)pages.Count != header.DatabasePages)
+        {
+            throw new InvalidDataException(
+                "The pull-updates response used replace_base apply mode without returning every database page exactly once.");
+        }
 
         await ApplyIncrementalPagesAsync(options, header, pages, metadata.ClientId, effectiveToken).ConfigureAwait(false);
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
@@ -182,8 +377,141 @@ internal static class ManagedReplicaBootstrapper
     }
 
     /// <summary>
+    /// Decodes and applies an MVCC logical-log stream. The complete body is decoded and validated
+    /// (<see cref="ManagedReplicaLml3Decoder.Decode"/>) before anything is mutated. A non-empty
+    /// transaction set is replayed under one <c>BEGIN IMMEDIATE</c>/<c>COMMIT</c> against a
+    /// dedicated connection (never the caller's live connection, so the local push change journal
+    /// never captures this replay); the database, fingerprint, table map, protocol, and revision
+    /// only advance together after that commit succeeds, and are left untouched on any failure.
+    /// </summary>
+    private static async Task<(AhtolaSyncOutcome Outcome, AhtolaSyncStatistics Statistics)> ApplyLogicalUpdatesAsync(
+        AhtolaReplicaOptions options,
+        ManagedReplicaMetadata metadata,
+        PullHeader header,
+        byte[] body,
+        AhtolaSyncOptions syncOptions,
+        long networkSentBytes,
+        long networkReceivedBytes,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<ManagedReplicaLogicalTxn> transactions;
+        if (header.LogicalMetadata is { } logicalMetadata)
+        {
+            transactions = ManagedReplicaLml3Decoder.Decode(logicalMetadata.Ranges, body, cancellationToken);
+        }
+        else if (body.Length == 0)
+        {
+            transactions = [];
+        }
+        else
+        {
+            throw new InvalidDataException(
+                "The pull-updates response is missing MVCC logical-log metadata for a non-empty logical stream.");
+        }
+
+        if (transactions.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
+        {
+            syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
+            return (AhtolaSyncOutcome.UpToDate,
+                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, metadata.Revision));
+        }
+
+        var metadataPath = options.Path + MetadataSuffix;
+        var directory = Path.GetDirectoryName(Path.GetFullPath(options.Path))!;
+        var metadataStagingPath = Path.Combine(directory, $".{Path.GetFileName(metadataPath)}.logical-{Guid.NewGuid():N}.tmp");
+
+        long operationCount = 0;
+        var tableNamesByStableId = metadata.TableNamesByStableId;
+        if (transactions.Count != 0)
+        {
+            using var database = ManagedDatabaseAdapter.Open(options.Path);
+            var connection = database.Connect();
+            ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
+            try
+            {
+                var applied = ManagedReplicaLogicalReplayer.Apply(
+                    connection, transactions, metadata.TableNamesByStableId, metadata.ClientId, cancellationToken);
+                ExecuteNonQuery(connection, "COMMIT");
+                operationCount = applied.OperationCount;
+                tableNamesByStableId = applied.TableNamesByStableId;
+            }
+            catch
+            {
+                TryExecuteNonQuery(connection, "ROLLBACK");
+                throw;
+            }
+
+            // Force a WAL (if any) to checkpoint into the main file so the fingerprint hashed
+            // below, and any later plain-file-byte divergence check, observe the committed data.
+            TryExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+        }
+
+        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
+        var fingerprint = ComputeDatabaseFingerprint(options.Path);
+        try
+        {
+            await WriteMetadataAsync(
+                    metadataStagingPath,
+                    metadataPath,
+                    header.Revision,
+                    fingerprint,
+                    header.Protocol,
+                    tableNamesByStableId,
+                    cancellationToken,
+                    replaceExisting: true,
+                    clientId: metadata.ClientId)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            DeleteIfExists(metadataStagingPath);
+        }
+
+        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
+        return (AhtolaSyncOutcome.RemoteChangesApplied,
+            new AhtolaSyncStatistics(operationCount, 0, 0, DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, header.Revision));
+    }
+
+    private static async Task<byte[]> ReadRemainingBytesAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        using var buffer = new MemoryStream();
+        var chunk = new byte[81920];
+        int read;
+        while ((read = await stream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
+        {
+            if (buffer.Length + read > MaxLogicalBodyLength)
+                throw new InvalidDataException("The MVCC logical-log stream exceeds the supported size.");
+            buffer.Write(chunk, 0, read);
+        }
+
+        return buffer.ToArray();
+    }
+
+    private static void ExecuteNonQuery(IManagedConnectionAdapter connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step();
+    }
+
+    private static void TryExecuteNonQuery(IManagedConnectionAdapter connection, string sql)
+    {
+        try
+        {
+            ExecuteNonQuery(connection, sql);
+        }
+        catch
+        {
+            // Best effort: a failed ROLLBACK/checkpoint must not mask the original failure, and a
+            // checkpoint pragma that the engine does not support for the current journal mode is
+            // harmless (the commit already made the main file consistent in that mode).
+        }
+    }
+
+
+    /// <summary>
     /// Records the local image that was just acknowledged by a committed remote push. This
-    /// preserves the client identity and lets the subsequent pull retain its divergence guard.
+    /// preserves the client identity, protocol, and table map, and lets the subsequent pull
+    /// retain its divergence guard.
     /// </summary>
     public static async Task<ManagedReplicaMetadata> RecordLocalPushAsync(
         AhtolaReplicaOptions options,
@@ -203,6 +531,8 @@ internal static class ManagedReplicaBootstrapper
                     metadataPath,
                     metadata.Revision,
                     fingerprint,
+                    metadata.Protocol,
+                    metadata.TableNamesByStableId,
                     cancellationToken,
                     replaceExisting: true,
                     clientId: metadata.ClientId)
@@ -265,11 +595,20 @@ internal static class ManagedReplicaBootstrapper
             databaseInstalled = true;
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished);
             cancellationToken.ThrowIfCancellationRequested();
+            // A page-based apply never decodes logical schema identity operations, so the table
+            // map is rebuilt fresh from the newly-installed schema (self-healing), matching
+            // Turso's read_logical_replay_table_map usage after page-based apply paths. The
+            // freshly detected protocol is recorded too, so a protocol-2 remote that answered this
+            // particular pull with Pages (e.g. Pages+ReplaceBase) still enables a logical request
+            // on the next pull rather than sticking to pages forever.
+            var tableMap = RebuildTableMapFromSchema(options.Path);
             await WriteMetadataAsync(
                     metadataStagingPath,
                     metadataPath,
                     header.Revision,
                     ComputeDatabaseFingerprint(options.Path),
+                    header.Protocol,
+                    tableMap,
                     cancellationToken,
                     replaceExisting: true,
                     clientId: clientId)
@@ -296,7 +635,7 @@ internal static class ManagedReplicaBootstrapper
         }
     }
 
-    private static async Task<string> DownloadDatabaseAsync(
+    private static async Task<(string Revision, RemotePullProtocol Protocol)> DownloadDatabaseAsync(
         AhtolaReplicaOptions options,
         string stagingPath,
         CancellationToken cancellationToken)
@@ -329,6 +668,11 @@ internal static class ManagedReplicaBootstrapper
         var headerPayload = await reader.ReadAsync(MaxHeaderLength, effectiveCancellationToken).ConfigureAwait(false)
             ?? throw new InvalidDataException("The pull-updates response did not contain a protobuf header.");
         var header = ParseHeader(headerPayload);
+        if (header.StreamKind != PullStreamKind.Pages)
+        {
+            throw new InvalidDataException(
+                "Managed embedded replica bootstrap requires a raw page stream; the server returned an MVCC logical-log stream.");
+        }
 
         var databaseLength = checked((long)header.DatabasePages * PageSize);
         var receivedPages = new HashSet<ulong>();
@@ -360,8 +704,9 @@ internal static class ManagedReplicaBootstrapper
             staging.Flush(flushToDisk: true);
         }
 
-        return header.Revision;
+        return (header.Revision, header.Protocol);
     }
+
 
     private static void ValidateStagedDatabase(string stagingPath)
     {
@@ -382,15 +727,26 @@ internal static class ManagedReplicaBootstrapper
         string metadataPath,
         string revision,
         string fingerprint,
+        RemotePullProtocol protocol,
+        IReadOnlyDictionary<ulong, string> tableNamesByStableId,
         CancellationToken cancellationToken,
         bool replaceExisting = false,
         string? clientId = null)
     {
+        var protocolText = protocol switch
+        {
+            RemotePullProtocol.Unknown => "unknown",
+            RemotePullProtocol.Pages => "pages",
+            RemotePullProtocol.MvccLogical => "mvcc_logical",
+            _ => throw new ArgumentOutOfRangeException(nameof(protocol), protocol, "Unknown remote pull protocol."),
+        };
         var metadata = string.Concat(
-            "version=2\n",
+            "version=3\n",
             "server_revision_base64=", Convert.ToBase64String(StrictUtf8.GetBytes(revision)), "\n",
             "database_sha256=", fingerprint, "\n",
-            "client_id=", clientId ?? Guid.NewGuid().ToString("N"), "\n");
+            "client_id=", clientId ?? Guid.NewGuid().ToString("N"), "\n",
+            "protocol=", protocolText, "\n",
+            "table_map_base64=", Convert.ToBase64String(EncodeTableMap(tableNamesByStableId)), "\n");
         await using (var stream = new FileStream(
             stagingPath,
             FileMode.CreateNew,
@@ -420,6 +776,7 @@ internal static class ManagedReplicaBootstrapper
         ulong? streamKind = null;
         ulong? applyMode = null;
         ulong? protocol = null;
+        ManagedReplicaLogicalLogMetadata? logicalMetadata = null;
 
         while (reader.TryReadField(out var field, out var wireType))
         {
@@ -448,7 +805,10 @@ internal static class ManagedReplicaBootstrapper
                     applyMode = ReadSingleVarint(ref reader, wireType, applyMode, "apply mode");
                     break;
                 case 7:
-                    throw new InvalidDataException("Managed embedded replica bootstrap does not support logical update streams.");
+                    if (logicalMetadata is not null)
+                        throw new InvalidDataException("The pull-updates response contains MVCC logical-log metadata more than once.");
+                    logicalMetadata = ParseLogicalLogMetadata(reader.ReadLengthDelimited(wireType, "MVCC logical-log metadata"));
+                    break;
                 case 8:
                     protocol = ReadSingleVarint(ref reader, wireType, protocol, "protocol");
                     break;
@@ -464,14 +824,100 @@ internal static class ManagedReplicaBootstrapper
             throw new InvalidDataException("The pull-updates response did not provide a server revision.");
         if (databasePages is not { } pageCount || pageCount == 0 || pageCount > (ulong)(long.MaxValue / PageSize))
             throw new InvalidDataException("The pull-updates response has an invalid database size.");
-        if (streamKind is > 0)
-            throw new InvalidDataException("Managed embedded replica bootstrap supports only page streams.");
+        if (streamKind is > 1)
+            throw new InvalidDataException("The pull-updates response has an unsupported stream kind.");
         if (applyMode is > 1)
             throw new InvalidDataException("The pull-updates response has an unsupported apply mode.");
-        // A logical-protocol remote still bootstraps as a raw page stream - the field describes the incremental
-        // pulls that follow, which CheckForUpdatesAsync refuses explicitly. The payload itself is already
-        // constrained to raw pages by the checks above.
-        return new PullHeader(revision, pageCount, protocol is > 1);
+
+        var resolvedStreamKind = streamKind == 1 ? PullStreamKind.MvccLogicalLog : PullStreamKind.Pages;
+        var resolvedApplyMode = applyMode == 1 ? PullApplyMode.ReplaceBase : PullApplyMode.Incremental;
+        // A server predating the protocol field, or reporting a future unknown value, is treated
+        // as page-only: MVCC databases only exist behind servers that advertise protocol=2.
+        var resolvedProtocol = protocol == 2 ? RemotePullProtocol.MvccLogical : RemotePullProtocol.Pages;
+
+        // Metadata (tag 7) is intentionally optional even for a logical stream: a genuinely empty
+        // logical response (nothing new) may omit it entirely, with an empty body. The caller
+        // validates that combination against the body length, matching Turso's
+        // decode_raw_mvcc_logical_log_to_file (missing metadata + empty body => zero transactions).
+        return new PullHeader(revision, pageCount, resolvedStreamKind, resolvedApplyMode, resolvedProtocol, logicalMetadata);
+    }
+
+    private static ManagedReplicaLogicalLogMetadata ParseLogicalLogMetadata(byte[] payload)
+    {
+        var reader = new ProtobufFieldReader(payload);
+        string? format = null;
+        var checkpointTransition = false;
+        var ranges = new List<ManagedReplicaLogicalLogRange>();
+
+        while (reader.TryReadField(out var field, out var wireType))
+        {
+            switch (field)
+            {
+                case 1:
+                    if (format is not null)
+                        throw new InvalidDataException("The MVCC logical-log metadata contains a format more than once.");
+                    format = StrictUtf8.GetString(reader.ReadLengthDelimited(wireType, "MVCC logical-log format"));
+                    break;
+                case 2:
+                    checkpointTransition = reader.ReadVarint(wireType, "MVCC logical-log checkpoint transition") != 0;
+                    break;
+                case 3:
+                    ranges.Add(ParseLogicalLogRange(reader.ReadLengthDelimited(wireType, "MVCC logical-log range")));
+                    break;
+                default:
+                    reader.SkipField(wireType);
+                    break;
+            }
+        }
+
+        if (string.IsNullOrEmpty(format))
+            throw new InvalidDataException("The MVCC logical-log metadata is missing its format.");
+        if (!string.Equals(format, ManagedReplicaLml3Decoder.ExpectedFormat, StringComparison.Ordinal))
+            throw new InvalidDataException($"The MVCC logical-log metadata has an unsupported format '{format}'.");
+
+        return new ManagedReplicaLogicalLogMetadata(format, checkpointTransition, ranges);
+    }
+
+    private static ManagedReplicaLogicalLogRange ParseLogicalLogRange(byte[] payload)
+    {
+        var reader = new ProtobufFieldReader(payload);
+        ulong? generation = null;
+        ulong? startOffset = null;
+        ulong? endOffset = null;
+        var startsWithHeader = false;
+        byte[]? crcSeed = null;
+
+        while (reader.TryReadField(out var field, out var wireType))
+        {
+            switch (field)
+            {
+                case 1:
+                    generation = ReadSingleVarint(ref reader, wireType, generation, "range generation");
+                    break;
+                case 2:
+                    startOffset = ReadSingleVarint(ref reader, wireType, startOffset, "range start offset");
+                    break;
+                case 3:
+                    endOffset = ReadSingleVarint(ref reader, wireType, endOffset, "range end offset");
+                    break;
+                case 4:
+                    startsWithHeader = reader.ReadVarint(wireType, "range starts_with_header") != 0;
+                    break;
+                case 5:
+                    if (crcSeed is not null)
+                        throw new InvalidDataException("The MVCC logical-log range contains a CRC seed more than once.");
+                    crcSeed = reader.ReadLengthDelimited(wireType, "range CRC seed");
+                    break;
+                default:
+                    reader.SkipField(wireType);
+                    break;
+            }
+        }
+
+        if (generation is null || startOffset is null || endOffset is null)
+            throw new InvalidDataException("The MVCC logical-log range is missing required fields.");
+
+        return new ManagedReplicaLogicalLogRange(generation.Value, startOffset.Value, endOffset.Value, startsWithHeader, crcSeed);
     }
 
     private static PullPage ParsePage(byte[] payload)
@@ -535,15 +981,17 @@ internal static class ManagedReplicaBootstrapper
     }
 
     private static byte[] CreateInitialPullRequest(TimeSpan? longPollTimeout)
-        => CreatePullRequest(clientRevision: null, longPollTimeout);
+        => CreatePullRequest(clientRevision: null, longPollTimeout, requestLogicalProtocol: false);
 
-    private static byte[] CreatePullRequest(string? clientRevision, TimeSpan? longPollTimeout)
+    /// <summary>
+    /// Builds a <c>PullUpdatesReqProtoBody</c> request. <paramref name="clientRevision"/> is
+    /// always emitted (tag 3) whenever it is non-empty, independent of whether a long-poll
+    /// timeout is configured: the server cannot compute an incremental diff without it. Setting
+    /// <paramref name="requestLogicalProtocol"/> encodes tag 8 (<c>stream_kind</c>) as
+    /// <c>MvccLogicalLog</c> (1) instead of leaving it at its <c>Pages</c> (0) default.
+    /// </summary>
+    private static byte[] CreatePullRequest(string? clientRevision, TimeSpan? longPollTimeout, bool requestLogicalProtocol)
     {
-        // Raw, Pages, and empty revisions are Prost defaults. A configured
-        // timeout alone is non-default and uses PullUpdatesReqProtoBody tag 4.
-        if (longPollTimeout is null)
-            return [];
-
         var request = new List<byte>(clientRevision is null ? 6 : clientRevision.Length + 12);
         if (!string.IsNullOrEmpty(clientRevision))
         {
@@ -556,6 +1004,11 @@ internal static class ManagedReplicaBootstrapper
         {
             WriteVarint(request, 4u << 3);
             WriteVarint(request, checked((ulong)timeout.TotalMilliseconds));
+        }
+        if (requestLogicalProtocol)
+        {
+            WriteVarint(request, 8u << 3);
+            WriteVarint(request, 1); // PullUpdatesStreamKind::MvccLogicalLog
         }
         return request.ToArray();
     }
@@ -673,8 +1126,43 @@ internal static class ManagedReplicaBootstrapper
     private static bool IsSha256Hex(string value)
         => value.Length == 64 && value.All(static c => c is >= '0' and <= '9' or >= 'A' and <= 'F');
 
-    public readonly record struct ManagedReplicaMetadata(string Revision, string DatabaseSha256, string ClientId);
-    private readonly record struct PullHeader(string Revision, ulong DatabasePages, bool RemoteUsesLogicalProtocol);
+    /// <summary>
+    /// v3 managed embedded-replica metadata. <see cref="Revision"/> is an opaque, exact UTF-8
+    /// resume token echoed back verbatim on the next pull request; it is never parsed or
+    /// interpreted. <see cref="Protocol"/> is the detected remote sync capability, and
+    /// <see cref="TableNamesByStableId"/> is the persisted portable table-id-to-name map used to
+    /// resolve logical row operations that omit an explicit table name.
+    /// </summary>
+    public readonly record struct ManagedReplicaMetadata(
+        string Revision,
+        string DatabaseSha256,
+        string ClientId,
+        RemotePullProtocol Protocol,
+        IReadOnlyDictionary<ulong, string> TableNamesByStableId);
+    private enum PullStreamKind
+    {
+        Pages = 0,
+        MvccLogicalLog = 1,
+    }
+
+    private enum PullApplyMode
+    {
+        Incremental = 0,
+        ReplaceBase = 1,
+    }
+
+    private readonly record struct ManagedReplicaLogicalLogMetadata(
+        string Format,
+        bool CheckpointTransition,
+        IReadOnlyList<ManagedReplicaLogicalLogRange> Ranges);
+
+    private readonly record struct PullHeader(
+        string Revision,
+        ulong DatabasePages,
+        PullStreamKind StreamKind,
+        PullApplyMode ApplyMode,
+        RemotePullProtocol Protocol,
+        ManagedReplicaLogicalLogMetadata? LogicalMetadata);
     private readonly record struct PullPage(ulong PageId, byte[] Data);
 
     private sealed class DelimitedProtobufReader(Stream stream)

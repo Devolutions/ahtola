@@ -225,6 +225,26 @@ public sealed class AhtolaReplicaOptions
         };
     }
 
+    /// <summary>
+    /// Returns a copy with long polling disabled, used for a one-shot, non-blocking pull (e.g.
+    /// the immediate logical catch-up performed right after a fresh managed embedded-replica
+    /// bootstrap): it must return whatever is immediately available rather than hold the call
+    /// open waiting for future changes.
+    /// </summary>
+    internal AhtolaReplicaOptions WithoutLongPoll()
+    {
+        return new AhtolaReplicaOptions(Path, RemoteUri, AuthToken, BootstrapIfEmpty)
+        {
+            LongPollTimeout = null,
+            PartialBootstrap = PartialBootstrap,
+            RemoteEncryption = RemoteEncryption,
+            PushOperationsThreshold = PushOperationsThreshold,
+            PullBytesThreshold = PullBytesThreshold,
+            SyncInterval = SyncInterval,
+            HttpPolicy = HttpPolicy,
+        };
+    }
+
     internal void ThrowIfApplicationHttpReentrant(bool closing)
     {
         if (_applicationHttpScope.Value?.IsActive != true)

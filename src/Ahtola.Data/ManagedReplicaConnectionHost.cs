@@ -232,7 +232,9 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         try
         {
             using var operation = syncEntry.EnterLocalOperation(CancellationToken.None);
-            EnsureReplicaAvailableAsync(options, CancellationToken.None).GetAwaiter().GetResult();
+            var freshBootstrap = EnsureReplicaAvailableAsync(options, CancellationToken.None).GetAwaiter().GetResult();
+            if (freshBootstrap)
+                CatchUpAfterFreshBootstrapAsync(options, CancellationToken.None).GetAwaiter().GetResult();
             return OpenExisting(options, syncEntry);
         }
         catch
@@ -252,7 +254,9 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         try
         {
             using var operation = await syncEntry.EnterLocalOperationAsync(cancellationToken).ConfigureAwait(false);
-            await EnsureReplicaAvailableAsync(options, cancellationToken).ConfigureAwait(false);
+            var freshBootstrap = await EnsureReplicaAvailableAsync(options, cancellationToken).ConfigureAwait(false);
+            if (freshBootstrap)
+                await CatchUpAfterFreshBootstrapAsync(options, cancellationToken).ConfigureAwait(false);
             return OpenExisting(options, syncEntry);
         }
         catch
@@ -300,10 +304,15 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         }
     }
 
-    private static async Task EnsureReplicaAvailableAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
+    /// <summary>
+    /// Returns <see langword="true"/> when this call performed a fresh bootstrap (the replica
+    /// path did not exist yet), so the caller can catch it up with one immediate logical pull
+    /// before exposing the connection.
+    /// </summary>
+    private static async Task<bool> EnsureReplicaAvailableAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
     {
         if (File.Exists(options.Path) && new FileInfo(options.Path).Length > 0)
-            return;
+            return false;
 
         if (File.Exists(options.Path))
         {
@@ -312,6 +321,30 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         }
 
         await ManagedReplicaBootstrapper.BootstrapAsync(options, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>
+    /// Catches a freshly bootstrapped MVCC-protocol replica up to the retained logical log. The
+    /// bootstrap page image is the last durable generation base (the server deliberately never
+    /// checkpoints for a bootstrap), so without this pull, opening the connection would hand out
+    /// a database missing every commit since the last natural checkpoint. Long-polling is
+    /// disabled: when the base is already current this must return immediately rather than hold
+    /// the open call open waiting for future changes. A no-op for page-protocol replicas, whose
+    /// bootstrap is already current.
+    /// </summary>
+    private static async Task CatchUpAfterFreshBootstrapAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
+    {
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(options.Path);
+        if (metadata is not { Protocol: RemotePullProtocol.MvccLogical } value)
+            return;
+
+        _ = await ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                options.WithoutLongPoll(),
+                value,
+                new AhtolaSyncOptions(),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async Task SyncAsync(CancellationToken cancellationToken)

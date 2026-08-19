@@ -428,7 +428,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     // protocol=2 (MvccLogical) describes the incremental pulls that follow, not the bootstrap, which the server
-    // still ships as a raw page stream.
+    // still ships as a raw page stream. A fresh MVCC bootstrap must also catch up with one immediate,
+    // non-long-poll logical pull before the connection opens (see CatchUpAfterFreshBootstrapAsync).
     [Test]
     public void CreateReplicaBootstrapsRawPagesFromALogicalProtocolRemote()
     {
@@ -447,7 +448,11 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             DeleteReplicaFiles(sourcePath);
         }
 
-        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", databaseImage, protocol: 2));
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up: nothing new
+        ]);
         var options = new AhtolaReplicaOptions(
             path,
             new Uri("https://example.test"),
@@ -464,6 +469,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             using var command = connection.CreateCommand();
             command.CommandText = "SELECT value FROM bootstrap_marker;";
             command.ExecuteScalar().Should().Be(42L);
+            handler.CallCount.Should().Be(2, "a fresh MVCC bootstrap must be followed by exactly one catch-up pull");
         }
         finally
         {
@@ -472,7 +478,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
-    public void SyncAgainstALogicalProtocolRemoteReportsThatBootstrapIsTheRefreshPath()
+    public void SyncAgainstALogicalProtocolRemoteAppliesLogicalChanges()
     {
         var path = Path.Combine(
             TestContext.CurrentContext.WorkDirectory,
@@ -489,11 +495,27 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             DeleteReplicaFiles(sourcePath);
         }
 
-        // One response for the bootstrap, a second for the sync attempt.
+        var salt = 777UL;
+        var logHeader = Lml3TestBuilder.BuildHeader(salt);
+        var crc = Lml3TestBuilder.HeaderSeedCrc(salt);
+        var schemaRecord = Lml3TestBuilder.SchemaRecord("table", "widgets", 5, "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)");
+        var schemaOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -1, Lml3TestBuilder.UpsertTablePayload(1, schemaRecord));
+        var rowRecord = Core.Storage.SqliteRecordCodec.Encode([Core.SqlValue.Null, Core.SqlValue.Text("alice")]);
+        var rowOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -2, Lml3TestBuilder.UpsertTablePayload(9, rowRecord));
+        var recoveryPayload = schemaOp.Concat(rowOp).ToArray();
+        var portableTxn = Lml3TestBuilder.BuildPortableLogicalTxn(1, 1, ["widgets"], [(-2, 0)]);
+        var extRecord = Lml3TestBuilder.BuildExtensionRecord(Lml3TestBuilder.PortableChangesExtensionType, Lml3TestBuilder.Delimited(portableTxn));
+        var frame = Lml3TestBuilder.BuildFrame(ref crc, recoveryPayload, opCount: 2, extensionBlock: extRecord);
+        var logicalBody = logHeader.Concat(frame).ToArray();
+        var rangeMessage = BuildLogicalLogRangeMessage(1, 0, (ulong)logicalBody.Length, startsWithHeader: true);
+
+        // Responses in order: (1) protocol-2 page bootstrap, (2) fresh-bootstrap catch-up (nothing
+        // new yet), (3) the explicit Sync() call's logical pull with real changes.
         var handler = new PullUpdatesHandler(
         [
             CreatePullResponse("revision-42", databaseImage, protocol: 2),
-            CreatePullResponse("revision-43", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
         ]);
         var options = new AhtolaReplicaOptions(
             path,
@@ -509,18 +531,264 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             using var connection = AhtolaConnection.CreateReplica(options);
             connection.Open();
 
-            Action sync = () => connection.Sync();
+            var result = connection.Sync(new AhtolaSyncOptions());
 
-            // Without this the caller saw an opaque revision-consistency failure instead of the real reason.
-            sync.Should().Throw<NotSupportedException>()
-                .WithMessage("*MVCC logical pull protocol*")
-                .And.Message.Should().Contain("bootstrapping it again");
+            result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            result.Statistics.Revision.Should().Be("revision-43");
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT name FROM widgets WHERE id = 9;";
+            command.ExecuteScalar().Should().Be("alice");
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
         }
         finally
         {
             DeleteReplicaFiles(path);
         }
     }
+
+    [Test]
+    public async Task LogicalSyncRequestBytesIncludeClientRevisionAndLogicalStreamKind()
+    {
+        var path = NewReplicaPath("managed-replica-logical-request-fields");
+        var image = CreateDatabaseImage(path + ".source");
+        var capturedRequests = new List<Dictionary<int, (ulong? Number, string? Text)>>();
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-42", body: []),
+        ],
+        request =>
+        {
+            var bytes = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+            if (bytes.Length > 0)
+                capturedRequests.Add(ReadFields(bytes));
+        });
+        var options = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open(); // bootstrap (no revision, empty request) + fresh-bootstrap catch-up
+            await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None).ConfigureAwait(false);
+
+            // The fresh-bootstrap catch-up and the explicit Sync() both know the remote is
+            // MvccLogical: both must carry client_revision (tag 3) and request the logical
+            // stream_kind (tag 8 = 1), proving the CreatePullRequest fix applies to every
+            // logical-capable pull, not just ones with a configured long-poll timeout.
+            capturedRequests.Should().HaveCount(2);
+            foreach (var fields in capturedRequests)
+            {
+                fields[3].Text.Should().Be("revision-42");
+                fields[8].Number.Should().Be(1);
+            }
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task MalformedLogicalResponseRollsBackAndRetainsThePreviousRevisionThenRetrySucceeds()
+    {
+        var path = NewReplicaPath("managed-replica-logical-malformed-rollback");
+        var image = CreateDatabaseImage(path + ".source");
+
+        var salt = 999UL;
+        var goodHeader = Lml3TestBuilder.BuildHeader(salt);
+        var goodCrc = Lml3TestBuilder.HeaderSeedCrc(salt);
+        var record = Core.Storage.SqliteRecordCodec.Encode([Core.SqlValue.Text("hello")]);
+        var op = Lml3TestBuilder.BuildRecoveryOp(0, 0, -1, Lml3TestBuilder.UpsertTablePayload(1, record));
+        var schemaRecord = Lml3TestBuilder.SchemaRecord("table", "widgets", 5, "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)");
+        var schemaOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -1, Lml3TestBuilder.UpsertTablePayload(1, schemaRecord));
+        var rowRecord = Core.Storage.SqliteRecordCodec.Encode([Core.SqlValue.Null, Core.SqlValue.Text("bob")]);
+        var rowOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -2, Lml3TestBuilder.UpsertTablePayload(3, rowRecord));
+        var recoveryPayload = schemaOp.Concat(rowOp).ToArray();
+        var portableTxn = Lml3TestBuilder.BuildPortableLogicalTxn(1, 1, ["widgets"], [(-2, 0)]);
+        var extRecord = Lml3TestBuilder.BuildExtensionRecord(Lml3TestBuilder.PortableChangesExtensionType, Lml3TestBuilder.Delimited(portableTxn));
+        var goodFrame = Lml3TestBuilder.BuildFrame(ref goodCrc, recoveryPayload, opCount: 2, extensionBlock: extRecord);
+        var goodBody = goodHeader.Concat(goodFrame).ToArray();
+        var goodRange = BuildLogicalLogRangeMessage(1, 0, (ulong)goodBody.Length, startsWithHeader: true);
+
+        // A corrupted body: flip a byte inside the frame's CRC so the decoder rejects it.
+        var corruptBody = (byte[])goodBody.Clone();
+        corruptBody[^5] ^= 0xFF;
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up
+            CreateLogicalPullResponse("revision-43", corruptBody, rangeMessages: [goodRange]), // malformed
+            CreateLogicalPullResponse("revision-43", goodBody, rangeMessages: [goodRange]), // retry, valid
+        ]);
+        var options = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            Func<Task> firstSync = () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            await firstSync.Should().ThrowAsync<InvalidDataException>();
+
+            // Failure must not advance the durable revision or table map, and must not leave a
+            // partially-applied schema/row change behind.
+            var afterFailure = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            afterFailure.Revision.Should().Be("revision-42");
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'widgets';";
+                command.ExecuteScalar().Should().Be(0L, "the failed apply must not have left a partially-created table");
+            }
+
+            var retryResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            retryResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            retryResult.Statistics.Revision.Should().Be("revision-43");
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "SELECT name FROM widgets WHERE id = 3;";
+                command.ExecuteScalar().Should().Be("bob");
+            }
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ProtocolTwoPagesReplaceBaseAppliesAFullAtomicReplacementAndRetainsLogicalProtocol()
+    {
+        var path = NewReplicaPath("managed-replica-logical-replace-base");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var replacedImage = CreateDatabaseImageWithMarker(path + ".replaced", 84);
+
+        var capturedThirdRequest = new List<Dictionary<int, (ulong? Number, string? Text)>>();
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up
+            CreateReplaceBasePullResponse("revision-43", replacedImage),
+            CreateLogicalPullResponse("revision-43", body: []), // proves the next pull still requests logical
+        ],
+        request =>
+        {
+            var bytes = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+            if (bytes.Length > 0)
+                capturedThirdRequest.Add(ReadFields(bytes));
+        });
+        var options = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+            ReadBootstrapMarker(connection).Should().Be(42);
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            ReadBootstrapMarker(connection).Should().Be(84);
+
+            // A second sync must still request the logical protocol: Pages+ReplaceBase for one
+            // response does not downgrade the persisted remote capability.
+            await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            capturedThirdRequest.Should().Contain(fields => fields.ContainsKey(8) && fields[8].Number == 1);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Protocol.Should().Be(RemotePullProtocol.MvccLogical);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task LogicalSyncCancellationLeavesThePreviousRevisionInPlace()
+    {
+        var path = NewReplicaPath("managed-replica-logical-cancel");
+        var image = CreateDatabaseImage(path + ".source");
+        var handler = new BlockingLogicalSyncHandler(
+            CreatePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: [])); // fresh-bootstrap catch-up, non-blocking
+        using var cancellation = new CancellationTokenSource();
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+
+            var sync = connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token);
+            await handler.SyncStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            cancellation.Cancel();
+            Assert.CatchAsync<OperationCanceledException>(() => sync);
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    /// <summary>
+    /// Like <see cref="BlockingPullUpdatesHandler"/> but accounts for the extra, non-blocking
+    /// fresh-bootstrap logical catch-up call: only the third call (the explicit <c>Sync()</c>)
+    /// blocks until released.
+    /// </summary>
+    private sealed class BlockingLogicalSyncHandler(byte[] bootstrapResponse, byte[] catchUpResponse) : HttpMessageHandler
+    {
+        private readonly TaskCompletionSource<bool> _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _callCount;
+
+        public TaskCompletionSource<bool> SyncStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            var call = Interlocked.Increment(ref _callCount);
+            byte[] payload;
+            if (call == 1)
+            {
+                payload = bootstrapResponse;
+            }
+            else if (call == 2)
+            {
+                payload = catchUpResponse;
+            }
+            else
+            {
+                SyncStarted.TrySetResult(true);
+                await _release.Task.WaitAsync(cancellationToken);
+                payload = catchUpResponse;
+            }
+
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(payload),
+            };
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
+            return response;
+        }
+    }
+
+    private static byte[] CreateReplaceBasePullResponse(string revision, byte[] databaseImage, ulong protocol = 2)
+        // CreatePullResponse already hard-codes apply_mode (tag 6) to 1 (ReplaceBase), matching
+        // every other page-stream fixture in this file; this wrapper just names that intent for
+        // the ReplaceBase-specific test below.
+        => CreatePullResponse(revision, databaseImage, protocol: protocol);
 
     [Test]
     public async Task ManagedReplicaAcceptsRawLegacyAndV1PageStreams()
@@ -550,6 +818,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             DeleteReplicaFiles(path);
         }
     }
+
 
     [Test]
     public async Task ManagedReplicaJournalDoesNotCaptureRemotePageApply()
@@ -1240,13 +1509,13 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
-        [Test]
-        public async Task SyncAsyncReportsUpToDateForTheStoredRevision()
-        {
-            var path = NewReplicaPath("managed-embedded-replica-up-to-date");
-            var image = CreateDatabaseImage(path + ".source");
-            var handler = new PullUpdatesHandler([
-                CreatePullResponse("revision-42", image),
+    [Test]
+    public async Task SyncAsyncReportsUpToDateForTheStoredRevision()
+    {
+        var path = NewReplicaPath("managed-embedded-replica-up-to-date");
+        var image = CreateDatabaseImage(path + ".source");
+        var handler = new PullUpdatesHandler([
+            CreatePullResponse("revision-42", image),
                 CreatePullResponse("revision-42", [], declaredPages: 1),
             ], request =>
             {
@@ -1261,86 +1530,86 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                 fields[3].Text.Should().Be("revision-42");
                 fields[4].Number.Should().Be(3000);
             });
-            var progress = new ProgressRecorder();
-            try
-            {
-                using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
-                connection.Open();
-                connection.Capabilities.SupportsSync.Should().BeTrue();
-                var result = await connection.SyncAsync(
-                    new AhtolaSyncOptions(progress),
-                    CancellationToken.None);
-                result.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
-                result.Statistics.Revision.Should().Be("revision-42");
-                result.Statistics.NetworkSentBytes.Should().BeGreaterThan(0);
-                result.Statistics.NetworkReceivedBytes.Should().BeGreaterThan(0);
-                progress.Stages.Should().Contain([AhtolaSyncProgressStage.Pulling, AhtolaSyncProgressStage.Completed]);
-                handler.CallCount.Should().Be(2);
-            }
-            finally { DeleteReplicaFiles(path); }
-        }
-
-        [Test]
-        public async Task SyncAsyncWithChangedRemotePublishesTheNewRevision()
+        var progress = new ProgressRecorder();
+        try
         {
-            var path = NewReplicaPath("managed-embedded-replica-changed");
-            var image = CreateDatabaseImage(path + ".source");
-            var handler = new PullUpdatesHandler([
-                CreatePullResponse("revision-42", image),
-                CreatePullResponse("revision-43", image),
-            ]);
-            try
-            {
-                using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
-                {
-                    connection.Open();
-                    var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
-                    result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
-                    result.Statistics.Revision.Should().Be("revision-43");
-                    using var command = connection.CreateCommand();
-                    command.CommandText = "SELECT value FROM bootstrap_marker;";
-                    command.ExecuteScalar().Should().Be(42L);
-                }
-                File.ReadAllBytes(path).Should().Equal(image);
-                File.ReadAllText(path + ".ahtola-replica-meta")
-                    .Should().Contain("server_revision_base64=cmV2aXNpb24tNDM=");
-            }
-            finally { DeleteReplicaFiles(path); }
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.Capabilities.SupportsSync.Should().BeTrue();
+            var result = await connection.SyncAsync(
+                new AhtolaSyncOptions(progress),
+                CancellationToken.None);
+            result.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            result.Statistics.Revision.Should().Be("revision-42");
+            result.Statistics.NetworkSentBytes.Should().BeGreaterThan(0);
+            result.Statistics.NetworkReceivedBytes.Should().BeGreaterThan(0);
+            progress.Stages.Should().Contain([AhtolaSyncProgressStage.Pulling, AhtolaSyncProgressStage.Completed]);
+            handler.CallCount.Should().Be(2);
         }
+        finally { DeleteReplicaFiles(path); }
+    }
 
     [Test]
-                public async Task QuiesceManagedReplicaReopensOnlyWhenNoReaderOrTransactionIsActive()
-                {
-                    var path = NewReplicaPath("managed-embedded-replica-quiesce");
-                    try
-                    {
-                        CreateInitializedDatabase(path);
-                        using var connection = AhtolaConnection.CreateReplica(
-                            new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null));
-                        connection.Open();
-                        await connection.QuiesceManagedReplicaAsync(_ => Task.CompletedTask);
-                        using (var command = connection.CreateCommand())
-                        {
-                            command.CommandText = "SELECT value FROM bootstrap_marker;";
-                            command.ExecuteScalar().Should().Be(42L);
-                        }
+    public async Task SyncAsyncWithChangedRemotePublishesTheNewRevision()
+    {
+        var path = NewReplicaPath("managed-embedded-replica-changed");
+        var image = CreateDatabaseImage(path + ".source");
+        var handler = new PullUpdatesHandler([
+            CreatePullResponse("revision-42", image),
+                CreatePullResponse("revision-43", image),
+            ]);
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+            {
+                connection.Open();
+                var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+                result.Statistics.Revision.Should().Be("revision-43");
+                using var command = connection.CreateCommand();
+                command.CommandText = "SELECT value FROM bootstrap_marker;";
+                command.ExecuteScalar().Should().Be(42L);
+            }
+            File.ReadAllBytes(path).Should().Equal(image);
+            File.ReadAllText(path + ".ahtola-replica-meta")
+                .Should().Contain("server_revision_base64=cmV2aXNpb24tNDM=");
+        }
+        finally { DeleteReplicaFiles(path); }
+    }
 
-                        using (var transaction = connection.BeginTransaction())
-                        {
-                            Assert.ThrowsAsync<InvalidOperationException>(
-                                () => connection.QuiesceManagedReplicaAsync(_ => Task.CompletedTask))!
-                                .Message.Should().Be("Managed embedded replica sync cannot run while a transaction is active.");
-                            transaction.Rollback();
-                        }
+    [Test]
+    public async Task QuiesceManagedReplicaReopensOnlyWhenNoReaderOrTransactionIsActive()
+    {
+        var path = NewReplicaPath("managed-embedded-replica-quiesce");
+        try
+        {
+            CreateInitializedDatabase(path);
+            using var connection = AhtolaConnection.CreateReplica(
+                new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null));
+            connection.Open();
+            await connection.QuiesceManagedReplicaAsync(_ => Task.CompletedTask);
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "SELECT value FROM bootstrap_marker;";
+                command.ExecuteScalar().Should().Be(42L);
+            }
 
-                        using var readerCommand = connection.CreateCommand();
-                        readerCommand.CommandText = "SELECT value FROM bootstrap_marker;";
-                        using var reader = readerCommand.ExecuteReader();
-                        Assert.ThrowsAsync<InvalidOperationException>(
-                            () => connection.QuiesceManagedReplicaAsync(_ => Task.CompletedTask))!
-                            .Message.Should().Be("Managed embedded replica sync cannot run while a data reader is active.");
-                    }
-                    finally { DeleteReplicaFiles(path); }
+            using (var transaction = connection.BeginTransaction())
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.QuiesceManagedReplicaAsync(_ => Task.CompletedTask))!
+                    .Message.Should().Be("Managed embedded replica sync cannot run while a transaction is active.");
+                transaction.Rollback();
+            }
+
+            using var readerCommand = connection.CreateCommand();
+            readerCommand.CommandText = "SELECT value FROM bootstrap_marker;";
+            using var reader = readerCommand.ExecuteReader();
+            Assert.ThrowsAsync<InvalidOperationException>(
+                () => connection.QuiesceManagedReplicaAsync(_ => Task.CompletedTask))!
+                .Message.Should().Be("Managed embedded replica sync cannot run while a data reader is active.");
+        }
+        finally { DeleteReplicaFiles(path); }
     }
 
     [Test]
@@ -1924,6 +2193,54 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         return response.ToArray();
     }
 
+    private static byte[] BuildLogicalLogRangeMessage(
+        ulong generation, ulong startOffset, ulong endOffset, bool startsWithHeader, byte[]? crcSeed = null)
+    {
+        var range = new List<byte>();
+        WriteVarintField(range, 1, generation);
+        WriteVarintField(range, 2, startOffset);
+        WriteVarintField(range, 3, endOffset);
+        if (startsWithHeader)
+            WriteVarintField(range, 4, 1);
+        if (crcSeed is not null)
+            WriteLengthDelimitedField(range, 5, crcSeed);
+        return range.ToArray();
+    }
+
+    /// <summary>Builds a pull-updates response header (tag 5 = stream_kind MvccLogicalLog) plus its raw lml3 body appended verbatim (no further length-delimited framing).</summary>
+    private static byte[] CreateLogicalPullResponse(
+        string revision,
+        byte[] body,
+        IReadOnlyList<byte[]>? rangeMessages = null,
+        ulong declaredPages = 1,
+        ulong applyMode = 0,
+        ulong protocol = 2,
+        bool checkpointTransition = false)
+    {
+        var header = new List<byte>();
+        WriteLengthDelimitedField(header, 1, Encoding.UTF8.GetBytes(revision));
+        WriteVarintField(header, 2, declaredPages);
+        WriteLengthDelimitedField(header, 3, []); // raw_encoding
+        WriteVarintField(header, 5, 1); // stream_kind = MvccLogicalLog
+        WriteVarintField(header, 6, applyMode);
+        if (rangeMessages is not null)
+        {
+            var metadata = new List<byte>();
+            WriteLengthDelimitedField(metadata, 1, Encoding.UTF8.GetBytes("lml3"));
+            if (checkpointTransition)
+                WriteVarintField(metadata, 2, 1);
+            foreach (var range in rangeMessages)
+                WriteLengthDelimitedField(metadata, 3, range);
+            WriteLengthDelimitedField(header, 7, metadata.ToArray());
+        }
+        WriteVarintField(header, 8, protocol);
+
+        var response = new List<byte>();
+        WriteDelimitedMessage(response, header);
+        response.AddRange(body);
+        return response.ToArray();
+    }
+
     private static byte[] CreateOversizedMessagePrefix()
     {
         var response = new List<byte>();
@@ -1955,21 +2272,21 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     private static Dictionary<int, (ulong? Number, string? Text)> ReadFields(byte[] payload)
+    {
+        var fields = new Dictionary<int, (ulong?, string?)>();
+        var offset = 0;
+        while (offset < payload.Length)
         {
-            var fields = new Dictionary<int, (ulong?, string?)>();
-            var offset = 0;
-            while (offset < payload.Length)
-            {
-                var key = ReadVarint(payload, ref offset);
-                var field = checked((int)(key >> 3));
-                fields[field] = (key & 7) == 0
-                    ? (ReadVarint(payload, ref offset), null)
-                    : (null, Encoding.UTF8.GetString(payload, offset + 1, checked((int)payload[offset])));
-                if ((key & 7) == 2)
-                    offset += 1 + payload[offset];
-            }
-            return fields;
+            var key = ReadVarint(payload, ref offset);
+            var field = checked((int)(key >> 3));
+            fields[field] = (key & 7) == 0
+                ? (ReadVarint(payload, ref offset), null)
+                : (null, Encoding.UTF8.GetString(payload, offset + 1, checked((int)payload[offset])));
+            if ((key & 7) == 2)
+                offset += 1 + payload[offset];
         }
+        return fields;
+    }
     private static ulong ReadVarint(byte[] source, ref int offset)
     {
         ulong result = 0;
