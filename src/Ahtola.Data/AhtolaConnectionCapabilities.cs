@@ -105,7 +105,7 @@ public sealed class AhtolaConnectionCapabilities
     private static readonly AhtolaConnectionCapabilities AhtolaManagedEmbeddedReplica = new(
         AhtolaConnectionFacade.AhtolaData,
         AhtolaConnectionMode.EmbeddedReplica,
-        canCreateBatch: false,
+        canCreateBatch: true,
         supportsAsyncOperations: true,
         supportsTransactions: true,
         supportsSavepoints: true);
@@ -113,7 +113,7 @@ public sealed class AhtolaConnectionCapabilities
     private static readonly AhtolaConnectionCapabilities AhtolaSyncEmbeddedReplica = new(
         AhtolaConnectionFacade.AhtolaData,
         AhtolaConnectionMode.EmbeddedReplica,
-        canCreateBatch: false,
+        canCreateBatch: true,
         supportsAsyncOperations: true,
         supportsTransactions: true,
         supportsSavepoints: true,

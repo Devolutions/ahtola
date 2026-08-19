@@ -59,6 +59,134 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public void ManagedReplicaBatchSupportsAutocommitWritesAndReportsCapabilities()
+    {
+        var path = NewReplicaPath("managed-replica-batch-autocommit");
+        try
+        {
+            CreateJournalDatabase(path);
+            using var connection = AhtolaConnection.CreateReplica(
+                new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null));
+            connection.Open();
+
+            connection.CanCreateBatch.Should().BeTrue();
+            connection.Capabilities.CanCreateBatch.Should().BeTrue();
+            using var batch = connection.CreateBatch();
+            batch.Should().BeOfType<AhtolaBatch>();
+            var managedBatch = (AhtolaBatch)batch;
+            managedBatch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (10);"));
+            managedBatch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (20);"));
+
+            managedBatch.ExecuteNonQuery().Should().Be(2);
+            managedBatch.BatchCommands.Select(command => command.RecordsAffected).Should().Equal(1, 1);
+            connection.ReadManagedReplicaLocalChanges(10).Changes
+                .Select(change => change.RowId)
+                .Should()
+                .Equal(1, 2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ManagedReplicaBatchPreservesTransactionAndCancellationSemantics()
+    {
+        var path = NewReplicaPath("managed-replica-batch-transaction");
+        try
+        {
+            CreateJournalDatabase(path);
+            using var connection = AhtolaConnection.CreateReplica(
+                new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null));
+            connection.Open();
+
+            using (var transaction = connection.BeginTransaction())
+            {
+                using var batch = (AhtolaBatch)connection.CreateBatch();
+                batch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (10);"));
+                batch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (20);"));
+                (await batch.ExecuteNonQueryAsync(CancellationToken.None)).Should().Be(2);
+                connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+                transaction.Commit();
+            }
+
+            using (var transaction = connection.BeginTransaction())
+            {
+                using var batch = (AhtolaBatch)connection.CreateBatch();
+                batch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (30);"));
+                batch.ExecuteNonQuery().Should().Be(1);
+                transaction.Rollback();
+            }
+
+            using (var cancelledBatch = (AhtolaBatch)connection.CreateBatch())
+            {
+                cancelledBatch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (40);"));
+                Assert.ThrowsAsync<OperationCanceledException>(
+                    async () => await cancelledBatch.ExecuteNonQueryAsync(new CancellationToken(canceled: true)));
+            }
+
+            connection.ReadManagedReplicaLocalChanges(10).Changes
+                .Select(change => change.RowId)
+                .Should()
+                .Equal(1, 2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void ManagedReplicaBatchPreservesMixedResultOrderingAndRejectsRemoteConditions()
+    {
+        var path = NewReplicaPath("managed-replica-batch-results");
+        try
+        {
+            CreateJournalDatabase(path);
+            using var connection = AhtolaConnection.CreateReplica(
+                new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null));
+            connection.Open();
+
+            using (var batch = (AhtolaBatch)connection.CreateBatch())
+            {
+                batch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (10);"));
+                batch.BatchCommands.Add(new AhtolaBatchCommand("SELECT value FROM journal_events ORDER BY value;"));
+                batch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (20);"));
+                batch.BatchCommands.Add(new AhtolaBatchCommand("SELECT value FROM journal_events ORDER BY value;"));
+
+                using var reader = batch.ExecuteReader();
+                reader.FieldCount.Should().Be(0);
+                reader.NextResult().Should().BeTrue();
+                reader.Read().Should().BeTrue();
+                reader.GetInt64(0).Should().Be(10);
+                reader.Read().Should().BeFalse();
+                reader.NextResult().Should().BeTrue();
+                reader.FieldCount.Should().Be(0);
+                reader.NextResult().Should().BeTrue();
+                reader.Read().Should().BeTrue();
+                reader.GetInt64(0).Should().Be(10);
+                reader.Read().Should().BeTrue();
+                reader.GetInt64(0).Should().Be(20);
+                reader.NextResult().Should().BeFalse();
+                reader.RecordsAffected.Should().Be(2);
+            }
+
+            using var conditionalBatch = (AhtolaBatch)connection.CreateBatch();
+            conditionalBatch.BatchCommands.Add(new AhtolaBatchCommand("SELECT 1")
+            {
+                RemoteCondition = AhtolaRemoteBatchCondition.IsAutocommit,
+            });
+            Assert.Throws<NotSupportedException>(() => conditionalBatch.ExecuteNonQuery())!
+                .Message.Should().Be("RemoteCondition requires a remote Ahtola connection.");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public void ManagedReplicaJournalCapturesOnlyCommittedTransactionMutations()
     {
         var path = NewReplicaPath("managed-replica-journal-commit");
@@ -154,7 +282,9 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             using (var connection = AhtolaConnection.CreateReplica(options))
             {
                 connection.Open();
-                connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+                using var writeBatch = (AhtolaBatch)connection.CreateBatch();
+                writeBatch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (10);"));
+                writeBatch.ExecuteNonQuery().Should().Be(1);
             }
 
             using var reopened = AhtolaConnection.CreateReplica(options);
@@ -471,7 +601,9 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             using (var connection = AhtolaConnection.CreateReplica(options))
             {
                 connection.Open();
-                connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+                using var batch = (AhtolaBatch)connection.CreateBatch();
+                batch.BatchCommands.Add(new AhtolaBatchCommand("INSERT INTO journal_events VALUES (10);"));
+                batch.ExecuteNonQuery().Should().Be(1);
 
                 var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
                 result.Statistics.CdcOperations.Should().Be(1);
@@ -1253,6 +1385,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             CreatePullResponse("revision-42", [], declaredPages: 1),
             CreatePullResponse("revision-42", [], declaredPages: 1),
             CreatePullResponse("revision-42", [], declaredPages: 1),
+            CreatePullResponse("revision-42", [], declaredPages: 1),
         ]);
         try
         {
@@ -1283,6 +1416,17 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             (await readerSync.WaitAsync(TimeSpan.FromSeconds(5))).Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
 
             prepared.ExecuteScalar().Should().Be(42L);
+
+            using (var batch = (AhtolaBatch)local.CreateBatch())
+            {
+                batch.BatchCommands.Add(new AhtolaBatchCommand("SELECT value FROM bootstrap_marker;"));
+                using var batchReader = batch.ExecuteReader();
+                var batchSync = synchronizer.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+                await Task.Delay(100);
+                batchSync.IsCompleted.Should().BeFalse();
+                batchReader.Dispose();
+                (await batchSync.WaitAsync(TimeSpan.FromSeconds(5))).Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            }
 
             local.ExecuteNonQuery("BEGIN;");
             var sqlTransactionSync = synchronizer.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
