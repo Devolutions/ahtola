@@ -132,6 +132,7 @@ public sealed class InMemoryFileSystem : IFileSystem, IAtomicFileSystem
         if (readOnly && mode == FileOpenMode.CreateNew)
             throw new ArgumentException("A newly created file cannot be opened read-only.", nameof(readOnly));
 
+        _faults?.BeforeOperation(FileSystemOperation.Open);
         lock (_gate)
         {
             var exists = _files.TryGetValue(path, out var store);
@@ -156,6 +157,7 @@ public sealed class InMemoryFileSystem : IFileSystem, IAtomicFileSystem
     public void DeleteFile(string path)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
+        _faults?.BeforeOperation(FileSystemOperation.Delete);
         lock (_gate)
             _files.Remove(path);
     }

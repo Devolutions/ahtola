@@ -21,11 +21,13 @@ public enum FileOpenMode
 /// </summary>
 public enum FileSystemOperation
 {
-    Read,
-    Write,
-    SetLength,
-    FlushToDisk,
-    AtomicReplace,
+    Read = 0,
+    Write = 1,
+    SetLength = 2,
+    FlushToDisk = 3,
+    AtomicReplace = 4,
+    Open = 5,
+    Delete = 6,
 }
 
 /// <summary>
@@ -76,6 +78,16 @@ internal interface IAtomicFileSystem
         string sourcePath,
         string destinationPath,
         bool replaceEmptyDestination);
+}
+
+/// <summary>
+/// Optional temporary-file capability. Implementations that can ask the host to
+/// remove a file when its final handle closes expose it without leaking host I/O
+/// APIs into execution code.
+/// </summary>
+internal interface ITemporaryFileSystem
+{
+    IFile OpenTemporaryFile(string path);
 }
 
 /// <summary>

@@ -639,7 +639,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ConcurrentMvccIdentityTracker? ConcurrentMvccIdentityTracker = null,
         SqliteTextEncoding MvccTextEncoding = SqliteTextEncoding.Utf8,
         IReadOnlyDictionary<string, VirtualTableDefinition>? VirtualTables = null,
-        ChangeDataCaptureSession? ChangeDataCapture = null)
+        ChangeDataCaptureSession? ChangeDataCapture = null,
+        VdbeExecutionOptions? VdbeExecutionOptions = null)
     {
         /// <summary>
         /// Row-loop checkpoint. It honors cooperative cancellation exactly as before and
@@ -1381,7 +1382,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool ignoreCheckConstraints = false,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
-        ChangeDataCaptureSession? changeDataCapture = null)
+        ChangeDataCaptureSession? changeDataCapture = null,
+        VdbeExecutionOptions? vdbeExecutionOptions = null)
     {
         var result = ExecuteCore(
             statement,
@@ -1398,7 +1400,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ignoreCheckConstraints,
             executeTableList,
             externalTables,
-            changeDataCapture);
+            changeDataCapture,
+            vdbeExecutionOptions);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -1432,7 +1435,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool ignoreCheckConstraints = false,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
-        ChangeDataCaptureSession? changeDataCapture = null)
+        ChangeDataCaptureSession? changeDataCapture = null,
+        VdbeExecutionOptions? vdbeExecutionOptions = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -1455,7 +1459,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ignoreCheckConstraints,
                 executeTableList,
                 externalTables,
-                changeDataCapture));
+                changeDataCapture,
+                vdbeExecutionOptions));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -1502,7 +1507,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 ignoreCheckConstraints,
                                 executeTableList,
                                 externalTables,
-                                changeDataCapture: changeDataCapture);
+                                changeDataCapture: changeDataCapture,
+                                vdbeExecutionOptions: vdbeExecutionOptions);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -1571,7 +1577,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 ignoreCheckConstraints,
                                 executeTableList,
                                 externalTables,
-                                changeDataCapture: changeDataCapture);
+                                changeDataCapture: changeDataCapture,
+                                vdbeExecutionOptions: vdbeExecutionOptions);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -1612,7 +1619,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             ignoreCheckConstraints,
                             executeTableList,
                             externalTables,
-                            changeDataCapture: changeDataCapture);
+                            changeDataCapture: changeDataCapture,
+                            vdbeExecutionOptions: vdbeExecutionOptions);
 
                     var working = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
                     ExecutionResult result;
@@ -1634,7 +1642,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             ignoreCheckConstraints,
                             executeTableList,
                             externalTables,
-                            changeDataCapture: changeDataCapture);
+                            changeDataCapture: changeDataCapture,
+                            vdbeExecutionOptions: vdbeExecutionOptions);
                     }
                     catch (EmbeddedConflictFailException)
                     {
@@ -2027,7 +2036,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         long lastInsertRowId,
         bool foreignKeysEnabled,
         bool recursiveTriggersEnabled,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        VdbeExecutionOptions? vdbeExecutionOptions = null)
     {
         lock (_gate)
         {
@@ -2038,7 +2048,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 lastInsertRowId,
                 foreignKeysEnabled,
                 recursiveTriggersEnabled,
-                cancellationToken);
+                cancellationToken,
+                vdbeExecutionOptions);
         }
     }
 
@@ -2049,7 +2060,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         long lastInsertRowId,
         bool foreignKeysEnabled,
         bool recursiveTriggersEnabled,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        VdbeExecutionOptions? vdbeExecutionOptions = null)
     {
         var context = new QueryContext(
             catalog.Tables,
@@ -2059,7 +2071,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             LastInsertRowId: lastInsertRowId,
             ForeignKeysEnabled: foreignKeysEnabled,
             RecursiveTriggersEnabled: recursiveTriggersEnabled,
-            CancellationToken: cancellationToken);
+            CancellationToken: cancellationToken,
+            VdbeExecutionOptions: vdbeExecutionOptions);
         var result = MaterializeQueryResult(ExecuteQuery(statement, parameters, context, outerRow: null));
         var affinities = DescribeQueryAffinities(
             statement,
@@ -3627,7 +3640,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
         MvStore? concurrentMvStore = null,
         MvccTxId? concurrentMvccTxId = null,
-        ChangeDataCaptureSession? changeDataCapture = null)
+        ChangeDataCaptureSession? changeDataCapture = null,
+        VdbeExecutionOptions? vdbeExecutionOptions = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -3653,7 +3667,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 externalTables,
                 concurrentMvStore,
                 concurrentMvccTxId,
-                changeDataCapture));
+                changeDataCapture,
+                vdbeExecutionOptions));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -3689,7 +3704,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ConcurrentMvccIdentityTracker: concurrentMvStore is null ? null : new ConcurrentMvccIdentityTracker(),
             MvccTextEncoding: GetTextEncoding(),
             VirtualTables: catalog.VirtualTables,
-            ChangeDataCapture: changeDataCapture);
+            ChangeDataCapture: changeDataCapture,
+            VdbeExecutionOptions: vdbeExecutionOptions);
         EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
         var result = statement switch
         {
@@ -10572,7 +10588,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         if (CanRouteInsertThroughCompiler(statement, context)
             && TryCompileInsert(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
-            return RunCompiledDml(compiled, columns, hasReturning, parameters);
+            return RunCompiledDml(compiled, columns, hasReturning, parameters, context.VdbeExecutionOptions);
 
         return PerformInsertEvaluated(statement, parameters, context);
     }
@@ -11508,12 +11524,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 foreignKeyCompiled,
                 foreignKeyColumns,
                 foreignKeyHasReturning,
-                parameters);
+                parameters,
+                context.VdbeExecutionOptions);
         }
 
         if (CanRouteUpdateThroughCompiler(statement, context)
             && TryCompileUpdate(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
-            return RunCompiledDml(compiled, columns, hasReturning, parameters);
+            return RunCompiledDml(compiled, columns, hasReturning, parameters, context.VdbeExecutionOptions);
 
         return PerformUpdateEvaluated(statement, parameters, context);
     }
@@ -13989,12 +14006,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 foreignKeyCompiled,
                 foreignKeyColumns,
                 foreignKeyHasReturning,
-                parameters);
+                parameters,
+                context.VdbeExecutionOptions);
         }
 
         if (CanCompilePlainDelete(context)
             && TryCompileDelete(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
-            return RunCompiledDml(compiled, columns, hasReturning, parameters);
+            return RunCompiledDml(compiled, columns, hasReturning, parameters, context.VdbeExecutionOptions);
 
         return PerformDeleteEvaluated(statement, parameters, context);
     }
@@ -14892,7 +14910,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 compiled,
                 columns,
                 BuildValuesBinding(compiled.ParameterIndices ?? [], parameters),
-                context.CancellationToken);
+                context.CancellationToken,
+                context.VdbeExecutionOptions);
         }
 
         return ExecuteSelect(select, parameters, context, outerRow);
@@ -20261,10 +20280,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CompiledSelect compiled,
         string[] columns,
         VdbeParameterBinding? parameterBinding,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        VdbeExecutionOptions? executionOptions = null)
     {
-        using var runtime = new ResumableStatement(
+        using var runtime = ResumableStatement.CreateWithExecutionOptions(
             compiled.Program,
+            executionOptions ?? VdbeExecutionOptions.Default,
             compiled.CursorSources,
             parameterBinding: parameterBinding);
         var rows = new List<SqlValue[]>();
@@ -20289,10 +20310,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CompiledDml compiled,
         string[] columns,
         bool hasReturning,
-        SqlValue[] parameters)
+        SqlValue[] parameters,
+        VdbeExecutionOptions? executionOptions = null)
     {
-        using var runtime = new ResumableStatement(
+        using var runtime = ResumableStatement.CreateWithExecutionOptions(
             compiled.Program,
+            executionOptions ?? VdbeExecutionOptions.Default,
             compiled.CursorSources,
             compiled.RuntimeWriteTargets,
             BuildValuesBinding(compiled.ParameterIndices ?? [], parameters));
@@ -24438,7 +24461,8 @@ out bool hasReturning)
             return RunCompiledProgram(
                 compiledCompound,
                 compoundColumns,
-                BuildValuesBinding(compiledCompound.ParameterIndices ?? [], parameters));
+                BuildValuesBinding(compiledCompound.ParameterIndices ?? [], parameters),
+                executionOptions: context.VdbeExecutionOptions);
         }
 
         var first = ExecuteCompoundTerm(statement.Terms[0], parameters, context, outerRow);
@@ -41777,6 +41801,33 @@ public sealed partial class EmbeddedConnection : IDisposable
         }
     }
 
+    private VdbeExecutionOptions CreateVdbeExecutionOptions(EmbeddedDatabase database)
+    {
+        ArgumentNullException.ThrowIfNull(database);
+        if (_tempStore == 2)
+        {
+            return new VdbeExecutionOptions(
+                new InMemoryFileSystem(),
+                long.MaxValue,
+                temporaryDirectory: "ahtola-memory-sorter");
+        }
+
+        var cacheSize = _cacheSizes.GetValueOrDefault(database, -2000);
+        Int128 bytes = cacheSize < 0
+            ? (Int128)(cacheSize == long.MinValue ? long.MaxValue : -cacheSize) * 1024
+            : (Int128)cacheSize * database.GetPageSize();
+        var budget = bytes <= 0
+            ? 1L
+            : bytes >= long.MaxValue
+                ? long.MaxValue
+                : (long)bytes;
+
+        return new VdbeExecutionOptions(
+            PhysicalFileSystem.Instance,
+            budget,
+            temporaryDirectory: Path.GetTempPath());
+    }
+
     /// <summary>
     /// Tracks one outer statement's use of connection-private temp triggers. Temp triggers live in
     /// a separate in-memory database, so firing one for a main-schema table means handing it to the
@@ -43188,6 +43239,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                     throw new EmbeddedSqlException("attempt to write a readonly database");
 
                 var routed = RouteStatement(statement);
+                var vdbeExecutionOptions = CreateVdbeExecutionOptions(routed.Database);
                 // A reader-excluding EXCLUSIVE transaction on another connection blocks
                 // this statement outright, which is what SQLite's EXCLUSIVE lock does
                 // under a rollback journal.
@@ -43248,7 +43300,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 executeTableList: ExecutePragmaTableList,
                                 concurrentMvStore: concurrentStore,
                                 concurrentMvccTxId: concurrentTxId,
-                                changeDataCapture: changeDataCapture);
+                                changeDataCapture: changeDataCapture,
+                                vdbeExecutionOptions: vdbeExecutionOptions);
                         }
                         else if (transactionState is null)
                         {
@@ -43270,7 +43323,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     ignoreCheckConstraints: _ignoreCheckConstraints,
                                     executeTableList: ExecutePragmaTableList,
                                     externalTables: routed.ExternalTables,
-                                    changeDataCapture: changeDataCapture);
+                                    changeDataCapture: changeDataCapture,
+                                    vdbeExecutionOptions: vdbeExecutionOptions);
                             }
                             catch (Exception failure)
                                 when (failure is not EmbeddedConflictFailException
@@ -43308,7 +43362,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 externalTables: routed.ExternalTables,
                                 concurrentMvStore: concurrentStore,
                                 concurrentMvccTxId: concurrentTxId,
-                                changeDataCapture: changeDataCapture);
+                                changeDataCapture: changeDataCapture,
+                                vdbeExecutionOptions: vdbeExecutionOptions);
                             if (EmbeddedDatabase.MayMutate(routed.Statement))
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not
@@ -43909,6 +43964,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         var sourceQuery = source.Statement as QueryStatement
             ?? throw new InvalidOperationException("CREATE TABLE AS SELECT routing did not return a query.");
         var sourceState = GetTransactionState(source.Database);
+        var vdbeExecutionOptions = CreateVdbeExecutionOptions(source.Database);
         var materialization = sourceState is null
             ? source.Database.MaterializeCreateTableAs(
                 sourceQuery,
@@ -43916,7 +43972,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 _lastInsertRowId,
                 _foreignKeys,
                 _recursiveTriggers,
-                cancellationToken)
+                cancellationToken,
+                vdbeExecutionOptions)
             : source.Database.MaterializeCreateTableAs(
                 sourceQuery,
                 parameters,
@@ -43924,7 +43981,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 _lastInsertRowId,
                 _foreignKeys,
                 _recursiveTriggers,
-                cancellationToken);
+                cancellationToken,
+                vdbeExecutionOptions);
         cancellationToken.ThrowIfCancellationRequested();
         if (ReferenceEquals(source.Database, _tempDatabase))
             _tempInitialized = true;
