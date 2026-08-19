@@ -317,6 +317,9 @@ public class AhtolaTransaction : DbTransaction
             IsolationLevel.Unspecified => IsolationLevel.Serializable,
             IsolationLevel.Serializable => IsolationLevel.Serializable,
             IsolationLevel.ReadCommitted => IsolationLevel.Serializable,
+
+            // Serializable is strictly stronger, so upgrading honours the request.
+            IsolationLevel.RepeatableRead => IsolationLevel.Serializable,
             IsolationLevel.ReadUncommitted => IsolationLevel.ReadUncommitted,
             _ => throw new NotSupportedException($"Isolation level {isolationLevel} is not supported.")
         };
