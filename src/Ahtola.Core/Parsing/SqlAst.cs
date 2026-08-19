@@ -307,6 +307,14 @@ internal sealed record PragmaDeferForeignKeysStatement(bool? Enabled, string? Sc
 
 internal sealed record PragmaRecursiveTriggersStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
 
+/// <summary>
+/// Turso's connection-scoped public change-data-capture configuration. A null
+/// value queries the active configuration; otherwise it is <c>mode[,table]</c>.
+/// </summary>
+internal sealed record PragmaCaptureDataChangesConnectionStatement(
+    string? Value,
+    string? Schema = null) : ParsedStatement;
+
 internal enum PragmaHeaderIntegerKind
 {
     SchemaVersion,
