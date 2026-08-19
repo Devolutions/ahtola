@@ -235,10 +235,12 @@ connection, and a managed embedded replica — see
 
 Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
 
-- **In-memory working set** — tables and intermediate results stay in the process
-  heap; nothing spills to disk. Prefer modest databases and explicit transactions
-  for writes (managed writes are slower than native SQLite and the gap grows with
-  table size).
+- **Working set** — tables and most intermediates stay in the process heap.
+  Sorters spill stable runs through the managed temporary file system once their
+  memory budget is exceeded, but hash joins, DISTINCT/compound operations, and
+  opaque aggregate state do not yet spill. Prefer modest databases and explicit
+  transactions for writes (managed writes are slower than native SQLite and the
+  gap grows with table size).
 - **Planner** — `ANALYZE` / `sqlite_stat1` feed index scoring and limited join
   cost gates (selective outer for two-table INNER nested loops; equijoin hash
   build side). Full System-R DP join reordering and multi-index AND intersection
@@ -260,16 +262,22 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   can read a DB still held by native SQLite/Turso (e.g. winget `index.db`) without
   taking main-file locks.
 - **MVCC** — process-local `PRAGMA journal_mode=mvcc` + `BEGIN CONCURRENT` with
-  dual-cursor SELECT/DML routing, logical log, and a checkpoint SM skeleton
-  (`PRAGMA wal_checkpoint` in MVCC mode). Not cross-process; residual schema-
-  cookie polish and full per-page b-tree checkpoint SM remain open — see
-  [docs/mvcc-port-contract.md](docs/mvcc-port-contract.md).
+  typed rowid/composite-key and materialized-index overlays, a durable logical
+  log, and a synchronous page-WAL checkpoint sequence (`PRAGMA wal_checkpoint`
+  in MVCC mode). Not cross-process; concurrent DDL remains exclusive while
+  active MVCC snapshots exist, and lazy per-page cursor/checkpoint parity is
+  still deferred — see [docs/mvcc-port-contract.md](docs/mvcc-port-contract.md).
 - **Managed virtual-table subset** — statically registered `fts5`, `rtree`, and
   `rtree_i32` modules persist module-owned state in the managed catalog, but are
   not full SQLite FTS5/R-Tree implementations and do not create interoperable
-  FTS/R-Tree shadow tables. Loadable extensions, raw `sqlite3*` handles
-  (`Handle` is null), AEGIS encryption ciphers, sync engine / CDC, CREATE
-  SEQUENCE, and typed-value extensions remain unavailable.
+  FTS/R-Tree shadow tables.
+- **SQL CDC** — `PRAGMA capture_data_changes_conn` implements Turso v0.7.2's
+  per-connection V1/V2 CDC tables and transactional COMMIT records. It is
+  independent of the managed replica's private journal and does not provide a
+  full sync engine or logical-replication replay.
+- **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
+  is null), AEGIS encryption ciphers, the full sync engine / advanced replica
+  protocols, `CREATE SEQUENCE`, and typed-value extensions.
 - **Native / Sync companions** — not shipped. Connection-string paths that need
   them fail closed. OS P/Invoke in the pager for locks/WAL is intentional engine
   code, not a Rust SDK binding.

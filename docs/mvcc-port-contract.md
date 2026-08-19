@@ -45,22 +45,23 @@ Pinned submodule: `turso-src/` @ **v0.7.2** (`046e9cbf6`).
 | **1** | Clock, `MvStore` tx registry + write-set WW conflicts, pragma/BEGIN surface, classic catalog DML under concurrent txs |
 | **1.5** | Row-version chains (`Insert`/`Update`/`Delete`/`TryRead`/`ScanVisible`), visibility + WW on chains, commit stamp rewrite, rollback drop |
 | **2** | Durable logical log (`*.db-log`) with Turso LML2/MVTX framing constants, CRC32C, upsert/delete ops, replay into `MvStore` on enable; checkpoint TRUNCATE clears log |
-| **3** | Header version **255** via pager `SwitchJournalMode(Mvcc)`; cold open restores `MvStore`; `MvccDualCursor` merge primitive; **shared `MvStore`/log per path** (`EmbeddedMvStoreRegistry`) so pooled multi-connection concurrent writers share one version store + rowid allocator; concurrent commit reloads durable catalog then merges store snapshots |
-| **3.5** | **SQL dual-cursor routing:** under `BEGIN CONCURRENT`, `GetNamedTableRows` merges base catalog + store via `MvccDualCursor.MergeVisibleRows`; DML records versions via `ReportRowChange` → `DeleteOrTombstoneBase` / `UpdateIncludingBase` (DELETE/UPDATE) and connection `RecordConcurrentMvccMutation` (INSERT + global rowid); peer uncommitted writes invisible; SI after peer commit; same-row WW on SQL path |
+| **3** | Header version **255** via pager `SwitchJournalMode(Mvcc)`; cold open restores `MvStore`; typed `MvccKey` rows/index objects and V4 logical-log frames cover rowid and composite keys; **shared `MvStore`/log per path** (`EmbeddedMvStoreRegistry`) lets pooled multi-connection concurrent writers share one version store; concurrent commit reloads durable catalog then merges store snapshots |
+| **3.5** | **SQL dual-cursor routing:** under `BEGIN CONCURRENT`, typed base/store overlays cover rowid and `WITHOUT ROWID` primary keys, with materialized index-plan overlays. DML records typed table/index versions through `ReportRowChange`, including trigger and foreign-key actions; peer uncommitted writes remain invisible, snapshot isolation holds after peer commit, and same-key writes conflict. |
 | **3.6 (current)** | **Synchronous page-WAL checkpoint state machine:** `PRAGMA wal_checkpoint` in MVCC mode runs `RunMvccCheckpoint` — AcquireLock → Collect/Materialize (reuse `MergeConcurrentCatalogFromStoreLocked`) → persist pages to WAL **without automatic reset** → backfill and flush the main store → retire/upgrade the logical log → reset the WAL last for TRUNCATE/RESTART/FULL → `GarbageCollectAfterCheckpoint`. Active concurrent txs return busy before mutation. PASSIVE retains both WAL and logical-log recovery evidence. This adapts Turso's cooperative b-tree I/O state machine to managed synchronous `IFileSystem` operations. |
-| **Open** | MVCC-versioned schema rows (concurrent DDL currently fails closed); schema generation cookie polish; full per-page btree checkpoint SM / WAL TRUNCATE interleave parity with Turso if product requires it |
+| **Open** | Concurrent DDL is deliberately exclusive while active MVCC snapshots exist; full lazy per-page B-tree cursor/checkpoint parity with Turso remains deferred if product requires it. |
 
 ## Dual-cursor SQL routing notes
 
-- **INSERT:** classic catalog insert first; connection allocates store-global rowid and `MvStore.Insert`. `ReportRowChange` does **not** re-insert (avoids double store rows).
-- **DELETE of base-only row:** pure tombstone (`begin=txId`, `end=null`, `IsTombstone=true`). `SnapshotCommittedDeletes` treats committed live tombstones as deletes for catalog merge.
-- **UPDATE of base-only row:** `UpdateIncludingBase` = tombstone prior + insert new cells.
-- **WW on concurrent base tombstones:** `ThrowIfConcurrentWriterOnRow` — pure tombstones share `End=null`, so classic chain WW alone is insufficient.
-- **SELECT:** dual-cursor path is rowid tables only; `sqlite_*` and WITHOUT ROWID stay catalog-only.
-  Concurrent DML against those catalog-only targets fails before mutation until system-table and
-  composite-key dual-cursor routing exists, preventing a transaction-local catalog change from
-  being dropped during the store-to-catalog merge. The same gate applies to row-trigger bodies
-  and foreign-key CASCADE/SET NULL/SET DEFAULT actions.
+- **INSERT:** rowid tables allocate a store-global rowid; `WITHOUT ROWID` tables derive a typed,
+  collation-aware primary-key identity. `ReportRowChange` records the corresponding table and
+  index versions without double insertion.
+- **DELETE/UPDATE:** base-key tombstones and replacements remain one MVCC mutation scope. Primary
+  key or indexed-value changes remove old typed/index keys and insert their replacements.
+- **WW:** `ThrowIfConcurrentWriterOnRow` applies to the typed identity, so pure base tombstones
+  cannot bypass first-committer-wins conflict detection.
+- **SELECT:** typed dual-cursor routing covers rowid and `WITHOUT ROWID` primary-key scans, with
+  materialized index-plan overlays. `sqlite_schema` publication is schema-generation gated; DDL
+  remains exclusive against active MVCC snapshots rather than exposing a stale catalog.
 - **Process-local:** store is not cross-process (same as Turso process MVCC scope here).
 
 ## Checkpoint notes
