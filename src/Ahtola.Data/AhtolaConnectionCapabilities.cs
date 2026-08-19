@@ -185,5 +185,5 @@ public sealed class AhtolaConnectionCapabilities
 
     internal static bool IsRemoteDataSource(string dataSource)
         => Uri.TryCreate(dataSource, UriKind.Absolute, out var uri)
-           && uri.Scheme is "libsql" or "http" or "https" or "ws" or "wss";
+           && uri.Scheme is "libsql" or "turso" or "http" or "https" or "ws" or "wss";
 }

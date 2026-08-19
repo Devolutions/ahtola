@@ -173,7 +173,8 @@ public class AhtolaConnectionOptions
 
         var scheme = uri.Scheme.ToLowerInvariant() switch
         {
-            "libsql" => Tls == false ? "http" : "https",
+            // turso is the scheme the Turso dashboard hands out; it addresses the same endpoint as libsql.
+            "libsql" or "turso" => Tls == false ? "http" : "https",
             "http" => ValidateTls(uri.Scheme, expectedTls: false),
             "https" => ValidateTls(uri.Scheme, expectedTls: true),
             "ws" => ValidateTls(uri.Scheme, expectedTls: false, normalizedScheme: "http"),
@@ -244,6 +245,7 @@ public class AhtolaConnectionOptions
     private static bool IsRemoteScheme(string scheme)
     {
         return scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase)
+               || scheme.Equals("turso", StringComparison.OrdinalIgnoreCase)
                || scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
                || scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
                || scheme.Equals("ws", StringComparison.OrdinalIgnoreCase)

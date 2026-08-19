@@ -180,7 +180,8 @@ public sealed class AhtolaReplicaOptions
         if (!remoteUri.IsAbsoluteUri)
             throw new ArgumentException("Embedded replica remote URLs must be absolute.", nameof(remoteUri));
 
-        if (remoteUri.Scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase))
+        if (remoteUri.Scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase)
+            || remoteUri.Scheme.Equals("turso", StringComparison.OrdinalIgnoreCase))
         {
             var builder = new UriBuilder(remoteUri)
             {
@@ -198,7 +199,8 @@ public sealed class AhtolaReplicaOptions
             return remoteUri;
         }
 
-        throw new ArgumentException("Embedded replica remote URLs must use libsql, HTTP, or HTTPS.", nameof(remoteUri));
+        throw new ArgumentException(
+            "Embedded replica remote URLs must use libsql, turso, HTTP, or HTTPS.", nameof(remoteUri));
     }
 
     internal IDisposable EnterApplicationHttpScope()
