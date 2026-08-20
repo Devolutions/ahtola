@@ -62,7 +62,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         ArgumentNullException.ThrowIfNull(sql);
         ArgumentNullException.ThrowIfNull(parameters);
 
-        ValidateParameters(parameters);
+        ValidateParameters(sql, parameters);
         var request = new RemotePipelineRequest
         {
             Baton = _baton,
@@ -371,12 +371,17 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         return statement;
     }
 
-    internal static void ValidateParameters(AhtolaParameterCollection parameters)
+    internal static void ValidateParameters(string sql, AhtolaParameterCollection parameters)
     {
+        ArgumentNullException.ThrowIfNull(sql);
         ArgumentNullException.ThrowIfNull(parameters);
-        foreach (AhtolaParameter parameter in parameters)
+        var bindings = AhtolaParameterBindings.Create(sql, parameters);
+        for (var index = 1; index <= bindings.Map.Count; index++)
         {
-            var value = parameter.ToValue();
+            if (!bindings.Map.IsReferenced(index))
+                continue;
+
+            var value = bindings.GetParameter(index).ToValue();
             if (value.ValueType == AhtolaValueType.Real && !double.IsFinite(value.RealValue))
             {
                 throw new AhtolaParameterException(
@@ -388,7 +393,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
     internal static void ValidateParameters(IReadOnlyList<AhtolaBatchCommand> commands)
     {
         foreach (var command in commands)
-            ValidateParameters(command.Parameters);
+            ValidateParameters(command.CommandText, command.Parameters);
     }
 
     private static RemoteBatchCondition BuildCondition(AhtolaRemoteBatchCondition condition)

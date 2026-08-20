@@ -449,7 +449,7 @@ public sealed class SqliteRemoteFacadeTests
             replica.Open();
             replica.Capabilities.Mode.Should().Be(AhtolaConnectionMode.EmbeddedReplica);
             replica.Capabilities.SupportsSync.Should().BeTrue();
-            replica.CanCreateBatch.Should().BeFalse();
+            replica.CanCreateBatch.Should().BeTrue();
 
             using (var command = replica.CreateCommand())
             {
@@ -461,8 +461,16 @@ public sealed class SqliteRemoteFacadeTests
 
             Action sync = () => replica.Sync();
             sync.Should().Throw<NotSupportedException>().Which.Message.Should().Contain("bootstrap metadata");
-            Action createBatch = () => replica.CreateBatch();
-            createBatch.Should().Throw<NotSupportedException>();
+
+            using var batch = replica.CreateBatch();
+            var insert = batch.CreateBatchCommand();
+            insert.CommandText = "INSERT INTO values_table VALUES (10)";
+            batch.BatchCommands.Add(insert);
+            batch.ExecuteNonQuery().Should().Be(1);
+
+            using var count = replica.CreateCommand();
+            count.CommandText = "SELECT COUNT(*) FROM values_table";
+            count.ExecuteScalar().Should().Be(2L);
         }
         finally
         {

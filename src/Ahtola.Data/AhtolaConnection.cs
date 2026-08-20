@@ -627,8 +627,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         int commandTimeout,
         CancellationToken cancellationToken)
     {
-        AhtolaRemoteClient.ValidateParameters(parameters);
-        _ = AhtolaParameterBindings.Create(sql, parameters);
+        AhtolaRemoteClient.ValidateParameters(sql, parameters);
         for (var attempt = 0; ; attempt++)
         {
             var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
@@ -674,8 +673,6 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         CancellationToken cancellationToken)
     {
         AhtolaRemoteClient.ValidateParameters(batchCommands);
-        foreach (var command in batchCommands)
-            _ = AhtolaParameterBindings.Create(command.CommandText, command.Parameters);
         for (var attempt = 0; ; attempt++)
         {
             var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");

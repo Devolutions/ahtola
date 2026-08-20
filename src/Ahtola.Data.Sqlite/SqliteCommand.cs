@@ -295,7 +295,6 @@ public class SqliteCommand : DbCommand
         CancellationToken cancellationToken)
     {
         EnsureExecutable("ExecuteReader");
-        ValidateRemoteFiniteParameters();
         if (Connection?.IsReadOnly == true && IsWriteCommand(CommandText))
             throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
         if (SplitStatements(CommandText).Count > 1)
@@ -446,7 +445,6 @@ public class SqliteCommand : DbCommand
 
     private SqliteDataReader ExecuteAhtola(CommandBehavior behavior, CancellationToken cancellationToken)
     {
-        ValidateRemoteFiniteParameters();
         var statements = SplitStatements(CommandText);
         if (statements.Count > 1)
             return ExecuteAhtolaBatch(behavior, cancellationToken);
@@ -612,30 +610,6 @@ public class SqliteCommand : DbCommand
             string.Equals(parameter.ParameterName, name, StringComparison.OrdinalIgnoreCase)
             || string.Equals(TrimParameterPrefix(parameter.ParameterName), TrimParameterPrefix(name), StringComparison.OrdinalIgnoreCase));
 
-    private void ValidateRemoteFiniteParameters()
-    {
-        if (Connection?.EndpointMode != AhtolaConnectionEndpointMode.RemoteHrana)
-            return;
-
-        foreach (SqliteParameter parameter in Parameters)
-        {
-            var nonFinite = parameter.Value switch
-            {
-                double value => !double.IsFinite(value),
-                float value => !float.IsFinite(value),
-                _ => false,
-            };
-            if (!nonFinite)
-                continue;
-
-            var exception = new AhtolaParameterException(
-                "Only finite numbers (not Infinity or NaN) can be passed as remote arguments.");
-            throw SqliteRemoteExceptionClassifier.From(
-                exception,
-                ToSqliteException(exception, CommandText));
-        }
-    }
-
     private static bool ParameterMatchesAnyName(SqliteParameter parameter, IReadOnlySet<string> names)
         => names.Any(name =>
             string.Equals(parameter.ParameterName, name, StringComparison.OrdinalIgnoreCase)
@@ -662,14 +636,38 @@ public class SqliteCommand : DbCommand
 
     internal void CopyAhtolaParameters(AhtolaParameterCollection destination)
     {
-        foreach (SqliteParameter parameter in Parameters)
-            CopyAhtolaParameter(destination, parameter);
+        var parameterMap = SqlParameterMap.Parse(CommandText);
+        var namedParameters = Enumerable.Range(1, parameterMap.Count)
+            .Select(parameterMap.GetName)
+            .Where(static name => name is not null)
+            .Cast<string>()
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var positionalParameters = Parameters.Cast<SqliteParameter>()
+            .Where(parameter => !ParameterMatchesAnyName(parameter, namedParameters))
+            .ToList();
+        var positionalIndex = 0;
+        CopyStatementParameters(destination, parameterMap, positionalParameters, ref positionalIndex);
     }
 
-    private static void CopyAhtolaParameter(AhtolaParameterCollection destination, SqliteParameter parameter)
+    private void CopyAhtolaParameter(AhtolaParameterCollection destination, SqliteParameter parameter)
     {
         if (!parameter.HasValue)
             throw new InvalidOperationException(Properties.Resources.RequiresSet(nameof(parameter.Value)));
+
+        var nonFinite = parameter.Value switch
+        {
+            double value => !double.IsFinite(value),
+            float value => !float.IsFinite(value),
+            _ => false,
+        };
+        if (Connection?.Mode == AhtolaConnectionMode.RemoteHrana && nonFinite)
+        {
+            var exception = new AhtolaParameterException(
+                "Only finite numbers (not Infinity or NaN) can be passed as remote arguments.");
+            throw SqliteRemoteExceptionClassifier.From(
+                exception,
+                ToSqliteException(exception, CommandText));
+        }
 
         destination.Add(new AhtolaParameter
         {

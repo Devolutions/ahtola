@@ -160,7 +160,7 @@ public sealed class AhtolaConnectionCapabilities
     private static readonly AhtolaConnectionCapabilities SqliteEmbeddedReplica = new(
         AhtolaConnectionFacade.Sqlite,
         AhtolaConnectionMode.EmbeddedReplica,
-        canCreateBatch: false,
+        canCreateBatch: true,
         supportsAsyncOperations: true,
         supportsTransactions: true,
         supportsSavepoints: true,
