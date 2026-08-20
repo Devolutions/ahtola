@@ -703,19 +703,15 @@ The earlier behavioral gaps below are closed or reduced:
 | `mvcc-write-write-conflict-detection` | missing | s2-capability | L | 0 | 0 | Turso's MVCC path detects first-committer-wins write-write conflicts and surfaces LimboError::WriteWriteConflict distinctly from Busy, so callers can decide whether to re… |
 
 ## 9. Sync / replication & provider surface
-18 entries, 1 mapped failure line — expected: the conformance suite exercises
-the local engine, not replication. Turso's `sync/engine/` (logical
-replication, CDC replay, bootstrap/apply, conflict policy) has **no managed
-counterpart**; Ahtola.Data instead provides the Hrana remote client and
-optional-companion dispatch (`AhtolaNativeProvider`/`AhtolaReplicaProvider`/
-`SqliteNativeProvider` load `Turso.Data.Native`/`Turso.Data.Sync` by name and
-fail closed when absent — an intentional product decision, not a gap to
-"fix" by renaming).
-The 11 `missing` entries (sync engine core, bootstrap protocol, conflict
-resolution, CDC replay) are
-**upstream-ahead features**; adopting them is a roadmap decision (s4-adjacent
-but filed as `missing`/s2 since they are unshipped rather than rejected).
-2 `extension` entries cover Ahtola-only provider conveniences.
+The conformance suite exercises the local engine, not replication, so these
+gaps have little sqltest coverage. Ahtola.Data now has a pure-managed,
+pull-capable sync path: raw-page bootstrap/page protocol, MVCC `lml3` logical
+decode and transactional replay, opaque revision/protocol/table-map metadata,
+local-change push journaling, self-origin filtering, and atomic ReplaceBase
+fallback. It does not claim Turso's full native sync engine (partial/lazy
+bootstrap, zstd page sets, remote encryption, or push-side automatic conflict
+resolution). Optional companion dispatch remains an intentional extension
+point and is not shipped by this repository.
 
 ### 9.1 Managed Cloud replica support matrix (Turso v0.7.2)
 
@@ -734,8 +730,9 @@ while staged, before either the database or its replica metadata is published.
 | Partial prefix bootstrap, query bootstrap, lazy loading (`PartialBootstrap`) | **Explicitly rejected** | The managed replica has neither the server page selector/query protocol nor lazy page storage. |
 | Chunked bootstrap (`PullBytesThreshold`) | **Explicitly rejected** | A complete initial image is the only bootstrap shape; a multi-request page-selection bootstrap is not implemented. |
 | zstd/compressed page sets | **Explicitly rejected** | The response must declare raw encoding and each page payload must be exactly 4 KiB. |
-| MVCC logical streams / `MvccLogical` protocol | **Explicitly rejected** | There is no managed portable logical-log decoder or replay path. |
-| Local divergence before an incremental pull | **Explicitly rejected** | A changed fingerprint or local WAL/journal state aborts synchronization before any HTTP pull or file replacement. A managed replica never overwrites unproven local state. |
+| MVCC logical streams / `MvccLogical` protocol | **Qualified (pull-only)** | After raw bootstrap, the client requests `mvcc_logical_log`, validates the complete `lml3` body and CRC chain, replays header/schema/row operations in one transaction, filters this client's transactions, and advances metadata only after durable publication. Unsafe pending deletes/schema changes fail closed until pushed. |
+| Protocol-2 page fallback | **Qualified for validated full replacement** | `Pages + ReplaceBase` checkpoints/removes safe sidecars and atomically installs every page. Incremental page fallback still requires a provably unchanged page base and rejects local WAL divergence. |
+| Local divergence before an incremental pull | **Mode-aware** | Logical pulls precollect/reapply safe pending local rows. Page pulls reject pending journal entries or an unproven physical base. |
 | Non-4 KiB Cloud page streams | **Unknown/deferred — rejected by the gate** | Turso v0.7.2's physical sync protocol uses `PAGE_SIZE = 4096` (`sync/engine/src/database_sync_operations.rs`); the managed decoder intentionally has the same fixed 4 KiB stream boundary. Ahtola's local SQLite engine can use other database page sizes, but that does not qualify them for Cloud replica streaming. |
 
 Turso v0.7.2 exposes the broader option surface in
@@ -743,8 +740,8 @@ Turso v0.7.2 exposes the broader option surface in
 defines partial strategies and physical/logical stream kinds in
 `sync/engine/src/types.rs` and `sync/engine/src/server_proto.rs`. Its logical
 mode also rejects partial sync and remote encryption
-(`ensure_logical_mvcc_pull_supported`). Those upstream capabilities are not
-claimed by the managed replica.
+(`ensure_logical_mvcc_pull_supported`). The managed replica claims only the
+qualified subset in the matrix above.
 
 | ID | Kind | Severity | Effort | Mapped fails | Cited | Summary |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -752,18 +749,18 @@ claimed by the managed replica.
 | `sync-checkpoint-mode-mismatch-vs-managed-storage` | divergent | s2-capability | M | 0 | 0 | Turso's sync checkpoint explicitly composes Passive (checkpoint only the already-synced WAL prefix, tracked by a watermark) followed by Truncate (once fully synced) to ke… |
 | `sync-conflict-error-surfaced-not-handled` | missing | s2-capability | M | 0 | 0 | Turso's push path distinguishes a specific 'conflict' HTTP status from the remote wal_push endpoint and surfaces a typed DatabaseSyncEngineConflict error that callers can… |
 | `sync-connection-pooling-no-replica-awareness` | partial | s3-perf | M | 0 | 0 | Turso's engine has a wait_changes_from_remote long-poll loop that lets a replica connection block until the server reports new changes, enabling push-driven refresh inste… |
-| `sync-ef-core-provider-no-sync-surface` | missing | s3-perf | M | 0 | 0 | The EF Core provider's UseAhtola surface has no options overload for embedded-replica/sync configuration (no way to pass AhtolaReplicaOptions or trigger DbContext-level S… |
+| `sync-ef-core-provider-no-sync-surface` | closed | s3-perf | M | 0 | 0 | `UseAhtola` accepts direct Turso/Hrana and `Replica Path` connection strings. EF queries, CRUD, migrations, creator operations, and transactions route through the remote/replica-capable SQLite facade; explicit sync remains on the underlying `SqliteConnection`. |
 | `sync-http-pipeline-v2-only-no-v3-websocket` | partial | s2-capability | M | 0 | 0 | Ahtola's remote client is hard-coded to the '/v2/pipeline' HTTP endpoint with a JSON baton-session pipeline; there is no WebSocket transport and no wal_push/pull_updates… |
 | `sync-native-provider-companion-intentional` | extension | s4-intentional | S | 0 | 0 | AhtolaNativeProvider's dynamic-load-by-name pattern for an optional 'Turso.Data.Native' companion (used for Local Provider=Native) exists purely as an extension point for… |
-| `sync-no-embedded-sync-engine-port` | missing | s2-capability | L | 0 | 0 | Turso's ~5,300-line sync engine (bootstrap, CDC capture/replay, WAL push/pull, checkpoint-with-revert-DB, MVCC logical-log replay) has no managed C# implementation anywhe… |
-| `sync-no-mvcc-logical-log-replay` | missing | s2-capability | L | 0 | 0 | The MVCC-mode pull path decodes a portable protobuf logical log (row upsert/delete, schema create/drop/alter/refresh, header updates keyed by stable_table_id) and replays… |
-| `sync-no-page-protocol-pull-decode` | missing | s2-capability | M | 0 | 0 | The legacy/physical pull protocol streams raw or zstd-compressed page images (PageData, PageSetZstdEncodingProto) keyed by a pull-updates request/response envelope. Nothi… |
+| `sync-no-embedded-sync-engine-port` | partial | s2-capability | L | 0 | 0 | The managed provider now implements raw bootstrap/page pulls, pull-only MVCC logical replay, durable local push journaling, protocol metadata, and atomic publication. Partial/lazy sync, zstd, remote encryption, and Turso's complete conflict/checkpoint policy remain outside the managed subset. |
+| `sync-no-mvcc-logical-log-replay` | closed | s2-capability | L | 0 | 0 | The managed pull path decodes Turso v0.7.2 portable `lml3` transactions, validates range/frame CRCs and bounds, replays header/schema/row changes atomically, persists protocol/table maps, filters client echoes, and compensates post-commit metadata failures. |
+| `sync-no-page-protocol-pull-decode` | partial | s2-capability | M | 0 | 0 | Raw 4-KiB page bootstrap/incremental streams and protocol-2 full ReplaceBase fallback are decoded and atomically published. zstd and partial page-selection streams remain explicitly rejected. |
 | `sync-no-partial-sync-lazy-page-storage` | missing | s2-capability | L | 0 | 0 | Ahtola already defines a rich C# surface for partial bootstrap (prefix-length or server-side-query page selection, lazy segment size, prefetch flag), matching the shape o… |
 | `sync-no-revert-db-checkpoint-safety` | missing | s1-correctness | L | 0 | 0 | Turso's checkpoint keeps a shadow 'revert' WAL (`<db>-wal-revert`) so a passive checkpoint of synced frames can be rolled back if the corresponding push to remote later r… |
 | `sync-partial-encryption-mutual-exclusion-unenforced` | divergent | s1-correctness | S | 0 | 0 | Turso hard-errors when partial-sync + remote-encryption + MVCC-logical-pull are combined incompatibly. Ahtola's AhtolaReplicaOptions.Validate() checks PartialBootstrap/Bo… |
 | `sync-remote-encryption-header-not-wired-for-remote-client` | missing | s2-capability | S | 0 | 0 | AhtolaRemoteEncryptionOptions models the cipher/base64 key surface used to compute reserved-bytes for encrypted Turso Cloud databases (consumed by the not-yet-existing re… |
 | `sync-remote-execute-stream-only-two-request-kinds` | divergent | s4-intentional | S | 0 | 0 | Turso's own vendored server_proto.rs already restricts the Hrana-like pipeline to Execute and Batch stream kinds (no cursor/describe/sequence/store_sql variants seen in f… |
-| `sync-remote-hrana-batch-cond-unsupported` | missing | s2-capability | M | 0 | 0 | The Hrana-style batch wire format supports per-step conditions (BatchCond: run step N only if step M ok/errored, boolean combinators, IsAutocommit) enabling server-side c… |
+| `sync-remote-hrana-batch-cond-unsupported` | closed | s2-capability | M | 0 | 0 | Remote batches serialize nested `ok`/`error`/`not`/`and`/`or`/`is_autocommit` conditions. Multi-statement commands and explicit batches chain `ok(previous)` so later destructive steps do not run after a failure. |
 | `sync-remote-no-replication-index-tracking` | missing | s3-perf | S | 0 | 0 | The wire batch request/result carries an optional replication_index (string-encoded u64) letting a client pin reads to a minimum server replication position for read-your… |
 | `sync-sdk-kit-native-companion-intentional` | extension | s4-intentional | S | 0 | 0 | sdk-kit is Turso's native C-ABI/FFI surface for embedding the sync engine into other languages (capi.rs, bindings.rs). Ahtola deliberately has no native companion and no… |
 
