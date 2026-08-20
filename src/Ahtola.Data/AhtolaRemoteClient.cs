@@ -57,6 +57,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         ArgumentNullException.ThrowIfNull(sql);
         ArgumentNullException.ThrowIfNull(parameters);
 
+        ValidateParameters(parameters);
         var request = new RemotePipelineRequest
         {
             Baton = _baton,
@@ -85,6 +86,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         ArgumentNullException.ThrowIfNull(commands);
         if (commands.Count == 0)
             throw new InvalidOperationException("Batch must contain at least one command.");
+        ValidateParameters(commands);
 
         var steps = new List<RemoteBatchStep>(commands.Count);
         foreach (var command in commands)
@@ -187,16 +189,16 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, ?, ?) ON CONFLICT(client_id) DO UPDATE SET pull_gen=excluded.pull_gen, change_id=excluded.change_id",
             new AhtolaParameterCollection(),
             wantRows: false);
-        watermarkStatement.Args.Add(new RemoteRequestValue { Type = "text", Value = clientId });
+        watermarkStatement.Args.Add(new RemoteRequestValue { Type = "text", StringValue = clientId });
         watermarkStatement.Args.Add(new RemoteRequestValue
         {
             Type = "integer",
-            Value = sourcePullGeneration.ToString(CultureInfo.InvariantCulture),
+            StringValue = sourcePullGeneration.ToString(CultureInfo.InvariantCulture),
         });
         watermarkStatement.Args.Add(new RemoteRequestValue
         {
             Type = "integer",
-            Value = changes.Changes[^1].Sequence.ToString(CultureInfo.InvariantCulture),
+            StringValue = changes.Changes[^1].Sequence.ToString(CultureInfo.InvariantCulture),
         });
         steps.Add(new RemoteBatchStep { Condition = guarded, Statement = watermarkStatement });
 
@@ -363,6 +365,26 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         }
 
         return statement;
+    }
+
+    internal static void ValidateParameters(AhtolaParameterCollection parameters)
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+        foreach (AhtolaParameter parameter in parameters)
+        {
+            var value = parameter.ToValue();
+            if (value.ValueType == AhtolaValueType.Real && !double.IsFinite(value.RealValue))
+            {
+                throw new AhtolaParameterException(
+                    "Only finite numbers (not Infinity or NaN) can be passed as remote arguments.");
+            }
+        }
+    }
+
+    internal static void ValidateParameters(IReadOnlyList<AhtolaBatchCommand> commands)
+    {
+        foreach (var command in commands)
+            ValidateParameters(command.Parameters);
     }
 
     private static RemoteBatchCondition BuildCondition(AhtolaRemoteBatchCondition condition)
@@ -744,15 +766,13 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         public RemoteRequestValue Value { get; init; } = RemoteRequestValue.Null();
     }
 
+    [JsonConverter(typeof(RemoteRequestValueJsonConverter))]
     private sealed class RemoteRequestValue
     {
-        [JsonPropertyName("type")]
         public string Type { get; init; } = "";
 
-        [JsonPropertyName("value")]
-        public object? Value { get; init; }
+        public string? StringValue { get; init; }
 
-        [JsonPropertyName("base64")]
         public string? Base64 { get; init; }
 
         public static RemoteRequestValue Null()
@@ -771,17 +791,17 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                 AhtolaValueType.Integer => new RemoteRequestValue
                 {
                     Type = "integer",
-                    Value = value.IntValue.ToString(CultureInfo.InvariantCulture),
+                    StringValue = value.IntValue.ToString(CultureInfo.InvariantCulture),
                 },
                 AhtolaValueType.Real => new RemoteRequestValue
                 {
                     Type = "float",
-                    Value = value.RealValue,
+                    FloatValue = value.RealValue,
                 },
                 AhtolaValueType.Text => new RemoteRequestValue
                 {
                     Type = "text",
-                    Value = value.StringValue ?? string.Empty,
+                    StringValue = value.StringValue ?? string.Empty,
                 },
                 AhtolaValueType.Blob => new RemoteRequestValue
                 {
@@ -791,6 +811,27 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                 _ => throw new ArgumentOutOfRangeException(nameof(value), value.ValueType, null),
             };
         }
+
+        public double? FloatValue { get; init; }
+    }
+
+    private sealed class RemoteRequestValueJsonConverter : JsonConverter<RemoteRequestValue>
+    {
+        public override RemoteRequestValue Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+            => throw new NotSupportedException("Remote request values are serialized only.");
+
+        public override void Write(Utf8JsonWriter writer, RemoteRequestValue value, JsonSerializerOptions options)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("type", value.Type);
+            if (value.FloatValue is { } floatValue)
+                writer.WriteNumber("value", floatValue);
+            else if (value.StringValue is not null)
+                writer.WriteString("value", value.StringValue);
+            else if (value.Base64 is not null)
+                writer.WriteString("base64", value.Base64);
+            writer.WriteEndObject();
+        }
     }
 
     [JsonSourceGenerationOptions(DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
@@ -798,6 +839,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
     [JsonSerializable(typeof(RemotePipelineResponse))]
     [JsonSerializable(typeof(RemoteBatchResult))]
     [JsonSerializable(typeof(RemoteStatementResult))]
+    [JsonSerializable(typeof(RemoteRequestValue))]
     private sealed partial class AhtolaRemoteJsonContext : JsonSerializerContext;
 }
 

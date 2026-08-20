@@ -9,6 +9,8 @@ namespace Ahtola;
 public class AhtolaConnection : DbConnection, ILocalReaderConnection
 {
     internal const int AutomaticSyncMaximumAttempts = 3;
+    // Test-only transport seam. Production callers continue to use the default HttpClient transport.
+    internal static Func<HttpMessageHandler?>? RemoteMessageHandlerFactory { get; set; }
 
     private AhtolaNativeDatabase? _nativeDatabase;
     private AhtolaReplicaDatabase? _replicaDatabase;
@@ -619,6 +621,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         int commandTimeout,
         CancellationToken cancellationToken)
     {
+        AhtolaRemoteClient.ValidateParameters(parameters);
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
         var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
         try
@@ -627,6 +630,10 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 .ConfigureAwait(false);
         }
         catch (AhtolaRemoteSqlException)
+        {
+            throw;
+        }
+        catch (AhtolaParameterException)
         {
             throw;
         }
@@ -643,6 +650,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         bool wantRows,
         CancellationToken cancellationToken)
     {
+        AhtolaRemoteClient.ValidateParameters(batchCommands);
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
         var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
         try
@@ -658,6 +666,10 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 .ConfigureAwait(false);
         }
         catch (AhtolaRemoteSqlException)
+        {
+            throw;
+        }
+        catch (AhtolaParameterException)
         {
             throw;
         }
@@ -857,10 +869,17 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         }
 
         ValidateDirectRemoteLocalProvider();
-        _remoteClient = new AhtolaRemoteClient(
-            _connectionOptions.GetRemoteUri(),
-            _connectionOptions.AuthToken,
-            _connectionOptions.GetRemoteEncryptionOptions());
+        var endpoint = _connectionOptions.GetRemoteUri();
+        var remoteEncryption = _connectionOptions.GetRemoteEncryptionOptions();
+        var handler = RemoteMessageHandlerFactory?.Invoke();
+        _remoteClient = handler is null
+            ? new AhtolaRemoteClient(endpoint, _connectionOptions.AuthToken, remoteEncryption)
+            : new AhtolaRemoteClient(
+                new HttpClient(handler, disposeHandler: false),
+                endpoint,
+                _connectionOptions.AuthToken,
+                remoteEncryption,
+                disposeHttpClient: true);
     }
 
     private async Task OpenRemoteReplicaAsync(
@@ -938,10 +957,18 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 "Encryption Cipher and Encryption Key are local database options and cannot be used with remote Ahtola URLs.");
         }
 
-        return _replicaOptions ?? new AhtolaReplicaOptions(
+        if (_replicaOptions is not null)
+            return _replicaOptions;
+
+        var handler = RemoteMessageHandlerFactory?.Invoke();
+        return new AhtolaReplicaOptions(
             _connectionOptions.ReplicaPath,
             _connectionOptions.GetRemoteUri(),
-            _connectionOptions.AuthToken);
+            _connectionOptions.AuthToken)
+        {
+            SyncInterval = _connectionOptions.SyncInterval,
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
     }
 
     private void SetReplicaDatabase(AhtolaReplicaDatabase replicaDatabase)

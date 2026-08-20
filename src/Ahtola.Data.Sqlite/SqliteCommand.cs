@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Ahtola;
 using Ahtola.Core;
+using Ahtola.Core.Parsing;
 
 namespace Ahtola.Data.Sqlite;
 
@@ -14,6 +15,8 @@ public class SqliteCommand : DbCommand
     private SqliteConnection? _connection;
     private SqliteTransaction? _transaction;
     private SqliteStatementAdapter? _statement;
+    private AhtolaCommand? _ahtolaCommand;
+    private AhtolaBatch? _ahtolaBatch;
     private string _commandText = string.Empty;
     private int _commandTimeout = 30;
     private bool _hasOpenReader;
@@ -137,7 +140,12 @@ public class SqliteCommand : DbCommand
                             ?? (value is null ? null : throw new ArgumentException("Transaction must be a SqliteTransaction.", nameof(value)));
     }
 
-    public override void Cancel() => _cancellation.Cancel();
+    public override void Cancel()
+    {
+        _cancellation.Cancel();
+        _ahtolaCommand?.Cancel();
+        _ahtolaBatch?.Cancel();
+    }
 
     public override int ExecuteNonQuery()
     {
@@ -166,6 +174,25 @@ public class SqliteCommand : DbCommand
     public override void Prepare()
     {
         EnsureExecutable("Prepare");
+        if (Connection?.AhtolaConnection is { } ahtolaConnection)
+        {
+            using var command = new AhtolaCommand(ahtolaConnection)
+            {
+                CommandText = CommandText,
+                CommandTimeout = CommandTimeout,
+            };
+            CopyAhtolaParameters(command.Parameters);
+            try
+            {
+                command.Prepare();
+                return;
+            }
+            catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+            {
+                throw MapAhtolaException(ex, CommandText);
+            }
+        }
+
         var statements = SplitStatements(CommandText);
         if (statements.Count != 1)
         {
@@ -182,9 +209,9 @@ public class SqliteCommand : DbCommand
             _statement = preparedStatement;
             preparedStatement = null;
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
         {
-            throw ToSqliteException(ex);
+            throw MapAhtolaException(ex);
         }
         finally
         {
@@ -256,9 +283,61 @@ public class SqliteCommand : DbCommand
         // OperationCanceledException from the reader-execution path (EF Core's
         // async query contract), not derived TaskCanceledException.
         cancellationToken.ThrowIfCancellationRequested();
+        if (Connection?.AhtolaConnection is not null)
+            return ExecuteAhtolaAsync(behavior, cancellationToken);
         return _cancellation.RunAsync<DbDataReader>(
             token => Execute("ExecuteReader", behavior, token),
             cancellationToken);
+    }
+
+    private async Task<DbDataReader> ExecuteAhtolaAsync(
+        CommandBehavior behavior,
+        CancellationToken cancellationToken)
+    {
+        EnsureExecutable("ExecuteReader");
+        ValidateRemoteFiniteParameters();
+        if (Connection?.IsReadOnly == true && IsWriteCommand(CommandText))
+            throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
+        if (SplitStatements(CommandText).Count > 1)
+            return await ExecuteAhtolaBatchAsync(behavior, cancellationToken).ConfigureAwait(false);
+
+        var connection = Connection!.AhtolaConnection!;
+        var command = new AhtolaCommand(connection)
+        {
+            CommandText = CommandText,
+            CommandTimeout = CommandTimeout,
+        };
+        try
+        {
+            if (Transaction?.IsCompleted == true)
+                throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
+            if (Transaction?.AhtolaTransaction is { } transaction)
+                command.Transaction = transaction;
+            CopyAhtolaParameters(command.Parameters);
+
+            _ahtolaCommand?.Dispose();
+            _ahtolaCommand = command;
+            _hasOpenReader = true;
+            var reader = await command.ExecuteReaderAsync(behavior, cancellationToken).ConfigureAwait(false);
+            return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader);
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        {
+            if (ReferenceEquals(_ahtolaCommand, command))
+                _ahtolaCommand = null;
+            _hasOpenReader = false;
+            command.Dispose();
+            Connection?.ObserveRemoteInvalidation();
+            throw MapAhtolaException(ex, CommandText);
+        }
+        catch
+        {
+            if (ReferenceEquals(_ahtolaCommand, command))
+                _ahtolaCommand = null;
+            _hasOpenReader = false;
+            command.Dispose();
+            throw;
+        }
     }
 
     protected override void Dispose(bool disposing)
@@ -267,6 +346,10 @@ public class SqliteCommand : DbCommand
         {
             _statement?.Dispose();
             _statement = null;
+            _ahtolaCommand?.Dispose();
+            _ahtolaCommand = null;
+            _ahtolaBatch?.Dispose();
+            _ahtolaBatch = null;
             _connection?.CommandClosed(this);
         }
 
@@ -277,6 +360,10 @@ public class SqliteCommand : DbCommand
     {
         _statement?.Dispose();
         _statement = null;
+        _ahtolaCommand?.Dispose();
+        _ahtolaCommand = null;
+        _ahtolaBatch?.Dispose();
+        _ahtolaBatch = null;
         _hasOpenReader = false;
     }
 
@@ -287,6 +374,10 @@ public class SqliteCommand : DbCommand
     {
         cancellationToken.ThrowIfCancellationRequested();
         EnsureExecutable(method);
+        if (Connection?.IsReadOnly == true && IsWriteCommand(CommandText))
+            throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
+        if (Connection?.AhtolaConnection is not null)
+            return ExecuteAhtola(behavior, cancellationToken);
         if (IsEmptyCommand(CommandText))
         {
             _hasOpenReader = true;
@@ -301,9 +392,6 @@ public class SqliteCommand : DbCommand
             if (!Connection.WaitForNoOpenReader(timeout, cancellationToken))
                 throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
         }
-        if (Connection?.IsReadOnly == true && IsWriteCommand(CommandText))
-            throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
-
         var recordsAffected = 0;
         var hadRecordsAffectedStatement = false;
         var statements = SplitStatements(CommandText);
@@ -355,6 +443,255 @@ public class SqliteCommand : DbCommand
         _hasOpenReader = true;
         return new SqliteDataReader(this, recordsAffected, behavior, CloseReader);
     }
+
+    private SqliteDataReader ExecuteAhtola(CommandBehavior behavior, CancellationToken cancellationToken)
+    {
+        ValidateRemoteFiniteParameters();
+        var statements = SplitStatements(CommandText);
+        if (statements.Count > 1)
+            return ExecuteAhtolaBatch(behavior, cancellationToken);
+
+        var connection = Connection!.AhtolaConnection!;
+        var command = new AhtolaCommand(connection)
+        {
+            CommandText = CommandText,
+            CommandTimeout = CommandTimeout,
+        };
+        try
+        {
+            if (Transaction?.IsCompleted == true)
+                throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
+            if (Transaction?.AhtolaTransaction is { } transaction)
+                command.Transaction = transaction;
+
+            CopyAhtolaParameters(command.Parameters);
+
+            _ahtolaCommand?.Dispose();
+            _ahtolaCommand = command;
+            _hasOpenReader = true;
+            var reader = command.ExecuteReader(behavior);
+            return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader);
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        {
+            if (ReferenceEquals(_ahtolaCommand, command))
+                _ahtolaCommand = null;
+            _hasOpenReader = false;
+            command.Dispose();
+            Connection?.ObserveRemoteInvalidation();
+            throw MapAhtolaException(ex, CommandText);
+        }
+        catch
+        {
+            if (ReferenceEquals(_ahtolaCommand, command))
+                _ahtolaCommand = null;
+            _hasOpenReader = false;
+            command.Dispose();
+            throw;
+        }
+
+    }
+
+    private SqliteDataReader ExecuteAhtolaBatch(CommandBehavior behavior, CancellationToken cancellationToken)
+        {
+            var batch = CreateAhtolaBatch();
+            try
+            {
+                _ahtolaBatch?.Dispose();
+                _ahtolaBatch = batch;
+                _hasOpenReader = true;
+                var reader = batch.ExecuteReader(behavior);
+                return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader);
+            }
+            catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+            {
+                if (ReferenceEquals(_ahtolaBatch, batch))
+                    _ahtolaBatch = null;
+                _hasOpenReader = false;
+                batch.Dispose();
+                Connection?.ObserveRemoteInvalidation();
+                throw MapAhtolaException(ex, CommandText);
+            }
+            catch
+            {
+                if (ReferenceEquals(_ahtolaBatch, batch))
+                    _ahtolaBatch = null;
+                _hasOpenReader = false;
+                batch.Dispose();
+                throw;
+            }
+        }
+
+    private async Task<DbDataReader> ExecuteAhtolaBatchAsync(
+            CommandBehavior behavior,
+            CancellationToken cancellationToken)
+        {
+            var batch = CreateAhtolaBatch();
+            try
+            {
+                _ahtolaBatch?.Dispose();
+                _ahtolaBatch = batch;
+                _hasOpenReader = true;
+                var reader = await batch.ExecuteReaderAsync(behavior, cancellationToken).ConfigureAwait(false);
+                return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader);
+            }
+            catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+            {
+                if (ReferenceEquals(_ahtolaBatch, batch))
+                    _ahtolaBatch = null;
+                _hasOpenReader = false;
+                batch.Dispose();
+                Connection?.ObserveRemoteInvalidation();
+                throw MapAhtolaException(ex, CommandText);
+            }
+            catch
+            {
+                if (ReferenceEquals(_ahtolaBatch, batch))
+                    _ahtolaBatch = null;
+                _hasOpenReader = false;
+                batch.Dispose();
+                throw;
+            }
+        }
+
+    private AhtolaBatch CreateAhtolaBatch()
+    {
+        var batch = new AhtolaBatch(Connection!.AhtolaConnection!)
+        {
+            Timeout = CommandTimeout,
+        };
+        var statements = SplitStatements(CommandText);
+        var namedParameters = statements
+            .Select(SqlParameterMap.Parse)
+            .SelectMany(map => Enumerable.Range(1, map.Count).Select(map.GetName))
+            .Where(static name => name is not null)
+            .Cast<string>()
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var positionalParameters = Parameters.Cast<SqliteParameter>()
+            .Where(parameter => !ParameterMatchesAnyName(parameter, namedParameters))
+            .ToList();
+        var positionalIndex = 0;
+
+        for (var i = 0; i < statements.Count; i++)
+        {
+            var command = new AhtolaBatchCommand(statements[i]);
+            CopyStatementParameters(
+                command.Parameters,
+                SqlParameterMap.Parse(statements[i]),
+                positionalParameters,
+                ref positionalIndex);
+            if (i > 0 && Connection!.Mode == AhtolaConnectionMode.RemoteHrana)
+                command.RemoteCondition = AhtolaRemoteBatchCondition.StepSucceeded(i - 1);
+            batch.BatchCommands.Add(command);
+        }
+
+        return batch;
+    }
+
+    private void CopyStatementParameters(
+        AhtolaParameterCollection destination,
+        SqlParameterMap parameterMap,
+        IReadOnlyList<SqliteParameter> positionalParameters,
+        ref int positionalIndex)
+    {
+        for (var index = 1; index <= parameterMap.Count; index++)
+        {
+            var name = parameterMap.GetName(index);
+            var parameter = name is null
+                ? positionalIndex < positionalParameters.Count
+                    ? positionalParameters[positionalIndex++]
+                    : throw new InvalidOperationException(Properties.Resources.MissingParameters(index))
+                : FindParameter(name)
+                    ?? throw new InvalidOperationException(Properties.Resources.MissingParameters(name));
+            CopyAhtolaParameter(destination, parameter);
+        }
+    }
+
+    private SqliteParameter? FindParameter(string name)
+        => Parameters.Cast<SqliteParameter>().FirstOrDefault(parameter =>
+            string.Equals(parameter.ParameterName, name, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(TrimParameterPrefix(parameter.ParameterName), TrimParameterPrefix(name), StringComparison.OrdinalIgnoreCase));
+
+    private void ValidateRemoteFiniteParameters()
+    {
+        if (Connection?.EndpointMode != AhtolaConnectionEndpointMode.RemoteHrana)
+            return;
+
+        foreach (SqliteParameter parameter in Parameters)
+        {
+            var nonFinite = parameter.Value switch
+            {
+                double value => !double.IsFinite(value),
+                float value => !float.IsFinite(value),
+                _ => false,
+            };
+            if (!nonFinite)
+                continue;
+
+            var exception = new AhtolaParameterException(
+                "Only finite numbers (not Infinity or NaN) can be passed as remote arguments.");
+            throw SqliteRemoteExceptionClassifier.From(
+                exception,
+                ToSqliteException(exception, CommandText));
+        }
+    }
+
+    private static bool ParameterMatchesAnyName(SqliteParameter parameter, IReadOnlySet<string> names)
+        => names.Any(name =>
+            string.Equals(parameter.ParameterName, name, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(TrimParameterPrefix(parameter.ParameterName), TrimParameterPrefix(name), StringComparison.OrdinalIgnoreCase));
+
+    private static string? TrimParameterPrefix(string? name)
+        => string.IsNullOrEmpty(name) ? name : name[0] is '@' or ':' or '$' or '?' ? name[1..] : name;
+    private void CloseAhtolaReader()
+    {
+        _hasOpenReader = false;
+        _ahtolaCommand?.Dispose();
+        _ahtolaCommand = null;
+        _ahtolaBatch?.Dispose();
+        _ahtolaBatch = null;
+    }
+
+    internal SqliteException MapAhtolaException(Exception exception, string? sql = null)
+    {
+        var mapped = ToSqliteException(exception, sql);
+        return Connection?.Mode == AhtolaConnectionMode.RemoteHrana
+            ? SqliteRemoteExceptionClassifier.From(exception, mapped)
+            : mapped;
+    }
+
+    internal void CopyAhtolaParameters(AhtolaParameterCollection destination)
+    {
+        foreach (SqliteParameter parameter in Parameters)
+            CopyAhtolaParameter(destination, parameter);
+    }
+
+    private static void CopyAhtolaParameter(AhtolaParameterCollection destination, SqliteParameter parameter)
+    {
+        if (!parameter.HasValue)
+            throw new InvalidOperationException(Properties.Resources.RequiresSet(nameof(parameter.Value)));
+
+        destination.Add(new AhtolaParameter
+        {
+            ParameterName = parameter.ParameterName,
+            DbType = parameter.DbType,
+            Direction = parameter.Direction,
+            IsNullable = parameter.IsNullable,
+            SourceColumn = parameter.SourceColumn,
+            SourceColumnNullMapping = parameter.SourceColumnNullMapping,
+            Size = parameter.Size,
+            Value = SnapshotAhtolaParameterValue(parameter.GetResolvedStorageValue()),
+        });
+    }
+
+    internal static object? SnapshotAhtolaParameterValue(object? value)
+        => value switch
+        {
+            byte[] bytes => bytes.ToArray(),
+            Memory<byte> memory => memory.ToArray(),
+            ReadOnlyMemory<byte> memory => memory.ToArray(),
+            _ => value,
+        };
 
     private void ThrowIfReaderOpen(string property)
     {

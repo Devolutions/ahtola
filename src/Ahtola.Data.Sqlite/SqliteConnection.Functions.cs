@@ -12,6 +12,8 @@ public partial class SqliteConnection
     private void RegisterScalarFunction(string name, int argc, bool isDeterministic, Func<object?[], object?>? function)
     {
         ArgumentNullException.ThrowIfNull(name);
+        if (!Capabilities.SupportsUserDefinedFunctions)
+            throw new NotSupportedException("User-defined functions are supported only for local database connections.");
             // Shared-memory catalogs are process-wide for the named database. Scalar
             // registrations are therefore catalog-scoped (visible to every lease), which is
             // what EF Core needs when multiple connections share Mode=Memory;Cache=Shared.

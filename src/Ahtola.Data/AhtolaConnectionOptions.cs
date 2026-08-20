@@ -49,9 +49,11 @@ public class AhtolaConnectionOptions
             ? AhtolaLocalProvider.Native
             : AhtolaLocalProvider.Managed;
 
-    public bool IsRemote => IsRemoteDataSource(DataSource);
+    public bool IsRemote => AhtolaConnectionModeClassifier.Classify(DataSource, ReplicaPath)
+        != AhtolaConnectionEndpointMode.Local;
 
-    public bool IsReplica => IsRemote && !string.IsNullOrWhiteSpace(ReplicaPath);
+    public bool IsReplica => AhtolaConnectionModeClassifier.Classify(DataSource, ReplicaPath)
+        == AhtolaConnectionEndpointMode.EmbeddedReplica;
 
     public AhtolaEncryptionCipher? GetEncryptionCipher() => _builder.GetEncryptionCipher();
 
@@ -161,7 +163,8 @@ public class AhtolaConnectionOptions
 
     public Uri GetRemoteUri()
     {
-        if (!Uri.TryCreate(DataSource, UriKind.Absolute, out var uri) || !IsRemoteScheme(uri.Scheme))
+        if (!Uri.TryCreate(DataSource, UriKind.Absolute, out var uri)
+            || !AhtolaConnectionModeClassifier.IsRemoteScheme(uri.Scheme))
             throw new InvalidOperationException($"Data Source is not a remote Ahtola URL: {DataSource}");
 
         if (!string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
@@ -234,22 +237,6 @@ public class AhtolaConnectionOptions
             builder.AuthToken = options.AuthToken;
         builder.SyncInterval = options.SyncInterval;
         return new AhtolaConnectionOptions(builder);
-    }
-
-    private static bool IsRemoteDataSource(string dataSource)
-    {
-        return Uri.TryCreate(dataSource, UriKind.Absolute, out var uri)
-               && IsRemoteScheme(uri.Scheme);
-    }
-
-    private static bool IsRemoteScheme(string scheme)
-    {
-        return scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase)
-               || scheme.Equals("turso", StringComparison.OrdinalIgnoreCase)
-               || scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
-               || scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
-               || scheme.Equals("ws", StringComparison.OrdinalIgnoreCase)
-               || scheme.Equals("wss", StringComparison.OrdinalIgnoreCase);
     }
 
     private string ValidateTls(string scheme, bool expectedTls, string? normalizedScheme = null)

@@ -9,6 +9,8 @@ public partial class SqliteConnection
     private void RegisterCollation(string name, Func<string, string, int>? comparison)
     {
         ArgumentNullException.ThrowIfNull(name);
+        if (!Capabilities.SupportsCustomCollations)
+            throw new NotSupportedException("Custom collations are supported only for local database connections.");
             // Shared-memory catalogs are process-wide for the named database. Collation
             // registrations are therefore catalog-scoped (visible to every lease), which is
             // what EF Core needs when multiple connections share Mode=Memory;Cache=Shared.

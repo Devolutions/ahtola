@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
+using System.Net.Http;
 using System.Globalization;
 using System.Security.Cryptography;
 using Ahtola;
@@ -18,6 +19,8 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     private AhtolaNativeDatabase? _database;
     private IManagedDatabaseAdapter? _managedDatabase;
+    private AhtolaConnection? _ahtolaConnection;
+    private bool _ahtolaConnectionWasOpen;
     private ManagedConnectionPoolLease? _managedPoolLease;
     private SqliteConnectionStringBuilder _connectionOptions = new();
     private bool _disposed;
@@ -104,6 +107,8 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         {
             if (State == ConnectionState.Open)
                 throw new InvalidOperationException("PageCodec cannot be set while the connection is open.");
+            if (value is not null && IsRemoteDataSource)
+                throw new NotSupportedException("PageCodec is supported only for local database connections.");
             if (value is not null)
                 PageCodecId.ValidateNonZero(value.CodecId);
             _pageCodec = value;
@@ -131,26 +136,81 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     /// </summary>
     public override string ServerVersion => Ahtola.Core.EmbeddedDatabase.SqliteCompatibilityVersion;
 
-    public override ConnectionState State => _database is null && _managedDatabase is null
+    public override ConnectionState State => _ahtolaConnection?.State
+        ?? (_database is null && _managedDatabase is null
         ? ConnectionState.Closed
-        : ConnectionState.Open;
+        : ConnectionState.Open);
+
+    /// <summary>
+    /// Gets the execution mode currently configured for this facade.
+    /// </summary>
+    public AhtolaConnectionMode Mode => Capabilities.Mode;
+
+    /// <summary>
+    /// Gets the endpoint classification without requiring the connection to be open.
+    /// </summary>
+    public AhtolaConnectionEndpointMode EndpointMode => _ahtolaConnection?.Capabilities.Mode switch
+    {
+        AhtolaConnectionMode.RemoteHrana => AhtolaConnectionEndpointMode.RemoteHrana,
+        AhtolaConnectionMode.EmbeddedReplica => AhtolaConnectionEndpointMode.EmbeddedReplica,
+        _ => AhtolaConnectionModeClassifier.Classify(
+            _connectionOptions.DataSource,
+            _connectionOptions.ReplicaPath),
+    };
 
     public AhtolaConnectionCapabilities Capabilities
-        => AhtolaConnectionCapabilities.ForSqlite(_connectionOptions.EffectiveLocalProvider);
+        => _ahtolaConnection is not null
+            ? AhtolaConnectionCapabilities.ForSqliteMode(_ahtolaConnection.Capabilities.Mode)
+            : EndpointMode switch
+            {
+                AhtolaConnectionEndpointMode.RemoteHrana => AhtolaConnectionCapabilities.ForSqliteRemote(isReplica: false),
+                AhtolaConnectionEndpointMode.EmbeddedReplica => AhtolaConnectionCapabilities.ForSqliteRemote(isReplica: true),
+                _ => AhtolaConnectionCapabilities.ForSqlite(_connectionOptions.EffectiveLocalProvider),
+            };
 
     public override bool CanCreateBatch => Capabilities.CanCreateBatch;
+
+    // Test-only forwarding seam. Keeping it on the facade permits deterministic remote
+    // tests without reflection while production callers retain the default transport.
+    internal static Func<HttpMessageHandler?>? RemoteMessageHandlerFactory
+    {
+        get => AhtolaConnection.RemoteMessageHandlerFactory;
+        set => AhtolaConnection.RemoteMessageHandlerFactory = value;
+    }
 
     protected override DbProviderFactory DbProviderFactory => SqliteFactory.Instance;
 
     public override void Open()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_database is not null || _managedDatabase is not null)
+        if (_database is not null || _managedDatabase is not null || _ahtolaConnection is not null)
             throw new InvalidOperationException("The connection is already open.");
-        if (AhtolaConnectionCapabilities.IsRemoteDataSource(_connectionOptions.DataSource))
+        if (IsRemoteDataSource)
         {
-            throw new NotSupportedException(
-                "Ahtola.Data.Sqlite supports only local database connections. Use AhtolaConnection for remote Hrana or embedded replica connections.");
+            ValidateRemoteOpenMode();
+            var remoteOriginalState = State;
+            try
+            {
+                _ahtolaConnection = new AhtolaConnection(_connectionOptions.GetAhtolaConnectionString());
+                _ahtolaConnection.Open();
+                _ahtolaConnectionWasOpen = true;
+                _dataSource = _ahtolaConnection.DataSource;
+                ApplyReplicaConnectionOptions();
+                OnStateChange(new StateChangeEventArgs(remoteOriginalState, State));
+                return;
+            }
+            catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
+            {
+                _ahtolaConnection?.Dispose();
+                _ahtolaConnection = null;
+                throw MapRemoteLifecycleException(ex);
+            }
+            catch
+            {
+                _ahtolaConnection?.Dispose();
+                _ahtolaConnection = null;
+                throw;
+            }
         }
         ValidateManagedSharedCacheOptions();
         ValidateForeignReadOnlyOptions();
@@ -158,7 +218,7 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
                 if (!useManaged && !string.IsNullOrEmpty(_connectionOptions.Password))
                     throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
 
-                var originalState = State;
+                var localOriginalState = State;
                 var filename = NormalizeDataSource(_connectionOptions);
                 var readOnly = _connectionOptions.Mode == SqliteOpenMode.ReadOnly;
                 var managedSharedMemory = IsManagedSharedMemoryConfiguration(_connectionOptions);
@@ -230,7 +290,7 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
                     RegisterCollations();
                     RegisterHooks();
                     LoadPendingExtensions();
-                    OnStateChange(new StateChangeEventArgs(originalState, State));
+                    OnStateChange(new StateChangeEventArgs(localOriginalState, State));
                 }
                 catch (AhtolaException ex)
                 {
@@ -273,6 +333,9 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
 
+        if (IsRemoteDataSource)
+            return OpenRemoteAsync(cancellationToken);
+
         return Task.Run(
             () =>
             {
@@ -287,8 +350,118 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             CancellationToken.None);
     }
 
+    private async Task OpenRemoteAsync(CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_ahtolaConnection is not null)
+            throw new InvalidOperationException("The connection is already open.");
+        ValidateRemoteOpenMode();
+
+        var remoteOpenOriginalState = State;
+        try
+        {
+            var connection = new AhtolaConnection(_connectionOptions.GetAhtolaConnectionString());
+            _ahtolaConnection = connection;
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            _ahtolaConnectionWasOpen = true;
+            _dataSource = connection.DataSource;
+            ApplyReplicaConnectionOptions();
+            OnStateChange(new StateChangeEventArgs(remoteOpenOriginalState, State));
+        }
+        catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
+        {
+            _ahtolaConnection?.Dispose();
+            _ahtolaConnection = null;
+            throw MapRemoteLifecycleException(ex);
+        }
+        catch
+        {
+            _ahtolaConnection?.Dispose();
+            _ahtolaConnection = null;
+            throw;
+        }
+    }
+
+    /// <summary>Synchronizes an embedded replica with its configured remote endpoint.</summary>
+    public void Sync()
+    {
+        var connection = _ahtolaConnection
+            ?? throw new NotSupportedException("Sync requires an open embedded replica connection.");
+        try
+        {
+            connection.Sync();
+        }
+        catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
+        {
+            ObserveRemoteInvalidation();
+            throw MapRemoteLifecycleException(ex);
+        }
+    }
+
+    /// <summary>Asynchronously synchronizes an embedded replica with its configured remote endpoint.</summary>
+    public Task SyncAsync(CancellationToken cancellationToken = default)
+    {
+        var connection = _ahtolaConnection
+            ?? throw new NotSupportedException("Sync requires an open embedded replica connection.");
+        return SyncRemoteAsync(connection, cancellationToken);
+    }
+
+    private async Task SyncRemoteAsync(AhtolaConnection connection, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await connection.SyncAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
+        {
+            ObserveRemoteInvalidation();
+            throw MapRemoteLifecycleException(ex);
+        }
+    }
+
     public override void Close()
     {
+        if (_ahtolaConnection is not null)
+        {
+            var remoteCloseOriginalState = State;
+            var connection = _ahtolaConnection;
+            _ahtolaConnection = null;
+            Exception? cleanupError = null;
+            try
+            {
+                CloseOpenReaders();
+                Transaction?.Dispose();
+                ResetOpenCommands();
+                connection.Close();
+            }
+            catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
+            {
+                cleanupError = ex;
+                throw MapRemoteLifecycleException(ex);
+            }
+            catch (Exception ex)
+            {
+                cleanupError = ex;
+                throw;
+            }
+            finally
+            {
+                try
+                {
+                    connection.Dispose();
+                }
+                catch when (cleanupError is not null)
+                {
+                }
+                _ahtolaConnectionWasOpen = false;
+                _dataSource = null;
+                _readOnly = false;
+                OnStateChange(new StateChangeEventArgs(remoteCloseOriginalState, State));
+            }
+
+            return;
+        }
+
         if (_database is null && _managedDatabase is null)
             return;
 
@@ -547,6 +720,8 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         if (State != ConnectionState.Open)
             throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection("BackupDatabase"));
         ArgumentNullException.ThrowIfNull(destination);
+        if (!Capabilities.SupportsBackup || !destination.Capabilities.SupportsBackup)
+            throw new NotSupportedException("Backup is supported only for local database connections.");
         if (IsManagedProvider != destination.IsManagedProvider)
             throw new NotSupportedException(Properties.Resources.ManagedBackupMixedProvidersNotSupported);
         if (IsManagedProvider)
@@ -572,7 +747,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     protected override DbCommand CreateDbCommand() => CreateCommand();
 
-    protected override DbBatch CreateDbBatch() => new SqliteBatch(this);
+    protected override DbBatch CreateDbBatch()
+    {
+        if (!CanCreateBatch)
+            throw new NotSupportedException("Batch execution is not supported by this embedded replica connection.");
+        return new SqliteBatch(this);
+    }
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
         => BeginTransaction(isolationLevel);
@@ -600,12 +780,28 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     {
         if (disposing && !_disposed)
         {
-            Close();
-            _noOpenReaders.Dispose();
+            try
+            {
+                Close();
+            }
+            catch
+            {
+                // Dispose must not hide the exception that caused scope unwinding.
+            }
+            finally
+            {
+                _noOpenReaders.Dispose();
+            }
         }
 
         _disposed = true;
         base.Dispose(disposing);
+    }
+
+    public override ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
     }
 
     internal AhtolaNativeDatabase NativeDatabase => _database ?? throw new InvalidOperationException("The connection is not open.");
@@ -616,6 +812,52 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     internal bool IsManagedConnection => _managedDatabase is not null;
 
     internal bool UsesManagedDatabase => IsManagedConnection;
+
+    internal AhtolaConnection? AhtolaConnection => _ahtolaConnection;
+
+    internal bool IsRemoteConnection => _ahtolaConnection?.IsRemote == true;
+
+    internal bool IsReplicaConnection => _ahtolaConnection?.Capabilities.Mode == AhtolaConnectionMode.EmbeddedReplica;
+
+    internal void ObserveRemoteInvalidation()
+    {
+        var connection = _ahtolaConnection;
+        if (connection is null
+            || connection.State == ConnectionState.Open
+            || !_ahtolaConnectionWasOpen)
+        {
+            return;
+        }
+
+        _ahtolaConnection = null;
+        _ahtolaConnectionWasOpen = false;
+        _dataSource = null;
+        try
+        {
+            try
+            {
+                CloseOpenReaders();
+                Transaction?.MarkCompletedExternally(rolledBack: true);
+                ResetOpenCommands();
+            }
+            finally
+            {
+                connection.Dispose();
+            }
+        }
+        catch
+        {
+            // The original remote exception is the actionable error.
+        }
+        finally
+        {
+            OnStateChange(new StateChangeEventArgs(ConnectionState.Open, ConnectionState.Closed));
+        }
+    }
+
+    private bool IsRemoteDataSource => EndpointMode != AhtolaConnectionEndpointMode.Local;
+
+    private bool IsReplicaDataSource => EndpointMode == AhtolaConnectionEndpointMode.EmbeddedReplica;
 
         internal DateTimeKind DateTimeKind => _connectionOptions.DateTimeKind;
 
@@ -754,6 +996,39 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             ExecuteNonQuery("PRAGMA foreign_keys = 1;");
         if (_connectionOptions.RecursiveTriggers)
             _recursiveTriggers = true;
+    }
+
+    private void ApplyReplicaConnectionOptions()
+    {
+        if (EndpointMode != AhtolaConnectionEndpointMode.EmbeddedReplica)
+            return;
+
+        ExecuteNonQuery("PRAGMA foreign_keys = " + (_connectionOptions.ForeignKeys != false ? "1" : "0") + ";");
+        if (_connectionOptions.Mode == SqliteOpenMode.ReadOnly)
+        {
+            _readOnly = true;
+            ExecuteNonQuery("PRAGMA query_only = ON;");
+        }
+        if (_connectionOptions.RecursiveTriggers)
+            _recursiveTriggers = true;
+    }
+
+    private void ValidateRemoteOpenMode()
+    {
+        if (EndpointMode == AhtolaConnectionEndpointMode.RemoteHrana
+            && _connectionOptions.Mode == SqliteOpenMode.ReadOnly)
+        {
+            throw new NotSupportedException(
+                "Mode=ReadOnly cannot be enforced for a direct remote Hrana connection. Configure server-side read-only access instead.");
+        }
+    }
+
+    private SqliteException MapRemoteLifecycleException(Exception exception)
+    {
+        var mapped = SqliteCommand.ToSqliteException(exception);
+        return EndpointMode == AhtolaConnectionEndpointMode.Local
+            ? mapped
+            : SqliteRemoteExceptionClassifier.From(exception, mapped);
     }
 
     private void EnableManagedReadOnly()
