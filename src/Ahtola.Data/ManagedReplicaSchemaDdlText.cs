@@ -10,6 +10,20 @@ namespace Ahtola;
 internal static class ManagedReplicaSchemaDdlText
 {
     /// <summary>
+    /// Structural shape of a <c>CREATE TABLE</c> statement: its column definitions (name plus
+    /// full definition text), table-level constraints (verbatim text, e.g. a table-level
+    /// <c>PRIMARY KEY</c>/<c>UNIQUE</c>/<c>CHECK</c>/<c>FOREIGN KEY</c> clause), and the
+    /// presence of the <c>STRICT</c>/<c>WITHOUT ROWID</c> table options. Used to detect whether a
+    /// remote schema refresh is purely additive (safe to apply via <c>ALTER TABLE ADD COLUMN</c>)
+    /// or requires a full table rebuild that this replay engine does not implement.
+    /// </summary>
+    public readonly record struct TableShape(
+        IReadOnlyList<(string Name, string Definition)> Columns,
+        IReadOnlyList<string> TableConstraints,
+        bool Strict,
+        bool WithoutRowId);
+
+    /// <summary>
     /// Splits the column/constraint list of a <c>CREATE TABLE</c> statement into individual
     /// column definitions, skipping table-level constraints (<c>PRIMARY KEY</c>, <c>UNIQUE</c>,
     /// <c>CHECK</c>, <c>FOREIGN KEY</c>, <c>CONSTRAINT</c>). Returns <see langword="null"/> when
@@ -17,6 +31,16 @@ internal static class ManagedReplicaSchemaDdlText
     /// SELECT</c>).
     /// </summary>
     public static IReadOnlyList<(string Name, string Definition)>? SplitCreateTableColumns(string createTableSql)
+        => TryGetCreateTableShape(createTableSql)?.Columns;
+
+    /// <summary>
+    /// Parses a <c>CREATE TABLE</c> statement's full structural shape (columns, table-level
+    /// constraints, and <c>STRICT</c>/<c>WITHOUT ROWID</c> options). Returns <see langword="null"/>
+    /// when the statement's column-list parentheses cannot be located (e.g. <c>CREATE TABLE ... AS
+    /// SELECT</c>), in which case the statement cannot be safely diffed and must be replayed
+    /// directly.
+    /// </summary>
+    public static TableShape? TryGetCreateTableShape(string createTableSql)
     {
         ArgumentNullException.ThrowIfNull(createTableSql);
         var index = SkipTrivia(createTableSql, 0);
@@ -50,23 +74,62 @@ internal static class ManagedReplicaSchemaDdlText
         if (closeParen < 0)
             return null;
 
-        var definitions = new List<(string, string)>();
+        var columns = new List<(string, string)>();
+        var tableConstraints = new List<string>();
         foreach (var span in SplitTopLevelByComma(createTableSql, index + 1, closeParen))
         {
             var trimmed = TrimTrivia(createTableSql, span.Start, span.End);
             if (trimmed.Start >= trimmed.End)
                 continue;
 
+            var segmentText = createTableSql[trimmed.Start..trimmed.End];
             if (IsTableLevelConstraint(createTableSql, trimmed.Start))
+            {
+                tableConstraints.Add(segmentText);
                 continue;
+            }
 
             if (!TryReadIdentifier(createTableSql, trimmed.Start, out var name, out _))
                 continue;
 
-            definitions.Add((name, createTableSql[trimmed.Start..trimmed.End]));
+            columns.Add((name, segmentText));
         }
 
-        return definitions;
+        var tail = createTableSql[(closeParen + 1)..];
+        var strict = ContainsTopLevelKeyword(tail, "STRICT");
+        var withoutRowId = ContainsTopLevelKeyword(tail, "WITHOUT") && ContainsTopLevelKeyword(tail, "ROWID");
+
+        return new TableShape(columns, tableConstraints, strict, withoutRowId);
+    }
+
+    /// <summary>
+    /// Rewrites a <c>CREATE TABLE</c> statement to include <c>IF NOT EXISTS</c> when not already
+    /// present, mirroring Turso's <c>execute_ddl_idempotent</c> (which unconditionally sets
+    /// <c>if_not_exists = true</c> on the parsed AST before executing). This keeps a bare
+    /// <c>CREATE TABLE</c> replay idempotent under retry even when the table already exists.
+    /// Returns the original text unchanged when it cannot be parsed as a recognized
+    /// <c>CREATE TABLE</c> shape.
+    /// </summary>
+    public static string EnsureCreateTableIfNotExists(string createTableSql)
+    {
+        ArgumentNullException.ThrowIfNull(createTableSql);
+        var index = SkipTrivia(createTableSql, 0);
+        if (!MatchKeyword(createTableSql, ref index, "CREATE"))
+            return createTableSql;
+        _ = MatchKeyword(createTableSql, ref index, "TEMP") || MatchKeyword(createTableSql, ref index, "TEMPORARY");
+        if (!MatchKeyword(createTableSql, ref index, "TABLE"))
+            return createTableSql;
+
+        var afterTable = index;
+        var probe = index;
+        if (MatchKeyword(createTableSql, ref probe, "IF"))
+        {
+            // Already has (or attempts) an IF [NOT EXISTS] clause; leave it exactly as-is either
+            // way (a malformed "IF" without "NOT EXISTS" should surface its own parse error).
+            return createTableSql;
+        }
+
+        return string.Concat(createTableSql.AsSpan(0, afterTable), " IF NOT EXISTS", createTableSql.AsSpan(afterTable));
     }
 
     /// <summary>
@@ -120,6 +183,32 @@ internal static class ManagedReplicaSchemaDdlText
     {
         var probe = index;
         return MatchKeyword(sql, ref probe, keyword);
+    }
+
+    /// <summary>
+    /// Scans <paramref name="sql"/> for a standalone occurrence of <paramref name="keyword"/> at
+    /// any position (word-boundary on both sides; quoted tokens/comments are skipped over
+    /// whole). Used to detect the <c>STRICT</c>/<c>WITHOUT ROWID</c> table options in the text
+    /// following a <c>CREATE TABLE</c> statement's closing column-list parenthesis.
+    /// </summary>
+    private static bool ContainsTopLevelKeyword(string sql, string keyword)
+    {
+        var index = 0;
+        while (index < sql.Length)
+        {
+            var precededByWordChar = index > 0 && (char.IsLetterOrDigit(sql[index - 1]) || sql[index - 1] == '_');
+            if (!precededByWordChar)
+            {
+                var probe = index;
+                if (MatchKeyword(sql, ref probe, keyword))
+                    return true;
+            }
+
+            var (consumed, _) = ClassifyAt(sql, index, sql.Length);
+            index += Math.Max(1, consumed);
+        }
+
+        return false;
     }
 
     private static bool MatchKeyword(string sql, ref int index, string keyword)
@@ -222,9 +311,12 @@ internal static class ManagedReplicaSchemaDdlText
         var index = start;
         while (index < end)
         {
-            var (consumed, isTrivia) = ClassifyAt(sql, index, end);
-            if (isTrivia)
+            var (consumed, kind) = ClassifyAt(sql, index, end);
+            if (kind != LexicalKind.Other)
             {
+                // Whitespace/comments and quoted identifiers/string literals are consumed as one
+                // atomic unit: their internal characters (including '(', ')', ',') must never be
+                // individually re-examined for structural paren/comma tracking.
                 index += consumed;
                 continue;
             }
@@ -265,8 +357,8 @@ internal static class ManagedReplicaSchemaDdlText
         var index = openParenIndex;
         while (index < sql.Length)
         {
-            var (consumed, isTrivia) = ClassifyAt(sql, index, sql.Length);
-            if (isTrivia)
+            var (consumed, kind) = ClassifyAt(sql, index, sql.Length);
+            if (kind != LexicalKind.Other)
             {
                 index += consumed;
                 continue;
@@ -295,23 +387,39 @@ internal static class ManagedReplicaSchemaDdlText
     }
 
     /// <summary>
-    /// Classifies one lexical unit starting at <paramref name="index"/>: string/quoted-identifier
-    /// literals and comments are consumed whole (returned as "trivia" from the caller's
-    /// perspective, i.e. their internal punctuation must not affect paren/comma tracking); any
-    /// other single character is returned with <c>consumed = 1</c>.
+    /// Lexical classification for one scanned unit. <see cref="Whitespace"/> covers actual
+    /// whitespace and comments (safe for <see cref="SkipTrivia"/> to skip when searching for the
+    /// start of the next significant token). <see cref="QuotedToken"/> covers string literals and
+    /// quoted/bracketed identifiers: these are structurally significant (must NOT be skipped by
+    /// <see cref="SkipTrivia"/>, or an identifier reader positioned at the opening quote would
+    /// never see it) but must still be consumed as one atomic span by paren/comma scanners so
+    /// punctuation inside the quotes cannot be misread as SQL structure.
     /// </summary>
-    private static (int Consumed, bool IsTrivia) ClassifyAt(string sql, int index, int end)
+    private enum LexicalKind
+    {
+        Other,
+        Whitespace,
+        QuotedToken,
+    }
+
+    /// <summary>
+    /// Classifies one lexical unit starting at <paramref name="index"/>. Comments are consumed
+    /// whole as <see cref="LexicalKind.Whitespace"/>; string literals and quoted identifiers are
+    /// consumed whole as <see cref="LexicalKind.QuotedToken"/>; any other single character is
+    /// returned with <c>consumed = 1</c> and <see cref="LexicalKind.Other"/>.
+    /// </summary>
+    private static (int Consumed, LexicalKind Kind) ClassifyAt(string sql, int index, int end)
     {
         var c = sql[index];
         if (c is ' ' or '\t' or '\r' or '\n')
-            return (1, true);
+            return (1, LexicalKind.Whitespace);
 
         if (c == '-' && index + 1 < end && sql[index + 1] == '-')
         {
             var scan = index + 2;
             while (scan < end && sql[scan] != '\n')
                 scan++;
-            return (scan - index, true);
+            return (scan - index, LexicalKind.Whitespace);
         }
 
         if (c == '/' && index + 1 < end && sql[index + 1] == '*')
@@ -320,9 +428,11 @@ internal static class ManagedReplicaSchemaDdlText
             while (scan + 1 < end && !(sql[scan] == '*' && sql[scan + 1] == '/'))
                 scan++;
             scan = Math.Min(scan + 2, end);
-            return (scan - index, true);
+            return (scan - index, LexicalKind.Whitespace);
         }
 
+        // String literals ('...') and quoted identifiers ("...", `...`) share the same doubled-
+        // delimiter escape rule (e.g. "a""b" / 'a''b' / `a``b`).
         if (c is '\'' or '"' or '`')
         {
             var scan = index + 1;
@@ -343,27 +453,28 @@ internal static class ManagedReplicaSchemaDdlText
                 scan++;
             }
 
-            return (scan - index, true);
+            return (scan - index, LexicalKind.QuotedToken);
         }
 
+        // Bracketed identifiers ([...]) have no escape convention in SQLite; ']' always closes.
         if (c == '[')
         {
             var scan = index + 1;
             while (scan < end && sql[scan] != ']')
                 scan++;
             scan = Math.Min(scan + 1, end);
-            return (scan - index, true);
+            return (scan - index, LexicalKind.QuotedToken);
         }
 
-        return (1, false);
+        return (1, LexicalKind.Other);
     }
 
     private static int SkipTrivia(string sql, int index)
     {
         while (index < sql.Length)
         {
-            var (consumed, isTrivia) = ClassifyAt(sql, index, sql.Length);
-            if (!isTrivia)
+            var (consumed, kind) = ClassifyAt(sql, index, sql.Length);
+            if (kind != LexicalKind.Whitespace)
                 return index;
             index += Math.Max(1, consumed);
         }

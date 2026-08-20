@@ -91,6 +91,19 @@ internal readonly record struct ManagedReplicaLogicalApplyResult(
     long OperationCount);
 
 /// <summary>
+/// One locally pending row change, captured (or marked for deletion) before a remote logical
+/// pull's apply transaction begins, so it can be reapplied afterward on top of the new remote
+/// base. <see cref="CapturedValues"/> is the row's current column values (only set when
+/// <see cref="IsDelete"/> is <see langword="false"/>); reapplying uses <see cref="RowId"/> for
+/// identity exactly like a wire-format row operation.
+/// </summary>
+internal readonly record struct ManagedReplicaCapturedLocalRowChange(
+    string TableName,
+    long RowId,
+    bool IsDelete,
+    IReadOnlyList<SqlValue>? CapturedValues);
+
+/// <summary>
 /// Replays decoded MVCC logical-log transactions onto a managed connection using plain SQL,
 /// mirroring Turso's <c>DatabaseReplaySession</c>/<c>DatabaseReplayGenerator</c>. This is a
 /// pull-only replay engine: the wire decode never produces an "Update" row change (only
@@ -138,6 +151,122 @@ internal static class ManagedReplicaLogicalReplayer
         }
 
         return new ManagedReplicaLogicalApplyResult(tableMap.Snapshot(), transactionCount, operationCount);
+    }
+
+    /// <summary>
+    /// Precollects the current local state for each distinct (table, rowid) touched by a still-
+    /// unpushed local change, BEFORE a remote pull's apply transaction begins. This preserves
+    /// local writes that have not yet been pushed to (and are thus unknown to) the remote server:
+    /// without it, the remote apply's row-level upsert/delete could silently overwrite a locally
+    /// committed row that the server has never seen, and the change would be lost even though the
+    /// local change journal still (correctly) believes it is pending push. Mirrors Turso's
+    /// precollect-before-remote-apply step in <c>DatabaseSyncEngine::apply_changes</c>.
+    /// </summary>
+    /// <remarks>
+    /// Only Row-kind changes to logically-replayable tables are captured. Schema-kind local
+    /// changes are not reconciled here: a schema DDL is not at risk of being silently overwritten
+    /// by a remote row-level apply the way row data is (the remote apply only ever touches tables
+    /// explicitly named in its own operations), so reconciling it against a competing remote
+    /// schema op for the same name is treated as an accepted out-of-scope edge case.
+    /// </remarks>
+    public static IReadOnlyList<ManagedReplicaCapturedLocalRowChange> CapturePendingLocalRowChanges(
+        IManagedConnectionAdapter connection,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(pendingLocalChanges);
+
+        // Collapse to the LAST recorded operation per (table, rowid): only the final local
+        // intent for each row matters for reconciliation, and the live row already reflects it
+        // for whichever (table, rowid) pair's final recorded op was not a delete.
+        var isFinalOpDeleteByKey = new Dictionary<(string Table, long RowId), bool>();
+        var order = new List<(string Table, long RowId)>();
+        foreach (var change in pendingLocalChanges)
+        {
+            if (change.Kind != ReplicaLocalChangeKind.Row
+                || !ManagedReplicaLogicalFilters.IsLogicallyReplayable(change.Table))
+            {
+                continue;
+            }
+
+            var key = (change.Table, change.RowId);
+            if (!isFinalOpDeleteByKey.ContainsKey(key))
+                order.Add(key);
+            isFinalOpDeleteByKey[key] = change.Operation == SqliteChangeOperation.Delete;
+        }
+
+        var captured = new List<ManagedReplicaCapturedLocalRowChange>(order.Count);
+        foreach (var key in order)
+        {
+            if (isFinalOpDeleteByKey[key])
+            {
+                captured.Add(new ManagedReplicaCapturedLocalRowChange(key.Table, key.RowId, true, null));
+                continue;
+            }
+
+            var values = TryCaptureCurrentRowValues(connection, key.Table, key.RowId);
+            if (values is null)
+            {
+                // The row is not currently present (e.g. the table no longer exists, has no
+                // accessible rowid, or was removed by an uncaptured path): nothing to reapply.
+                continue;
+            }
+
+            captured.Add(new ManagedReplicaCapturedLocalRowChange(key.Table, key.RowId, false, values));
+        }
+
+        return captured;
+    }
+
+    private static IReadOnlyList<SqlValue>? TryCaptureCurrentRowValues(
+        IManagedConnectionAdapter connection,
+        string tableName,
+        long rowId)
+    {
+        var info = GetTableColumnsInfo(connection, tableName);
+        if (info.ColumnNames.Count == 0 || info.IsWithoutRowId || info.RowidReferenceName is not { } rowidReference)
+            return null;
+
+        var columnList = string.Join(", ", info.ColumnNames.Select(QuoteIdentifier));
+        using var statement = connection.Prepare(
+            $"SELECT {columnList} FROM {QuoteIdentifier(tableName)} WHERE {QuoteIdentifier(rowidReference)} = ?");
+        statement.Bind(1, SqlValue.Integer(rowId));
+        if (statement.Step() != StatementStepResult.Row)
+            return null;
+
+        var values = new SqlValue[info.ColumnNames.Count];
+        for (var i = 0; i < values.Length; i++)
+            values[i] = statement.GetValue(i);
+        return values;
+    }
+
+    /// <summary>
+    /// Reapplies previously captured pending local row changes (see
+    /// <see cref="CapturePendingLocalRowChanges"/>) on top of a just-applied remote base,
+    /// rebasing local writes that have not yet been pushed to the remote server so they survive
+    /// a concurrent pull instead of being silently overwritten. The caller is responsible for
+    /// wrapping this call in its own transaction.
+    /// </summary>
+    public static void ReplayPendingLocalRowChanges(
+        IManagedConnectionAdapter connection,
+        IReadOnlyList<ManagedReplicaCapturedLocalRowChange> capturedChanges,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(capturedChanges);
+
+        foreach (var change in capturedChanges)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (change.IsDelete)
+            {
+                ReplayRowDelete(connection, change.TableName, change.RowId, []);
+                continue;
+            }
+
+            var record = SqliteRecordCodec.Encode(change.CapturedValues!);
+            ReplayRowUpsert(connection, change.TableName, change.RowId, record);
+        }
     }
 
     /// <summary>
@@ -307,17 +436,27 @@ internal static class ManagedReplicaLogicalReplayer
             return;
         }
 
-        var incomingColumns = ManagedReplicaSchemaDdlText.SplitCreateTableColumns(sql);
-        if (incomingColumns is not null)
+        var incomingShape = ManagedReplicaSchemaDdlText.TryGetCreateTableShape(sql);
+        if (incomingShape is not null)
         {
             var currentColumns = GetTableColumnNames(connection, name);
             if (currentColumns.Count == 0)
             {
-                ExecuteDdl(connection, sql);
+                // Table does not exist locally yet: a plain CREATE is safe, but must be
+                // rewritten to IF NOT EXISTS so a retried replay of the same transaction after a
+                // partial/interrupted apply cannot fail with "table already exists".
+                ExecuteDdl(connection, ManagedReplicaSchemaDdlText.EnsureCreateTableIfNotExists(sql));
                 return;
             }
 
-            foreach (var (columnName, definition) in incomingColumns)
+            var currentSql = GetTableCreateSql(connection, name);
+            if (currentSql is not null
+                && ManagedReplicaSchemaDdlText.TryGetCreateTableShape(currentSql) is { } currentShape)
+            {
+                AssertPurelyAdditiveTableRefresh(name, currentShape, incomingShape.Value);
+            }
+
+            foreach (var (columnName, definition) in incomingShape.Value.Columns)
             {
                 if (currentColumns.Contains(columnName, StringComparer.OrdinalIgnoreCase))
                     continue;
@@ -338,6 +477,80 @@ internal static class ManagedReplicaLogicalReplayer
         // Unrecognized DDL shape (e.g. ALTER TABLE RENAME/DROP COLUMN): replay directly. A second
         // replay of the identical statement is not guaranteed to be idempotent, matching upstream.
         ExecuteDdl(connection, sql);
+    }
+
+    /// <summary>
+    /// Rejects a table schema refresh/alter that cannot be safely applied as an additive column
+    /// diff: renamed/dropped columns, changed column definitions (type/constraint), changed
+    /// table-level constraints, or a changed <c>STRICT</c>/<c>WITHOUT ROWID</c> mode. Turso's own
+    /// <c>execute_ddl_idempotent</c> has the same additive-only limitation but silently ignores
+    /// these cases (leaving stale columns/data behind); this replica instead fails closed BEFORE
+    /// any mutation or revision publication so the replica never silently diverges from the
+    /// remote schema.
+    /// </summary>
+    private static void AssertPurelyAdditiveTableRefresh(
+        string tableName,
+        ManagedReplicaSchemaDdlText.TableShape current,
+        ManagedReplicaSchemaDdlText.TableShape incoming)
+    {
+        if (current.Strict != incoming.Strict || current.WithoutRowId != incoming.WithoutRowId)
+        {
+            throw new InvalidDataException(
+                $"Logical schema refresh for table '{tableName}' changes STRICT/WITHOUT ROWID mode, "
+                + "which additive column replay does not support.");
+        }
+
+        var incomingColumnsByName = incoming.Columns
+            .ToDictionary(c => c.Name, c => c.Definition, StringComparer.OrdinalIgnoreCase);
+        foreach (var (columnName, definition) in current.Columns)
+        {
+            if (!incomingColumnsByName.TryGetValue(columnName, out var incomingDefinition))
+            {
+                throw new InvalidDataException(
+                    $"Logical schema refresh for table '{tableName}' removes or renames column "
+                    + $"'{columnName}', which additive column replay does not support.");
+            }
+
+            if (!NormalizeDdlWhitespace(incomingDefinition)
+                    .Equals(NormalizeDdlWhitespace(definition), StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException(
+                    $"Logical schema refresh for table '{tableName}' changes the definition of "
+                    + $"column '{columnName}', which additive column replay does not support.");
+            }
+        }
+
+        var currentConstraints = current.TableConstraints
+            .Select(NormalizeDdlWhitespace)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var incomingConstraints = incoming.TableConstraints
+            .Select(NormalizeDdlWhitespace)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (!currentConstraints.SetEquals(incomingConstraints))
+        {
+            throw new InvalidDataException(
+                $"Logical schema refresh for table '{tableName}' changes table-level constraints, "
+                + "which additive column replay does not support.");
+        }
+    }
+
+    /// <summary>
+    /// Collapses whitespace runs so cosmetic formatting differences (extra spaces, newlines)
+    /// don't produce a false-positive "definition changed" detection; the comparison is otherwise
+    /// exact (case-insensitive) over tokens and punctuation.
+    /// </summary>
+    private static string NormalizeDdlWhitespace(string text)
+        => string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    private static string? GetTableCreateSql(IManagedConnectionAdapter connection, string tableName)
+    {
+        using var statement = connection.Prepare(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?");
+        statement.Bind(1, SqlValue.Text(tableName));
+        if (statement.Step() != StatementStepResult.Row)
+            return null;
+        var value = statement.GetValue(0);
+        return value.Kind == SqlValueKind.Text ? value.AsText() : null;
     }
 
     private static string SchemaObjectTypeName(ManagedReplicaLogicalSchemaKind kind) => kind switch
@@ -385,6 +598,9 @@ internal static class ManagedReplicaLogicalReplayer
             using var statement = connection.Prepare(sql);
             for (var i = 0; i < recordColumnCount; i++)
             {
+                // RowidAliasColumnIndex is only ever set for a genuine rowid-table single-column
+                // INTEGER PRIMARY KEY (never for WITHOUT ROWID, see GetTableColumnsInfo), so this
+                // correctly leaves WITHOUT ROWID / composite / non-INTEGER PK values untouched.
                 var value = i == info.RowidAliasColumnIndex ? SqlValue.Integer(rowId) : decoded[i];
                 statement.Bind(i + 1, value);
             }
@@ -393,7 +609,15 @@ internal static class ManagedReplicaLogicalReplayer
             return;
         }
 
-        var insertColumnList = string.Join(", ", recordColumns.Select(QuoteIdentifier).Append("\"rowid\""));
+        // No declared primary key: this is necessarily a genuine rowid table (WITHOUT ROWID
+        // requires a PRIMARY KEY), so row identity is the wire rowid. Reference it through
+        // whichever of "rowid"/"_rowid_"/"oid" is not shadowed by a declared column.
+        var rowidReference = info.RowidReferenceName
+            ?? throw new InvalidDataException(
+                $"Cannot reference table '{tableName}''s rowid for upsert: \"rowid\", \"_rowid_\", "
+                + "and \"oid\" are all shadowed by declared columns.");
+
+        var insertColumnList = string.Join(", ", recordColumns.Select(QuoteIdentifier).Append(QuoteIdentifier(rowidReference)));
         var insertPlaceholders = string.Join(", ", Enumerable.Repeat("?", recordColumnCount + 1));
         var insertSql = $"INSERT OR REPLACE INTO {QuoteIdentifier(tableName)}({insertColumnList}) VALUES ({insertPlaceholders})";
         using var insertStatement = connection.Prepare(insertSql);
@@ -410,13 +634,26 @@ internal static class ManagedReplicaLogicalReplayer
 
         if (useRowid)
         {
+            if (info.IsWithoutRowId)
+            {
+                throw new InvalidDataException(
+                    $"DELETE for table '{tableName}' has no primary-key projection and no before image, "
+                    + "but the table is WITHOUT ROWID and has no rowid to delete by; refusing rowid-based replay.");
+            }
+
             if (info.PkColumnIndices.Count > 0 && info.RowidAliasColumnIndex is null)
             {
                 throw new InvalidDataException(
                     $"DELETE for table '{tableName}' has no primary-key projection and no before image, but its PRIMARY KEY is not the rowid; refusing rowid-based replay.");
             }
 
-            using var statement = connection.Prepare($"DELETE FROM {QuoteIdentifier(tableName)} WHERE rowid = ?");
+            var rowidReference = info.RowidReferenceName
+                ?? throw new InvalidDataException(
+                    $"Cannot reference table '{tableName}''s rowid for delete: \"rowid\", \"_rowid_\", "
+                    + "and \"oid\" are all shadowed by declared columns.");
+
+            using var statement = connection.Prepare(
+                $"DELETE FROM {QuoteIdentifier(tableName)} WHERE {QuoteIdentifier(rowidReference)} = ?");
             statement.Bind(1, SqlValue.Integer(rowId));
             statement.Step();
             return;
@@ -435,7 +672,12 @@ internal static class ManagedReplicaLogicalReplayer
                 $"DELETE for table '{tableName}' supplied {key.Length} primary-key value(s) but the table has {info.PkColumnIndices.Count}.");
         }
 
-        var predicates = string.Join(" AND ", info.PkColumnIndices.Select(i => $"{QuoteIdentifier(info.ColumnNames[i])} = ?"));
+        // Non-STRICT SQLite does not implicitly forbid NULL in a declared (non-rowid-alias)
+        // PRIMARY KEY column, so an ordinary "col = ?" predicate would silently match zero rows
+        // (and thus silently no-op the delete) whenever the key holds NULL, since SQL's
+        // three-valued logic makes "NULL = NULL" unknown rather than true. "IS" is SQLite's
+        // NULL-safe equality operator and matches a NULL key correctly.
+        var predicates = string.Join(" AND ", info.PkColumnIndices.Select(i => $"{QuoteIdentifier(info.ColumnNames[i])} IS ?"));
         using var deleteStatement = connection.Prepare($"DELETE FROM {QuoteIdentifier(tableName)} WHERE {predicates}");
         for (var i = 0; i < key.Length; i++)
             deleteStatement.Bind(i + 1, key[i]);
@@ -445,7 +687,16 @@ internal static class ManagedReplicaLogicalReplayer
     private readonly record struct TableColumnsInfo(
         IReadOnlyList<string> ColumnNames,
         IReadOnlyList<int> PkColumnIndices,
-        int? RowidAliasColumnIndex);
+        int? RowidAliasColumnIndex,
+        bool IsWithoutRowId,
+        string? RowidReferenceName);
+
+    /// <summary>
+    /// The three case-insensitive special names SQLite recognizes for the hidden rowid pseudo
+    /// column, in the priority order SQLite itself uses when one or more is shadowed by a
+    /// declared column of the same name (see sqlite.org/lang_createtable.html#rowid).
+    /// </summary>
+    private static readonly string[] RowidSpecialNames = ["rowid", "_rowid_", "oid"];
 
     private static TableColumnsInfo GetTableColumnsInfo(IManagedConnectionAdapter connection, string tableName)
     {
@@ -476,15 +727,46 @@ internal static class ManagedReplicaLogicalReplayer
 
         pkColumns.Sort((a, b) => a.Ordinal.CompareTo(b.Ordinal));
         var pkColumnIndices = pkColumns.Select(p => p.ColumnIndex).ToArray();
+
+        // WITHOUT ROWID is not reported by pragma_table_info; it must be read from the table's
+        // own recorded CREATE TABLE text. A table with no local schema (not yet created) simply
+        // has no create SQL, so this is always false in that case, matching the pre-existing
+        // "does this table exist" check based on an empty column list.
+        var isWithoutRowId = columnNames.Count > 0
+            && GetTableCreateSql(connection, tableName) is { } createSql
+            && ManagedReplicaSchemaDdlText.TryGetCreateTableShape(createSql) is { WithoutRowId: true };
+
         int? rowidAliasColumnIndex = null;
-        if (pkColumnIndices.Length == 1)
+        if (!isWithoutRowId && pkColumnIndices.Length == 1)
         {
+            // A single-column PRIMARY KEY of declared type INTEGER is a rowid alias in ordinary
+            // (non-WITHOUT ROWID) tables regardless of ASC/DESC: SQLite's rowid-alias rule keys
+            // only on column count and declared type text, not sort direction.
             var pk = pkColumnIndices[0];
             if (pk < columnTypes.Count && columnTypes[pk].Equals("INTEGER", StringComparison.OrdinalIgnoreCase))
                 rowidAliasColumnIndex = pk;
         }
 
-        return new TableColumnsInfo(columnNames, pkColumnIndices, rowidAliasColumnIndex);
+        var rowidReferenceName = isWithoutRowId ? null : ResolveRowidReferenceName(columnNames);
+
+        return new TableColumnsInfo(columnNames, pkColumnIndices, rowidAliasColumnIndex, isWithoutRowId, rowidReferenceName);
+    }
+
+    /// <summary>
+    /// Picks the special rowid name ("rowid", then "_rowid_", then "oid") that is not shadowed by
+    /// a declared column of the same name (case-insensitive), matching SQLite's own resolution
+    /// order. Returns <see langword="null"/> in the vanishingly rare case where a table declares
+    /// columns literally named all three, leaving the true rowid unreachable by any special name.
+    /// </summary>
+    private static string? ResolveRowidReferenceName(IReadOnlyList<string> columnNames)
+    {
+        foreach (var candidate in RowidSpecialNames)
+        {
+            if (!columnNames.Contains(candidate, StringComparer.OrdinalIgnoreCase))
+                return candidate;
+        }
+
+        return null;
     }
 
     private static List<string> GetTableColumnNames(IManagedConnectionAdapter connection, string tableName)

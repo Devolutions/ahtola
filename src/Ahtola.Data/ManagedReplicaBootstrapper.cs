@@ -19,6 +19,21 @@ internal static class ManagedReplicaBootstrapper
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly IReadOnlyDictionary<ulong, string> EmptyTableMap = new Dictionary<ulong, string>();
 
+    /// <summary>
+    /// Deletes a bootstrapped replica's durable artifacts: the main database file, its v3
+    /// metadata sidecar, and any WAL/SHM/journal sidecars. Used to roll a bootstrap fully back
+    /// when the mandatory post-bootstrap logical catch-up fails (see
+    /// <see cref="ManagedReplicaConnectionHost"/>'s combined bootstrap+catch-up publication unit),
+    /// so a subsequent open retries a clean bootstrap rather than observing a replica that is
+    /// durably "bootstrapped" but has permanently skipped catch-up.
+    /// </summary>
+    internal static void DeleteBootstrappedReplicaFiles(string path)
+    {
+        DeleteIfExists(path);
+        DeleteIfExists(path + MetadataSuffix);
+        DeleteStagingSidecars(path);
+    }
+
     public static async Task BootstrapAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -293,10 +308,26 @@ internal static class ManagedReplicaBootstrapper
         return map;
     }
 
-    public static async Task<AhtolaSyncResult> CheckForUpdatesAsync(
+    public static Task<AhtolaSyncResult> CheckForUpdatesAsync(
         AhtolaReplicaOptions options, ManagedReplicaMetadata metadata, AhtolaSyncOptions syncOptions,
         CancellationToken cancellationToken)
+        => CheckForUpdatesAsync(options, metadata, syncOptions, [], cancellationToken);
+
+    /// <summary>
+    /// Pulls and applies remote changes. <paramref name="pendingLocalChanges"/> is the set of
+    /// local changes still awaiting push at the moment this call starts (e.g. left over after a
+    /// push batch capped by <see cref="AhtolaReplicaOptions.PushOperationsThreshold"/>, or simply
+    /// because no push has run yet this cycle); for the MVCC logical protocol these are
+    /// precollected and reapplied on top of the newly pulled base so they are not silently lost
+    /// (see <see cref="ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges"/>). Ignored
+    /// for the page protocol, which has no mechanism to reconcile local writes across a pull.
+    /// </summary>
+    public static async Task<AhtolaSyncResult> CheckForUpdatesAsync(
+        AhtolaReplicaOptions options, ManagedReplicaMetadata metadata, AhtolaSyncOptions syncOptions,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+        CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(pendingLocalChanges);
         ManagedReplicaSupportMatrix.ValidateOptions(options);
         EnsureNoLocalDivergence(options.Path, metadata);
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pulling));
@@ -340,7 +371,8 @@ internal static class ManagedReplicaBootstrapper
 
             var body = await ReadRemainingBytesAsync(stream, effectiveToken).ConfigureAwait(false);
             var (outcome, statistics) = await ApplyLogicalUpdatesAsync(
-                options, metadata, header, body, syncOptions, payload.Length, reader.BytesRead + body.Length, effectiveToken)
+                options, metadata, header, body, syncOptions, pendingLocalChanges,
+                payload.Length, reader.BytesRead + body.Length, effectiveToken)
                 .ConfigureAwait(false);
             return new AhtolaSyncResult(outcome, statistics);
         }
@@ -383,6 +415,10 @@ internal static class ManagedReplicaBootstrapper
     /// dedicated connection (never the caller's live connection, so the local push change journal
     /// never captures this replay); the database, fingerprint, table map, protocol, and revision
     /// only advance together after that commit succeeds, and are left untouched on any failure.
+    /// When the remote apply is non-empty and <paramref name="pendingLocalChanges"/> is non-empty,
+    /// the current local state for every row touched by a pending change is precollected before
+    /// the remote apply begins and reapplied in a follow-up transaction afterward, so local writes
+    /// the server has not yet seen survive the pull instead of being silently overwritten.
     /// </summary>
     private static async Task<(AhtolaSyncOutcome Outcome, AhtolaSyncStatistics Statistics)> ApplyLogicalUpdatesAsync(
         AhtolaReplicaOptions options,
@@ -390,6 +426,7 @@ internal static class ManagedReplicaBootstrapper
         PullHeader header,
         byte[] body,
         AhtolaSyncOptions syncOptions,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
         long networkSentBytes,
         long networkReceivedBytes,
         CancellationToken cancellationToken)
@@ -424,52 +461,183 @@ internal static class ManagedReplicaBootstrapper
         var tableNamesByStableId = metadata.TableNamesByStableId;
         if (transactions.Count != 0)
         {
-            using var database = ManagedDatabaseAdapter.Open(options.Path);
-            var connection = database.Connect();
-            ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
+            // The SQL transaction below mutates the live database file in place (unlike the
+            // page-based path, which stages a whole replacement file before ever touching the
+            // original). Durability compensation for that in-place mutation therefore needs its
+            // own full-artifact snapshot, taken before the transaction starts, covering every
+            // durable file the engine may touch: the main database file plus its WAL/SHM/journal
+            // sidecars. If anything fails after COMMIT but before metadata is durably published
+            // (including a failed checkpoint, which must never be swallowed), every one of those
+            // artifacts is restored to its pre-apply state so the old revision/fingerprint pair
+            // in metadata remains valid and the next sync safely retries from the old revision.
+            var artifactBackup = BackupDatabaseArtifacts(options.Path, directory, Guid.NewGuid().ToString("N"));
+            var metadataPublished = false;
             try
             {
-                var applied = ManagedReplicaLogicalReplayer.Apply(
-                    connection, transactions, metadata.TableNamesByStableId, metadata.ClientId, cancellationToken);
-                ExecuteNonQuery(connection, "COMMIT");
-                operationCount = applied.OperationCount;
-                tableNamesByStableId = applied.TableNamesByStableId;
+                using (var database = ManagedDatabaseAdapter.Open(options.Path))
+                {
+                    var connection = database.Connect();
+
+                    // Precollect BEFORE the remote apply begins: capture is a plain read against
+                    // the current (pre-pull) committed state, on the same dedicated connection
+                    // that is about to apply the remote transactions.
+                    var capturedLocalChanges = pendingLocalChanges.Count == 0
+                        ? []
+                        : ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pendingLocalChanges);
+
+                    ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
+                    try
+                    {
+                        var applied = ManagedReplicaLogicalReplayer.Apply(
+                            connection, transactions, metadata.TableNamesByStableId, metadata.ClientId, cancellationToken);
+                        operationCount = applied.OperationCount;
+                        tableNamesByStableId = applied.TableNamesByStableId;
+
+                        // Rebase the still-unpushed local writes on top of the just-applied
+                        // remote base, in the SAME transaction (matching Turso's
+                        // apply_logical_mvcc_changes_internal, which replays local changes before
+                        // its single COMMIT rather than in a follow-up transaction). These
+                        // changes remain in the local change journal (not acknowledged here): the
+                        // server has not seen them yet, so a later push must still send them.
+                        if (capturedLocalChanges.Count != 0)
+                        {
+                            ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(
+                                connection, capturedLocalChanges, cancellationToken);
+                        }
+
+                        ExecuteNonQuery(connection, "COMMIT");
+                    }
+                    catch
+                    {
+                        TryExecuteNonQuery(connection, "ROLLBACK");
+                        throw;
+                    }
+
+                    ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.LogicalApplyCommitted);
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // Force a WAL (if any) to checkpoint into the main file so the fingerprint
+                    // hashed below, and any later plain-file-byte divergence check, observe the
+                    // committed data. This must not be a best-effort/swallowed call: the
+                    // transaction above is already durably committed, so a checkpoint failure
+                    // here is compensated (restored) below like any other failure in this block,
+                    // rather than silently leaving the file inconsistent with what publication is
+                    // about to record.
+                    ExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+                    ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.LogicalApplyCheckpointed);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
+                var fingerprint = ComputeDatabaseFingerprint(options.Path);
+                try
+                {
+                    await WriteMetadataAsync(
+                            metadataStagingPath,
+                            metadataPath,
+                            header.Revision,
+                            fingerprint,
+                            header.Protocol,
+                            tableNamesByStableId,
+                            cancellationToken,
+                            replaceExisting: true,
+                            clientId: metadata.ClientId)
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    DeleteIfExists(metadataStagingPath);
+                }
+
+                // From this point on, metadata already durably fingerprints the just-installed
+                // database image: a later interruption (e.g. cancellation observed immediately
+                // below) must preserve that matched (new database, new metadata) pair rather than
+                // restore only the database and leave metadata pointing at a revision the file no
+                // longer contains.
+                metadataPublished = true;
+                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.LogicalApplyMetadataPublished);
+                cancellationToken.ThrowIfCancellationRequested();
             }
             catch
             {
-                TryExecuteNonQuery(connection, "ROLLBACK");
+                if (!metadataPublished)
+                    RestoreDatabaseArtifacts(options.Path, artifactBackup);
                 throw;
             }
-
-            // Force a WAL (if any) to checkpoint into the main file so the fingerprint hashed
-            // below, and any later plain-file-byte divergence check, observe the committed data.
-            TryExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
-        }
-
-        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
-        var fingerprint = ComputeDatabaseFingerprint(options.Path);
-        try
-        {
-            await WriteMetadataAsync(
-                    metadataStagingPath,
-                    metadataPath,
-                    header.Revision,
-                    fingerprint,
-                    header.Protocol,
-                    tableNamesByStableId,
-                    cancellationToken,
-                    replaceExisting: true,
-                    clientId: metadata.ClientId)
-                .ConfigureAwait(false);
-        }
-        finally
-        {
-            DeleteIfExists(metadataStagingPath);
+            finally
+            {
+                DeleteBackupArtifacts(artifactBackup);
+            }
         }
 
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
         return (AhtolaSyncOutcome.RemoteChangesApplied,
             new AhtolaSyncStatistics(operationCount, 0, 0, DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, header.Revision));
+    }
+
+    /// <summary>
+    /// The file suffixes for a SQLite/Ahtola database's durability-relevant sidecar files,
+    /// beyond the main database file itself: the WAL, its shared-memory index, and the legacy
+    /// rollback journal. A logical-apply compensation snapshot must cover all of these, not just
+    /// the main file, or a restore could leave a WAL that references pages the restored main file
+    /// no longer has (or vice versa).
+    /// </summary>
+    private static readonly string[] DatabaseSidecarSuffixes = ["-wal", "-shm", "-journal"];
+
+    private readonly record struct DatabaseArtifactBackup(
+        string DatabasePath,
+        string MainBackupPath,
+        bool MainExisted,
+        IReadOnlyList<(string SidecarPath, string BackupPath, bool Existed)> Sidecars);
+
+    /// <summary>
+    /// Snapshots the main database file and every present sidecar to sibling <c>.bak</c> files so
+    /// <see cref="RestoreDatabaseArtifacts"/> can put every durable artifact back exactly as it
+    /// was, including artifacts that did not exist before the apply (which are deleted, not just
+    /// left as leftover empty files, on restore).
+    /// </summary>
+    private static DatabaseArtifactBackup BackupDatabaseArtifacts(string databasePath, string directory, string token)
+    {
+        var mainBackupPath = Path.Combine(directory, $".{Path.GetFileName(databasePath)}.logical-{token}.bak");
+        var mainExisted = File.Exists(databasePath);
+        if (mainExisted)
+            File.Copy(databasePath, mainBackupPath, overwrite: true);
+
+        var sidecars = new List<(string, string, bool)>(DatabaseSidecarSuffixes.Length);
+        foreach (var suffix in DatabaseSidecarSuffixes)
+        {
+            var sidecarPath = databasePath + suffix;
+            var sidecarBackupPath = Path.Combine(directory, $".{Path.GetFileName(databasePath)}{suffix}.logical-{token}.bak");
+            var existed = File.Exists(sidecarPath);
+            if (existed)
+                File.Copy(sidecarPath, sidecarBackupPath, overwrite: true);
+            sidecars.Add((sidecarPath, sidecarBackupPath, existed));
+        }
+
+        return new DatabaseArtifactBackup(databasePath, mainBackupPath, mainExisted, sidecars);
+    }
+
+    private static void RestoreDatabaseArtifacts(string databasePath, DatabaseArtifactBackup backup)
+    {
+        if (backup.MainExisted)
+            File.Copy(backup.MainBackupPath, databasePath, overwrite: true);
+        else
+            DeleteIfExists(databasePath);
+
+        foreach (var (sidecarPath, sidecarBackupPath, existed) in backup.Sidecars)
+        {
+            if (existed)
+                File.Copy(sidecarBackupPath, sidecarPath, overwrite: true);
+            else
+                DeleteIfExists(sidecarPath);
+        }
+    }
+
+    private static void DeleteBackupArtifacts(DatabaseArtifactBackup backup)
+    {
+        DeleteIfExists(backup.MainBackupPath);
+        foreach (var (_, sidecarBackupPath, _) in backup.Sidecars)
+            DeleteIfExists(sidecarBackupPath);
     }
 
     private static async Task<byte[]> ReadRemainingBytesAsync(Stream stream, CancellationToken cancellationToken)
@@ -1074,8 +1242,30 @@ internal static class ManagedReplicaBootstrapper
         destination.Add((byte)value);
     }
 
+    /// <summary>
+    /// Rejects a replica whose file bytes drifted from what the last sync recorded, without a
+    /// managed avenue back to reconciled state.
+    /// </summary>
+    /// <remarks>
+    /// The page protocol supports only a raw whole/partial-page replacement apply: it has no way
+    /// to reconcile local writes made between syncs, so any local WAL/journal activity or main-
+    /// file byte drift there is necessarily unmanaged and must be rejected.
+    /// </remarks>
+    /// <remarks>
+    /// The MVCC logical protocol is different: it is explicitly designed to keep serving local
+    /// writes between syncs (they are captured by the local change journal, pushed on a later
+    /// sync, and reconciled around each pull by precollecting and replaying still-unpushed
+    /// changes on top of the new remote base — see
+    /// <see cref="ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges"/>). An evolving WAL
+    /// and a main-file fingerprint that drifts from the last recorded one are therefore the
+    /// expected steady state for this protocol, not evidence of an unmanaged, out-of-band
+    /// modification, so this check is skipped entirely for it.
+    /// </remarks>
     public static void EnsureNoLocalDivergence(string databasePath, ManagedReplicaMetadata metadata)
     {
+        if (metadata.Protocol == RemotePullProtocol.MvccLogical)
+            return;
+
         // Opening the managed pager may create an empty 32-byte WAL header; frames
         // beyond that header are local state and cannot be replaced safely.
         if ((File.Exists(databasePath + "-wal") && new FileInfo(databasePath + "-wal").Length > 32)

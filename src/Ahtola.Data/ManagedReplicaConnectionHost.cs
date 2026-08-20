@@ -231,10 +231,9 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var syncEntry = ManagedReplicaSyncRegistry.Acquire(options.Path);
         try
         {
+            EnsureReplicaAvailableAndCaughtUpAsync(syncEntry, options, CancellationToken.None)
+                .GetAwaiter().GetResult();
             using var operation = syncEntry.EnterLocalOperation(CancellationToken.None);
-            var freshBootstrap = EnsureReplicaAvailableAsync(options, CancellationToken.None).GetAwaiter().GetResult();
-            if (freshBootstrap)
-                CatchUpAfterFreshBootstrapAsync(options, CancellationToken.None).GetAwaiter().GetResult();
             return OpenExisting(options, syncEntry);
         }
         catch
@@ -253,10 +252,8 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var syncEntry = ManagedReplicaSyncRegistry.Acquire(options.Path);
         try
         {
+            await EnsureReplicaAvailableAndCaughtUpAsync(syncEntry, options, cancellationToken).ConfigureAwait(false);
             using var operation = await syncEntry.EnterLocalOperationAsync(cancellationToken).ConfigureAwait(false);
-            var freshBootstrap = await EnsureReplicaAvailableAsync(options, cancellationToken).ConfigureAwait(false);
-            if (freshBootstrap)
-                await CatchUpAfterFreshBootstrapAsync(options, cancellationToken).ConfigureAwait(false);
             return OpenExisting(options, syncEntry);
         }
         catch
@@ -305,14 +302,49 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     }
 
     /// <summary>
-    /// Returns <see langword="true"/> when this call performed a fresh bootstrap (the replica
-    /// path did not exist yet), so the caller can catch it up with one immediate logical pull
-    /// before exposing the connection.
+    /// Ensures a replica database exists at <paramref name="options"/>'s path, bootstrapping it
+    /// from the remote database if missing, and performs the mandatory post-bootstrap logical
+    /// catch-up pull (<see cref="RunCatchUpIfMvccLogicalAsync"/>) before returning — as ONE
+    /// exclusive publication unit (the same <see cref="ManagedReplicaSyncRegistry.Entry.PublishAsync"/>
+    /// mechanism a regular <see cref="SyncAsync(CancellationToken)"/> uses).
     /// </summary>
-    private static async Task<bool> EnsureReplicaAvailableAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
+    /// <remarks>
+    /// A durably bootstrapped-but-never-caught-up replica is not a safe state to leave sitting on
+    /// disk: its base image is the last durable generation base (the server deliberately never
+    /// checkpoints for a bootstrap), so without a guaranteed catch-up it would silently serve
+    /// stale data, potentially forever, since a later <c>Open()</c> only sees a durable
+    /// (database, metadata) pair and has no way to tell that catch-up never ran. Publication
+    /// exclusivity additionally serializes concurrent first-time <c>Open()</c> calls for the same
+    /// path so they cannot race each other's downloads, and if catch-up fails after a successful
+    /// bootstrap, the whole (database, metadata) pair is rolled back so the next attempt (by this
+    /// caller, or a concurrent one that was waiting for its publication turn) retries a clean
+    /// bootstrap+catch-up rather than observing a half-finished replica.
+    /// </remarks>
+    private static async Task EnsureReplicaAvailableAndCaughtUpAsync(
+        ManagedReplicaSyncRegistry.Entry syncEntry,
+        AhtolaReplicaOptions options,
+        CancellationToken cancellationToken)
     {
-        if (File.Exists(options.Path) && new FileInfo(options.Path).Length > 0)
-            return false;
+        if (IsReplicaFilePresent(options.Path))
+            return;
+
+        await syncEntry.PublishAsync(
+                token => BootstrapAndCatchUpAsync(options, token),
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static bool IsReplicaFilePresent(string path)
+        => File.Exists(path) && new FileInfo(path).Length > 0;
+
+    private static async Task BootstrapAndCatchUpAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
+    {
+        if (IsReplicaFilePresent(options.Path))
+        {
+            // Another Open() call already completed bootstrap+catch-up while this one waited
+            // its turn for exclusive publication access; nothing left to do.
+            return;
+        }
 
         if (File.Exists(options.Path))
         {
@@ -321,7 +353,15 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         }
 
         await ManagedReplicaBootstrapper.BootstrapAsync(options, cancellationToken).ConfigureAwait(false);
-        return true;
+        try
+        {
+            await RunCatchUpIfMvccLogicalAsync(options, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            ManagedReplicaBootstrapper.DeleteBootstrappedReplicaFiles(options.Path);
+            throw;
+        }
     }
 
     /// <summary>
@@ -333,7 +373,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     /// the open call open waiting for future changes. A no-op for page-protocol replicas, whose
     /// bootstrap is already current.
     /// </summary>
-    private static async Task CatchUpAfterFreshBootstrapAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
+    private static async Task RunCatchUpIfMvccLogicalAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
     {
         var metadata = ManagedReplicaBootstrapper.LoadMetadata(options.Path);
         if (metadata is not { Protocol: RemotePullProtocol.MvccLogical } value)
@@ -386,10 +426,16 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var push = await PushLocalChangesAsync(replicaOptions, metadata, syncOptions, cancellationToken)
             .ConfigureAwait(false);
         metadata = push.Metadata;
+
+        // Anything still sitting in the change journal after the push batch above (capped by
+        // PushOperationsThreshold) has not reached the server, so the pull below must reconcile
+        // it rather than let its own remote row-level apply silently overwrite it.
+        var pendingLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes;
         var result = await ManagedReplicaBootstrapper.CheckForUpdatesAsync(
                 replicaOptions,
                 metadata,
                 syncOptions,
+                pendingLocalChanges,
                 cancellationToken)
             .ConfigureAwait(false);
         _metadata = ManagedReplicaBootstrapper.LoadMetadata(replicaOptions.Path);

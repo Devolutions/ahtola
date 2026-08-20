@@ -251,8 +251,34 @@ public sealed class ManagedReplicaLml3DecoderTests
 
         var op0 = txns.Should().ContainSingle().Subject.Ops.Should().ContainSingle().Subject;
         op0.OpType.Should().Be(ManagedReplicaLogicalOpType.UpdateHeader);
-        op0.UserVersion.Should().Be(7u);
-        op0.ApplicationId.Should().Be(99u);
+        op0.UserVersion.Should().Be(7);
+        op0.ApplicationId.Should().Be(99);
+    }
+
+    [Test]
+    public void DecodesNegativeUserVersionAndApplicationIdAsSignedInt32()
+    {
+        // SQLite's user_version/application_id are signed int32 values that round-trip negative
+        // numbers through PRAGMA; the wire bytes must be read as a two's-complement signed value
+        // (BinaryPrimitives.ReadInt32BigEndian), not as an unsigned value that would corrupt a
+        // negative number into a huge positive one.
+        var salt = 58UL;
+        var header = Lml3TestBuilder.BuildHeader(salt);
+        var crc = Lml3TestBuilder.HeaderSeedCrc(salt);
+
+        var payload = Lml3TestBuilder.UpdateHeaderPayload(userVersion: -1, applicationId: int.MinValue);
+        var op = Lml3TestBuilder.BuildRecoveryOp(4, 0, -1, payload);
+        var portableTxn = Lml3TestBuilder.BuildPortableLogicalTxn(1, 1);
+        var extRecord = Lml3TestBuilder.BuildExtensionRecord(1, Lml3TestBuilder.Delimited(portableTxn));
+        var frame = Lml3TestBuilder.BuildFrame(ref crc, op, 1, extRecord);
+
+        var body = header.Concat(frame).ToArray();
+        var ranges = new[] { new ManagedReplicaLogicalLogRange(1, 0, (ulong)body.Length, true, null) };
+        var txns = ManagedReplicaLml3Decoder.Decode(ranges, body, CancellationToken.None);
+
+        var op0 = txns.Should().ContainSingle().Subject.Ops.Should().ContainSingle().Subject;
+        op0.UserVersion.Should().Be(-1);
+        op0.ApplicationId.Should().Be(int.MinValue);
     }
 
     [Test]
@@ -593,6 +619,117 @@ public sealed class ManagedReplicaLml3DecoderTests
         cts.Cancel();
         var ranges = new[] { new ManagedReplicaLogicalLogRange(1, 0, 0, true, null) };
         Assert.Throws<OperationCanceledException>(() => ManagedReplicaLml3Decoder.Decode(ranges, [], cts.Token));
+    }
+
+    [Test]
+    public void ExtensionRecordLengthOfExactlyOverflowThresholdIsRejected()
+    {
+        // 0x80000000: the smallest uint whose (int) cast would be negative if narrowed without a
+        // guard, which could make payloadEnd regress behind payloadStart (breaking forward
+        // progress) or throw the wrong exception type from a checked cast.
+        AssertMalformedExtensionRecordLengthThrows(0x80000000);
+    }
+
+    [Test]
+    public void ExtensionRecordLengthNearUInt32MaxIsRejected()
+    {
+        AssertMalformedExtensionRecordLengthThrows(0xfffffff8);
+    }
+
+    private static void AssertMalformedExtensionRecordLengthThrows(uint declaredLength)
+    {
+        var salt = 55UL;
+        var header = Lml3TestBuilder.BuildHeader(salt);
+        var crc = Lml3TestBuilder.HeaderSeedCrc(salt);
+        var op = Lml3TestBuilder.BuildRecoveryOp(0, 0, -2, Lml3TestBuilder.UpsertTablePayload(1, [0x00]));
+
+        // One hand-built extension record header whose length field lies about how much data
+        // follows (no actual payload bytes are present at all).
+        var extensionBlock = new byte[8];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(extensionBlock.AsSpan(0), 1); // type
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(extensionBlock.AsSpan(2), 0); // flags
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(extensionBlock.AsSpan(4), declaredLength);
+
+        var frame = Lml3TestBuilder.BuildFrameWithExtensionRecordCount(
+            ref crc, op, 1, extensionBlock, extensionRecordCount: 1);
+
+        var body = header.Concat(frame).ToArray();
+        var ranges = new[] { new ManagedReplicaLogicalLogRange(1, 0, (ulong)body.Length, true, null) };
+        Assert.Throws<InvalidDataException>(() => ManagedReplicaLml3Decoder.Decode(ranges, body, CancellationToken.None));
+    }
+
+    [Test]
+    public void HugeDeclaredExtensionRecordCountIsRejectedBeforeIterating()
+    {
+        var salt = 56UL;
+        var header = Lml3TestBuilder.BuildHeader(salt);
+        var crc = Lml3TestBuilder.HeaderSeedCrc(salt);
+        var op = Lml3TestBuilder.BuildRecoveryOp(0, 0, -2, Lml3TestBuilder.UpsertTablePayload(1, [0x00]));
+
+        // A tiny extension block cannot possibly contain anywhere near this many 8-byte-minimum
+        // records; the decoder must reject the declared count up front rather than attempt to
+        // iterate towards discovering the mismatch.
+        var extensionBlock = new byte[8];
+        var frame = Lml3TestBuilder.BuildFrameWithExtensionRecordCount(
+            ref crc, op, 1, extensionBlock, extensionRecordCount: 0xfffffff8);
+
+        var body = header.Concat(frame).ToArray();
+        var ranges = new[] { new ManagedReplicaLogicalLogRange(1, 0, (ulong)body.Length, true, null) };
+        Assert.Throws<InvalidDataException>(() => ManagedReplicaLml3Decoder.Decode(ranges, body, CancellationToken.None));
+    }
+
+    [Test]
+    public void CancellationIsHonoredWhileScanningALargeExtensionBlock()
+    {
+        var salt = 57UL;
+        var header = Lml3TestBuilder.BuildHeader(salt);
+        var crc = Lml3TestBuilder.HeaderSeedCrc(salt);
+        var op = Lml3TestBuilder.BuildRecoveryOp(0, 0, -2, Lml3TestBuilder.UpsertTablePayload(1, [0x00]));
+
+        // Many zero-payload (8-byte header only) extension records: individually cheap and legal,
+        // but numerous enough that an uncancellable scan would be a real DoS concern for an
+        // attacker-controlled recordCount. A pre-cancelled token must still surface
+        // OperationCanceledException (not run to completion, and not throw some other exception
+        // type first).
+        const int recordCount = 5000;
+        var extensionBlock = new byte[recordCount * 8];
+        for (var i = 0; i < recordCount; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(extensionBlock.AsSpan(i * 8), 1);
+
+        var frame = Lml3TestBuilder.BuildFrameWithExtensionRecordCount(
+            ref crc, op, 1, extensionBlock, extensionRecordCount: recordCount);
+
+        var body = header.Concat(frame).ToArray();
+        var ranges = new[] { new ManagedReplicaLogicalLogRange(1, 0, (ulong)body.Length, true, null) };
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        Assert.Throws<OperationCanceledException>(() => ManagedReplicaLml3Decoder.Decode(ranges, body, cts.Token));
+    }
+
+    [Test]
+    public void Crc32CMatchesTheCanonicalCheckValue()
+    {
+        // The standard CRC32C (Castagnoli) check value: CRC32C(ASCII "123456789") == 0xE3069283.
+        // This asserts the PRODUCTION Lml3Crc32C directly against an externally-defined constant,
+        // independent of the separate Lml3Crc32CForTests implementation the test builder uses to
+        // construct fixtures (a bug shared by both would not be caught by frame round-trip tests
+        // alone).
+        var bytes = System.Text.Encoding.ASCII.GetBytes("123456789");
+        Lml3Crc32C.Compute(bytes).Should().Be(0xE3069283u);
+    }
+
+    [Test]
+    public void Crc32CChainedAppendMatchesASingleComputeOverTheConcatenation()
+    {
+        var part1 = System.Text.Encoding.ASCII.GetBytes("123456789");
+        var part2 = System.Text.Encoding.ASCII.GetBytes("the quick brown fox");
+        var whole = part1.Concat(part2).ToArray();
+
+        var chained = Lml3Crc32C.Append(Lml3Crc32C.Compute(part1), part2);
+        var direct = Lml3Crc32C.Compute(whole);
+
+        chained.Should().Be(direct);
     }
 }
 

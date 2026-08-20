@@ -92,6 +92,129 @@ public sealed class ManagedReplicaLogicalReplayerTests
     }
 
     [Test]
+    public void TableRefreshRejectsARenamedColumnInsteadOfSilentlyDiverging()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)");
+        Exec(connection, "INSERT INTO widgets VALUES (1, 'a')");
+
+        // The remote renamed "name" to "label"; additive column-diffing alone cannot express a
+        // rename (it would just ADD a new "label" column and leave "name" stale).
+        var txn = SingleOpTxn(SchemaOp(
+            ManagedReplicaLogicalSchemaAction.Refresh,
+            ManagedReplicaLogicalSchemaKind.Table,
+            "widgets",
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, label TEXT)"));
+
+        Action act = () => Apply(connection, [txn]);
+        act.Should().Throw<InvalidDataException>().WithMessage("*removes or renames column*");
+        // Nothing must have been mutated: the original column and data are untouched.
+        ColumnNames(connection, "widgets").Should().Equal("id", "name");
+        Scalar(connection, "SELECT name FROM widgets WHERE id = 1").AsText().Should().Be("a");
+    }
+
+    [Test]
+    public void TableRefreshRejectsADroppedColumn()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT, note TEXT)");
+
+        var txn = SingleOpTxn(SchemaOp(
+            ManagedReplicaLogicalSchemaAction.Refresh,
+            ManagedReplicaLogicalSchemaKind.Table,
+            "widgets",
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)"));
+
+        Action act = () => Apply(connection, [txn]);
+        act.Should().Throw<InvalidDataException>().WithMessage("*removes or renames column*");
+    }
+
+    [Test]
+    public void TableRefreshRejectsAChangedColumnDefinition()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)");
+
+        var txn = SingleOpTxn(SchemaOp(
+            ManagedReplicaLogicalSchemaAction.Refresh,
+            ManagedReplicaLogicalSchemaKind.Table,
+            "widgets",
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT NOT NULL)"));
+
+        Action act = () => Apply(connection, [txn]);
+        act.Should().Throw<InvalidDataException>().WithMessage("*changes the definition of*");
+    }
+
+    [Test]
+    public void TableRefreshRejectsAChangedTableLevelConstraint()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE widgets(x TEXT, y TEXT, PRIMARY KEY(x, y))");
+
+        var txn = SingleOpTxn(SchemaOp(
+            ManagedReplicaLogicalSchemaAction.Refresh,
+            ManagedReplicaLogicalSchemaKind.Table,
+            "widgets",
+            "CREATE TABLE widgets(x TEXT, y TEXT, UNIQUE(x, y))"));
+
+        Action act = () => Apply(connection, [txn]);
+        act.Should().Throw<InvalidDataException>().WithMessage("*table-level constraints*");
+    }
+
+    [Test]
+    public void TableRefreshRejectsAddingStrict()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)");
+
+        var txn = SingleOpTxn(SchemaOp(
+            ManagedReplicaLogicalSchemaAction.Refresh,
+            ManagedReplicaLogicalSchemaKind.Table,
+            "widgets",
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT) STRICT"));
+
+        Action act = () => Apply(connection, [txn]);
+        act.Should().Throw<InvalidDataException>().WithMessage("*STRICT/WITHOUT ROWID*");
+    }
+
+    [Test]
+    public void TableRefreshRejectsAddingWithoutRowid()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE widgets(id TEXT PRIMARY KEY, name TEXT)");
+
+        var txn = SingleOpTxn(SchemaOp(
+            ManagedReplicaLogicalSchemaAction.Refresh,
+            ManagedReplicaLogicalSchemaKind.Table,
+            "widgets",
+            "CREATE TABLE widgets(id TEXT PRIMARY KEY, name TEXT) WITHOUT ROWID"));
+
+        Action act = () => Apply(connection, [txn]);
+        act.Should().Throw<InvalidDataException>().WithMessage("*STRICT/WITHOUT ROWID*");
+    }
+
+    [Test]
+    public void TableRefreshStillAllowsAPurelyAdditiveColumn()
+    {
+        // A genuinely additive refresh (new column, all existing columns/constraints unchanged)
+        // must still succeed; issue-4's fix only rejects NON-additive changes.
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)");
+        Exec(connection, "INSERT INTO widgets VALUES (1, 'a')");
+
+        var txn = SingleOpTxn(SchemaOp(
+            ManagedReplicaLogicalSchemaAction.Refresh,
+            ManagedReplicaLogicalSchemaKind.Table,
+            "widgets",
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT, note TEXT)"));
+
+        Action act = () => Apply(connection, [txn]);
+        act.Should().NotThrow();
+        ColumnNames(connection, "widgets").Should().Equal("id", "name", "note");
+        Scalar(connection, "SELECT name FROM widgets WHERE id = 1").AsText().Should().Be("a");
+    }
+
+    [Test]
     public void UpsertRowIntoARowidOnlyTablePreservesTheRowid()
     {
         using var connection = OpenConnection();
@@ -234,6 +357,82 @@ public sealed class ManagedReplicaLogicalReplayerTests
     }
 
     [Test]
+    public void IntegerPrimaryKeyDescStillCountsAsTheRowidAlias()
+    {
+        // SQLite's rowid-alias rule keys only on column count (1) and declared type text
+        // ("INTEGER"), never on ASC/DESC sort direction.
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY DESC, name TEXT)");
+
+        var record = SqliteRecordCodecTestHelper.EncodeRow(SqlValue.Null, SqlValue.Text("alice"));
+        var txn = SingleOpTxn(RowOp(ManagedReplicaLogicalOpType.UpsertRow, "t", rowId: 5, record));
+        Apply(connection, [txn]);
+
+        Scalar(connection, "SELECT id FROM t").AsInteger().Should().Be(5);
+    }
+
+    [Test]
+    public void UpsertIntoAWithoutRowidTableUsesTheDeclaredPrimaryKeyNotTheWireRowid()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT) WITHOUT ROWID");
+
+        // WITHOUT ROWID never has a rowid alias, even though the PK is a single column: the wire
+        // rowid (99, deliberately implausible) must NOT be substituted into any column value.
+        var record = SqliteRecordCodecTestHelper.EncodeRow(SqlValue.Text("k1"), SqlValue.Text("v1"));
+        var txn = SingleOpTxn(RowOp(ManagedReplicaLogicalOpType.UpsertRow, "t", rowId: 99, record));
+        Apply(connection, [txn]);
+
+        Scalar(connection, "SELECT y FROM t WHERE x = 'k1'").AsText().Should().Be("v1");
+    }
+
+    [Test]
+    public void DeleteWithoutAKeyOnAWithoutRowidTableIsRefused()
+    {
+        // A WITHOUT ROWID table has no rowid at all to delete by; a delete that arrives without a
+        // primary-key projection (and no before image) must fail rather than guess.
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(x TEXT PRIMARY KEY) WITHOUT ROWID");
+        Exec(connection, "INSERT INTO t VALUES ('k1')");
+
+        var txn = SingleOpTxn(RowOp(ManagedReplicaLogicalOpType.DeleteRow, "t", rowId: 1, record: []));
+        Action act = () => Apply(connection, [txn]);
+        act.Should().Throw<InvalidDataException>().WithMessage("*WITHOUT ROWID*");
+    }
+
+    [Test]
+    public void UpsertHandlesATableWithAGenuineRowidNamedColumnThatIsNotTheAlias()
+    {
+        // A table with no INTEGER PRIMARY KEY alias may still declare a real column literally
+        // named "rowid"; SQLite then requires "_rowid_"/"oid" to reach the true pseudo-column.
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(\"rowid\" TEXT, y TEXT)");
+
+        var record = SqliteRecordCodecTestHelper.EncodeRow(SqlValue.Text("not-the-alias"), SqlValue.Text("v1"));
+        var txn = SingleOpTxn(RowOp(ManagedReplicaLogicalOpType.UpsertRow, "t", rowId: 42, record));
+        Apply(connection, [txn]);
+
+        Scalar(connection, "SELECT \"rowid\" FROM t WHERE _rowid_ = 42").AsText().Should().Be("not-the-alias");
+    }
+
+    [Test]
+    public void DeleteWithANullPrimaryKeyValueMatchesTheNullRowNullSafely()
+    {
+        // Non-STRICT SQLite does not implicitly forbid NULL in a declared (non-rowid-alias)
+        // PRIMARY KEY column. An ordinary "col = ?" predicate would silently match zero rows for
+        // a NULL key (three-valued SQL logic); the delete must use NULL-safe equality instead.
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(x TEXT, y TEXT, PRIMARY KEY(x, y))");
+        Exec(connection, "INSERT INTO t VALUES (NULL, 'only-y')");
+
+        var key = SqliteRecordCodecTestHelper.EncodeRow(SqlValue.Null, SqlValue.Text("only-y"));
+        var txn = SingleOpTxn(RowOp(ManagedReplicaLogicalOpType.DeleteRow, "t", rowId: 0, record: key));
+        Apply(connection, [txn]);
+
+        RowCount(connection, "t").Should().Be(0);
+    }
+
+    [Test]
     public void HeaderUpdateReplaysBothPragmasWhenBothArePresent()
     {
         using var connection = OpenConnection();
@@ -254,6 +453,31 @@ public sealed class ManagedReplicaLogicalReplayerTests
 
         Scalar(connection, "PRAGMA user_version").AsInteger().Should().Be(7);
         Scalar(connection, "PRAGMA application_id").AsInteger().Should().Be(99);
+    }
+
+    [Test]
+    public void HeaderUpdateReplaysNegativeValuesCorrectly()
+    {
+        // user_version/application_id are signed int32 in real SQLite; replaying -1/int.MinValue
+        // must round-trip through PRAGMA exactly, not wrap into a huge unsigned value.
+        using var connection = OpenConnection();
+        var txn = SingleOpTxn(new ManagedReplicaLogicalOp(
+            ManagedReplicaLogicalOpType.UpdateHeader,
+            TableName: string.Empty,
+            RowId: 0,
+            Record: [],
+            Sql: string.Empty,
+            UserVersion: -1,
+            ApplicationId: int.MinValue,
+            SchemaAction: null,
+            SchemaKind: null,
+            SchemaName: string.Empty,
+            StableTableId: 0));
+
+        Apply(connection, [txn]);
+
+        Scalar(connection, "PRAGMA user_version").AsInteger().Should().Be(-1);
+        Scalar(connection, "PRAGMA application_id").AsInteger().Should().Be(int.MinValue);
     }
 
     [Test]
@@ -465,6 +689,133 @@ public sealed class ManagedReplicaLogicalReplayerTests
 
         result.TableNamesByStableId.Should().NotContainKey(42);
         result.TransactionCount.Should().Be(0);
+    }
+
+    [Test]
+    public void CapturePendingLocalRowChangesCapturesTheCurrentRowForANonDeleteFinalOperation()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)");
+        Exec(connection, "INSERT INTO t VALUES (1, 'local-value')");
+
+        var pending = new[] { ReplicaLocalChange.Row(SqliteChangeOperation.Insert, "main", "t", 1) };
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        captured.Should().ContainSingle();
+        captured[0].TableName.Should().Be("t");
+        captured[0].RowId.Should().Be(1);
+        captured[0].IsDelete.Should().BeFalse();
+        captured[0].CapturedValues.Should().NotBeNull();
+        captured[0].CapturedValues![1].AsText().Should().Be("local-value");
+    }
+
+    [Test]
+    public void CapturePendingLocalRowChangesCollapsesMultipleEntriesToTheFinalOperation()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)");
+        Exec(connection, "INSERT INTO t VALUES (1, 'final-value')");
+
+        // Insert then update recorded separately in the journal: only the FINAL state matters.
+        var pending = new[]
+        {
+            ReplicaLocalChange.Row(SqliteChangeOperation.Insert, "main", "t", 1),
+            ReplicaLocalChange.Row(SqliteChangeOperation.Update, "main", "t", 1),
+        };
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        captured.Should().ContainSingle();
+        captured[0].CapturedValues![1].AsText().Should().Be("final-value");
+    }
+
+    [Test]
+    public void CapturePendingLocalRowChangesMarksATrailingDeleteWithoutReadingCurrentState()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)");
+        // Row already gone locally: the last recorded op for rowid 1 was a delete.
+
+        var pending = new[]
+        {
+            ReplicaLocalChange.Row(SqliteChangeOperation.Insert, "main", "t", 1),
+            ReplicaLocalChange.Row(SqliteChangeOperation.Delete, "main", "t", 1),
+        };
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        captured.Should().ContainSingle();
+        captured[0].IsDelete.Should().BeTrue();
+        captured[0].CapturedValues.Should().BeNull();
+    }
+
+    [Test]
+    public void CapturePendingLocalRowChangesSkipsInternalTables()
+    {
+        using var connection = OpenConnection();
+        var pending = new[]
+        {
+            ReplicaLocalChange.Row(SqliteChangeOperation.Insert, "main", "turso_cdc", 1),
+            ReplicaLocalChange.Row(SqliteChangeOperation.Insert, "main", "sqlite_sequence", 1),
+        };
+
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        captured.Should().BeEmpty();
+    }
+
+    [Test]
+    public void ReplayPendingLocalRowChangesReapliesAnUpsertOnTopOfARemoteOverwrite()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)");
+        Exec(connection, "INSERT INTO t VALUES (1, 'local-value')");
+
+        var pending = new[] { ReplicaLocalChange.Row(SqliteChangeOperation.Insert, "main", "t", 1) };
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        // Simulate the remote pull overwriting the same row with different data.
+        Exec(connection, "UPDATE t SET name = 'remote-value' WHERE id = 1");
+
+        ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(connection, captured, CancellationToken.None);
+
+        // The precollected local value wins, since it is reapplied after the remote overwrite.
+        Scalar(connection, "SELECT name FROM t WHERE id = 1").AsText().Should().Be("local-value");
+    }
+
+    [Test]
+    public void ReplayPendingLocalRowChangesReappliesADeleteEvenIfARemotePullResurrectedTheRow()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)");
+
+        var pending = new[] { ReplicaLocalChange.Row(SqliteChangeOperation.Delete, "main", "t", 1) };
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        // Simulate the remote pull inserting a row the server still had at that rowid.
+        Exec(connection, "INSERT INTO t VALUES (1, 'remote-resurrected')");
+
+        ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(connection, captured, CancellationToken.None);
+
+        RowCount(connection, "t").Should().Be(0);
+    }
+
+    [Test]
+    public void ReplayPendingLocalRowChangesLeavesUnrelatedRemoteRowsIntact()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT)");
+        Exec(connection, "CREATE TABLE remote_items(id INTEGER PRIMARY KEY, x TEXT)");
+        Exec(connection, "INSERT INTO local_items VALUES (1, 'local')");
+
+        var pending = new[] { ReplicaLocalChange.Row(SqliteChangeOperation.Insert, "main", "local_items", 1) };
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        // Simulate the remote apply touching a disjoint table.
+        Exec(connection, "INSERT INTO remote_items VALUES (2, 'remote')");
+
+        ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(connection, captured, CancellationToken.None);
+
+        Scalar(connection, "SELECT x FROM local_items WHERE id = 1").AsText().Should().Be("local");
+        Scalar(connection, "SELECT x FROM remote_items WHERE id = 2").AsText().Should().Be("remote");
     }
 
     // --- helpers ---

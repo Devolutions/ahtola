@@ -14,6 +14,9 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     private const int IncrementalApplyStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.IncrementalApplyStagedDatabase;
     private const int IncrementalApplyDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished;
     private const int IncrementalApplyMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.IncrementalApplyMetadataPublished;
+    private const int LogicalApplyCommittedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyCommitted;
+    private const int LogicalApplyCheckpointedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyCheckpointed;
+    private const int LogicalApplyMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyMetadataPublished;
 
     [Test]
     public void ReplicaOptionsNormalizeLibsqlUrlsToHttps()
@@ -24,6 +27,61 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             authToken: null);
 
         options.RemoteUri.Should().Be(new Uri("https://example.test/cluster"));
+    }
+
+    [Test]
+    public void WithoutLongPollSharesTheReentrancyScopeWithItsSourceOptions()
+    {
+        var options = new AhtolaReplicaOptions("replica.db", new Uri("https://example.test"), authToken: null);
+        var withoutLongPoll = options.WithoutLongPoll();
+
+        using (options.EnterApplicationHttpScope())
+        {
+            // A reentrant call observed through the derived (WithoutLongPoll) options instance
+            // must be detected: it is the SAME logical connection's HTTP call stack (e.g. the
+            // one-shot fresh-bootstrap catch-up pull), not an independent one.
+            Action reentrant = () => withoutLongPoll.ThrowIfApplicationHttpReentrant(closing: false);
+            reentrant.Should().Throw<InvalidOperationException>()
+                .WithMessage("*cannot be reentered*");
+        }
+
+        // Once the scope exits (entered via the original instance), the derived instance must
+        // also observe it as inactive again.
+        Action afterExit = () => withoutLongPoll.ThrowIfApplicationHttpReentrant(closing: false);
+        afterExit.Should().NotThrow();
+    }
+
+    [Test]
+    public void EnteringTheScopeViaWithoutLongPollIsObservedByTheSourceOptions()
+    {
+        var options = new AhtolaReplicaOptions("replica.db", new Uri("https://example.test"), authToken: null);
+        var withoutLongPoll = options.WithoutLongPoll();
+
+        using (withoutLongPoll.EnterApplicationHttpScope())
+        {
+            Action reentrant = () => options.ThrowIfApplicationHttpReentrant(closing: false);
+            reentrant.Should().Throw<InvalidOperationException>();
+        }
+
+        Action afterExit = () => options.ThrowIfApplicationHttpReentrant(closing: false);
+        afterExit.Should().NotThrow();
+    }
+
+    [Test]
+    public void WithoutLongPollDoesNotShareTheScopeWithAnUnrelatedCloneForConnection()
+    {
+        // CloneForConnection() represents a genuinely independent connection (a fresh
+        // AhtolaConnection built from a shared template AhtolaReplicaOptions), so it correctly
+        // keeps its own separate reentrancy scope; only WithoutLongPoll's derivation (the same
+        // connection's one-shot catch-up pull) needs to share state with its source.
+        var options = new AhtolaReplicaOptions("replica.db", new Uri("https://example.test"), authToken: null);
+        var forAnotherConnection = options.CloneForConnection();
+
+        using (options.EnterApplicationHttpScope())
+        {
+            Action act = () => forAnotherConnection.ThrowIfApplicationHttpReentrant(closing: false);
+            act.Should().NotThrow();
+        }
     }
 
     [Test]
@@ -478,6 +536,362 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public void FailedFreshBootstrapCatchUpRollsBackTheWholeBootstrapForACleanRetry()
+    {
+        var path = NewReplicaPath("managed-replica-catchup-failure-rollback");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        // Only the bootstrap page response is queued: the catch-up pull's HTTP call has nothing
+        // left to dequeue and fails, simulating a network/server failure during catch-up.
+        var failingHandler = new PullUpdatesHandler([CreatePullResponse("revision-42", databaseImage, protocol: 2)]);
+        var options = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null, bootstrapIfEmpty: true)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(failingHandler),
+        };
+
+        try
+        {
+            Assert.Throws<InvalidOperationException>(() => AhtolaConnection.CreateReplica(options).Open());
+
+            // The bootstrap alone is not a complete, safe-to-serve replica (it is missing the
+            // logical catch-up that brings it current); the whole (database, metadata) pair must
+            // be rolled back rather than left as a durably "bootstrapped but never caught up"
+            // replica that a later Open() would never retry.
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+
+            // A subsequent Open() (here, with a working handler) must retry a clean bootstrap +
+            // catch-up rather than being blocked by leftover partial state.
+            var workingHandler = new PullUpdatesHandler(
+            [
+                CreatePullResponse("revision-42", databaseImage, protocol: 2),
+                CreateLogicalPullResponse("revision-42", body: []),
+            ]);
+            var retryOptions = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null, bootstrapIfEmpty: true)
+            {
+                HttpPolicy = new AhtolaSyncHttpPolicy(workingHandler),
+            };
+            using var connection = AhtolaConnection.CreateReplica(retryOptions);
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM bootstrap_marker;";
+            command.ExecuteScalar().Should().Be(42L);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ConcurrentFirstOpensForTheSameMissingPathDoNotRaceEachOthersBootstrap()
+    {
+        var path = NewReplicaPath("managed-replica-concurrent-first-open");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        // Bootstrap + catch-up publication is exclusive per path, so only ONE of the concurrent
+        // Open() calls actually performs it; the queue only ever needs to satisfy one attempt.
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+        ]);
+        var options = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null, bootstrapIfEmpty: true)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
+
+        try
+        {
+            var openTasks = Enumerable.Range(0, 4)
+                .Select(_ => Task.Run(() => AhtolaConnection.CreateReplica(options).Open()))
+                .ToArray();
+            await Task.WhenAll(openTasks);
+
+            handler.CallCount.Should().Be(2, "concurrent first opens must serialize on one bootstrap+catch-up, not race duplicate downloads");
+            using var verify = new AhtolaConnection($"Data Source={path};Local Provider=Managed");
+            verify.Open();
+            verify.ExecuteNonQuery("SELECT value FROM bootstrap_marker;").Should().Be(0);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task LogicalPullPreservesAPendingUnpushedLocalRowChangeOnADisjointTable()
+    {
+        var path = NewReplicaPath("managed-replica-logical-precollect-disjoint");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "remote_items",
+            rowId: 2,
+            columnValue: "remote",
+            schemaSql: "CREATE TABLE remote_items(id INTEGER PRIMARY KEY, x TEXT)",
+            salt: 900UL);
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+        ]);
+        var options = CreateOptions(path, handler);
+        try
+        {
+            IReadOnlyList<ReplicaLocalChange> pendingChanges;
+            ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata;
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+
+                // A genuine local write, through the real connection: captured by the update
+                // hook into the change journal exactly like a real "header-255" application
+                // write. The connection is closed before directly driving CheckForUpdatesAsync
+                // below, since that call (like a real sync) requires exclusive file access.
+                connection.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+                connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'local');");
+
+                pendingChanges = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
+                pendingChanges.Should().NotBeEmpty("the local writes above must have been captured as pending, unpushed changes");
+                metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            }
+
+            var result = await ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                options, metadata, new AhtolaSyncOptions(), pendingChanges, CancellationToken.None);
+
+            result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            reopened.Open();
+            using var remoteCommand = reopened.CreateCommand();
+            remoteCommand.CommandText = "SELECT x FROM remote_items WHERE id = 2;";
+            remoteCommand.ExecuteScalar().Should().Be("remote");
+
+            using var localCommand = reopened.CreateCommand();
+            localCommand.CommandText = "SELECT x FROM local_items WHERE id = 1;";
+            localCommand.ExecuteScalar().Should().Be("local", "the pending local write must survive the concurrent remote pull");
+
+            // The reconciled local change is still unpushed (the pull never acknowledges it).
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().NotBeEmpty();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task LogicalPullOverwritesAPendingLocalRowThatRemoteAlsoChangedWithTheLocalValue()
+    {
+        // A "remote conflict": both the pending local change and the incoming remote transaction
+        // touch the SAME row. The local pending write must win, since it is reapplied AFTER the
+        // remote apply (matching Turso's ordering-based "last write wins" semantics).
+        var path = NewReplicaPath("managed-replica-logical-precollect-conflict");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "shared",
+            rowId: 1,
+            columnValue: "remote-value",
+            schemaSql: "CREATE TABLE shared(id INTEGER PRIMARY KEY, x TEXT)",
+            salt: 901UL);
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+        ]);
+        var options = CreateOptions(path, handler);
+        try
+        {
+            IReadOnlyList<ReplicaLocalChange> pendingChanges;
+            ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata;
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+
+                connection.ExecuteNonQuery("CREATE TABLE shared(id INTEGER PRIMARY KEY, x TEXT);");
+                connection.ExecuteNonQuery("INSERT INTO shared(id, x) VALUES (1, 'local-value');");
+
+                pendingChanges = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
+                metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            }
+
+            await ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                options, metadata, new AhtolaSyncOptions(), pendingChanges, CancellationToken.None);
+
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            reopened.Open();
+            using var command = reopened.CreateCommand();
+            command.CommandText = "SELECT x FROM shared WHERE id = 1;";
+            command.ExecuteScalar().Should().Be("local-value");
+            RowCountViaConnection(reopened, "shared").Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task SyncPushesOneBatchThenReconcilesRemainingPendingChangesAcrossThePull()
+    {
+        // More local changes than PushOperationsThreshold: the push only sends the first batch,
+        // leaving the rest pending in the change journal, which the pull must still reconcile
+        // rather than silently lose.
+        var path = NewReplicaPath("managed-replica-logical-batch-reconcile");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            // local_items is baked into the bootstrap image itself (not created via the open
+            // connection), so only the two row inserts below become pending journal entries.
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "remote_items",
+            rowId: 2,
+            columnValue: "remote",
+            schemaSql: "CREATE TABLE remote_items(id INTEGER PRIMARY KEY, x TEXT)",
+            salt: 902UL);
+
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');"); // pushed
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (2, 'second');"); // left pending
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            handler.PushCallCount.Should().Be(1, "only one push batch (capped at threshold 1) must run per sync");
+
+            using var remoteCommand = connection.CreateCommand();
+            remoteCommand.CommandText = "SELECT x FROM remote_items WHERE id = 2;";
+            remoteCommand.ExecuteScalar().Should().Be("remote");
+
+            using var localCommand = connection.CreateCommand();
+            localCommand.CommandText = "SELECT x FROM local_items ORDER BY id;";
+            using var reader = localCommand.ExecuteReader();
+            var values = new List<string>();
+            while (reader.Read())
+                values.Add(reader.GetString(0));
+            values.Should().Equal("first", "second");
+
+            // The pushed change (id=1) is acknowledged; the unpushed one (id=2) is still pending.
+            var remainingPending = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
+            remainingPending.Should().ContainSingle();
+            remainingPending[0].RowId.Should().Be(2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void LogicalDivergenceGuardToleratesAnEvolvingWalUnlikeThePageProtocol()
+    {
+        var path = NewReplicaPath("managed-replica-logical-divergence-tolerance");
+        try
+        {
+            CreateInitializedDatabase(path);
+            // Simulate legitimate, in-flight local WAL content (well beyond an empty 32-byte
+            // header), which the page-protocol guard would reject outright.
+            File.WriteAllBytes(path + "-wal", new byte[128]);
+
+            var logicalMetadata = new ManagedReplicaBootstrapper.ManagedReplicaMetadata(
+                "revision-1", "not-a-real-fingerprint", "client-x", RemotePullProtocol.MvccLogical,
+                new Dictionary<ulong, string>());
+            Action logicalAct = () => ManagedReplicaBootstrapper.EnsureNoLocalDivergence(path, logicalMetadata);
+            logicalAct.Should().NotThrow("the MVCC logical protocol reconciles local writes across a pull instead of rejecting them");
+
+            var pageMetadata = logicalMetadata with { Protocol = RemotePullProtocol.Pages };
+            Action pageAct = () => ManagedReplicaBootstrapper.EnsureNoLocalDivergence(path, pageMetadata);
+            pageAct.Should().Throw<NotSupportedException>("the page protocol has no mechanism to reconcile local writes across a pull");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    private static long RowCountViaConnection(AhtolaConnection connection, string table)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT COUNT(*) FROM \"{table}\";";
+        return Convert.ToInt64(command.ExecuteScalar());
+    }
+
+    [Test]
     public void SyncAgainstALogicalProtocolRemoteAppliesLogicalChanges()
     {
         var path = Path.Combine(
@@ -739,6 +1153,113 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         {
             DeleteReplicaFiles(path);
         }
+    }
+
+    [TestCase(LogicalApplyCommittedBoundary, false)]
+    [TestCase(LogicalApplyCheckpointedBoundary, false)]
+    [TestCase(LogicalApplyMetadataPublishedBoundary, true)]
+    public async Task LogicalApplyCancellationRecoversAMatchedDatabaseAndMetadataPair(
+        int boundaryValue,
+        bool expectedRemoteChanges)
+    {
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var path = NewReplicaPath($"managed-replica-logical-apply-cancel-{boundary}");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "widgets",
+            rowId: 9,
+            columnValue: "alice",
+            schemaSql: "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)");
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up: nothing new
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+        ]);
+        var options = CreateOptions(path, handler);
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == boundary)
+                               cancellation.Cancel();
+                       }))
+                {
+                    Assert.CatchAsync<OperationCanceledException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token));
+                }
+            }
+
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path);
+            metadata.Should().NotBeNull();
+            metadata!.Value.Revision.Should().Be(expectedRemoteChanges ? "revision-43" : "revision-42");
+
+            // The database file and metadata must be a MATCHED pair either way: the metadata's
+            // recorded fingerprint must describe the file that is actually on disk.
+            var actualFingerprint = Convert.ToHexString(
+                System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path)));
+            metadata.Value.DatabaseSha256.Should().Be(actualFingerprint);
+
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            reopened.Open();
+            using var existsCommand = reopened.CreateCommand();
+            existsCommand.CommandText = "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'widgets';";
+            var tableExists = Convert.ToInt64(existsCommand.ExecuteScalar()) > 0;
+            tableExists.Should().Be(expectedRemoteChanges);
+            if (tableExists)
+            {
+                using var rowCommand = reopened.CreateCommand();
+                rowCommand.CommandText = "SELECT COUNT(*) FROM widgets WHERE id = 9;";
+                rowCommand.ExecuteScalar().Should().Be(1L);
+            }
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    /// <summary>
+    /// Builds a minimal logical pull body containing one schema Create and one row UpsertRow,
+    /// plus its matching lml3 range message, for tests that only need "some real remote change
+    /// happened" without caring about its exact shape.
+    /// </summary>
+    private static (byte[] Body, byte[] RangeMessage) BuildSimpleLogicalPullBody(
+        string tableName,
+        long rowId,
+        string columnValue,
+        string schemaSql,
+        ulong salt = 12345UL)
+    {
+        var logHeader = Lml3TestBuilder.BuildHeader(salt);
+        var crc = Lml3TestBuilder.HeaderSeedCrc(salt);
+        var schemaRecord = Lml3TestBuilder.SchemaRecord("table", tableName, 5, schemaSql);
+        var schemaOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -1, Lml3TestBuilder.UpsertTablePayload(1, schemaRecord));
+        var rowRecord = Core.Storage.SqliteRecordCodec.Encode([Core.SqlValue.Null, Core.SqlValue.Text(columnValue)]);
+        var rowOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -2, Lml3TestBuilder.UpsertTablePayload(rowId, rowRecord));
+        var recoveryPayload = schemaOp.Concat(rowOp).ToArray();
+        var portableTxn = Lml3TestBuilder.BuildPortableLogicalTxn(1, 1, [tableName], [(-2, 0)]);
+        var extRecord = Lml3TestBuilder.BuildExtensionRecord(Lml3TestBuilder.PortableChangesExtensionType, Lml3TestBuilder.Delimited(portableTxn));
+        var frame = Lml3TestBuilder.BuildFrame(ref crc, recoveryPayload, opCount: 2, extensionBlock: extRecord);
+        var logicalBody = logHeader.Concat(frame).ToArray();
+        var rangeMessage = BuildLogicalLogRangeMessage(1, 0, (ulong)logicalBody.Length, startsWithHeader: true);
+        return (logicalBody, rangeMessage);
     }
 
     /// <summary>

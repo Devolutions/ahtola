@@ -106,12 +106,12 @@ internal static class Lml3TestBuilder
             Core.SqlValue.Text(sql),
         ]);
 
-    public static byte[] UpdateHeaderPayload(uint userVersion, uint applicationId)
+    public static byte[] UpdateHeaderPayload(int userVersion, int applicationId)
     {
         var payload = new byte[100];
         Encoding.ASCII.GetBytes("SQLite format 3\0").CopyTo(payload, 0);
-        BinaryPrimitives.WriteUInt32BigEndian(payload.AsSpan(60), userVersion);
-        BinaryPrimitives.WriteUInt32BigEndian(payload.AsSpan(68), applicationId);
+        BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(60), userVersion);
+        BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(68), applicationId);
         return payload;
     }
 

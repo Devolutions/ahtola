@@ -130,7 +130,7 @@ internal static class ManagedReplicaLml3Decoder
             while (pos < rangeBody.Length)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                pos = DecodeFrame(rangeBody, pos, ref runningCrc, transactions);
+                pos = DecodeFrame(rangeBody, pos, ref runningCrc, transactions, cancellationToken);
             }
 
             previousRangeBoundary = (range.Generation, range.EndOffset);
@@ -149,7 +149,8 @@ internal static class ManagedReplicaLml3Decoder
         ReadOnlySpan<byte> rangeBody,
         int pos,
         ref uint? runningCrc,
-        List<ManagedReplicaLogicalTxn> transactions)
+        List<ManagedReplicaLogicalTxn> transactions,
+        CancellationToken cancellationToken)
     {
         var frameStart = pos;
         if (rangeBody.Length - pos < TxHeaderSize + TxTrailerSize)
@@ -225,7 +226,7 @@ internal static class ManagedReplicaLml3Decoder
 
         var extensionBlock = rangeBody[extensionStart..recoveryStart];
         var recoveryPayload = rangeBody[recoveryStart..trailerStart];
-        var portablePayload = FindExtensionPayload(extensionBlock, extensionRecordCount, ExtensionTypePortableChanges);
+        var portablePayload = FindExtensionPayload(extensionBlock, extensionRecordCount, ExtensionTypePortableChanges, cancellationToken);
         if (portablePayload.Length == 0)
             return frameEnd;
 
@@ -470,8 +471,11 @@ internal static class ManagedReplicaLml3Decoder
             RowId: 0,
             Record: [],
             Sql: string.Empty,
-            UserVersion: BinaryPrimitives.ReadUInt32BigEndian(payload[60..64]),
-            ApplicationId: BinaryPrimitives.ReadUInt32BigEndian(payload[68..72]),
+            // SQLite's user_version/application_id header fields are logically signed int32
+            // (PRAGMA user_version/application_id both accept and round-trip negative values),
+            // even though they occupy 4 raw big-endian bytes in the on-disk header.
+            UserVersion: BinaryPrimitives.ReadInt32BigEndian(payload[60..64]),
+            ApplicationId: BinaryPrimitives.ReadInt32BigEndian(payload[68..72]),
             SchemaAction: null,
             SchemaKind: null,
             SchemaName: string.Empty,
@@ -654,12 +658,26 @@ internal static class ManagedReplicaLml3Decoder
 
     // --- Extension record scanning ---
 
-    private static byte[] FindExtensionPayload(ReadOnlySpan<byte> extensionBlock, uint recordCount, ushort wantedType)
+    private static byte[] FindExtensionPayload(
+        ReadOnlySpan<byte> extensionBlock, uint recordCount, ushort wantedType, CancellationToken cancellationToken)
     {
+        // Each record consumes at least its 8-byte header (a zero-length payload is legal), so no
+        // more records than that can possibly fit; reject an absurd declared count up front
+        // instead of looping toward discovering it, bounding this independent of recordCount.
+        var maxPossibleRecords = extensionBlock.Length / ExtensionRecordHeaderSize;
+        if (recordCount > (uint)maxPossibleRecords)
+        {
+            throw new InvalidDataException(
+                "An MVCC logical-log extension block declares more records than it can possibly contain.");
+        }
+
         var offset = 0;
         var payload = new List<byte>();
         for (var i = 0; i < recordCount; i++)
         {
+            if ((i & 0x3FF) == 0)
+                cancellationToken.ThrowIfCancellationRequested();
+
             var headerEnd = checked(offset + ExtensionRecordHeaderSize);
             if (headerEnd > extensionBlock.Length)
                 throw new InvalidDataException("An MVCC logical-log extension record header is truncated.");
@@ -672,7 +690,18 @@ internal static class ManagedReplicaLml3Decoder
                     $"An MVCC logical-log extension has unsupported flags for type {extensionType}: {extensionFlags:x}.");
             }
 
-            var extensionLen = (int)ReadUInt32Le(extensionBlock, offset + 4);
+            // Widen before narrowing: a value >= 0x80000000 must fail closed with
+            // InvalidDataException, not silently become a negative int that could make
+            // payloadEnd regress behind payloadStart (non-progress) or underflow into an
+            // OverflowException/ArgumentException instead of the intended failure mode.
+            var extensionLenRaw = ReadUInt32Le(extensionBlock, offset + 4);
+            if (extensionLenRaw > int.MaxValue)
+            {
+                throw new InvalidDataException(
+                    "An MVCC logical-log extension record length overflows the supported buffer size.");
+            }
+
+            var extensionLen = (int)extensionLenRaw;
             var payloadStart = headerEnd;
             var payloadEnd = checked(payloadStart + extensionLen);
             if (payloadEnd > extensionBlock.Length)
@@ -681,6 +710,9 @@ internal static class ManagedReplicaLml3Decoder
             if (extensionType == wantedType)
                 payload.AddRange(extensionBlock[payloadStart..payloadEnd].ToArray());
 
+            // payloadEnd == headerEnd + (a validated non-negative length) > offset always holds,
+            // so every iteration strictly advances offset and the loop is bounded by
+            // extensionBlock.Length regardless of what recordCount claims.
             offset = payloadEnd;
         }
 
