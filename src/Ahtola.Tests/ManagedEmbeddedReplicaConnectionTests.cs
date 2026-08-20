@@ -1221,6 +1221,62 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+
+    // A real server omits non-optional proto3 scalars at zero, so a first range carries no start_offset field.
+    [Test]
+    public void LogicalSyncAcceptsARangeThatOmitsItsProto3DefaultFields()
+    {
+        var path = NewReplicaPath("managed-replica-logical-proto3-defaults");
+        var image = CreateDatabaseImage(path + ".source");
+
+        var salt = 778UL;
+        var logHeader = Lml3TestBuilder.BuildHeader(salt);
+        var crc = Lml3TestBuilder.HeaderSeedCrc(salt);
+        var schemaRecord = Lml3TestBuilder.SchemaRecord("table", "widgets", 5, "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)");
+        var schemaOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -1, Lml3TestBuilder.UpsertTablePayload(1, schemaRecord));
+        var rowRecord = Core.Storage.SqliteRecordCodec.Encode([Core.SqlValue.Null, Core.SqlValue.Text("bob")]);
+        var rowOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -2, Lml3TestBuilder.UpsertTablePayload(9, rowRecord));
+        var portableTxn = Lml3TestBuilder.BuildPortableLogicalTxn(1, 1, ["widgets"], [(-2, 0)]);
+        var extRecord = Lml3TestBuilder.BuildExtensionRecord(Lml3TestBuilder.PortableChangesExtensionType, Lml3TestBuilder.Delimited(portableTxn));
+        var frame = Lml3TestBuilder.BuildFrame(ref crc, schemaOp.Concat(rowOp).ToArray(), opCount: 2, extensionBlock: extRecord);
+        var logicalBody = logHeader.Concat(frame).ToArray();
+
+        // start_offset is 0, so it is absent from the wire entirely.
+        var rangeMessage = BuildLogicalLogRangeMessage(
+            1, 0, (ulong)logicalBody.Length, startsWithHeader: true, omitProto3Defaults: true);
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+        ]);
+        var options = new AhtolaReplicaOptions(
+            path,
+            new Uri("https://example.test"),
+            authToken: null,
+            bootstrapIfEmpty: true)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            var result = connection.Sync(new AhtolaSyncOptions());
+
+            result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT name FROM widgets WHERE id = 9;";
+            command.ExecuteScalar().Should().Be("bob");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
     [Test]
     public async Task LogicalSyncRequestBytesIncludeClientRevisionAndLogicalStreamKind()
     {
@@ -3195,12 +3251,16 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     private static byte[] BuildLogicalLogRangeMessage(
-        ulong generation, ulong startOffset, ulong endOffset, bool startsWithHeader, byte[]? crcSeed = null)
+        ulong generation, ulong startOffset, ulong endOffset, bool startsWithHeader, byte[]? crcSeed = null,
+        bool omitProto3Defaults = false)
     {
         var range = new List<byte>();
-        WriteVarintField(range, 1, generation);
-        WriteVarintField(range, 2, startOffset);
-        WriteVarintField(range, 3, endOffset);
+        if (!omitProto3Defaults || generation != 0)
+            WriteVarintField(range, 1, generation);
+        if (!omitProto3Defaults || startOffset != 0)
+            WriteVarintField(range, 2, startOffset);
+        if (!omitProto3Defaults || endOffset != 0)
+            WriteVarintField(range, 3, endOffset);
         if (startsWithHeader)
             WriteVarintField(range, 4, 1);
         if (crcSeed is not null)
