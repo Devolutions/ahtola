@@ -858,7 +858,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
-    public async Task PendingTextPrimaryKeyDeleteRejectsBeforeARecycledRowidCanDeleteARemoteInsert()
+    public async Task PendingTextPrimaryKeyDeleteRebasesByJournaledKeyWithoutDeletingARemoteInsert()
     {
         var path = NewReplicaPath("managed-replica-logical-pending-delete-identity");
         var sourcePath = path + ".source";
@@ -894,7 +894,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             CreatePullResponse("revision-42", databaseImage, protocol: 2),
             CreateLogicalPullResponse("revision-42", body: []),
             CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
-            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+            CreateLogicalPullResponse("revision-43", body: []),
         ],
         _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
         var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
@@ -905,8 +905,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             connection.Open();
 
             // The first change is pushed by the threshold-1 batch. The trailing delete remains
-            // pending while the pull attempts to insert a DIFFERENT key at the deleted row's old
-            // rowid (2), exactly the collision that made rowid-only delete replay unsafe.
+            // pending while the pull inserts a DIFFERENT key at the deleted row's old rowid (2).
+            // The journaled primary-key projection must protect the new remote key from deletion.
             connection.ExecuteNonQuery("INSERT INTO local_queue VALUES (1, 'pushed-first');");
             connection.ExecuteNonQuery("DELETE FROM items WHERE id = 'b';");
 
@@ -916,40 +916,32 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                 Convert.ToInt64(rowidCommand.ExecuteScalar()).Should().Be(1);
             }
 
-            Func<Task> firstSync = () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
-            await firstSync.Should().ThrowAsync<NotSupportedException>()
-                .WithMessage("*pending local delete*schema does not prove rowid*Push*retry*");
-
+            var firstResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            firstResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
             handler.PushCallCount.Should().Be(1);
-            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
-            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
-                .Should().ContainSingle(change =>
-                    change.Kind == ReplicaLocalChangeKind.Row
-                    && change.Operation == SqliteChangeOperation.Delete
-                    && change.Table == "items"
-                    && change.RowId == 2);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+            var pendingDelete = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
+            pendingDelete.Should().ContainSingle(change =>
+                change.Kind == ReplicaLocalChangeKind.Row
+                && change.Operation == SqliteChangeOperation.Delete
+                && change.Table == "items"
+                && change.RowId == 2);
+            pendingDelete[0].BeforeRecord.Should().NotBeNull();
 
-            using (var failedApplyCommand = connection.CreateCommand())
+            using (var appliedCommand = connection.CreateCommand())
             {
-                failedApplyCommand.CommandText = "SELECT group_concat(id, ',') FROM items ORDER BY id;";
-                failedApplyCommand.ExecuteScalar().Should().Be("a",
-                    "the pull must reject before remote key c can be installed and then accidentally deleted");
+                appliedCommand.CommandText = "SELECT id || ':' || value || ':' || rowid FROM items ORDER BY id;";
+                using var reader = appliedCommand.ExecuteReader();
+                var rows = new List<string>();
+                while (reader.Read())
+                    rows.Add(reader.GetString(0));
+                rows.Should().Equal("a:va:1", "c:vc:2");
             }
 
-            // The next sync pushes the delete first. With no residual unsafe delete to reapply,
-            // the identical remote response can now install c; SQLite reuses freed rowid 2, and c
-            // must survive because no rowid-only local delete replay runs afterward.
+            // The next sync pushes the retained delete and finds no additional remote changes.
             var retry = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
-            retry.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            retry.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
             handler.PushCallCount.Should().Be(2);
-
-            using var appliedCommand = connection.CreateCommand();
-            appliedCommand.CommandText = "SELECT id || ':' || value || ':' || rowid FROM items ORDER BY id;";
-            using var reader = appliedCommand.ExecuteReader();
-            var rows = new List<string>();
-            while (reader.Read())
-                rows.Add(reader.GetString(0));
-            rows.Should().Equal("a:va:1", "c:vc:2");
 
             ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
             ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().BeEmpty();
@@ -961,18 +953,14 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
-    public async Task PendingLocalSchemaChangeRejectsALogicalPullUntilItIsPushedThenMakesProgress()
+    public async Task PendingUnrelatedLocalAddColumnDoesNotBlockALogicalPull()
     {
         // More local changes than PushOperationsThreshold (1), the last of which is a SCHEMA
         // (DDL) change rather than a row change: the first sync's push batch only drains the row
-        // change, leaving the schema change pending in the journal when the pull runs. A remote
-        // logical response with actual transactions to apply must reject outright rather than
-        // silently proceed (a remote Refresh/Drop is generated against a schema state that does
-        // not yet reflect the unpushed local DDL). Once a SECOND sync finally pushes the
-        // remaining schema change, the SAME logical response (still describing the same old
-        // revision, since the first attempt's rejection happened before any metadata was
-        // touched) must apply normally: eventual progress, not a permanent stall.
-        var path = NewReplicaPath("managed-replica-logical-pending-schema-reject");
+        // change, leaving the additive ALTER pending when the pull runs. The remote transaction
+        // touches a different table, so it cannot conflict with that local schema change and must
+        // apply without waiting for a second push cycle.
+        var path = NewReplicaPath("managed-replica-logical-pending-unrelated-add-column");
         var sourcePath = path + ".source";
         byte[] databaseImage;
         try
@@ -999,15 +987,12 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             schemaSql: "CREATE TABLE remote_items(id INTEGER PRIMARY KEY, x TEXT)",
             salt: 903UL);
 
-        // The SAME logical response is queued twice: the first sync's pull must be rejected
-        // before it consumes/publishes anything, so the old revision is still current when the
-        // second sync's pull runs and must succeed against an identical response.
         var handler = new ReplicaPushHandler(
         [
             CreatePullResponse("revision-42", databaseImage, protocol: 2),
             CreateLogicalPullResponse("revision-42", body: []),
             CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
-            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+            CreateLogicalPullResponse("revision-43", body: []),
         ],
         _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
         var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
@@ -1020,33 +1005,10 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');"); // pushed first
             connection.ExecuteNonQuery("ALTER TABLE local_items ADD COLUMN extra TEXT;"); // left pending
 
-            var beforeMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
-
-            Func<Task> firstSync = () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
-            await firstSync.Should().ThrowAsync<NotSupportedException>()
-                .WithMessage("*schema change*pending push*");
-
-            handler.PushCallCount.Should().Be(1, "the row change was pushed; the schema change was left pending");
-            handler.PullCallCount.Should().Be(3, "bootstrap catch-up + the rejected explicit sync's pull");
-
-            // The rejected logical apply never reaches WriteMetadataAsync, so the revision
-            // recorded from the successful push-side of this same sync (RecordLocalPushAsync,
-            // which legitimately refreshes the fingerprint against the file as already mutated by
-            // the two local writes above, independent of the pull's own outcome) still carries the
-            // OLD, pre-pull revision rather than the rejected response's "revision-43".
-            var afterFailedSyncMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
-            afterFailedSyncMetadata.Revision.Should().Be(beforeMetadata.Revision);
-
-            // The still-pending schema change remains in the journal untouched by the rejection.
-            var pendingAfterFailure = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
-            pendingAfterFailure.Should().ContainSingle(c => c.Kind == ReplicaLocalChangeKind.Schema);
-
-            // Second sync: the schema change is now the only (and first) journal entry, so the
-            // threshold-1 push finally drains it. With no residual pending schema entries, the
-            // pull proceeds and applies the remote transaction normally.
-            var secondResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
-            secondResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
-            handler.PushCallCount.Should().Be(2, "the second sync finally pushes the pending schema change");
+            var firstResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            firstResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            handler.PushCallCount.Should().Be(1, "the row change was pushed; the schema change remains pending");
+            handler.PullCallCount.Should().Be(3, "bootstrap catch-up + the explicit sync pull");
 
             using var remoteCommand = connection.CreateCommand();
             remoteCommand.CommandText = "SELECT x FROM remote_items WHERE id = 2;";
@@ -1056,11 +1018,158 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             localCommand.CommandText = "SELECT extra FROM local_items WHERE id = 1;";
             localCommand.ExecuteScalar().Should().Be(DBNull.Value);
 
-            var finalMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
-            finalMetadata.Revision.Should().Be("revision-43");
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+
+            // The schema change is still pending after the first sync because the server has not
+            // acknowledged it. The next sync pushes it and observes an up-to-date pull response.
+            var pendingAfterFirstSync = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
+            pendingAfterFirstSync.Should().ContainSingle(c => c.Kind == ReplicaLocalChangeKind.Schema);
+
+            var secondResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            secondResult.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            handler.PushCallCount.Should().Be(2, "the next push drains the pending schema change");
 
             var pendingAfterProgress = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
             pendingAfterProgress.Should().BeEmpty();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PendingLocalAddColumnRebasesAcrossALogicalPullThatTouchesTheSameTable()
+    {
+        var path = NewReplicaPath("managed-replica-logical-pending-conflicting-add-column");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "local_items",
+            rowId: 2,
+            columnValue: "remote",
+            schemaSql: "CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT)",
+            salt: 904UL);
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+            CreateLogicalPullResponse("revision-43", body: []),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');");
+            connection.ExecuteNonQuery("ALTER TABLE local_items ADD COLUMN extra TEXT;");
+
+            var firstResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            firstResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            handler.PushCallCount.Should().Be(1, "the row change was pushed; the schema change remains pending");
+
+            using var remoteCommand = connection.CreateCommand();
+            remoteCommand.CommandText = "SELECT x FROM local_items WHERE id = 2;";
+            remoteCommand.ExecuteScalar().Should().Be("remote");
+
+            using var extraCommand = connection.CreateCommand();
+            extraCommand.CommandText = "SELECT extra FROM local_items WHERE id = 1;";
+            extraCommand.ExecuteScalar().Should().Be(DBNull.Value);
+
+            using var remoteExtraCommand = connection.CreateCommand();
+            remoteExtraCommand.CommandText = "SELECT extra FROM local_items WHERE id = 2;";
+            remoteExtraCommand.ExecuteScalar().Should().Be(DBNull.Value);
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
+                .Should().ContainSingle(change => change.Kind == ReplicaLocalChangeKind.Schema);
+
+            var secondResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            secondResult.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            handler.PushCallCount.Should().Be(2, "the next push drains the pending schema change");
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().BeEmpty();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PendingLocalDropTableStillRejectsALogicalPull()
+    {
+        var path = NewReplicaPath("managed-replica-logical-pending-drop-reject");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "remote_items",
+            rowId: 2,
+            columnValue: "remote",
+            schemaSql: "CREATE TABLE remote_items(id INTEGER PRIMARY KEY, x TEXT)",
+            salt: 905UL);
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');");
+            connection.ExecuteNonQuery("DROP TABLE local_items;");
+            var beforeMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+
+            Func<Task> sync = () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            await sync.Should().ThrowAsync<NotSupportedException>()
+                .WithMessage("*local schema change pending push*");
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be(beforeMetadata.Revision);
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
+                .Should().ContainSingle(change => change.Kind == ReplicaLocalChangeKind.Schema);
         }
         finally
         {
@@ -1397,20 +1506,36 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
-    public async Task ProtocolTwoPagesReplaceBaseWithPendingLocalChangesIsRejected()
+    public async Task ProtocolTwoPagesReplaceBaseReplaysPendingLocalStatements()
     {
-        // A protocol-2 (logical) replica whose response for THIS pull surprisingly turns out to
-        // be Pages+ReplaceBase (rather than a logical stream) has no way to reconcile still-
-        // pending local writes the way the logical path's precollect/reapply does; it must
-        // reject rather than silently clobber/mix local data with the incoming page replacement.
+        // A protocol-2 replica may still receive Pages+ReplaceBase. The pushed CREATE is already
+        // on the replacement snapshot; remaining INSERTs stay in the journal and must be replayed
+        // onto that snapshot instead of being rejected or lost.
         var path = NewReplicaPath("managed-replica-replace-base-pending-local");
         var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
-        var replacedImage = CreateDatabaseImageWithMarker(path + ".replaced", 84);
+        var replacedSource = path + ".replaced";
+        byte[] replacedImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={replacedSource};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (84);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            replacedImage = File.ReadAllBytes(replacedSource);
+        }
+        finally
+        {
+            DeleteReplicaFiles(replacedSource);
+        }
 
         var handler = new ReplicaPushHandler(
         [
             CreatePullResponse("revision-42", initialImage, protocol: 2),
-            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up
+            CreateLogicalPullResponse("revision-42", body: []),
             CreateReplaceBasePullResponse("revision-43", replacedImage),
         ],
         _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
@@ -1422,17 +1547,15 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             connection.Open();
             ReadBootstrapMarker(connection).Should().Be(42);
 
-            // Two local writes with a push threshold of 1: only the first is pushed, leaving the
-            // second genuinely pending when the sync's pull runs.
             connection.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
             connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');");
             connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (2, 'second');");
 
-            Assert.ThrowsAsync<NotSupportedException>(
-                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            handler.PushCallCount.Should().Be(1);
 
-            // The rejected page apply must not have touched local data at all.
-            ReadBootstrapMarker(connection).Should().Be(42);
+            ReadBootstrapMarker(connection).Should().Be(84);
             using var command = connection.CreateCommand();
             command.CommandText = "SELECT x FROM local_items ORDER BY id;";
             using var reader = command.ExecuteReader();
@@ -1440,6 +1563,9 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             while (reader.Read())
                 values.Add(reader.GetString(0));
             values.Should().Equal("first", "second");
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().HaveCount(2);
         }
         finally
         {

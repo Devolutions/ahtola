@@ -95,15 +95,26 @@ internal readonly record struct ManagedReplicaLogicalApplyResult(
 /// One locally pending row change, captured (or marked for deletion) before a remote logical
 /// pull's apply transaction begins, so it can be reapplied afterward on top of the new remote
 /// base. <see cref="CapturedValues"/> is the row's current column values (only set when
-/// <see cref="IsDelete"/> is <see langword="false"/>). A delete is captured only when the table's
-/// schema proves rowid is its stable identity (no declared primary key, or a genuine rowid-alias
-/// primary key); otherwise capture fails closed before the remote apply can mutate anything.
+/// <see cref="IsDelete"/> is <see langword="false"/>). <see cref="DeletedRowValues"/> is the
+/// journaled pre-delete image used to identify a non-rowid-alias primary key safely.
 /// </summary>
 internal readonly record struct ManagedReplicaCapturedLocalRowChange(
     string TableName,
     long RowId,
     bool IsDelete,
-    IReadOnlyList<SqlValue>? CapturedValues);
+    IReadOnlyList<SqlValue>? CapturedValues,
+    IReadOnlyList<SqlValue>? DeletedRowValues = null);
+
+/// <summary>
+/// A still-unpushed local <c>ALTER TABLE ... ADD COLUMN</c> that must survive a concurrent
+/// remote logical apply. The extra column is ignored by remote table-refresh additive checks
+/// (so it is not mistaken for a remote drop) and reapplied afterward if the remote recreate
+/// omitted it.
+/// </summary>
+internal readonly record struct ManagedReplicaPendingAddColumn(
+    string TableName,
+    string ColumnName,
+    string ColumnDefinition);
 
 /// <summary>
 /// Replays decoded MVCC logical-log transactions onto a managed connection using plain SQL,
@@ -123,7 +134,8 @@ internal static class ManagedReplicaLogicalReplayer
         IReadOnlyList<ManagedReplicaLogicalTxn> transactions,
         IReadOnlyDictionary<ulong, string> tableNamesByStableId,
         string excludedClientId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyList<ManagedReplicaPendingAddColumn>? pendingAddColumns = null)
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(transactions);
@@ -144,7 +156,7 @@ internal static class ManagedReplicaLogicalReplayer
             foreach (var op in operations)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                ReplayOperation(connection, op);
+                ReplayOperation(connection, op, pendingAddColumns);
                 operationCount++;
             }
 
@@ -153,6 +165,88 @@ internal static class ManagedReplicaLogicalReplayer
         }
 
         return new ManagedReplicaLogicalApplyResult(tableMap.Snapshot(), transactionCount, operationCount);
+    }
+
+    /// <summary>
+    /// Collects still-unpushed additive <c>ALTER TABLE ... ADD COLUMN</c> statements, last-write
+    /// wins per (table, column). Other schema kinds are ignored here; the caller rejects those
+    /// before apply.
+    /// </summary>
+    public static IReadOnlyList<ManagedReplicaPendingAddColumn> CollectPendingAddColumns(
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges)
+    {
+        ArgumentNullException.ThrowIfNull(pendingLocalChanges);
+
+        var extras = new Dictionary<(string Table, string Column), ManagedReplicaPendingAddColumn>(
+            PendingAddColumnKeyComparer.Instance);
+        foreach (var change in pendingLocalChanges)
+        {
+            if (change.Kind != ReplicaLocalChangeKind.Schema)
+                continue;
+            if (ManagedReplicaSchemaDdlText.TryParseAlterTableAddColumn(change.Sql) is not { } addColumn)
+                continue;
+            extras[(addColumn.TableName, addColumn.ColumnName)] = new ManagedReplicaPendingAddColumn(
+                addColumn.TableName,
+                addColumn.ColumnName,
+                addColumn.ColumnDefinition);
+        }
+
+        return extras.Count == 0 ? [] : extras.Values.ToArray();
+    }
+
+    /// <summary>
+    /// Reapplies still-unpushed additive columns after a remote logical apply. Missing tables are
+    /// skipped (the remote may have dropped them). Already-present columns are left unchanged.
+    /// </summary>
+    public static void ReplayPendingLocalAddColumns(
+        IManagedConnectionAdapter connection,
+        IReadOnlyList<ManagedReplicaPendingAddColumn> pendingAddColumns,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(pendingAddColumns);
+
+        foreach (var extra in pendingAddColumns)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!SchemaObjectExists(connection, "table", extra.TableName))
+                continue;
+
+            var currentColumns = GetTableColumnNames(connection, extra.TableName);
+            if (currentColumns.Contains(extra.ColumnName, StringComparer.OrdinalIgnoreCase))
+                continue;
+
+            ExecuteDdl(
+                connection,
+                $"ALTER TABLE {QuoteIdentifier(extra.TableName)} ADD COLUMN {extra.ColumnDefinition}");
+        }
+    }
+
+    /// <summary>
+    /// Replays the original SQL of still-unpushed local statements onto a freshly installed
+    /// ReplaceBase snapshot. Consecutive journal rows that share one statement (empty or repeated
+    /// <see cref="ReplicaLocalChange.Sql"/>) execute once. Used only after a complete page
+    /// replacement; incremental page patches cannot reconstruct a statement-level rebase.
+    /// </summary>
+    public static void ReplayPendingLocalStatements(
+        IManagedConnectionAdapter connection,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(pendingLocalChanges);
+
+        string? lastSql = null;
+        foreach (var change in pendingLocalChanges)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(change.Sql) || string.Equals(change.Sql, lastSql, StringComparison.Ordinal))
+                continue;
+
+            lastSql = change.Sql;
+            using var statement = connection.Prepare(change.Sql);
+            statement.Step();
+        }
     }
 
     /// <summary>
@@ -166,11 +260,8 @@ internal static class ManagedReplicaLogicalReplayer
     /// </summary>
     /// <remarks>
     /// Only Row-kind changes to logically-replayable tables are captured. Schema-kind local
-    /// changes are never reconciled here: by the time this runs, the caller (see
-    /// <c>ManagedReplicaBootstrapper.RejectIfLocalSchemaChangesArePending</c>) has already
-    /// rejected the whole apply outright if any Schema-kind entry is still pending push, so this
-    /// method is only ever reached when none remain in the journal - filtering them out here is
-    /// therefore a defensive no-op, not the actual enforcement point.
+    /// changes are reconciled separately: additive <c>ALTER TABLE ... ADD COLUMN</c> is collected
+    /// by <see cref="CollectPendingAddColumns"/> and reapplied after the remote transaction.
     /// </remarks>
     public static IReadOnlyList<ManagedReplicaCapturedLocalRowChange> CapturePendingLocalRowChanges(
         IManagedConnectionAdapter connection,
@@ -182,7 +273,7 @@ internal static class ManagedReplicaLogicalReplayer
         // Collapse to the LAST recorded operation per (table, rowid): only the final local
         // intent for each row matters for reconciliation, and the live row already reflects it
         // for whichever (table, rowid) pair's final recorded op was not a delete.
-        var isFinalOpDeleteByKey = new Dictionary<(string Table, long RowId), bool>();
+        var finalChangeByKey = new Dictionary<(string Table, long RowId), ReplicaLocalChange>();
         var order = new List<(string Table, long RowId)>();
         foreach (var change in pendingLocalChanges)
         {
@@ -193,18 +284,26 @@ internal static class ManagedReplicaLogicalReplayer
             }
 
             var key = (change.Table, change.RowId);
-            if (!isFinalOpDeleteByKey.ContainsKey(key))
+            if (!finalChangeByKey.ContainsKey(key))
                 order.Add(key);
-            isFinalOpDeleteByKey[key] = change.Operation == SqliteChangeOperation.Delete;
+            finalChangeByKey[key] = change;
         }
 
         var captured = new List<ManagedReplicaCapturedLocalRowChange>(order.Count);
         foreach (var key in order)
         {
-            if (isFinalOpDeleteByKey[key])
+            var finalChange = finalChangeByKey[key];
+            if (finalChange.Operation == SqliteChangeOperation.Delete)
             {
-                EnsurePendingLocalDeleteHasStableRowidIdentity(connection, key.Table);
-                captured.Add(new ManagedReplicaCapturedLocalRowChange(key.Table, key.RowId, true, null));
+                var deletedRowValues = DecodePendingLocalDeleteBeforeImage(finalChange);
+                if (deletedRowValues is null)
+                    EnsurePendingLocalDeleteHasStableRowidIdentity(connection, key.Table);
+                captured.Add(new ManagedReplicaCapturedLocalRowChange(
+                    key.Table,
+                    key.RowId,
+                    IsDelete: true,
+                    CapturedValues: null,
+                    DeletedRowValues: deletedRowValues));
                 continue;
             }
 
@@ -220,6 +319,19 @@ internal static class ManagedReplicaLogicalReplayer
         }
 
         return captured;
+    }
+
+    private static IReadOnlyList<SqlValue>? DecodePendingLocalDeleteBeforeImage(ReplicaLocalChange change)
+    {
+        if (change.BeforeRecord is null)
+            return null;
+        if (change.BeforeRecord.Length == 0)
+        {
+            throw new InvalidDataException(
+                $"Managed embedded replica has an empty before-image for pending local delete on table '{change.Table}'.");
+        }
+
+        return SqliteRecordCodec.Decode(change.BeforeRecord);
     }
 
     private static IReadOnlyList<SqlValue>? TryCaptureCurrentRowValues(
@@ -271,7 +383,7 @@ internal static class ManagedReplicaLogicalReplayer
 
             if (change.IsDelete)
             {
-                ReplayPendingLocalRowDelete(connection, change.TableName, change.RowId);
+                ReplayPendingLocalRowDelete(connection, change.TableName, change.RowId, change.DeletedRowValues);
                 continue;
             }
 
@@ -309,13 +421,36 @@ internal static class ManagedReplicaLogicalReplayer
     }
 
     /// <summary>
-    /// Replays a pending local delete by rowid after
-    /// <see cref="EnsurePendingLocalDeleteHasStableRowidIdentity"/> proved that rowid is this
-    /// table's stable logical identity.
+    /// Replays a pending local delete by its journaled declared-primary-key projection when
+    /// present, otherwise by rowid after <see cref="EnsurePendingLocalDeleteHasStableRowidIdentity"/>
+    /// proved rowid is stable.
     /// </summary>
-    private static void ReplayPendingLocalRowDelete(IManagedConnectionAdapter connection, string tableName, long rowId)
+    private static void ReplayPendingLocalRowDelete(
+        IManagedConnectionAdapter connection,
+        string tableName,
+        long rowId,
+        IReadOnlyList<SqlValue>? deletedRowValues)
     {
         var info = GetTableColumnsInfo(connection, tableName);
+        if (deletedRowValues is not null && info.PkColumnIndices.Count > 0 && info.RowidAliasColumnIndex is null)
+        {
+            if (deletedRowValues.Count != info.ColumnNames.Count)
+            {
+                throw new InvalidDataException(
+                    $"Managed embedded replica before-image for table '{tableName}' has {deletedRowValues.Count} column(s), "
+                    + $"but the current schema has {info.ColumnNames.Count}.");
+            }
+
+            var predicates = string.Join(
+                " AND ",
+                info.PkColumnIndices.Select(index => $"{QuoteIdentifier(info.ColumnNames[index])} IS ?"));
+            using var primaryKeyDelete = connection.Prepare($"DELETE FROM {QuoteIdentifier(tableName)} WHERE {predicates}");
+            for (var index = 0; index < info.PkColumnIndices.Count; index++)
+                primaryKeyDelete.Bind(index + 1, deletedRowValues[info.PkColumnIndices[index]]);
+            primaryKeyDelete.Step();
+            return;
+        }
+
         var rowidReference = info.RowidReferenceName
             ?? throw new InvalidDataException(
                 $"Cannot reference table '{tableName}''s rowid for pending local delete.");
@@ -406,7 +541,10 @@ internal static class ManagedReplicaLogicalReplayer
         return resolved;
     }
 
-    private static void ReplayOperation(IManagedConnectionAdapter connection, ManagedReplicaLogicalOp op)
+    private static void ReplayOperation(
+        IManagedConnectionAdapter connection,
+        ManagedReplicaLogicalOp op,
+        IReadOnlyList<ManagedReplicaPendingAddColumn>? pendingAddColumns)
     {
         switch (op.OpType)
         {
@@ -414,7 +552,7 @@ internal static class ManagedReplicaLogicalReplayer
                 ReplayHeaderOp(connection, op);
                 return;
             case ManagedReplicaLogicalOpType.Schema:
-                ReplaySchemaOp(connection, op);
+                ReplaySchemaOp(connection, op, pendingAddColumns);
                 return;
             case ManagedReplicaLogicalOpType.UpsertRow:
                 ReplayRowUpsert(connection, op.TableName, op.RowId, op.Record);
@@ -446,7 +584,10 @@ internal static class ManagedReplicaLogicalReplayer
             ExecuteDdl(connection, $"PRAGMA application_id = {applicationId.ToString(CultureInfo.InvariantCulture)}");
     }
 
-    private static void ReplaySchemaOp(IManagedConnectionAdapter connection, ManagedReplicaLogicalOp op)
+    private static void ReplaySchemaOp(
+        IManagedConnectionAdapter connection,
+        ManagedReplicaLogicalOp op,
+        IReadOnlyList<ManagedReplicaPendingAddColumn>? pendingAddColumns)
     {
         var kind = op.SchemaKind ?? throw new InvalidDataException("A logical schema operation is missing its schema kind.");
         var action = op.SchemaAction ?? throw new InvalidDataException("A logical schema operation is missing its schema action.");
@@ -455,12 +596,12 @@ internal static class ManagedReplicaLogicalReplayer
         {
             case ManagedReplicaLogicalSchemaAction.Create:
             case ManagedReplicaLogicalSchemaAction.Alter:
-                ExecuteDdlIdempotent(connection, kind, op.SchemaName, op.Sql);
+                ExecuteDdlIdempotent(connection, kind, op.SchemaName, op.Sql, pendingAddColumns);
                 return;
             case ManagedReplicaLogicalSchemaAction.Refresh:
                 if (kind != ManagedReplicaLogicalSchemaKind.Table)
                     ExecuteDdl(connection, SchemaDropSql(kind, op.SchemaName));
-                ExecuteDdlIdempotent(connection, kind, op.SchemaName, op.Sql);
+                ExecuteDdlIdempotent(connection, kind, op.SchemaName, op.Sql, pendingAddColumns);
                 return;
             case ManagedReplicaLogicalSchemaAction.Drop:
                 ExecuteDdl(connection, SchemaDropSql(kind, op.SchemaName));
@@ -487,7 +628,8 @@ internal static class ManagedReplicaLogicalReplayer
         IManagedConnectionAdapter connection,
         ManagedReplicaLogicalSchemaKind kind,
         string name,
-        string sql)
+        string sql,
+        IReadOnlyList<ManagedReplicaPendingAddColumn>? pendingAddColumns = null)
     {
         if (kind != ManagedReplicaLogicalSchemaKind.Table)
         {
@@ -514,7 +656,7 @@ internal static class ManagedReplicaLogicalReplayer
             if (currentSql is not null
                 && ManagedReplicaSchemaDdlText.TryGetCreateTableShape(currentSql) is { } currentShape)
             {
-                AssertPurelyAdditiveTableRefresh(name, currentShape, incomingShape.Value);
+                AssertPurelyAdditiveTableRefresh(name, currentShape, incomingShape.Value, pendingAddColumns);
             }
 
             foreach (var (columnName, definition) in incomingShape.Value.Columns)
@@ -552,7 +694,8 @@ internal static class ManagedReplicaLogicalReplayer
     private static void AssertPurelyAdditiveTableRefresh(
         string tableName,
         ManagedReplicaSchemaDdlText.TableShape current,
-        ManagedReplicaSchemaDdlText.TableShape incoming)
+        ManagedReplicaSchemaDdlText.TableShape incoming,
+        IReadOnlyList<ManagedReplicaPendingAddColumn>? pendingAddColumns)
     {
         if (current.Strict != incoming.Strict || current.WithoutRowId != incoming.WithoutRowId)
         {
@@ -567,6 +710,9 @@ internal static class ManagedReplicaLogicalReplayer
         {
             if (!incomingColumnsByName.TryGetValue(columnName, out var incomingDefinition))
             {
+                if (IsPendingLocalExtraColumn(tableName, columnName, pendingAddColumns))
+                    continue;
+
                 throw new InvalidDataException(
                     $"Logical schema refresh for table '{tableName}' removes or renames column "
                     + $"'{columnName}', which additive column replay does not support.");
@@ -602,6 +748,40 @@ internal static class ManagedReplicaLogicalReplayer
     /// </summary>
     private static string NormalizeDdlWhitespace(string text)
         => string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    private static bool IsPendingLocalExtraColumn(
+        string tableName,
+        string columnName,
+        IReadOnlyList<ManagedReplicaPendingAddColumn>? pendingAddColumns)
+    {
+        if (pendingAddColumns is null || pendingAddColumns.Count == 0)
+            return false;
+
+        foreach (var extra in pendingAddColumns)
+        {
+            if (string.Equals(extra.TableName, tableName, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(extra.ColumnName, columnName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private sealed class PendingAddColumnKeyComparer : IEqualityComparer<(string Table, string Column)>
+    {
+        public static readonly PendingAddColumnKeyComparer Instance = new();
+
+        public bool Equals((string Table, string Column) x, (string Table, string Column) y)
+            => string.Equals(x.Table, y.Table, StringComparison.OrdinalIgnoreCase)
+               && string.Equals(x.Column, y.Column, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode((string Table, string Column) obj)
+            => HashCode.Combine(
+                StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Table),
+                StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Column));
+    }
 
     private static string? GetTableCreateSql(IManagedConnectionAdapter connection, string tableName)
     {

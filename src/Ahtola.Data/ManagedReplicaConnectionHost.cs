@@ -1,4 +1,5 @@
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 
 namespace Ahtola;
 
@@ -495,14 +496,21 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     private void InstallChangeCapture(IManagedConnectionAdapter connection)
     {
         var hooks = connection.Hooks;
-        hooks.UpdateHook = change =>
+        hooks.DetailedUpdateHook = change =>
         {
             if (!change.Database.Equals("main", StringComparison.OrdinalIgnoreCase))
                 return;
             lock (_changeGate)
             {
                 _statementChanges.Add(
-                    ReplicaLocalChange.Row(change.Operation, change.Database, change.Table, change.RowId));
+                    ReplicaLocalChange.Row(
+                        change.Operation,
+                        change.Database,
+                        change.Table,
+                        change.RowId,
+                        change.Operation == SqliteChangeOperation.Delete && change.BeforeValues is { } beforeValues
+                            ? SqliteRecordCodec.Encode(beforeValues)
+                            : null));
             }
         };
         hooks.RollbackHook = () =>

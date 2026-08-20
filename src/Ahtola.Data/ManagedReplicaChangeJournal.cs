@@ -22,17 +22,19 @@ internal readonly record struct ReplicaLocalChange(
     string Database,
     string Table,
     long RowId,
-    string Sql)
+    string Sql,
+    byte[]? BeforeRecord)
 {
     public static ReplicaLocalChange Row(
         SqliteChangeOperation operation,
         string database,
         string table,
-        long rowId)
-        => new(0, ReplicaLocalChangeKind.Row, operation, database, table, rowId, string.Empty);
+        long rowId,
+        byte[]? beforeRecord = null)
+        => new(0, ReplicaLocalChangeKind.Row, operation, database, table, rowId, string.Empty, beforeRecord);
 
     public static ReplicaLocalChange Schema(string sql)
-        => new(0, ReplicaLocalChangeKind.Schema, default, string.Empty, string.Empty, 0, sql);
+        => new(0, ReplicaLocalChangeKind.Schema, default, string.Empty, string.Empty, 0, sql, null);
 }
 
 /// <summary>
@@ -53,8 +55,9 @@ internal sealed class ManagedReplicaChangeJournal
     internal const string Suffix = ".ahtola-replica-journal";
 
     private const ulong Magic = 0x4C_4E_52_4A_4C_4F_54_41; // "ATOLJRNL"
-    private const int Version = 3;
+    private const int Version = 4;
     private const int MaxStringBytes = 1024 * 1024;
+    private const int MaxBinaryBytes = 16 * 1024 * 1024;
 
     private readonly object _gate = new();
     private readonly string _path;
@@ -86,7 +89,7 @@ internal sealed class ManagedReplicaChangeJournal
         if (reader.ReadUInt64() != Magic)
             throw new InvalidDataException("Managed replica change journal has an unsupported format.");
         var formatVersion = reader.ReadInt32();
-        if (formatVersion is not (1 or 2 or Version))
+        if (formatVersion is not (1 or 2 or 3 or Version))
             throw new InvalidDataException("Managed replica change journal has an unsupported format.");
 
         var sequence = reader.ReadInt64();
@@ -235,6 +238,7 @@ internal sealed class ManagedReplicaChangeJournal
                 WriteString(writer, change.Table);
                 writer.Write(change.RowId);
                 WriteString(writer, change.Sql);
+                WriteBytes(writer, change.BeforeRecord);
                 break;
             case ReplicaLocalChangeKind.Schema:
                 WriteString(writer, change.Sql);
@@ -257,7 +261,8 @@ internal sealed class ManagedReplicaChangeJournal
                 ReadString(reader),
                 ReadString(reader),
                 reader.ReadInt64(),
-                formatVersion >= 3 ? ReadString(reader) : string.Empty),
+                formatVersion >= 3 ? ReadString(reader) : string.Empty,
+                formatVersion >= 4 ? ReadBytes(reader) : null),
             ReplicaLocalChangeKind.Schema => ReplicaLocalChange.Schema(ReadString(reader)) with { Sequence = sequence },
             _ => throw new InvalidDataException("Managed replica change journal has an unknown change kind."),
         };
@@ -271,6 +276,20 @@ internal sealed class ManagedReplicaChangeJournal
             throw new InvalidDataException("Managed replica change journal entry is too large.");
         writer.Write(bytes.Length);
         writer.Write(bytes);
+    }
+
+    private static void WriteBytes(BinaryWriter writer, byte[]? value)
+    {
+        if (value is null)
+        {
+            writer.Write(-1);
+            return;
+        }
+
+        if (value.Length > MaxBinaryBytes)
+            throw new InvalidDataException("Managed replica change journal binary entry is too large.");
+        writer.Write(value.Length);
+        writer.Write(value);
     }
 
     private static string ReadString(BinaryReader reader)
@@ -289,5 +308,18 @@ internal sealed class ManagedReplicaChangeJournal
         {
             throw new InvalidDataException("Managed replica change journal contains invalid UTF-8.", exception);
         }
+    }
+
+    private static byte[]? ReadBytes(BinaryReader reader)
+    {
+        var length = reader.ReadInt32();
+        if (length == -1)
+            return null;
+        if (length < 0 || length > MaxBinaryBytes)
+            throw new InvalidDataException("Managed replica change journal contains an invalid binary entry.");
+        var bytes = reader.ReadBytes(length);
+        if (bytes.Length != length)
+            throw new EndOfStreamException("Managed replica change journal is truncated.");
+        return bytes;
     }
 }

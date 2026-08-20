@@ -742,7 +742,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
                 return;
 
-            rowChanged(operation, tableName, rowId);
+            rowChanged(operation, tableName, rowId, before, after);
         }
 
         private void ReportWithoutRowidMvccChange(
@@ -42753,19 +42753,36 @@ public sealed partial class EmbeddedConnection : IDisposable
     private ManagedStatementHooks? CreateStatementHooks(EmbeddedDatabase database, bool includeCommitGate)
     {
         var updateHook = _hooks.UpdateHook;
+        var detailedUpdateHook = _hooks.DetailedUpdateHook;
         var commitHook = includeCommitGate ? _hooks.CommitHook : null;
         var progressHandler = _hooks.ProgressHandler;
         var progressInterval = _hooks.ProgressInterval;
-        if (updateHook is null && commitHook is null && (progressHandler is null || progressInterval <= 0))
+        if (updateHook is null
+            && detailedUpdateHook is null
+            && commitHook is null
+            && (progressHandler is null || progressInterval <= 0))
             return null;
 
         var schema = ResolveSchemaName(database);
         return new ManagedStatementHooks
         {
-            RowChanged = updateHook is null || _suppressUpdateHook
+            RowChanged = (updateHook is null && detailedUpdateHook is null) || _suppressUpdateHook
                 ? null
-                : (operation, table, rowId) => InvokeHook(
-                    () => updateHook(new SqliteRowChange(operation, schema, table, rowId))),
+                : (operation, table, rowId, before, after) =>
+                {
+                    if (updateHook is not null)
+                        InvokeHook(() => updateHook(new SqliteRowChange(operation, schema, table, rowId)));
+                    if (detailedUpdateHook is not null)
+                    {
+                        InvokeHook(() => detailedUpdateHook(new ManagedSqliteRowChange(
+                            operation,
+                            schema,
+                            table,
+                            rowId,
+                            before?.ToArray(),
+                            after?.ToArray())));
+                    }
+                },
             CommitGate = commitHook is null ? null : () => InvokeHook(commitHook),
             Progress = progressHandler is null || progressInterval <= 0
                 ? null
