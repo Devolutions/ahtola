@@ -958,7 +958,8 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         }
     }
 
-    private static void ValidateWrite(IReadOnlyList<SqliteWalWritePage> pages, uint databasePageCount)    {
+    private static void ValidateWrite(IReadOnlyList<SqliteWalWritePage> pages, uint databasePageCount)
+    {
         if (pages.Count == 0)
             throw new ArgumentException("A SQLite WAL transaction requires at least one page.", nameof(pages));
         if (databasePageCount == 0)

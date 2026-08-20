@@ -160,10 +160,19 @@ public sealed class ManagedVacuumCompactImageTests
         var sourceBefore = ReadAllBytes(fileSystem, sourcePath);
         var sourceRows = ReadRowSignature(connection);
 
-        // Fail partway through the sequential destination image write.
+        // Learn how many writes a successful vacuum performs, then fail in the
+        // middle of that range. Hard-coding an ordinal would silently stop
+        // exercising the image write whenever write batching changes.
+        const string ProbePath = "compact-interrupt-probe.db";
+        var writesBeforeProbe = faults.GetOperationCount(FileSystemOperation.Write);
+        ExecuteVacuumInto(connection, ProbePath);
+        var vacuumWrites = faults.GetOperationCount(FileSystemOperation.Write) - writesBeforeProbe;
+        vacuumWrites.Should().BeGreaterThan(1);
+        fileSystem.DeleteFile(ProbePath);
+
         faults.FailOnOccurrence(
             FileSystemOperation.Write,
-            faults.GetOperationCount(FileSystemOperation.Write) + 6);
+            faults.GetOperationCount(FileSystemOperation.Write) + Math.Max(1, vacuumWrites / 2));
         Assert.Throws<IOException>(() => ExecuteVacuumInto(connection, destinationPath));
         faults.ClearScheduled();
 

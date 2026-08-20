@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Text;
 
 namespace Ahtola.Core.Storage;
@@ -173,17 +174,67 @@ public sealed class SqliteIndexRecordComparer
             return CompareRTrimText(left, right);
 
         if (collation.IsBinary)
-        {
-            var encoding = GetTextEncoding(TextEncoding);
-            return CompareBinary(encoding.GetBytes(left), encoding.GetBytes(right));
-        }
+            return CompareBinaryText(left, right, GetTextEncoding(TextEncoding));
 
         throw new NotSupportedException(
             $"SQLite index comparison does not support collation {collation.Name}.");
     }
 
+    /// <summary>
+    /// Compares two strings as SQLite would compare their encoded bytes, without
+    /// allocating a byte array per comparison.
+    /// </summary>
+    /// <remarks>
+    /// This runs O(n log n) times per index build. Encoding both operands with
+    /// <c>Encoding.GetBytes</c> allocated two arrays on every comparison, which
+    /// dominated both the CPU and the garbage produced by a full rebuild.
+    /// For all-ASCII operands the encoded byte order matches ordinal char order
+    /// under UTF-8 and both UTF-16 forms, so no encoding is needed at all.
+    /// </remarks>
+    private static int CompareBinaryText(string left, string right, Encoding encoding)
+    {
+        if (Ascii.IsValid(left) && Ascii.IsValid(right))
+            return string.CompareOrdinal(left, right);
+
+        var leftMaximum = encoding.GetMaxByteCount(left.Length);
+        var rightMaximum = encoding.GetMaxByteCount(right.Length);
+        var leftBuffer = ArrayPool<byte>.Shared.Rent(leftMaximum);
+        var rightBuffer = ArrayPool<byte>.Shared.Rent(rightMaximum);
+        try
+        {
+            var leftLength = encoding.GetBytes(left, leftBuffer);
+            var rightLength = encoding.GetBytes(right, rightBuffer);
+            return CompareBinary(
+                leftBuffer.AsSpan(0, leftLength),
+                rightBuffer.AsSpan(0, rightLength));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(leftBuffer);
+            ArrayPool<byte>.Shared.Return(rightBuffer);
+        }
+    }
+
     internal static int CompareNoCaseText(string left, string right)
     {
+        if (Ascii.IsValid(left) && Ascii.IsValid(right))
+        {
+            // ASCII folding over ASCII input is exactly the byte-wise fold below,
+            // so the encode step and its two arrays are unnecessary.
+            var asciiCount = Math.Min(left.Length, right.Length);
+            for (var index = 0; index < asciiCount; index++)
+            {
+                var leftFolded = FoldAscii((byte)left[index]);
+                var rightFolded = FoldAscii((byte)right[index]);
+                if (leftFolded != rightFolded)
+                    return leftFolded.CompareTo(rightFolded);
+                if (leftFolded == 0)
+                    return left.Length.CompareTo(right.Length);
+            }
+
+            return left.Length.CompareTo(right.Length);
+        }
+
         var leftBytes = StrictUtf8.GetBytes(left);
         var rightBytes = StrictUtf8.GetBytes(right);
         var count = Math.Min(leftBytes.Length, rightBytes.Length);
@@ -207,9 +258,16 @@ public sealed class SqliteIndexRecordComparer
     }
 
     internal static int CompareRTrimText(string left, string right)
-        => CompareBinary(
-            StrictUtf8.GetBytes(left.TrimEnd(' ')),
-            StrictUtf8.GetBytes(right.TrimEnd(' ')));
+    {
+        var trimmedLeft = left.TrimEnd(' ');
+        var trimmedRight = right.TrimEnd(' ');
+        if (Ascii.IsValid(trimmedLeft) && Ascii.IsValid(trimmedRight))
+            return string.CompareOrdinal(trimmedLeft, trimmedRight);
+
+        return CompareBinary(
+            StrictUtf8.GetBytes(trimmedLeft),
+            StrictUtf8.GetBytes(trimmedRight));
+    }
 
     private static byte FoldAscii(byte value)
         => value is >= (byte)'A' and <= (byte)'Z'

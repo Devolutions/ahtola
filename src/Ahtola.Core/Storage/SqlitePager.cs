@@ -508,13 +508,16 @@ public sealed class SqlitePager : IDisposable
                 TimeSpan.Zero,
                 stopwatch: null,
                 pagerReadOnly: false);
+            // The caller overwrites this whole image and flushes once before
+            // publishing it, so syncing the placeholder header is wasted.
             pageStore = SqlitePageStore.Create(
                 storageFileSystem,
                 databasePath,
                 effectiveHeader,
                 overwrite: clientOwnership is not null,
                 encryption: encryption,
-                pageCodec: pageCodec);
+                pageCodec: pageCodec,
+                flushOnCreate: false);
             databaseCreated = true;
 
             var pager = new SqlitePager(

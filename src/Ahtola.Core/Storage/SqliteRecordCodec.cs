@@ -9,19 +9,28 @@ public static class SqliteRecordCodec
     private static readonly UnicodeEncoding StrictUtf16LittleEndian = new(false, false, true);
     private static readonly UnicodeEncoding StrictUtf16BigEndian = new(true, false, true);
 
+    /// <summary>Encodes <paramref name="values"/> as one SQLite record payload.</summary>
+    /// <remarks>
+    /// Sizes are computed first so the payload is written once into an
+    /// exactly-sized array. Building the body through growing <c>List&lt;byte&gt;</c>
+    /// buffers produced several times the record's own size in garbage, which
+    /// dominated allocations during a full catalog rebuild.
+    /// </remarks>
     public static byte[] Encode(IReadOnlyList<SqlValue> values, SqliteTextEncoding textEncoding = SqliteTextEncoding.Utf8)
     {
         ArgumentNullException.ThrowIfNull(values);
         var encoding = GetTextEncoding(textEncoding);
 
         var serialTypes = new ulong[values.Count];
-        var body = new List<byte>();
         var serialTypeBytes = 0;
+        var bodyLength = 0;
 
         for (var index = 0; index < values.Count; index++)
         {
-            serialTypes[index] = WriteValueBody(values[index], body, encoding);
-            serialTypeBytes += SqliteVarint.GetLength(serialTypes[index]);
+            var serialType = GetSerialType(values[index], encoding);
+            serialTypes[index] = serialType;
+            serialTypeBytes += SqliteVarint.GetLength(serialType);
+            bodyLength = checked(bodyLength + GetBodyLength(serialType));
         }
 
         var headerSize = serialTypeBytes + 1;
@@ -34,16 +43,21 @@ public static class SqliteRecordCodec
             headerSize = calculated;
         }
 
-        var record = new List<byte>(headerSize + body.Count);
-        WriteVarint(record, (ulong)headerSize);
+        var record = new byte[checked(headerSize + bodyLength)];
+        var position = SqliteVarint.Write((ulong)headerSize, record);
         foreach (var serialType in serialTypes)
-            WriteVarint(record, serialType);
+            position += SqliteVarint.Write(serialType, record.AsSpan(position));
 
-        if (record.Count != headerSize)
+        if (position != headerSize)
             throw new InvalidOperationException("SQLite record header size calculation is inconsistent.");
 
-        record.AddRange(body);
-        return record.ToArray();
+        for (var index = 0; index < values.Count; index++)
+            position += WriteValueBody(values[index], serialTypes[index], record.AsSpan(position), encoding);
+
+        if (position != record.Length)
+            throw new InvalidOperationException("SQLite record body size calculation is inconsistent.");
+
+        return record;
     }
 
     public static SqlValue[] Decode(ReadOnlySpan<byte> record, SqliteTextEncoding textEncoding = SqliteTextEncoding.Utf8)
@@ -80,68 +94,82 @@ public static class SqliteRecordCodec
         return values;
     }
 
-    private static ulong WriteValueBody(SqlValue value, List<byte> body, Encoding textEncoding)
-    {
-        switch (value.Kind)
+    /// <summary>The SQLite serial type that will represent <paramref name="value"/>.</summary>
+    private static ulong GetSerialType(SqlValue value, Encoding textEncoding)
+        => value.Kind switch
         {
-            case SqlValueKind.Null:
+            SqlValueKind.Null => 0,
+            SqlValueKind.Integer => GetIntegerSerialType(value.AsInteger()),
+            SqlValueKind.Real => 7,
+            SqlValueKind.Text => checked((ulong)textEncoding.GetByteCount(value.AsText()) * 2 + 13),
+            SqlValueKind.Blob => checked((ulong)value.AsBlobSpan().Length * 2 + 12),
+            _ => throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}."),
+        };
+
+    /// <summary>The body byte count implied by <paramref name="serialType"/>.</summary>
+    private static int GetBodyLength(ulong serialType)
+        => serialType switch
+        {
+            0 or 8 or 9 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 or 7 => 8,
+            10 or 11 => throw new InvalidOperationException($"SQLite record uses reserved serial type {serialType}."),
+            _ => checked((int)((serialType - (serialType % 2 == 0 ? 12UL : 13UL)) / 2)),
+        };
+
+    private static ulong GetIntegerSerialType(long value)
+        => value switch
+        {
+            0 => 8,
+            1 => 9,
+            >= sbyte.MinValue and <= sbyte.MaxValue => 1,
+            >= short.MinValue and <= short.MaxValue => 2,
+            >= -8_388_608 and <= 8_388_607 => 3,
+            >= int.MinValue and <= int.MaxValue => 4,
+            >= -140_737_488_355_328 and <= 140_737_488_355_327 => 5,
+            _ => 6,
+        };
+
+    /// <summary>Writes one value's body bytes and returns how many were written.</summary>
+    private static int WriteValueBody(
+        SqlValue value,
+        ulong serialType,
+        Span<byte> destination,
+        Encoding textEncoding)
+    {
+        switch (serialType)
+        {
+            case 0 or 8 or 9:
                 return 0;
-            case SqlValueKind.Integer:
-                return WriteInteger(value.AsInteger(), body);
-            case SqlValueKind.Real:
-                WriteInt64(body, BitConverter.DoubleToInt64Bits(value.AsReal()));
-                return 7;
-            case SqlValueKind.Text:
+            case 1 or 2 or 3 or 4 or 5 or 6:
                 {
-                    var bytes = textEncoding.GetBytes(value.AsText());
-                    body.AddRange(bytes);
-                    return checked((ulong)bytes.Length * 2 + 13);
+                    var byteCount = GetBodyLength(serialType);
+                    WriteIntegerBytes(destination, value.AsInteger(), byteCount);
+                    return byteCount;
                 }
-            case SqlValueKind.Blob:
-                {
-                                var bytes = value.AsBlobSpan();
-                                body.AddRange(bytes);
-                    return checked((ulong)bytes.Length * 2 + 12);
-                }
+            case 7:
+                BinaryPrimitives.WriteInt64BigEndian(destination, BitConverter.DoubleToInt64Bits(value.AsReal()));
+                return sizeof(long);
             default:
-                throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}.");
+                {
+                    if (serialType % 2 == 1)
+                        return textEncoding.GetBytes(value.AsText(), destination);
+
+                    var blob = value.AsBlobSpan();
+                    blob.CopyTo(destination);
+                    return blob.Length;
+                }
         }
     }
 
-    private static ulong WriteInteger(long value, List<byte> body)
+    private static void WriteIntegerBytes(Span<byte> destination, long value, int byteCount)
     {
-        if (value == 0)
-            return 8;
-        if (value == 1)
-            return 9;
-        if (value is >= sbyte.MinValue and <= sbyte.MaxValue)
-        {
-            body.Add(unchecked((byte)value));
-            return 1;
-        }
-        if (value is >= short.MinValue and <= short.MaxValue)
-        {
-            WriteIntegerBytes(body, value, 2);
-            return 2;
-        }
-        if (value is >= -8_388_608 and <= 8_388_607)
-        {
-            WriteIntegerBytes(body, value, 3);
-            return 3;
-        }
-        if (value is >= int.MinValue and <= int.MaxValue)
-        {
-            WriteIntegerBytes(body, value, 4);
-            return 4;
-        }
-        if (value is >= -140_737_488_355_328 and <= 140_737_488_355_327)
-        {
-            WriteIntegerBytes(body, value, 6);
-            return 5;
-        }
-
-        WriteIntegerBytes(body, value, 8);
-        return 6;
+        for (var index = 0; index < byteCount; index++)
+            destination[index] = (byte)(value >> ((byteCount - 1 - index) * 8));
     }
 
     private static SqlValue ReadValue(ReadOnlySpan<byte> record, ref int bodyPosition, ulong serialType, Encoding textEncoding)
@@ -219,21 +247,6 @@ public static class SqliteRecordCodec
     {
         for (var index = byteCount - 1; index >= 0; index--)
             body.Add((byte)(value >> (index * 8)));
-    }
-
-    private static void WriteInt64(List<byte> body, long value)
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(long)];
-        BinaryPrimitives.WriteInt64BigEndian(bytes, value);
-            body.AddRange(bytes);
-    }
-
-    private static void WriteVarint(List<byte> destination, ulong value)
-    {
-        Span<byte> bytes = stackalloc byte[SqliteVarint.MaximumLength];
-        var length = SqliteVarint.Write(value, bytes);
-        for (var index = 0; index < length; index++)
-            destination.Add(bytes[index]);
     }
 
     private static Encoding GetTextEncoding(SqliteTextEncoding textEncoding)

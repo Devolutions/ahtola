@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using Ahtola.Core.Parsing;
 using Ahtola.Core.Storage;
 
@@ -154,85 +154,85 @@ internal sealed class EmbeddedFileStore : IDisposable
         bool readOnly = false,
         int? initialPageSize = null,
         SqliteTextEncoding? initialTextEncoding = null,
-            bool foreignReadOnly = false,
-                IPageCodec? pageCodec = null,
-                bool createRollbackJournalMode = false)
+        bool foreignReadOnly = false,
+        IPageCodec? pageCodec = null,
+        bool createRollbackJournalMode = false)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
+
+        var walPath = path + "-wal";
+        var databaseExists = fileSystem.FileExists(path);
+        var walExists = fileSystem.FileExists(walPath);
+        if (initialPageSize is { } requestedPageSize)
+            _ = SqlitePageSize.Encode(requestedPageSize);
+
+        SqlitePager pager;
+        if (!databaseExists)
+        {
+            if (readOnly)
             {
-                ArgumentException.ThrowIfNullOrEmpty(path);
-                ArgumentNullException.ThrowIfNull(fileSystem);
-                PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
-
-            var walPath = path + "-wal";
-            var databaseExists = fileSystem.FileExists(path);
-            var walExists = fileSystem.FileExists(walPath);
-            if (initialPageSize is { } requestedPageSize)
-                _ = SqlitePageSize.Encode(requestedPageSize);
-
-            SqlitePager pager;
-            if (!databaseExists)
-            {
-                if (readOnly)
-                {
-                    throw new EmbeddedSqlException(
-                        $"Cannot open managed database '{path}' read-only because its database file does not exist.");
-                }
-
-                // The main database file is absent. A lingering write-ahead log is
-                // orphaned — its frames reference a database that was deleted (for
-                // example by EFCore's EnsureDeleted, which removes only the main
-                // file). Native SQLite discards the orphaned WAL and creates a
-                // fresh database; match that so delete/reopen cycles do not fault
-                // with "missing its main database file".
-                if (walExists)
-                    fileSystem.DeleteFile(walPath);
-
-                var header = SqliteDatabaseHeader.CreateDefault() with
-                {
-                    PageSize = initialPageSize ?? SqlitePageSize.Default,
-                    TextEncoding = initialTextEncoding ?? SqliteTextEncoding.Utf8,
-                };
-                if (createRollbackJournalMode)
-                {
-                    pager = SqlitePager.CreateRollbackJournal(
-                        fileSystem,
-                        path,
-                        walPath,
-                        header,
-                        encryption: encryption,
-                        pageCodec: pageCodec);
-                }
-                else
-                {
-                    var walHeader = SqliteWalHeader.Create(
-                        header.PageSize,
-                        unchecked((uint)Random.Shared.Next()),
-                        unchecked((uint)Random.Shared.Next()));
-                    pager = SqlitePager.Create(
-                        fileSystem,
-                        path,
-                        walPath,
-                        walHeader,
-                        header,
-                        encryption: encryption,
-                        pageCodec: pageCodec);
-                }
+                throw new EmbeddedSqlException(
+                    $"Cannot open managed database '{path}' read-only because its database file does not exist.");
             }
-            else
+
+            // The main database file is absent. A lingering write-ahead log is
+            // orphaned — its frames reference a database that was deleted (for
+            // example by EFCore's EnsureDeleted, which removes only the main
+            // file). Native SQLite discards the orphaned WAL and creates a
+            // fresh database; match that so delete/reopen cycles do not fault
+            // with "missing its main database file".
+            if (walExists)
+                fileSystem.DeleteFile(walPath);
+
+            var header = SqliteDatabaseHeader.CreateDefault() with
             {
-                if (initialPageSize is not null || initialTextEncoding is not null)
-                {
-                    throw new InvalidOperationException(
-                        "Initial page size and text encoding can be specified only when creating a database.");
-                }
-                pager = SqlitePager.Open(
+                PageSize = initialPageSize ?? SqlitePageSize.Default,
+                TextEncoding = initialTextEncoding ?? SqliteTextEncoding.Utf8,
+            };
+            if (createRollbackJournalMode)
+            {
+                pager = SqlitePager.CreateRollbackJournal(
                     fileSystem,
                     path,
                     walPath,
-                    readOnly,
+                    header,
                     encryption: encryption,
-                    foreignReadOnly: foreignReadOnly,
                     pageCodec: pageCodec);
             }
+            else
+            {
+                var walHeader = SqliteWalHeader.Create(
+                    header.PageSize,
+                    unchecked((uint)Random.Shared.Next()),
+                    unchecked((uint)Random.Shared.Next()));
+                pager = SqlitePager.Create(
+                    fileSystem,
+                    path,
+                    walPath,
+                    walHeader,
+                    header,
+                    encryption: encryption,
+                    pageCodec: pageCodec);
+            }
+        }
+        else
+        {
+            if (initialPageSize is not null || initialTextEncoding is not null)
+            {
+                throw new InvalidOperationException(
+                    "Initial page size and text encoding can be specified only when creating a database.");
+            }
+            pager = SqlitePager.Open(
+                fileSystem,
+                path,
+                walPath,
+                readOnly,
+                encryption: encryption,
+                foreignReadOnly: foreignReadOnly,
+                pageCodec: pageCodec);
+        }
 
         try
         {
@@ -10323,11 +10323,12 @@ internal sealed class EmbeddedFileStore : IDisposable
                 values[^1] = SqlValue.Integer(rowId!.Value);
             }
             var record = SqliteRecordCodec.Encode(values, _textEncoding);
-            // Decoding here doubles as the comparer's Validate() and gives the
-            // sort a pre-decoded key, so records are decoded once instead of
-            // twice per comparison.
-            var sortKey = SqliteRecordCodec.Decode(record, _textEncoding);
-            decorated.Add((sortKey, record));
+            // `values` is already the decoded form of `record`: every SqlValue
+            // factory normalises on construction (SqlValue.Real folds NaN to
+            // NULL), and Encode self-checks its header/body sizing. Decoding the
+            // record back just to obtain a sort key cost one decode plus a fresh
+            // value array and string per row of every index.
+            decorated.Add((values, record));
         }
 
         decorated.Sort((left, right) => comparer.Compare(left.SortKey, right.SortKey));
