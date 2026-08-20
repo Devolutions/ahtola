@@ -900,6 +900,38 @@ public sealed class ManagedReplicaLogicalReplayerTests
     }
 
     [Test]
+    public void ReplayPendingLocalRowChangesUsesAJournaledPrimaryKeyForANonAliasDelete()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)");
+        Exec(connection, "INSERT INTO t VALUES ('a', 'va'), ('b', 'vb')");
+        var localRowId = Scalar(connection, "SELECT rowid FROM t WHERE x = 'b'").AsInteger();
+        Exec(connection, "DELETE FROM t WHERE x = 'b'");
+
+        var beforeRecord = SqliteRecordCodecTestHelper.EncodeRow(SqlValue.Text("b"), SqlValue.Text("vb"));
+        ReplicaLocalChange[] pending =
+        [
+            ReplicaLocalChange.Row(
+                SqliteChangeOperation.Delete,
+                "main",
+                "t",
+                localRowId,
+                beforeRecord),
+        ];
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        // The remote may reuse the deleted row's old rowid for a different primary key. The
+        // journaled key must delete only "b", which is already absent, not the new row "c".
+        Exec(connection, "INSERT INTO t VALUES ('c', 'vc')");
+        Scalar(connection, "SELECT rowid FROM t WHERE x = 'c'").AsInteger().Should().Be(localRowId);
+
+        ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(connection, captured, CancellationToken.None);
+
+        Scalar(connection, "SELECT y FROM t WHERE x = 'c'").AsText().Should().Be("vc");
+        RowCount(connection, "t").Should().Be(2);
+    }
+
+    [Test]
     public void ReplayPendingLocalRowChangesSkipsReconciliationWhenTheRemoteDroppedTheTable()
     {
         using var connection = OpenConnection();
@@ -932,6 +964,45 @@ public sealed class ManagedReplicaLogicalReplayerTests
 
         Action act = () => ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(connection, captured, CancellationToken.None);
         act.Should().NotThrow();
+    }
+
+    [Test]
+    public void ApplyIgnoresPendingLocalExtraColumnsDuringTableRefreshThenReappliesThem()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT)");
+        Exec(connection, "ALTER TABLE t ADD COLUMN extra TEXT");
+        Exec(connection, "INSERT INTO t(id, x, extra) VALUES (1, 'local', 'kept')");
+
+        var pending = ManagedReplicaLogicalReplayer.CollectPendingAddColumns(
+        [
+            ReplicaLocalChange.Schema("ALTER TABLE t ADD COLUMN extra TEXT"),
+        ]);
+        pending.Should().ContainSingle();
+
+        var schemaOp = SchemaOp(
+            ManagedReplicaLogicalSchemaAction.Refresh,
+            ManagedReplicaLogicalSchemaKind.Table,
+            "t",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT)");
+        var remoteRecord = SqliteRecordCodecTestHelper.EncodeRow(SqlValue.Integer(2), SqlValue.Text("remote"));
+        var rowOp = RowOp(ManagedReplicaLogicalOpType.UpsertRow, "t", 2, remoteRecord);
+        var txn = new ManagedReplicaLogicalTxn(1, 1, [schemaOp, rowOp], string.Empty);
+
+        Action apply = () => ManagedReplicaLogicalReplayer.Apply(
+            connection,
+            [txn],
+            new Dictionary<ulong, string>(),
+            string.Empty,
+            CancellationToken.None,
+            pending);
+        apply.Should().NotThrow();
+
+        ManagedReplicaLogicalReplayer.ReplayPendingLocalAddColumns(connection, pending, CancellationToken.None);
+
+        ColumnNames(connection, "t").Should().Equal("id", "x", "extra");
+        Scalar(connection, "SELECT extra FROM t WHERE id = 1").AsText().Should().Be("kept");
+        Scalar(connection, "SELECT x FROM t WHERE id = 2").AsText().Should().Be("remote");
     }
 
     // --- helpers ---

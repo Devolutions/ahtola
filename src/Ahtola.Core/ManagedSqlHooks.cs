@@ -31,6 +31,19 @@ public readonly record struct SqliteRowChange(
     long RowId);
 
 /// <summary>
+/// A row change with managed before/after values. This is intentionally internal: it preserves
+/// the public SQLite-compatible update-hook contract while allowing managed subsystems such as
+/// replica synchronization to retain a delete's stable key after the row is gone.
+/// </summary>
+internal readonly record struct ManagedSqliteRowChange(
+    SqliteChangeOperation Operation,
+    string Database,
+    string Table,
+    long RowId,
+    IReadOnlyList<SqlValue>? BeforeValues,
+    IReadOnlyList<SqlValue>? AfterValues);
+
+/// <summary>
 /// The decision an authorizer callback returns, mirroring SQLite's <c>SQLITE_OK</c>,
 /// <c>SQLITE_DENY</c> and <c>SQLITE_IGNORE</c>.
 /// </summary>
@@ -185,6 +198,13 @@ public sealed class ManagedConnectionHooks
     public Action<SqliteRowChange>? UpdateHook { get; set; }
 
     /// <summary>
+    /// Internal detailed counterpart to <see cref="UpdateHook"/>. The assembly-visible hook retains
+    /// immutable before/after value snapshots for managed infrastructure without changing the
+    /// public SQLite-compatible update-hook surface.
+    /// </summary>
+    internal Action<ManagedSqliteRowChange>? DetailedUpdateHook { get; set; }
+
+    /// <summary>
     /// Invoked immediately before a transaction is committed. Returning <c>false</c> vetoes the
     /// commit, turning it into a rollback.
     /// </summary>
@@ -209,7 +229,7 @@ public sealed class ManagedConnectionHooks
     public int ProgressInterval { get; set; }
 
     internal bool HasExecutionHooks
-        => UpdateHook is not null || CommitHook is not null || ProgressHandler is not null;
+        => UpdateHook is not null || DetailedUpdateHook is not null || CommitHook is not null || ProgressHandler is not null;
 }
 
 /// <summary>
@@ -219,8 +239,8 @@ public sealed class ManagedConnectionHooks
 /// </summary>
 internal sealed class ManagedStatementHooks
 {
-    /// <summary>Reports a committed row change as (operation, table, rowid).</summary>
-    internal Action<SqliteChangeOperation, string, long>? RowChanged { get; init; }
+    /// <summary>Reports a changed row with optional before/after values.</summary>
+    internal Action<SqliteChangeOperation, string, long, SqlValue[]?, SqlValue[]?>? RowChanged { get; init; }
 
     /// <summary>
     /// Consulted immediately before the engine publishes an autocommit mutation. Returning

@@ -423,13 +423,15 @@ internal static class ManagedReplicaBootstrapper
         // expected to keep living in the WAL between syncs (tracked by the change journal,
         // reconciled by precollect/reapply for LOGICAL responses) -- but a raw page-based apply
         // has no such reconciliation mechanism at all, so this surprise combination needs its
-        // OWN, apply-mode-aware guard: both modes reject pending changes; ReplaceBase may
-        // checkpoint fully-pushed WAL state because it installs every page, while Incremental
-        // requires the existing main-file base to still match without checkpointing it first.
+        // OWN, apply-mode-aware guard: Incremental still rejects pending changes because a
+        // partial page patch cannot rebase journaled SQL. ReplaceBase installs every page, so
+        // pending statements can be replayed onto the new snapshot before metadata publication.
         if (requestLogical)
             EnsurePagesApplyIsSafe(options.Path, metadata, pendingLocalChanges, header.ApplyMode);
 
-        await ApplyIncrementalPagesAsync(options, header, pages, metadata.ClientId, effectiveToken).ConfigureAwait(false);
+        await ApplyIncrementalPagesAsync(
+                options, header, pages, metadata.ClientId, pendingLocalChanges, effectiveToken)
+            .ConfigureAwait(false);
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
         return new AhtolaSyncResult(AhtolaSyncOutcome.RemoteChangesApplied,
@@ -504,7 +506,8 @@ internal static class ManagedReplicaBootstrapper
         {
             if (transactions.Count != 0)
             {
-                RejectIfLocalSchemaChangesArePending(pendingLocalChanges);
+                RejectIfLocalSchemaChangesConflictWithRemoteChanges(pendingLocalChanges);
+                var pendingAddColumns = ManagedReplicaLogicalReplayer.CollectPendingAddColumns(pendingLocalChanges);
 
                 // The SQL transaction below mutates the live database file in place (unlike the
                 // page-based path, which stages a whole replacement file before ever touching the
@@ -532,16 +535,24 @@ internal static class ManagedReplicaBootstrapper
                     try
                     {
                         var applied = ManagedReplicaLogicalReplayer.Apply(
-                            connection, transactions, metadata.TableNamesByStableId, metadata.ClientId, cancellationToken);
+                            connection,
+                            transactions,
+                            metadata.TableNamesByStableId,
+                            metadata.ClientId,
+                            cancellationToken,
+                            pendingAddColumns);
                         operationCount = applied.OperationCount;
                         tableNamesByStableId = applied.TableNamesByStableId;
 
-                        // Rebase the still-unpushed local writes on top of the just-applied
-                        // remote base, in the SAME transaction (matching Turso's
-                        // apply_logical_mvcc_changes_internal, which replays local changes before
-                        // its single COMMIT rather than in a follow-up transaction). These
-                        // changes remain in the local change journal (not acknowledged here): the
-                        // server has not seen them yet, so a later push must still send them.
+                        // Rebase still-unpushed local schema first so captured row values that
+                        // include a locally-added column have a home, then rebase row writes.
+                        // Both stay in the change journal: the server has not seen them yet.
+                        if (pendingAddColumns.Count != 0)
+                        {
+                            ManagedReplicaLogicalReplayer.ReplayPendingLocalAddColumns(
+                                connection, pendingAddColumns, cancellationToken);
+                        }
+
                         if (capturedLocalChanges.Count != 0)
                         {
                             ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(
@@ -771,6 +782,7 @@ internal static class ManagedReplicaBootstrapper
         PullHeader header,
         IReadOnlyList<PullPage> pages,
         string clientId,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
         CancellationToken cancellationToken)
     {
         var directory = Path.GetDirectoryName(Path.GetFullPath(options.Path))!;
@@ -816,6 +828,27 @@ internal static class ManagedReplicaBootstrapper
             databaseInstalled = true;
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished);
             cancellationToken.ThrowIfCancellationRequested();
+
+            if (header.ApplyMode == PullApplyMode.ReplaceBase && pendingLocalChanges.Count > 0)
+            {
+                using var database = ManagedDatabaseAdapter.Open(options.Path);
+                var connection = database.Connect();
+                ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
+                try
+                {
+                    ManagedReplicaLogicalReplayer.ReplayPendingLocalStatements(
+                        connection, pendingLocalChanges, cancellationToken);
+                    ExecuteNonQuery(connection, "COMMIT");
+                }
+                catch
+                {
+                    TryExecuteNonQuery(connection, "ROLLBACK");
+                    throw;
+                }
+
+                ExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+            }
+
             // A page-based apply never decodes logical schema identity operations, so the table
             // map is rebuilt fresh from the newly-installed schema (self-healing), matching
             // Turso's read_logical_replay_table_map usage after page-based apply paths. The
@@ -1337,12 +1370,13 @@ internal static class ManagedReplicaBootstrapper
     /// given pull with raw pages (e.g. after its logical log has been garbage-collected, or for a
     /// ReplaceBase). A raw page-based apply has no mechanism to reconcile local writes the way the
     /// logical path's precollect/reapply does, so both modes reject outright when local changes are
-    /// still pending push. After that their safety requirements differ: ReplaceBase installs a
-    /// complete validated snapshot, so it may checkpoint and discard fully-pushed local WAL state
-    /// before replacement; Incremental patches only selected pages, so any non-empty WAL already
-    /// proves that its main-file base is stale and must be rejected without checkpointing/mutating
-    /// that base. An incremental apply proceeds only when sidecars are already trivial and the main
-    /// file still matches the recorded fingerprint exactly.
+    /// still pending push. Incremental still rejects those entries because a partial page patch
+    /// cannot rebase journaled SQL. ReplaceBase installs a complete snapshot, so pending statements
+    /// are replayed onto the new image before metadata publication. After that their remaining
+    /// safety requirements differ: ReplaceBase may checkpoint and discard fully-pushed local WAL
+    /// state before replacement; Incremental patches only selected pages, so any non-empty WAL
+    /// already proves that its main-file base is stale and must be rejected without
+    /// checkpointing/mutating that base.
     /// </summary>
     private static void EnsurePagesApplyIsSafe(
         string databasePath,
@@ -1350,11 +1384,11 @@ internal static class ManagedReplicaBootstrapper
         IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
         PullApplyMode applyMode)
     {
-        if (pendingLocalChanges.Count > 0)
+        if (pendingLocalChanges.Count > 0 && applyMode == PullApplyMode.Incremental)
         {
             throw new NotSupportedException(
-                "Managed embedded replica has local changes pending push; a page-based update has no way to "
-                + "reconcile them and was rejected. Push the pending local changes, then retry.");
+                "Managed embedded replica has local changes pending push; an incremental page-based update "
+                + "has no way to reconcile them and was rejected. Push the pending local changes, then retry.");
         }
 
         if (applyMode == PullApplyMode.Incremental)
@@ -1449,44 +1483,13 @@ internal static class ManagedReplicaBootstrapper
     ];
 
     /// <summary>
-    /// Rejects a non-empty logical apply outright while any local change journal entry is still a
-    /// pending, unpushed, EXISTING-object-modifying SCHEMA change (a DDL statement captured by
-    /// <c>ManagedReplicaConnectionHost</c>'s DDL hook), rather than silently ignoring it the way
-    /// <see cref="ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges"/> does for its own,
-    /// narrower row-reconciliation purpose.
+    /// Rejects a non-empty logical apply while a pending local schema change cannot be rebased.
+    /// Additive <c>ALTER TABLE ... ADD COLUMN</c> is always allowed: extra local columns are
+    /// ignored during remote table refresh and reapplied afterward. <c>CREATE</c> remains
+    /// allowed because it introduces an object the server cannot yet know.
     /// </summary>
-    /// <remarks>
-    /// Unlike a pending local ROW change (which the precollect/reapply flow safely rebases on top
-    /// of the new remote base), a pending local SCHEMA change that modifies or removes an object
-    /// the server already knows about has no reconciliation story: the remote's own schema
-    /// operations (a table Refresh or Drop) are generated against the state the SERVER believes
-    /// this client last had, which by definition does not include a change the server has not yet
-    /// received. Two concrete failure modes motivate rejecting outright instead of proceeding:
-    /// <list type="bullet">
-    /// <item>A remote Refresh's incoming CREATE TABLE text reflects the server's (older) shape.
-    /// Diffed against the LOCAL table shape (which already includes the unpushed local schema
-    /// change), the refresh can look permanently non-additive - e.g. a locally-added column looks
-    /// like the remote is asking to remove it - and would be rejected by the table-refresh guard
-    /// on EVERY subsequent sync, with no way to make progress until the user manually intervenes.</item>
-    /// <item>A remote Drop for the same table removes it entirely; replaying it while a local
-    /// schema change (and any local row changes precollected against the OLD shape) is still
-    /// pending can leave row reapply referencing a column set that no longer has a home.</item>
-    /// </list>
-    /// Rejecting here is a deliberate, conservative choice over attempting reconciliation: the
-    /// caller receives an explicit, clearly retryable reason and can push the pending local
-    /// changes (moving them out of the journal) before the next pull attempt, at which point this
-    /// check no longer applies and the pull proceeds normally.
-    /// </remarks>
-    /// <remarks>
-    /// A pending <c>CREATE</c> (table, index, trigger, or view) is deliberately NOT treated as
-    /// risky here and is allowed through unchecked: by definition it introduces a new object the
-    /// server cannot yet have any competing view of, so it cannot exhibit either failure mode
-    /// above the way an <c>ALTER</c>/<c>DROP</c>/<c>REINDEX</c>/<c>VACUUM</c> of an
-    /// already-shared object can. Excluding it also preserves the everyday "create a local table,
-    /// write some rows, then sync while a concurrent remote change lands" flow exercised by the
-    /// existing local-row precollect/reapply tests, none of which push before pulling.
-    /// </remarks>
-    private static void RejectIfLocalSchemaChangesArePending(IReadOnlyList<ReplicaLocalChange> pendingLocalChanges)
+    private static void RejectIfLocalSchemaChangesConflictWithRemoteChanges(
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges)
     {
         foreach (var change in pendingLocalChanges)
         {
@@ -1497,6 +1500,9 @@ internal static class ManagedReplicaBootstrapper
             {
                 continue;
             }
+
+            if (ManagedReplicaSchemaDdlText.TryParseAlterTableAddColumn(change.Sql) is not null)
+                continue;
 
             throw new NotSupportedException(
                 "Managed embedded replica has a local schema change pending push; a logical pull with "
