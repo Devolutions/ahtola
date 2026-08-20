@@ -858,6 +858,109 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public async Task PendingTextPrimaryKeyDeleteRejectsBeforeARecycledRowidCanDeleteARemoteInsert()
+    {
+        var path = NewReplicaPath("managed-replica-logical-pending-delete-identity");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_queue(id INTEGER PRIMARY KEY, value TEXT);");
+                source.ExecuteNonQuery("CREATE TABLE items(id TEXT PRIMARY KEY, value TEXT);");
+                source.ExecuteNonQuery("INSERT INTO items VALUES ('a', 'va'), ('b', 'vb');");
+            }
+
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var (logicalBody, rangeMessage) = BuildLogicalPullBody(
+            tableName: "items",
+            rowId: 2,
+            rowValues: [SqlValue.Text("c"), SqlValue.Text("vc")],
+            schemaSql: "CREATE TABLE items(id TEXT PRIMARY KEY, value TEXT)",
+            salt: 904UL);
+
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            // The first change is pushed by the threshold-1 batch. The trailing delete remains
+            // pending while the pull attempts to insert a DIFFERENT key at the deleted row's old
+            // rowid (2), exactly the collision that made rowid-only delete replay unsafe.
+            connection.ExecuteNonQuery("INSERT INTO local_queue VALUES (1, 'pushed-first');");
+            connection.ExecuteNonQuery("DELETE FROM items WHERE id = 'b';");
+
+            using (var rowidCommand = connection.CreateCommand())
+            {
+                rowidCommand.CommandText = "SELECT rowid FROM items WHERE id = 'a';";
+                Convert.ToInt64(rowidCommand.ExecuteScalar()).Should().Be(1);
+            }
+
+            Func<Task> firstSync = () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            await firstSync.Should().ThrowAsync<NotSupportedException>()
+                .WithMessage("*pending local delete*schema does not prove rowid*Push*retry*");
+
+            handler.PushCallCount.Should().Be(1);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
+                .Should().ContainSingle(change =>
+                    change.Kind == ReplicaLocalChangeKind.Row
+                    && change.Operation == SqliteChangeOperation.Delete
+                    && change.Table == "items"
+                    && change.RowId == 2);
+
+            using (var failedApplyCommand = connection.CreateCommand())
+            {
+                failedApplyCommand.CommandText = "SELECT group_concat(id, ',') FROM items ORDER BY id;";
+                failedApplyCommand.ExecuteScalar().Should().Be("a",
+                    "the pull must reject before remote key c can be installed and then accidentally deleted");
+            }
+
+            // The next sync pushes the delete first. With no residual unsafe delete to reapply,
+            // the identical remote response can now install c; SQLite reuses freed rowid 2, and c
+            // must survive because no rowid-only local delete replay runs afterward.
+            var retry = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            retry.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            handler.PushCallCount.Should().Be(2);
+
+            using var appliedCommand = connection.CreateCommand();
+            appliedCommand.CommandText = "SELECT id || ':' || value || ':' || rowid FROM items ORDER BY id;";
+            using var reader = appliedCommand.ExecuteReader();
+            var rows = new List<string>();
+            while (reader.Read())
+                rows.Add(reader.GetString(0));
+            rows.Should().Equal("a:va:1", "c:vc:2");
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().BeEmpty();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public async Task PendingLocalSchemaChangeRejectsALogicalPullUntilItIsPushedThenMakesProgress()
     {
         // More local changes than PushOperationsThreshold (1), the last of which is a SCHEMA
@@ -1289,6 +1392,120 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public async Task ProtocolTwoPagesReplaceBaseAfterAFullyPushedWalWriteSucceedsAndRetainsLogicalProtocol()
+    {
+        var path = NewReplicaPath("managed-replica-replace-base-pushed-wal");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var replacedImage = CreateDatabaseImageWithMarker(path + ".replaced", 84);
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateReplaceBasePullResponse("revision-43", replacedImage),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using (var local = AhtolaConnection.CreateReplica(options))
+            {
+                local.Open();
+                local.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 43;");
+            }
+
+            StageCommittedMainFileChangesInWal(path, initialImage);
+
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().ContainSingle();
+            File.Exists(path + "-wal").Should().BeTrue();
+            new FileInfo(path + "-wal").Length.Should().BeGreaterThan(32,
+                "the local write must still be represented by real WAL frames before synchronization");
+
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+            ReadBootstrapMarker(connection).Should().Be(43);
+
+            // The push drains the only journal entry. ReplaceBase is then allowed to checkpoint
+            // and clean that fully-pushed WAL before atomically installing the complete snapshot;
+            // it must not compare the post-checkpoint main file with the pre-checkpoint metadata
+            // fingerprint because the replacement does not depend on those old bytes.
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            handler.PushCallCount.Should().Be(1);
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().BeEmpty();
+            ReadBootstrapMarker(connection).Should().Be(84);
+
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            metadata.Revision.Should().Be("revision-43");
+            metadata.Protocol.Should().Be(RemotePullProtocol.MvccLogical);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ProtocolTwoIncrementalPagesRejectsAFullyPushedWalWriteWithoutAdvancing()
+    {
+        var path = NewReplicaPath("managed-replica-incremental-pushed-wal");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var incrementedImage = CreateDatabaseImageWithMarker(path + ".incremented", 84);
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using (var local = AhtolaConnection.CreateReplica(options))
+            {
+                local.Open();
+                local.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 43;");
+            }
+
+            StageCommittedMainFileChangesInWal(path, initialImage);
+
+            var walPath = path + "-wal";
+            File.Exists(walPath).Should().BeTrue();
+            var walLengthBeforeSync = new FileInfo(walPath).Length;
+            walLengthBeforeSync.Should().BeGreaterThan(32);
+
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                ReadBootstrapMarker(connection).Should().Be(43);
+
+                Func<Task> sync = () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+                await sync.Should().ThrowAsync<NotSupportedException>()
+                    .WithMessage("*local divergence*incremental pull*");
+
+                ReadBootstrapMarker(connection).Should().Be(43);
+            }
+
+            // The push succeeded, so the journal is empty, but an incremental page patch cannot
+            // prove that its page set was generated from the locally changed WAL base. Reject
+            // without checkpointing that WAL, installing pages, or advancing the resume token.
+            handler.PushCallCount.Should().Be(1);
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+            File.ReadAllBytes(path).Should().Equal(initialImage,
+                "an unsafe incremental fallback must not checkpoint the local WAL into its page base");
+            File.Exists(walPath).Should().BeTrue();
+            new FileInfo(walPath).Length.Should().Be(walLengthBeforeSync);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public async Task ProtocolTwoPagesReplaceBaseAppliesAFullAtomicReplacementAndRetainsLogicalProtocol()
     {
         var path = NewReplicaPath("managed-replica-logical-replace-base");
@@ -1455,12 +1672,25 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         string columnValue,
         string schemaSql,
         ulong salt = 12345UL)
+        => BuildLogicalPullBody(
+            tableName,
+            rowId,
+            [SqlValue.Null, SqlValue.Text(columnValue)],
+            schemaSql,
+            salt);
+
+    private static (byte[] Body, byte[] RangeMessage) BuildLogicalPullBody(
+        string tableName,
+        long rowId,
+        IReadOnlyList<SqlValue> rowValues,
+        string schemaSql,
+        ulong salt)
     {
         var logHeader = Lml3TestBuilder.BuildHeader(salt);
         var crc = Lml3TestBuilder.HeaderSeedCrc(salt);
         var schemaRecord = Lml3TestBuilder.SchemaRecord("table", tableName, 5, schemaSql);
         var schemaOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -1, Lml3TestBuilder.UpsertTablePayload(1, schemaRecord));
-        var rowRecord = Core.Storage.SqliteRecordCodec.Encode([Core.SqlValue.Null, Core.SqlValue.Text(columnValue)]);
+        var rowRecord = Core.Storage.SqliteRecordCodec.Encode(rowValues);
         var rowOp = Lml3TestBuilder.BuildRecoveryOp(0, 0, -2, Lml3TestBuilder.UpsertTablePayload(rowId, rowRecord));
         var recoveryPayload = schemaOp.Concat(rowOp).ToArray();
         var portableTxn = Lml3TestBuilder.BuildPortableLogicalTxn(1, 1, [tableName], [(-2, 0)]);
@@ -1515,10 +1745,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     private static byte[] CreateReplaceBasePullResponse(string revision, byte[] databaseImage, ulong protocol = 2)
-        // CreatePullResponse already hard-codes apply_mode (tag 6) to 1 (ReplaceBase), matching
-        // every other page-stream fixture in this file; this wrapper just names that intent for
-        // the ReplaceBase-specific test below.
-        => CreatePullResponse(revision, databaseImage, protocol: protocol);
+        => CreatePullResponse(revision, databaseImage, protocol: protocol, applyMode: 1);
 
     [Test]
     public async Task ManagedReplicaAcceptsRawLegacyAndV1PageStreams()
@@ -2799,6 +3026,49 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         finally { DeleteReplicaFiles(path); }
     }
 
+    /// <summary>
+    /// Re-expresses changes already committed into <paramref name="path"/>'s main file as a
+    /// committed WAL transaction over <paramref name="baseImage"/>. This creates the exact durable
+    /// shape needed by page-fallback tests: the journal still describes a real local SQL write,
+    /// the main file remains the metadata-recorded pre-write base, and readers observe the local
+    /// write through valid committed WAL frames until a checkpoint occurs.
+    /// </summary>
+    private static void StageCommittedMainFileChangesInWal(string path, byte[] baseImage)
+    {
+        var committedImage = File.ReadAllBytes(path);
+        committedImage.Length.Should().BeGreaterThan(0);
+        (committedImage.Length % 4096).Should().Be(0);
+        (baseImage.Length % 4096).Should().Be(0);
+
+        foreach (var suffix in new[] { "-wal", "-shm", "-journal" })
+        {
+            var sidecar = path + suffix;
+            if (File.Exists(sidecar))
+                File.Delete(sidecar);
+        }
+
+        File.WriteAllBytes(path, baseImage);
+        using var pager = Core.Storage.SqlitePager.Open(
+            Core.Storage.PhysicalFileSystem.Instance,
+            path,
+            path + "-wal");
+        using var transaction = pager.BeginTransaction(
+            targetDatabaseSizeInPages: checked((uint)(committedImage.Length / 4096)));
+        for (var offset = 0; offset < committedImage.Length; offset += 4096)
+        {
+            var committedPage = committedImage.AsSpan(offset, 4096);
+            var basePage = offset < baseImage.Length
+                ? baseImage.AsSpan(offset, 4096)
+                : ReadOnlySpan<byte>.Empty;
+            if (committedPage.SequenceEqual(basePage))
+                continue;
+
+            transaction.WritePage(checked((uint)(offset / 4096 + 1)), committedPage);
+        }
+
+        transaction.Commit();
+    }
+
     private static byte[] CreateJournalDatabaseImage(string path)
     {
         try { CreateJournalDatabase(path); return File.ReadAllBytes(path); }
@@ -2895,7 +3165,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         ulong streamKind = 0,
         ulong? declaredPages = null,
         bool omitDefaultPageId = true,
-        ulong? protocol = 1)
+        ulong? protocol = 1,
+        ulong applyMode = 1)
     {
         var header = new List<byte>();
         WriteLengthDelimitedField(header, 1, Encoding.UTF8.GetBytes(revision));
@@ -2905,7 +3176,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         else
             WriteLengthDelimitedField(header, 4, []);
         WriteVarintField(header, 5, streamKind);
-        WriteVarintField(header, 6, 1);
+        WriteVarintField(header, 6, applyMode);
         if (protocol is { } protocolValue)
             WriteVarintField(header, 8, protocolValue);
 

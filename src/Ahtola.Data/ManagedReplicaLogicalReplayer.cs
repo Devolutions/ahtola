@@ -95,8 +95,9 @@ internal readonly record struct ManagedReplicaLogicalApplyResult(
 /// One locally pending row change, captured (or marked for deletion) before a remote logical
 /// pull's apply transaction begins, so it can be reapplied afterward on top of the new remote
 /// base. <see cref="CapturedValues"/> is the row's current column values (only set when
-/// <see cref="IsDelete"/> is <see langword="false"/>); reapplying uses <see cref="RowId"/> for
-/// identity exactly like a wire-format row operation.
+/// <see cref="IsDelete"/> is <see langword="false"/>). A delete is captured only when the table's
+/// schema proves rowid is its stable identity (no declared primary key, or a genuine rowid-alias
+/// primary key); otherwise capture fails closed before the remote apply can mutate anything.
 /// </summary>
 internal readonly record struct ManagedReplicaCapturedLocalRowChange(
     string TableName,
@@ -202,6 +203,7 @@ internal static class ManagedReplicaLogicalReplayer
         {
             if (isFinalOpDeleteByKey[key])
             {
+                EnsurePendingLocalDeleteHasStableRowidIdentity(connection, key.Table);
                 captured.Add(new ManagedReplicaCapturedLocalRowChange(key.Table, key.RowId, true, null));
                 continue;
             }
@@ -279,26 +281,44 @@ internal static class ManagedReplicaLogicalReplayer
     }
 
     /// <summary>
-    /// Deletes a row by its authoritative LOCAL rowid, for reconciling a pending local delete
-    /// that was captured (see <see cref="CapturePendingLocalRowChanges"/>) before a remote pull.
-    /// This deliberately does not reuse <see cref="ReplayRowDelete"/>'s wire-format "empty key
-    /// projection" path: that path refuses a rowid-based delete whenever the table's PRIMARY KEY
-    /// is not the rowid alias, because for a REMOTE-origin delete the remote's rowid might not
-    /// match this replica's rowid for the same logical row. Neither caveat applies here: the
-    /// rowid was read directly off this replica's own row at capture time, so it is always the
-    /// correct, unambiguous identity for the row this replica itself deleted locally, regardless
-    /// of whether the table's declared PRIMARY KEY happens to alias the rowid.
+    /// Verifies that rowid is the table's stable logical identity before retaining a pending local
+    /// delete for post-pull replay. A non-rowid-alias primary key makes the deleted row's old rowid
+    /// unsafe: the remote apply can insert a different primary key and SQLite may reuse that freed
+    /// rowid, causing replay-by-rowid to delete the newly inserted remote row. The change journal
+    /// does not persist the deleted row's old primary-key projection, so this case must wait until
+    /// the delete is pushed and acknowledged instead of guessing.
+    /// </summary>
+    private static void EnsurePendingLocalDeleteHasStableRowidIdentity(
+        IManagedConnectionAdapter connection,
+        string tableName)
+    {
+        var info = GetTableColumnsInfo(connection, tableName);
+        var hasStableRowidIdentity = info.ColumnNames.Count > 0
+            && !info.IsWithoutRowId
+            && info.RowidReferenceName is not null
+            && (info.PkColumnIndices.Count == 0 || info.RowidAliasColumnIndex is not null);
+        if (!hasStableRowidIdentity)
+        {
+            throw new NotSupportedException(
+                $"Managed embedded replica has a pending local delete for table '{tableName}' whose "
+                + "schema does not prove rowid is its stable identity (for example, its declared "
+                + "primary key is not a rowid alias). Push the pending delete, then retry the logical "
+                + "pull; replaying it by the deleted row's old rowid could remove an unrelated remote "
+                + "row that reused that rowid.");
+        }
+    }
+
+    /// <summary>
+    /// Replays a pending local delete by rowid after
+    /// <see cref="EnsurePendingLocalDeleteHasStableRowidIdentity"/> proved that rowid is this
+    /// table's stable logical identity.
     /// </summary>
     private static void ReplayPendingLocalRowDelete(IManagedConnectionAdapter connection, string tableName, long rowId)
     {
         var info = GetTableColumnsInfo(connection, tableName);
-        if (info.IsWithoutRowId || info.RowidReferenceName is not { } rowidReference)
-        {
-            // No true rowid to delete by (WITHOUT ROWID has none; the vanishingly rare case of
-            // all three special names being shadowed leaves it unreachable). Nothing safe to do.
-            return;
-        }
-
+        var rowidReference = info.RowidReferenceName
+            ?? throw new InvalidDataException(
+                $"Cannot reference table '{tableName}''s rowid for pending local delete.");
         using var statement = connection.Prepare(
             $"DELETE FROM {QuoteIdentifier(tableName)} WHERE {QuoteIdentifier(rowidReference)} = ?");
         statement.Bind(1, SqlValue.Integer(rowId));

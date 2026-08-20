@@ -423,11 +423,11 @@ internal static class ManagedReplicaBootstrapper
         // expected to keep living in the WAL between syncs (tracked by the change journal,
         // reconciled by precollect/reapply for LOGICAL responses) -- but a raw page-based apply
         // has no such reconciliation mechanism at all, so this surprise combination needs its
-        // OWN, stricter guard: reject outright if local changes are still pending push, and
-        // otherwise safely checkpoint ordinary (already fully pushed) WAL activity before the
-        // byte-level divergence check, rather than treat it as instant unmanaged divergence.
+        // OWN, apply-mode-aware guard: both modes reject pending changes; ReplaceBase may
+        // checkpoint fully-pushed WAL state because it installs every page, while Incremental
+        // requires the existing main-file base to still match without checkpointing it first.
         if (requestLogical)
-            EnsurePagesApplyIsSafe(options.Path, metadata, pendingLocalChanges);
+            EnsurePagesApplyIsSafe(options.Path, metadata, pendingLocalChanges, header.ApplyMode);
 
         await ApplyIncrementalPagesAsync(options, header, pages, metadata.ClientId, effectiveToken).ConfigureAwait(false);
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
@@ -1332,15 +1332,19 @@ internal static class ManagedReplicaBootstrapper
     /// even when the remembered protocol is MvccLogical: a protocol-2 remote can still answer any
     /// given pull with raw pages (e.g. after its logical log has been garbage-collected, or for a
     /// ReplaceBase). A raw page-based apply has no mechanism to reconcile local writes the way the
-    /// logical path's precollect/reapply does, so it rejects outright when local changes are still
-    /// pending push, and otherwise safely checkpoints ordinary (already fully pushed) local WAL
-    /// activity before the byte-level divergence check, rather than treat a live-but-fully-pushed
-    /// WAL as instant unmanaged divergence the way a naive check would.
+    /// logical path's precollect/reapply does, so both modes reject outright when local changes are
+    /// still pending push. After that their safety requirements differ: ReplaceBase installs a
+    /// complete validated snapshot, so it may checkpoint and discard fully-pushed local WAL state
+    /// before replacement; Incremental patches only selected pages, so any non-empty WAL already
+    /// proves that its main-file base is stale and must be rejected without checkpointing/mutating
+    /// that base. An incremental apply proceeds only when sidecars are already trivial and the main
+    /// file still matches the recorded fingerprint exactly.
     /// </summary>
     private static void EnsurePagesApplyIsSafe(
         string databasePath,
         ManagedReplicaMetadata metadata,
-        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges)
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+        PullApplyMode applyMode)
     {
         if (pendingLocalChanges.Count > 0)
         {
@@ -1349,27 +1353,49 @@ internal static class ManagedReplicaBootstrapper
                 + "reconcile them and was rejected. Push the pending local changes, then retry.");
         }
 
-        TryCheckpointSidecarsBeforePagesApply(databasePath);
-        CheckFileDivergence(databasePath, metadata);
+        if (applyMode == PullApplyMode.Incremental)
+        {
+            CheckFileDivergence(databasePath, metadata);
+            DeleteStagingSidecars(databasePath);
+            return;
+        }
+
+        CheckpointAndCleanSidecarsBeforePagesApply(databasePath);
     }
 
-    private static void TryCheckpointSidecarsBeforePagesApply(string databasePath)
+    private static void CheckpointAndCleanSidecarsBeforePagesApply(string databasePath)
     {
-        if (!File.Exists(databasePath + "-wal") && !File.Exists(databasePath + "-journal"))
+        if (!DatabaseSidecarSuffixes.Any(suffix => File.Exists(databasePath + suffix)))
             return;
 
-        try
+        using (var pager = Ahtola.Core.Storage.SqlitePager.Open(
+                   Ahtola.Core.Storage.PhysicalFileSystem.Instance,
+                   databasePath,
+                   databasePath + "-wal"))
         {
-            using var database = ManagedDatabaseAdapter.Open(databasePath);
-            var connection = database.Connect();
-            ExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+            var checkpoint = pager.CheckpointToMainStoreAndResetWal();
+            if (checkpoint.RetainedCommittedFrameCount != 0)
+            {
+                throw new NotSupportedException(
+                    "Managed embedded replica could not reset all fully-pushed WAL frames before "
+                    + "applying a page-based replacement.");
+            }
         }
-        catch
+
+        // A successful durable checkpoint-and-reset leaves no frames beyond the 32-byte WAL
+        // header and no rollback journal content. Anything else means the base is still carrying
+        // live local state and must not be replaced or patched. Once proven clean, delete every
+        // sidecar while publication still holds exclusive ownership so the newly installed
+        // database cannot be paired with stale WAL-index state.
+        if ((File.Exists(databasePath + "-wal") && new FileInfo(databasePath + "-wal").Length > 32)
+            || (File.Exists(databasePath + "-journal") && new FileInfo(databasePath + "-journal").Length > 0))
         {
-            // Best effort: a failed checkpoint here still leaves a non-trivial WAL/journal,
-            // which CheckFileDivergence immediately below correctly rejects on its own terms
-            // (it is not silently accepting an inconsistent file either way).
+            throw new NotSupportedException(
+                "Managed embedded replica could not checkpoint all fully-pushed local state before "
+                + "applying a page-based update; retry after readers and transactions are quiescent.");
         }
+
+        DeleteStagingSidecars(databasePath);
     }
 
     private static void CheckFileDivergence(string databasePath, ManagedReplicaMetadata metadata)

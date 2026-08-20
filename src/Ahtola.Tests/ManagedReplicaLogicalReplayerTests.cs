@@ -877,30 +877,26 @@ public sealed class ManagedReplicaLogicalReplayerTests
     }
 
     [Test]
-    public void ReplayPendingLocalRowChangesDeletesByAuthoritativeRowidOnATextPrimaryKeyTable()
+    public void CapturePendingLocalRowChangesRejectsATextPrimaryKeyDeleteWhoseRowidCanBeRecycled()
     {
-        // A declared non-alias (TEXT) PRIMARY KEY: the wire-format empty-key delete path would
-        // refuse a rowid-based delete here (the remote's rowid might not match this replica's),
-        // but a PENDING LOCAL delete's captured rowid is always this replica's own, authoritative
-        // rowid and must be used directly rather than routed through that refusal.
+        // A declared non-alias (TEXT) PRIMARY KEY: after deleting row "b" at rowid 2, a remote
+        // insert of a different key "c" can reuse rowid 2. Retaining only the deleted rowid would
+        // make post-pull reconciliation delete "c", so capture must fail closed before mutation
+        // and wait until the pending delete has been pushed.
         using var connection = OpenConnection();
         Exec(connection, "CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)");
-        Exec(connection, "INSERT INTO t VALUES ('k1', 'v1')");
-        var localRowId = Scalar(connection, "SELECT rowid FROM t WHERE x = 'k1'").AsInteger();
-        Exec(connection, "DELETE FROM t WHERE x = 'k1'");
+        Exec(connection, "INSERT INTO t VALUES ('a', 'va'), ('b', 'vb')");
+        var localRowId = Scalar(connection, "SELECT rowid FROM t WHERE x = 'b'").AsInteger();
+        localRowId.Should().Be(2);
+        Exec(connection, "DELETE FROM t WHERE x = 'b'");
 
         var pending = new[] { ReplicaLocalChange.Row(SqliteChangeOperation.Delete, "main", "t", localRowId) };
-        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+        Action act = () => ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
 
-        // Simulate the remote pull resurrecting the same key at the same local rowid (e.g. the
-        // remote had not yet observed this replica's delete): reconciliation must not throw and
-        // must remove it again, using the authoritative captured rowid rather than the
-        // wire-format empty-key refusal path.
-        Exec(connection, $"INSERT INTO t(rowid, x, y) VALUES ({localRowId}, 'k1', 'v1')");
-
-        Action act = () => ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(connection, captured, CancellationToken.None);
-        act.Should().NotThrow();
-        RowCount(connection, "t").Should().Be(0);
+        act.Should().Throw<NotSupportedException>()
+            .WithMessage("*pending local delete*schema does not prove rowid*Push*retry*");
+        Scalar(connection, "SELECT COUNT(*) FROM t WHERE x = 'a'").AsInteger().Should().Be(1);
+        Scalar(connection, "SELECT COUNT(*) FROM t WHERE x = 'b'").AsInteger().Should().Be(0);
     }
 
     [Test]
