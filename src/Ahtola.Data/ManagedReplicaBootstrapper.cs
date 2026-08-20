@@ -1135,10 +1135,14 @@ internal static class ManagedReplicaBootstrapper
             }
         }
 
-        if (generation is null || startOffset is null || endOffset is null)
-            throw new InvalidDataException("The MVCC logical-log range is missing required fields.");
-
-        return new ManagedReplicaLogicalLogRange(generation.Value, startOffset.Value, endOffset.Value, startsWithHeader, crcSeed);
+        // generation, start_offset and end_offset are non-optional proto3 scalars, so the server omits them at
+        // zero. A first range starts at offset 0 and carries no tag 2 at all.
+        return new ManagedReplicaLogicalLogRange(
+            generation ?? 0,
+            startOffset ?? 0,
+            endOffset ?? 0,
+            startsWithHeader,
+            crcSeed);
     }
 
     private static PullPage ParsePage(byte[] payload)
