@@ -153,4 +153,42 @@ public sealed class ManagedReplicaSchemaDdlTextTests
     {
         ManagedReplicaSchemaDdlText.TryGetCreateTableShape("CREATE TABLE t AS SELECT 1").Should().BeNull();
     }
+
+    [Test]
+    public void IsColumnLevelPrimaryKeyDescendingDetectsTheBareForm()
+    {
+        ManagedReplicaSchemaDdlText.IsColumnLevelPrimaryKeyDescending("id INTEGER PRIMARY KEY DESC").Should().BeTrue();
+    }
+
+    [Test]
+    public void IsColumnLevelPrimaryKeyDescendingIsFalseForAscOrUnspecified()
+    {
+        ManagedReplicaSchemaDdlText.IsColumnLevelPrimaryKeyDescending("id INTEGER PRIMARY KEY ASC").Should().BeFalse();
+        ManagedReplicaSchemaDdlText.IsColumnLevelPrimaryKeyDescending("id INTEGER PRIMARY KEY").Should().BeFalse();
+    }
+
+    [Test]
+    public void IsColumnLevelPrimaryKeyDescendingIsFalseWhenThereIsNoPrimaryKeyAtAll()
+    {
+        ManagedReplicaSchemaDdlText.IsColumnLevelPrimaryKeyDescending("id INTEGER").Should().BeFalse();
+    }
+
+    [Test]
+    public void IsColumnLevelPrimaryKeyDescendingIgnoresDescInsideAQuotedDefaultValue()
+    {
+        ManagedReplicaSchemaDdlText.IsColumnLevelPrimaryKeyDescending(
+            "id INTEGER PRIMARY KEY DEFAULT 'PRIMARY KEY DESC'").Should().BeFalse();
+    }
+
+    [Test]
+    public void TryGetCreateTableShapeExposesTheColumnLevelDescConstraintOnItsOwnColumn()
+    {
+        var shape = ManagedReplicaSchemaDdlText.TryGetCreateTableShape(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY DESC, name TEXT)");
+
+        shape.Should().NotBeNull();
+        var idColumn = shape!.Value.Columns.Single(c => c.Name == "id");
+        ManagedReplicaSchemaDdlText.IsColumnLevelPrimaryKeyDescending(idColumn.Definition).Should().BeTrue();
+        shape.Value.TableConstraints.Should().BeEmpty();
+    }
 }

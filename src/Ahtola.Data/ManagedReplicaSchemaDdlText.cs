@@ -211,6 +211,38 @@ internal static class ManagedReplicaSchemaDdlText
         return false;
     }
 
+    /// <summary>
+    /// Detects SQLite's documented "INTEGER PRIMARY KEY DESC" rowid-alias exception: a
+    /// COLUMN-level <c>PRIMARY KEY</c> constraint immediately followed by <c>DESC</c> does
+    /// <i>not</i> alias the rowid (unlike <c>ASC</c>/unspecified, and unlike the equivalent
+    /// table-level <c>PRIMARY KEY(col DESC)</c> form, which still aliases regardless of
+    /// direction). <paramref name="columnDefinitionText"/> must be a single column's own
+    /// definition text (e.g. from <see cref="TableShape.Columns"/>), not a table constraint or
+    /// the whole statement, since this only scans for a bare (unparenthesized) PRIMARY KEY
+    /// clause. See sqlite.org/lang_createtable.html#rowid.
+    /// </summary>
+    public static bool IsColumnLevelPrimaryKeyDescending(string columnDefinitionText)
+    {
+        ArgumentNullException.ThrowIfNull(columnDefinitionText);
+        var index = 0;
+        while (index < columnDefinitionText.Length)
+        {
+            var precededByWordChar = index > 0
+                && (char.IsLetterOrDigit(columnDefinitionText[index - 1]) || columnDefinitionText[index - 1] == '_');
+            if (!precededByWordChar)
+            {
+                var probe = index;
+                if (MatchKeyword(columnDefinitionText, ref probe, "PRIMARY") && MatchKeyword(columnDefinitionText, ref probe, "KEY"))
+                    return MatchKeyword(columnDefinitionText, ref probe, "DESC");
+            }
+
+            var (consumed, _) = ClassifyAt(columnDefinitionText, index, columnDefinitionText.Length);
+            index += Math.Max(1, consumed);
+        }
+
+        return false;
+    }
+
     private static bool MatchKeyword(string sql, ref int index, string keyword)
     {
         var start = SkipTrivia(sql, index);

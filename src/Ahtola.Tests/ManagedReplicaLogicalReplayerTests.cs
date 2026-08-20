@@ -357,18 +357,39 @@ public sealed class ManagedReplicaLogicalReplayerTests
     }
 
     [Test]
-    public void IntegerPrimaryKeyDescStillCountsAsTheRowidAlias()
+    public void ColumnLevelIntegerPrimaryKeyDescIsNotARowidAlias()
     {
-        // SQLite's rowid-alias rule keys only on column count (1) and declared type text
-        // ("INTEGER"), never on ASC/DESC sort direction.
+        // SQLite's documented quirk (sqlite.org/lang_createtable.html#rowid): a COLUMN-level
+        // "PRIMARY KEY DESC" constraint does NOT alias the rowid (unlike ASC/unspecified, and
+        // unlike the equivalent table-level "PRIMARY KEY(id DESC)" form, which still does). The
+        // decoded record's own id value must be used as-is, never overwritten by the wire rowid.
         using var connection = OpenConnection();
         Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY DESC, name TEXT)");
+
+        var record = SqliteRecordCodecTestHelper.EncodeRow(SqlValue.Integer(99), SqlValue.Text("alice"));
+        var txn = SingleOpTxn(RowOp(ManagedReplicaLogicalOpType.UpsertRow, "t", rowId: 5, record));
+        Apply(connection, [txn]);
+
+        Scalar(connection, "SELECT id FROM t").AsInteger().Should().Be(
+            99, "id is not a rowid alias for the column-level DESC form, so its decoded value must not be overwritten by the wire rowid");
+    }
+
+    [Test]
+    public void TableLevelPrimaryKeyDescStillCountsAsTheRowidAlias()
+    {
+        // The table-constraint form PRIMARY KEY(id DESC) is NOT subject to the column-level
+        // DESC exception and still aliases the rowid, per SQLite's documented behavior: only
+        // three example declarations lose the alias, and PRIMARY KEY(x DESC) as a table
+        // constraint is explicitly NOT one of them.
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER, name TEXT, PRIMARY KEY(id DESC))");
 
         var record = SqliteRecordCodecTestHelper.EncodeRow(SqlValue.Null, SqlValue.Text("alice"));
         var txn = SingleOpTxn(RowOp(ManagedReplicaLogicalOpType.UpsertRow, "t", rowId: 5, record));
         Apply(connection, [txn]);
 
-        Scalar(connection, "SELECT id FROM t").AsInteger().Should().Be(5);
+        Scalar(connection, "SELECT id FROM t").AsInteger().Should().Be(
+            5, "PRIMARY KEY(id DESC) as a table constraint still aliases the rowid");
     }
 
     [Test]
@@ -478,6 +499,43 @@ public sealed class ManagedReplicaLogicalReplayerTests
 
         Scalar(connection, "PRAGMA user_version").AsInteger().Should().Be(-1);
         Scalar(connection, "PRAGMA application_id").AsInteger().Should().Be(int.MinValue);
+    }
+
+    [Test]
+    public void HeaderUpdateReplaysNegativeValuesCorrectlyUnderANonInvariantCulture()
+    {
+        // sv-SE formats a negative number's sign as U+2212 (MINUS SIGN) rather than ASCII
+        // U+002D (HYPHEN-MINUS) under default ToString()/interpolation formatting. The emitted
+        // PRAGMA text must use the invariant culture explicitly, or this would produce invalid
+        // SQL syntax for a negative user_version/application_id.
+        var previousCulture = System.Globalization.CultureInfo.CurrentCulture;
+        System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("sv-SE");
+        try
+        {
+            using var connection = OpenConnection();
+            var txn = SingleOpTxn(new ManagedReplicaLogicalOp(
+                ManagedReplicaLogicalOpType.UpdateHeader,
+                TableName: string.Empty,
+                RowId: 0,
+                Record: [],
+                Sql: string.Empty,
+                UserVersion: -1,
+                ApplicationId: -42,
+                SchemaAction: null,
+                SchemaKind: null,
+                SchemaName: string.Empty,
+                StableTableId: 0));
+
+            Action act = () => Apply(connection, [txn]);
+            act.Should().NotThrow();
+
+            Scalar(connection, "PRAGMA user_version").AsInteger().Should().Be(-1);
+            Scalar(connection, "PRAGMA application_id").AsInteger().Should().Be(-42);
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = previousCulture;
+        }
     }
 
     [Test]
@@ -816,6 +874,68 @@ public sealed class ManagedReplicaLogicalReplayerTests
 
         Scalar(connection, "SELECT x FROM local_items WHERE id = 1").AsText().Should().Be("local");
         Scalar(connection, "SELECT x FROM remote_items WHERE id = 2").AsText().Should().Be("remote");
+    }
+
+    [Test]
+    public void ReplayPendingLocalRowChangesDeletesByAuthoritativeRowidOnATextPrimaryKeyTable()
+    {
+        // A declared non-alias (TEXT) PRIMARY KEY: the wire-format empty-key delete path would
+        // refuse a rowid-based delete here (the remote's rowid might not match this replica's),
+        // but a PENDING LOCAL delete's captured rowid is always this replica's own, authoritative
+        // rowid and must be used directly rather than routed through that refusal.
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)");
+        Exec(connection, "INSERT INTO t VALUES ('k1', 'v1')");
+        var localRowId = Scalar(connection, "SELECT rowid FROM t WHERE x = 'k1'").AsInteger();
+        Exec(connection, "DELETE FROM t WHERE x = 'k1'");
+
+        var pending = new[] { ReplicaLocalChange.Row(SqliteChangeOperation.Delete, "main", "t", localRowId) };
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        // Simulate the remote pull resurrecting the same key at the same local rowid (e.g. the
+        // remote had not yet observed this replica's delete): reconciliation must not throw and
+        // must remove it again, using the authoritative captured rowid rather than the
+        // wire-format empty-key refusal path.
+        Exec(connection, $"INSERT INTO t(rowid, x, y) VALUES ({localRowId}, 'k1', 'v1')");
+
+        Action act = () => ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(connection, captured, CancellationToken.None);
+        act.Should().NotThrow();
+        RowCount(connection, "t").Should().Be(0);
+    }
+
+    [Test]
+    public void ReplayPendingLocalRowChangesSkipsReconciliationWhenTheRemoteDroppedTheTable()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)");
+        Exec(connection, "INSERT INTO t VALUES (1, 'local-value')");
+
+        var pending = new[] { ReplicaLocalChange.Row(SqliteChangeOperation.Insert, "main", "t", 1) };
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        // Simulate the remote transaction dropping the table entirely.
+        Exec(connection, "DROP TABLE t");
+
+        Action act = () => ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(connection, captured, CancellationToken.None);
+        act.Should().NotThrow("reconciliation must skip a captured change whose table no longer exists, not abort the whole apply");
+        TableExists(connection, "t").Should().BeFalse();
+    }
+
+    [Test]
+    public void ReplayPendingLocalRowChangesSkipsADeleteReconciliationWhenTheRemoteDroppedTheTable()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)");
+        Exec(connection, "INSERT INTO t VALUES (1, 'local-value')");
+        Exec(connection, "DELETE FROM t WHERE id = 1");
+
+        var pending = new[] { ReplicaLocalChange.Row(SqliteChangeOperation.Delete, "main", "t", 1) };
+        var captured = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(connection, pending);
+
+        Exec(connection, "DROP TABLE t");
+
+        Action act = () => ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(connection, captured, CancellationToken.None);
+        act.Should().NotThrow();
     }
 
     // --- helpers ---

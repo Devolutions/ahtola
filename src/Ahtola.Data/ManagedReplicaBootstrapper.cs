@@ -329,9 +329,24 @@ internal static class ManagedReplicaBootstrapper
     {
         ArgumentNullException.ThrowIfNull(pendingLocalChanges);
         ManagedReplicaSupportMatrix.ValidateOptions(options);
-        EnsureNoLocalDivergence(options.Path, metadata);
-        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pulling));
         var requestLogical = metadata.Protocol == RemotePullProtocol.MvccLogical;
+        if (!requestLogical)
+        {
+            // A non-logical (page) protocol client can only ever receive a Pages response for
+            // any given pull, so this is known upfront and the guard can (and should) run before
+            // spending a network round-trip on a request that would have to be rejected anyway.
+            // This is the ORIGINAL, unconditional file-level check only (no pendingLocalChanges
+            // rejection): a page-protocol replica has never reconciled local writes via the pull
+            // path, so it has always tolerated unrelated journal-tracked pending push entries as
+            // long as the file itself has not diverged, and that historical behavior is
+            // preserved exactly here. A logical-protocol client cannot be checked here: its
+            // response might turn out to be a Pages stream too (see the equivalent, STRICTER
+            // check further down, after the actual stream kind of THIS response is known), or it
+            // might be a logical stream that needs no such check at all.
+            EnsureNoLocalDivergence(options.Path, metadata);
+        }
+
+        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pulling));
         var payload = CreatePullRequest(metadata.Revision, options.LongPollTimeout, requestLogical);
         using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
         using var scope = options.EnterApplicationHttpScope();
@@ -401,6 +416,19 @@ internal static class ManagedReplicaBootstrapper
                 "The pull-updates response used replace_base apply mode without returning every database page exactly once.");
         }
 
+        // The response turned out to be a Pages stream (Incremental or ReplaceBase) even though
+        // the remembered protocol is MvccLogical (a protocol-2 remote can still answer any given
+        // pull this way, e.g. after its logical log was garbage-collected). Unlike the ordinary,
+        // historical page-protocol path above, a logical-protocol replica's local writes are
+        // expected to keep living in the WAL between syncs (tracked by the change journal,
+        // reconciled by precollect/reapply for LOGICAL responses) -- but a raw page-based apply
+        // has no such reconciliation mechanism at all, so this surprise combination needs its
+        // OWN, stricter guard: reject outright if local changes are still pending push, and
+        // otherwise safely checkpoint ordinary (already fully pushed) WAL activity before the
+        // byte-level divergence check, rather than treat it as instant unmanaged divergence.
+        if (requestLogical)
+            EnsurePagesApplyIsSafe(options.Path, metadata, pendingLocalChanges);
+
         await ApplyIncrementalPagesAsync(options, header, pages, metadata.ClientId, effectiveToken).ConfigureAwait(false);
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
@@ -417,9 +445,19 @@ internal static class ManagedReplicaBootstrapper
     /// only advance together after that commit succeeds, and are left untouched on any failure.
     /// When the remote apply is non-empty and <paramref name="pendingLocalChanges"/> is non-empty,
     /// the current local state for every row touched by a pending change is precollected before
-    /// the remote apply begins and reapplied in a follow-up transaction afterward, so local writes
-    /// the server has not yet seen survive the pull instead of being silently overwritten.
+    /// the remote apply begins and reapplied in the same transaction, so local writes the server
+    /// has not yet seen survive the pull instead of being silently overwritten.
     /// </summary>
+    /// <remarks>
+    /// Metadata (revision/fingerprint/table map) is published whenever <paramref name="header"/>
+    /// carries a new revision, even when the decoded transaction set is empty (e.g. every
+    /// transaction in the response was excluded as this client's own echo). Skipping metadata
+    /// publication in that case would leave metadata pinned to the OLD revision forever: the next
+    /// pull would resend the identical already-acknowledged range, decode to zero transactions
+    /// again, and never converge to <see cref="AhtolaSyncOutcome.UpToDate"/>. Nothing was mutated
+    /// on disk in that case, so the previously recorded fingerprint/table map remain valid as-is
+    /// and no compensation is needed.
+    /// </remarks>
     private static async Task<(AhtolaSyncOutcome Outcome, AhtolaSyncStatistics Statistics)> ApplyLogicalUpdatesAsync(
         AhtolaReplicaOptions options,
         ManagedReplicaMetadata metadata,
@@ -459,21 +497,26 @@ internal static class ManagedReplicaBootstrapper
 
         long operationCount = 0;
         var tableNamesByStableId = metadata.TableNamesByStableId;
-        if (transactions.Count != 0)
+        string fingerprint;
+        DatabaseArtifactBackup? artifactBackup = null;
+        var metadataPublished = false;
+        try
         {
-            // The SQL transaction below mutates the live database file in place (unlike the
-            // page-based path, which stages a whole replacement file before ever touching the
-            // original). Durability compensation for that in-place mutation therefore needs its
-            // own full-artifact snapshot, taken before the transaction starts, covering every
-            // durable file the engine may touch: the main database file plus its WAL/SHM/journal
-            // sidecars. If anything fails after COMMIT but before metadata is durably published
-            // (including a failed checkpoint, which must never be swallowed), every one of those
-            // artifacts is restored to its pre-apply state so the old revision/fingerprint pair
-            // in metadata remains valid and the next sync safely retries from the old revision.
-            var artifactBackup = BackupDatabaseArtifacts(options.Path, directory, Guid.NewGuid().ToString("N"));
-            var metadataPublished = false;
-            try
+            if (transactions.Count != 0)
             {
+                RejectIfLocalSchemaChangesArePending(pendingLocalChanges);
+
+                // The SQL transaction below mutates the live database file in place (unlike the
+                // page-based path, which stages a whole replacement file before ever touching the
+                // original). Durability compensation for that in-place mutation therefore needs
+                // its own full-artifact snapshot, taken before the transaction starts, covering
+                // every durable file the engine may touch: the main database file plus its
+                // WAL/SHM/journal sidecars. If anything fails after COMMIT but before metadata is
+                // durably published (including a failed checkpoint, which must never be
+                // swallowed), every one of those artifacts is restored to its pre-apply state so
+                // the old revision/fingerprint pair in metadata remains valid and the next sync
+                // safely retries from the old revision.
+                artifactBackup = BackupDatabaseArtifacts(options.Path, directory, Guid.NewGuid().ToString("N"));
                 using (var database = ManagedDatabaseAdapter.Open(options.Path))
                 {
                     var connection = database.Connect();
@@ -529,45 +572,55 @@ internal static class ManagedReplicaBootstrapper
                 }
 
                 syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
-                var fingerprint = ComputeDatabaseFingerprint(options.Path);
-                try
-                {
-                    await WriteMetadataAsync(
-                            metadataStagingPath,
-                            metadataPath,
-                            header.Revision,
-                            fingerprint,
-                            header.Protocol,
-                            tableNamesByStableId,
-                            cancellationToken,
-                            replaceExisting: true,
-                            clientId: metadata.ClientId)
-                        .ConfigureAwait(false);
-                }
-                finally
-                {
-                    DeleteIfExists(metadataStagingPath);
-                }
-
-                // From this point on, metadata already durably fingerprints the just-installed
-                // database image: a later interruption (e.g. cancellation observed immediately
-                // below) must preserve that matched (new database, new metadata) pair rather than
-                // restore only the database and leave metadata pointing at a revision the file no
-                // longer contains.
-                metadataPublished = true;
-                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.LogicalApplyMetadataPublished);
-                cancellationToken.ThrowIfCancellationRequested();
+                fingerprint = ComputeDatabaseFingerprint(options.Path);
             }
-            catch
+            else
             {
-                if (!metadataPublished)
-                    RestoreDatabaseArtifacts(options.Path, artifactBackup);
-                throw;
+                // Revision advanced but every wire transaction decoded to nothing applied (e.g.
+                // all were excluded as this client's own echo): nothing on disk changed, so the
+                // previously recorded fingerprint and table map remain valid as-is. Only the
+                // revision needs to move forward.
+                fingerprint = metadata.DatabaseSha256;
+            }
+
+            try
+            {
+                await WriteMetadataAsync(
+                        metadataStagingPath,
+                        metadataPath,
+                        header.Revision,
+                        fingerprint,
+                        header.Protocol,
+                        tableNamesByStableId,
+                        cancellationToken,
+                        replaceExisting: true,
+                        clientId: metadata.ClientId)
+                    .ConfigureAwait(false);
             }
             finally
             {
-                DeleteBackupArtifacts(artifactBackup);
+                DeleteIfExists(metadataStagingPath);
             }
+
+            // From this point on, metadata already durably fingerprints the just-installed
+            // database image: a later interruption (e.g. cancellation observed immediately
+            // below) must preserve that matched (database, metadata) pair rather than restore
+            // only the database and leave metadata pointing at a revision the file no longer
+            // (or, in the zero-transaction case, does not yet) reflect.
+            metadataPublished = true;
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.LogicalApplyMetadataPublished);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        catch
+        {
+            if (!metadataPublished && artifactBackup is { } backup)
+                RestoreDatabaseArtifacts(options.Path, backup);
+            throw;
+        }
+        finally
+        {
+            if (artifactBackup is { } backupToDelete)
+                DeleteBackupArtifacts(backupToDelete);
         }
 
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
@@ -1259,13 +1312,68 @@ internal static class ManagedReplicaBootstrapper
     /// <see cref="ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges"/>). An evolving WAL
     /// and a main-file fingerprint that drifts from the last recorded one are therefore the
     /// expected steady state for this protocol, not evidence of an unmanaged, out-of-band
-    /// modification, so this check is skipped entirely for it.
+    /// modification, so this convenience overload (context-free about which stream kind a
+    /// specific response actually returned) skips the check entirely based on the remembered
+    /// protocol. <see cref="CheckForUpdatesAsync(AhtolaReplicaOptions,ManagedReplicaMetadata,AhtolaSyncOptions,IReadOnlyList{ReplicaLocalChange},CancellationToken)"/>
+    /// does NOT rely on this overload's protocol-based skip for its own gating, precisely because
+    /// a protocol-2 (MvccLogical) remote can still answer a given pull with a Pages stream (see
+    /// <see cref="EnsurePagesApplyIsSafe"/>).
     /// </remarks>
     public static void EnsureNoLocalDivergence(string databasePath, ManagedReplicaMetadata metadata)
     {
         if (metadata.Protocol == RemotePullProtocol.MvccLogical)
             return;
 
+        CheckFileDivergence(databasePath, metadata);
+    }
+
+    /// <summary>
+    /// Guards a PAGES-stream apply (Incremental or ReplaceBase). This stream kind may be returned
+    /// even when the remembered protocol is MvccLogical: a protocol-2 remote can still answer any
+    /// given pull with raw pages (e.g. after its logical log has been garbage-collected, or for a
+    /// ReplaceBase). A raw page-based apply has no mechanism to reconcile local writes the way the
+    /// logical path's precollect/reapply does, so it rejects outright when local changes are still
+    /// pending push, and otherwise safely checkpoints ordinary (already fully pushed) local WAL
+    /// activity before the byte-level divergence check, rather than treat a live-but-fully-pushed
+    /// WAL as instant unmanaged divergence the way a naive check would.
+    /// </summary>
+    private static void EnsurePagesApplyIsSafe(
+        string databasePath,
+        ManagedReplicaMetadata metadata,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges)
+    {
+        if (pendingLocalChanges.Count > 0)
+        {
+            throw new NotSupportedException(
+                "Managed embedded replica has local changes pending push; a page-based update has no way to "
+                + "reconcile them and was rejected. Push the pending local changes, then retry.");
+        }
+
+        TryCheckpointSidecarsBeforePagesApply(databasePath);
+        CheckFileDivergence(databasePath, metadata);
+    }
+
+    private static void TryCheckpointSidecarsBeforePagesApply(string databasePath)
+    {
+        if (!File.Exists(databasePath + "-wal") && !File.Exists(databasePath + "-journal"))
+            return;
+
+        try
+        {
+            using var database = ManagedDatabaseAdapter.Open(databasePath);
+            var connection = database.Connect();
+            ExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+        }
+        catch
+        {
+            // Best effort: a failed checkpoint here still leaves a non-trivial WAL/journal,
+            // which CheckFileDivergence immediately below correctly rejects on its own terms
+            // (it is not silently accepting an inconsistent file either way).
+        }
+    }
+
+    private static void CheckFileDivergence(string databasePath, ManagedReplicaMetadata metadata)
+    {
         // Opening the managed pager may create an empty 32-byte WAL header; frames
         // beyond that header are local state and cannot be replaced safely.
         if ((File.Exists(databasePath + "-wal") && new FileInfo(databasePath + "-wal").Length > 32)
@@ -1309,6 +1417,64 @@ internal static class ManagedReplicaBootstrapper
         databasePath + MetadataSuffix,
         databasePath + ManagedReplicaChangeJournal.Suffix,
     ];
+
+    /// <summary>
+    /// Rejects a non-empty logical apply outright while any local change journal entry is still a
+    /// pending, unpushed, EXISTING-object-modifying SCHEMA change (a DDL statement captured by
+    /// <c>ManagedReplicaConnectionHost</c>'s DDL hook), rather than silently ignoring it the way
+    /// <see cref="ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges"/> does for its own,
+    /// narrower row-reconciliation purpose.
+    /// </summary>
+    /// <remarks>
+    /// Unlike a pending local ROW change (which the precollect/reapply flow safely rebases on top
+    /// of the new remote base), a pending local SCHEMA change that modifies or removes an object
+    /// the server already knows about has no reconciliation story: the remote's own schema
+    /// operations (a table Refresh or Drop) are generated against the state the SERVER believes
+    /// this client last had, which by definition does not include a change the server has not yet
+    /// received. Two concrete failure modes motivate rejecting outright instead of proceeding:
+    /// <list type="bullet">
+    /// <item>A remote Refresh's incoming CREATE TABLE text reflects the server's (older) shape.
+    /// Diffed against the LOCAL table shape (which already includes the unpushed local schema
+    /// change), the refresh can look permanently non-additive - e.g. a locally-added column looks
+    /// like the remote is asking to remove it - and would be rejected by the table-refresh guard
+    /// on EVERY subsequent sync, with no way to make progress until the user manually intervenes.</item>
+    /// <item>A remote Drop for the same table removes it entirely; replaying it while a local
+    /// schema change (and any local row changes precollected against the OLD shape) is still
+    /// pending can leave row reapply referencing a column set that no longer has a home.</item>
+    /// </list>
+    /// Rejecting here is a deliberate, conservative choice over attempting reconciliation: the
+    /// caller receives an explicit, clearly retryable reason and can push the pending local
+    /// changes (moving them out of the journal) before the next pull attempt, at which point this
+    /// check no longer applies and the pull proceeds normally.
+    /// </remarks>
+    /// <remarks>
+    /// A pending <c>CREATE</c> (table, index, trigger, or view) is deliberately NOT treated as
+    /// risky here and is allowed through unchecked: by definition it introduces a new object the
+    /// server cannot yet have any competing view of, so it cannot exhibit either failure mode
+    /// above the way an <c>ALTER</c>/<c>DROP</c>/<c>REINDEX</c>/<c>VACUUM</c> of an
+    /// already-shared object can. Excluding it also preserves the everyday "create a local table,
+    /// write some rows, then sync while a concurrent remote change lands" flow exercised by the
+    /// existing local-row precollect/reapply tests, none of which push before pulling.
+    /// </remarks>
+    private static void RejectIfLocalSchemaChangesArePending(IReadOnlyList<ReplicaLocalChange> pendingLocalChanges)
+    {
+        foreach (var change in pendingLocalChanges)
+        {
+            if (change.Kind != ReplicaLocalChangeKind.Schema)
+                continue;
+            if (SqlTransactionControl.GetFirstKeyword(change.Sql) is { } keyword
+                && keyword.Equals("CREATE", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            throw new NotSupportedException(
+                "Managed embedded replica has a local schema change pending push; a logical pull with "
+                + "remote changes to apply cannot safely proceed while it is unpushed, since a remote table "
+                + "refresh or drop is generated against a schema state that does not yet reflect it. Push "
+                + "the pending local changes, then retry.");
+        }
+    }
 
     private static string ComputeDatabaseFingerprint(string path)
         => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));

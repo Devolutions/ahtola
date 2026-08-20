@@ -1,3 +1,4 @@
+using System.Globalization;
 using Ahtola.Core;
 using Ahtola.Core.Storage;
 
@@ -164,10 +165,11 @@ internal static class ManagedReplicaLogicalReplayer
     /// </summary>
     /// <remarks>
     /// Only Row-kind changes to logically-replayable tables are captured. Schema-kind local
-    /// changes are not reconciled here: a schema DDL is not at risk of being silently overwritten
-    /// by a remote row-level apply the way row data is (the remote apply only ever touches tables
-    /// explicitly named in its own operations), so reconciling it against a competing remote
-    /// schema op for the same name is treated as an accepted out-of-scope edge case.
+    /// changes are never reconciled here: by the time this runs, the caller (see
+    /// <c>ManagedReplicaBootstrapper.RejectIfLocalSchemaChangesArePending</c>) has already
+    /// rejected the whole apply outright if any Schema-kind entry is still pending push, so this
+    /// method is only ever reached when none remain in the journal - filtering them out here is
+    /// therefore a defensive no-op, not the actual enforcement point.
     /// </remarks>
     public static IReadOnlyList<ManagedReplicaCapturedLocalRowChange> CapturePendingLocalRowChanges(
         IManagedConnectionAdapter connection,
@@ -258,15 +260,49 @@ internal static class ManagedReplicaLogicalReplayer
         foreach (var change in capturedChanges)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // The remote transaction just applied may have dropped this table entirely (or it
+            // may never have existed locally in the first place for some other reason); there
+            // is nothing to reconcile for local data belonging to a table that is not there.
+            if (!SchemaObjectExists(connection, "table", change.TableName))
+                continue;
+
             if (change.IsDelete)
             {
-                ReplayRowDelete(connection, change.TableName, change.RowId, []);
+                ReplayPendingLocalRowDelete(connection, change.TableName, change.RowId);
                 continue;
             }
 
             var record = SqliteRecordCodec.Encode(change.CapturedValues!);
             ReplayRowUpsert(connection, change.TableName, change.RowId, record);
         }
+    }
+
+    /// <summary>
+    /// Deletes a row by its authoritative LOCAL rowid, for reconciling a pending local delete
+    /// that was captured (see <see cref="CapturePendingLocalRowChanges"/>) before a remote pull.
+    /// This deliberately does not reuse <see cref="ReplayRowDelete"/>'s wire-format "empty key
+    /// projection" path: that path refuses a rowid-based delete whenever the table's PRIMARY KEY
+    /// is not the rowid alias, because for a REMOTE-origin delete the remote's rowid might not
+    /// match this replica's rowid for the same logical row. Neither caveat applies here: the
+    /// rowid was read directly off this replica's own row at capture time, so it is always the
+    /// correct, unambiguous identity for the row this replica itself deleted locally, regardless
+    /// of whether the table's declared PRIMARY KEY happens to alias the rowid.
+    /// </summary>
+    private static void ReplayPendingLocalRowDelete(IManagedConnectionAdapter connection, string tableName, long rowId)
+    {
+        var info = GetTableColumnsInfo(connection, tableName);
+        if (info.IsWithoutRowId || info.RowidReferenceName is not { } rowidReference)
+        {
+            // No true rowid to delete by (WITHOUT ROWID has none; the vanishingly rare case of
+            // all three special names being shadowed leaves it unreachable). Nothing safe to do.
+            return;
+        }
+
+        using var statement = connection.Prepare(
+            $"DELETE FROM {QuoteIdentifier(tableName)} WHERE {QuoteIdentifier(rowidReference)} = ?");
+        statement.Bind(1, SqlValue.Integer(rowId));
+        statement.Step();
     }
 
     /// <summary>
@@ -379,10 +415,15 @@ internal static class ManagedReplicaLogicalReplayer
                 "A logical update_header operation must include at least one header field.");
         }
 
+        // Must format with the invariant culture explicitly: some cultures (e.g. sv-SE) render a
+        // negative number's sign as U+2212 (MINUS SIGN) rather than ASCII U+002D (HYPHEN-MINUS)
+        // under the default ToString()/interpolation formatting, which would emit invalid SQL
+        // text for a negative user_version/application_id (both are signed int32 in real SQLite)
+        // if the current thread's culture were ever anything but invariant/en-US-like.
         if (op.UserVersion is { } userVersion)
-            ExecuteDdl(connection, $"PRAGMA user_version = {userVersion}");
+            ExecuteDdl(connection, $"PRAGMA user_version = {userVersion.ToString(CultureInfo.InvariantCulture)}");
         if (op.ApplicationId is { } applicationId)
-            ExecuteDdl(connection, $"PRAGMA application_id = {applicationId}");
+            ExecuteDdl(connection, $"PRAGMA application_id = {applicationId.ToString(CultureInfo.InvariantCulture)}");
     }
 
     private static void ReplaySchemaOp(IManagedConnectionAdapter connection, ManagedReplicaLogicalOp op)
@@ -728,28 +769,56 @@ internal static class ManagedReplicaLogicalReplayer
         pkColumns.Sort((a, b) => a.Ordinal.CompareTo(b.Ordinal));
         var pkColumnIndices = pkColumns.Select(p => p.ColumnIndex).ToArray();
 
-        // WITHOUT ROWID is not reported by pragma_table_info; it must be read from the table's
-        // own recorded CREATE TABLE text. A table with no local schema (not yet created) simply
-        // has no create SQL, so this is always false in that case, matching the pre-existing
-        // "does this table exist" check based on an empty column list.
-        var isWithoutRowId = columnNames.Count > 0
+        // WITHOUT ROWID/the PRIMARY KEY DESC column-constraint exception are not reported by
+        // pragma_table_info; both must be read from the table's own recorded CREATE TABLE text.
+        // A table with no local schema (not yet created) simply has no create SQL, so both are
+        // resolved to their "ordinary rowid table" defaults in that case, matching the
+        // pre-existing "does this table exist" check based on an empty column list.
+        ManagedReplicaSchemaDdlText.TableShape? shape = columnNames.Count > 0
             && GetTableCreateSql(connection, tableName) is { } createSql
-            && ManagedReplicaSchemaDdlText.TryGetCreateTableShape(createSql) is { WithoutRowId: true };
+                ? ManagedReplicaSchemaDdlText.TryGetCreateTableShape(createSql)
+                : null;
+        var isWithoutRowId = shape is { WithoutRowId: true };
 
         int? rowidAliasColumnIndex = null;
         if (!isWithoutRowId && pkColumnIndices.Length == 1)
         {
-            // A single-column PRIMARY KEY of declared type INTEGER is a rowid alias in ordinary
-            // (non-WITHOUT ROWID) tables regardless of ASC/DESC: SQLite's rowid-alias rule keys
-            // only on column count and declared type text, not sort direction.
             var pk = pkColumnIndices[0];
             if (pk < columnTypes.Count && columnTypes[pk].Equals("INTEGER", StringComparison.OrdinalIgnoreCase))
-                rowidAliasColumnIndex = pk;
+            {
+                // SQLite's documented rowid-alias exception: a COLUMN-level "PRIMARY KEY DESC"
+                // constraint does NOT alias the rowid, but the equivalent TABLE-level
+                // "PRIMARY KEY(col DESC)" form still does. Distinguish them from the recorded
+                // CREATE TABLE text; when the text cannot be parsed, default to aliasing (the
+                // ordinary, overwhelmingly common case) rather than refuse to replay at all.
+                var isColumnLevelDescException = shape is { } tableShape
+                    && !ContainsPrimaryKeyTableConstraint(tableShape)
+                    && FindColumnDefinition(tableShape, columnNames[pk]) is { } columnDefinition
+                    && ManagedReplicaSchemaDdlText.IsColumnLevelPrimaryKeyDescending(columnDefinition);
+
+                if (!isColumnLevelDescException)
+                    rowidAliasColumnIndex = pk;
+            }
         }
 
         var rowidReferenceName = isWithoutRowId ? null : ResolveRowidReferenceName(columnNames);
 
         return new TableColumnsInfo(columnNames, pkColumnIndices, rowidAliasColumnIndex, isWithoutRowId, rowidReferenceName);
+    }
+
+    private static bool ContainsPrimaryKeyTableConstraint(ManagedReplicaSchemaDdlText.TableShape shape)
+        => shape.TableConstraints.Any(constraint =>
+            constraint.TrimStart().StartsWith("PRIMARY", StringComparison.OrdinalIgnoreCase));
+
+    private static string? FindColumnDefinition(ManagedReplicaSchemaDdlText.TableShape shape, string columnName)
+    {
+        foreach (var (name, definition) in shape.Columns)
+        {
+            if (string.Equals(name, columnName, StringComparison.OrdinalIgnoreCase))
+                return definition;
+        }
+
+        return null;
     }
 
     /// <summary>

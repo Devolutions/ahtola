@@ -858,6 +858,114 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public async Task PendingLocalSchemaChangeRejectsALogicalPullUntilItIsPushedThenMakesProgress()
+    {
+        // More local changes than PushOperationsThreshold (1), the last of which is a SCHEMA
+        // (DDL) change rather than a row change: the first sync's push batch only drains the row
+        // change, leaving the schema change pending in the journal when the pull runs. A remote
+        // logical response with actual transactions to apply must reject outright rather than
+        // silently proceed (a remote Refresh/Drop is generated against a schema state that does
+        // not yet reflect the unpushed local DDL). Once a SECOND sync finally pushes the
+        // remaining schema change, the SAME logical response (still describing the same old
+        // revision, since the first attempt's rejection happened before any metadata was
+        // touched) must apply normally: eventual progress, not a permanent stall.
+        var path = NewReplicaPath("managed-replica-logical-pending-schema-reject");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "remote_items",
+            rowId: 2,
+            columnValue: "remote",
+            schemaSql: "CREATE TABLE remote_items(id INTEGER PRIMARY KEY, x TEXT)",
+            salt: 903UL);
+
+        // The SAME logical response is queued twice: the first sync's pull must be rejected
+        // before it consumes/publishes anything, so the old revision is still current when the
+        // second sync's pull runs and must succeed against an identical response.
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');"); // pushed first
+            connection.ExecuteNonQuery("ALTER TABLE local_items ADD COLUMN extra TEXT;"); // left pending
+
+            var beforeMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+
+            Func<Task> firstSync = () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            await firstSync.Should().ThrowAsync<NotSupportedException>()
+                .WithMessage("*schema change*pending push*");
+
+            handler.PushCallCount.Should().Be(1, "the row change was pushed; the schema change was left pending");
+            handler.PullCallCount.Should().Be(3, "bootstrap catch-up + the rejected explicit sync's pull");
+
+            // The rejected logical apply never reaches WriteMetadataAsync, so the revision
+            // recorded from the successful push-side of this same sync (RecordLocalPushAsync,
+            // which legitimately refreshes the fingerprint against the file as already mutated by
+            // the two local writes above, independent of the pull's own outcome) still carries the
+            // OLD, pre-pull revision rather than the rejected response's "revision-43".
+            var afterFailedSyncMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            afterFailedSyncMetadata.Revision.Should().Be(beforeMetadata.Revision);
+
+            // The still-pending schema change remains in the journal untouched by the rejection.
+            var pendingAfterFailure = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
+            pendingAfterFailure.Should().ContainSingle(c => c.Kind == ReplicaLocalChangeKind.Schema);
+
+            // Second sync: the schema change is now the only (and first) journal entry, so the
+            // threshold-1 push finally drains it. With no residual pending schema entries, the
+            // pull proceeds and applies the remote transaction normally.
+            var secondResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            secondResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            handler.PushCallCount.Should().Be(2, "the second sync finally pushes the pending schema change");
+
+            using var remoteCommand = connection.CreateCommand();
+            remoteCommand.CommandText = "SELECT x FROM remote_items WHERE id = 2;";
+            remoteCommand.ExecuteScalar().Should().Be("remote");
+
+            using var localCommand = connection.CreateCommand();
+            localCommand.CommandText = "SELECT extra FROM local_items WHERE id = 1;";
+            localCommand.ExecuteScalar().Should().Be(DBNull.Value);
+
+            var finalMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            finalMetadata.Revision.Should().Be("revision-43");
+
+            var pendingAfterProgress = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
+            pendingAfterProgress.Should().BeEmpty();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public void LogicalDivergenceGuardToleratesAnEvolvingWalUnlikeThePageProtocol()
     {
         var path = NewReplicaPath("managed-replica-logical-divergence-tolerance");
@@ -889,6 +997,56 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         using var command = connection.CreateCommand();
         command.CommandText = $"SELECT COUNT(*) FROM \"{table}\";";
         return Convert.ToInt64(command.ExecuteScalar());
+    }
+
+    [Test]
+    public async Task ZeroTransactionRevisionAdvancePublishesMetadataSoTheNextSyncIsUpToDate()
+    {
+        // A logical response can advance the revision while decoding to zero transactions (e.g.
+        // every wire transaction was excluded as this client's own echo, or the body was
+        // genuinely empty). Metadata must still publish the new revision, or the next sync would
+        // resend the identical range forever instead of ever reaching UpToDate.
+        var path = NewReplicaPath("managed-replica-logical-zero-tx-revision");
+        var sourcePath = path + ".source";
+        byte[] databaseImage;
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            databaseImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up
+            CreateLogicalPullResponse("revision-43", body: []), // new revision, nothing decoded
+            CreateLogicalPullResponse("revision-43", body: []), // second sync: same revision
+        ]);
+        var options = CreateOptions(path, handler);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            var firstResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            firstResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            firstResult.Statistics.Revision.Should().Be("revision-43");
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be(
+                "revision-43", "metadata must publish the new revision even though nothing was decoded to replay");
+
+            var secondResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            secondResult.Outcome.Should().Be(
+                AhtolaSyncOutcome.UpToDate, "metadata must have advanced so the identical revision now round-trips as up to date");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
     }
 
     [Test]
@@ -1072,6 +1230,57 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             }
 
             ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ProtocolTwoPagesReplaceBaseWithPendingLocalChangesIsRejected()
+    {
+        // A protocol-2 (logical) replica whose response for THIS pull surprisingly turns out to
+        // be Pages+ReplaceBase (rather than a logical stream) has no way to reconcile still-
+        // pending local writes the way the logical path's precollect/reapply does; it must
+        // reject rather than silently clobber/mix local data with the incoming page replacement.
+        var path = NewReplicaPath("managed-replica-replace-base-pending-local");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var replacedImage = CreateDatabaseImageWithMarker(path + ".replaced", 84);
+
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up
+            CreateReplaceBasePullResponse("revision-43", replacedImage),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+            ReadBootstrapMarker(connection).Should().Be(42);
+
+            // Two local writes with a push threshold of 1: only the first is pushed, leaving the
+            // second genuinely pending when the sync's pull runs.
+            connection.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');");
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (2, 'second');");
+
+            Assert.ThrowsAsync<NotSupportedException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            // The rejected page apply must not have touched local data at all.
+            ReadBootstrapMarker(connection).Should().Be(42);
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT x FROM local_items ORDER BY id;";
+            using var reader = command.ExecuteReader();
+            var values = new List<string>();
+            while (reader.Read())
+                values.Add(reader.GetString(0));
+            values.Should().Equal("first", "second");
         }
         finally
         {

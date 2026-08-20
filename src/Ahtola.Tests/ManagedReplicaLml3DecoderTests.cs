@@ -679,7 +679,7 @@ public sealed class ManagedReplicaLml3DecoderTests
     }
 
     [Test]
-    public void CancellationIsHonoredWhileScanningALargeExtensionBlock()
+    public void PreCancelledTokenIsHonoredEvenForALargeExtensionBlock()
     {
         var salt = 57UL;
         var header = Lml3TestBuilder.BuildHeader(salt);
@@ -690,7 +690,9 @@ public sealed class ManagedReplicaLml3DecoderTests
         // but numerous enough that an uncancellable scan would be a real DoS concern for an
         // attacker-controlled recordCount. A pre-cancelled token must still surface
         // OperationCanceledException (not run to completion, and not throw some other exception
-        // type first).
+        // type first). This only proves the token is honored at entry; see
+        // CancellationRequestedMidScanInterruptsTheExtensionRecordLoop for a check that fires
+        // deep inside the loop specifically.
         const int recordCount = 5000;
         var extensionBlock = new byte[recordCount * 8];
         for (var i = 0; i < recordCount; i++)
@@ -704,6 +706,37 @@ public sealed class ManagedReplicaLml3DecoderTests
 
         using var cts = new CancellationTokenSource();
         cts.Cancel();
+        Assert.Throws<OperationCanceledException>(() => ManagedReplicaLml3Decoder.Decode(ranges, body, cts.Token));
+    }
+
+    [Test]
+    public void CancellationRequestedMidScanInterruptsTheExtensionRecordLoop()
+    {
+        var salt = 58UL;
+        var header = Lml3TestBuilder.BuildHeader(salt);
+        var crc = Lml3TestBuilder.HeaderSeedCrc(salt);
+        var op = Lml3TestBuilder.BuildRecoveryOp(0, 0, -2, Lml3TestBuilder.UpsertTablePayload(1, [0x00]));
+
+        // Large enough (millions of individually valid 8-byte records) that scanning the whole
+        // block takes measurable wall-clock time -- comfortably longer than the short
+        // CancelAfter() timer below -- so the request genuinely lands WHILE FindExtensionPayload's
+        // loop is still running (checked every 1024 iterations), rather than only ever being
+        // observed before the scan begins the way a pre-cancelled token would be. CancelAfter
+        // fires its callback from an independent timer thread, so it can interleave with the
+        // synchronous scan without needing a second Task/thread of our own.
+        const int recordCount = 2_000_000;
+        var extensionBlock = new byte[recordCount * 8];
+        for (var i = 0; i < recordCount; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(extensionBlock.AsSpan(i * 8), 1);
+
+        var frame = Lml3TestBuilder.BuildFrameWithExtensionRecordCount(
+            ref crc, op, 1, extensionBlock, extensionRecordCount: recordCount);
+
+        var body = header.Concat(frame).ToArray();
+        var ranges = new[] { new ManagedReplicaLogicalLogRange(1, 0, (ulong)body.Length, true, null) };
+
+        using var cts = new CancellationTokenSource();
+        cts.CancelAfter(TimeSpan.FromMilliseconds(1));
         Assert.Throws<OperationCanceledException>(() => ManagedReplicaLml3Decoder.Decode(ranges, body, cts.Token));
     }
 
