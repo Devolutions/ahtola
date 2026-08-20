@@ -48,15 +48,17 @@ try
         if (typeof(DbContext).Assembly.GetName().Version?.Major != expectedEfMajor)
             throw new InvalidOperationException($"The managed Ahtola package consumer must run against EF Core {expectedEfMajor}.x.");
 
-    try
+    var remoteOptions = new DbContextOptionsBuilder<ConsumerContext>()
+        .UseAhtola("Data Source=libsql://example-org.Ahtola.io;Auth Token=package-test-token")
+        .Options;
+    using (var remoteContext = new ConsumerContext(remoteOptions))
     {
-        _ = new DbContextOptionsBuilder<ConsumerContext>()
-            .UseAhtola("Data Source=libsql://example-org.Ahtola.io");
-        throw new InvalidOperationException("UseAhtola must reject remote URLs during configuration.");
-    }
-    catch (NotSupportedException exception) when (
-        exception.Message.Contains("retry and transaction semantics", StringComparison.Ordinal))
-    {
+        if (remoteContext.Database.GetDbConnection() is not SqliteConnection remoteConnection
+            || remoteConnection.Capabilities.Mode != AhtolaConnectionMode.RemoteHrana)
+        {
+            throw new InvalidOperationException(
+                "The packaged UseAhtola provider did not retain the configured remote endpoint mode.");
+        }
     }
 
     const string encryptionKey = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
@@ -312,7 +314,7 @@ static void VerifyPublicCapabilityContract()
         ahtolaReplica.CanCreateBatch,
         AhtolaConnectionFacade.AhtolaData,
         AhtolaConnectionMode.EmbeddedReplica,
-        [false, true, true, true, false, false, false, false, false, false, false, false, true]);
+        [true, true, true, true, false, false, false, false, false, false, false, false, true]);
 
     using var sqliteManaged = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
     AssertCapabilities(
@@ -329,6 +331,23 @@ static void VerifyPublicCapabilityContract()
         AhtolaConnectionFacade.Sqlite,
         AhtolaConnectionMode.NativeLocal,
         [true, true, true, true, true, true, true, true, true, true, true, false, false]);
+
+    using var sqliteRemote = new SqliteConnection("Data Source=https://example.Ahtola.io");
+    AssertCapabilities(
+        sqliteRemote.Capabilities,
+        sqliteRemote.CanCreateBatch,
+        AhtolaConnectionFacade.Sqlite,
+        AhtolaConnectionMode.RemoteHrana,
+        [true, true, true, true, false, false, false, false, false, false, false, false, false]);
+
+    using var sqliteReplica = new SqliteConnection(
+        "Data Source=https://example.Ahtola.io;Replica Path=replica.db");
+    AssertCapabilities(
+        sqliteReplica.Capabilities,
+        sqliteReplica.CanCreateBatch,
+        AhtolaConnectionFacade.Sqlite,
+        AhtolaConnectionMode.EmbeddedReplica,
+        [true, true, true, true, false, false, false, false, false, false, false, false, true]);
 }
 
 static void AssertCapabilities(

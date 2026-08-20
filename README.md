@@ -86,13 +86,17 @@ connection.ExecuteNonQuery("CREATE TABLE t(a, b)");
 
 ```csharp
 options.UseAhtola("Data Source=app.db");
+
+// Direct Turso/Hrana:
+options.UseAhtola("Data Source=turso://my-db.turso.io;Auth Token=" + authToken);
 ```
 
 Common connection-string keywords: `Data Source`, `Mode`, `Cache`, `Pooling`,
 `Foreign Keys`, `Default Timeout` / `Command Timeout`, `Foreign Read Only`,
 `DateTimeKind`, `BinaryGUID`, `Password` (passphrase → AES-256-GCM), or
-`Encryption Cipher` + `Encryption Key` (hex AES-128/256-GCM). Default local
-provider is managed-only.
+`Encryption Cipher` + `Encryption Key` (hex AES-128/256-GCM). Turso/Hrana URLs
+also accept `Auth Token`, `Replica Path`, `Sync Interval`, `Read Your Writes`,
+and `Tls` through either ADO.NET facade. Default local provider is managed-only.
 
 ### Standard SQLite files
 

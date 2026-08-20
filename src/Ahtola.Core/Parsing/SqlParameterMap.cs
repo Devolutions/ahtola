@@ -5,11 +5,13 @@ public sealed class SqlParameterMap
     public const int MaximumParameterCount = 250_000;
 
     private readonly string?[] _names;
+    private readonly bool[] _referenced;
     private readonly Dictionary<string, int> _indices;
 
-    private SqlParameterMap(string?[] names, Dictionary<string, int> indices)
+    private SqlParameterMap(string?[] names, bool[] referenced, Dictionary<string, int> indices)
     {
         _names = names;
+        _referenced = referenced;
         _indices = indices;
     }
 
@@ -23,6 +25,14 @@ public sealed class SqlParameterMap
         return _names[index];
     }
 
+    public bool IsReferenced(int index)
+    {
+        if (index < 1 || index > Count)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        return _referenced[index];
+    }
+
     public bool TryGetIndex(string name, out int index)
     {
         ArgumentNullException.ThrowIfNull(name);
@@ -34,6 +44,7 @@ public sealed class SqlParameterMap
         ArgumentNullException.ThrowIfNull(sql);
 
         var names = new List<string?> { null };
+        var referenced = new List<bool> { false };
         var indices = new Dictionary<string, int>(StringComparer.Ordinal);
         var cursor = 0;
 
@@ -60,10 +71,10 @@ public sealed class SqlParameterMap
                     cursor = SkipBlockComment(sql, cursor + 2);
                     continue;
                 case '?':
-                    cursor = AddQuestionParameter(sql, cursor, names, indices);
+                    cursor = AddQuestionParameter(sql, cursor, names, referenced, indices);
                     continue;
                 case ':' or '@' or '$':
-                    cursor = AddNamedParameter(sql, cursor, names, indices);
+                    cursor = AddNamedParameter(sql, cursor, names, referenced, indices);
                     continue;
                 default:
                     cursor++;
@@ -71,10 +82,15 @@ public sealed class SqlParameterMap
             }
         }
 
-        return new SqlParameterMap(names.ToArray(), indices);
+        return new SqlParameterMap(names.ToArray(), referenced.ToArray(), indices);
     }
 
-    private static int AddQuestionParameter(string sql, int cursor, List<string?> names, Dictionary<string, int> indices)
+    private static int AddQuestionParameter(
+        string sql,
+        int cursor,
+        List<string?> names,
+        List<bool> referenced,
+        Dictionary<string, int> indices)
     {
         var end = cursor + 1;
         while (end < sql.Length && char.IsAsciiDigit(sql[end]))
@@ -84,6 +100,7 @@ public sealed class SqlParameterMap
         {
             EnsureParameterLimit(names.Count);
             names.Add(null);
+            referenced.Add(true);
             return end;
         }
 
@@ -91,14 +108,20 @@ public sealed class SqlParameterMap
             throw new FormatException($"Invalid numbered parameter at offset {cursor}.");
 
         EnsureParameterLimit(index);
-        EnsureSlot(names, index);
+        EnsureSlot(names, referenced, index);
         var name = sql[cursor..end];
         names[index] ??= name;
+        referenced[index] = true;
         indices.TryAdd(name, index);
         return end;
     }
 
-    private static int AddNamedParameter(string sql, int cursor, List<string?> names, Dictionary<string, int> indices)
+    private static int AddNamedParameter(
+        string sql,
+        int cursor,
+        List<string?> names,
+        List<bool> referenced,
+        Dictionary<string, int> indices)
     {
         var end = ScanNamedParameterEnd(sql, cursor);
 
@@ -111,6 +134,7 @@ public sealed class SqlParameterMap
             EnsureParameterLimit(names.Count);
             var index = names.Count;
             names.Add(name);
+            referenced.Add(true);
             indices.Add(name, index);
         }
 
@@ -145,10 +169,13 @@ public sealed class SqlParameterMap
         return end;
     }
 
-    private static void EnsureSlot(List<string?> names, int index)
+    private static void EnsureSlot(List<string?> names, List<bool> referenced, int index)
     {
         while (names.Count <= index)
+        {
             names.Add(null);
+            referenced.Add(false);
+        }
     }
 
     private static void EnsureParameterLimit(int count)

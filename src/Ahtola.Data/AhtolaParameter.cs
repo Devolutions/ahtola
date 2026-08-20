@@ -99,7 +99,7 @@ public class AhtolaParameter : DbParameter
             return new AhtolaValue { ValueType = AhtolaValueType.Null };
 
         var valueType = Value.GetType();
-        if (!ParameterTypeMapping.TryGetValue(valueType, out var parameterValueKind))
+        if (!TryGetParameterValueKind(valueType, out var parameterValueKind))
         {
             throw new ArgumentException($"Parameter type {valueType} is not supported");
         }
@@ -113,7 +113,7 @@ public class AhtolaParameter : DbParameter
             return SqlValue.Null;
 
         var valueType = Value.GetType();
-        if (!ParameterTypeMapping.TryGetValue(valueType, out var parameterValueKind))
+        if (!TryGetParameterValueKind(valueType, out var parameterValueKind))
             throw new ArgumentException($"Parameter type {valueType} is not supported");
 
         return parameterValueKind switch
@@ -137,8 +137,37 @@ public class AhtolaParameter : DbParameter
         }
     }
 
+    private static bool TryGetParameterValueKind(Type valueType, out ParameterValueKind parameterValueKind)
+    {
+        if (valueType.IsEnum)
+        {
+            parameterValueKind = ParameterValueKind.Integer;
+            return true;
+        }
+
+        return ParameterTypeMapping.TryGetValue(valueType, out parameterValueKind);
+    }
+
     private static long ToInt64Unchecked(object value)
-        => value is ulong u64 ? unchecked((long)u64) : Convert.ToInt64(value, CultureInfo.InvariantCulture);
+    {
+        if (value is ulong u64)
+            return unchecked((long)u64);
+        if (!value.GetType().IsEnum)
+            return Convert.ToInt64(value, CultureInfo.InvariantCulture);
+
+        return Type.GetTypeCode(Enum.GetUnderlyingType(value.GetType())) switch
+        {
+            TypeCode.SByte => Convert.ToSByte(value, CultureInfo.InvariantCulture),
+            TypeCode.Byte => Convert.ToByte(value, CultureInfo.InvariantCulture),
+            TypeCode.Int16 => Convert.ToInt16(value, CultureInfo.InvariantCulture),
+            TypeCode.UInt16 => Convert.ToUInt16(value, CultureInfo.InvariantCulture),
+            TypeCode.Int32 => Convert.ToInt32(value, CultureInfo.InvariantCulture),
+            TypeCode.UInt32 => Convert.ToUInt32(value, CultureInfo.InvariantCulture),
+            TypeCode.Int64 => Convert.ToInt64(value, CultureInfo.InvariantCulture),
+            TypeCode.UInt64 => unchecked((long)Convert.ToUInt64(value, CultureInfo.InvariantCulture)),
+            _ => throw new ArgumentException($"Enum type {value.GetType()} has an unsupported underlying type.")
+        };
+    }
 
     private static AhtolaValue GetAhtolaValue(object value, ParameterValueKind parameterValueKind)
     {

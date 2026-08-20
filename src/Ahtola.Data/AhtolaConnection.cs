@@ -9,6 +9,8 @@ namespace Ahtola;
 public class AhtolaConnection : DbConnection, ILocalReaderConnection
 {
     internal const int AutomaticSyncMaximumAttempts = 3;
+    // Test-only transport seam. Production callers continue to use the default HttpClient transport.
+    internal static Func<HttpMessageHandler?>? RemoteMessageHandlerFactory { get; set; }
 
     private AhtolaNativeDatabase? _nativeDatabase;
     private AhtolaReplicaDatabase? _replicaDatabase;
@@ -96,6 +98,12 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     public AhtolaConnection(string connectionString)
     {
         _connectionOptions = AhtolaConnectionOptions.Parse(connectionString);
+    }
+
+    internal AhtolaConnection(string connectionString, AhtolaRemoteClient remoteClient)
+        : this(connectionString)
+    {
+        _remoteClient = remoteClient ?? throw new ArgumentNullException(nameof(remoteClient));
     }
 
     /// <summary>
@@ -619,21 +627,42 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         int commandTimeout,
         CancellationToken cancellationToken)
     {
-        var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
-        var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
-        try
+        AhtolaRemoteClient.ValidateParameters(sql, parameters);
+        for (var attempt = 0; ; attempt++)
         {
-            return await remoteClient.ExecuteAsync(sql, parameters, wantRows, commandTimeout, closeAfter, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (AhtolaRemoteSqlException)
-        {
-            throw;
-        }
-        catch
-        {
-            InvalidateRemoteSession();
-            throw;
+            var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
+            var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
+            try
+            {
+                return await remoteClient.ExecuteAsync(sql, parameters, wantRows, commandTimeout, closeAfter, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (AhtolaRemoteSqlException exception) when (exception.IsStreamExpired)
+            {
+                if (_remoteTransactionActive)
+                {
+                    RecordRemoteTransactionFailure(exception);
+                    throw;
+                }
+
+                ResetRemoteSession();
+                if (attempt != 0)
+                    throw;
+            }
+            catch (AhtolaRemoteSqlException)
+            {
+                throw;
+            }
+            catch (AhtolaParameterException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                RecordRemoteTransactionFailure(exception);
+                InvalidateRemoteSession();
+                throw;
+            }
         }
     }
 
@@ -643,34 +672,54 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         bool wantRows,
         CancellationToken cancellationToken)
     {
-        var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
-        var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
-        try
+        AhtolaRemoteClient.ValidateParameters(batchCommands);
+        for (var attempt = 0; ; attempt++)
         {
-            return await remoteClient.ExecuteBatchAsync(
-                    batchCommands,
-                    commandTimeout,
-                    wantRows,
-                    closeAfter,
-                    cancellationToken,
-                    step => TransactionCompletedExternally(
-                        SqlTransactionControl.GetCompletion(batchCommands[step].CommandText)))
-                .ConfigureAwait(false);
-        }
-        catch (AhtolaRemoteSqlException)
-        {
-            throw;
-        }
-        catch
-        {
-            InvalidateRemoteSession();
-            throw;
+            var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
+            var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
+            try
+            {
+                return await remoteClient.ExecuteBatchAsync(
+                        batchCommands,
+                        commandTimeout,
+                        wantRows,
+                        closeAfter,
+                        cancellationToken,
+                        step => TransactionCompletedExternally(
+                            SqlTransactionControl.GetCompletion(batchCommands[step].CommandText)))
+                    .ConfigureAwait(false);
+            }
+            catch (AhtolaRemoteSqlException exception) when (exception.IsStreamExpired)
+            {
+                if (_remoteTransactionActive)
+                {
+                    RecordRemoteTransactionFailure(exception);
+                    throw;
+                }
+
+                ResetRemoteSession();
+                if (attempt != 0)
+                    throw;
+            }
+            catch (AhtolaRemoteSqlException)
+            {
+                throw;
+            }
+            catch (AhtolaParameterException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                RecordRemoteTransactionFailure(exception);
+                InvalidateRemoteSession();
+                throw;
+            }
         }
     }
 
     internal void BeginRemoteTransaction(IsolationLevel isolationLevel)
     {
-        _ = isolationLevel;
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
         if (_remoteTransactionActive)
             throw new InvalidOperationException("A transaction is already active on this connection.");
@@ -679,13 +728,16 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         try
         {
             remoteClient
-                .ExecuteAsync("BEGIN", new AhtolaParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
+                .ExecuteAsync(GetRemoteBeginSql(isolationLevel), new AhtolaParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
                 .GetAwaiter()
                 .GetResult();
         }
-        catch (AhtolaRemoteSqlException)
+        catch (AhtolaRemoteSqlException exception)
         {
-            _remoteTransactionActive = false;
+            if (exception.IsStreamExpired)
+                ResetRemoteSession();
+            else
+                _remoteTransactionActive = false;
             throw;
         }
         catch
@@ -699,7 +751,6 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         IsolationLevel isolationLevel,
         CancellationToken cancellationToken)
     {
-        _ = isolationLevel;
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
         if (_remoteTransactionActive)
             throw new InvalidOperationException("A transaction is already active on this connection.");
@@ -709,7 +760,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         {
             await remoteClient
                 .ExecuteAsync(
-                    "BEGIN",
+                    GetRemoteBeginSql(isolationLevel),
                     new AhtolaParameterCollection(),
                     wantRows: false,
                     DefaultTimeout,
@@ -717,9 +768,12 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                     cancellationToken)
                 .ConfigureAwait(false);
         }
-        catch (AhtolaRemoteSqlException)
+        catch (AhtolaRemoteSqlException exception)
         {
-            _remoteTransactionActive = false;
+            if (exception.IsStreamExpired)
+                ResetRemoteSession();
+            else
+                _remoteTransactionActive = false;
             throw;
         }
         catch
@@ -742,12 +796,15 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 .GetAwaiter()
                 .GetResult();
         }
-        catch (AhtolaRemoteSqlException)
+        catch (AhtolaRemoteSqlException exception)
         {
+            if (exception.IsStreamExpired)
+                RecordRemoteTransactionFailure(exception);
             throw;
         }
-        catch
+        catch (Exception exception)
         {
+            RecordRemoteTransactionFailure(exception);
             InvalidateRemoteSession();
             throw;
         }
@@ -773,12 +830,15 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                     cancellationToken)
                 .ConfigureAwait(false);
         }
-        catch (AhtolaRemoteSqlException)
+        catch (AhtolaRemoteSqlException exception)
         {
+            if (exception.IsStreamExpired)
+                RecordRemoteTransactionFailure(exception);
             throw;
         }
-        catch
+        catch (Exception exception)
         {
+            RecordRemoteTransactionFailure(exception);
             InvalidateRemoteSession();
             throw;
         }
@@ -800,8 +860,15 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 .GetResult();
             _remoteTransactionActive = false;
         }
-        catch
+        catch (AhtolaRemoteSqlException exception)
         {
+            if (exception.IsStreamExpired)
+                RecordRemoteTransactionFailure(exception);
+            throw;
+        }
+        catch (Exception exception)
+        {
+            RecordRemoteTransactionFailure(exception);
             InvalidateRemoteSession();
             throw;
         }
@@ -826,8 +893,15 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 .ConfigureAwait(false);
             _remoteTransactionActive = false;
         }
-        catch
+        catch (AhtolaRemoteSqlException exception)
         {
+            if (exception.IsStreamExpired)
+                RecordRemoteTransactionFailure(exception);
+            throw;
+        }
+        catch (Exception exception)
+        {
+            RecordRemoteTransactionFailure(exception);
             InvalidateRemoteSession();
             throw;
         }
@@ -857,10 +931,17 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         }
 
         ValidateDirectRemoteLocalProvider();
-        _remoteClient = new AhtolaRemoteClient(
-            _connectionOptions.GetRemoteUri(),
-            _connectionOptions.AuthToken,
-            _connectionOptions.GetRemoteEncryptionOptions());
+        var endpoint = _connectionOptions.GetRemoteUri();
+        var remoteEncryption = _connectionOptions.GetRemoteEncryptionOptions();
+        var handler = RemoteMessageHandlerFactory?.Invoke();
+        _remoteClient = handler is null
+            ? new AhtolaRemoteClient(endpoint, _connectionOptions.AuthToken, remoteEncryption)
+            : new AhtolaRemoteClient(
+                new HttpClient(handler, disposeHandler: false),
+                endpoint,
+                _connectionOptions.AuthToken,
+                remoteEncryption,
+                disposeHttpClient: true);
     }
 
     private async Task OpenRemoteReplicaAsync(
@@ -938,10 +1019,18 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 "Encryption Cipher and Encryption Key are local database options and cannot be used with remote Ahtola URLs.");
         }
 
-        return _replicaOptions ?? new AhtolaReplicaOptions(
+        if (_replicaOptions is not null)
+            return _replicaOptions;
+
+        var handler = RemoteMessageHandlerFactory?.Invoke();
+        return new AhtolaReplicaOptions(
             _connectionOptions.ReplicaPath,
             _connectionOptions.GetRemoteUri(),
-            _connectionOptions.AuthToken);
+            _connectionOptions.AuthToken)
+        {
+            SyncInterval = _connectionOptions.SyncInterval,
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
     }
 
     private void SetReplicaDatabase(AhtolaReplicaDatabase replicaDatabase)
@@ -1382,6 +1471,24 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         _remoteTransactionActive = false;
         _readUncommitted = false;
     }
+
+    private void ResetRemoteSession()
+    {
+        _remoteClient?.ResetSession();
+        _remoteTransactionActive = false;
+        _readUncommitted = false;
+    }
+
+    private void RecordRemoteTransactionFailure(Exception exception)
+    {
+        if (_remoteTransactionActive)
+            _transaction?.RecordFailure(exception);
+        if (exception is AhtolaRemoteSqlException { IsStreamExpired: true })
+            ResetRemoteSession();
+    }
+
+    private static string GetRemoteBeginSql(IsolationLevel isolationLevel)
+        => isolationLevel == IsolationLevel.ReadUncommitted ? "BEGIN" : "BEGIN IMMEDIATE";
 
     private void CloseOpenReaders()
     {

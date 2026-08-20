@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 
@@ -400,6 +401,23 @@ public sealed record SqliteWalRecoveryInfo(
 }
 
 /// <summary>
+/// Supplies one transaction's page images to
+/// <see cref="SqliteWalFile.AppendFrames(ISqliteWalFrameSource, uint)"/> without
+/// materializing an intermediate copy of the batch.
+/// </summary>
+public interface ISqliteWalFrameSource
+{
+    /// <summary>The number of frames in this batch. Must be greater than zero.</summary>
+    int Count { get; }
+
+    /// <summary>The 1-based database page number for <paramref name="index"/>.</summary>
+    uint GetPageNumber(int index);
+
+    /// <summary>The plaintext page image for <paramref name="index"/>.</summary>
+    ReadOnlySpan<byte> GetPageImage(int index);
+}
+
+/// <summary>
 /// A minimal, single-writer SQLite WAL file codec over <see cref="IFileSystem"/>.
 /// It validates checksums and salts but intentionally does not provide SQLite
 /// locking, shared-memory coordination, checkpointing, or transaction orchestration.
@@ -643,6 +661,137 @@ public sealed class SqliteWalFile : IDisposable
             throw new InvalidDataException("SQLite WAL length changed while preparing an append.");
 
         var frame = new byte[checked((int)FrameSize)];
+        EncodeFrame(frame, pageNumber, pageData, databaseSizeInPages, scan.LastChecksum);
+        AppendAtEnd(offset, frame);
+        return frameNumber;
+    }
+
+    /// <summary>
+    /// Appends an entire transaction's frames in one pass: the preceding WAL is
+    /// scanned once, the rolling checksum chain is carried across the batch, and
+    /// only the final frame carries the commit marker.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This mirrors Turso's <c>append_frames_vectored</c> /
+    /// <c>finish_append_frames_commit</c> split in
+    /// <c>core/storage/wal.rs</c>: a transaction's frames are one logical
+    /// append, so re-validating every preceding frame per page turns an
+    /// <c>O(P)</c> commit into an <c>O(P^2)</c> one.
+    /// </para>
+    /// <para>
+    /// Failure atomicity: each frame is written with one bounded write. A failed
+    /// write truncates its own partial frame, and every earlier frame of the
+    /// batch stays only as an uncommitted tail, because the commit marker is
+    /// written on the final frame alone. Recovery therefore discards the whole
+    /// batch, exactly as it would for the per-frame append path.
+    /// </para>
+    /// </remarks>
+    /// <returns>The frame number of the last appended frame.</returns>
+    public long AppendFrames(ISqliteWalFrameSource frames, uint commitDatabaseSizeInPages)
+    {
+        ArgumentNullException.ThrowIfNull(frames);
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+
+        var count = frames.Count;
+        if (count <= 0)
+            throw new ArgumentException("A SQLite WAL frame batch must contain at least one frame.", nameof(frames));
+
+        MaterializeHeaderAfterCheckpointTruncate();
+        var scan = ScanCore();
+        if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile)
+        {
+            throw new InvalidDataException(
+                "Cannot append to a SQLite WAL with a partial or invalid frame tail; recover it first.");
+        }
+
+        var firstFrameNumber = checked(scan.Info.LastValidFrameNumber + 1);
+        var baseOffset = FrameOffset(firstFrameNumber);
+        if (_file.Length != baseOffset)
+            throw new InvalidDataException("SQLite WAL length changed while preparing an append.");
+
+        var frameSize = checked((int)FrameSize);
+        var buffer = ArrayPool<byte>.Shared.Rent(frameSize);
+        var rolling = scan.LastChecksum;
+        var writeOffset = baseOffset;
+
+        try
+        {
+            for (var index = 0; index < count; index++)
+            {
+                var pageNumber = frames.GetPageNumber(index);
+                if (pageNumber == 0)
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(frames),
+                        pageNumber,
+                        "SQLite WAL page numbers are 1-based.");
+                }
+
+                var pageData = frames.GetPageImage(index);
+                if (pageData.Length != Header.PageSize)
+                {
+                    throw new ArgumentException(
+                        $"SQLite WAL page data must be exactly {Header.PageSize} bytes.",
+                        nameof(frames));
+                }
+
+                // Only the final frame of the batch carries the commit marker, so
+                // recovery treats a torn batch as entirely uncommitted.
+                var databaseSizeInPages = index == count - 1 ? commitDatabaseSizeInPages : 0U;
+                var frame = buffer.AsSpan(0, frameSize);
+                rolling = EncodeFrame(frame, pageNumber, pageData, databaseSizeInPages, rolling);
+
+                // One bounded write per frame keeps append granularity identical to
+                // the per-frame path; the win here is the single preceding scan.
+                var expectedLength = checked(writeOffset + frameSize);
+                _file.Write(writeOffset, frame);
+                if (_file.Length != expectedLength)
+                    throw new InvalidDataException("Appending a SQLite WAL frame produced an invalid file length.");
+
+                writeOffset = expectedLength;
+            }
+        }
+        catch (Exception appendException)
+        {
+            try
+            {
+                // Truncate only the frame that failed. Earlier frames of this
+                // batch stay as an uncommitted tail: none of them carries the
+                // commit marker, so recovery still discards the whole batch,
+                // and a peer sees exactly the boundary the per-frame path left.
+                if (_file.Length != writeOffset)
+                    _file.SetLength(writeOffset);
+            }
+            catch (Exception rollbackException)
+            {
+                throw new InvalidDataException(
+                    "Appending a SQLite WAL frame batch failed and the original length could not be restored.",
+                    new AggregateException(appendException, rollbackException));
+            }
+
+            throw;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        return checked(firstFrameNumber + count - 1);
+    }
+
+    /// <summary>
+    /// Writes one framed page image into <paramref name="destination"/> and
+    /// returns the rolling checksum after that frame.
+    /// </summary>
+    private (uint First, uint Second) EncodeFrame(
+        Span<byte> destination,
+        uint pageNumber,
+        ReadOnlySpan<byte> pageData,
+        uint databaseSizeInPages,
+        (uint First, uint Second) previousChecksum)
+    {
         var frameHeader = new SqliteWalFrameHeader(
             pageNumber,
             databaseSizeInPages,
@@ -650,32 +799,32 @@ public sealed class SqliteWalFile : IDisposable
             Header.Salt2,
             0,
             0);
-        frameHeader.WriteTo(frame.AsSpan(0, SqliteWalFrameHeader.Size));
-                if (_pageCodec is null)
-            pageData.CopyTo(frame.AsSpan(SqliteWalFrameHeader.Size));
+        frameHeader.WriteTo(destination[..SqliteWalFrameHeader.Size]);
+        if (_pageCodec is null)
+            pageData.CopyTo(destination[SqliteWalFrameHeader.Size..]);
         else
-                    PageCodecSupport.Encode(
-                        _pageCodec,
-                        PageLocation.Wal,
-                        pageNumber,
-                        pageData,
-                        frame.AsSpan(SqliteWalFrameHeader.Size));
+        {
+            PageCodecSupport.Encode(
+                _pageCodec,
+                PageLocation.Wal,
+                pageNumber,
+                pageData,
+                destination[SqliteWalFrameHeader.Size..]);
+        }
 
         var (First, Second) = SqliteWalChecksum.Calculate(
-            frame.AsSpan(0, 8),
+            destination[..8],
             Header.ChecksumByteOrder,
-            scan.LastChecksum.First,
-            scan.LastChecksum.Second);
+            previousChecksum.First,
+            previousChecksum.Second);
         var checksum = SqliteWalChecksum.Calculate(
-            frame.AsSpan(SqliteWalFrameHeader.Size),
+            destination[SqliteWalFrameHeader.Size..],
             Header.ChecksumByteOrder,
             First,
             Second);
-        BinaryPrimitives.WriteUInt32BigEndian(frame.AsSpan(16, 4), checksum.First);
-        BinaryPrimitives.WriteUInt32BigEndian(frame.AsSpan(20, 4), checksum.Second);
-
-        AppendAtEnd(offset, frame);
-        return frameNumber;
+        BinaryPrimitives.WriteUInt32BigEndian(destination.Slice(16, 4), checksum.First);
+        BinaryPrimitives.WriteUInt32BigEndian(destination.Slice(20, 4), checksum.Second);
+        return checksum;
     }
 
     /// <summary>
@@ -728,6 +877,89 @@ public sealed class SqliteWalFile : IDisposable
         }
 
         throw new InvalidOperationException("SQLite WAL frame traversal ended unexpectedly.");
+    }
+
+    /// <summary>
+    /// Reads a contiguous run of frames, validating the checksum chain from the
+    /// WAL header through <paramref name="lastFrameNumber"/> exactly once.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ReadFrame(long)"/> revalidates the whole prefix per call, so
+    /// materializing a commit's frames one at a time is <c>O(P^2)</c>. WAL-index
+    /// publication reads a contiguous committed range, which this serves in a
+    /// single pass.
+    /// </remarks>
+    public IReadOnlyList<SqliteWalFrame> ReadFrameRange(long firstFrameNumber, long lastFrameNumber)
+    {
+        ThrowIfDisposed();
+        if (firstFrameNumber < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(firstFrameNumber),
+                firstFrameNumber,
+                "SQLite WAL frame numbers are 1-based.");
+        }
+        if (lastFrameNumber < firstFrameNumber)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(lastFrameNumber),
+                lastFrameNumber,
+                "The last SQLite WAL frame number cannot precede the first.");
+        }
+
+        var fullFrameCount = CompleteFrameCount(_file.Length);
+        if (lastFrameNumber > fullFrameCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(lastFrameNumber),
+                lastFrameNumber,
+                $"Frame number is out of range for {fullFrameCount} complete SQLite WAL frame(s).");
+        }
+
+        var frameSize = checked((int)FrameSize);
+        var results = new List<SqliteWalFrame>(checked((int)(lastFrameNumber - firstFrameNumber + 1)));
+        var previousChecksum = (Header.Checksum1, Header.Checksum2);
+        var rented = ArrayPool<byte>.Shared.Rent(frameSize);
+        try
+        {
+            var frame = rented.AsSpan(0, frameSize);
+            for (var frameNumber = 1L; frameNumber <= lastFrameNumber; frameNumber++)
+            {
+                var read = _file.Read(FrameOffset(frameNumber), frame);
+                if (read != frame.Length)
+                {
+                    throw new InvalidDataException(
+                        $"Short read on SQLite WAL frame: expected {frame.Length} bytes, got {read} bytes.");
+                }
+
+                var frameHeader = ValidateFrame(frame, previousChecksum, out var checksum);
+                previousChecksum = checksum;
+                if (frameNumber < firstFrameNumber)
+                    continue;
+
+                var onDiskPageData = frame[SqliteWalFrameHeader.Size..];
+                var pageData = new byte[onDiskPageData.Length];
+                if (_pageCodec is null)
+                    onDiskPageData.CopyTo(pageData);
+                else
+                {
+                    PageCodecSupport.Decode(
+                        _pageCodec,
+                        PageLocation.Wal,
+                        frameHeader.PageNumber,
+                        onDiskPageData,
+                        pageData);
+                }
+
+                results.Add(new SqliteWalFrame(frameHeader, pageData));
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+
+        return results;
     }
 
     /// <summary>
@@ -893,43 +1125,63 @@ public sealed class SqliteWalFile : IDisposable
         var lastValidFrameNumber = 0L;
         var lastCommittedFrameNumber = 0L;
         var lastCommittedDatabaseSizeInPages = 0U;
-
-        for (var frameNumber = 1L; frameNumber <= fullFrameCount; frameNumber++)
+        if (fullFrameCount == 0)
         {
-            var frame = new byte[checked((int)FrameSize)];
-            if (_file.Read(FrameOffset(frameNumber), frame) != frame.Length)
-            {
-                return CreateScanState(
-                    lastValidFrameNumber,
-                    lastCommittedFrameNumber,
-                    lastCommittedDatabaseSizeInPages,
-                    SqliteWalRecoveryStopReason.PartialFrame,
-                    previousChecksum);
-            }
+            return CreateScanState(
+                lastValidFrameNumber,
+                lastCommittedFrameNumber,
+                lastCommittedDatabaseSizeInPages,
+                hasPartialFrame ? SqliteWalRecoveryStopReason.PartialFrame : SqliteWalRecoveryStopReason.EndOfFile,
+                previousChecksum);
+        }
 
-            SqliteWalFrameHeader frameHeader;
-            (uint First, uint Second) checksum;
-            try
+        // One rented buffer for the whole scan: allocating per frame turned every
+        // recovery scan into megabytes of garbage on large WALs.
+        var frameSize = checked((int)FrameSize);
+        var rented = ArrayPool<byte>.Shared.Rent(frameSize);
+        try
+        {
+            var frame = rented.AsSpan(0, frameSize);
+            for (var frameNumber = 1L; frameNumber <= fullFrameCount; frameNumber++)
             {
-                frameHeader = ValidateFrame(frame, previousChecksum, out checksum);
-            }
-            catch (InvalidDataException)
-            {
-                return CreateScanState(
-                    lastValidFrameNumber,
-                    lastCommittedFrameNumber,
-                    lastCommittedDatabaseSizeInPages,
-                    SqliteWalRecoveryStopReason.InvalidFrame,
-                    previousChecksum);
-            }
+                if (_file.Read(FrameOffset(frameNumber), frame) != frame.Length)
+                {
+                    return CreateScanState(
+                        lastValidFrameNumber,
+                        lastCommittedFrameNumber,
+                        lastCommittedDatabaseSizeInPages,
+                        SqliteWalRecoveryStopReason.PartialFrame,
+                        previousChecksum);
+                }
 
-            lastValidFrameNumber = frameNumber;
-            previousChecksum = checksum;
-            if (frameHeader.IsCommit)
-            {
-                lastCommittedFrameNumber = frameNumber;
-                lastCommittedDatabaseSizeInPages = frameHeader.DatabaseSizeInPages;
+                SqliteWalFrameHeader frameHeader;
+                (uint First, uint Second) checksum;
+                try
+                {
+                    frameHeader = ValidateFrame(frame, previousChecksum, out checksum);
+                }
+                catch (InvalidDataException)
+                {
+                    return CreateScanState(
+                        lastValidFrameNumber,
+                        lastCommittedFrameNumber,
+                        lastCommittedDatabaseSizeInPages,
+                        SqliteWalRecoveryStopReason.InvalidFrame,
+                        previousChecksum);
+                }
+
+                lastValidFrameNumber = frameNumber;
+                previousChecksum = checksum;
+                if (frameHeader.IsCommit)
+                {
+                    lastCommittedFrameNumber = frameNumber;
+                    lastCommittedDatabaseSizeInPages = frameHeader.DatabaseSizeInPages;
+                }
             }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
         }
 
         return CreateScanState(

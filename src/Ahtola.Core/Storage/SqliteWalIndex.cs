@@ -915,12 +915,17 @@ public sealed class SqliteWalIndexSharedMemory
                     "The SQLite WAL does not contain exactly the committed frame boundary being published.");
             }
 
+            // One chain walk for the published run: ReadFrame revalidates the
+            // whole prefix per call, making per-frame verification O(P^2).
+            var expectedFrames = wal.ReadFrameRange(
+                checked(priorHeader.MaximumFrame + 1U),
+                committedHeader.MaximumFrame);
             for (var index = 0; index < frames.Count; index++)
             {
                 var frameNumber = checked(priorHeader.MaximumFrame + (uint)index + 1);
                 var frame = frames[index]
                     ?? throw new ArgumentException("SQLite WAL frame collections cannot contain null frames.", nameof(frames));
-                var expected = wal.ReadFrame(frameNumber);
+                var expected = expectedFrames[index];
                 if (frame.Header != expected.Header || !frame.PageData.AsSpan().SequenceEqual(expected.PageData))
                 {
                     throw new InvalidDataException(
@@ -1110,11 +1115,11 @@ public sealed class SqliteWalIndexSharedMemory
             EnsureWritableBlocks(SqliteWalIndexLayout.GetRequiredBlockCount(maximumFrame));
             ClearFrameIndex();
             PublishResetCheckpointInfo();
-            for (var frameNumber = 1U; maximumFrame != 0; frameNumber++)
+            if (maximumFrame != 0)
             {
-                PublishFrameIndex(frameNumber, wal.ReadFrame(frameNumber).Header.PageNumber);
-                if (frameNumber == maximumFrame)
-                    break;
+                var frameNumber = 0U;
+                foreach (var frame in wal.ReadFrameRange(1, maximumFrame))
+                    PublishFrameIndex(++frameNumber, frame.Header.PageNumber);
             }
 
             _mapping.MemoryBarrier();

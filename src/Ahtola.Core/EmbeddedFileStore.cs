@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using Ahtola.Core.Parsing;
 using Ahtola.Core.Storage;
 
@@ -154,42 +154,55 @@ internal sealed class EmbeddedFileStore : IDisposable
         bool readOnly = false,
         int? initialPageSize = null,
         SqliteTextEncoding? initialTextEncoding = null,
-            bool foreignReadOnly = false,
-            IPageCodec? pageCodec = null)
+        bool foreignReadOnly = false,
+        IPageCodec? pageCodec = null,
+        bool createRollbackJournalMode = false)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
+
+        var walPath = path + "-wal";
+        var databaseExists = fileSystem.FileExists(path);
+        var walExists = fileSystem.FileExists(walPath);
+        if (initialPageSize is { } requestedPageSize)
+            _ = SqlitePageSize.Encode(requestedPageSize);
+
+        SqlitePager pager;
+        if (!databaseExists)
         {
-            ArgumentException.ThrowIfNullOrEmpty(path);
-            ArgumentNullException.ThrowIfNull(fileSystem);
-            PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
-
-            var walPath = path + "-wal";
-            var databaseExists = fileSystem.FileExists(path);
-            var walExists = fileSystem.FileExists(walPath);
-            if (initialPageSize is { } requestedPageSize)
-                _ = SqlitePageSize.Encode(requestedPageSize);
-
-            SqlitePager pager;
-            if (!databaseExists)
+            if (readOnly)
             {
-                if (readOnly)
-                {
-                    throw new EmbeddedSqlException(
-                        $"Cannot open managed database '{path}' read-only because its database file does not exist.");
-                }
+                throw new EmbeddedSqlException(
+                    $"Cannot open managed database '{path}' read-only because its database file does not exist.");
+            }
 
-                // The main database file is absent. A lingering write-ahead log is
-                // orphaned — its frames reference a database that was deleted (for
-                // example by EFCore's EnsureDeleted, which removes only the main
-                // file). Native SQLite discards the orphaned WAL and creates a
-                // fresh database; match that so delete/reopen cycles do not fault
-                // with "missing its main database file".
-                if (walExists)
-                    fileSystem.DeleteFile(walPath);
+            // The main database file is absent. A lingering write-ahead log is
+            // orphaned — its frames reference a database that was deleted (for
+            // example by EFCore's EnsureDeleted, which removes only the main
+            // file). Native SQLite discards the orphaned WAL and creates a
+            // fresh database; match that so delete/reopen cycles do not fault
+            // with "missing its main database file".
+            if (walExists)
+                fileSystem.DeleteFile(walPath);
 
-                var header = SqliteDatabaseHeader.CreateDefault() with
-                {
-                    PageSize = initialPageSize ?? SqlitePageSize.Default,
-                    TextEncoding = initialTextEncoding ?? SqliteTextEncoding.Utf8,
-                };
+            var header = SqliteDatabaseHeader.CreateDefault() with
+            {
+                PageSize = initialPageSize ?? SqlitePageSize.Default,
+                TextEncoding = initialTextEncoding ?? SqliteTextEncoding.Utf8,
+            };
+            if (createRollbackJournalMode)
+            {
+                pager = SqlitePager.CreateRollbackJournal(
+                    fileSystem,
+                    path,
+                    walPath,
+                    header,
+                    encryption: encryption,
+                    pageCodec: pageCodec);
+            }
+            else
+            {
                 var walHeader = SqliteWalHeader.Create(
                     header.PageSize,
                     unchecked((uint)Random.Shared.Next()),
@@ -203,22 +216,23 @@ internal sealed class EmbeddedFileStore : IDisposable
                     encryption: encryption,
                     pageCodec: pageCodec);
             }
-            else
+        }
+        else
+        {
+            if (initialPageSize is not null || initialTextEncoding is not null)
             {
-                if (initialPageSize is not null || initialTextEncoding is not null)
-                {
-                    throw new InvalidOperationException(
-                        "Initial page size and text encoding can be specified only when creating a database.");
-                }
-                pager = SqlitePager.Open(
-                    fileSystem,
-                    path,
-                    walPath,
-                    readOnly,
-                    encryption: encryption,
-                    foreignReadOnly: foreignReadOnly,
-                    pageCodec: pageCodec);
+                throw new InvalidOperationException(
+                    "Initial page size and text encoding can be specified only when creating a database.");
             }
+            pager = SqlitePager.Open(
+                fileSystem,
+                path,
+                walPath,
+                readOnly,
+                encryption: encryption,
+                foreignReadOnly: foreignReadOnly,
+                pageCodec: pageCodec);
+        }
 
         try
         {
@@ -1375,6 +1389,37 @@ internal sealed class EmbeddedFileStore : IDisposable
             previousTables,
             checkpointAfterCommit: false);
 
+    /// <summary>
+    /// Builds a private, not-yet-published VACUUM destination image in one
+    /// transaction: the source header is folded into the same commit and no
+    /// intermediate checkpoint runs.
+    /// </summary>
+    /// <remarks>
+    /// This mirrors SQLite's <c>vacuum.c</c> (and Turso's
+    /// <c>core/vdbe/vacuum.rs</c>) target-build policy: the target is a private
+    /// temporary file, so intermediate durability buys nothing — a crash simply
+    /// discards it. Durability is established once, by the caller's final
+    /// journal-mode fold, before the image is atomically published.
+    /// </remarks>
+    private FileCatalogVersion PersistForVacuumTarget(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
+        SqliteDatabaseHeader vacuumSourceHeader)
+        => PersistCore(
+            tables,
+            views,
+            triggers,
+            virtualTables,
+            reclaimTrailingPages: false,
+            incrementSchemaCookie: false,
+            pragmaHeader: null,
+            forceFullRewrite: false,
+            previousTables: null,
+            checkpointAfterCommit: false,
+            vacuumSourceHeader: vacuumSourceHeader);
+
     internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header);
 
     /// <summary>
@@ -1570,11 +1615,15 @@ internal sealed class EmbeddedFileStore : IDisposable
                        _fileSystem,
                        out _,
                        initialPageSize: pageSize,
-                       initialTextEncoding: _textEncoding))
+                       initialTextEncoding: _textEncoding,
+                       createRollbackJournalMode: true))
             {
-                replacement.Persist(tables, views, triggers, virtualTables);
-                replacement.SwitchJournalMode(SqliteJournalMode.Delete);
-                replacement.RewriteVacuumHeader(_header);
+                // The private target is created directly in DELETE mode and its
+                // final image is written straight into the main file: nothing can
+                // observe it until it is atomically published, so an intermediate
+                // WAL copy plus checkpoint buys no recoverability.
+                replacement.PersistForVacuumTarget(tables, views, triggers, virtualTables, _header);
+                replacement.ValidateVacuumTarget();
             }
 
             try
@@ -1604,6 +1653,32 @@ internal sealed class EmbeddedFileStore : IDisposable
             TryDeleteArtifact(temporaryShmPath);
             TryDeleteArtifact(temporaryPath);
         }
+    }
+
+    /// <summary>
+    /// Proves a freshly folded VACUUM destination is self-contained before it is
+    /// published: the WAL is gone, the header is authoritative, and the complete
+    /// catalog re-reads and re-validates from the main image alone.
+    /// </summary>
+    private void ValidateVacuumTarget()
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        if (_pager.JournalMode != SqliteJournalMode.Delete)
+        {
+            throw new EmbeddedSqlException(
+                "VACUUM INTO could not fold its destination into a self-contained database image.");
+        }
+
+        var header = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
+        if (header.DatabaseSizeInPages != _pager.CommittedPageCount
+            || header.VersionValidFor != header.ChangeCounter)
+        {
+            throw new EmbeddedSqlException(
+                "VACUUM INTO produced a destination whose header does not describe its own image.");
+        }
+
+        _header = header;
     }
 
     private void RewriteVacuumHeader(SqliteDatabaseHeader sourceHeader)
@@ -1652,7 +1727,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         PragmaHeaderMetadata? pragmaHeader,
         bool forceFullRewrite,
         IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null,
-        bool checkpointAfterCommit = true)
+        bool checkpointAfterCommit = true,
+        SqliteDatabaseHeader? vacuumSourceHeader = null)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -1777,6 +1853,24 @@ internal sealed class EmbeddedFileStore : IDisposable
             UserVersion = pragmaHeader?.UserVersion ?? currentHeader.UserVersion,
             ApplicationId = pragmaHeader?.ApplicationId ?? currentHeader.ApplicationId,
         };
+        if (vacuumSourceHeader is { } vacuumSource)
+        {
+            // Fold VACUUM's destination header into the single rebuild commit
+            // instead of paying a second transaction to rewrite page one.
+            var vacuumChangeCounter = unchecked(vacuumSource.ChangeCounter + 1);
+            newHeader = newHeader with
+            {
+                ChangeCounter = vacuumChangeCounter,
+                VersionValidFor = vacuumChangeCounter,
+                SchemaCookie = unchecked(vacuumSource.SchemaCookie + 1),
+                DefaultPageCacheSize = vacuumSource.DefaultPageCacheSize,
+                TextEncoding = vacuumSource.TextEncoding,
+                UserVersion = vacuumSource.UserVersion,
+                ApplicationId = vacuumSource.ApplicationId,
+                SqliteVersion = vacuumSource.SqliteVersion,
+            };
+        }
+
         newHeader.WriteTo(schemaTree.RootPage);
         ValidateRewritePlan(
             target,
@@ -1788,6 +1882,39 @@ internal sealed class EmbeddedFileStore : IDisposable
             indexRootPages,
             indexPages,
             freelist);
+
+        if (vacuumSourceHeader is not null)
+        {
+            // Private, unpublished destination: write the final image straight
+            // into the main file instead of through WAL + checkpoint.
+            var image = new Dictionary<uint, ReadOnlyMemory<byte>>(checked((int)target));
+            CollectRewritePlanPages(
+                image,
+                tableNames,
+                rootPages,
+                tablePages,
+                indexes,
+                indexRootPages,
+                indexPages,
+                schemaTree,
+                freelist);
+            for (var pageNumber = 1U; pageNumber <= target; pageNumber++)
+            {
+                if (!image.ContainsKey(pageNumber))
+                {
+                    throw new EmbeddedSqlException(
+                        $"VACUUM INTO could not build a complete destination image: page {pageNumber} is missing.");
+                }
+            }
+
+            _pager.WriteUnpublishedVacuumImage(target, pageNumber => image[pageNumber]);
+            _header = newHeader;
+            _tableRootPages = rootPages;
+            _indexRootPages = indexRootPages;
+            _lastSchemaSignature = signature;
+            _committedTables = tables;
+            return CommittedCatalogVersion;
+        }
 
         using (var transaction = reclaimTrailingPages
                    ? _pager.BeginExclusiveRewriteTransaction(target)
@@ -1842,6 +1969,58 @@ internal sealed class EmbeddedFileStore : IDisposable
         _lastSchemaSignature = signature;
         _committedTables = tables;
         return CommittedCatalogVersion;
+    }
+
+    /// <summary>
+    /// Gathers every page of a completed rewrite plan by final page number, in
+    /// the same order the transaction path writes them.
+    /// </summary>
+    private static void CollectRewritePlanPages(
+        Dictionary<uint, ReadOnlyMemory<byte>> image,
+        IReadOnlyList<string> tableNames,
+        IReadOnlyDictionary<string, uint> rootPages,
+        IReadOnlyDictionary<uint, PreparedTableTree> tablePages,
+        IReadOnlyList<IndexDefinition> indexes,
+        IReadOnlyDictionary<string, uint> indexRootPages,
+        IReadOnlyDictionary<uint, PreparedIndexTree> indexPages,
+        PreparedSchemaTree schemaTree,
+        SqliteFreelist freelist)
+    {
+        foreach (var name in tableNames)
+        {
+            var tablePage = tablePages[rootPages[name]];
+            image[rootPages[name]] = tablePage.RootPage;
+            foreach (var interiorPage in tablePage.InteriorPages)
+                image[interiorPage.PageNumber] = interiorPage.Page;
+            foreach (var leafPage in tablePage.LeafPages)
+                image[leafPage.PageNumber] = leafPage.Page;
+            foreach (var overflowPage in tablePage.OverflowPages)
+                image[overflowPage.PageNumber] = overflowPage.Page;
+        }
+
+        foreach (var definition in indexes)
+        {
+            var indexPage = indexPages[indexRootPages[definition.Index.Name]];
+            image[indexRootPages[definition.Index.Name]] = indexPage.RootPage;
+            foreach (var interiorPage in indexPage.InteriorPages)
+                image[interiorPage.PageNumber] = interiorPage.Page;
+            foreach (var leafPage in indexPage.LeafPages)
+                image[leafPage.PageNumber] = leafPage.Page;
+            foreach (var overflowPage in indexPage.OverflowPages)
+                image[overflowPage.PageNumber] = overflowPage.Page;
+        }
+
+        foreach (var interiorPage in schemaTree.InteriorPages)
+            image[interiorPage.PageNumber] = interiorPage.Page;
+        foreach (var leafPage in schemaTree.LeafPages)
+            image[leafPage.PageNumber] = leafPage.Page;
+        foreach (var overflowPage in schemaTree.OverflowPages)
+            image[overflowPage.PageNumber] = overflowPage.Page;
+        foreach (var freelistPage in freelist.PageImages)
+            image[freelistPage.PageNumber] = freelistPage.Page;
+
+        // Page one carries the authoritative size and catalog routing.
+        image[SchemaRootPage] = schemaTree.RootPage;
     }
 
     /// <summary>The number of changed rows above which a complete rewrite is preferred.</summary>
@@ -8961,44 +9140,63 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private List<List<PendingTableCell>> PartitionTableLeafCells(string name, EmbeddedTable table)
     {
+        // Planning only needs each cell's encoded length to place page
+        // boundaries, and rowids are already strictly increasing here, so a
+        // throwaway page builder (which copies every payload into a planning
+        // cell and signals "full" by throwing) was pure duplicated work. The fit
+        // arithmetic mirrors SqliteTableLeafPageBuilder.EnsureFits exactly so
+        // page boundaries are unchanged.
+        const int HeaderOffset = 0;
         var leafGroups = new List<List<PendingTableCell>> { new() };
-        var builder = new SqliteTableLeafPageBuilder(_pageSize, _usableSpace, isFirstPage: false);
+        var cellBytes = 0;
+        var cellCount = 0;
         foreach (var (rowId, record) in EnumerateRowCells(name, table))
         {
-            var pending = new PendingTableCell(
+            var encodedLength = SqliteTableLeafCell.CalculateEncodedLength(
                 rowId,
-                record,
-                CreateTableLeafPlanningCell(rowId, record));
-            try
+                checked((ulong)record.Length),
+                _usableSpace);
+            if (!TableLeafCellFits(HeaderOffset, cellBytes, cellCount, encodedLength))
             {
-                builder.Append(pending.PlanningCell);
-            }
-            catch (InvalidOperationException) when (leafGroups[^1].Count > 0)
-            {
-                leafGroups.Add([]);
-                builder = new SqliteTableLeafPageBuilder(_pageSize, _usableSpace, isFirstPage: false);
-                try
-                {
-                    builder.Append(pending.PlanningCell);
-                }
-                catch (InvalidOperationException exception)
+                if (cellCount == 0 || leafGroups[^1].Count == 0)
                 {
                     throw new EmbeddedSqlException(
-                        $"The managed file engine cannot persist table '{name}' because rowid {rowId} cannot fit in a SQLite table leaf.",
-                        exception);
+                        $"The managed file engine cannot persist table '{name}' because rowid {rowId} cannot fit in a SQLite table leaf.");
+                }
+
+                leafGroups.Add([]);
+                cellBytes = 0;
+                cellCount = 0;
+                if (!TableLeafCellFits(HeaderOffset, cellBytes, cellCount, encodedLength))
+                {
+                    throw new EmbeddedSqlException(
+                        $"The managed file engine cannot persist table '{name}' because rowid {rowId} cannot fit in a SQLite table leaf.");
                 }
             }
-            catch (InvalidOperationException exception)
-            {
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist table '{name}' because rowid {rowId} cannot fit in a SQLite table leaf.",
-                    exception);
-            }
 
-            leafGroups[^1].Add(pending);
+            cellBytes = checked(cellBytes + encodedLength);
+            cellCount++;
+            leafGroups[^1].Add(new PendingTableCell(rowId, record));
         }
 
         return leafGroups;
+    }
+
+    /// <summary>
+    /// Mirrors <c>SqliteTableLeafPageBuilder.EnsureFits</c>: whether one more
+    /// cell and its pointer still fit in the leaf's usable space.
+    /// </summary>
+    private bool TableLeafCellFits(int headerOffset, int cellBytes, int cellCount, int additionalCellLength)
+    {
+        if (cellCount == ushort.MaxValue)
+            return false;
+
+        var totalCellBytes = checked(cellBytes + additionalCellLength);
+        var pointerArrayEnd = checked(
+            headerOffset
+            + SqliteBtreePageHeader.LeafHeaderSize
+            + ((cellCount + 1) * sizeof(ushort)));
+        return _usableSpace - totalCellBytes >= pointerArrayEnd;
     }
 
     private SqliteTableLeafCell CreateTableLeafPlanningCell(long rowId, ReadOnlySpan<byte> record)
@@ -9675,41 +9873,62 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyList<byte[]> records,
         SqliteIndexRecordComparer comparer)
     {
+        // Planning only needs each cell's encoded length to place page
+        // boundaries; BuildIndexRecords already proved strict order over the
+        // whole sequence, so re-decoding and re-comparing every record here
+        // (through a throwaway page builder) was pure duplicated work. The fit
+        // arithmetic mirrors SqliteIndexLeafPageBuilder.EnsureFits exactly so
+        // page boundaries are unchanged.
+        const int HeaderOffset = 0;
         var leafGroups = new List<List<byte[]>> { new() };
-        var builder = new SqliteIndexLeafPageBuilder(_pageSize, _usableSpace, comparer);
+        var cellBytes = 0;
+        var cellCount = 0;
         foreach (var record in records)
         {
-            var planningCell = CreateIndexLeafPlanningCell(record);
-            try
+            var encodedLength = SqliteIndexLeafCell.CalculateEncodedLength(
+                checked((ulong)record.Length),
+                _usableSpace);
+            if (!IndexLeafCellFits(HeaderOffset, cellBytes, cellCount, encodedLength))
             {
-                builder.Append(planningCell, record);
-            }
-            catch (InvalidOperationException) when (leafGroups[^1].Count > 0)
-            {
-                leafGroups.Add([]);
-                builder = new SqliteIndexLeafPageBuilder(_pageSize, _usableSpace, comparer);
-                try
-                {
-                    builder.Append(planningCell, record);
-                }
-                catch (InvalidOperationException exception)
+                if (cellCount == 0 || leafGroups[^1].Count == 0)
                 {
                     throw new EmbeddedSqlException(
-                        $"The managed file engine cannot persist {treeDescription} because one key cannot fit in a SQLite index leaf.",
-                        exception);
+                        $"The managed file engine cannot persist {treeDescription} because one key cannot fit in a SQLite index leaf.");
+                }
+
+                leafGroups.Add([]);
+                cellBytes = 0;
+                cellCount = 0;
+                if (!IndexLeafCellFits(HeaderOffset, cellBytes, cellCount, encodedLength))
+                {
+                    throw new EmbeddedSqlException(
+                        $"The managed file engine cannot persist {treeDescription} because one key cannot fit in a SQLite index leaf.");
                 }
             }
-            catch (InvalidOperationException exception)
-            {
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist {treeDescription} because one key cannot fit in a SQLite index leaf.",
-                    exception);
-            }
 
+            cellBytes = checked(cellBytes + encodedLength);
+            cellCount++;
             leafGroups[^1].Add(record);
         }
 
         return leafGroups;
+    }
+
+    /// <summary>
+    /// Mirrors <c>SqliteIndexLeafPageBuilder.EnsureFits</c>: whether one more
+    /// cell and its pointer still fit in the leaf's usable space.
+    /// </summary>
+    private bool IndexLeafCellFits(int headerOffset, int cellBytes, int cellCount, int additionalCellLength)
+    {
+        if (cellCount == ushort.MaxValue)
+            return false;
+
+        var totalCellBytes = checked(cellBytes + additionalCellLength);
+        var pointerArrayEnd = checked(
+            headerOffset
+            + SqliteBtreePageHeader.LeafHeaderSize
+            + ((cellCount + 1) * sizeof(ushort)));
+        return _usableSpace - totalCellBytes >= pointerArrayEnd;
     }
 
     private SqliteIndexLeafCell CreateIndexLeafPlanningCell(ReadOnlySpan<byte> record)
@@ -9735,7 +9954,12 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         var builder = new SqliteIndexLeafPageBuilder(_pageSize, _usableSpace, comparer);
         foreach (var record in records)
-            builder.Append(CreateIndexLeafCell(record, allocator, overflowPages), record);
+        {
+            // BuildIndexRecords already proved this sequence strictly ordered and
+            // decodable, and the cell is derived from the record right here.
+            builder.AppendTrusted(CreateIndexLeafCell(record, allocator, overflowPages));
+        }
+
         return builder.Build();
     }
 
@@ -10057,7 +10281,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         var storageColumns = table.WithoutRowid
             ? GetWithoutRowidIndexStorageColumns(table, index)
             : null;
-        var records = new List<byte[]>(table.Rows.Count);
+        var decorated = new List<(SqlValue[] SortKey, byte[] Record)>(table.Rows.Count);
         for (var rowIndex = 0; rowIndex < table.Rows.Count; rowIndex++)
         {
             var row = table.Rows[rowIndex];
@@ -10099,18 +10323,26 @@ internal sealed class EmbeddedFileStore : IDisposable
                 values[^1] = SqlValue.Integer(rowId!.Value);
             }
             var record = SqliteRecordCodec.Encode(values, _textEncoding);
-            comparer.Validate(record);
-            records.Add(record);
+            // `values` is already the decoded form of `record`: every SqlValue
+            // factory normalises on construction (SqlValue.Real folds NaN to
+            // NULL), and Encode self-checks its header/body sizing. Decoding the
+            // record back just to obtain a sort key cost one decode plus a fresh
+            // value array and string per row of every index.
+            decorated.Add((values, record));
         }
 
-        records.Sort((left, right) => comparer.Compare(left, right));
-        for (var indexPosition = 1; indexPosition < records.Count; indexPosition++)
+        decorated.Sort((left, right) => comparer.Compare(left.SortKey, right.SortKey));
+        var records = new List<byte[]>(decorated.Count);
+        for (var indexPosition = 0; indexPosition < decorated.Count; indexPosition++)
         {
-            if (comparer.Compare(records[indexPosition - 1], records[indexPosition]) >= 0)
+            if (indexPosition > 0
+                && comparer.Compare(decorated[indexPosition - 1].SortKey, decorated[indexPosition].SortKey) >= 0)
             {
                 throw new EmbeddedSqlException(
                     $"The managed file engine cannot persist index '{index.Name}' because its complete SQLite index keys are not strictly ordered.");
             }
+
+            records.Add(decorated[indexPosition].Record);
         }
 
         return records;
@@ -11010,7 +11242,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private sealed record PageImage(uint PageNumber, byte[] Page);
 
-    private sealed record PendingTableCell(long RowId, byte[] Record, SqliteTableLeafCell PlanningCell);
+    private sealed record PendingTableCell(long RowId, byte[] Record);
 
     private sealed record WithoutRowidRecord(byte[] Record, SqlValue[] Key);
 

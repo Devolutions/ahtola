@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.Common;
+using System.Net.Http;
 using Ahtola;
 
 namespace Ahtola.Data.Sqlite;
@@ -97,6 +98,9 @@ public sealed class SqliteBatch : DbBatch
     public override int ExecuteNonQuery()
     {
         var connection = ValidateBatch();
+        if (UsesRemoteBatch(connection))
+            return ExecuteRemoteNonQueryAsync(connection, CancellationToken.None).GetAwaiter().GetResult();
+
         var (commands, execution) = CreateExecution(connection, CancellationToken.None);
         return SequentialBatchExecutor.ExecuteNonQuery(commands, execution);
     }
@@ -105,6 +109,9 @@ public sealed class SqliteBatch : DbBatch
     {
         cancellationToken.ThrowIfCancellationRequested();
         var connection = ValidateBatch();
+        if (UsesRemoteBatch(connection))
+            return await ExecuteRemoteNonQueryAsync(connection, cancellationToken).ConfigureAwait(false);
+
         var (commands, execution) = CreateExecution(connection, cancellationToken);
         return await SequentialBatchExecutor
             .ExecuteNonQueryAsync(commands, execution)
@@ -154,6 +161,9 @@ public sealed class SqliteBatch : DbBatch
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
     {
         var connection = ValidateBatch();
+        if (UsesRemoteBatch(connection))
+            return ExecuteRemoteReaderAsync(connection, behavior, CancellationToken.None).GetAwaiter().GetResult();
+
         var (commands, execution) = CreateExecution(connection, CancellationToken.None);
         return SequentialBatchExecutor.ExecuteReader(commands, execution, behavior);
     }
@@ -164,6 +174,9 @@ public sealed class SqliteBatch : DbBatch
     {
         cancellationToken.ThrowIfCancellationRequested();
         var connection = ValidateBatch();
+        if (UsesRemoteBatch(connection))
+            return await ExecuteRemoteReaderAsync(connection, behavior, cancellationToken).ConfigureAwait(false);
+
         var (commands, execution) = CreateExecution(connection, cancellationToken);
         return await SequentialBatchExecutor
             .ExecuteReaderAsync(commands, execution, behavior)
@@ -199,6 +212,8 @@ public sealed class SqliteBatch : DbBatch
             ?? throw new InvalidOperationException("Connection must be set before executing a batch.");
         if (connection.State != ConnectionState.Open)
             throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection("ExecuteBatch"));
+        if (!connection.CanCreateBatch)
+            throw new NotSupportedException("Batch execution is not supported by this embedded replica connection.");
         if (_transaction is { IsCompleted: true } or { WasRolledBackExternally: true })
             throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
         if (_transaction is not null && !ReferenceEquals(_transaction.Connection, connection))
@@ -217,6 +232,94 @@ public sealed class SqliteBatch : DbBatch
         }
 
         return connection;
+    }
+
+    private static bool UsesRemoteBatch(SqliteConnection connection)
+        => connection.Capabilities.Mode == AhtolaConnectionMode.RemoteHrana;
+
+    private async Task<int> ExecuteRemoteNonQueryAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        using var execution = BeginExecution(cancellationToken);
+        using var batch = CreateRemoteBatch(connection);
+        try
+        {
+            var recordsAffected = await batch.ExecuteNonQueryAsync(execution.Token).ConfigureAwait(false);
+            CopyRemoteRecordsAffected(batch);
+            return recordsAffected;
+        }
+        catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
+        {
+            throw SqliteRemoteExceptionClassifier.From(ex, SqliteCommand.ToSqliteException(ex));
+        }
+    }
+
+    private async Task<DbDataReader> ExecuteRemoteReaderAsync(
+        SqliteConnection connection,
+        CommandBehavior behavior,
+        CancellationToken cancellationToken)
+    {
+        using var execution = BeginExecution(cancellationToken);
+        var batch = CreateRemoteBatch(connection);
+        try
+        {
+            var reader = await batch.ExecuteReaderAsync(behavior, execution.Token).ConfigureAwait(false);
+            CopyRemoteRecordsAffected(batch);
+            var command = new SqliteCommand(connection);
+            return new SqliteDataReader(
+                command,
+                reader,
+                behavior,
+                () =>
+                {
+                    batch.Dispose();
+                    command.Dispose();
+                },
+                // Every explicitly-added DbBatchCommand must be exposed 1:1, including a plain
+                // write with no RETURNING clause (0 columns) — this is the raw DbBatch contract
+                // callers rely on (mirrored by the local/replica SequentialBatchDataReader), and
+                // is why the general SqliteCommand skip-to-first-column-result behavior must not
+                // apply here.
+                skipToFirstColumnResult: false);
+        }
+        catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
+        {
+            batch.Dispose();
+            throw SqliteRemoteExceptionClassifier.From(ex, SqliteCommand.ToSqliteException(ex));
+        }
+        catch
+        {
+            batch.Dispose();
+            throw;
+        }
+    }
+
+    private AhtolaBatch CreateRemoteBatch(SqliteConnection connection)
+    {
+        var batch = new AhtolaBatch(connection.AhtolaConnection!)
+        {
+            Timeout = Timeout,
+        };
+        var index = 0;
+        foreach (var batchCommand in _batchCommands.AsReadOnly())
+        {
+            var remoteCommand = new AhtolaBatchCommand(batchCommand.CommandText);
+            CopyParameters(batchCommand.Parameters, remoteCommand.Parameters);
+            if (index > 0)
+                remoteCommand.RemoteCondition = AhtolaRemoteBatchCondition.StepSucceeded(index - 1);
+            batch.BatchCommands.Add(remoteCommand);
+            index++;
+        }
+
+        return batch;
+    }
+
+    private void CopyRemoteRecordsAffected(AhtolaBatch batch)
+    {
+        var remoteCommands = batch.BatchCommands.AsReadOnly();
+        for (var i = 0; i < remoteCommands.Count; i++)
+            _batchCommands.AsReadOnly()[i].SetRecordsAffected(remoteCommands[i].RecordsAffected);
     }
 
     private (
@@ -309,6 +412,29 @@ public sealed class SqliteBatch : DbBatch
                 copy.Value = SnapshotValue(parameter.Value);
 
             destination.Add(copy);
+        }
+    }
+
+    private static void CopyParameters(
+        SqliteParameterCollection source,
+        AhtolaParameterCollection destination)
+    {
+        foreach (SqliteParameter parameter in source)
+        {
+            if (!parameter.HasValue)
+                throw new InvalidOperationException(Properties.Resources.RequiresSet(nameof(parameter.Value)));
+
+            destination.Add(new AhtolaParameter
+            {
+                ParameterName = parameter.ParameterName,
+                DbType = parameter.DbType,
+                Direction = parameter.Direction,
+                IsNullable = parameter.IsNullable,
+                SourceColumn = parameter.SourceColumn,
+                SourceColumnNullMapping = parameter.SourceColumnNullMapping,
+                Size = parameter.Size,
+                Value = SqliteCommand.SnapshotAhtolaParameterValue(parameter.GetResolvedStorageValue()),
+            });
         }
     }
 

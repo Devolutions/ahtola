@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Sqlite.Storage.Internal;
 using Microsoft.EntityFrameworkCore.Storage;
+using Ahtola;
 using AhtolaSqliteConnection = Ahtola.Data.Sqlite.SqliteConnection;
 using AhtolaSqliteConnectionStringBuilder = Ahtola.Data.Sqlite.SqliteConnectionStringBuilder;
 using AhtolaSqliteOpenMode = Ahtola.Data.Sqlite.SqliteOpenMode;
@@ -44,9 +45,18 @@ public class AhtolaSqliteRelationalConnection : SqliteRelationalConnection
     {
         var connectionStringBuilder = new AhtolaSqliteConnectionStringBuilder(GetValidatedConnectionString())
         {
-            Mode = AhtolaSqliteOpenMode.ReadOnly,
             Pooling = false
         };
+
+        // A direct remote Hrana connection cannot enforce Mode=ReadOnly locally (the facade
+        // rejects it at Open() because there is no local file to guard); only apply it for
+        // local and embedded-replica connections, where it maps to a real local semantic
+        // (a native/managed read-only file open, or PRAGMA query_only for a replica).
+        if (AhtolaConnectionModeClassifier.Classify(connectionStringBuilder.DataSource, connectionStringBuilder.ReplicaPath)
+            != AhtolaConnectionEndpointMode.RemoteHrana)
+        {
+            connectionStringBuilder.Mode = AhtolaSqliteOpenMode.ReadOnly;
+        }
 
         var contextOptions = new DbContextOptionsBuilder()
             .UseAhtola(connectionStringBuilder.ToString())
@@ -62,6 +72,14 @@ public class AhtolaSqliteRelationalConnection : SqliteRelationalConnection
     {
         if (_commandTimeout.HasValue)
             connection.DefaultTimeout = _commandTimeout.Value;
+
+        // Direct remote Hrana and embedded-replica connections cannot register client-side
+        // functions, aggregates, or collations (the facade throws NotSupportedException for
+        // them); the remote/replica endpoint's own SQLite-compatible engine supplies its own
+        // built-ins (e.g. `instr`) instead. Skip registration entirely for those modes rather
+        // than attempting it and failing.
+        if (!connection.Capabilities.SupportsUserDefinedFunctions)
+            return;
 
         connection.CreateFunction<string, string, bool?>(
             "regexp",

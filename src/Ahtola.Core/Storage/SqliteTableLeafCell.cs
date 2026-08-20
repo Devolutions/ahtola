@@ -45,6 +45,27 @@ public sealed class SqliteTableLeafCell
     public int EncodedLength { get; }
 
     /// <summary>
+    /// The byte count a table-leaf cell would occupy for the given rowid and
+    /// payload length, without materializing the cell.
+    /// </summary>
+    /// <remarks>
+    /// Page-packing decides leaf boundaries from this length alone; building a
+    /// throwaway cell copies the whole payload just to read it back.
+    /// </remarks>
+    public static int CalculateEncodedLength(long rowId, ulong payloadLength, int usableSpace)
+    {
+        var layout = SqlitePayloadLayout.Calculate(
+            SqliteBtreePageType.TableLeaf,
+            payloadLength,
+            usableSpace);
+        var contentLength = checked(
+            SqliteVarint.GetLength(payloadLength)
+            + SqliteVarint.GetLength(unchecked((ulong)rowId))
+            + layout.StoredPayloadLength);
+        return Math.Max(contentLength, MinimumStorageLength);
+    }
+
+    /// <summary>
     /// Creates a cell whose complete payload fits locally.
     /// </summary>
     public static SqliteTableLeafCell Create(

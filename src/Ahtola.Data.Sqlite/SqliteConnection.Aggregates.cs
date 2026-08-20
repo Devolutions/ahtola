@@ -9,6 +9,8 @@ public partial class SqliteConnection
     private void RegisterAggregateFunction(string name, int argc, bool isDeterministic, object? seed, Func<object?, object?[], object?>? step, Func<object?, object?> resultSelector)
     {
         ArgumentNullException.ThrowIfNull(name);
+        if (!Capabilities.SupportsUserDefinedAggregates)
+            throw new NotSupportedException("User-defined aggregates are supported only for local database connections.");
             // Shared-memory catalogs are process-wide for the named database. Aggregate
             // registrations are therefore catalog-scoped (visible to every lease), which is
             // what EF Core needs when multiple connections share Mode=Memory;Cache=Shared.

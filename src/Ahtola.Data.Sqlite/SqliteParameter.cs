@@ -184,6 +184,27 @@ public class SqliteParameter : DbParameter
         };
     }
 
+    /// <summary>
+    /// Produces the SQLite storage-class value used by the remote ADO.NET bridge.
+    /// This deliberately applies <see cref="SqliteType"/> and <see cref="Size"/> before
+    /// handing the value to <c>AhtolaParameter</c>, whose general-purpose inference differs
+    /// from Microsoft.Data.Sqlite's parameter contract.
+    /// </summary>
+    internal object? GetResolvedStorageValue()
+    {
+        if (Value is null || Value == DBNull.Value)
+            return DBNull.Value;
+
+        return SqliteType switch
+        {
+            SqliteType.Integer => ToInt64(Value),
+            SqliteType.Real => ToDouble(Value),
+            SqliteType.Blob => ToBytes(Value),
+            SqliteType.Text => ApplySize(ToInvariantString(Value)),
+            _ => throw new ArgumentOutOfRangeException(),
+        };
+    }
+
     private static SqliteType InferSqliteType(object? value)
     {
         return value switch
@@ -251,7 +272,11 @@ public class SqliteParameter : DbParameter
         return value switch
         {
             ulong u64 => unchecked((long)u64),
-            Enum enumValue => Convert.ToInt64(enumValue, CultureInfo.InvariantCulture),
+            Enum enumValue => Type.GetTypeCode(Enum.GetUnderlyingType(enumValue.GetType())) switch
+            {
+                TypeCode.UInt64 => unchecked((long)Convert.ToUInt64(enumValue, CultureInfo.InvariantCulture)),
+                _ => Convert.ToInt64(enumValue, CultureInfo.InvariantCulture),
+            },
             _ => Convert.ToInt64(value, CultureInfo.InvariantCulture),
         };
     }

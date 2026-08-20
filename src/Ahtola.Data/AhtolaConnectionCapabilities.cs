@@ -21,6 +21,56 @@ public enum AhtolaConnectionMode
 }
 
 /// <summary>
+/// Identifies whether a data source targets a local database, direct Hrana endpoint,
+/// or embedded replica. This is the single URL classifier shared by both public
+/// ADO.NET facades.
+/// </summary>
+public enum AhtolaConnectionEndpointMode
+{
+    Local,
+    RemoteHrana,
+    EmbeddedReplica,
+}
+
+/// <summary>
+/// Classifies Ahtola data-source and replica-path options without opening a connection.
+/// </summary>
+public static class AhtolaConnectionModeClassifier
+{
+    /// <summary>
+    /// Classifies a local path or supported direct/embedded remote endpoint.
+    /// </summary>
+    public static AhtolaConnectionEndpointMode Classify(string? dataSource, string? replicaPath = null)
+    {
+        if (!IsRemoteDataSource(dataSource))
+            return AhtolaConnectionEndpointMode.Local;
+
+        return string.IsNullOrWhiteSpace(replicaPath)
+            ? AhtolaConnectionEndpointMode.RemoteHrana
+            : AhtolaConnectionEndpointMode.EmbeddedReplica;
+    }
+
+    /// <summary>
+    /// Returns whether a data source uses a supported Hrana transport URL.
+    /// </summary>
+    public static bool IsRemoteDataSource(string? dataSource)
+        => Uri.TryCreate(dataSource, UriKind.Absolute, out var uri)
+           && IsRemoteScheme(uri.Scheme);
+
+    /// <summary>
+    /// Returns whether a URI scheme addresses a supported Hrana endpoint.
+    /// </summary>
+    public static bool IsRemoteScheme(string? scheme)
+        => scheme is not null
+           && (scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase)
+               || scheme.Equals("turso", StringComparison.OrdinalIgnoreCase)
+               || scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
+               || scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
+               || scheme.Equals("ws", StringComparison.OrdinalIgnoreCase)
+               || scheme.Equals("wss", StringComparison.OrdinalIgnoreCase));
+}
+
+/// <summary>
 /// Describes the operations supported by a facade and execution mode.
 /// </summary>
 public sealed class AhtolaConnectionCapabilities
@@ -55,7 +105,7 @@ public sealed class AhtolaConnectionCapabilities
     private static readonly AhtolaConnectionCapabilities AhtolaManagedEmbeddedReplica = new(
         AhtolaConnectionFacade.AhtolaData,
         AhtolaConnectionMode.EmbeddedReplica,
-        canCreateBatch: false,
+        canCreateBatch: true,
         supportsAsyncOperations: true,
         supportsTransactions: true,
         supportsSavepoints: true);
@@ -63,7 +113,7 @@ public sealed class AhtolaConnectionCapabilities
     private static readonly AhtolaConnectionCapabilities AhtolaSyncEmbeddedReplica = new(
         AhtolaConnectionFacade.AhtolaData,
         AhtolaConnectionMode.EmbeddedReplica,
-        canCreateBatch: false,
+        canCreateBatch: true,
         supportsAsyncOperations: true,
         supportsTransactions: true,
         supportsSavepoints: true,
@@ -98,6 +148,23 @@ public sealed class AhtolaConnectionCapabilities
         supportsCustomCollations: true,
         supportsExtensions: true,
         supportsAttach: true);
+
+    private static readonly AhtolaConnectionCapabilities SqliteRemoteHrana = new(
+        AhtolaConnectionFacade.Sqlite,
+        AhtolaConnectionMode.RemoteHrana,
+        canCreateBatch: true,
+        supportsAsyncOperations: true,
+        supportsTransactions: true,
+        supportsSavepoints: true);
+
+    private static readonly AhtolaConnectionCapabilities SqliteEmbeddedReplica = new(
+        AhtolaConnectionFacade.Sqlite,
+        AhtolaConnectionMode.EmbeddedReplica,
+        canCreateBatch: true,
+        supportsAsyncOperations: true,
+        supportsTransactions: true,
+        supportsSavepoints: true,
+        supportsSync: true);
 
     private AhtolaConnectionCapabilities(
         AhtolaConnectionFacade facade,
@@ -183,7 +250,19 @@ public sealed class AhtolaConnectionCapabilities
             ? SqliteManagedLocal
             : SqliteNativeLocal;
 
+    internal static AhtolaConnectionCapabilities ForSqliteRemote(bool isReplica)
+        => isReplica ? SqliteEmbeddedReplica : SqliteRemoteHrana;
+
+    internal static AhtolaConnectionCapabilities ForSqliteMode(AhtolaConnectionMode mode)
+        => mode switch
+        {
+            AhtolaConnectionMode.RemoteHrana => SqliteRemoteHrana,
+            AhtolaConnectionMode.EmbeddedReplica => SqliteEmbeddedReplica,
+            AhtolaConnectionMode.ManagedLocal => SqliteManagedLocal,
+            AhtolaConnectionMode.NativeLocal => SqliteNativeLocal,
+            _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown Ahtola connection mode."),
+        };
+
     internal static bool IsRemoteDataSource(string dataSource)
-        => Uri.TryCreate(dataSource, UriKind.Absolute, out var uri)
-           && uri.Scheme is "libsql" or "turso" or "http" or "https" or "ws" or "wss";
+        => AhtolaConnectionModeClassifier.IsRemoteDataSource(dataSource);
 }

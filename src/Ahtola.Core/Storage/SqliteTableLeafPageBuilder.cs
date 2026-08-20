@@ -14,6 +14,7 @@ public sealed class SqliteTableLeafPageBuilder
     private readonly List<SqliteTableLeafCell> _cells = [];
     private readonly int _headerOffset;
     private long? _lastRowId;
+    private int _cellBytes;
 
     /// <summary>
     /// Creates a builder for one table-leaf page.
@@ -58,6 +59,7 @@ public sealed class SqliteTableLeafPageBuilder
 
         EnsureFits(cell.EncodedLength);
         _cells.Add(cell);
+        _cellBytes = checked(_cellBytes + cell.EncodedLength);
         _lastRowId = cell.RowId;
     }
 
@@ -119,10 +121,9 @@ public sealed class SqliteTableLeafPageBuilder
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(additionalCellLength);
 
-        var cellBytes = additionalCellLength;
-        foreach (var existingCell in _cells)
-            cellBytes = checked(cellBytes + existingCell.EncodedLength);
-
+        // Running total: re-summing every existing cell per append made packing
+        // a full leaf quadratic in its cell count.
+        var cellBytes = checked(_cellBytes + additionalCellLength);
         var pointerArrayEnd = checked(
             _headerOffset
             + SqliteBtreePageHeader.LeafHeaderSize
@@ -136,11 +137,7 @@ public sealed class SqliteTableLeafPageBuilder
 
     private int CalculateCellContentAreaOffset()
     {
-        var cellBytes = 0;
-        foreach (var cell in _cells)
-            cellBytes = checked(cellBytes + cell.EncodedLength);
-
-        var cellContentAreaOffset = UsableSpace - cellBytes;
+        var cellContentAreaOffset = UsableSpace - _cellBytes;
         var pointerArrayEnd = checked(
             _headerOffset
             + SqliteBtreePageHeader.LeafHeaderSize

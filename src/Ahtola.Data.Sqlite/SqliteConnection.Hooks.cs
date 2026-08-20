@@ -176,6 +176,9 @@ public partial class SqliteConnection
 
     private void EnsureHooksSupported(object? handler)
     {
+        if (EndpointMode != AhtolaConnectionEndpointMode.Local
+            || !Capabilities.SupportsUserDefinedFunctions)
+            throw new NotSupportedException("SQLite hooks are supported only for local database connections.");
         if (handler is null)
             return;
         if (IsManagedSharedMemory)

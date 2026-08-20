@@ -434,6 +434,9 @@ public class CorePrimitiveTests
         parameters.GetName(4).Should().Be("@other");
         parameters.GetName(5).Should().Be("$value");
         parameters.GetName(6).Should().BeNull();
+        parameters.IsReferenced(1).Should().BeFalse();
+        parameters.IsReferenced(2).Should().BeTrue();
+        parameters.IsReferenced(6).Should().BeTrue();
         parameters.TryGetIndex("?2", out var numbered).Should().BeTrue();
         numbered.Should().Be(2);
         parameters.TryGetIndex(":name", out var named).Should().BeTrue();

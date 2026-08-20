@@ -12,6 +12,9 @@ internal enum ManagedReplicaDurableBoundary
     IncrementalApplyMetadataPublished,
     JournalAppendPersisted,
     JournalAcknowledgementPersisted,
+    LogicalApplyCommitted,
+    LogicalApplyCheckpointed,
+    LogicalApplyMetadataPublished,
 }
 
 /// <summary>

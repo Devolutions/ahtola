@@ -119,6 +119,18 @@ public sealed class InMemoryFileSystem : IFileSystem, IAtomicFileSystem
 
     public InMemoryFileSystem(DeterministicFaultInjector? faults = null) => _faults = faults;
 
+    /// <summary>Snapshots every path this file system currently holds.</summary>
+    /// <remarks>
+    /// Used by tests that must prove an operation left no temporary artifacts
+    /// behind, which cannot be checked through <see cref="FileExists"/> alone
+    /// because those paths embed a generated identifier.
+    /// </remarks>
+    public IReadOnlyList<string> EnumerateFilePaths()
+    {
+        lock (_gate)
+            return [.. _files.Keys];
+    }
+
     public bool FileExists(string path)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);

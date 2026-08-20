@@ -13,7 +13,8 @@ public sealed class SqliteIndexLeafPageBuilder
 {
     private readonly List<CellEntry> _cells = [];
     private readonly int _headerOffset;
-    private byte[]? _lastRecord;
+    private SqlValue[]? _lastDecodedRecord;
+    private int _cellBytes;
 
     /// <summary>Creates a builder for one index-leaf page.</summary>
     public SqliteIndexLeafPageBuilder(
@@ -94,16 +95,39 @@ public sealed class SqliteIndexLeafPageBuilder
                 nameof(record));
         }
 
-        RecordComparer.Validate(record);
-        if (_lastRecord is not null && RecordComparer.Compare(_lastRecord, record) >= 0)
+        // One decode per appended record: Validate and the order check previously
+        // decoded the same bytes up to three times per cell.
+        var decoded = SqliteRecordCodec.Decode(record, RecordComparer.TextEncoding);
+        if (_lastDecodedRecord is not null && RecordComparer.Compare(_lastDecodedRecord, decoded) >= 0)
             throw new ArgumentException("SQLite index records must be strictly increasing in configured order.", nameof(record));
         if (_cells.Count == ushort.MaxValue)
             throw new InvalidOperationException("A SQLite index-leaf page cannot contain more than 65535 cells.");
 
         EnsureFits(cell.EncodedLength);
-        var recordCopy = record.ToArray();
-        _cells.Add(new CellEntry(cell, recordCopy));
-        _lastRecord = recordCopy;
+        _cells.Add(new CellEntry(cell));
+        _cellBytes = checked(_cellBytes + cell.EncodedLength);
+        _lastDecodedRecord = decoded;
+    }
+
+    /// <summary>
+    /// Appends a cell whose record was already validated and ordered by the
+    /// caller, skipping the payload comparison, decode, and order check.
+    /// </summary>
+    /// <remarks>
+    /// Used by the full-catalog rebuild, which derives leaf groups from a record
+    /// sequence it has already proven strictly ordered and decodable. Re-running
+    /// those checks per cell costs a payload memcmp plus a record decode for
+    /// every row of every index.
+    /// </remarks>
+    internal void AppendTrusted(SqliteIndexLeafCell cell)
+    {
+        ArgumentNullException.ThrowIfNull(cell);
+        if (_cells.Count == ushort.MaxValue)
+            throw new InvalidOperationException("A SQLite index-leaf page cannot contain more than 65535 cells.");
+
+        EnsureFits(cell.EncodedLength);
+        _cells.Add(new CellEntry(cell));
+        _cellBytes = checked(_cellBytes + cell.EncodedLength);
     }
 
     /// <summary>Returns a zero-initialized page image packed with the appended cells.</summary>
@@ -161,10 +185,9 @@ public sealed class SqliteIndexLeafPageBuilder
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(additionalCellLength);
 
-        var cellBytes = additionalCellLength;
-        foreach (var existingCell in _cells)
-            cellBytes = checked(cellBytes + existingCell.Cell.EncodedLength);
-
+        // Running total: re-summing every existing cell per append made packing
+        // a full leaf quadratic in its cell count.
+        var cellBytes = checked(_cellBytes + additionalCellLength);
         var pointerArrayEnd = checked(
             _headerOffset
             + SqliteBtreePageHeader.LeafHeaderSize
@@ -178,11 +201,7 @@ public sealed class SqliteIndexLeafPageBuilder
 
     private int CalculateCellContentAreaOffset()
     {
-        var cellBytes = 0;
-        foreach (var cell in _cells)
-            cellBytes = checked(cellBytes + cell.Cell.EncodedLength);
-
-        var cellContentAreaOffset = UsableSpace - cellBytes;
+        var cellContentAreaOffset = UsableSpace - _cellBytes;
         var pointerArrayEnd = checked(
             _headerOffset
             + SqliteBtreePageHeader.LeafHeaderSize
@@ -196,5 +215,5 @@ public sealed class SqliteIndexLeafPageBuilder
         return cellContentAreaOffset;
     }
 
-    private sealed record CellEntry(SqliteIndexLeafCell Cell, byte[] Record);
+    private sealed record CellEntry(SqliteIndexLeafCell Cell);
 }

@@ -1,3 +1,4 @@
+﻿using System.Buffers;
 using System.Buffers.Binary;
 
 namespace Ahtola.Core.Storage;
@@ -17,6 +18,10 @@ namespace Ahtola.Core.Storage;
 /// </remarks>
 public sealed class SqlitePageStore : IDisposable
 {
+    // Upper bound on the staging buffer used when writing a complete image, so
+    // a very large destination still writes in bounded, sequential runs.
+    private const int MaximumSequentialWriteBytes = 1 << 20;
+
     private readonly IFile _file;
     private readonly IPageCodec? _pageCodec;
     private readonly bool _ownsPageCodec;
@@ -221,92 +226,94 @@ public sealed class SqlitePageStore : IDisposable
         string path,
         SqliteDatabaseHeader? header = null,
         bool overwrite = false,
-            AhtolaEncryptionOptions? encryption = null,
-            IPageCodec? pageCodec = null)
+        AhtolaEncryptionOptions? encryption = null,
+        IPageCodec? pageCodec = null,
+        bool flushOnCreate = true)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+
+        // A freshly created database has exactly one page, so the in-header size
+        // is authoritative (change-counter equals version-valid-for).
+        var effectiveHeader = (header ?? SqliteDatabaseHeader.CreateDefault()) with
         {
-            ArgumentNullException.ThrowIfNull(fileSystem);
-            ArgumentException.ThrowIfNullOrEmpty(path);
+            ChangeCounter = 1,
+            DatabaseSizeInPages = 1,
+            VersionValidFor = 1,
+        };
+        var boundCodec = PageCodecSupport.Bind(
+            encryption,
+            pageCodec,
+            effectiveHeader.PageSize,
+            out var ownsCodec);
+        if (boundCodec is not null)
+            effectiveHeader = PageCodecSupport.ApplyReservedBytes(boundCodec, effectiveHeader);
 
-            // A freshly created database has exactly one page, so the in-header size
-            // is authoritative (change-counter equals version-valid-for).
-            var effectiveHeader = (header ?? SqliteDatabaseHeader.CreateDefault()) with
+        var pageSize = effectiveHeader.PageSize;
+        var firstPage = new byte[pageSize];
+        effectiveHeader.WriteTo(firstPage);
+        SqliteBtreePageHeader
+            .CreateEmpty(
+                SqliteBtreePageType.TableLeaf,
+                pageSize,
+                isFirstPage: true,
+                usableSpace: effectiveHeader.UsableSpace)
+            .WriteTo(firstPage);
+
+        var mode = overwrite ? FileOpenMode.OpenOrCreate : FileOpenMode.CreateNew;
+        var file = fileSystem.OpenFile(path, mode);
+        var createdArtifact = mode == FileOpenMode.CreateNew;
+        try
+        {
+            file.SetLength(0);
+            if (boundCodec is null)
             {
-                ChangeCounter = 1,
-                DatabaseSizeInPages = 1,
-                VersionValidFor = 1,
-            };
-            var boundCodec = PageCodecSupport.Bind(
-                encryption,
-                pageCodec,
-                effectiveHeader.PageSize,
-                out var ownsCodec);
-            if (boundCodec is not null)
-                effectiveHeader = PageCodecSupport.ApplyReservedBytes(boundCodec, effectiveHeader);
+                file.Write(0, firstPage);
+            }
+            else
+            {
+                var encoded = new byte[pageSize];
+                PageCodecSupport.Encode(boundCodec, PageLocation.Database, 1, firstPage, encoded);
+                file.Write(0, encoded);
+            }
 
-            var pageSize = effectiveHeader.PageSize;
-            var firstPage = new byte[pageSize];
-            effectiveHeader.WriteTo(firstPage);
-            SqliteBtreePageHeader
-                .CreateEmpty(
-                    SqliteBtreePageType.TableLeaf,
-                    pageSize,
-                    isFirstPage: true,
-                    usableSpace: effectiveHeader.UsableSpace)
-                .WriteTo(firstPage);
+            file.SetLength(pageSize);
+            if (flushOnCreate)
+                file.FlushToDisk();
+            return new SqlitePageStore(file, effectiveHeader, boundCodec, ownsCodec) { Path = path };
+        }
+        catch
+        {
+            try
+        {
+                file.Dispose();
+            }
+            catch
+        {
+            }
 
-            var mode = overwrite ? FileOpenMode.OpenOrCreate : FileOpenMode.CreateNew;
-            var file = fileSystem.OpenFile(path, mode);
-            var createdArtifact = mode == FileOpenMode.CreateNew;
             try
             {
-                file.SetLength(0);
-                if (boundCodec is null)
-                {
-                    file.Write(0, firstPage);
-                }
-                else
-                {
-                    var encoded = new byte[pageSize];
-                    PageCodecSupport.Encode(boundCodec, PageLocation.Database, 1, firstPage, encoded);
-                    file.Write(0, encoded);
-                }
-
-                file.SetLength(pageSize);
-                file.FlushToDisk();
-                return new SqlitePageStore(file, effectiveHeader, boundCodec, ownsCodec) { Path = path };
+                PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
             }
             catch
             {
-                try
-            {
-                    file.Dispose();
-                }
-                catch
-            {
-                }
-
-                try
-                {
-                    PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
-                }
-                catch
-                {
-                }
-
-                if (createdArtifact)
-                {
-                    try
-                    {
-                        fileSystem.DeleteFile(path);
-                    }
-                    catch
-                    {
-                    }
-                }
-
-                throw;
             }
+
+            if (createdArtifact)
+            {
+                try
+                {
+                    fileSystem.DeleteFile(path);
+                }
+                catch
+                {
+                }
+            }
+
+            throw;
         }
+    }
 
     /// <summary>
     /// Reads page <paramref name="pageNumber"/> (1-based) into
@@ -410,6 +417,103 @@ public sealed class SqlitePageStore : IDisposable
 
         _file.SetLength(sourceLength);
         _file.FlushToDisk();
+    }
+
+    /// <summary>
+    /// Writes a complete, final-numbered page image sequentially into a private
+    /// store that has not been published yet, then makes it durable once.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the VACUUM destination sink. An ordinary commit routes every page
+    /// through the WAL and a later checkpoint, so the image is written twice and
+    /// read back once. A vacuum target is a private temporary file that nothing
+    /// can observe until it is atomically published, so the intermediate WAL copy
+    /// buys no recoverability — a crash simply discards the temporary file.
+    /// </para>
+    /// <para>
+    /// Pages are still encoded through the page codec with their final page
+    /// numbers, so encrypted and page-number-dependent encodings are unchanged.
+    /// The file length is set once up front and flushed once at the end.
+    /// </para>
+    /// </remarks>
+    internal void WriteUnpublishedImage(
+        uint pageCount,
+        Func<uint, ReadOnlyMemory<byte>> getPageImage)
+    {
+        ArgumentNullException.ThrowIfNull(getPageImage);
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+        if (pageCount == 0)
+            throw new ArgumentOutOfRangeException(nameof(pageCount), pageCount, "A SQLite database has at least one page.");
+
+        var targetLength = checked((long)pageCount * PageSize);
+        _file.SetLength(targetLength);
+        if (_file.Length != targetLength)
+            throw new InvalidDataException("Preallocating the vacuum destination did not reach its page boundary.");
+
+        // Stage pages into a bounded buffer and write them in large sequential
+        // runs: one write syscall per page turned a few hundred kilobytes of
+        // output into hundreds of syscalls.
+        var pagesPerBatch = Math.Max(1, MaximumSequentialWriteBytes / PageSize);
+        var batchPages = (int)Math.Min(pageCount, (uint)pagesPerBatch);
+        var buffer = ArrayPool<byte>.Shared.Rent(checked(batchPages * PageSize));
+        SqliteDatabaseHeader? firstPageHeader = null;
+        try
+        {
+            var buffered = 0;
+            var batchOffset = 0L;
+            for (var pageNumber = 1U; pageNumber <= pageCount; pageNumber++)
+            {
+                var page = getPageImage(pageNumber);
+                if (page.Length != PageSize)
+                {
+                    throw new InvalidDataException(
+                        $"Vacuum destination page {pageNumber} is {page.Length} bytes; expected {PageSize}.");
+                }
+
+                if (pageNumber == 1)
+                {
+                    firstPageHeader = SqliteDatabaseHeader.Parse(page.Span);
+                    if (firstPageHeader.PageSize != PageSize)
+                        throw new InvalidDataException("Vacuum destination page 1 does not declare the store's page size.");
+                    if (firstPageHeader.DatabaseSizeInPages != pageCount
+                        || firstPageHeader.VersionValidFor != firstPageHeader.ChangeCounter)
+                    {
+                        throw new InvalidDataException(
+                            "Vacuum destination page 1 must authoritatively declare its own page count.");
+                    }
+                }
+
+                // Pages are still encoded with their final page numbers, so
+                // page-number-dependent codecs (encryption) are unaffected.
+                var slot = buffer.AsSpan(buffered * PageSize, PageSize);
+                if (_pageCodec is null)
+                    page.Span.CopyTo(slot);
+                else
+                    PageCodecSupport.Encode(_pageCodec, PageLocation.Database, pageNumber, page.Span, slot);
+
+                buffered++;
+                if (buffered != batchPages && pageNumber != pageCount)
+                    continue;
+
+                _file.Write(batchOffset, buffer.AsSpan(0, buffered * PageSize));
+                batchOffset += buffered * PageSize;
+                buffered = 0;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        AssertPageAligned();
+        if (_file.Length != targetLength)
+            throw new InvalidDataException("Writing the vacuum destination changed its expected file length.");
+
+        _file.FlushToDisk();
+        _header = firstPageHeader
+            ?? throw new InvalidDataException("Vacuum destination did not receive a first page.");
     }
 
     /// <summary>

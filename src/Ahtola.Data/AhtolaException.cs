@@ -32,3 +32,8 @@ public class AhtolaException : Exception
     internal static AhtolaException FromCorePreparation(EmbeddedSqlException exception)
         => new($"Unable to prepare statement: Parse error: {exception.Message}", exception);
 }
+
+/// <summary>
+/// Indicates that a parameter cannot be represented by the remote protocol.
+/// </summary>
+public sealed class AhtolaParameterException(string message) : AhtolaException(message);

@@ -4,6 +4,7 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -17,6 +18,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     private readonly SqliteCommand _command;
     private readonly SqliteConnection _connection;
     private SqliteStatementAdapter? _statement;
+    private DbDataReader? _delegatedReader;
+    private bool _skipDelegatedReaderToFirstColumnResult;
     private string _currentSql = string.Empty;
     private readonly List<string> _remainingSql = new();
     private readonly CommandBehavior _behavior;
@@ -145,12 +148,69 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
-    public override int Depth => 0;
+    internal SqliteDataReader(
+        SqliteCommand command,
+        DbDataReader delegatedReader,
+        CommandBehavior behavior,
+        Action closeCallback,
+        bool skipToFirstColumnResult)
+    {
+        _command = command;
+        _connection = command.Connection
+            ?? throw new InvalidOperationException("A data reader requires an associated connection.");
+        _delegatedReader = delegatedReader ?? throw new ArgumentNullException(nameof(delegatedReader));
+        _behavior = behavior;
+        _closeCallback = closeCallback;
+        _skipDelegatedReaderToFirstColumnResult = skipToFirstColumnResult;
+        if (skipToFirstColumnResult)
+        {
+            // A SqliteCommand.CommandText containing multiple semicolon-separated statements
+            // (e.g. "INSERT ...; SELECT changes();") is executed as one remote/replica batch.
+            // Position the reader on the first result that has columns, exactly like the local
+            // statement-stepping path already does in Execute(...)/NextResultCore below: a
+            // leading INSERT/UPDATE/DELETE without RETURNING is absorbed rather than exposed as
+            // its own reader position, so ExecuteScalar/ExecuteReader callers — including EF
+            // Core's own ModificationCommandBatch and SqliteHistoryRepository — land directly on
+            // the first row-producing result instead of reading null/throwing off an empty one.
+            // This applies only to SqliteCommand's own multi-statement CommandText splitting.
+            // SqliteBatch's explicit DbBatchCommands (skipToFirstColumnResult: false) — and
+            // AhtolaBatch's own DbBatch.ExecuteReader() used directly — must keep exposing every
+            // explicitly-added command 1:1, matching the local/replica SequentialBatchDataReader
+            // contract: each NextResult() call advances exactly one explicit command, even one
+            // with zero columns (a plain INSERT/UPDATE/DELETE without RETURNING).
+            SkipDelegatedReaderToColumns(_delegatedReader);
+        }
+
+        ((ILocalReaderConnection)_connection).ReaderOpened(this);
+    }
+
+    private static bool SkipDelegatedReaderToColumns(DbDataReader reader)
+    {
+        while (reader.FieldCount == 0 && reader.NextResult())
+        {
+        }
+
+        return reader.FieldCount > 0;
+    }
+
+    private static async Task<bool> SkipDelegatedReaderToColumnsAsync(DbDataReader reader, CancellationToken cancellationToken)
+    {
+        while (reader.FieldCount == 0
+               && await reader.NextResultAsync(cancellationToken).ConfigureAwait(false))
+        {
+        }
+
+        return reader.FieldCount > 0;
+    }
+
+    public override int Depth => _delegatedReader?.Depth ?? 0;
 
     public override int FieldCount
     {
         get
         {
+            if (_delegatedReader is not null)
+                return _delegatedReader.FieldCount;
             EnsureOpen();
             if (_statement is null)
                 return 0;
@@ -166,6 +226,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     {
         get
         {
+            if (_delegatedReader is not null)
+                return _delegatedReader.HasRows;
             EnsureOpen();
             if (_statement is null)
                 return false;
@@ -177,6 +239,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     }
 
     public override bool IsClosed => _isClosed
+        || (_delegatedReader?.IsClosed ?? false)
         || _command.Connection?.State != ConnectionState.Open
         || (_statement?.IsInvalid ?? false);
 
@@ -184,6 +247,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     {
         get
         {
+            if (_delegatedReader is not null)
+                return _delegatedReader.RecordsAffected;
             if (_recordsAffected > 0 || _hadRecordsAffectedStatement)
                 return _recordsAffected;
 
@@ -197,6 +262,13 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override bool GetBoolean(int ordinal)
     {
+        if (_delegatedReader is not null)
+        {
+            var delegatedValue = GetDelegatedValue(ordinal);
+            return delegatedValue is string text && bool.TryParse(text, out var parsed)
+                ? parsed
+                : Convert.ToInt64(delegatedValue, CultureInfo.InvariantCulture) != 0;
+        }
         EnsureOpen();
         var value = GetTypedValue(ordinal);
         if (value.Kind == ReaderValueKind.Text && bool.TryParse(value.Text, out var boolValue))
@@ -207,18 +279,21 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override byte GetByte(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetByte(ordinal);
         EnsureOpen();
         return (byte)GetInt64(ordinal);
     }
 
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetBytes(ordinal, dataOffset, buffer, bufferOffset, length);
         EnsureOpen();
         return CopyValue(GetBlobValue(ordinal), dataOffset, buffer, bufferOffset, length);
     }
 
     public override char GetChar(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetChar(ordinal);
         EnsureOpen();
         var value = GetTypedValue(ordinal);
         if (value.Kind == ReaderValueKind.Text && value.Text.Length == 1)
@@ -295,12 +370,14 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetChars(ordinal, dataOffset, buffer, bufferOffset, length);
         EnsureOpen();
         return CopyValue(GetTextValue(ordinal).ToCharArray(), dataOffset, buffer, bufferOffset, length);
     }
 
     public override string GetDataTypeName(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetDataTypeName(ordinal);
         EnsureOpen();
         ValidateOrdinal(ordinal);
         var declaredType = GetDeclaredTypeName(ordinal);
@@ -333,6 +410,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override DateTime GetDateTime(int ordinal)
     {
+        if (_delegatedReader is not null)
+            return ApplyConfiguredDateTimeKind(ParseDateTime(GetDelegatedTextValue(ordinal)));
         EnsureOpen();
         var value = GetTypedValue(ordinal);
             var dateTime = value.Kind switch
@@ -347,6 +426,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public virtual DateTimeOffset GetDateTimeOffset(int ordinal)
     {
+        if (_delegatedReader is not null)
+            return ParseDateTimeOffset(GetDelegatedTextValue(ordinal));
         EnsureOpen();
         var value = GetTypedValue(ordinal);
         return value.Kind switch
@@ -360,6 +441,13 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override decimal GetDecimal(int ordinal)
     {
+        if (_delegatedReader is not null)
+        {
+            var delegatedValue = GetDelegatedValue(ordinal);
+            return delegatedValue is string text
+                ? decimal.Parse(text, NumberStyles.Float, CultureInfo.InvariantCulture)
+                : Convert.ToDecimal(delegatedValue, CultureInfo.InvariantCulture);
+        }
         EnsureOpen();
         var value = GetTypedValue(ordinal);
         return value.Kind switch
@@ -377,6 +465,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override double GetDouble(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetDouble(ordinal);
         EnsureOpen();
         var value = GetTypedValue(ordinal);
         return value.Kind switch
@@ -387,11 +476,12 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         };
     }
 
-    public override IEnumerator GetEnumerator() => new DbEnumerator(this, closeReader: false);
+    public override IEnumerator GetEnumerator() => _delegatedReader?.GetEnumerator() ?? new DbEnumerator(this, closeReader: false);
 
     [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     public override Type GetFieldType(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetFieldType(ordinal);
         EnsureOpen();
         ValidateOrdinal(ordinal);
         var valueType = CurrentValueKind(ordinal);
@@ -431,7 +521,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     public override T GetFieldValue<T>(int ordinal)
     {
         EnsureOpen();
-        if (typeof(T) == typeof(byte[]))
+        if (_delegatedReader is null && typeof(T) == typeof(byte[]))
         {
             var rawValue = GetTypedValue(ordinal);
             if (rawValue.Kind == ReaderValueKind.Blob)
@@ -514,12 +604,30 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override float GetFloat(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetFloat(ordinal);
         EnsureOpen();
         return (float)GetDouble(ordinal);
     }
 
     public override Guid GetGuid(int ordinal)
     {
+        if (_delegatedReader is not null)
+        {
+            var delegatedValue = GetDelegatedValue(ordinal);
+            if (delegatedValue is Guid guid)
+                return guid;
+            if (delegatedValue is byte[] bytes)
+            {
+                if (bytes.Length == 16)
+                    return new Guid(bytes);
+                if (Guid.TryParse(Encoding.UTF8.GetString(bytes), out guid))
+                    return guid;
+            }
+            if (delegatedValue is string text && Guid.TryParse(text, out guid))
+                return guid;
+
+            throw new InvalidCastException($"Cannot convert the value at ordinal {ordinal} to Guid.");
+        }
         EnsureOpen();
         var value = GetTypedValue(ordinal);
         return ToGuid(ordinal, value);
@@ -527,18 +635,21 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override short GetInt16(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetInt16(ordinal);
         EnsureOpen();
         return (short)GetInt64(ordinal);
     }
 
     public override int GetInt32(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetInt32(ordinal);
         EnsureOpen();
         return (int)GetInt64(ordinal);
     }
 
     public override long GetInt64(int ordinal)
     {
+        if (_delegatedReader is not null) return Convert.ToInt64(GetDelegatedValue(ordinal), CultureInfo.InvariantCulture);
         EnsureOpen();
         var value = GetTypedValue(ordinal);
         return value.Kind switch
@@ -552,6 +663,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override string GetName(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetName(ordinal);
         EnsureOpen();
         var statement = GetStatement();
         ValidateOrdinal(ordinal);
@@ -562,18 +674,21 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override Stream GetStream(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetStream(ordinal);
         EnsureOpen();
         return new MemoryStream(GetBlobValue(ordinal).ToArray(), writable: false);
     }
 
     public override TextReader GetTextReader(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetTextReader(ordinal);
         EnsureOpen();
         return new StringReader(GetTextValue(ordinal));
     }
 
     public override int GetOrdinal(string name)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetOrdinal(name);
         EnsureOpen();
         ArgumentNullException.ThrowIfNull(name);
         _ = GetStatement();
@@ -605,6 +720,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override DataTable GetSchemaTable()
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetSchemaTable() ?? new DataTable("SchemaTable");
         EnsureOpen();
         var schema = new DataTable("SchemaTable");
         schema.Columns.Add(SchemaTableColumn.ColumnName, typeof(string));
@@ -700,6 +816,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override string GetString(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetString(ordinal);
         EnsureOpen();
         var value = GetTypedValue(ordinal);
         return value.Kind switch
@@ -714,6 +831,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public virtual TimeSpan GetTimeSpan(int ordinal)
     {
+        if (_delegatedReader is not null)
+            return TimeSpan.Parse(GetDelegatedTextValue(ordinal), CultureInfo.InvariantCulture);
         EnsureOpen();
         var value = GetTypedValue(ordinal);
         return value.Kind switch
@@ -726,6 +845,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override object GetValue(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetValue(ordinal);
         EnsureOpen();
         EnsureHasCurrentRow();
         var value = ReadValue(ordinal);
@@ -746,8 +866,19 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         };
     }
 
+    private object GetDelegatedValue(int ordinal)
+    {
+        EnsureOpen();
+        var value = _delegatedReader!.GetValue(ordinal);
+        if (value == DBNull.Value)
+            throw new InvalidOperationException(Properties.Resources.CalledOnNullValue(ordinal));
+
+        return value;
+    }
+
     public override int GetValues(object[] values)
     {
+        if (_delegatedReader is not null) return _delegatedReader.GetValues(values);
         EnsureOpen();
         _ = GetStatement();
         EnsureHasCurrentRow();
@@ -762,6 +893,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override bool IsDBNull(int ordinal)
     {
+        if (_delegatedReader is not null) return _delegatedReader.IsDBNull(ordinal);
         EnsureOpen();
         EnsureHasCurrentRow();
         var valueType = ReadValue(ordinal).Kind;
@@ -769,7 +901,29 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     }
 
     public override bool NextResult()
-        => _command.RunOperation(NextResultCore);
+    {
+        if (_delegatedReader is null)
+            return _command.RunOperation(NextResultCore);
+
+        try
+        {
+            if (!_skipDelegatedReaderToFirstColumnResult)
+            {
+                // SqliteBatch's explicit DbBatchCommands (and AhtolaBatch's own DbBatch API used
+                // directly) must expose every command 1:1: advance exactly one step, whatever
+                // its column count, matching SequentialBatchDataReader's local/replica contract.
+                return _delegatedReader.NextResult();
+            }
+
+            // Mirror NextResultCore below: always move at least one step, then keep skipping
+            // forward through any further 0-column (non-RETURNING DML) results.
+            return _delegatedReader.NextResult() && SkipDelegatedReaderToColumns(_delegatedReader);
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        {
+            throw _command.MapAhtolaException(ex);
+        }
+    }
 
     private bool NextResultCore(CancellationToken cancellationToken)
     {
@@ -840,7 +994,19 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     }
 
     public override bool Read()
-        => _command.RunOperation(ReadCore);
+    {
+        if (_delegatedReader is null)
+            return _command.RunOperation(ReadCore);
+
+        try
+        {
+            return _delegatedReader.Read();
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        {
+            throw _command.MapAhtolaException(ex);
+        }
+    }
 
     private bool ReadCore(CancellationToken cancellationToken)
     {
@@ -867,17 +1033,72 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
     }
 
-    public override Task<bool> ReadAsync(CancellationToken cancellationToken)
-        => _command.RunOperationAsync(ReadCore, cancellationToken);
+    public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
+    {
+        if (_delegatedReader is null)
+            return await _command.RunOperationAsync(ReadCore, cancellationToken).ConfigureAwait(false);
 
-    public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
-        => _command.RunOperationAsync(NextResultCore, cancellationToken);
+        try
+        {
+            return await _delegatedReader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        {
+            throw _command.MapAhtolaException(ex);
+        }
+    }
+
+    public override async Task<bool> NextResultAsync(CancellationToken cancellationToken)
+    {
+        if (_delegatedReader is null)
+            return await _command.RunOperationAsync(NextResultCore, cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            if (!_skipDelegatedReaderToFirstColumnResult)
+            {
+                // SqliteBatch's explicit DbBatchCommands (and AhtolaBatch's own DbBatch API used
+                // directly) must expose every command 1:1: advance exactly one step, whatever
+                // its column count, matching SequentialBatchDataReader's local/replica contract.
+                return await _delegatedReader.NextResultAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            // Mirror NextResult() above: always move at least one step, then keep skipping
+            // forward through any further 0-column (non-RETURNING DML) results.
+            if (!await _delegatedReader.NextResultAsync(cancellationToken).ConfigureAwait(false))
+                return false;
+
+            return await SkipDelegatedReaderToColumnsAsync(_delegatedReader, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        {
+            throw _command.MapAhtolaException(ex);
+        }
+    }
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
-        => CompleteAsync(() => IsDBNull(ordinal), cancellationToken);
+        => _delegatedReader?.IsDBNullAsync(ordinal, cancellationToken) ?? CompleteAsync(() => IsDBNull(ordinal), cancellationToken);
 
     public override Task<T> GetFieldValueAsync<T>(int ordinal, CancellationToken cancellationToken)
-        => CompleteAsync(() => GetFieldValue<T>(ordinal), cancellationToken);
+        => CompleteAsync(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return GetFieldValue<T>(ordinal);
+        }, cancellationToken);
+
+    private string GetDelegatedTextValue(int ordinal)
+    {
+        var value = _delegatedReader!.GetValue(ordinal);
+        if (value == DBNull.Value)
+            throw new InvalidOperationException(Properties.Resources.CalledOnNullValue(ordinal));
+
+        return value switch
+        {
+            string text => text,
+            IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
+            _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty,
+        };
+    }
 
     private static Task<T> CompleteAsync<T>(Func<T> operation, CancellationToken cancellationToken)
     {
@@ -913,6 +1134,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (_isClosed)
             return;
 
+        _delegatedReader?.Dispose();
+        _delegatedReader = null;
         _statement?.Dispose();
         _statement = null;
         _remainingSql.Clear();
@@ -928,6 +1151,16 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
         try
         {
+            if (_delegatedReader is not null)
+            {
+                _recordsAffected = _delegatedReader.RecordsAffected;
+                _hadRecordsAffectedStatement = true;
+                _delegatedReader.Dispose();
+                _delegatedReader = null;
+                FinishClose();
+                return;
+            }
+
             if (_statement is not null)
             {
                 while (GetStatement().Read())

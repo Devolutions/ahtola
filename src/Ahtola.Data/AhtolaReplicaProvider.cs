@@ -49,7 +49,7 @@ public static class AhtolaReplicaProvider
 /// </summary>
 public sealed class AhtolaReplicaOptions
 {
-    private readonly AsyncLocal<ApplicationHttpScope?> _applicationHttpScope = new();
+    private AsyncLocal<ApplicationHttpScope?> _applicationHttpScope = new();
 
     /// <summary>
     /// Initializes embedded-replica connection options.
@@ -223,6 +223,35 @@ public sealed class AhtolaReplicaOptions
             SyncInterval = SyncInterval,
             HttpPolicy = HttpPolicy,
         };
+    }
+
+    /// <summary>
+    /// Returns a copy with long polling disabled, used for a one-shot, non-blocking pull (e.g.
+    /// the immediate logical catch-up performed right after a fresh managed embedded-replica
+    /// bootstrap): it must return whatever is immediately available rather than hold the call
+    /// open waiting for future changes.
+    /// </summary>
+    /// <remarks>
+    /// Shares <see cref="_applicationHttpScope"/> with the source instance (rather than starting
+    /// a fresh one, as <see cref="CloneForConnection"/> does for a genuinely new connection): the
+    /// catch-up pull and the connection's regular pulls are the same logical connection's HTTP
+    /// call stack, so a reentrant application HTTP handler must be caught regardless of which of
+    /// the two option instances is in scope when the reentrant call happens.
+    /// </remarks>
+    internal AhtolaReplicaOptions WithoutLongPoll()
+    {
+        var clone = new AhtolaReplicaOptions(Path, RemoteUri, AuthToken, BootstrapIfEmpty)
+        {
+            LongPollTimeout = null,
+            PartialBootstrap = PartialBootstrap,
+            RemoteEncryption = RemoteEncryption,
+            PushOperationsThreshold = PushOperationsThreshold,
+            PullBytesThreshold = PullBytesThreshold,
+            SyncInterval = SyncInterval,
+            HttpPolicy = HttpPolicy,
+        };
+        clone._applicationHttpScope = _applicationHttpScope;
+        return clone;
     }
 
     internal void ThrowIfApplicationHttpReentrant(bool closing)

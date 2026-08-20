@@ -29,6 +29,11 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Version",
         "Local Provider",
         "Foreign Read Only",
+        "Auth Token",
+        "Replica Path",
+        "Read Your Writes",
+        "Sync Interval",
+        "Tls",
     ];
 
     private static readonly Dictionary<string, string> KeywordMap = new(StringComparer.OrdinalIgnoreCase)
@@ -67,6 +72,18 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["LocalProvider"] = "Local Provider",
         ["Foreign Read Only"] = "Foreign Read Only",
         ["ForeignReadOnly"] = "Foreign Read Only",
+        ["Auth Token"] = "Auth Token",
+        ["AuthToken"] = "Auth Token",
+        ["Authentication Token"] = "Auth Token",
+        ["AuthenticationToken"] = "Auth Token",
+        ["Replica Path"] = "Replica Path",
+        ["ReplicaPath"] = "Replica Path",
+        ["Read Your Writes"] = "Read Your Writes",
+        ["ReadYourWrites"] = "Read Your Writes",
+        ["Sync Interval"] = "Sync Interval",
+        ["SyncInterval"] = "Sync Interval",
+        ["Tls"] = "Tls",
+        ["TLS"] = "Tls",
     };
 
     public SqliteConnectionStringBuilder()
@@ -210,6 +227,42 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         set => this["Foreign Read Only"] = value;
     }
 
+    /// <summary>Authentication token used by a remote libsql or Turso endpoint.</summary>
+    public string AuthToken
+    {
+        get => GetString("Auth Token");
+        set => SetString("Auth Token", value);
+    }
+
+    /// <summary>Local path used for an embedded replica of a remote endpoint.</summary>
+    public string ReplicaPath
+    {
+        get => GetString("Replica Path");
+        set => SetString("Replica Path", value);
+    }
+
+    public bool ReadYourWrites
+    {
+        get => GetBool("Read Your Writes", true);
+        set => this["Read Your Writes"] = value;
+    }
+
+    public int SyncInterval
+    {
+        get => GetInt("Sync Interval", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Sync Interval"] = value;
+        }
+    }
+
+    public bool? Tls
+    {
+        get => GetNullableBool("Tls");
+        set => SetNullable("Tls", value);
+    }
+
     public override ICollection Keys => new ReadOnlyCollection<string>(CanonicalKeywords);
 
     public override ICollection Values => new ReadOnlyCollection<object?>(CanonicalKeywords.Select(GetValueOrDefault).ToArray());
@@ -269,8 +322,40 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         var builder = new DbConnectionStringBuilder();
         if (!string.IsNullOrEmpty(DataSource))
             builder["Data Source"] = DataSource;
-        if (DefaultTimeout != 30)
+        if (base.ContainsKey("Mode"))
+            builder["Mode"] = Mode.ToString();
+        if (base.ContainsKey("Cache"))
+            builder["Cache"] = Cache.ToString();
+        if (base.ContainsKey("Foreign Keys"))
+            builder["Foreign Keys"] = ForeignKeys!.Value;
+        if (base.ContainsKey("Recursive Triggers"))
+            builder["Recursive Triggers"] = RecursiveTriggers;
+        if (base.ContainsKey("Default Timeout"))
             builder["Default Timeout"] = DefaultTimeout;
+        if (base.ContainsKey("Pooling"))
+            builder["Pooling"] = Pooling;
+        if (base.ContainsKey("Auth Token"))
+            builder["Auth Token"] = AuthToken;
+        if (base.ContainsKey("Replica Path"))
+            builder["Replica Path"] = ReplicaPath;
+        if (base.ContainsKey("Read Your Writes"))
+            builder["Read Your Writes"] = ReadYourWrites;
+        if (base.ContainsKey("Sync Interval"))
+            builder["Sync Interval"] = SyncInterval;
+        if (base.ContainsKey("Tls"))
+            builder["Tls"] = Tls!.Value;
+        if (base.ContainsKey("Encryption Cipher"))
+            builder["Encryption Cipher"] = EncryptionCipher;
+        if (base.ContainsKey("Encryption Key"))
+            builder["Encryption Key"] = EncryptionKey;
+        if (base.ContainsKey("Password"))
+            builder["Password"] = Password;
+        if (base.ContainsKey("Password Scheme"))
+            builder["Password Scheme"] = PasswordScheme;
+        if (base.ContainsKey("Local Provider"))
+            builder["Local Provider"] = LocalProvider.ToString();
+        else if (base.ContainsKey("Replica Path"))
+            builder["Local Provider"] = AhtolaLocalProvider.Managed.ToString();
 
         return builder.ConnectionString;
     }
@@ -428,8 +513,9 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Mode" => ConvertOpenMode(value),
             "Cache" => ConvertCacheMode(value),
             "Foreign Keys" => ConvertToNullableBoolean(value),
-            "Recursive Triggers" or "Pooling" or "BinaryGUID" or "Foreign Read Only" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
-            "Default Timeout" or "Version" => Convert.ToInt32(value, CultureInfo.InvariantCulture),
+            "Recursive Triggers" or "Pooling" or "BinaryGUID" or "Foreign Read Only" or "Read Your Writes" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
+            "Tls" => ConvertToNullableBoolean(value),
+            "Default Timeout" or "Version" or "Sync Interval" => Convert.ToInt32(value, CultureInfo.InvariantCulture),
             "DateTimeKind" => ConvertDateTimeKind(value),
             "Local Provider" => ConvertLocalProvider(value),
             _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty,
@@ -443,6 +529,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Mode" => ConvertOpenMode(value),
             "Cache" => ConvertCacheMode(value),
             "Foreign Keys" => ConvertToNullableBoolean(value)!,
+            "Tls" => ConvertToNullableBoolean(value)!,
+            "Read Your Writes" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
             "DateTimeKind" => ConvertDateTimeKind(value),
             "Local Provider" => ConvertLocalProvider(value),
             _ => value,
@@ -471,6 +559,11 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Version" => 3,
             "Local Provider" => AhtolaLocalProvider.Native,
             "Foreign Read Only" => false,
+            "Auth Token" => string.Empty,
+            "Replica Path" => string.Empty,
+            "Read Your Writes" => true,
+            "Sync Interval" => 0,
+            "Tls" => null!,
             _ => throw new ArgumentException(Properties.Resources.KeywordNotSupported(keyword)),
         };
     }

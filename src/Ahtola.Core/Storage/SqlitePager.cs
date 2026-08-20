@@ -460,6 +460,105 @@ public sealed class SqlitePager : IDisposable
     }
 
     /// <summary>
+    /// Creates a fresh SQLite database in DELETE (rollback-journal) mode, with no
+    /// WAL, WAL-index, or shared memory.
+    /// </summary>
+    /// <remarks>
+    /// Used for a private VACUUM destination. Creating the target in WAL mode and
+    /// switching it afterwards costs a WAL file, a shared-memory mapping, a
+    /// checkpoint, and a header-rewrite transaction on an image nothing can
+    /// observe yet.
+    /// </remarks>
+    internal static SqlitePager CreateRollbackJournal(
+        IFileSystem fileSystem,
+        string databasePath,
+        string walPath,
+        SqliteDatabaseHeader databaseHeader,
+        AhtolaEncryptionOptions? encryption = null,
+        IPageCodec? pageCodec = null)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentException.ThrowIfNullOrEmpty(databasePath);
+        ArgumentException.ThrowIfNullOrEmpty(walPath);
+        ArgumentNullException.ThrowIfNull(databaseHeader);
+        encryption ??= GetFileSystemEncryption(fileSystem);
+        pageCodec ??= GetFileSystemPageCodec(fileSystem);
+        PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
+
+        var effectiveHeader = databaseHeader with
+        {
+            ReadVersion = SqliteFileFormatVersion.Legacy,
+            WriteVersion = SqliteFileFormatVersion.Legacy,
+        };
+        var effectiveLockManager = SqlitePagerLockRegistry.Get(fileSystem, databasePath, walPath);
+        var storageFileSystem = CreateStorageFileSystem(fileSystem);
+        var clientOwnership = SqliteManagedFileOwnershipRegistry.Acquire(
+            fileSystem,
+            databasePath,
+            createNew: true,
+            readOnly: false,
+            TimeSpan.Zero);
+        SqlitePageStore? pageStore = null;
+        var databaseCreated = false;
+        try
+        {
+            using var createLock = EnterLockWithinBudget(
+                effectiveLockManager,
+                SqlitePagerLockOperation.Checkpoint,
+                TimeSpan.Zero,
+                stopwatch: null,
+                pagerReadOnly: false);
+            // The caller overwrites this whole image and flushes once before
+            // publishing it, so syncing the placeholder header is wasted.
+            pageStore = SqlitePageStore.Create(
+                storageFileSystem,
+                databasePath,
+                effectiveHeader,
+                overwrite: clientOwnership is not null,
+                encryption: encryption,
+                pageCodec: pageCodec,
+                flushOnCreate: false);
+            databaseCreated = true;
+
+            var pager = new SqlitePager(
+                storageFileSystem,
+                databasePath,
+                walPath,
+                pageStore,
+                wal: null,
+                SqliteJournalMode.Delete,
+                effectiveLockManager,
+                DefaultPageCacheCapacity);
+            pager.InitializeRollbackJournalView();
+            pager._lockGeneration = createLock.PublishStorageChange();
+            pager._state = SqlitePagerState.Ready;
+            pager._busyTimeout = TimeSpan.Zero;
+            pager._clientOwnership = clientOwnership;
+            clientOwnership = null;
+            return pager;
+        }
+        catch
+        {
+            try
+            {
+                pageStore?.Dispose();
+            }
+            catch
+            {
+            }
+
+            if (databaseCreated)
+                TryDeleteCreatedArtifact(storageFileSystem, databasePath);
+
+            throw;
+        }
+        finally
+        {
+            clientOwnership?.Dispose();
+        }
+    }
+
+    /// <summary>
     /// Opens a main database and WAL pair, rebuilding the visible page overlay
     /// from every valid transaction through the last commit marker.
     /// </summary>
@@ -1291,6 +1390,49 @@ public sealed class SqlitePager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Publishes a complete VACUUM destination image directly into the main
+    /// database file of a private, not-yet-published store.
+    /// </summary>
+    /// <remarks>
+    /// Routing a vacuum target through the WAL writes the whole image twice and
+    /// reads it back once for the checkpoint. The target is a private temporary
+    /// file, so that intermediate copy buys nothing: nothing can observe it, and
+    /// a crash discards it. The caller must own the store exclusively and must
+    /// not have committed anything through the WAL.
+    /// </remarks>
+    internal void WriteUnpublishedVacuumImage(
+        uint pageCount,
+        Func<uint, ReadOnlyMemory<byte>> getPageImage)
+    {
+        ArgumentNullException.ThrowIfNull(getPageImage);
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            ThrowIfReadOnly();
+            if (_state != SqlitePagerState.Ready)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot write a vacuum destination image while the pager is {_state}.");
+            }
+            if (_activeTransaction is not null || _activeReadTransactions.Count != 0)
+            {
+                throw new InvalidOperationException(
+                    "Cannot write a vacuum destination image while transactions are active.");
+            }
+            if (_committedFrameCount != 0)
+            {
+                throw new InvalidOperationException(
+                    "Cannot write a vacuum destination image over a store with committed WAL frames.");
+            }
+
+            _pageStore.WriteUnpublishedImage(pageCount, getPageImage);
+            _walPageOverlay.Clear();
+            _pageCache.Clear();
+            _committedPageCount = _pageStore.PageCount;
+        }
+    }
+
     internal void ReplaceDatabaseFile(string replacementPath, TimeSpan? busyTimeout = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(replacementPath);
@@ -1814,13 +1956,8 @@ public sealed class SqlitePager : IDisposable
 
         var targetPageCount = finalFrame.Header.DatabaseSizeInPages;
         var latestFrames = new Dictionary<uint, byte[]>();
-        for (var frameNumber = 1U; ; frameNumber++)
-        {
-            var frame = wal.ReadFrame(frameNumber);
+        foreach (var frame in wal.ReadFrameRange(1, safeFrame))
             latestFrames[frame.Header.PageNumber] = frame.PageData;
-            if (frameNumber == safeFrame)
-                break;
-        }
 
         var originalPageCount = _pageStore.PageCount;
         var installedPageCount = 0;
@@ -1953,13 +2090,14 @@ public sealed class SqlitePager : IDisposable
                 ValidateWalHasNotChanged();
                 var priorWalIndexHeader = TryReadValidatedWalIndexHeader(wal);
                 var priorCommittedFrameCount = _committedFrameCount;
-                for (var index = 0; index < transaction.WriteOrder.Count; index++)
+                if (transaction.WriteOrder.Count > 0)
                 {
-                    var pageNumber = transaction.WriteOrder[index];
-                    var databaseSizeInPages = index == transaction.WriteOrder.Count - 1
-                        ? transaction.TargetDatabaseSizeInPages
-                        : 0;
-                    wal.AppendFrame(pageNumber, transaction.GetPageImage(pageNumber), databaseSizeInPages);
+                    // One batch append: the WAL is scanned once and the checksum
+                    // chain is carried across the transaction's frames, instead of
+                    // re-validating every preceding frame per page.
+                    wal.AppendFrames(
+                        new SqlitePagerTransaction.WalFrameSource(transaction),
+                        transaction.TargetDatabaseSizeInPages);
                 }
 
                 wal.Flush();
@@ -2744,6 +2882,33 @@ public sealed class SqlitePager : IDisposable
             _ => SqliteFileFormatVersion.Legacy,
         };
 
+    /// <summary>
+    /// Establishes the committed view of a freshly created DELETE-mode database,
+    /// which has no WAL and therefore no frames to recover.
+    /// </summary>
+    private void InitializeRollbackJournalView()
+    {
+        var header = _pageStore.Header;
+        if (IsWalCompatibleFormat(header.WriteVersion) || IsWalCompatibleFormat(header.ReadVersion))
+        {
+            throw new InvalidDataException(
+                "A rollback-journal SQLite database requires legacy read and write format versions.");
+        }
+        if (header.VersionValidFor != header.ChangeCounter
+            || header.DatabaseSizeInPages != _pageStore.PageCount)
+        {
+            throw new InvalidDataException(
+                "A rollback-journal SQLite database must have an authoritative main-database header.");
+        }
+
+        _committedPageCount = _pageStore.PageCount;
+        _committedFrameCount = 0;
+        _walPageOverlay.Clear();
+        _pageCache.Clear();
+        _recoveryInfo = CreateEmptyRecoveryInfo();
+        _visibleRecoveryInfo = _recoveryInfo;
+    }
+
     private void InitializeCleanWalView()
     {
         var header = _pageStore.Header;
@@ -2779,18 +2944,22 @@ public sealed class SqlitePager : IDisposable
 
         var transactionPages = new Dictionary<uint, byte[]>();
         var finalTransactionHasPageOne = false;
-        for (var frameNumber = 1L; frameNumber <= recovery.LastCommittedFrameNumber; frameNumber++)
+        if (recovery.LastCommittedFrameNumber > 0)
         {
-            var frame = wal.ReadFrame(frameNumber);
-            transactionPages[frame.Header.PageNumber] = frame.PageData;
-            if (!frame.Header.IsCommit)
-                continue;
+            var frameNumber = 0L;
+            foreach (var frame in wal.ReadFrameRange(1, recovery.LastCommittedFrameNumber))
+            {
+                frameNumber++;
+                transactionPages[frame.Header.PageNumber] = frame.PageData;
+                if (!frame.Header.IsCommit)
+                    continue;
 
-            ValidateRecoveredTransaction(transactionPages, frame.Header.DatabaseSizeInPages);
-            if (frameNumber == recovery.LastCommittedFrameNumber)
-                finalTransactionHasPageOne = transactionPages.ContainsKey(1);
-            PublishRecoveredTransaction(transactionPages, frame.Header.DatabaseSizeInPages);
-            transactionPages.Clear();
+                ValidateRecoveredTransaction(transactionPages, frame.Header.DatabaseSizeInPages);
+                if (frameNumber == recovery.LastCommittedFrameNumber)
+                    finalTransactionHasPageOne = transactionPages.ContainsKey(1);
+                PublishRecoveredTransaction(transactionPages, frame.Header.DatabaseSizeInPages);
+                transactionPages.Clear();
+            }
         }
 
         if (transactionPages.Count != 0)
@@ -3066,14 +3235,11 @@ public sealed class SqlitePager : IDisposable
             && priorHeader.MaximumFrame == (uint)priorCommittedFrameCount
             && recovery.LastCommittedFrameNumber > priorCommittedFrameCount)
         {
-            var frames = new List<SqliteWalFrame>(
-                checked((int)(recovery.LastCommittedFrameNumber - priorCommittedFrameCount)));
-            for (var frameNumber = priorCommittedFrameCount + 1;
-                 frameNumber <= recovery.LastCommittedFrameNumber;
-                 frameNumber++)
-            {
-                frames.Add(wal.ReadFrame(frameNumber));
-            }
+            // One chain walk for the whole committed run: ReadFrame revalidates
+            // the entire prefix per call, which made publication O(P^2).
+            var frames = wal.ReadFrameRange(
+                priorCommittedFrameCount + 1,
+                recovery.LastCommittedFrameNumber);
 
             var commitFrame = frames[^1].Header;
             var committedHeader = priorHeader.WithCommittedFrames(
@@ -3118,17 +3284,19 @@ public sealed class SqlitePager : IDisposable
         var overlay = new Dictionary<uint, byte[]>();
         var transactionPages = new Dictionary<uint, byte[]>();
         uint lastCommitPageCount = 0;
-        for (var frameNumber = 1U; frameNumber <= maximumFrame; frameNumber++)
+        if (maximumFrame > 0)
         {
-            var frame = wal.ReadFrame(frameNumber);
-            transactionPages[frame.Header.PageNumber] = frame.PageData;
-            if (!frame.Header.IsCommit)
-                continue;
+            foreach (var frame in wal.ReadFrameRange(1, maximumFrame))
+            {
+                transactionPages[frame.Header.PageNumber] = frame.PageData;
+                if (!frame.Header.IsCommit)
+                    continue;
 
-            foreach (var pair in transactionPages)
-                overlay[pair.Key] = pair.Value;
-            lastCommitPageCount = frame.Header.DatabaseSizeInPages;
-            transactionPages.Clear();
+                foreach (var pair in transactionPages)
+                    overlay[pair.Key] = pair.Value;
+                lastCommitPageCount = frame.Header.DatabaseSizeInPages;
+                transactionPages.Clear();
+            }
         }
 
         if (transactionPages.Count != 0)
@@ -3651,6 +3819,20 @@ public sealed class SqlitePagerTransaction : IDisposable
             throw new InvalidOperationException($"SQLite pager transaction has no image for page {pageNumber}.");
 
         return page;
+    }
+
+    /// <summary>
+    /// Exposes this transaction's staged pages, in write order, as a single WAL
+    /// frame batch so the commit appends them in one pass.
+    /// </summary>
+    internal sealed class WalFrameSource(SqlitePagerTransaction transaction) : ISqliteWalFrameSource
+    {
+        public int Count => transaction.WriteOrder.Count;
+
+        public uint GetPageNumber(int index) => transaction.WriteOrder[index];
+
+        public ReadOnlySpan<byte> GetPageImage(int index)
+            => transaction.GetPageImage(transaction.WriteOrder[index]);
     }
 
     internal long PublishStorageChange()

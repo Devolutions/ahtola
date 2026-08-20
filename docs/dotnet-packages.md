@@ -27,7 +27,7 @@ replica**.
 | --- | --- | --- |
 | `Devolutions.Ahtola.Core` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Core) | Pure-managed engine (pager, b-tree, WAL, VDBE). Rarely referenced directly — it flows in transitively — unless you need engine-level types such as `IPageCodec`. |
 | `Devolutions.Ahtola.Data.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Data.Sqlite) | ADO.NET provider: the `Microsoft.Data.Sqlite`-compatible facade (`Ahtola.Data.Sqlite.SqliteConnection`, …) plus the native `Ahtola.AhtolaConnection` types (local files, MVCC, Turso Cloud direct/replica). Embeds `Ahtola.Data`. |
-| `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.EntityFrameworkCore.Sqlite) | EF Core provider (`UseAhtola`), **local databases only** (see [Entity Framework Core](#entity-framework-core)). |
+| `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.EntityFrameworkCore.Sqlite) | EF Core provider (`UseAhtola`) — local databases, direct remote Turso Cloud/Hrana connections, and embedded replicas (see [Entity Framework Core](#entity-framework-core)). |
 
 ```bash
 # ADO.NET only
@@ -56,10 +56,10 @@ Devolutions.Ahtola.Core` yourself. Add it directly only if you're writing an
 - **Native Ahtola API, or you need Turso Cloud (direct connection or embedded
   replica)** → same package, `using Ahtola;` — see
   [Native Ahtola types](#native-ahtola-types) and the Turso Cloud sections below.
-  EF Core's `UseAhtola` does **not** support Turso Cloud URLs; use
-  `AhtolaConnection` directly for that.
 - **EF Core** → also add `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` and call
-  `optionsBuilder.UseAhtola(...)` — local SQLite files only.
+  `optionsBuilder.UseAhtola(...)` — local files, direct remote Turso Cloud/Hrana
+  URLs, and embedded replicas are all supported (see
+  [Entity Framework Core](#entity-framework-core)).
 
 ## The SQLite-compatible facade
 
@@ -87,9 +87,23 @@ while (reader.Read())
 yourself. `SqliteFactory.Instance` is the `DbProviderFactory` if you need
 provider-agnostic construction (e.g. `DbProviderFactories.RegisterFactory`).
 
-This facade is **local-file only** — its `SqliteConnectionStringBuilder` does
-not accept Turso Cloud keywords (`Auth Token`, `Replica Path`, …). Use the
-native `Ahtola.AhtolaConnection` (below) for Turso Cloud.
+The same facade also opens direct Turso/Hrana URLs and managed embedded
+replicas, so code written against `Microsoft.Data.Sqlite` can usually keep its
+`SqliteConnection`/`SqliteCommand`/`SqliteBatch` shapes:
+
+```csharp
+using var cloud = new SqliteConnection(
+    "Data Source=turso://my-db.turso.io;Auth Token=" + authToken);
+
+using var replica = new SqliteConnection(
+    "Data Source=turso://my-db.turso.io;Auth Token=" + authToken
+    + ";Replica Path=./replica.db");
+```
+
+Local-only APIs (user-defined functions/aggregates, custom collations, hooks,
+extensions, backup, and incremental blobs) fail explicitly when the selected
+remote mode cannot provide them. Inspect `connection.Capabilities` before using
+an optional surface.
 
 ### Standard SQLite files
 
@@ -115,10 +129,10 @@ connection.Open();
 connection.ExecuteNonQuery("CREATE TABLE t(a, b)");
 ```
 
-Use the native types when you need capabilities the facade doesn't surface:
-Turso Cloud direct connections, managed embedded replicas, `Sync`/`SyncAsync`,
-and `Capabilities` (e.g. `CanCreateBatch`, `SupportsSync`) for feature-testing
-a connection before using it.
+Use the native types when you prefer the Ahtola-specific API and exception
+types. Both facades support direct remote connections, managed embedded
+replicas, batches, `Sync`/`SyncAsync`, and `Capabilities` (e.g.
+`CanCreateBatch`, `SupportsSync`) for feature-testing a connection before use.
 
 ## Connection string reference
 
@@ -127,7 +141,7 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 
 | Keyword | Notes |
 | --- | --- |
-| `Data Source` (`Filename`) | File path, `:memory:`, or (native types only) a Turso Cloud URL (`libsql://…` / `https://…`) |
+| `Data Source` (`Filename`) | File path, `:memory:`, or a Turso/Hrana URL (`turso://…`, `libsql://…`, `https://…`) |
 | `Mode` | `ReadWriteCreate` (default), `ReadWrite`, `ReadOnly`, `Memory` |
 | `Cache` | `Private` (default) / `Shared` |
 | `Pooling` | Connection pooling (default `true`) |
@@ -140,9 +154,8 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 | `Foreign Read Only` | Read another engine's open database without taking main-file locks (`Mode=ReadOnly` + `Pooling=False`) |
 | `DateTimeKind`, `BinaryGUID` | Facade-only ADO.NET conversion behavior |
 
-Native-types-only keywords for Turso Cloud (see the Turso Cloud sections
-below): `Auth Token`, `Replica Path`, `Sync Interval`, `Read Your Writes`,
-`Tls`.
+Remote keywords accepted by both facades (see the Turso Cloud sections below):
+`Auth Token`, `Replica Path`, `Sync Interval`, `Read Your Writes`, `Tls`.
 
 ## Working with a local SQLite file
 
@@ -303,19 +316,53 @@ and an optional `Action<SqliteDbContextOptionsBuilder>` — the same shape as
 net10.0; the pinned range is enforced at load time and throws
 `NotSupportedException` on a mismatched EF Core version).
 
-**`UseAhtola` supports local Ahtola databases only.** Passing a Turso Cloud
-`Data Source` (`libsql://`, `http(s)://`, `ws(s)://`) throws
-`NotSupportedException` at options-build time — Turso Cloud's retry and
-transaction semantics aren't modeled by the EF Core provider yet. Use
-`AhtolaConnection` directly (see the Turso Cloud sections below) for that
-scenario. Migrations, `EnsureCreated`/`EnsureDeleted`, and querying all work
-normally against a local file or `:memory:`.
+**`UseAhtola` supports local files, direct remote Turso Cloud/Hrana
+connections, and embedded replicas** — it classifies the `Data Source` the
+same way the ADO.NET facades do and wires up the matching services:
+
+```csharp
+// Local file or :memory: (native or Local Provider=Managed)
+.UseAhtola("Data Source=app.db")
+
+// Direct remote Turso Cloud/Hrana — every read and write is a round trip
+.UseAhtola("Data Source=turso://my-db.turso.io;Auth Token=" + authToken)
+
+// Embedded replica — queries run against a local synced copy
+.UseAhtola("Data Source=turso://my-db.turso.io;Auth Token=" + authToken + ";Replica Path=replica.db")
+```
+
+Migrations, `EnsureCreated`/`EnsureDeleted`, querying, `SaveChanges`
+(including `INSERT ... RETURNING`), and explicit transactions all work over a
+direct remote or embedded-replica connection. A direct remote connection
+cannot enforce `Mode=ReadOnly` (there is no local file to guard) and its
+`EnsureDeleted`/`Delete` is always a no-op — the remote database is
+provisioned and owned independently (e.g. via the Turso CLI/API), so
+`UseAhtola` never attempts to drop it.
+
+Because a remote/replica connection cannot register client-side SQL
+functions or collations, a few LINQ constructs that translate to those on
+local connections are rejected with a `NotSupportedException` **at query
+translation time** (before any request reaches the server) instead of
+failing late with an opaque "no such function" error:
+
+- `Regex.IsMatch(...)` (translates to a client-registered `regexp` function).
+- Decimal arithmetic (`+ - * / %`, unary `-`) and decimal `Sum`/`Average`/`Max`/`Min`.
+- `OrderBy`/`OrderByDescending` on a `decimal` value (needs the `EF_DECIMAL` collation).
+
+Everything else — standard SQL, JSON1 (including primitive collections),
+equality/inequality on decimals, and simply storing/reading decimal values —
+keeps working normally. No automatic `EnableRetryOnFailure`-style execution
+strategy is registered for remote connections: a transient remote failure
+(e.g. `SQLITE_BUSY`) propagates to the caller as-is rather than being
+silently retried, since safely retrying inside a user-managed transaction is
+not implemented yet. Use `SqliteRemoteExceptionClassifier.IsTransient(...)`
+if you want to detect and retry transient failures yourself.
 
 ## Turso Cloud: direct connection
 
-`AhtolaConnection` opens a connection straight against Turso Cloud
-(`libsql://` is normalized to `https://`) with no local file at all — every
-read and write is a remote round trip.
+`AhtolaConnection` and `Ahtola.Data.Sqlite.SqliteConnection` open a connection
+straight against Turso Cloud (`turso://` / `libsql://` normalize to HTTPS) with
+no local file at all — every read and write is a remote round trip.
 
 ```csharp
 using Ahtola;
@@ -331,12 +378,17 @@ var result = command.ExecuteScalar();
 cloud.Close();
 ```
 
-Network and provider failures for cloud connections are wrapped in a generic
-`InvalidOperationException`, specifically so a credential never leaks into an
-error message. `connection.ConnectionString` is always redacted
-(`Data Source=...;Auth Token=***`) — the bearer token is never exposed or
-serialized. Never hardcode the token; read it from a secret manager or
-environment variable at runtime.
+The SQLite-compatible facade maps remote failures to `SqliteRemoteException`;
+use `SqliteRemoteExceptionClassifier.IsTransient(...)` for explicit retry
+policy. The native facade exposes `AhtolaException` /
+`AhtolaRemoteSqlException`. Connection strings redact the bearer token
+(`Data Source=...;Auth Token=***`) — it is never exposed in diagnostics. Never
+hardcode the token; read it from a secret manager or environment variable.
+
+Expired Hrana streams are retried once automatically only for stateless
+commands. An active transaction is never replayed: it becomes unusable and
+commit/rollback preserves the original stream failure instead of masking it
+with a local "database is closed" error.
 
 ## Turso Cloud: managed embedded replica
 
@@ -377,6 +429,20 @@ using var replica = new AhtolaConnection(
     "Data Source=libsql://my-db.turso.io;Auth Token=" + authToken +
     ";Replica Path=./replica.db;Sync Interval=30");
 ```
+
+Bootstrap is a validated raw-page snapshot. For protocol-2 databases,
+incremental pull is Turso's MVCC logical stream: Ahtola validates the complete
+`lml3` response, replays the transaction atomically, filters this client's own
+transactions, and only then advances the opaque server revision. If retained
+logical history is unavailable, a complete `Pages + ReplaceBase` response is
+installed atomically. Pending local row changes are preserved across logical
+pulls; unsafe residual deletes or schema changes fail closed until they have
+been pushed. Protocol-1 databases keep the page-incremental path.
+
+Embedded replicas support `DbBatch` through both facades. Enum parameters bind
+as their underlying SQLite integer value. Extra parameters that are not
+referenced by the SQL are ignored; every referenced slot still requires a
+value.
 
 Server-side rejection of a replayed local change surfaces as
 `Ahtola.AhtolaReplicaConflictException`: `ConflictKind`
@@ -422,11 +488,10 @@ catch (Ahtola.AhtolaReplicaConflictException ex)
     Console.WriteLine($"{ex.ConflictKind}: {ex.Message} (remote code {ex.RemoteErrorCode})");
     // Journal is retained; decide whether to discard or replay the change.
 }
-catch (InvalidOperationException)
+catch (Ahtola.Data.Sqlite.SqliteRemoteException ex)
 {
-    // Turso Cloud / embedded-replica network and provider failures are
-    // wrapped this way to keep credentials and provider internals out of
-    // the error message.
+    Console.WriteLine(ex.Classification);
+    // Retry only when your operation is safe to repeat.
 }
 ```
 
@@ -435,9 +500,10 @@ catch (InvalidOperationException)
   locked`; `Default Timeout` / `Command Timeout` on the connection string
   (and `PRAGMA busy_timeout`) control how long a statement waits before
   giving up.
-- Turso Cloud / embedded-replica network and provider failures are wrapped as
-  `InvalidOperationException` with a generic message, to keep credentials and
-  provider internals out of the error stream.
+- The SQLite-compatible facade maps Turso/Hrana failures to
+  `SqliteRemoteException` with transient/permanent classification and optional
+  HTTP status. The native facade exposes `AhtolaException` /
+  `AhtolaRemoteSqlException`.
 - Embedded-replica sync conflicts are `Ahtola.AhtolaReplicaConflictException`
   (see above) and expose `ConflictKind`, `RemoteErrorCode`, and
   `LocalChangeSequence` for programmatic handling.
