@@ -19,6 +19,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     private readonly SqliteConnection _connection;
     private SqliteStatementAdapter? _statement;
     private DbDataReader? _delegatedReader;
+    private bool _skipDelegatedReaderToFirstColumnResult;
     private string _currentSql = string.Empty;
     private readonly List<string> _remainingSql = new();
     private readonly CommandBehavior _behavior;
@@ -147,7 +148,12 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
-    internal SqliteDataReader(SqliteCommand command, DbDataReader delegatedReader, CommandBehavior behavior, Action closeCallback)
+    internal SqliteDataReader(
+        SqliteCommand command,
+        DbDataReader delegatedReader,
+        CommandBehavior behavior,
+        Action closeCallback,
+        bool skipToFirstColumnResult)
     {
         _command = command;
         _connection = command.Connection
@@ -155,7 +161,46 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         _delegatedReader = delegatedReader ?? throw new ArgumentNullException(nameof(delegatedReader));
         _behavior = behavior;
         _closeCallback = closeCallback;
+        _skipDelegatedReaderToFirstColumnResult = skipToFirstColumnResult;
+        if (skipToFirstColumnResult)
+        {
+            // A SqliteCommand.CommandText containing multiple semicolon-separated statements
+            // (e.g. "INSERT ...; SELECT changes();") is executed as one remote/replica batch.
+            // Position the reader on the first result that has columns, exactly like the local
+            // statement-stepping path already does in Execute(...)/NextResultCore below: a
+            // leading INSERT/UPDATE/DELETE without RETURNING is absorbed rather than exposed as
+            // its own reader position, so ExecuteScalar/ExecuteReader callers — including EF
+            // Core's own ModificationCommandBatch and SqliteHistoryRepository — land directly on
+            // the first row-producing result instead of reading null/throwing off an empty one.
+            // This applies only to SqliteCommand's own multi-statement CommandText splitting.
+            // SqliteBatch's explicit DbBatchCommands (skipToFirstColumnResult: false) — and
+            // AhtolaBatch's own DbBatch.ExecuteReader() used directly — must keep exposing every
+            // explicitly-added command 1:1, matching the local/replica SequentialBatchDataReader
+            // contract: each NextResult() call advances exactly one explicit command, even one
+            // with zero columns (a plain INSERT/UPDATE/DELETE without RETURNING).
+            SkipDelegatedReaderToColumns(_delegatedReader);
+        }
+
         ((ILocalReaderConnection)_connection).ReaderOpened(this);
+    }
+
+    private static bool SkipDelegatedReaderToColumns(DbDataReader reader)
+    {
+        while (reader.FieldCount == 0 && reader.NextResult())
+        {
+        }
+
+        return reader.FieldCount > 0;
+    }
+
+    private static async Task<bool> SkipDelegatedReaderToColumnsAsync(DbDataReader reader, CancellationToken cancellationToken)
+    {
+        while (reader.FieldCount == 0
+               && await reader.NextResultAsync(cancellationToken).ConfigureAwait(false))
+        {
+        }
+
+        return reader.FieldCount > 0;
     }
 
     public override int Depth => _delegatedReader?.Depth ?? 0;
@@ -862,7 +907,17 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
         try
         {
-            return _delegatedReader.NextResult();
+            if (!_skipDelegatedReaderToFirstColumnResult)
+            {
+                // SqliteBatch's explicit DbBatchCommands (and AhtolaBatch's own DbBatch API used
+                // directly) must expose every command 1:1: advance exactly one step, whatever
+                // its column count, matching SequentialBatchDataReader's local/replica contract.
+                return _delegatedReader.NextResult();
+            }
+
+            // Mirror NextResultCore below: always move at least one step, then keep skipping
+            // forward through any further 0-column (non-RETURNING DML) results.
+            return _delegatedReader.NextResult() && SkipDelegatedReaderToColumns(_delegatedReader);
         }
         catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
         {
@@ -1000,7 +1055,20 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
         try
         {
-            return await _delegatedReader.NextResultAsync(cancellationToken).ConfigureAwait(false);
+            if (!_skipDelegatedReaderToFirstColumnResult)
+            {
+                // SqliteBatch's explicit DbBatchCommands (and AhtolaBatch's own DbBatch API used
+                // directly) must expose every command 1:1: advance exactly one step, whatever
+                // its column count, matching SequentialBatchDataReader's local/replica contract.
+                return await _delegatedReader.NextResultAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            // Mirror NextResult() above: always move at least one step, then keep skipping
+            // forward through any further 0-column (non-RETURNING DML) results.
+            if (!await _delegatedReader.NextResultAsync(cancellationToken).ConfigureAwait(false))
+                return false;
+
+            return await SkipDelegatedReaderToColumnsAsync(_delegatedReader, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
         {

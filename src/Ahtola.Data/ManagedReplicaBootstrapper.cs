@@ -10,7 +10,7 @@ internal static class ManagedReplicaBootstrapper
     private const int PageSize = 4096;
     private const int MaxHeaderLength = 64 * 1024;
     private const int MaxPageMessageLength = PageSize + 1024;
-    private const string MetadataSuffix = ".ahtola-replica-meta";
+    internal const string MetadataSuffix = ".ahtola-replica-meta";
     private static readonly byte[] SqliteHeader = "SQLite format 3\0"u8.ToArray();
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
@@ -632,6 +632,41 @@ internal static class ManagedReplicaBootstrapper
             throw new NotSupportedException("Managed embedded replica local divergence was detected; incremental pull cannot replace local changes.");
     }
 
+    /// <summary>Determines whether a bootstrapped managed embedded replica is present at
+    /// <paramref name="databasePath"/> using only local filesystem state (the database file and
+    /// its metadata sidecar) — never opens a connection or contacts the remote endpoint. Opening
+    /// an embedded-replica connection when the local database is absent triggers a full remote
+    /// bootstrap/download as a side effect, which existence checks must never do.</summary>
+    internal static ManagedReplicaLocalState GetLocalState(string databasePath)
+    {
+        var databaseExists = File.Exists(databasePath);
+        var metadataExists = File.Exists(databasePath + MetadataSuffix);
+        if (databaseExists == metadataExists)
+            return databaseExists ? ManagedReplicaLocalState.Present : ManagedReplicaLocalState.Absent;
+
+        // BootstrapAsync itself refuses to proceed when exactly one of the pair exists (see its
+        // own metadata-without-database check above); existence checks must surface the same
+        // inconsistency rather than silently reporting true/false or repairing it implicitly.
+        return ManagedReplicaLocalState.Inconsistent;
+    }
+
+    /// <summary>Every local filesystem artifact a managed embedded replica may have written
+    /// alongside <paramref name="databasePath"/>: the database file itself, SQLite's own
+    /// -wal/-shm/-journal siblings, the bootstrap/sync metadata sidecar, and the local change
+    /// journal used to buffer writes between pushes. Callers that need to fully remove a
+    /// replica's local footprint (e.g. EF's DatabaseCreator.Delete) must delete this whole set,
+    /// not just the primary database file, or a later bootstrap will find a stale, inconsistent
+    /// partial state.</summary>
+    internal static IReadOnlyList<string> GetLocalArtifactPaths(string databasePath) =>
+    [
+        databasePath,
+        databasePath + "-wal",
+        databasePath + "-shm",
+        databasePath + "-journal",
+        databasePath + MetadataSuffix,
+        databasePath + ManagedReplicaChangeJournal.Suffix,
+    ];
+
     private static string ComputeDatabaseFingerprint(string path)
         => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
 
@@ -782,4 +817,24 @@ internal static class ManagedReplicaBootstrapper
             _offset += length;
         }
     }
+}
+
+/// <summary>The local on-disk state of a managed embedded replica, as determined purely from
+/// filesystem checks (see <see cref="ManagedReplicaBootstrapper.GetLocalState"/>) without opening
+/// a connection or contacting the remote endpoint.</summary>
+internal enum ManagedReplicaLocalState
+{
+    /// <summary>Neither the database file nor its metadata sidecar exist locally: no replica has
+    /// been bootstrapped at this path yet.</summary>
+    Absent,
+
+    /// <summary>Both the database file and its metadata sidecar exist locally: a bootstrapped
+    /// replica is present.</summary>
+    Present,
+
+    /// <summary>Exactly one of the database file or metadata sidecar exists locally. This is the
+    /// same inconsistency <see cref="ManagedReplicaBootstrapper.BootstrapAsync"/> itself refuses
+    /// to resolve automatically; callers should surface it as an error rather than silently
+    /// treating it as present, absent, or repairing it implicitly.</summary>
+    Inconsistent,
 }

@@ -106,13 +106,15 @@ public sealed class SqliteRemoteFacadeTests
             {
                 command.CommandText = "INSERT INTO t VALUES (5); SELECT 42; SELECT 42;";
                 using var reader = command.ExecuteReader();
-                reader.FieldCount.Should().Be(0);
-                reader.NextResult().Should().BeTrue();
+                // The leading INSERT (no columns) is transparently absorbed, matching the
+                // local SqliteCommand contract: the reader lands directly on the first SELECT.
+                reader.FieldCount.Should().Be(1);
                 reader.Read().Should().BeTrue();
                 reader.GetFieldValue<int>(0).Should().Be(42);
                 reader.NextResult().Should().BeTrue();
                 reader.Read().Should().BeTrue();
                 reader.GetFieldValueAsync<int>(0, CancellationToken.None).GetAwaiter().GetResult().Should().Be(42);
+                reader.NextResult().Should().BeFalse();
                 reader.RecordsAffected.Should().Be(1);
             }
             handler.SqlStatements.Should().Contain("INSERT INTO t VALUES (5)");
@@ -588,6 +590,97 @@ public sealed class SqliteRemoteFacadeTests
         {
             SqliteConnection.RemoteMessageHandlerFactory = priorFactory;
         }
+    }
+
+    [Test]
+    public void DirectRemoteBatch_PreservesEveryExplicitCommandResult_IncludingZeroColumnWrites()
+    {
+        // SqliteBatch's explicit DbBatchCommands must be exposed 1:1 over a remote connection,
+        // exactly like the local/replica SequentialBatchDataReader contract: a plain write with
+        // no RETURNING clause (0 columns) is its own reader position, not silently absorbed the
+        // way SqliteCommand's own multi-statement CommandText splitting is (see
+        // DirectRemote_FacadeDelegatesCommandsTransactionsReadersAndBatches above, and
+        // LocalBatch_PreservesEveryExplicitCommandResult... below for the local-mode parity
+        // check).
+        using var handler = new FacadeRemoteHandler();
+        var priorFactory = SqliteConnection.RemoteMessageHandlerFactory;
+        SqliteConnection.RemoteMessageHandlerFactory = () => handler;
+        try
+        {
+            using var connection = new SqliteConnection("Data Source=https://example.test/db;Auth Token=token");
+            connection.Open();
+            using var batch = connection.CreateBatch();
+            batch.BatchCommands.Add(new SqliteBatchCommand("INSERT INTO t VALUES (1)"));
+            batch.BatchCommands.Add(new SqliteBatchCommand("SELECT 42"));
+            using var reader = batch.ExecuteReader();
+
+            reader.FieldCount.Should().Be(0);
+            reader.Read().Should().BeFalse();
+            reader.NextResult().Should().BeTrue();
+            reader.FieldCount.Should().Be(1);
+            reader.Read().Should().BeTrue();
+            reader.GetInt64(0).Should().Be(42);
+            reader.NextResult().Should().BeFalse();
+        }
+        finally
+        {
+            SqliteConnection.RemoteMessageHandlerFactory = priorFactory;
+        }
+    }
+
+    [Test]
+    public void DirectRemoteBatch_AllWriteCommands_ExposesEachStepViaExplicitNextResult()
+    {
+        using var handler = new FacadeRemoteHandler();
+        var priorFactory = SqliteConnection.RemoteMessageHandlerFactory;
+        SqliteConnection.RemoteMessageHandlerFactory = () => handler;
+        try
+        {
+            using var connection = new SqliteConnection("Data Source=https://example.test/db;Auth Token=token");
+            connection.Open();
+            using var batch = connection.CreateBatch();
+            batch.BatchCommands.Add(new SqliteBatchCommand("INSERT INTO t VALUES (1)"));
+            batch.BatchCommands.Add(new SqliteBatchCommand("INSERT INTO t VALUES (2)"));
+            using var reader = batch.ExecuteReader();
+
+            reader.FieldCount.Should().Be(0);
+            reader.NextResult().Should().BeTrue("the second explicit write command is still its own reader position");
+            reader.FieldCount.Should().Be(0);
+            reader.NextResult().Should().BeFalse();
+        }
+        finally
+        {
+            SqliteConnection.RemoteMessageHandlerFactory = priorFactory;
+        }
+    }
+
+    [Test]
+    public void LocalBatch_PreservesEveryExplicitCommandResult_IncludingZeroColumnWrites_MatchingRemoteContract()
+    {
+        // Same shape and assertions as DirectRemoteBatch_PreservesEveryExplicitCommandResult...
+        // above, run against a local managed connection instead of a remote one: proves the
+        // remote-side fix actually restores parity with what local/replica already did, rather
+        // than merely asserting the remote behavior in isolation.
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        using (var create = connection.CreateCommand())
+        {
+            create.CommandText = "CREATE TABLE t(value INTEGER NOT NULL);";
+            create.ExecuteNonQuery();
+        }
+
+        using var batch = connection.CreateBatch();
+        batch.BatchCommands.Add(new SqliteBatchCommand("INSERT INTO t VALUES (1)"));
+        batch.BatchCommands.Add(new SqliteBatchCommand("SELECT 42"));
+        using var reader = batch.ExecuteReader();
+
+        reader.FieldCount.Should().Be(0);
+        reader.Read().Should().BeFalse();
+        reader.NextResult().Should().BeTrue();
+        reader.FieldCount.Should().Be(1);
+        reader.Read().Should().BeTrue();
+        reader.GetInt64(0).Should().Be(42);
+        reader.NextResult().Should().BeFalse();
     }
 
     private sealed class FacadeRemoteHandler : HttpMessageHandler

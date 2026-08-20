@@ -267,11 +267,21 @@ public sealed class SqliteBatch : DbBatch
             var reader = await batch.ExecuteReaderAsync(behavior, execution.Token).ConfigureAwait(false);
             CopyRemoteRecordsAffected(batch);
             var command = new SqliteCommand(connection);
-            return new SqliteDataReader(command, reader, behavior, () =>
-            {
-                batch.Dispose();
-                command.Dispose();
-            });
+            return new SqliteDataReader(
+                command,
+                reader,
+                behavior,
+                () =>
+                {
+                    batch.Dispose();
+                    command.Dispose();
+                },
+                // Every explicitly-added DbBatchCommand must be exposed 1:1, including a plain
+                // write with no RETURNING clause (0 columns) — this is the raw DbBatch contract
+                // callers rely on (mirrored by the local/replica SequentialBatchDataReader), and
+                // is why the general SqliteCommand skip-to-first-column-result behavior must not
+                // apply here.
+                skipToFirstColumnResult: false);
         }
         catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
         {

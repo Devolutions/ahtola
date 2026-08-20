@@ -27,7 +27,7 @@ replica**.
 | --- | --- | --- |
 | `Devolutions.Ahtola.Core` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Core) | Pure-managed engine (pager, b-tree, WAL, VDBE). Rarely referenced directly — it flows in transitively — unless you need engine-level types such as `IPageCodec`. |
 | `Devolutions.Ahtola.Data.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Data.Sqlite) | ADO.NET provider: the `Microsoft.Data.Sqlite`-compatible facade (`Ahtola.Data.Sqlite.SqliteConnection`, …) plus the native `Ahtola.AhtolaConnection` types (local files, MVCC, Turso Cloud direct/replica). Embeds `Ahtola.Data`. |
-| `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.EntityFrameworkCore.Sqlite) | EF Core provider (`UseAhtola`), **local databases only** (see [Entity Framework Core](#entity-framework-core)). |
+| `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.EntityFrameworkCore.Sqlite) | EF Core provider (`UseAhtola`) — local databases, direct remote Turso Cloud/Hrana connections, and embedded replicas (see [Entity Framework Core](#entity-framework-core)). |
 
 ```bash
 # ADO.NET only
@@ -56,10 +56,10 @@ Devolutions.Ahtola.Core` yourself. Add it directly only if you're writing an
 - **Native Ahtola API, or you need Turso Cloud (direct connection or embedded
   replica)** → same package, `using Ahtola;` — see
   [Native Ahtola types](#native-ahtola-types) and the Turso Cloud sections below.
-  EF Core's `UseAhtola` does **not** support Turso Cloud URLs; use
-  `AhtolaConnection` directly for that.
 - **EF Core** → also add `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` and call
-  `optionsBuilder.UseAhtola(...)` — local SQLite files only.
+  `optionsBuilder.UseAhtola(...)` — local files, direct remote Turso Cloud/Hrana
+  URLs, and embedded replicas are all supported (see
+  [Entity Framework Core](#entity-framework-core)).
 
 ## The SQLite-compatible facade
 
@@ -303,13 +303,47 @@ and an optional `Action<SqliteDbContextOptionsBuilder>` — the same shape as
 net10.0; the pinned range is enforced at load time and throws
 `NotSupportedException` on a mismatched EF Core version).
 
-**`UseAhtola` supports local Ahtola databases only.** Passing a Turso Cloud
-`Data Source` (`libsql://`, `http(s)://`, `ws(s)://`) throws
-`NotSupportedException` at options-build time — Turso Cloud's retry and
-transaction semantics aren't modeled by the EF Core provider yet. Use
-`AhtolaConnection` directly (see the Turso Cloud sections below) for that
-scenario. Migrations, `EnsureCreated`/`EnsureDeleted`, and querying all work
-normally against a local file or `:memory:`.
+**`UseAhtola` supports local files, direct remote Turso Cloud/Hrana
+connections, and embedded replicas** — it classifies the `Data Source` the
+same way the ADO.NET facades do and wires up the matching services:
+
+```csharp
+// Local file or :memory: (native or Local Provider=Managed)
+.UseAhtola("Data Source=app.db")
+
+// Direct remote Turso Cloud/Hrana — every read and write is a round trip
+.UseAhtola("Data Source=turso://my-db.turso.io;Auth Token=" + authToken)
+
+// Embedded replica — queries run against a local synced copy
+.UseAhtola("Data Source=turso://my-db.turso.io;Auth Token=" + authToken + ";Replica Path=replica.db")
+```
+
+Migrations, `EnsureCreated`/`EnsureDeleted`, querying, `SaveChanges`
+(including `INSERT ... RETURNING`), and explicit transactions all work over a
+direct remote or embedded-replica connection. A direct remote connection
+cannot enforce `Mode=ReadOnly` (there is no local file to guard) and its
+`EnsureDeleted`/`Delete` is always a no-op — the remote database is
+provisioned and owned independently (e.g. via the Turso CLI/API), so
+`UseAhtola` never attempts to drop it.
+
+Because a remote/replica connection cannot register client-side SQL
+functions or collations, a few LINQ constructs that translate to those on
+local connections are rejected with a `NotSupportedException` **at query
+translation time** (before any request reaches the server) instead of
+failing late with an opaque "no such function" error:
+
+- `Regex.IsMatch(...)` (translates to a client-registered `regexp` function).
+- Decimal arithmetic (`+ - * / %`, unary `-`) and decimal `Sum`/`Average`/`Max`/`Min`.
+- `OrderBy`/`OrderByDescending` on a `decimal` value (needs the `EF_DECIMAL` collation).
+
+Everything else — standard SQL, JSON1 (including primitive collections),
+equality/inequality on decimals, and simply storing/reading decimal values —
+keeps working normally. No automatic `EnableRetryOnFailure`-style execution
+strategy is registered for remote connections: a transient remote failure
+(e.g. `SQLITE_BUSY`) propagates to the caller as-is rather than being
+silently retried, since safely retrying inside a user-managed transaction is
+not implemented yet. Use `SqliteRemoteExceptionClassifier.IsTransient(...)`
+if you want to detect and retry transient failures yourself.
 
 ## Turso Cloud: direct connection
 

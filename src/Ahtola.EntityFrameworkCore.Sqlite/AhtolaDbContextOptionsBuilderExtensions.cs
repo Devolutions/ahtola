@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Sqlite.Storage.Internal;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.EntityFrameworkCore.Update;
+using Ahtola;
 using Ahtola.EntityFrameworkCore.Sqlite.Query.Internal;
 using Ahtola.EntityFrameworkCore.Sqlite.Storage.Internal;
 using Ahtola.EntityFrameworkCore.Sqlite.Update.Internal;
@@ -29,9 +30,9 @@ public static class AhtolaDbContextOptionsBuilderExtensions
         Action<SqliteDbContextOptionsBuilder>? sqliteOptionsAction = null)
     {
         EnsureSupportedEntityFrameworkCoreVersion();
-        var usesManagedLocalProvider = UsesManagedLocalProvider(connectionString);
+        var mode = ClassifyConnectionMode(connectionString);
         optionsBuilder.UseSqlite(connectionString, sqliteOptionsAction);
-        return UseAhtolaServices(optionsBuilder, usesManagedLocalProvider);
+        return UseAhtolaServices(optionsBuilder, mode);
     }
 
     public static DbContextOptionsBuilder UseAhtola(
@@ -49,9 +50,9 @@ public static class AhtolaDbContextOptionsBuilderExtensions
         ArgumentNullException.ThrowIfNull(connection);
 
         EnsureSupportedEntityFrameworkCoreVersion();
-        var usesManagedLocalProvider = UsesManagedLocalProvider(connection.ConnectionString);
+        var mode = ClassifyConnectionMode(connection.ConnectionString);
         optionsBuilder.UseSqlite(connection, contextOwnsConnection, sqliteOptionsAction);
-        return UseAhtolaServices(optionsBuilder, usesManagedLocalProvider);
+        return UseAhtolaServices(optionsBuilder, mode);
     }
 
     public static DbContextOptionsBuilder<TContext> UseAhtola<TContext>(
@@ -81,46 +82,85 @@ public static class AhtolaDbContextOptionsBuilderExtensions
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteQuerySqlGeneratorFactory))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteUpdateSqlGenerator))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteQuerySqlGeneratorFactory))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaRemoteSqliteQuerySqlGeneratorFactory))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaReplicaSqliteQuerySqlGeneratorFactory))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteHistoryRepository))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteMigrationsSqlGenerator))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteParameterBasedSqlProcessorFactory))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaRestrictedSqliteParameterBasedSqlProcessorFactory))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteQueryableMethodTranslatingExpressionVisitorFactory))]
     private static DbContextOptionsBuilder UseAhtolaServices(
         DbContextOptionsBuilder optionsBuilder,
-        bool usesManagedLocalProvider)
+        AhtolaConnectionMode mode)
     {
         var configuredOptions = optionsBuilder
             .ReplaceService<ISqliteRelationalConnection, AhtolaSqliteRelationalConnection>()
             .ReplaceService<IRelationalDatabaseCreator, AhtolaSqliteDatabaseCreator>()
-            .ReplaceService<IQuerySqlGeneratorFactory, AhtolaSqliteQuerySqlGeneratorFactory>()
             .ReplaceService<IUpdateSqlGenerator, AhtolaSqliteUpdateSqlGenerator>();
 
-        return usesManagedLocalProvider
-            ? configuredOptions
+        // Managed-engine-specific service replacements (JSON1 table-valued functions disabled,
+        // migrations/history restricted to what the managed engine can execute) apply only to
+        // ManagedLocal and EmbeddedReplica: both run queries against a local managed-engine
+        // database (a private file, or the local replica copy). NativeLocal and RemoteHrana run
+        // against a real SQLite-compatible engine (the native SDK, or the remote/Turso server)
+        // and keep the unrestricted, JSON1-enabled services — RemoteHrana additionally layers in
+        // the remote-aware translation restrictions (regexp/decimal ef_*/EF_DECIMAL) that neither
+        // it nor EmbeddedReplica can register client-side, and leaves migrations/history at EF
+        // Core's stock SQLite services rather than the managed-engine-restricted ones.
+        return mode switch
+        {
+            AhtolaConnectionMode.ManagedLocal => configuredOptions
                 .ReplaceService<IQuerySqlGeneratorFactory, AhtolaManagedSqliteQuerySqlGeneratorFactory>()
                 .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, AhtolaManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
                 .ReplaceService<IHistoryRepository, AhtolaManagedSqliteHistoryRepository>()
                 .ReplaceService<IMigrationsSqlGenerator, AhtolaManagedSqliteMigrationsSqlGenerator>()
-                .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, AhtolaSqliteParameterBasedSqlProcessorFactory>()
-            : configuredOptions
-                .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, AhtolaSqliteQueryableMethodTranslatingExpressionVisitorFactory>();
+                .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, AhtolaSqliteParameterBasedSqlProcessorFactory>(),
+
+            AhtolaConnectionMode.EmbeddedReplica => configuredOptions
+                .ReplaceService<IQuerySqlGeneratorFactory, AhtolaReplicaSqliteQuerySqlGeneratorFactory>()
+                .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, AhtolaManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
+                .ReplaceService<IHistoryRepository, AhtolaManagedSqliteHistoryRepository>()
+                .ReplaceService<IMigrationsSqlGenerator, AhtolaManagedSqliteMigrationsSqlGenerator>()
+                .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, AhtolaRestrictedSqliteParameterBasedSqlProcessorFactory>(),
+
+            AhtolaConnectionMode.RemoteHrana => configuredOptions
+                .ReplaceService<IQuerySqlGeneratorFactory, AhtolaRemoteSqliteQuerySqlGeneratorFactory>()
+                .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, AhtolaSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
+                .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, AhtolaRestrictedSqliteParameterBasedSqlProcessorFactory>(),
+
+            _ /* NativeLocal */ => configuredOptions
+                .ReplaceService<IQuerySqlGeneratorFactory, AhtolaSqliteQuerySqlGeneratorFactory>()
+                .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, AhtolaSqliteQueryableMethodTranslatingExpressionVisitorFactory>(),
+        };
     }
 
-    private static bool UsesManagedLocalProvider(string? connectionString)
+    /// <summary>
+    /// Classifies a connection string into the execution mode that determines which EF Core
+    /// services <see cref="UseAhtolaServices"/> wires up. Uses the same
+    /// <see cref="AhtolaConnectionModeClassifier"/> that the ADO.NET facades use, so a
+    /// <c>libsql://</c>/<c>turso://</c>/<c>http(s)://</c>/<c>ws(s)://</c> Data Source (with or
+    /// without a Replica Path) is recognized identically here and in
+    /// <see cref="Ahtola.Data.Sqlite.SqliteConnection"/>.
+    /// </summary>
+    private static AhtolaConnectionMode ClassifyConnectionMode(string? connectionString)
     {
+        // No connection string (e.g. a context configured to attach one later) has no local
+        // file or remote endpoint to classify; preserve the historical default of treating it
+        // as a native local connection.
         if (connectionString is null)
-            return false;
+            return AhtolaConnectionMode.NativeLocal;
 
         var connectionOptions = new AhtolaSqliteConnectionStringBuilder(connectionString);
-        if (IsRemoteAhtolaUrl(connectionOptions.DataSource))
+        var endpointMode = AhtolaConnectionModeClassifier.Classify(connectionOptions.DataSource, connectionOptions.ReplicaPath);
+        return endpointMode switch
         {
-            throw new NotSupportedException(
-                "UseAhtola supports only local Ahtola databases. Remote URLs require retry and transaction semantics that are not implemented yet; use AhtolaConnection directly for remote ADO.NET access.");
-        }
-
-        return !connectionOptions.IsLocalProviderConfigured
-            || connectionOptions.LocalProvider == AhtolaLocalProvider.Managed;
+            AhtolaConnectionEndpointMode.RemoteHrana => AhtolaConnectionMode.RemoteHrana,
+            AhtolaConnectionEndpointMode.EmbeddedReplica => AhtolaConnectionMode.EmbeddedReplica,
+            _ => !connectionOptions.IsLocalProviderConfigured || connectionOptions.LocalProvider == AhtolaLocalProvider.Managed
+                ? AhtolaConnectionMode.ManagedLocal
+                : AhtolaConnectionMode.NativeLocal,
+        };
     }
 
     private static void EnsureSupportedEntityFrameworkCoreVersion()
@@ -131,15 +171,5 @@ public static class AhtolaDbContextOptionsBuilderExtensions
             throw new NotSupportedException(
                 $"Ahtola.EntityFrameworkCore.Sqlite supports EF Core {SupportedEntityFrameworkCoreMajorVersion}.x, but EF Core {loadedVersion?.ToString() ?? "with an unknown version"} is loaded.");
         }
-    }
-
-    private static bool IsRemoteAhtolaUrl(string dataSource)
-    {
-        return Uri.TryCreate(dataSource, UriKind.Absolute, out var uri)
-            && (uri.Scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase)
-                || uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
-                || uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
-                || uri.Scheme.Equals("ws", StringComparison.OrdinalIgnoreCase)
-                || uri.Scheme.Equals("wss", StringComparison.OrdinalIgnoreCase));
     }
 }

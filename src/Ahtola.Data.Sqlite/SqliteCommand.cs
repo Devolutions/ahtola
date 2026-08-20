@@ -318,7 +318,7 @@ public class SqliteCommand : DbCommand
             _ahtolaCommand = command;
             _hasOpenReader = true;
             var reader = await command.ExecuteReaderAsync(behavior, cancellationToken).ConfigureAwait(false);
-            return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader);
+            return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader, skipToFirstColumnResult: true);
         }
         catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
         {
@@ -468,7 +468,7 @@ public class SqliteCommand : DbCommand
             _ahtolaCommand = command;
             _hasOpenReader = true;
             var reader = command.ExecuteReader(behavior);
-            return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader);
+            return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader, skipToFirstColumnResult: true);
         }
         catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
         {
@@ -499,7 +499,7 @@ public class SqliteCommand : DbCommand
                 _ahtolaBatch = batch;
                 _hasOpenReader = true;
                 var reader = batch.ExecuteReader(behavior);
-                return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader);
+                return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader, skipToFirstColumnResult: true);
             }
             catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
             {
@@ -531,7 +531,7 @@ public class SqliteCommand : DbCommand
                 _ahtolaBatch = batch;
                 _hasOpenReader = true;
                 var reader = await batch.ExecuteReaderAsync(behavior, cancellationToken).ConfigureAwait(false);
-                return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader);
+                return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader, skipToFirstColumnResult: true);
             }
             catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
             {

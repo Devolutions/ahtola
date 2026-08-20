@@ -8,10 +8,12 @@ namespace Ahtola.EntityFrameworkCore.Sqlite.Query.Internal;
 
 public sealed class AhtolaSqliteQuerySqlGenerator(
     QuerySqlGeneratorDependencies dependencies,
-    bool areJsonEachFunctionsSupported = true) : SqliteQuerySqlGenerator(dependencies)
+    bool areJsonEachFunctionsSupported = true,
+    bool supportsProviderExtensionFunctions = true) : SqliteQuerySqlGenerator(dependencies)
 {
     private string? _unaliasedDmlTargetTableAlias;
     private readonly bool _areJsonEachFunctionsSupported = areJsonEachFunctionsSupported;
+    private readonly bool _supportsProviderExtensionFunctions = supportsProviderExtensionFunctions;
 
     protected override Expression VisitDelete(DeleteExpression deleteExpression)
     {
@@ -77,6 +79,9 @@ public sealed class AhtolaSqliteQuerySqlGenerator(
     {
         if (ShouldUseDecimalCollation(orderingExpression.Expression))
         {
+            if (!_supportsProviderExtensionFunctions)
+                throw AhtolaRemoteSqlRestrictions.ForDecimalOrdering();
+
             var collatedExpression = new CollateExpression(orderingExpression.Expression, "EF_DECIMAL");
             return base.VisitOrdering(new OrderingExpression(collatedExpression, orderingExpression.IsAscending));
         }

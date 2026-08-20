@@ -10,6 +10,10 @@
         <IsPackable>false</IsPackable>
         <RootNamespace>Ahtola.Tests</RootNamespace>
         <AssemblyName>Ahtola.Tests</AssemblyName>
+        <!-- RemoteEf* tests assert on the concrete internal EF Core service types UseAhtola
+             wires up per connection mode (Ahtola's own, and EF Core's own SQLite provider
+             internals for the RemoteHrana/NativeLocal "stock services" branches). -->
+        <NoWarn>$(NoWarn);EF1001</NoWarn>
     </PropertyGroup>
 
     <ItemGroup>
