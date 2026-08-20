@@ -168,6 +168,71 @@ public sealed class RemoteStreamRecoveryTests
         handler.Requests.Should().HaveCount(2);
     }
 
+    [Test]
+    public void SqliteFacadeFaultedTransactionDisposalDoesNotMaskAnExceptionAlreadyUnwinding()
+    {
+        using var handler = new ScriptedPipelineHandler(
+            ExecuteSuccess("transaction", 0),
+            StreamExpired("transaction stream expired"));
+        var priorFactory = Ahtola.Data.Sqlite.SqliteConnection.RemoteMessageHandlerFactory;
+        Ahtola.Data.Sqlite.SqliteConnection.RemoteMessageHandlerFactory = () => handler;
+        try
+        {
+            using var connection = new Ahtola.Data.Sqlite.SqliteConnection(
+                "Data Source=https://example.test;Read Your Writes=True");
+            connection.Open();
+
+            var marker = Assert.Throws<MarkerException>(() =>
+            {
+                using var transaction = connection.BeginTransaction();
+                using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = "UPDATE t SET value = 1";
+                Assert.Throws<Ahtola.Data.Sqlite.SqliteRemoteException>(() => command.ExecuteNonQuery());
+                throw new MarkerException();
+            });
+
+            marker.Should().NotBeNull();
+            connection.Transaction.Should().BeNull();
+            handler.Requests.Should().HaveCount(2);
+        }
+        finally
+        {
+            Ahtola.Data.Sqlite.SqliteConnection.RemoteMessageHandlerFactory = priorFactory;
+        }
+    }
+
+    [Test]
+    public void SqliteFacadeFaultedCommitCompletesBeforeDisposal()
+    {
+        using var handler = new ScriptedPipelineHandler(
+            ExecuteSuccess("transaction", 0),
+            StreamExpired("transaction stream expired"));
+        var priorFactory = Ahtola.Data.Sqlite.SqliteConnection.RemoteMessageHandlerFactory;
+        Ahtola.Data.Sqlite.SqliteConnection.RemoteMessageHandlerFactory = () => handler;
+        try
+        {
+            using var connection = new Ahtola.Data.Sqlite.SqliteConnection(
+                "Data Source=https://example.test;Read Your Writes=True");
+            connection.Open();
+            var transaction = connection.BeginTransaction();
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "UPDATE t SET value = 1";
+            Assert.Throws<Ahtola.Data.Sqlite.SqliteRemoteException>(() => command.ExecuteNonQuery());
+
+            Assert.Throws<Ahtola.Data.Sqlite.SqliteRemoteException>(() => transaction.Commit());
+            transaction.Dispose();
+
+            connection.Transaction.Should().BeNull();
+            handler.Requests.Should().HaveCount(2);
+        }
+        finally
+        {
+            Ahtola.Data.Sqlite.SqliteConnection.RemoteMessageHandlerFactory = priorFactory;
+        }
+    }
+
     private static AhtolaConnection CreateConnection(HttpMessageHandler handler)
     {
         var client = new AhtolaRemoteClient(

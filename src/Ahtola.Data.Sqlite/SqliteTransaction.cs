@@ -143,7 +143,18 @@ public class SqliteTransaction : DbTransaction
             throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
 
         if (_ahtolaTransaction is not null)
-            RunAhtola(_ahtolaTransaction.Commit);
+        {
+            try
+            {
+                RunAhtola(_ahtolaTransaction.Commit);
+            }
+            catch
+            {
+                if (_ahtolaTransaction?.IsCompleted == true)
+                    Complete();
+                throw;
+            }
+        }
         else
             Execute("COMMIT;");
         Complete();
@@ -157,7 +168,18 @@ public class SqliteTransaction : DbTransaction
             throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
 
         if (_ahtolaTransaction is not null)
-            await RunAhtolaAsync(() => _ahtolaTransaction.CommitAsync(cancellationToken)).ConfigureAwait(false);
+        {
+            try
+            {
+                await RunAhtolaAsync(() => _ahtolaTransaction.CommitAsync(cancellationToken)).ConfigureAwait(false);
+            }
+            catch
+            {
+                if (_ahtolaTransaction?.IsCompleted == true)
+                    Complete();
+                throw;
+            }
+        }
         else
             await ExecuteAsync("COMMIT;", cancellationToken).ConfigureAwait(false);
         Complete();
@@ -272,7 +294,9 @@ public class SqliteTransaction : DbTransaction
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing && !_completed && _connection is { State: ConnectionState.Open })
+        if (disposing && !_completed && _ahtolaTransaction is not null)
+            Complete();
+        else if (disposing && !_completed && _connection is { State: ConnectionState.Open })
             Rollback();
         else if (disposing && _connection is not null && ReferenceEquals(_connection.Transaction, this))
             _connection.Transaction = null;
