@@ -312,7 +312,7 @@ static void VerifyPublicCapabilityContract()
         ahtolaReplica.CanCreateBatch,
         AhtolaConnectionFacade.AhtolaData,
         AhtolaConnectionMode.EmbeddedReplica,
-        [false, true, true, true, false, false, false, false, false, false, false, false, true]);
+        [true, true, true, true, false, false, false, false, false, false, false, false, true]);
 
     using var sqliteManaged = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
     AssertCapabilities(
@@ -329,6 +329,23 @@ static void VerifyPublicCapabilityContract()
         AhtolaConnectionFacade.Sqlite,
         AhtolaConnectionMode.NativeLocal,
         [true, true, true, true, true, true, true, true, true, true, true, false, false]);
+
+    using var sqliteRemote = new SqliteConnection("Data Source=https://example.Ahtola.io");
+    AssertCapabilities(
+        sqliteRemote.Capabilities,
+        sqliteRemote.CanCreateBatch,
+        AhtolaConnectionFacade.Sqlite,
+        AhtolaConnectionMode.RemoteHrana,
+        [true, true, true, true, false, false, false, false, false, false, false, false, false]);
+
+    using var sqliteReplica = new SqliteConnection(
+        "Data Source=https://example.Ahtola.io;Replica Path=replica.db");
+    AssertCapabilities(
+        sqliteReplica.Capabilities,
+        sqliteReplica.CanCreateBatch,
+        AhtolaConnectionFacade.Sqlite,
+        AhtolaConnectionMode.EmbeddedReplica,
+        [true, true, true, true, false, false, false, false, false, false, false, false, true]);
 }
 
 static void AssertCapabilities(
