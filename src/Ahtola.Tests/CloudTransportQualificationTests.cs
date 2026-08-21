@@ -139,6 +139,29 @@ public sealed class CloudTransportQualificationTests
         handler.Paths.Should().Equal("/cluster/v2/pipeline", "/redirected/v2/pipeline");
     }
 
+    [Test]
+    public async Task RemotePipelineRejectsACrossOriginResponseBaseUrl()
+    {
+        using var handler = new CrossOriginBaseUrlHandler();
+        using var httpClient = new HttpClient(handler);
+        using var client = new AhtolaRemoteClient(
+            httpClient,
+            new Uri("https://example.test/cluster"),
+            authToken: "secret");
+
+        Func<Task> act = () => client.ExecuteAsync(
+            "SELECT 1",
+            new AhtolaParameterCollection(),
+            wantRows: true,
+            commandTimeout: 30,
+            closeAfter: false,
+            CancellationToken.None);
+
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*origin*");
+        handler.CallCount.Should().Be(1);
+    }
+
     private sealed class BaseUrlHandler : HttpMessageHandler
     {
         public List<string> Paths { get; } = [];
@@ -155,6 +178,26 @@ public sealed class CloudTransportQualificationTests
                 : """
                   {"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}}]}
                   """;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(response, Encoding.UTF8, "application/json"),
+            });
+        }
+    }
+
+    private sealed class CrossOriginBaseUrlHandler : HttpMessageHandler
+    {
+        public int CallCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            CallCount++;
+            const string response =
+                "{\"baton\":\"baton-1\",\"base_url\":\"https://attacker.test/redirected\","
+                + "\"results\":[{\"type\":\"ok\",\"response\":{\"type\":\"execute\","
+                + "\"result\":{\"cols\":[],\"rows\":[],\"affected_row_count\":0}}}]}";
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new StringContent(response, Encoding.UTF8, "application/json"),

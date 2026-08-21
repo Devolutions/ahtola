@@ -396,6 +396,23 @@ public sealed class ManagedReplicaChangeCaptureBridgeTests
             SqliteRecordCodec.Decode(rows[0].After!).Should().Equal(
                 SqlValue.Integer(2),
                 SqlValue.Text("kept"));
+
+            replica.ExecuteNonQuery("SAVEPOINT \"SAVEPOINT\";");
+            replica.ExecuteNonQuery("INSERT INTO t VALUES (4, 'quoted');");
+            replica.ExecuteNonQuery("RELEASE \"SAVEPOINT\";");
+            replica.PeekPendingChangeCapture().Rows
+                .Select(row => row.RowId)
+                .Should().Equal(2, 4);
+
+            replica.ExecuteNonQuery("BEGIN;");
+            replica.ExecuteNonQuery("SAVEPOINT nested;");
+            replica.ExecuteNonQuery("INSERT INTO t VALUES (5, 'partial rollback');");
+            replica.ExecuteNonQuery("ROLLBACK TRANSACTION tx TO SAVEPOINT nested;");
+            replica.ExecuteNonQuery("INSERT INTO t VALUES (6, 'full rollback');");
+            replica.ExecuteNonQuery("ROLLBACK;");
+            replica.PeekPendingChangeCapture().Rows
+                .Select(row => row.RowId)
+                .Should().Equal(2, 4);
         }
         finally
         {

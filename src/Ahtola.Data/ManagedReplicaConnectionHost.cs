@@ -660,30 +660,15 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         metadata = ManagedReplicaRevertWal.PrepareSynchronization(replicaOptions.Path, metadata);
         var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0;
         var retainedMaterializer = _materializationLease?.FileSystem;
-        var maximumChanges = GetPushBatchLimit(replicaOptions);
-        var remainingProbeLimit = maximumChanges == int.MaxValue
-            ? int.MaxValue
-            : maximumChanges + 1;
-        long pushedChangeCount = 0;
-        while (true)
-        {
-            var push = await PushLocalChangesAsync(
-                    replicaOptions,
-                    metadata,
-                    syncOptions,
-                    retainedMaterializer,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            metadata = push.Metadata;
-            pushedChangeCount = checked(pushedChangeCount + push.ChangeCount);
-
-            var remaining = _changeJournal.ReadBatch(remainingProbeLimit);
-            if (metadata.RevertState.HasValue
-                || remaining.Changes.Count <= maximumChanges)
-            {
-                break;
-            }
-        }
+        var push = await PushLocalChangesAsync(
+                replicaOptions,
+                metadata,
+                syncOptions,
+                retainedMaterializer,
+                cancellationToken)
+            .ConfigureAwait(false);
+        metadata = push.Metadata;
+        var pushedChangeCount = push.ChangeCount;
 
         metadata = await ManagedReplicaBootstrapper
             .CompletePartialReplicaAsync(

@@ -714,6 +714,10 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         if (!string.IsNullOrWhiteSpace(response.BaseUrl))
         {
             var pipelineUri = CreatePipelineUri(new Uri(_pipelineUri, response.BaseUrl));
+            AhtolaRemoteTransportSecurity.ValidateRedirectOrigin(
+                _pipelineUri,
+                pipelineUri,
+                credentialsConfigured: _authToken is not null || _remoteEncryptionKey is not null);
             AhtolaRemoteTransportSecurity.Validate(
                 pipelineUri,
                 _authToken,

@@ -1248,6 +1248,10 @@ internal static class ManagedReplicaBootstrapper
                         connection,
                         acknowledgedLocalChanges,
                         cancellationToken);
+                    ManagedReplicaLogicalReplayer.ReplayPendingLocalStatements(
+                        connection,
+                        pendingLocalChanges,
+                        cancellationToken);
                     var applied = ManagedReplicaLogicalReplayer.Apply(
                         connection,
                         transactions,

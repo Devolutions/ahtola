@@ -106,7 +106,7 @@ internal static class AhtolaRemoteTransportSecurity
             or System.Net.HttpStatusCode.TemporaryRedirect
             or System.Net.HttpStatusCode.PermanentRedirect;
 
-    private static void ValidateRedirectOrigin(
+    internal static void ValidateRedirectOrigin(
         Uri source,
         Uri destination,
         bool credentialsConfigured)

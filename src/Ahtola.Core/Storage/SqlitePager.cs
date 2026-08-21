@@ -2963,23 +2963,26 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     internal SqlitePagerViewToken CaptureCommittedViewToken()
     {
+        lock (_gate)
+        {
+            if (_state == SqlitePagerState.Faulted)
+            {
+                // A failed post-commit checkpoint must still publish the already-committed
+                // catalog and classify the failure as maintenance. The ordinary reader-lock
+                // path rejects Faulted by design, so preserve the baseline cached-view token
+                // path for this narrow post-commit boundary.
+                SynchronizeCommittedView();
+                return CaptureCommittedViewTokenUnderLock();
+            }
+        }
+
         var readerLock = EnterReadLocks(ResolveBusyTimeout(null), out var mainFileLock);
         try
         {
             lock (_gate)
             {
                 SynchronizeCommittedView(mainFileLock);
-                var pageOne = new byte[_pageStore.PageSize];
-                ReadCommittedPageCore(1, pageOne);
-                var header = SqliteDatabaseHeader.Parse(pageOne);
-                return new SqlitePagerViewToken(
-                    header.ChangeCounter,
-                    _committedFrameCount,
-                    _wal?.Header.Salt1 ?? 0,
-                    _wal?.Header.Salt2 ?? 0,
-                    _committedPageCount,
-                    _fileSystem.GetWriteStamp(_databasePath),
-                    _fileSystem.GetWriteStamp(_walPath));
+                return CaptureCommittedViewTokenUnderLock();
             }
         }
         finally
@@ -2987,6 +2990,21 @@ public sealed class SqlitePager : IDisposable
             mainFileLock?.Dispose();
             readerLock.Dispose();
         }
+    }
+
+    private SqlitePagerViewToken CaptureCommittedViewTokenUnderLock()
+    {
+        var pageOne = new byte[_pageStore.PageSize];
+        ReadCommittedPageCore(1, pageOne);
+        var header = SqliteDatabaseHeader.Parse(pageOne);
+        return new SqlitePagerViewToken(
+            header.ChangeCounter,
+            _committedFrameCount,
+            _wal?.Header.Salt1 ?? 0,
+            _wal?.Header.Salt2 ?? 0,
+            _committedPageCount,
+            _fileSystem.GetWriteStamp(_databasePath),
+            _fileSystem.GetWriteStamp(_walPath));
     }
 
     /// <summary>
