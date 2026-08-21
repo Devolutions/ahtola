@@ -1,4 +1,5 @@
 using AwesomeAssertions;
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -482,6 +483,125 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         finally
         {
             DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ChunkedBootstrapPullsExactPageRangesAndMatchesOneShotImage()
+    {
+        var sourcePath = NewReplicaPath("managed-replica-chunked-bootstrap-source");
+        var oneShotPath = NewReplicaPath("managed-replica-one-shot-bootstrap");
+        var chunkedPath = NewReplicaPath("managed-replica-chunked-bootstrap");
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_payload(value BLOB NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_payload VALUES (zeroblob(20000));");
+            }
+
+            var databaseImage = File.ReadAllBytes(sourcePath);
+            var pageCount = checked(databaseImage.Length / 4096);
+            pageCount.Should().BeGreaterThan(4);
+            const int pagesPerChunk = 2;
+            var expectedRequestCount = (pageCount + pagesPerChunk - 1) / pagesPerChunk;
+            var chunkResponses = Enumerable.Range(0, expectedRequestCount)
+                .Select(index =>
+                {
+                    var start = index * pagesPerChunk;
+                    var end = Math.Min(start + pagesPerChunk, pageCount);
+                    return CreatePullResponseForPageRange("revision-42", databaseImage, start, end);
+                })
+                .ToArray();
+            var capturedRequests = new List<BootstrapPullRequest>();
+            var chunkedHandler = new PullUpdatesHandler(
+                chunkResponses,
+                request => capturedRequests.Add(
+                    ReadBootstrapPullRequest(request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult())));
+            var oneShotHandler = new PullUpdatesHandler(CreatePullResponse("revision-42", databaseImage));
+
+            await ManagedReplicaBootstrapper.BootstrapAsync(
+                CreateOptions(oneShotPath, oneShotHandler),
+                CancellationToken.None);
+            await ManagedReplicaBootstrapper.BootstrapAsync(
+                new AhtolaReplicaOptions(
+                    chunkedPath,
+                    new Uri("https://example.test/cluster"),
+                    authToken: "token-42")
+                {
+                    PullBytesThreshold = 4097,
+                    HttpPolicy = new AhtolaSyncHttpPolicy(chunkedHandler),
+                },
+                CancellationToken.None);
+
+            chunkedHandler.CallCount.Should().Be(expectedRequestCount);
+            capturedRequests.Should().HaveCount(expectedRequestCount);
+            for (var index = 0; index < capturedRequests.Count; index++)
+            {
+                var start = index * pagesPerChunk;
+                var end = Math.Min(start + pagesPerChunk, pageCount);
+                capturedRequests[index].ServerRevision.Should().Be(index == 0 ? null : "revision-42");
+                capturedRequests[index].SelectedPages.Should().Equal(
+                    Enumerable.Range(start, end - start).Select(page => checked((uint)page)));
+            }
+
+            File.ReadAllBytes(chunkedPath).Should().Equal(databaseImage);
+            File.ReadAllBytes(chunkedPath).Should().Equal(File.ReadAllBytes(oneShotPath));
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+            DeleteReplicaFiles(oneShotPath);
+            DeleteReplicaFiles(chunkedPath);
+        }
+    }
+
+    [Test]
+    public void ChunkedBootstrapFailureDoesNotPublishPartialState()
+    {
+        var sourcePath = NewReplicaPath("managed-replica-chunked-bootstrap-failure-source");
+        var replicaPath = NewReplicaPath("managed-replica-chunked-bootstrap-failure");
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_payload(value BLOB NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_payload VALUES (zeroblob(12000));");
+            }
+
+            var databaseImage = File.ReadAllBytes(sourcePath);
+            (databaseImage.Length / 4096).Should().BeGreaterThan(1);
+            var handler = new PullUpdatesHandler(
+                CreatePullResponseForPageRange("revision-42", databaseImage, startPage: 0, endPage: 1));
+            var options = new AhtolaReplicaOptions(
+                replicaPath,
+                new Uri("https://example.test/cluster"),
+                authToken: null)
+            {
+                PullBytesThreshold = 4096,
+                HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+            };
+
+            Assert.ThrowsAsync<InvalidOperationException>(
+                () => ManagedReplicaBootstrapper.BootstrapAsync(options, CancellationToken.None));
+
+            File.Exists(replicaPath).Should().BeFalse();
+            File.Exists(replicaPath + ".ahtola-replica-meta").Should().BeFalse();
+            var directory = Path.GetDirectoryName(replicaPath)!;
+            Directory.GetFiles(
+                    directory,
+                    $".{Path.GetFileName(replicaPath)}.bootstrap-*.tmp")
+                .Should()
+                .BeEmpty();
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+            DeleteReplicaFiles(replicaPath);
         }
     }
 
@@ -2155,7 +2275,6 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     [TestCase(UnsupportedReplicaMode.RemoteEncryption)]
     [TestCase(UnsupportedReplicaMode.PartialPrefix)]
     [TestCase(UnsupportedReplicaMode.PartialQuery)]
-    [TestCase(UnsupportedReplicaMode.ChunkedBootstrap)]
     public void CreateReplicaRejectsUnsupportedModesBeforeOpeningOrMutatingLocalState(
         UnsupportedReplicaMode mode)
     {
@@ -3304,14 +3423,6 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                 PartialBootstrap = AhtolaPartialBootstrapOptions.QueryPages("SELECT 1"),
                 HttpPolicy = options.HttpPolicy,
             },
-            UnsupportedReplicaMode.ChunkedBootstrap => new AhtolaReplicaOptions(
-                path,
-                options.RemoteUri,
-                options.AuthToken)
-            {
-                PullBytesThreshold = 4096,
-                HttpPolicy = options.HttpPolicy,
-            },
             _ => throw new ArgumentOutOfRangeException(nameof(mode)),
         };
     }
@@ -3374,6 +3485,110 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             WriteDelimitedMessage(response, page);
         }
         return response.ToArray();
+    }
+
+    private static byte[] CreatePullResponseForPageRange(
+        string revision,
+        byte[] databaseImage,
+        int startPage,
+        int endPage)
+    {
+        var pageCount = checked(databaseImage.Length / 4096);
+        startPage.Should().BeGreaterThanOrEqualTo(0);
+        endPage.Should().BeGreaterThan(startPage).And.BeLessThanOrEqualTo(pageCount);
+        var response = new List<byte>(
+            CreatePullResponse(
+                revision,
+                [],
+                declaredPages: checked((ulong)pageCount)));
+        for (var pageId = startPage; pageId < endPage; pageId++)
+        {
+            var page = new List<byte>();
+            if (pageId != 0)
+                WriteVarintField(page, 1, checked((ulong)pageId));
+            WriteLengthDelimitedField(
+                page,
+                2,
+                databaseImage.AsSpan(pageId * 4096, 4096));
+            WriteDelimitedMessage(response, page);
+        }
+
+        return response.ToArray();
+    }
+
+    private static BootstrapPullRequest ReadBootstrapPullRequest(byte[] payload)
+    {
+        string? serverRevision = null;
+        byte[]? selector = null;
+        var offset = 0;
+        while (offset < payload.Length)
+        {
+            var key = ReadVarint(payload, ref offset);
+            var field = checked((int)(key >> 3));
+            switch (key & 7)
+            {
+                case 0:
+                    _ = ReadVarint(payload, ref offset);
+                    break;
+                case 2:
+                    var length = checked((int)ReadVarint(payload, ref offset));
+                    var value = payload.AsSpan(offset, length);
+                    offset += length;
+                    if (field == 2)
+                        serverRevision = Encoding.UTF8.GetString(value);
+                    else if (field == 5)
+                        selector = value.ToArray();
+                    break;
+                default:
+                    throw new InvalidOperationException("Unsupported test protobuf wire type.");
+            }
+        }
+
+        selector.Should().NotBeNull();
+        return new BootstrapPullRequest(serverRevision, DecodeRoaringPageSelector(selector!));
+    }
+
+    private static IReadOnlyList<uint> DecodeRoaringPageSelector(byte[] selector)
+    {
+        const ushort serialCookie = 12347;
+        var offset = 0;
+        var cookie = BinaryPrimitives.ReadUInt32LittleEndian(selector.AsSpan(offset));
+        offset += sizeof(uint);
+        checked((ushort)(cookie & ushort.MaxValue)).Should().Be(serialCookie);
+        var containerCount = checked((int)(cookie >> 16) + 1);
+        var runBitmap = selector.AsSpan(offset, (containerCount + 7) / 8);
+        offset += runBitmap.Length;
+        var keys = new ushort[containerCount];
+        for (var index = 0; index < containerCount; index++)
+        {
+            keys[index] = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+            offset += sizeof(ushort);
+            _ = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+            offset += sizeof(ushort);
+        }
+
+        if (containerCount >= 4)
+            offset += containerCount * sizeof(uint);
+
+        var pages = new List<uint>();
+        for (var index = 0; index < containerCount; index++)
+        {
+            (runBitmap[index / 8] & (1 << (index % 8))).Should().NotBe(0);
+            var runCount = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+            offset += sizeof(ushort);
+            for (var run = 0; run < runCount; run++)
+            {
+                var start = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+                offset += sizeof(ushort);
+                var additionalValues = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+                offset += sizeof(ushort);
+                for (var value = 0; value <= additionalValues; value++)
+                    pages.Add(((uint)keys[index] << 16) | checked((uint)(start + value)));
+            }
+        }
+
+        offset.Should().Be(selector.Length);
+        return pages;
     }
 
     private static byte[] BuildLogicalLogRangeMessage(
@@ -3529,8 +3744,11 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         RemoteEncryption,
         PartialPrefix,
         PartialQuery,
-        ChunkedBootstrap,
     }
+
+    private readonly record struct BootstrapPullRequest(
+        string? ServerRevision,
+        IReadOnlyList<uint> SelectedPages);
 
     public enum PullResponseFramingFailure
     {

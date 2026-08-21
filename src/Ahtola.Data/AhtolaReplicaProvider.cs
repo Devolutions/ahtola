@@ -121,7 +121,9 @@ public sealed class AhtolaReplicaOptions
     public long? PushOperationsThreshold { get; init; }
 
     /// <summary>
-    /// Gets or initializes the bootstrap pull chunk target in bytes.
+    /// Gets or initializes the target size in bytes for each initial bootstrap pull.
+    /// The target is rounded up to complete 4 KiB pages, and the complete database
+    /// image is staged eagerly before it is published.
     /// </summary>
     public long? PullBytesThreshold { get; init; }
 
