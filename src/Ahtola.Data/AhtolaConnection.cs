@@ -566,6 +566,29 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 "Local replica changes are available only for managed embedded replica connections."))
             .ReadLocalChanges(maximumChanges);
 
+    /// <summary>
+    /// Returns a read-only snapshot of this managed embedded replica connection's currently
+    /// pending (not yet pushed) local changes, projected into Ahtola's public change-data-capture
+    /// row contract (the same row shape as the real <c>turso_cdc</c> table). This performs no
+    /// network I/O, never writes a real CDC table, and never advances the push acknowledgement
+    /// watermark: calling it repeatedly, or interleaving it with an unrelated push, has no effect
+    /// on either. See <see cref="AhtolaReplicaChangeRow"/> for the exact per-row guarantees and
+    /// documented limitations (transaction grouping, delete pre-image requirements, and
+    /// "after"-image reconstruction for rows superseded later in the same pending batch).
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The connection is not a managed embedded replica connection.
+    /// </exception>
+    /// <exception cref="AhtolaReplicaChangeCaptureException">
+    /// The pending batch contains an entry that cannot be safely represented in the
+    /// change-data-capture row contract (a schema/DDL change, or a delete with no captured
+    /// pre-image).
+    /// </exception>
+    public AhtolaReplicaChangeCaptureBatch PeekPendingChangeCapture()
+        => (_managedReplicaHost ?? throw new InvalidOperationException(
+                "Pending change-data-capture is available only for managed embedded replica connections."))
+            .PeekPendingChangeCapture();
+
     void ILocalReaderConnection.ReaderOpened(IConnectionOwnedReader reader)
     {
         lock (_readerLock)

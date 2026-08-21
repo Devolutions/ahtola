@@ -101,6 +101,14 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     public void AcknowledgeLocalChanges(long watermark)
         => _changeJournal.Acknowledge(watermark);
 
+    /// <summary>
+    /// Projects the entire currently pending local change batch into Ahtola's public
+    /// change-data-capture row contract. Pure read: it does not acknowledge the journal
+    /// watermark, so it has no effect on a subsequent push.
+    /// </summary>
+    public AhtolaReplicaChangeCaptureBatch PeekPendingChangeCapture()
+        => ManagedReplicaChangeCaptureProjector.Project(Database.Connection, _changeJournal.ReadBatch(int.MaxValue));
+
     public void StatementStarted(string sql)
     {
         ArgumentNullException.ThrowIfNull(sql);
