@@ -40,6 +40,96 @@ internal static class ManagedReplicaBootstrapper
         cancellationToken.ThrowIfCancellationRequested();
         ManagedReplicaSupportMatrix.ValidateOptions(options);
 
+        var metadataPath = options.Path + MetadataSuffix;
+
+        // Fast, unlocked pre-check: reject an obviously-unusable bootstrap target before paying
+        // for a network round trip. Re-checked below, authoritatively, once the apply lease is
+        // held -- two concurrent bootstraps of the same missing path could otherwise both pass
+        // this check before either installs.
+        EnsureBootstrapTargetIsMissing(options, metadataPath);
+
+        var directory = Path.GetDirectoryName(Path.GetFullPath(options.Path))!;
+        var stagingPath = Path.Combine(
+            directory,
+            $".{Path.GetFileName(options.Path)}.bootstrap-{Guid.NewGuid():N}.tmp");
+        var metadataStagingPath = Path.Combine(
+            directory,
+            $".{Path.GetFileName(metadataPath)}.bootstrap-{Guid.NewGuid():N}.tmp");
+
+        // This outer try/finally spans the download, the apply lease, and the install --
+        // everything that can produce a staging artifact needing cleanup. It replaces the
+        // original single try/finally that used to wrap just the download-through-install
+        // sequence: without it, a cancellation raised the instant the apply lease below is
+        // acquired (i.e. before the inner try is even entered) would release the lease correctly
+        // via `await using`, but would skip staging-file cleanup entirely.
+        try
+        {
+            var (revision, protocol) = await DownloadDatabaseAsync(options, stagingPath, cancellationToken).ConfigureAwait(false);
+            ValidateStagedDatabase(stagingPath);
+
+            // One exclusive apply lease spans the authoritative re-check below through install and
+            // metadata publication, or the catch block's rollback cleanup on any failure. Acquired
+            // only now, after the network download and staged-file validation above complete
+            // unlocked, so the lease never spans a long-poll network wait; see
+            // ManagedReplicaApplyLock for why this seam stays narrow enough to rebase onto a real
+            // cross-process OS lock later without spanning I/O.
+            await using var lease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, cancellationToken)
+                .ConfigureAwait(false);
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var databaseInstalled = false;
+            try
+            {
+                // Authoritative re-check, now that the lease is held: closes the race between the
+                // fast pre-check above and lease acquisition. The loser of a concurrent bootstrap race
+                // gets the same clean, purpose-built exception here instead of a raw IOException from
+                // File.Move below.
+                EnsureBootstrapTargetIsMissing(options, metadataPath);
+
+                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapStagedDatabase);
+                cancellationToken.ThrowIfCancellationRequested();
+                File.Move(stagingPath, options.Path, overwrite: false);
+                databaseInstalled = true;
+
+                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapDatabasePublished);
+                cancellationToken.ThrowIfCancellationRequested();
+                var tableMap = RebuildTableMapFromSchema(options.Path);
+                await WriteMetadataAsync(
+                    metadataStagingPath,
+                    metadataPath,
+                    revision,
+                    ComputeDatabaseFingerprint(options.Path),
+                    protocol,
+                    tableMap,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A bootstrap image is not usable as a replica until its matching revision
+                // metadata is durable. Roll it back so the next open can bootstrap cleanly.
+                if (databaseInstalled && !File.Exists(metadataPath))
+                    DeleteIfExists(options.Path);
+                throw;
+            }
+        }
+        finally
+        {
+            DeleteIfExists(stagingPath);
+            DeleteStagingSidecars(stagingPath);
+            DeleteIfExists(metadataStagingPath);
+        }
+    }
+
+    /// <summary>
+    /// Guards a bootstrap-install target: the path must be missing, bootstrap-on-empty must be
+    /// enabled, and no orphaned metadata sidecar can already exist. Called once, unlocked, as a
+    /// fast pre-check before paying for the network download, and again immediately after the
+    /// apply lease is acquired as the authoritative, race-closing check (see
+    /// <see cref="BootstrapAsync"/>).
+    /// </summary>
+    private static void EnsureBootstrapTargetIsMissing(AhtolaReplicaOptions options, string metadataPath)
+    {
         if (File.Exists(options.Path))
         {
             throw new NotSupportedException(
@@ -52,57 +142,10 @@ internal static class ManagedReplicaBootstrapper
                 "Managed embedded replica bootstrap is disabled and the replica path does not contain an initialized managed database.");
         }
 
-        var metadataPath = options.Path + MetadataSuffix;
         if (File.Exists(metadataPath))
         {
             throw new InvalidOperationException(
                 "Managed embedded replica metadata exists while the replica database is missing.");
-        }
-
-        var directory = Path.GetDirectoryName(Path.GetFullPath(options.Path))!;
-        var stagingPath = Path.Combine(
-            directory,
-            $".{Path.GetFileName(options.Path)}.bootstrap-{Guid.NewGuid():N}.tmp");
-        var metadataStagingPath = Path.Combine(
-            directory,
-            $".{Path.GetFileName(metadataPath)}.bootstrap-{Guid.NewGuid():N}.tmp");
-
-        var databaseInstalled = false;
-        try
-        {
-            var (revision, protocol) = await DownloadDatabaseAsync(options, stagingPath, cancellationToken).ConfigureAwait(false);
-            ValidateStagedDatabase(stagingPath);
-
-            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapStagedDatabase);
-            cancellationToken.ThrowIfCancellationRequested();
-            File.Move(stagingPath, options.Path, overwrite: false);
-            databaseInstalled = true;
-
-            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapDatabasePublished);
-            cancellationToken.ThrowIfCancellationRequested();
-            var tableMap = RebuildTableMapFromSchema(options.Path);
-            await WriteMetadataAsync(
-                metadataStagingPath,
-                metadataPath,
-                revision,
-                ComputeDatabaseFingerprint(options.Path),
-                protocol,
-                tableMap,
-                cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            // A bootstrap image is not usable as a replica until its matching revision
-            // metadata is durable. Roll it back so the next open can bootstrap cleanly.
-            if (databaseInstalled && !File.Exists(metadataPath))
-                DeleteIfExists(options.Path);
-            throw;
-        }
-        finally
-        {
-            DeleteIfExists(stagingPath);
-            DeleteStagingSidecars(stagingPath);
-            DeleteIfExists(metadataStagingPath);
         }
     }
 
@@ -385,6 +428,16 @@ internal static class ManagedReplicaBootstrapper
             }
 
             var body = await ReadRemainingBytesAsync(stream, effectiveToken).ConfigureAwait(false);
+
+            // One exclusive apply lease spans the whole logical apply (below): commit, checkpoint,
+            // and metadata publication, or the callee's own rollback on failure. See
+            // ManagedReplicaApplyLock for why this seam is deliberately narrow (acquired only for
+            // the local apply, never for the network round trip above).
+            await using var logicalApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, effectiveToken)
+                .ConfigureAwait(false);
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
+            effectiveToken.ThrowIfCancellationRequested();
+
             var (outcome, statistics) = await ApplyLogicalUpdatesAsync(
                 options, metadata, header, body, syncOptions, pendingLocalChanges,
                 payload.Length, reader.BytesRead + body.Length, effectiveToken)
@@ -416,6 +469,16 @@ internal static class ManagedReplicaBootstrapper
                 "The pull-updates response used replace_base apply mode without returning every database page exactly once.");
         }
 
+        // One exclusive apply lease spans the sidecar/fingerprint re-check below through the
+        // page-based apply and its metadata publication (or rollback). Acquired here -- after the
+        // network round trip, before any sidecar inspection -- so a concurrent local write can
+        // never land between "checked clean" and "applied" the way it could when the historical
+        // page-protocol path relied solely on the pre-network EnsureNoLocalDivergence check.
+        await using var pagesApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, effectiveToken)
+            .ConfigureAwait(false);
+        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
+        effectiveToken.ThrowIfCancellationRequested();
+
         // The response turned out to be a Pages stream (Incremental or ReplaceBase) even though
         // the remembered protocol is MvccLogical (a protocol-2 remote can still answer any given
         // pull this way, e.g. after its logical log was garbage-collected). Unlike the ordinary,
@@ -426,8 +489,18 @@ internal static class ManagedReplicaBootstrapper
         // OWN, apply-mode-aware guard: Incremental still rejects pending changes because a
         // partial page patch cannot rebase journaled SQL. ReplaceBase installs every page, so
         // pending statements can be replayed onto the new snapshot before metadata publication.
+        //
+        // The ordinary, historical page-protocol path (requestLogical == false) re-validates here
+        // too: EnsureNoLocalDivergence already ran once before the network call above, but only
+        // this post-network, lock-held check is authoritative -- a local write landing during the
+        // round trip must still be caught before the apply below mutates anything. Always the
+        // strict fingerprint/sidecar check here (never the checkpoint-and-discard behavior
+        // EnsurePagesApplyIsSafe uses for ReplaceBase): a page-protocol replica has no push
+        // mechanism, so there is no way to know local WAL content is already reflected upstream.
         if (requestLogical)
             EnsurePagesApplyIsSafe(options.Path, metadata, pendingLocalChanges, header.ApplyMode);
+        else
+            CheckFileDivergence(options.Path, metadata);
 
         await ApplyIncrementalPagesAsync(
                 options, header, pages, metadata.ClientId, pendingLocalChanges, effectiveToken)

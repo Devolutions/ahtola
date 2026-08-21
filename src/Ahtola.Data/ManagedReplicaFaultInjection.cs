@@ -15,6 +15,15 @@ internal enum ManagedReplicaDurableBoundary
     LogicalApplyCommitted,
     LogicalApplyCheckpointed,
     LogicalApplyMetadataPublished,
+
+    /// <summary>
+    /// Hit immediately after the single exclusive apply lease (see
+    /// <c>ManagedReplicaApplyLock</c>) is acquired, before the caller re-checks sidecars/
+    /// fingerprint and applies. Shared by all three acquisition sites (bootstrap install,
+    /// logical apply, incremental/replace-base page apply): tests distinguish which site fired
+    /// by which API they invoked, not by a separate boundary value.
+    /// </summary>
+    ReplicaApplyLockAcquired,
 }
 
 /// <summary>
