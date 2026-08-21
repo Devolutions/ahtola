@@ -836,6 +836,7 @@ public sealed class SqlitePager : IDisposable
     /// <summary>Reads a copy of one page from the committed WAL-overlay view.</summary>
     public byte[] ReadCommittedPage(uint pageNumber)
     {
+        EnsureCommittedPageMaterialized(pageNumber);
         using var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(null), IsReadOnly);
         lock (_gate)
         {
@@ -853,6 +854,7 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     public void ReadCommittedPage(uint pageNumber, Span<byte> destination)
     {
+        EnsureCommittedPageMaterialized(pageNumber);
         using var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(null), IsReadOnly);
         lock (_gate)
         {
@@ -2278,6 +2280,33 @@ public sealed class SqlitePager : IDisposable
         }
     }
 
+    internal void EnsureSnapshotPageMaterialized(
+        IReadOnlyDictionary<uint, byte[]> walPageOverlay,
+        uint pageCount,
+        uint pageNumber)
+    {
+        if (!_pageStore.SupportsPageMaterialization)
+            return;
+
+        var requiresMaterialization = false;
+        lock (_gate)
+        {
+            ThrowIfNotReadable();
+            if (pageNumber == 0 || pageNumber > pageCount)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(pageNumber),
+                    pageNumber,
+                    $"Page number is out of range for snapshot database size {pageCount}.");
+            }
+            requiresMaterialization = !walPageOverlay.ContainsKey(pageNumber)
+                && pageNumber <= _pageStore.PageCount;
+        }
+
+        if (requiresMaterialization)
+            _pageStore.EnsurePageMaterialized(pageNumber);
+    }
+
     internal void EndReadTransaction(SqlitePagerReadTransaction transaction)
     {
         lock (_gate)
@@ -2830,10 +2859,20 @@ public sealed class SqlitePager : IDisposable
     }
 
     private static AhtolaEncryptionOptions? GetFileSystemEncryption(IFileSystem fileSystem)
-        => fileSystem is AhtolaEncryptionFileSystem encrypted ? encrypted.Encryption : null;
+        => fileSystem switch
+        {
+            AhtolaEncryptionFileSystem encrypted => encrypted.Encryption,
+            IFileSystemDecorator decorator => GetFileSystemEncryption(decorator.InnerFileSystem),
+            _ => null,
+        };
 
         private static IPageCodec? GetFileSystemPageCodec(IFileSystem fileSystem)
-            => fileSystem is AhtolaPageCodecFileSystem codec ? codec.PageCodec : null;
+            => fileSystem switch
+            {
+                AhtolaPageCodecFileSystem codec => codec.PageCodec,
+                IFileSystemDecorator decorator => GetFileSystemPageCodec(decorator.InnerFileSystem),
+                _ => null,
+            };
 
     private static SqliteWalRecoveryInfo CreateEmptyRecoveryInfo()
         => new(
@@ -3470,6 +3509,28 @@ public sealed class SqlitePager : IDisposable
         return page;
     }
 
+    private void EnsureCommittedPageMaterialized(uint pageNumber)
+    {
+        if (!_pageStore.SupportsPageMaterialization)
+            return;
+
+        var requiresMaterialization = false;
+        using (var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(null), IsReadOnly))
+        {
+            lock (_gate)
+            {
+                ThrowIfNotReadable();
+                SynchronizeCommittedView();
+                ValidateVisiblePageNumber(pageNumber);
+                requiresMaterialization = !_walPageOverlay.ContainsKey(pageNumber)
+                    && pageNumber <= _pageStore.PageCount;
+            }
+        }
+
+        if (requiresMaterialization)
+            _pageStore.EnsurePageMaterialized(pageNumber);
+    }
+
     private void ValidateVisiblePageNumber(uint pageNumber)
     {
         if (pageNumber == 0 || pageNumber > _committedPageCount)
@@ -3607,24 +3668,33 @@ public sealed class SqlitePagerReadTransaction : IDisposable
     public byte[] ReadPage(uint pageNumber)
     {
         lock (_gate)
+            EnsureActiveSnapshotNoLock();
+
+        _pager.EnsureSnapshotPageMaterialized(_walPageOverlay, PageCount, pageNumber);
+
+        lock (_gate)
         {
-            if (_readerLock is null && _walIndexSnapshot is null)
-                throw new ObjectDisposedException(nameof(SqlitePagerReadTransaction));
-
-            try
-            {
-                _walIndexSnapshot?.EnsureStillValid();
-            }
-            catch (SqliteWalReadSnapshotInvalidatedException exception)
-            {
-                throw new SqlitePagerBusyException(
-                    SqlitePagerLockOperation.Reader,
-                    SqlitePagerBusyReason.Snapshot,
-                    TimeSpan.Zero,
-                    exception);
-            }
-
+            EnsureActiveSnapshotNoLock();
             return _pager.ReadSnapshotPage(_walPageOverlay, PageCount, _cacheGeneration, pageNumber);
+        }
+    }
+
+    private void EnsureActiveSnapshotNoLock()
+    {
+        if (_readerLock is null && _walIndexSnapshot is null)
+            throw new ObjectDisposedException(nameof(SqlitePagerReadTransaction));
+
+        try
+        {
+            _walIndexSnapshot?.EnsureStillValid();
+        }
+        catch (SqliteWalReadSnapshotInvalidatedException exception)
+        {
+            throw new SqlitePagerBusyException(
+                SqlitePagerLockOperation.Reader,
+                SqlitePagerBusyReason.Snapshot,
+                TimeSpan.Zero,
+                exception);
         }
     }
 
@@ -3754,8 +3824,15 @@ public sealed class SqlitePagerTransaction : IDisposable
             ThrowIfNotActive();
             if (_pageImages.TryGetValue(pageNumber, out var page))
                 return [.. page];
+        }
 
-            return _pager.ReadCommittedPage(pageNumber);
+        var committedPage = _pager.ReadCommittedPage(pageNumber);
+        lock (_gate)
+        {
+            ThrowIfNotActive();
+            return _pageImages.TryGetValue(pageNumber, out var page)
+                ? [.. page]
+                : committedPage;
         }
     }
 

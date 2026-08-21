@@ -334,6 +334,7 @@ public sealed class SqlitePageStore : IDisposable
                 $"Page number is out of range for a database of {count} page(s).");
         }
 
+        EnsurePageMaterialized(pageNumber);
         var offset = PageOffset(pageNumber);
                 if (_pageCodec is not null)
         {
@@ -377,12 +378,26 @@ public sealed class SqlitePageStore : IDisposable
                 $"Page number is out of range for a database of {count} page(s).");
         }
 
+        EnsurePageMaterialized(pageNumber);
         var page = new byte[PageSize];
         var read = _file.Read(PageOffset(pageNumber), page);
         if (read != PageSize)
             throw new InvalidDataException($"Short raw read on page {pageNumber}: expected {PageSize} bytes, got {read}.");
         return page;
     }
+
+    internal void EnsurePageMaterialized(uint pageNumber)
+    {
+        ThrowIfDisposed();
+        if (_file is IPageMaterializingFile materializingFile
+            && pageNumber >= 1
+            && pageNumber <= PageCount)
+        {
+            materializingFile.EnsureMaterialized(PageOffset(pageNumber), PageSize);
+        }
+    }
+
+    internal bool SupportsPageMaterialization => _file is IPageMaterializingFile;
 
     internal void RefreshHeader()
     {
