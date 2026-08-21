@@ -57,6 +57,86 @@ public sealed class ManagedReplicaPageMaterializationTests
         source.CallCount.Should().Be(1);
     }
 
+    [Test]
+    public async Task ConnectionsSharingAReplicaRegistryEntryCoalesceTheirFault()
+    {
+        var databasePath = $"registry-{Guid.NewGuid():N}.db";
+        var fileSystem = new InMemoryFileSystem();
+        InitializePartialDatabase(fileSystem, databasePath, pageCount: 4);
+        var expected = CreatePage(0x54);
+        var source = new BlockingPageSource(databasePages: 4, expected);
+        using var first = ManagedReplicaPageMaterializationRegistry.Acquire(
+            fileSystem,
+            databasePath,
+            Revision,
+            source,
+            prefetchSegments: false);
+        using var second = ManagedReplicaPageMaterializationRegistry.Acquire(
+            fileSystem,
+            databasePath,
+            Revision,
+            new RecordingPageSource(4, _ => throw new InvalidOperationException("The first source owns the entry.")),
+            prefetchSegments: false);
+
+        var reads = new[] { first, second }
+            .Select(lease => Task.Run(() =>
+            {
+                using var file = lease.FileSystem.OpenFile(databasePath, FileOpenMode.OpenExisting, readOnly: true);
+                var page = new byte[PageSize];
+                file.Read(PageSize, page).Should().Be(PageSize);
+                return page;
+            }))
+            .ToArray();
+
+        await source.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        source.CallCount.Should().Be(1);
+        source.Release();
+
+        var pages = await Task.WhenAll(reads).WaitAsync(TimeSpan.FromSeconds(5));
+        pages.Should().AllSatisfy(page => page.Should().Equal(expected));
+        source.CallCount.Should().Be(1);
+    }
+
+    [Test]
+    public async Task RegistryDoesNotPublishAReplacementUntilLastCloseFinishes()
+    {
+        var databasePath = $"registry-close-{Guid.NewGuid():N}.db";
+        var inner = new InMemoryFileSystem();
+        InitializePartialDatabase(inner, databasePath, pageCount: 4);
+        var fileSystem = new BlockingDisposeFileSystem(inner, databasePath);
+        var source = new RecordingPageSource(4, _ => CreatePage(0x55));
+        var first = ManagedReplicaPageMaterializationRegistry.Acquire(
+            fileSystem,
+            databasePath,
+            Revision,
+            source,
+            prefetchSegments: false);
+        fileSystem.Arm();
+
+        var close = Task.Run(first.Dispose);
+        await fileSystem.DisposeStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var acquireStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var replacement = Task.Run(() =>
+        {
+            acquireStarted.SetResult(true);
+            return ManagedReplicaPageMaterializationRegistry.Acquire(
+                fileSystem,
+                databasePath,
+                Revision,
+                source,
+                prefetchSegments: false);
+        });
+        await acquireStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(100);
+
+        replacement.IsCompleted.Should().BeFalse();
+        fileSystem.OpenedWhileDisposeWasBlocked.Should().BeFalse();
+        fileSystem.Release();
+
+        await close.WaitAsync(TimeSpan.FromSeconds(5));
+        using var reopened = await replacement.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
     [TestCase(InvalidPageResponse.WrongPage)]
     [TestCase(InvalidPageResponse.WrongSize)]
     public void InvalidRemotePageIsRejectedBeforeSparseBytesCanBeRead(InvalidPageResponse response)
@@ -130,7 +210,85 @@ public sealed class ManagedReplicaPageMaterializationTests
         using var store = SqlitePageStore.Open(reopened, "replica.db");
 
         store.ReadPage(2).Should().Equal(expected);
+        reopened.HasLocalMutations.Should().BeTrue();
         source.CallCount.Should().Be(0);
+    }
+
+    [TestCase((int)ManagedReplicaDurableBoundary.PageMutationIntentPersisted, false)]
+    [TestCase((int)ManagedReplicaDurableBoundary.PageMutationDatabasePersisted, true)]
+    public void InterruptedLocalPageWritesRecoverWithoutPublishingSparseBytes(
+        int boundaryValue,
+        bool localWriteWasDurable)
+    {
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var fileSystem = CreatePartialDatabase(pageCount: 4);
+        var localPage = CreatePage(0x75);
+        var remotePage = CreatePage(0x76);
+        var unusedSource = new DelegatePageSource((_, _, _) =>
+            Task.FromException<ManagedReplicaPageBatch>(
+                new InvalidOperationException("The interrupted write must not fetch.")));
+        using (var materializing = OpenMaterializing(fileSystem, unusedSource, prefetchSegments: false))
+        using (var file = materializing.OpenFile("replica.db", FileOpenMode.OpenExisting))
+        using (ManagedReplicaFaultInjection.Push(point =>
+               {
+                   if (point == boundary)
+                       throw new InvalidOperationException("Injected page mutation interruption.");
+               }))
+        {
+            var write = () => file.Write(PageSize, localPage);
+            write.Should().Throw<InvalidOperationException>();
+        }
+
+        var reopenedSource = new RecordingPageSource(4, _ => remotePage);
+        using var reopened = OpenMaterializing(fileSystem, reopenedSource, prefetchSegments: false);
+        using var store = SqlitePageStore.Open(reopened, "replica.db");
+
+        store.ReadPage(2).Should().Equal(localWriteWasDurable ? localPage : remotePage);
+        reopened.HasLocalMutations.Should().BeTrue();
+        reopenedSource.CallCount.Should().Be(localWriteWasDurable ? 0 : 1);
+    }
+
+    [Test]
+    public void PhysicalPartialReplicaHasExclusiveCrossProcessOwnership()
+    {
+        var path = Path.Combine(
+            TestContext.CurrentContext.WorkDirectory,
+            $"managed-replica-page-owner-{Guid.NewGuid():N}.db");
+        try
+        {
+            InitializePartialDatabase(PhysicalFileSystem.Instance, path, pageCount: 4);
+            var source = new RecordingPageSource(4, _ => CreatePage(0x77));
+            using var owner = new ManagedReplicaPageMaterializingFileSystem(
+                PhysicalFileSystem.Instance,
+                path,
+                Revision,
+                source,
+                prefetchSegments: false);
+
+            var secondOpen = () => new ManagedReplicaPageMaterializingFileSystem(
+                PhysicalFileSystem.Instance,
+                path,
+                Revision,
+                source,
+                prefetchSegments: false);
+
+            secondOpen.Should().Throw<IOException>().WithMessage("*another process*");
+        }
+        finally
+        {
+            foreach (var suffix in new[]
+                     {
+                         string.Empty,
+                         "-wal",
+                         ManagedReplicaPageMaterializingFileSystem.StateSuffix,
+                         ManagedReplicaPageMaterializingFileSystem.OwnershipLockSuffix,
+                     })
+            {
+                var artifact = path + suffix;
+                if (File.Exists(artifact))
+                    File.Delete(artifact);
+            }
+        }
     }
 
     [TestCase(false)]
@@ -182,6 +340,27 @@ public sealed class ManagedReplicaPageMaterializationTests
         file.Read(PageSize, destination).Should().Be(PageSize);
         destination.Should().Equal(expected);
         source.CallCount.Should().Be(2);
+    }
+
+    [Test]
+    public void FailedStateTailRollbackPoisonsTheOpenMaterializer()
+    {
+        var inner = CreatePartialDatabase(pageCount: 4);
+        var fileSystem = new StateTailFailureFileSystem(
+            inner,
+            "replica.db" + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+        var source = new RecordingPageSource(4, _ => CreatePage(0x35));
+        using var materializing = OpenMaterializing(fileSystem, source, prefetchSegments: false);
+        using var file = materializing.OpenFile("replica.db", FileOpenMode.OpenExisting, readOnly: true);
+        fileSystem.Arm();
+        var destination = new byte[PageSize];
+
+        var firstRead = () => file.Read(PageSize, destination);
+        firstRead.Should().Throw<IOException>().WithMessage("*partial record could not be removed*");
+
+        var secondRead = () => file.Read(2 * PageSize, destination);
+        secondRead.Should().Throw<InvalidDataException>().WithMessage("*close and reopen*");
+        source.CallCount.Should().Be(1);
     }
 
     [Test]
@@ -255,6 +434,16 @@ public sealed class ManagedReplicaPageMaterializationTests
         int segmentSize = ManagedReplicaPageMaterializingFileSystem.DefaultSegmentSize)
     {
         var fileSystem = new InMemoryFileSystem();
+        InitializePartialDatabase(fileSystem, "replica.db", pageCount, segmentSize);
+        return fileSystem;
+    }
+
+    private static void InitializePartialDatabase(
+        IFileSystem fileSystem,
+        string databasePath,
+        int pageCount,
+        int segmentSize = ManagedReplicaPageMaterializingFileSystem.DefaultSegmentSize)
+    {
         var header = SqliteDatabaseHeader.CreateDefault() with
         {
             ChangeCounter = 1,
@@ -271,7 +460,7 @@ public sealed class ManagedReplicaPageMaterializationTests
                 usableSpace: header.UsableSpace)
             .WriteTo(firstPage);
 
-        using (var file = fileSystem.OpenFile("replica.db", FileOpenMode.CreateNew))
+        using (var file = fileSystem.OpenFile(databasePath, FileOpenMode.CreateNew))
         {
             file.SetLength(checked((long)pageCount * PageSize));
             file.Write(0, firstPage);
@@ -279,20 +468,19 @@ public sealed class ManagedReplicaPageMaterializationTests
         }
         using (SqliteWalFile.Create(
                    fileSystem,
-                   "replica.db-wal",
+                   databasePath + "-wal",
                    SqliteWalHeader.Create(PageSize, salt1: 11, salt2: 13)))
         {
         }
 
         ManagedReplicaPageMaterializingFileSystem.InitializeState(
             fileSystem,
-            "replica.db",
+            databasePath,
             Revision,
             checked((ulong)pageCount),
             PageSize,
             segmentSize,
             [0]);
-        return fileSystem;
     }
 
     private static ManagedReplicaPageMaterializingFileSystem OpenMaterializing(
@@ -502,6 +690,139 @@ public sealed class ManagedReplicaPageMaterializationTests
                 revision,
                 databasePages,
                 pageIds.Select(pageId => new ManagedReplicaFetchedPage(pageId, page)).ToArray()));
+        }
+    }
+
+    private sealed class BlockingDisposeFileSystem(
+        IFileSystem inner,
+        string databasePath) : IFileSystem
+    {
+        private readonly ManualResetEventSlim _release = new(initialState: false);
+        private int _armed;
+        private int _disposeBlocked;
+        private int _openedWhileDisposeWasBlocked;
+
+        public TaskCompletionSource<bool> DisposeStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool OpenedWhileDisposeWasBlocked =>
+            Volatile.Read(ref _openedWhileDisposeWasBlocked) != 0;
+
+        public void Arm() => Volatile.Write(ref _armed, 1);
+
+        public void Release() => _release.Set();
+
+        public bool FileExists(string path) => inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+        {
+            if (Volatile.Read(ref _disposeBlocked) != 0)
+                Volatile.Write(ref _openedWhileDisposeWasBlocked, 1);
+            var file = inner.OpenFile(path, mode, readOnly);
+            return string.Equals(path, databasePath, StringComparison.Ordinal)
+                ? new BlockingDisposeFile(this, file)
+                : file;
+        }
+
+        public void DeleteFile(string path) => inner.DeleteFile(path);
+
+        public FileWriteStamp? GetWriteStamp(string path) => inner.GetWriteStamp(path);
+
+        private sealed class BlockingDisposeFile(
+            BlockingDisposeFileSystem owner,
+            IFile innerFile) : IFile
+        {
+            public long Length => innerFile.Length;
+
+            public bool IsReadOnly => innerFile.IsReadOnly;
+
+            public int Read(long position, Span<byte> destination) =>
+                innerFile.Read(position, destination);
+
+            public void Write(long position, ReadOnlySpan<byte> source) =>
+                innerFile.Write(position, source);
+
+            public void SetLength(long length) => innerFile.SetLength(length);
+
+            public void FlushToDisk() => innerFile.FlushToDisk();
+
+            public void Dispose()
+            {
+                if (Volatile.Read(ref owner._armed) != 0
+                    && Interlocked.CompareExchange(ref owner._disposeBlocked, 1, 0) == 0)
+                {
+                    owner.DisposeStarted.TrySetResult(true);
+                    owner._release.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue();
+                    Volatile.Write(ref owner._disposeBlocked, 0);
+                }
+
+                innerFile.Dispose();
+            }
+        }
+    }
+
+    private sealed class StateTailFailureFileSystem(
+        IFileSystem inner,
+        string statePath) : IFileSystem
+    {
+        private int _armed;
+        private int _writeFailed;
+        private int _rollbackFailed;
+
+        public void Arm() => Volatile.Write(ref _armed, 1);
+
+        public bool FileExists(string path) => inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+        {
+            var file = inner.OpenFile(path, mode, readOnly);
+            return string.Equals(path, statePath, StringComparison.Ordinal)
+                ? new StateTailFailureFile(this, file)
+                : file;
+        }
+
+        public void DeleteFile(string path) => inner.DeleteFile(path);
+
+        public FileWriteStamp? GetWriteStamp(string path) => inner.GetWriteStamp(path);
+
+        private sealed class StateTailFailureFile(
+            StateTailFailureFileSystem owner,
+            IFile innerFile) : IFile
+        {
+            public long Length => innerFile.Length;
+
+            public bool IsReadOnly => innerFile.IsReadOnly;
+
+            public int Read(long position, Span<byte> destination) =>
+                innerFile.Read(position, destination);
+
+            public void Write(long position, ReadOnlySpan<byte> source)
+            {
+                if (Volatile.Read(ref owner._armed) != 0
+                    && Interlocked.CompareExchange(ref owner._writeFailed, 1, 0) == 0)
+                {
+                    innerFile.Write(position, source[..Math.Min(8, source.Length)]);
+                    throw new IOException("Injected partial page-state write.");
+                }
+
+                innerFile.Write(position, source);
+            }
+
+            public void SetLength(long length)
+            {
+                if (Volatile.Read(ref owner._armed) != 0
+                    && Volatile.Read(ref owner._writeFailed) != 0
+                    && Interlocked.CompareExchange(ref owner._rollbackFailed, 1, 0) == 0)
+                {
+                    throw new IOException("Injected page-state rollback failure.");
+                }
+
+                innerFile.SetLength(length);
+            }
+
+            public void FlushToDisk() => innerFile.FlushToDisk();
+
+            public void Dispose() => innerFile.Dispose();
         }
     }
 

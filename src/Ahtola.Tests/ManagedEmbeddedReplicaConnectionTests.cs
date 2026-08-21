@@ -10,6 +10,8 @@ namespace Ahtola.Tests;
 public sealed class ManagedEmbeddedReplicaConnectionTests
 {
     private const int BootstrapStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.BootstrapStagedDatabase;
+    private const int BootstrapSafetyStatePublishedBoundary =
+        (int)ManagedReplicaDurableBoundary.BootstrapSafetyStatePublished;
     private const int BootstrapDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.BootstrapDatabasePublished;
     private const int IncrementalApplyStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.IncrementalApplyStagedDatabase;
     private const int IncrementalApplyDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished;
@@ -518,28 +520,181 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
-    public void CreateReplicaPrefixBootstrapRejectsMissingPagesBeforeInstallingTheReplica()
+    public void CreateReplicaPrefixBootstrapLazilyFetchesMissingPagesAndReusesDurableState()
     {
         var path = NewReplicaPath("managed-replica-incomplete-prefix-bootstrap");
         var databaseImage = CreateDatabaseImage(path + ".source");
         databaseImage.Length.Should().BeGreaterThan(4096);
-        var handler = new PullUpdatesHandler(
-            CreatePullResponse(
-                "revision-prefix",
-                databaseImage[..4096],
-                declaredPages: checked((ulong)(databaseImage.Length / 4096))),
-            request =>
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
             {
-                var payload = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-                var selector = ReadLengthDelimitedField(payload, 5);
-                selector.Should().Equal(
-                    0x3a, 0x30, 0x00, 0x00, // portable no-run cookie (12346)
-                    0x01, 0x00, 0x00, 0x00, // one container
-                    0x00, 0x00, 0x00, 0x00, // key 0, cardinality 1
-                    0x10, 0x00, 0x00, 0x00, // container payload offset
-                    0x00, 0x00);             // page 0
-                ReadPortableRoaringBitmap(selector).Should().Equal(0u);
-            });
+                connection.Open();
+                ReadBootstrapMarker(connection).Should().Be(42);
+            }
+
+            handler.RequestedPages.Should().NotBeEmpty();
+            handler.RequestedPages[0].Should().Equal(0u);
+            handler.RequestedPages.Skip(1).SelectMany(static pages => pages).Should().Contain(1u);
+            var callCountAfterFirstOpen = handler.CallCount;
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeTrue();
+
+            using (var reopened = AhtolaConnection.CreateReplica(options))
+            {
+                reopened.Open();
+                ReadBootstrapMarker(reopened).Should().Be(42);
+                var callsBeforeSync = handler.CallCount;
+
+                var result = reopened
+                    .SyncAsync(new AhtolaSyncOptions(), CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult();
+
+                result.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+                handler.CallCount.Should().Be(callsBeforeSync + 1);
+            }
+
+            handler.SyncCallCount.Should().Be(1);
+            handler.CallCount.Should().Be(callCountAfterFirstOpen + 1);
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PartialBootstrapPublishesSafetyStateBeforeTheSparseDatabase()
+    {
+        var path = NewReplicaPath("managed-replica-partial-bootstrap-publication");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+        var observedSafeBoundary = false;
+
+        try
+        {
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point != ManagedReplicaDurableBoundary.BootstrapSafetyStatePublished)
+                           return;
+                       observedSafeBoundary = !File.Exists(path)
+                           && File.Exists(path + ManagedReplicaBootstrapper.MetadataSuffix)
+                           && File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+                       throw new InvalidOperationException("Injected bootstrap publication interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => ManagedReplicaBootstrapper.BootstrapAsync(options, CancellationToken.None));
+            }
+
+            observedSafeBoundary.Should().BeTrue();
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ManagedReplicaBootstrapper.MetadataSuffix).Should().BeFalse();
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();
+
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            reopened.Open();
+            ReadBootstrapMarker(reopened).Should().Be(42);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CompletePartialBootstrapMarkerRequiresItsPageState()
+    {
+        var path = NewReplicaPath("managed-replica-partial-bootstrap-missing-state");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+
+        try
+        {
+            var callsBeforeRecovery = 0;
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                ReadBootstrapMarker(connection).Should().Be(42);
+                callsBeforeRecovery = handler.CallCount;
+                File.Delete(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+
+                Action sync = () => connection
+                    .SyncAsync(new AhtolaSyncOptions(), CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult();
+                sync.Should().Throw<InvalidDataException>().WithMessage("*lazy-page state*missing*");
+            }
+
+            using var recovered = AhtolaConnection.CreateReplica(options);
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            handler.CallCount.Should().BeGreaterThan(callsBeforeRecovery);
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void BootstrapMarkerRequiresItsMetadata()
+    {
+        var path = NewReplicaPath("managed-replica-bootstrap-missing-metadata");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(databaseImage.Length));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                ReadBootstrapMarker(connection).Should().Be(42);
+            }
+
+            var callsBeforeRecovery = handler.CallCount;
+            File.Delete(path + ManagedReplicaBootstrapper.MetadataSuffix);
+
+            using var recovered = AhtolaConnection.CreateReplica(options);
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            handler.CallCount.Should().BeGreaterThan(callsBeforeRecovery);
+            File.Exists(path + ManagedReplicaBootstrapper.MetadataSuffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PartialReplicaPushesTrackedLocalChangesBeforeCompletingItsImage()
+    {
+        var path = NewReplicaPath("managed-replica-partial-push");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
         var options = CreateOptions(
             path,
             handler,
@@ -548,11 +703,65 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         try
         {
             using var connection = AhtolaConnection.CreateReplica(options);
-            Assert.Throws<NotSupportedException>(() => connection.Open())!
-                .Message.Should().Contain("no lazy page-fault storage");
-            handler.CallCount.Should().Be(1);
-            File.Exists(path).Should().BeFalse();
-            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+            connection.Open();
+            connection.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 84;").Should().Be(1);
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            result.Statistics.CdcOperations.Should().Be(1);
+            handler.PushCallCount.Should().Be(1);
+            ReadBootstrapMarker(connection).Should().Be(84);
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PushedPartialReplicaCanResumeImageCompletionAfterReopen()
+    {
+        var path = NewReplicaPath("managed-replica-partial-push-resume");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                connection.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 84;").Should().Be(1);
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == ManagedReplicaDurableBoundary.PartialImageCompletionStarted)
+                               throw new InvalidOperationException("Injected partial image completion interruption.");
+                       }))
+                {
+                    var exception = Assert.ThrowsAsync<InvalidOperationException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                    exception!.Message.Should().Be("Injected partial image completion interruption.");
+                }
+
+                handler.PushCallCount.Should().Be(1);
+                connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+                File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeTrue();
+            }
+
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            reopened.Open();
+
+            var result = await reopened.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            handler.PushCallCount.Should().Be(1);
+            ReadBootstrapMarker(reopened).Should().Be(84);
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();
         }
         finally
         {
@@ -2229,7 +2438,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
 
     [TestCase(UnsupportedReplicaMode.RemoteEncryption)]
     [TestCase(UnsupportedReplicaMode.PartialQuery)]
-    [TestCase(UnsupportedReplicaMode.PartialPrefixLazy)]
+    [TestCase(UnsupportedReplicaMode.PartialPrefixInvalidSegment)]
     [TestCase(UnsupportedReplicaMode.ChunkedBootstrap)]
     public void CreateReplicaRejectsUnsupportedModesBeforeOpeningOrMutatingLocalState(
         UnsupportedReplicaMode mode)
@@ -2244,8 +2453,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             var exception = Assert.Throws<NotSupportedException>(() => connection.Open())!;
             if (mode == UnsupportedReplicaMode.PartialQuery)
                 exception.Message.Should().Contain("query-selected bootstrap pages");
-            if (mode == UnsupportedReplicaMode.PartialPrefixLazy)
-                exception.Message.Should().Contain("eager prefix bootstrap only");
+            if (mode == UnsupportedReplicaMode.PartialPrefixInvalidSegment)
+                exception.Message.Should().Contain("whole number of 4 KiB pages");
 
             handler.CallCount.Should().Be(0);
             File.Exists(path).Should().BeFalse();
@@ -2566,6 +2775,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [TestCase(BootstrapStagedDatabaseBoundary)]
+    [TestCase(BootstrapSafetyStatePublishedBoundary)]
     [TestCase(BootstrapDatabasePublishedBoundary)]
     public async Task BootstrapCancellationAtDurableBoundaryLeavesNoUnpairedReplicaFiles(
         int boundaryValue)
@@ -3377,14 +3587,14 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                 PartialBootstrap = AhtolaPartialBootstrapOptions.QueryPages("SELECT 1"),
                 HttpPolicy = options.HttpPolicy,
             },
-            UnsupportedReplicaMode.PartialPrefixLazy => new AhtolaReplicaOptions(
+            UnsupportedReplicaMode.PartialPrefixInvalidSegment => new AhtolaReplicaOptions(
                 path,
                 options.RemoteUri,
                 options.AuthToken)
             {
                 PartialBootstrap = AhtolaPartialBootstrapOptions.Prefix(
                     4096,
-                    segmentSize: 8192,
+                    segmentSize: 5000,
                     prefetch: true),
                 HttpPolicy = options.HttpPolicy,
             },
@@ -3409,6 +3619,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                      path + "-shm",
                      path + "-journal",
                      path + ".ahtola-replica-meta",
+                     path + ManagedReplicaPageMaterializingFileSystem.StateSuffix,
                      path + ManagedReplicaChangeJournal.Suffix,
                  })
         {
@@ -3457,6 +3668,39 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             WriteLengthDelimitedField(page, 2, databaseImage.AsSpan(offset, length));
             WriteDelimitedMessage(response, page);
         }
+        return response.ToArray();
+    }
+
+    private static byte[] CreatePageSubsetPullResponse(
+        string revision,
+        byte[] databaseImage,
+        IReadOnlyList<uint> pageIds)
+    {
+        var databasePages = checked((ulong)(databaseImage.Length / 4096));
+        var header = new List<byte>();
+        WriteLengthDelimitedField(header, 1, Encoding.UTF8.GetBytes(revision));
+        WriteVarintField(header, 2, databasePages);
+        WriteLengthDelimitedField(header, 3, []);
+        WriteVarintField(header, 5, 0);
+        WriteVarintField(header, 6, 1);
+        WriteVarintField(header, 8, 1);
+
+        var response = new List<byte>();
+        WriteDelimitedMessage(response, header);
+        foreach (var pageId in pageIds)
+        {
+            if ((ulong)pageId >= databasePages)
+                throw new ArgumentOutOfRangeException(nameof(pageIds));
+            var page = new List<byte>();
+            if (pageId != 0)
+                WriteVarintField(page, 1, pageId);
+            WriteLengthDelimitedField(
+                page,
+                2,
+                databaseImage.AsSpan(checked((int)pageId * 4096), 4096));
+            WriteDelimitedMessage(response, page);
+        }
+
         return response.ToArray();
     }
 
@@ -3561,6 +3805,16 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
 
     private static byte[] ReadLengthDelimitedField(byte[] payload, int requestedField)
     {
+        if (TryReadLengthDelimitedField(payload, requestedField, out var value))
+            return value;
+        throw new InvalidOperationException($"Protobuf field {requestedField} was not found.");
+    }
+
+    private static bool TryReadLengthDelimitedField(
+        byte[] payload,
+        int requestedField,
+        out byte[] value)
+    {
         var offset = 0;
         while (offset < payload.Length)
         {
@@ -3579,11 +3833,15 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             if (length > payload.Length - offset)
                 throw new InvalidOperationException("Invalid test protobuf field length.");
             if (field == requestedField)
-                return payload.AsSpan(offset, length).ToArray();
+            {
+                value = payload.AsSpan(offset, length).ToArray();
+                return true;
+            }
             offset += length;
         }
 
-        throw new InvalidOperationException($"Protobuf field {requestedField} was not found.");
+        value = [];
+        return false;
     }
 
     private static IReadOnlyList<uint> ReadPortableRoaringBitmap(byte[] payload)
@@ -3685,7 +3943,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     {
         RemoteEncryption,
         PartialQuery,
-        PartialPrefixLazy,
+        PartialPrefixInvalidSegment,
         ChunkedBootstrap,
     }
 
@@ -3707,6 +3965,67 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         public List<AhtolaSyncProgressStage> Stages { get; } = [];
 
         public void Report(AhtolaSyncProgress value) => Stages.Add(value.Stage);
+    }
+
+    private sealed class LazyPagePullHandler(string revision, byte[] databaseImage) : HttpMessageHandler
+    {
+        private readonly object _gate = new();
+        private readonly List<uint[]> _requestedPages = [];
+        private int _callCount;
+        private int _syncCallCount;
+        private int _pushCallCount;
+
+        public int CallCount => Volatile.Read(ref _callCount);
+
+        public int SyncCallCount => Volatile.Read(ref _syncCallCount);
+
+        public int PushCallCount => Volatile.Read(ref _pushCallCount);
+
+        public IReadOnlyList<uint[]> RequestedPages
+        {
+            get
+            {
+                lock (_gate)
+                    return _requestedPages.Select(static pages => pages.ToArray()).ToArray();
+            }
+        }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            if (!request.RequestUri!.AbsolutePath.EndsWith("/pull-updates", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref _pushCallCount);
+                return ReplicaPushHandler.SuccessfulBatchResponse(stepCount: 5);
+            }
+
+            var payload = await request.Content!.ReadAsByteArrayAsync(cancellationToken);
+            Interlocked.Increment(ref _callCount);
+            byte[] response;
+            if (TryReadLengthDelimitedField(payload, 5, out var selector))
+            {
+                var pageIds = ReadPortableRoaringBitmap(selector).ToArray();
+                lock (_gate)
+                    _requestedPages.Add(pageIds);
+                response = CreatePageSubsetPullResponse(revision, databaseImage, pageIds);
+            }
+            else
+            {
+                Interlocked.Increment(ref _syncCallCount);
+                response = CreatePullResponse(
+                    revision,
+                    [],
+                    declaredPages: checked((ulong)(databaseImage.Length / 4096)));
+            }
+
+            var message = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(response),
+            };
+            message.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
+            return message;
+        }
     }
 
     private sealed class PullUpdatesHandler : HttpMessageHandler

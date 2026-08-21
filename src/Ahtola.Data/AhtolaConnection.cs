@@ -446,7 +446,8 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         }
         finally
         {
-            _managedDatabase = host.Database;
+            if (host.TryGetDatabase(out var database))
+                _managedDatabase = database;
         }
     }
 

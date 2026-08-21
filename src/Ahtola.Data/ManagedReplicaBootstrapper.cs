@@ -3,15 +3,17 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 
 namespace Ahtola;
 
 internal static class ManagedReplicaBootstrapper
 {
-    private const int PageSize = 4096;
+    internal const int PageSize = 4096;
     private const int MaxHeaderLength = 64 * 1024;
     private const int MaxPageMessageLength = PageSize + 1024;
     internal const string MetadataSuffix = ".ahtola-replica-meta";
+    internal const string BootstrapStateSuffix = ".ahtola-replica-bootstrap";
     private const int MaxMetadataFileLength = 1024 * 1024;
     private const int MaxTableMapEntries = 100_000;
     private const int MaxStringBytes = 64 * 1024;
@@ -30,9 +32,16 @@ internal static class ManagedReplicaBootstrapper
     /// </summary>
     internal static void DeleteBootstrappedReplicaFiles(string path)
     {
+        DeletePublishedReplicaFiles(path);
+        DeleteIfExists(path + BootstrapStateSuffix);
+    }
+
+    private static void DeletePublishedReplicaFiles(string path)
+    {
         DeleteIfExists(path);
         DeleteIfExists(path + MetadataSuffix);
         DeleteIfExists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+        DeleteIfExists(path + ManagedReplicaPageMaterializingFileSystem.OwnershipLockSuffix);
         DeleteStagingSidecars(path);
     }
 
@@ -41,6 +50,16 @@ internal static class ManagedReplicaBootstrapper
         ArgumentNullException.ThrowIfNull(options);
         cancellationToken.ThrowIfCancellationRequested();
         ManagedReplicaSupportMatrix.ValidateOptions(options);
+
+        if (File.Exists(options.Path) && !File.Exists(options.Path + BootstrapStateSuffix))
+        {
+            throw new NotSupportedException(
+                "Managed embedded replica bootstrap only installs a database at a missing replica path.");
+        }
+
+        using var publication = BootstrapPublication.Acquire(options.Path);
+        if (publication.RequiresRecovery)
+            DeletePublishedReplicaFiles(options.Path);
 
         if (File.Exists(options.Path))
         {
@@ -61,6 +80,8 @@ internal static class ManagedReplicaBootstrapper
                 "Managed embedded replica metadata exists while the replica database is missing.");
         }
 
+        publication.MarkInProgress();
+
         var directory = Path.GetDirectoryName(Path.GetFullPath(options.Path))!;
         var stagingPath = Path.Combine(
             directory,
@@ -68,43 +89,96 @@ internal static class ManagedReplicaBootstrapper
         var metadataStagingPath = Path.Combine(
             directory,
             $".{Path.GetFileName(metadataPath)}.bootstrap-{Guid.NewGuid():N}.tmp");
+        var metadataWritePath = metadataStagingPath + ".write";
 
         var databaseInstalled = false;
+        var metadataInstalled = false;
+        var stateInstalled = false;
         try
         {
-            var (revision, protocol) = await DownloadDatabaseAsync(options, stagingPath, cancellationToken).ConfigureAwait(false);
-            ValidateStagedDatabase(stagingPath);
+            var download = await DownloadDatabaseAsync(options, stagingPath, cancellationToken).ConfigureAwait(false);
+            ValidateStagedDatabase(stagingPath, download.IsPartial);
+
+            IReadOnlyDictionary<ulong, string> tableMap;
+            if (download.IsPartial)
+            {
+                var partialBootstrap = options.PartialBootstrap
+                    ?? throw new InvalidOperationException("Partial bootstrap options are unavailable.");
+                ManagedReplicaPageMaterializingFileSystem.InitializeState(
+                    PhysicalFileSystem.Instance,
+                    stagingPath,
+                    download.Revision,
+                    download.DatabasePages,
+                    PageSize,
+                    partialBootstrap.SegmentSize
+                        ?? ManagedReplicaPageMaterializingFileSystem.DefaultSegmentSize,
+                    download.MaterializedPageIds);
+                using var materializingFileSystem = new ManagedReplicaPageMaterializingFileSystem(
+                    PhysicalFileSystem.Instance,
+                    stagingPath,
+                    download.Revision,
+                    new ManagedReplicaPullPageSource(options),
+                    partialBootstrap.Prefetch);
+                tableMap = RebuildTableMapFromSchema(stagingPath, materializingFileSystem);
+            }
+            else
+            {
+                tableMap = RebuildTableMapFromSchema(stagingPath);
+            }
+
+            await WriteMetadataAsync(
+                metadataWritePath,
+                metadataStagingPath,
+                download.Revision,
+                ComputeDatabaseFingerprint(stagingPath),
+                download.Protocol,
+                tableMap,
+                cancellationToken).ConfigureAwait(false);
 
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapStagedDatabase);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var stagedStatePath = stagingPath + ManagedReplicaPageMaterializingFileSystem.StateSuffix;
+            if (download.IsPartial)
+            {
+                File.Move(
+                    stagedStatePath,
+                    options.Path + ManagedReplicaPageMaterializingFileSystem.StateSuffix,
+                    overwrite: false);
+                stateInstalled = true;
+            }
+
+            File.Move(metadataStagingPath, metadataPath, overwrite: false);
+            metadataInstalled = true;
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapSafetyStatePublished);
             cancellationToken.ThrowIfCancellationRequested();
             File.Move(stagingPath, options.Path, overwrite: false);
             databaseInstalled = true;
 
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapDatabasePublished);
             cancellationToken.ThrowIfCancellationRequested();
-            var tableMap = RebuildTableMapFromSchema(options.Path);
-            await WriteMetadataAsync(
-                metadataStagingPath,
-                metadataPath,
-                revision,
-                ComputeDatabaseFingerprint(options.Path),
-                protocol,
-                tableMap,
-                cancellationToken).ConfigureAwait(false);
+            publication.MarkComplete(download.IsPartial);
         }
         catch
         {
-            // A bootstrap image is not usable as a replica until its matching revision
-            // metadata is durable. Roll it back so the next open can bootstrap cleanly.
-            if (databaseInstalled && !File.Exists(metadataPath))
+            // The durable in-progress marker makes a crash recoverable. Eagerly remove anything
+            // this attempt published too, while retaining that marker for the next attempt.
+            if (databaseInstalled || metadataInstalled || stateInstalled)
                 DeleteIfExists(options.Path);
+            if (metadataInstalled)
+                DeleteIfExists(metadataPath);
+            if (stateInstalled)
+                DeleteIfExists(options.Path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
             throw;
         }
         finally
         {
             DeleteIfExists(stagingPath);
             DeleteStagingSidecars(stagingPath);
+            DeleteIfExists(stagingPath + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+            DeleteIfExists(stagingPath + ManagedReplicaPageMaterializingFileSystem.OwnershipLockSuffix);
             DeleteIfExists(metadataStagingPath);
+            DeleteIfExists(metadataWritePath);
         }
     }
 
@@ -115,9 +189,13 @@ internal static class ManagedReplicaBootstrapper
     /// apply path (bootstrap, incremental pages, replace-base), where no logical schema identity
     /// operations are decoded but a future logical pull may depend on an existing map.
     /// </summary>
-    private static IReadOnlyDictionary<ulong, string> RebuildTableMapFromSchema(string databasePath)
+    private static IReadOnlyDictionary<ulong, string> RebuildTableMapFromSchema(
+        string databasePath,
+        IFileSystem? fileSystem = null)
     {
-        using var database = ManagedDatabaseAdapter.Open(databasePath);
+        using var database = fileSystem is null
+            ? ManagedDatabaseAdapter.Open(databasePath)
+            : ManagedDatabaseAdapter.OpenFile(databasePath, fileSystem, readOnly: false);
         var connection = database.Connect();
         using var statement = connection.Prepare(
             "SELECT rootpage, name FROM sqlite_schema WHERE type = 'table' AND rootpage != 0");
@@ -750,8 +828,17 @@ internal static class ManagedReplicaBootstrapper
     public static async Task<ManagedReplicaMetadata> RecordLocalPushAsync(
         AhtolaReplicaOptions options,
         ManagedReplicaMetadata metadata,
+        ManagedReplicaPageMaterializingFileSystem? retainedMaterializer,
         CancellationToken cancellationToken)
     {
+        var publication = GetBootstrapPublicationInfo(options.Path);
+        var statePath = options.Path + ManagedReplicaPageMaterializingFileSystem.StateSuffix;
+        if (publication.RequiresPageState && !File.Exists(statePath))
+        {
+            throw new InvalidDataException(
+                "Managed replica bootstrap state requires lazy-page state that is missing.");
+        }
+
         var metadataPath = options.Path + MetadataSuffix;
         var directory = Path.GetDirectoryName(Path.GetFullPath(metadataPath))!;
         var stagingPath = Path.Combine(
@@ -771,6 +858,98 @@ internal static class ManagedReplicaBootstrapper
                     replaceExisting: true,
                     clientId: metadata.ClientId)
                 .ConfigureAwait(false);
+            if (File.Exists(statePath))
+            {
+                if (retainedMaterializer is not null)
+                {
+                    retainedMaterializer.MarkLocalMutationsPushed();
+                }
+                else
+                {
+                    using var fileSystem = new ManagedReplicaPageMaterializingFileSystem(
+                        PhysicalFileSystem.Instance,
+                        options.Path,
+                        metadata.Revision,
+                        new ManagedReplicaPullPageSource(options),
+                        prefetchSegments: false);
+                    fileSystem.MarkLocalMutationsPushed();
+                }
+            }
+            return metadata with { DatabaseSha256 = fingerprint };
+        }
+        finally
+        {
+            DeleteIfExists(stagingPath);
+        }
+    }
+
+    internal static async Task<ManagedReplicaMetadata> CompletePartialReplicaAsync(
+        AhtolaReplicaOptions options,
+        ManagedReplicaMetadata metadata,
+        bool allowTrackedLocalMutations,
+        ManagedReplicaPageMaterializingFileSystem? retainedMaterializer,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var statePath = options.Path + ManagedReplicaPageMaterializingFileSystem.StateSuffix;
+        var publication = GetBootstrapPublicationInfo(options.Path);
+        if (publication.RequiresPageState && !File.Exists(statePath))
+        {
+            throw new InvalidDataException(
+                "Managed replica bootstrap state requires lazy-page state that is missing.");
+        }
+        if (!File.Exists(statePath))
+            return metadata;
+
+        using var ownedFileSystem = retainedMaterializer is null
+            ? new ManagedReplicaPageMaterializingFileSystem(
+                PhysicalFileSystem.Instance,
+                options.Path,
+                metadata.Revision,
+                new ManagedReplicaPullPageSource(options),
+                prefetchSegments: false)
+            : null;
+        var fileSystem = retainedMaterializer ?? ownedFileSystem!;
+        var hasLocalDivergence = fileSystem.HasLocalMutations
+            || (File.Exists(options.Path + "-wal")
+                && new FileInfo(options.Path + "-wal").Length > 32)
+            || (File.Exists(options.Path + "-journal")
+                && new FileInfo(options.Path + "-journal").Length > 0);
+        if (metadata.Protocol == RemotePullProtocol.Pages
+            && hasLocalDivergence
+            && !allowTrackedLocalMutations
+            && !fileSystem.LocalMutationsPushed)
+        {
+            throw new NotSupportedException(
+                "Managed embedded replica local divergence was detected; incremental pull cannot replace local changes.");
+        }
+
+        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.PartialImageCompletionStarted);
+        await fileSystem.MaterializeAllAsync(cancellationToken).ConfigureAwait(false);
+
+        var fingerprint = fileSystem.ComputeDatabaseFingerprint();
+        var metadataPath = options.Path + MetadataSuffix;
+        var directory = Path.GetDirectoryName(Path.GetFullPath(metadataPath))!;
+        var stagingPath = Path.Combine(
+            directory,
+            $".{Path.GetFileName(metadataPath)}.materialized-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            await WriteMetadataAsync(
+                    stagingPath,
+                    metadataPath,
+                    metadata.Revision,
+                    fingerprint,
+                    metadata.Protocol,
+                    metadata.TableNamesByStableId,
+                    cancellationToken,
+                    replaceExisting: true,
+                    clientId: metadata.ClientId)
+                .ConfigureAwait(false);
+            MarkBootstrapPublicationFull(options.Path);
+            DeleteIfExists(statePath);
             return metadata with { DatabaseSha256 = fingerprint };
         }
         finally
@@ -891,7 +1070,7 @@ internal static class ManagedReplicaBootstrapper
         }
     }
 
-    private static async Task<(string Revision, RemotePullProtocol Protocol)> DownloadDatabaseAsync(
+    private static async Task<InitialDownload> DownloadDatabaseAsync(
         AhtolaReplicaOptions options,
         string stagingPath,
         CancellationToken cancellationToken)
@@ -930,13 +1109,8 @@ internal static class ManagedReplicaBootstrapper
             throw new InvalidDataException(
                 "Managed embedded replica bootstrap requires a raw page stream; the server returned an MVCC logical-log stream.");
         }
-        if (prefixPageCount is { } selectedPages && selectedPages < header.DatabasePages)
-        {
-            throw new NotSupportedException(
-                $"Managed embedded replica prefix bootstrap selected {selectedPages} of {header.DatabasePages} pages. "
-                + "The managed pager has no lazy page-fault storage, so the replica cannot be opened safely. "
-                + "Increase the prefix to cover the complete database.");
-        }
+        var expectedPageCount = Math.Min(prefixPageCount ?? header.DatabasePages, header.DatabasePages);
+        var isPartial = expectedPageCount < header.DatabasePages;
 
         var databaseLength = checked((long)header.DatabasePages * PageSize);
         var receivedPages = new HashSet<ulong>();
@@ -952,8 +1126,11 @@ internal static class ManagedReplicaBootstrapper
             while (await reader.ReadAsync(MaxPageMessageLength, effectiveCancellationToken).ConfigureAwait(false) is { } pagePayload)
             {
                 var page = ParsePage(pagePayload);
-                if (page.PageId >= header.DatabasePages)
-                    throw new InvalidDataException("The pull-updates response contains a page outside the declared database size.");
+                if (page.PageId >= expectedPageCount)
+                {
+                    throw new InvalidDataException(
+                        "The pull-updates response contains a page outside the selected bootstrap range.");
+                }
                 if (!receivedPages.Add(page.PageId))
                     throw new InvalidDataException("The pull-updates response contains a duplicate page.");
 
@@ -961,14 +1138,22 @@ internal static class ManagedReplicaBootstrapper
                 await staging.WriteAsync(page.Data, effectiveCancellationToken).ConfigureAwait(false);
             }
 
-            if ((ulong)receivedPages.Count != header.DatabasePages)
-                throw new InvalidDataException("The pull-updates response did not contain every database page exactly once.");
+            if ((ulong)receivedPages.Count != expectedPageCount)
+            {
+                throw new InvalidDataException(
+                    "The pull-updates response did not contain every selected bootstrap page exactly once.");
+            }
 
             await staging.FlushAsync(effectiveCancellationToken).ConfigureAwait(false);
             staging.Flush(flushToDisk: true);
         }
 
-        return (header.Revision, header.Protocol);
+        return new InitialDownload(
+            header.Revision,
+            header.Protocol,
+            header.DatabasePages,
+            receivedPages.Order().ToArray(),
+            isPartial);
     }
 
     internal static async Task<ManagedReplicaPageBatch> FetchPagesAsync(
@@ -1057,7 +1242,7 @@ internal static class ManagedReplicaBootstrapper
     }
 
 
-    private static void ValidateStagedDatabase(string stagingPath)
+    private static void ValidateStagedDatabase(string stagingPath, bool allowMissingPages = false)
     {
         using (var stream = new FileStream(stagingPath, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
@@ -1066,6 +1251,9 @@ internal static class ManagedReplicaBootstrapper
             if (!header.SequenceEqual(SqliteHeader))
                 throw new InvalidDataException("The bootstrapped page stream does not contain a SQLite database header.");
         }
+
+        if (allowMissingPages)
+            return;
 
         using var database = ManagedDatabaseAdapter.Open(stagingPath);
         _ = database.Connect();
@@ -1589,6 +1777,55 @@ internal static class ManagedReplicaBootstrapper
             File.Delete(path);
     }
 
+    internal static BootstrapPublicationInfo GetBootstrapPublicationInfo(string databasePath)
+    {
+        var path = databasePath + BootstrapStateSuffix;
+        if (!File.Exists(path))
+            return new BootstrapPublicationInfo(
+                MarkerExists: false,
+                IsComplete: true,
+                RequiresPageState: false);
+
+        try
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            var status = BootstrapPublication.ReadStatus(stream);
+            return new BootstrapPublicationInfo(
+                MarkerExists: true,
+                IsComplete: status is BootstrapPublicationStatus.Complete
+                    or BootstrapPublicationStatus.CompletePartial,
+                RequiresPageState: status == BootstrapPublicationStatus.CompletePartial);
+        }
+        catch (IOException)
+        {
+            // The writer holds the bootstrap range lock, or publication was interrupted while
+            // the marker was being replaced. In either case no database may be opened yet.
+            return new BootstrapPublicationInfo(
+                MarkerExists: true,
+                IsComplete: false,
+                RequiresPageState: false);
+        }
+    }
+
+    internal static bool IsBootstrapPublicationComplete(string databasePath)
+        => GetBootstrapPublicationInfo(databasePath).IsComplete;
+
+    private static void MarkBootstrapPublicationFull(string databasePath)
+    {
+        using var publication = BootstrapPublication.Acquire(databasePath);
+        if (publication.RequiresRecovery)
+        {
+            throw new InvalidDataException(
+                "Managed replica bootstrap state became inconsistent while completing its partial image.");
+        }
+
+        publication.MarkComplete(isPartial: false);
+    }
+
     private static void DeleteStagingSidecars(string path)
     {
         DeleteIfExists(path + "-wal");
@@ -1722,14 +1959,23 @@ internal static class ManagedReplicaBootstrapper
     }
 
     /// <summary>Determines whether a bootstrapped managed embedded replica is present at
-    /// <paramref name="databasePath"/> using only local filesystem state (the database file and
-    /// its metadata sidecar) — never opens a connection or contacts the remote endpoint. Opening
+    /// <paramref name="databasePath"/> using only local filesystem state (the database file,
+    /// metadata sidecar, and optional lazy-page state) — never opens a connection or contacts the remote endpoint. Opening
     /// an embedded-replica connection when the local database is absent triggers a full remote
     /// bootstrap/download as a side effect, which existence checks must never do.</summary>
     internal static ManagedReplicaLocalState GetLocalState(string databasePath)
     {
         var databaseExists = File.Exists(databasePath);
         var metadataExists = File.Exists(databasePath + MetadataSuffix);
+        var pageStateExists = File.Exists(
+            databasePath + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+        var publication = GetBootstrapPublicationInfo(databasePath);
+        if (!publication.IsComplete
+            || publication.MarkerExists && !metadataExists
+            || publication.RequiresPageState && !pageStateExists)
+            return ManagedReplicaLocalState.Inconsistent;
+        if (pageStateExists && (!databaseExists || !metadataExists))
+            return ManagedReplicaLocalState.Inconsistent;
         if (databaseExists == metadataExists)
             return databaseExists ? ManagedReplicaLocalState.Present : ManagedReplicaLocalState.Absent;
 
@@ -1753,7 +1999,9 @@ internal static class ManagedReplicaBootstrapper
         databasePath + "-shm",
         databasePath + "-journal",
         databasePath + MetadataSuffix,
+        databasePath + BootstrapStateSuffix,
         databasePath + ManagedReplicaPageMaterializingFileSystem.StateSuffix,
+        databasePath + ManagedReplicaPageMaterializingFileSystem.OwnershipLockSuffix,
         databasePath + ManagedReplicaChangeJournal.Suffix,
     ];
 
@@ -1788,7 +2036,16 @@ internal static class ManagedReplicaBootstrapper
     }
 
     private static string ComputeDatabaseFingerprint(string path)
-        => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 128 * 1024,
+            FileOptions.SequentialScan);
+        return Convert.ToHexString(SHA256.HashData(stream));
+    }
 
     private static bool IsSha256Hex(string value)
         => value.Length == 64 && value.All(static c => c is >= '0' and <= '9' or >= 'A' and <= 'F');
@@ -1806,6 +2063,167 @@ internal static class ManagedReplicaBootstrapper
         string ClientId,
         RemotePullProtocol Protocol,
         IReadOnlyDictionary<ulong, string> TableNamesByStableId);
+
+    internal readonly record struct BootstrapPublicationInfo(
+        bool MarkerExists,
+        bool IsComplete,
+        bool RequiresPageState);
+
+    private enum BootstrapPublicationStatus
+    {
+        Empty,
+        InProgress,
+        Complete,
+        CompletePartial,
+    }
+
+    private sealed class BootstrapPublication : IDisposable
+    {
+        private const int RecordLength = 48;
+        private static readonly byte[] Magic = "AHTLBP01"u8.ToArray();
+
+        private readonly FileStream _stream;
+        private int _disposed;
+
+        private BootstrapPublication(
+            FileStream stream,
+            BootstrapPublicationStatus status,
+            bool requiresRecovery)
+        {
+            _stream = stream;
+            Status = status;
+            RequiresRecovery = requiresRecovery;
+        }
+
+        internal BootstrapPublicationStatus Status { get; private set; }
+
+        internal bool RequiresRecovery { get; }
+
+        internal static BootstrapPublication Acquire(string databasePath)
+        {
+            var path = databasePath + BootstrapStateSuffix;
+            FileStream? stream = null;
+            try
+            {
+                stream = new FileStream(
+                    path,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    bufferSize: 1,
+                    FileOptions.WriteThrough);
+                var status = ReadStatus(stream);
+                var completeLength = stream.Length / RecordLength * RecordLength;
+                if (stream.Length != completeLength)
+                {
+                    stream.SetLength(completeLength);
+                    stream.Flush(flushToDisk: true);
+                }
+                var databaseExists = File.Exists(databasePath);
+                var metadataExists = File.Exists(databasePath + MetadataSuffix);
+                var pageStateExists = File.Exists(
+                    databasePath + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+                var requiresRecovery = status == BootstrapPublicationStatus.InProgress
+                    || status == BootstrapPublicationStatus.Complete
+                    && (!databaseExists || !metadataExists)
+                    || status == BootstrapPublicationStatus.CompletePartial
+                    && (!databaseExists || !metadataExists || !pageStateExists)
+                    || status == BootstrapPublicationStatus.Empty
+                    && (databaseExists || metadataExists || pageStateExists);
+                var publication = new BootstrapPublication(stream, status, requiresRecovery);
+                stream = null;
+                return publication;
+            }
+            catch (IOException exception)
+            {
+                throw new IOException(
+                    "Managed embedded replica bootstrap is already being published by another process.",
+                    exception);
+            }
+            finally
+            {
+                stream?.Dispose();
+            }
+        }
+
+        internal void MarkInProgress()
+        {
+            ThrowIfDisposed();
+            _stream.SetLength(0);
+            WriteStatus(BootstrapPublicationStatus.InProgress);
+        }
+
+        internal void MarkComplete(bool isPartial)
+        {
+            ThrowIfDisposed();
+            WriteStatus(
+                isPartial
+                    ? BootstrapPublicationStatus.CompletePartial
+                    : BootstrapPublicationStatus.Complete);
+        }
+
+        internal static BootstrapPublicationStatus ReadStatus(Stream stream)
+        {
+            if (stream.Length == 0)
+                return BootstrapPublicationStatus.Empty;
+
+            var completeRecords = stream.Length / RecordLength;
+            if (completeRecords == 0)
+                return BootstrapPublicationStatus.InProgress;
+
+            var record = new byte[RecordLength];
+            Span<byte> expected = stackalloc byte[32];
+            var status = BootstrapPublicationStatus.Empty;
+            stream.Position = 0;
+            for (long index = 0; index < completeRecords; index++)
+            {
+                stream.ReadExactly(record);
+                if (!record.AsSpan(0, Magic.Length).SequenceEqual(Magic))
+                    throw new InvalidDataException("Managed replica bootstrap state has an invalid record.");
+                var parsed = BinaryPrimitives.ReadInt32LittleEndian(record.AsSpan(8));
+                if (parsed is not ((int)BootstrapPublicationStatus.InProgress)
+                    and not ((int)BootstrapPublicationStatus.Complete)
+                    and not ((int)BootstrapPublicationStatus.CompletePartial))
+                {
+                    throw new InvalidDataException("Managed replica bootstrap state has an invalid status.");
+                }
+
+                SHA256.HashData(record.AsSpan(0, 16), expected);
+                if (!CryptographicOperations.FixedTimeEquals(expected, record.AsSpan(16, 32)))
+                {
+                    throw new InvalidDataException(
+                        "Managed replica bootstrap state failed its integrity check.");
+                }
+
+                status = (BootstrapPublicationStatus)parsed;
+            }
+
+            return status;
+        }
+
+        private void WriteStatus(BootstrapPublicationStatus status)
+        {
+            var record = new byte[RecordLength];
+            Magic.CopyTo(record, 0);
+            BinaryPrimitives.WriteInt32LittleEndian(record.AsSpan(8), (int)status);
+            BinaryPrimitives.WriteInt32LittleEndian(record.AsSpan(12), RecordLength);
+            SHA256.HashData(record.AsSpan(0, 16), record.AsSpan(16, 32));
+            _stream.Position = _stream.Length;
+            _stream.Write(record);
+            _stream.Flush(flushToDisk: true);
+            Status = status;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                _stream.Dispose();
+        }
+
+        private void ThrowIfDisposed()
+            => ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+    }
+
     private enum PullStreamKind
     {
         Pages = 0,
@@ -1822,6 +2240,13 @@ internal static class ManagedReplicaBootstrapper
         string Format,
         bool CheckpointTransition,
         IReadOnlyList<ManagedReplicaLogicalLogRange> Ranges);
+
+    private readonly record struct InitialDownload(
+        string Revision,
+        RemotePullProtocol Protocol,
+        ulong DatabasePages,
+        IReadOnlyList<ulong> MaterializedPageIds,
+        bool IsPartial);
 
     private readonly record struct PullHeader(
         string Revision,

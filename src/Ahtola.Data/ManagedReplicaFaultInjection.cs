@@ -6,6 +6,7 @@ namespace Ahtola;
 internal enum ManagedReplicaDurableBoundary
 {
     BootstrapStagedDatabase,
+    BootstrapSafetyStatePublished,
     BootstrapDatabasePublished,
     IncrementalApplyStagedDatabase,
     IncrementalApplyDatabasePublished,
@@ -15,6 +16,9 @@ internal enum ManagedReplicaDurableBoundary
     LogicalApplyCommitted,
     LogicalApplyCheckpointed,
     LogicalApplyMetadataPublished,
+    PageMutationIntentPersisted,
+    PageMutationDatabasePersisted,
+    PartialImageCompletionStarted,
 }
 
 /// <summary>
