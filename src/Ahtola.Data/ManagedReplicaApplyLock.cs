@@ -36,14 +36,12 @@ internal interface IManagedReplicaApplyLockCoordinator
 
 /// <summary>
 /// Holds the <see cref="IManagedReplicaApplyLockCoordinator"/> used by
-/// <see cref="ManagedReplicaBootstrapper"/>. Defaults to the in-process gate. This indirection is
-/// the entire seam gap #9 (the cross-process DELETE-mode OS lock) needs: swap
-/// <see cref="Current"/> in one place once that lock exists, without touching any bootstrapper
-/// call site.
+/// <see cref="ManagedReplicaBootstrapper"/>.
 /// </summary>
 internal static class ManagedReplicaApplyLock
 {
-    private static IManagedReplicaApplyLockCoordinator _current = InProcessManagedReplicaApplyLockCoordinator.Instance;
+    internal const string CarrierSuffix = ".ahtola-replica-apply-lock";
+    private static IManagedReplicaApplyLockCoordinator _current = CrossProcessManagedReplicaApplyLockCoordinator.Instance;
 
     internal static IManagedReplicaApplyLockCoordinator Current
     {
@@ -53,6 +51,62 @@ internal static class ManagedReplicaApplyLock
 
     internal static ValueTask<IAsyncDisposable> AcquireExclusiveAsync(string path, CancellationToken cancellationToken)
         => Current.AcquireExclusiveAsync(path, cancellationToken);
+}
+
+internal sealed class CrossProcessManagedReplicaApplyLockCoordinator : IManagedReplicaApplyLockCoordinator
+{
+    internal static readonly CrossProcessManagedReplicaApplyLockCoordinator Instance = new();
+
+    public async ValueTask<IAsyncDisposable> AcquireExclusiveAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        var localLease = await InProcessManagedReplicaApplyLockCoordinator.Instance
+            .AcquireExclusiveAsync(path, cancellationToken)
+            .ConfigureAwait(false);
+        SqliteWalByteRangeLockLease? carrierLease = null;
+        try
+        {
+            var carrierPath = Path.GetFullPath(path) + ManagedReplicaApplyLock.CarrierSuffix;
+            using (File.Open(
+                       carrierPath,
+                       FileMode.OpenOrCreate,
+                       FileAccess.ReadWrite,
+                       FileShare.ReadWrite | FileShare.Delete))
+            {
+            }
+
+            carrierLease = new SqliteWalByteRangeLock(carrierPath).AcquireExclusive(
+                offset: 0,
+                length: 1,
+                Timeout.InfiniteTimeSpan,
+                cancellationToken);
+
+            return new Lease(localLease, carrierLease);
+        }
+        catch
+        {
+            carrierLease?.Dispose();
+            await localLease.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private sealed class Lease(
+        IAsyncDisposable localLease,
+        SqliteWalByteRangeLockLease carrierLease) : IAsyncDisposable
+    {
+        private IAsyncDisposable? _localLease = localLease;
+        private SqliteWalByteRangeLockLease? _carrierLease = carrierLease;
+
+        public async ValueTask DisposeAsync()
+        {
+            Interlocked.Exchange(ref _carrierLease, null)?.Dispose();
+            var local = Interlocked.Exchange(ref _localLease, null);
+            if (local is not null)
+                await local.DisposeAsync().ConfigureAwait(false);
+        }
+    }
 }
 
 /// <summary>

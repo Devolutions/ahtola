@@ -4436,6 +4436,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                      path + "-journal",
                      path + ".ahtola-replica-meta",
                      path + ManagedReplicaChangeJournal.Suffix,
+                     path + ManagedReplicaApplyLock.CarrierSuffix,
                  })
         {
             if (File.Exists(file))
