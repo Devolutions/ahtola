@@ -11,6 +11,7 @@ namespace Ahtola;
 internal sealed class ManagedReplicaConnectionHost : IDisposable
 {
     private IManagedDatabaseAdapter? _database;
+    private AhtolaEncryptionFileSystem? _encryptionFileSystem;
     private ManagedReplicaBootstrapper.ManagedReplicaMetadata? _metadata;
     private readonly AhtolaReplicaOptions _options;
     private readonly ManagedReplicaSyncRegistry.Entry _syncEntry;
@@ -26,12 +27,14 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
 
     private ManagedReplicaConnectionHost(
         IManagedDatabaseAdapter database,
+        AhtolaEncryptionFileSystem? encryptionFileSystem,
         ManagedReplicaBootstrapper.ManagedReplicaMetadata? metadata,
         AhtolaReplicaOptions options,
         ManagedReplicaChangeJournal changeJournal,
         ManagedReplicaSyncRegistry.Entry syncEntry)
     {
         _database = database;
+        _encryptionFileSystem = encryptionFileSystem;
         _metadata = metadata;
         _options = options;
         _changeJournal = changeJournal;
@@ -268,12 +271,13 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         AhtolaReplicaOptions options,
         ManagedReplicaSyncRegistry.Entry syncEntry)
     {
-        var database = OpenDatabase(options.Path);
+        var (database, encryptionFileSystem) = OpenDatabase(options);
         try
         {
             _ = database.Connect();
             return new ManagedReplicaConnectionHost(
                 database,
+                encryptionFileSystem,
                 ManagedReplicaBootstrapper.LoadMetadata(options.Path),
                 options,
                 ManagedReplicaChangeJournal.Open(options.Path),
@@ -283,21 +287,30 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         catch
         {
             database.Dispose();
+            encryptionFileSystem?.Dispose();
             throw;
         }
     }
 
-    private static IManagedDatabaseAdapter OpenDatabase(string path)
+    /// <summary>
+    /// Opens the managed database at <paramref name="options"/>'s path, wiring in remote
+    /// encryption (see <see cref="ManagedReplicaEncryption.OpenDatabase"/>) when configured. The
+    /// returned file system, if any, must be kept alive and disposed alongside the database for
+    /// as long as it remains open -- it is consulted on every subsequent page read/write, not
+    /// only at open time.
+    /// </summary>
+    private static (IManagedDatabaseAdapter Database, AhtolaEncryptionFileSystem? FileSystem) OpenDatabase(
+        AhtolaReplicaOptions options)
     {
-        var database = ManagedDatabaseAdapter.Open(path);
+        var opened = ManagedReplicaEncryption.OpenDatabase(options.Path, options.RemoteEncryption);
         try
         {
-            _ = database.Connect();
-            return database;
+            _ = opened.Database.Connect();
+            return (opened.Database, opened.FileSystem);
         }
         catch
         {
-            database.Dispose();
+            opened.Dispose();
             throw;
         }
     }
@@ -460,6 +473,8 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             ReleaseSqlTransactionOperation();
             var database = Interlocked.Exchange(ref _database, null);
             database?.Dispose();
+            var encryptionFileSystem = Interlocked.Exchange(ref _encryptionFileSystem, null);
+            encryptionFileSystem?.Dispose();
         }
         finally
         {
@@ -473,11 +488,12 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var database = Interlocked.Exchange(ref _database, null)
             ?? throw new ObjectDisposedException(nameof(ManagedReplicaConnectionHost));
         database.Dispose();
+        Interlocked.Exchange(ref _encryptionFileSystem, null)?.Dispose();
     }
 
     internal void ReopenAfterPublication()
     {
-        var database = OpenDatabase(_options.Path);
+        var (database, encryptionFileSystem) = OpenDatabase(_options);
         try
         {
             var changeJournal = ManagedReplicaChangeJournal.Open(_options.Path);
@@ -485,11 +501,14 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             if (Interlocked.CompareExchange(ref _database, database, null) is not null)
                 throw new InvalidOperationException("Managed embedded replica host reopened more than once.");
             _changeJournal = changeJournal;
+            _encryptionFileSystem = encryptionFileSystem;
             database = null!;
+            encryptionFileSystem = null;
         }
         finally
         {
             database?.Dispose();
+            encryptionFileSystem?.Dispose();
         }
     }
 

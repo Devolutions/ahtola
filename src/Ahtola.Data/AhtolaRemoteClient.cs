@@ -8,7 +8,12 @@ namespace Ahtola;
 
 internal sealed partial class AhtolaRemoteClient : IDisposable
 {
-    private const string EncryptionKeyHeaderName = "x-turso-encryption-key";
+    /// <summary>
+    /// HTTP header used to convey the remote encryption key alongside a push/pull request. Also
+    /// used by <see cref="ManagedReplicaBootstrapper"/>'s raw HTTP bootstrap/pull requests so both
+    /// paths speak the identical remote-encryption wire protocol.
+    /// </summary>
+    internal const string EncryptionKeyHeaderName = "x-turso-encryption-key";
 
     private readonly HttpClient _httpClient;
     private readonly string? _authToken;
