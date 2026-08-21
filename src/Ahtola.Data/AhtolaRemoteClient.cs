@@ -210,7 +210,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         {
             Requests = [RemoteStreamRequest.Batch(new RemoteBatch { Steps = steps })],
         };
-        var response = await SendPipelineAsync(request, commandTimeout, cancellationToken).ConfigureAwait(false);
+        var response = await SendPipelineAsync(request, commandTimeout, cancellationToken, replicaPush: true).ConfigureAwait(false);
         UpdateSession(response, closeAfter: false);
 
         var succeeded = new bool[steps.Count];
@@ -223,10 +223,10 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         foreach (var step in replayedChangeSteps)
         {
             if (!succeeded[step])
-                throw new AhtolaException("Remote replica push skipped a local change.");
+                throw new AhtolaException("Remote replica push skipped a local change.", AhtolaReplicaPushFailureKind.InvalidLocalState);
         }
         if (!succeeded[watermarkStep] || !succeeded[commitStep])
-            throw new AhtolaException("Remote replica push did not commit its acknowledgement watermark.");
+            throw new AhtolaException("Remote replica push did not commit its acknowledgement watermark.", AhtolaReplicaPushFailureKind.InvalidLocalState);
     }
 
     public async Task CloseAsync(int commandTimeout, CancellationToken cancellationToken)
@@ -255,7 +255,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
     private async Task<RemotePipelineResponse> SendPipelineAsync(
         RemotePipelineRequest request,
         int commandTimeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool replicaPush = false)
     {
         using var timeout = CreateTimeout(commandTimeout, cancellationToken);
         var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
@@ -286,7 +287,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                     $"Remote replica push conflicted with HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {body}");
             throw new AhtolaException(
                 $"Remote request failed with HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {body}",
-                response.StatusCode);
+                response.StatusCode,
+                replicaPush);
         }
 
         try
@@ -553,7 +555,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         if (batch.StepErrors.Count != expectedCount || batch.StepResults.Count != expectedCount)
         {
             throw new AhtolaException(
-                $"Remote batch returned an unexpected result shape: {batch.StepResults.Count} results, {batch.StepErrors.Count} errors, expected {expectedCount}.");
+                $"Remote batch returned an unexpected result shape: {batch.StepResults.Count} results, {batch.StepErrors.Count} errors, expected {expectedCount}.",
+                replicaPush ? AhtolaReplicaPushFailureKind.InvalidLocalState : (AhtolaReplicaPushFailureKind?)null);
         }
 
         for (var i = 0; i < batch.StepErrors.Count; i++)
@@ -615,8 +618,9 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         AhtolaReplicaConflictKind conflictKind = AhtolaReplicaConflictKind.Unknown,
         long? localChangeSequence = null)
     {
+        var invalidLocalState = replicaPush ? AhtolaReplicaPushFailureKind.InvalidLocalState : (AhtolaReplicaPushFailureKind?)null;
         if (error is null)
-            return new AhtolaRemoteSqlException("Remote SQL execution failed.", null, null);
+            return new AhtolaRemoteSqlException("Remote SQL execution failed.", null, null, invalidLocalState);
 
         if (replicaPush && IsConflict(error))
         {
@@ -630,7 +634,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         var message = string.IsNullOrWhiteSpace(error.Code)
             ? $"Remote SQL execution failed: {error.Message}"
             : $"Remote SQL execution failed: {error.Message} ({error.Code})";
-        return new AhtolaRemoteSqlException(message, error.Code, error.Message);
+        return new AhtolaRemoteSqlException(message, error.Code, error.Message, invalidLocalState);
     }
 
     private static bool IsConflict(RemoteError error)
@@ -905,8 +909,12 @@ internal sealed class RemoteError
 
 internal sealed class AhtolaRemoteSqlException : AhtolaException
 {
-    public AhtolaRemoteSqlException(string message, string? remoteErrorCode, string? remoteErrorMessage)
-        : base(message)
+    public AhtolaRemoteSqlException(
+        string message,
+        string? remoteErrorCode,
+        string? remoteErrorMessage,
+        AhtolaReplicaPushFailureKind? replicaPushFailureKind = null)
+        : base(message, replicaPushFailureKind)
     {
         RemoteErrorCode = remoteErrorCode;
         RemoteErrorMessage = remoteErrorMessage;

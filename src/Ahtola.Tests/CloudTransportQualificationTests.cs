@@ -59,6 +59,59 @@ public sealed class CloudTransportQualificationTests
     }
 
     [Test]
+    public void ReplicaPushFailureClassifyRecognizesConflictExceptionsRegardlessOfHttpStatus()
+    {
+        AhtolaReplicaPushFailure.Classify(new AhtolaReplicaConflictException("row conflict"))
+            .Should().Be(AhtolaReplicaPushFailureKind.Conflict);
+        AhtolaReplicaPushFailure.Classify(
+                new AhtolaReplicaConflictException("HTTP conflict", remoteErrorCode: "SQLITE_CONSTRAINT"))
+            .Should().Be(AhtolaReplicaPushFailureKind.Conflict);
+    }
+
+    [TestCase(HttpStatusCode.RequestTimeout, AhtolaReplicaPushFailureKind.TransientTransport)]
+    [TestCase(HttpStatusCode.TooManyRequests, AhtolaReplicaPushFailureKind.TransientTransport)]
+    [TestCase(HttpStatusCode.InternalServerError, AhtolaReplicaPushFailureKind.TransientTransport)]
+    [TestCase(HttpStatusCode.BadRequest, AhtolaReplicaPushFailureKind.InvalidLocalState)]
+    [TestCase(HttpStatusCode.Unauthorized, AhtolaReplicaPushFailureKind.InvalidLocalState)]
+    public void ReplicaPushFailureClassifyMapsHttpStatusesConsistentlyForBothExceptionShapes(
+        HttpStatusCode statusCode,
+        AhtolaReplicaPushFailureKind expectedKind)
+    {
+        AhtolaReplicaPushFailure.Classify(new AhtolaException("HTTP failure", statusCode, replicaPush: true))
+            .Should().Be(expectedKind);
+        AhtolaReplicaPushFailure.Classify(new HttpRequestException("HTTP failure", inner: null, statusCode))
+            .Should().Be(expectedKind);
+    }
+
+    [Test]
+    public void ReplicaPushFailureClassifyTreatsCancellationAndNoResponseTransportFailuresAsTransient()
+    {
+        AhtolaReplicaPushFailure.Classify(new TaskCanceledException())
+            .Should().Be(AhtolaReplicaPushFailureKind.TransientTransport);
+        AhtolaReplicaPushFailure.Classify(new OperationCanceledException())
+            .Should().Be(AhtolaReplicaPushFailureKind.TransientTransport);
+        AhtolaReplicaPushFailure.Classify(new HttpRequestException("connection reset"))
+            .Should().Be(AhtolaReplicaPushFailureKind.TransientTransport);
+    }
+
+    [Test]
+    public void ReplicaPushFailureClassifyTreatsUnrecognizedAndProtocolFailuresAsInvalidLocalState()
+    {
+        AhtolaReplicaPushFailure.Classify(new InvalidDataException("malformed pull stream"))
+            .Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+        AhtolaReplicaPushFailure.Classify(new AhtolaException("plain failure"))
+            .Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+        AhtolaReplicaPushFailure.Classify(new InvalidOperationException("unexpected"))
+            .Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+    }
+
+    [Test]
+    public void ReplicaPushFailureClassifyRejectsNullException()
+    {
+        Assert.Throws<ArgumentNullException>(() => AhtolaReplicaPushFailure.Classify(null!));
+    }
+
+    [Test]
     public async Task RemotePipelineHonorsAResponseBaseUrl()
     {
         using var handler = new BaseUrlHandler();
