@@ -362,21 +362,20 @@ internal static class ManagedReplicaBootstrapper
         var payload = CreatePullRequest(metadata.Revision, options.LongPollTimeout, requestLogical);
         using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
         using var scope = options.EnterApplicationHttpScope();
-        using var client = options.HttpPolicy.MessageHandler is { } handler ? new HttpClient(handler, false) : new HttpClient();
+        using var client = options.HttpPolicy.CreateHttpClient(options.RemoteEncryption is not null);
         client.Timeout = Timeout.InfiniteTimeSpan;
-        using var request = new HttpRequestMessage(HttpMethod.Post, CreatePullUpdatesUri(options.RemoteUri))
-        {
-            Content = new ByteArrayContent(payload),
-        };
-        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
-        request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
         var token = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
-        if (token is not null)
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        if (options.RemoteEncryption is { } remoteEncryption)
-            request.Headers.TryAddWithoutValidation(AhtolaRemoteClient.EncryptionKeyHeaderName, remoteEncryption.Base64Key);
         var effectiveToken = timeout?.Token ?? cancellationToken;
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, effectiveToken).ConfigureAwait(false);
+        using var response = await AhtolaRemoteTransportSecurity
+            .SendAsync(
+                client,
+                CreatePullUpdatesUri(options.RemoteUri),
+                requestUri => CreatePullUpdatesHttpRequest(requestUri, payload, token, options.RemoteEncryption),
+                token,
+                remoteEncryptionConfigured: options.RemoteEncryption is not null,
+                HttpCompletionOption.ResponseHeadersRead,
+                effectiveToken)
+            .ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync(effectiveToken).ConfigureAwait(false);
         var reader = new DelimitedProtobufReader(stream);
@@ -910,24 +909,24 @@ internal static class ManagedReplicaBootstrapper
         using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
         var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
         using var scope = options.EnterApplicationHttpScope();
-        using var client = options.HttpPolicy.MessageHandler is { } handler
-            ? new HttpClient(handler, disposeHandler: false)
-            : new HttpClient();
+        using var client = options.HttpPolicy.CreateHttpClient(options.RemoteEncryption is not null);
         client.Timeout = Timeout.InfiniteTimeSpan;
-        using var request = new HttpRequestMessage(HttpMethod.Post, CreatePullUpdatesUri(options.RemoteUri));
-        request.Content = new ByteArrayContent(CreateInitialPullRequest(options.LongPollTimeout));
-        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
-        request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
+        var payload = CreateInitialPullRequest(options.LongPollTimeout);
         var authToken = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
-        if (authToken is not null)
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
-        if (options.RemoteEncryption is { } remoteEncryption)
-            request.Headers.TryAddWithoutValidation(AhtolaRemoteClient.EncryptionKeyHeaderName, remoteEncryption.Base64Key);
-
-        using var response = await client.SendAsync(
-            request,
-            HttpCompletionOption.ResponseHeadersRead,
-            effectiveCancellationToken).ConfigureAwait(false);
+        using var response = await AhtolaRemoteTransportSecurity
+            .SendAsync(
+                client,
+                CreatePullUpdatesUri(options.RemoteUri),
+                requestUri => CreatePullUpdatesHttpRequest(
+                    requestUri,
+                    payload,
+                    authToken,
+                    options.RemoteEncryption),
+                authToken,
+                remoteEncryptionConfigured: options.RemoteEncryption is not null,
+                HttpCompletionOption.ResponseHeadersRead,
+                effectiveCancellationToken)
+            .ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
 
         await using var stream = await response.Content.ReadAsStreamAsync(effectiveCancellationToken).ConfigureAwait(false);
@@ -1325,6 +1324,30 @@ internal static class ManagedReplicaBootstrapper
         var source = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         source.CancelAfter(timeout);
         return source;
+    }
+
+    private static HttpRequestMessage CreatePullUpdatesHttpRequest(
+        Uri requestUri,
+        byte[] payload,
+        string? authToken,
+        AhtolaRemoteEncryptionOptions? remoteEncryption)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
+        {
+            Content = new ByteArrayContent(payload),
+        };
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
+        request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
+        if (authToken is not null)
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+        if (remoteEncryption is not null)
+        {
+            request.Headers.TryAddWithoutValidation(
+                AhtolaRemoteClient.EncryptionKeyHeaderName,
+                remoteEncryption.Base64Key);
+        }
+
+        return request;
     }
 
     private static void DeleteIfExists(string path)

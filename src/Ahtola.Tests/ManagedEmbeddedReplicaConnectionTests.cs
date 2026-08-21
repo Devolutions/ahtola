@@ -3518,7 +3518,10 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             LongPollTimeout = TimeSpan.FromSeconds(3),
             SyncInterval = syncInterval,
             PushOperationsThreshold = pushOperationsThreshold,
-            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler)
+            {
+                MessageHandlerDisablesAutomaticRedirects = true,
+            },
         };
 
     private static AhtolaReplicaOptions CreateUnsupportedOptions(
@@ -3607,7 +3610,10 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         => new(path, new Uri("https://example.test/cluster"), authToken: "token-42")
         {
             LongPollTimeout = TimeSpan.FromSeconds(3),
-            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler)
+            {
+                MessageHandlerDisablesAutomaticRedirects = true,
+            },
             RemoteEncryption = new AhtolaRemoteEncryptionOptions(
                 Convert.ToBase64String(Convert.FromHexString(hexKey)), cipher),
         };

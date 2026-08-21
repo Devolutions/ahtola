@@ -138,9 +138,13 @@ public sealed class AhtolaReplicaOptions
 
     internal void Validate()
     {
+        ArgumentNullException.ThrowIfNull(HttpPolicy);
         AhtolaRemoteTransportSecurity.Validate(
             RemoteUri,
             AuthToken,
+            remoteEncryptionConfigured: RemoteEncryption is not null);
+        AhtolaRemoteTransportSecurity.ValidateRedirectContract(
+            HttpPolicy.MessageHandler is null || HttpPolicy.MessageHandlerDisablesAutomaticRedirects,
             remoteEncryptionConfigured: RemoteEncryption is not null);
 
         if (LongPollTimeout is { } longPollTimeout
@@ -176,8 +180,6 @@ public sealed class AhtolaReplicaOptions
             throw new InvalidOperationException(
                 "PullBytesThreshold cannot be combined with query partial bootstrap because the server selects the query page set.");
         }
-        ArgumentNullException.ThrowIfNull(HttpPolicy);
-        ArgumentNullException.ThrowIfNull(HttpPolicy);
     }
 
     private static Uri NormalizeRemoteUri(Uri remoteUri)
