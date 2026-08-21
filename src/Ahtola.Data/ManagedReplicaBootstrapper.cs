@@ -371,7 +371,6 @@ internal static class ManagedReplicaBootstrapper
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
         request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
         var token = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
-        ValidateAuthTokenTransport(request.RequestUri!, token);
         if (token is not null)
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         if (options.RemoteEncryption is { } remoteEncryption)
@@ -919,9 +918,7 @@ internal static class ManagedReplicaBootstrapper
         request.Content = new ByteArrayContent(CreateInitialPullRequest(options.LongPollTimeout));
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
         request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
-
         var authToken = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
-        ValidateAuthTokenTransport(request.RequestUri!, authToken);
         if (authToken is not null)
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
         if (options.RemoteEncryption is { } remoteEncryption)
@@ -1328,18 +1325,6 @@ internal static class ManagedReplicaBootstrapper
         var source = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         source.CancelAfter(timeout);
         return source;
-    }
-
-    private static void ValidateAuthTokenTransport(Uri endpoint, string? authToken)
-    {
-        if (authToken is null
-            || endpoint.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
-            || endpoint.IsLoopback)
-        {
-            return;
-        }
-
-        throw new InvalidOperationException("Auth Token requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
     }
 
     private static void DeleteIfExists(string path)

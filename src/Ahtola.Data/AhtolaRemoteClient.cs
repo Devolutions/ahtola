@@ -45,7 +45,10 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         _pipelineUri = CreatePipelineUri(endpoint);
         _authToken = string.IsNullOrWhiteSpace(authToken) ? null : authToken;
         _remoteEncryptionKey = remoteEncryption?.Base64Key;
-        ValidateAuthTokenTransport(_pipelineUri, _authToken);
+        AhtolaRemoteTransportSecurity.Validate(
+            _pipelineUri,
+            _authToken,
+            remoteEncryptionConfigured: _remoteEncryptionKey is not null);
         _disposeHttpClient = disposeHttpClient;
     }
 
@@ -328,18 +331,6 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         {
             throw new AhtolaException($"Unable to parse remote response: {ex.Message}");
         }
-    }
-
-    private static void ValidateAuthTokenTransport(Uri endpoint, string? authToken)
-    {
-        if (authToken is null
-            || endpoint.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
-            || endpoint.IsLoopback)
-        {
-            return;
-        }
-
-        throw new InvalidOperationException("Auth Token requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
     }
 
     private static RemoteStatement BuildStatement(string sql, AhtolaParameterCollection parameters, bool wantRows)
@@ -652,7 +643,10 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         if (!string.IsNullOrWhiteSpace(response.BaseUrl))
         {
             var pipelineUri = CreatePipelineUri(new Uri(_pipelineUri, response.BaseUrl));
-            ValidateAuthTokenTransport(pipelineUri, _authToken);
+            AhtolaRemoteTransportSecurity.Validate(
+                pipelineUri,
+                _authToken,
+                remoteEncryptionConfigured: _remoteEncryptionKey is not null);
             _pipelineUri = pipelineUri;
         }
 

@@ -138,6 +138,11 @@ public sealed class AhtolaReplicaOptions
 
     internal void Validate()
     {
+        AhtolaRemoteTransportSecurity.Validate(
+            RemoteUri,
+            AuthToken,
+            remoteEncryptionConfigured: RemoteEncryption is not null);
+
         if (LongPollTimeout is { } longPollTimeout
             && (longPollTimeout < TimeSpan.FromMilliseconds(1)
                 || longPollTimeout.TotalMilliseconds > int.MaxValue))

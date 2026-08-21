@@ -2185,6 +2185,63 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public async Task ReplicaEntryPointsRejectRemoteEncryptionOverNonLoopbackHttpBeforeRequestOrLocalMutation()
+    {
+        var path = NewReplicaPath("managed-replica-encryption-plaintext-http");
+        var handler = new PullUpdatesHandler(CreatePullResponse("unused", new byte[4096]));
+        var options = new AhtolaReplicaOptions(
+            path,
+            new Uri("http://database.example/cluster"),
+            authToken: null)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+            RemoteEncryption = new AhtolaRemoteEncryptionOptions(
+                Convert.ToBase64String(Convert.FromHexString(ReplicaEncryptionKeyHex)),
+                AhtolaRemoteEncryptionCipher.Aes256Gcm),
+        };
+
+        try
+        {
+            var action = () => AhtolaConnection.CreateReplica(options);
+
+            action.Should().Throw<InvalidOperationException>()
+                .WithMessage(
+                    "Remote encryption requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
+
+            Func<Task> bootstrap = () => ManagedReplicaBootstrapper.BootstrapAsync(
+                options,
+                CancellationToken.None);
+            await bootstrap.Should().ThrowAsync<InvalidOperationException>()
+                .WithMessage(
+                    "Remote encryption requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
+
+            var metadata = new ManagedReplicaBootstrapper.ManagedReplicaMetadata(
+                "revision-42",
+                "unused",
+                "client-42",
+                RemotePullProtocol.Pages,
+                new Dictionary<ulong, string>());
+            Func<Task> incrementalPull = () => ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                options,
+                metadata,
+                new AhtolaSyncOptions(),
+                CancellationToken.None);
+            await incrementalPull.Should().ThrowAsync<InvalidOperationException>()
+                .WithMessage(
+                    "Remote encryption requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
+
+            handler.CallCount.Should().Be(0);
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+            File.Exists(path + ManagedReplicaChangeJournal.Suffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public void CreateReplicaBootstrapsAnEncryptedRemoteDatabaseWithNonzeroReservedBytes()
     {
         // The source database is genuinely AES-256-GCM encrypted (28 reserved bytes per page;
