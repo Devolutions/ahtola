@@ -657,8 +657,14 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         AhtolaSyncOptions syncOptions,
         CancellationToken cancellationToken)
     {
+        if (metadata.JournalBaseWatermark < _changeJournal.RetentionBase)
+            metadata = metadata with { JournalBaseWatermark = _changeJournal.RetentionBase };
+        metadata = ManagedReplicaBootstrapper.EnsureLegacyRemoteBaseSnapshot(
+            replicaOptions.Path,
+            metadata);
         metadata = ManagedReplicaRevertWal.PrepareSynchronization(replicaOptions.Path, metadata);
-        var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0;
+        var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0
+            || _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark).Count != 0;
         var retainedMaterializer = _materializationLease?.FileSystem;
         var push = await PushLocalChangesAsync(
                 replicaOptions,
@@ -707,10 +713,13 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     {
         try
         {
+            // An explicit SQL transaction already owns a long-lived local-operation lease.
+            // Release it before waiting for a new disposal lease, otherwise a pending
+            // publication waits for the transaction while blocking this acquisition forever.
+            ReleaseSqlTransactionOperation();
             using var operation = EnterLocalOperation(CancellationToken.None);
             _syncEntry.Unregister(this);
             Interlocked.Exchange(ref _connection, null);
-            ReleaseSqlTransactionOperation();
             var database = Interlocked.Exchange(ref _database, null);
             try
             {

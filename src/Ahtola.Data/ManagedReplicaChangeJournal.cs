@@ -125,6 +125,15 @@ internal sealed class ManagedReplicaChangeJournal
         return new ManagedReplicaChangeJournal(path, sequence, watermark, changes);
     }
 
+    internal long RetentionBase
+    {
+        get
+        {
+            lock (_gate)
+                return _changes.Count == 0 ? _watermark : Math.Min(_changes[0].Sequence, _watermark);
+        }
+    }
+
     public ReplicaLocalChangeBatch ReadBatch(int maximumChanges)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumChanges);

@@ -296,6 +296,29 @@ internal static class ManagedReplicaBootstrapper
         };
     }
 
+    internal static ManagedReplicaMetadata EnsureLegacyRemoteBaseSnapshot(
+        string databasePath,
+        ManagedReplicaMetadata metadata)
+    {
+        var snapshotPath = databasePath + BaseSnapshotSuffix;
+        if (File.Exists(snapshotPath))
+            return metadata;
+
+        var fingerprint = ComputeDatabaseFingerprint(databasePath);
+        var expected = string.IsNullOrEmpty(metadata.RemoteBaseSha256)
+            ? metadata.DatabaseSha256
+            : metadata.RemoteBaseSha256;
+        if (!string.Equals(fingerprint, expected, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                "Legacy managed replica metadata has no remote-base snapshot and the main file "
+                + "has already diverged; a fresh bootstrap is required.");
+        }
+
+        CopyFileDurably(databasePath, snapshotPath);
+        return metadata with { RemoteBaseSha256 = fingerprint };
+    }
+
     private static ManagedReplicaMetadata LoadV2Metadata(Dictionary<string, string> values)
     {
         if (!values.TryGetValue("server_revision_base64", out var encodedRevision)
@@ -1218,6 +1241,7 @@ internal static class ManagedReplicaBootstrapper
             CancellationToken cancellationToken)
     {
         RejectIfLocalSchemaChangesConflictWithRemoteChanges(pendingLocalChanges);
+        var pendingAddColumns = ManagedReplicaLogicalReplayer.CollectPendingAddColumns(pendingLocalChanges);
         IReadOnlyList<ManagedReplicaCapturedLocalRowChange> capturedLocalChanges;
         using (var database = ManagedDatabaseAdapter.Open(options.Path))
         {
@@ -1257,7 +1281,8 @@ internal static class ManagedReplicaBootstrapper
                         transactions,
                         metadata.TableNamesByStableId,
                         metadata.ClientId,
-                        cancellationToken);
+                        cancellationToken,
+                        pendingAddColumns);
                     operationCount = applied.OperationCount;
                     tableNamesByStableId = applied.TableNamesByStableId;
                     ExecuteNonQuery(connection, "COMMIT");
@@ -1476,19 +1501,6 @@ internal static class ManagedReplicaBootstrapper
         try
         {
             var fingerprint = ComputeDatabaseFingerprint(options.Path);
-            await WriteMetadataAsync(
-                    stagingPath,
-                    metadataPath,
-                    metadata.Revision,
-                    fingerprint,
-                    metadata.Protocol,
-                    metadata.TableNamesByStableId,
-                    cancellationToken,
-                    replaceExisting: true,
-                    clientId: metadata.ClientId,
-                    journalBaseWatermark: metadata.JournalBaseWatermark,
-                    remoteBaseSha256: metadata.RemoteBaseSha256)
-                .ConfigureAwait(false);
             if (File.Exists(statePath))
             {
                 if (retainedMaterializer is not null)
@@ -1506,6 +1518,20 @@ internal static class ManagedReplicaBootstrapper
                     fileSystem.MarkLocalMutationsPushed();
                 }
             }
+
+            await WriteMetadataAsync(
+                    stagingPath,
+                    metadataPath,
+                    metadata.Revision,
+                    fingerprint,
+                    metadata.Protocol,
+                    metadata.TableNamesByStableId,
+                    cancellationToken,
+                    replaceExisting: true,
+                    clientId: metadata.ClientId,
+                    journalBaseWatermark: metadata.JournalBaseWatermark,
+                    remoteBaseSha256: metadata.RemoteBaseSha256)
+                .ConfigureAwait(false);
             var updated = metadata with
             {
                 DatabaseSha256 = fingerprint,
@@ -1653,9 +1679,11 @@ internal static class ManagedReplicaBootstrapper
             if (header.ApplyMode == PullApplyMode.ReplaceBase && pendingLocalChanges.Count > 0)
             {
                 File.Copy(stagingPath, protectedStagingPath, overwrite: false);
-                using (var database = ManagedDatabaseAdapter.Open(protectedStagingPath))
+                using (var opened = ManagedReplicaEncryption.OpenDatabase(
+                           protectedStagingPath,
+                           options.RemoteEncryption))
                 {
-                    var connection = database.Connect();
+                    var connection = opened.Database.Connect();
                     ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
                     try
                     {
@@ -1679,7 +1707,9 @@ internal static class ManagedReplicaBootstrapper
                     Revision = header.Revision,
                     DatabaseSha256 = ComputeDatabaseFingerprint(protectedStagingPath),
                     Protocol = header.Protocol,
-                    TableNamesByStableId = RebuildTableMapFromSchema(protectedStagingPath),
+                    TableNamesByStableId = RebuildTableMapFromSchema(
+                        protectedStagingPath,
+                        options.RemoteEncryption),
                     RevertState = null,
                     JournalBaseWatermark = AdvanceJournalBaseWatermark(metadata, acknowledgedLocalChanges),
                     RemoteBaseSha256 = ComputeDatabaseFingerprint(stagingPath),

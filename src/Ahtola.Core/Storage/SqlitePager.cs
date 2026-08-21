@@ -4156,16 +4156,22 @@ public sealed class SqlitePager : IDisposable
             return;
 
         var requiresMaterialization = false;
-        using (var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(null), IsReadOnly))
+        var readerLock = EnterReadLocks(ResolveBusyTimeout(null), out var mainFileLock);
+        try
         {
             lock (_gate)
             {
                 ThrowIfNotReadable();
-                SynchronizeCommittedView();
+                SynchronizeCommittedView(mainFileLock);
                 ValidateVisiblePageNumber(pageNumber);
                 requiresMaterialization = !_walPageOverlay.ContainsKey(pageNumber)
                     && pageNumber <= _pageStore.PageCount;
             }
+        }
+        finally
+        {
+            mainFileLock?.Dispose();
+            readerLock.Dispose();
         }
 
         if (requiresMaterialization)
