@@ -9,12 +9,14 @@ managed-only WAL dialect.
 **Status today: Stages 1–6 core attached, including live multi-engine WAL.**
 Physical pagers publish a real WAL-index, pin read marks, checkpoint under
 `WAL_CKPT_LOCK`, use SQLite busy backoff, recover with `iChange` bumps, and hold
-a Stage 6 **main-file SHARED** lock (not exclusive 512-byte ownership). Managed
-and stock SQLite can share one live WAL database: shared `-shm` DMS, peer writers
-without `IOERR`, and long-lived managed connections refresh heap catalogs from
-peer WAL growth on new statements. Remaining polish: PENDING/RESERVED writer
-upgrades for DELETE-mode parity, last-connection `-shm` unlink/heap fallback, and
-expanded Turso binary differential stress. An explicit
+a Stage 6 SQLite-compatible **main-file lock**. Rollback-journal pagers now use
+SHARED, RESERVED, PENDING, and EXCLUSIVE at SQLite transaction boundaries;
+WAL pagers retain their lifetime SHARED lock and continue to coordinate writers
+and checkpoints through `-shm`. Managed and stock SQLite can share one live WAL
+or DELETE-mode database without `IOERR`, and long-lived managed connections
+refresh their committed view from peer changes on new statements. Remaining
+polish is last-connection `-shm` unlink/heap fallback and expanded Turso binary
+differential stress. An explicit
 `Foreign Read Only=True` connection may still read without main-file locks
 (§1.9).
 
@@ -33,36 +35,44 @@ upstream Turso / `tursodb` tree (SQLite-compatible WAL-index and lock bytes).
 
 ## 1. The current contract
 
-### 1.1 Main-file client ownership
+### 1.1 Main-file lock protocol
 
 `SqliteManagedFileOwnership`, brokered per canonical path by
-`SqliteManagedFileOwnershipRegistry`.
+`SqliteManagedFileOwnershipRegistry`, is now a lock broker rather than an
+exclusive ownership boundary.
 
 | Property | Current behavior |
 | --- | --- |
-| Locked range | One byte in SQLite's SHARED range `[0x4000_0002, 0x4000_0200)` (stable FNV slot per canonical path) |
-| Lock kind | Stage 6 SHARED via `SqliteWalByteRangeLock` (Windows `LockFileEx` shared; Linux OFD read lock; macOS POSIX `F_SETLK` read lock) |
+| SQLite ranges | `PENDING_BYTE = 0x4000_0000`, `RESERVED_BYTE = PENDING_BYTE + 1`, and the 510-byte SHARED range `[PENDING_BYTE + 2, PENDING_BYTE + 512)` |
+| Lock kinds | Shared and exclusive byte-range locks via `SqliteWalByteRangeLock` (Windows `LockFileEx`; Linux OFD `fcntl`; macOS POSIX `fcntl`) |
 | Platform gate | Windows; 64-bit Linux with a 32-byte `struct flock` (OFD); macOS with Darwin `struct flock` (`F_SETLK`). Every other platform throws `PlatformNotSupportedException` at open |
 | Applies to | `PhysicalFileSystem` only, after unwrapping `AhtolaEncryptionFileSystem`. In-memory and custom file systems receive no cross-process boundary at all |
-| Lifetime | Acquired by the first `SqlitePager.Create`/`Open` for a path, reference-counted across every managed pager in the process, released only when the last one is disposed |
-| Registry key | `Path.GetFullPath(...)`, upper-invariant on Windows |
-| Contention | Retried every 10 ms until the configured busy timeout, then `SqlitePagerClientOwnershipException` (an `InvalidOperationException` exposing `DatabasePath` and `Timeout`) |
+| Broker lifetime | One canonical-path broker aggregates every managed pager onto one stable OS handle. Logical leases are reference-counted independently |
+| WAL lifetime | A WAL/MVCC pager retains SHARED for its lifetime. Its writer/checkpoint roles remain on the SQLite `-shm` lock bytes |
+| DELETE lifetime | Open and ordinary reads hold SHARED only for the operation or read transaction. A write transaction holds SHARED + RESERVED from begin through completion, adds PENDING + EXCLUSIVE for commit, then releases everything |
+| Registry key | Canonical full path with final symlink resolution where available; case-folded on Windows |
+| Contention | SQLite busy backoff runs within the configured timeout. Initial open SHARED contention is wrapped as `SqlitePagerClientOwnershipException`; transaction/read contention is `SqlitePagerBusyException` with the requested operation |
 | Create collision | `createNew: true` for a path already owned in this process throws `IOException` |
-| Read-only opens | Windows may hold ownership through a `FileAccess.Read` handle. Linux OFD write locks require a writable descriptor, so read-only ownership fails where the file cannot be opened `ReadWrite` |
+| Read-only opens | A read-only handle can take SHARED and query a conflicting RESERVED lock. A later managed writer upgrades the broker carrier to a writable handle without dropping aggregate SHARED |
 
 Consequences callers may rely on:
 
-- While a managed process owns a database, an ordinary SQLite client cannot take
-  `SHARED`, `RESERVED`, or `PENDING`, so it fails busy instead of reading a
-  database whose committed state lives in a WAL that SQLite cannot locate.
-- The reverse also holds: an ordinary SQLite reader holding `SHARED` blocks the
-  managed open, which fails with `SqlitePagerClientOwnershipException`.
-- Linux deliberately uses open-file-description locks. Ordinary POSIX record locks
-  are released for the entire process when *any* descriptor for the file is
-  closed, so a plain `F_SETLK` lock could be dropped silently by unrelated code.
-- The ownership lock is a boundary against *other* processes. It is not a
-  substitute for SQLite's locking inside the owning process, so a native SQLite
-  client must not be co-hosted with the managed engine on the same database.
+- SHARED acquisition briefly read-locks PENDING, read-locks the complete SHARED
+  range, then releases PENDING. A live PENDING or EXCLUSIVE owner therefore blocks
+  new readers.
+- RESERVED coexists with existing and new readers but excludes a second writer.
+  Commit takes PENDING before waiting for existing readers to drain, so it prevents
+  reader starvation, then converts the SHARED range to EXCLUSIVE.
+- A failed EXCLUSIVE upgrade retains PENDING and the transaction remains active.
+  Retrying commit can complete after readers drain; rollback, transaction disposal,
+  or pager disposal releases RESERVED and PENDING.
+- Hot-journal recovery first distinguishes a live RESERVED owner from an abandoned
+  journal, then upgrades SHARED directly through PENDING to EXCLUSIVE before
+  recovery. It never recovers another process's live journal.
+- Linux uses open-file-description locks so unrelated descriptor closes cannot
+  drop main-file locks. macOS uses SQLite-compatible process-scoped POSIX locks;
+  the broker defers closing pager and superseded lock descriptors while any
+  logical main-file lock remains.
 
 ### 1.2 `-shm` is a byte-lock carrier, not a WAL-index
 
@@ -96,39 +106,31 @@ Additional current behavior:
   carriers use `FileMode.OpenOrCreate`, and so does a reader lock taken by a
   read-write pager: like a native read-write connection, such a pager recreates
   the carrier on demand after a stock SQLite client removed it on clean close.
-- Byte-range locking is enabled on Windows and Linux only; anything else throws
-  `PlatformNotSupportedException` rather than falling back to process-local locks.
-- Contention is polled every 10 ms until the pager busy timeout expires and is
-  then raised as `SqlitePagerBusyException` carrying the requested
+- Byte-range locking is enabled on Windows, 64-bit Linux, and macOS; anything
+  else throws `PlatformNotSupportedException` rather than falling back to
+  process-local locks.
+- Contention follows SQLite's busy-backoff schedule until the pager busy timeout
+  expires and is then raised as `SqlitePagerBusyException` carrying the requested
   `SqlitePagerLockOperation`.
 
-### 1.3 Why this is not SQLite-compatible
+### 1.3 WAL compatibility boundary
 
-1. **No WAL-index exists.** SQLite locates WAL frames through the `-shm` mapping.
-   Managed never publishes `mxFrame`, `nPage`, frame checksums, the page-number
-   array, or the hash tables, so a concurrent SQLite client has no way to observe
-   managed commits, and managed has no way to observe SQLite's.
-2. **Read-mark locks are exclusive, not shared.** Windows `LockFile` is
-   exclusive-only, and on Linux `FileStream.Lock` requests `F_RDLCK` only while the
-   carrier handle happens to be read-only, so the lock mode is not stable. SQLite
-   readers take *shared* locks on a read mark and expect many readers per mark;
-   managed effectively supports at most five reader-holding coordinators.
-3. **Read marks are never written.** `aReadMark[]` stays zero, so managed readers
-   publish no snapshot for any checkpointer — managed or SQLite — to respect.
-   Managed reader isolation comes entirely from a process-local page-overlay copy
-   taken under the process-local lock manager.
-4. **Checkpoint exclusion is coarser than SQLite's.** Managed checkpointing demands
-   all eight lock bytes, so any externally held read-mark byte blocks it, while
-   SQLite's checkpointer takes `WAL_CKPT_LOCK` plus the marks it needs and can run
-   concurrently with a writer. Symmetrically, managed never takes byte 121 alone,
-   so an external holder of SQLite's checkpoint byte does not exclude a managed
-   writer.
-5. **Backfill accounting is absent.** `nBackfill` and `nBackfillAttempted` are
-   never maintained; installed-frame accounting lives only in
-   `SqliteCheckpointResult` and process-local pager state.
-6. **The primary arbiter is process-local.** `SqlitePagerLockManager` serializes
-   readers, the single writer, and checkpoints inside the process; the shm bytes
-   are a secondary boundary layered underneath it.
+1. **A real WAL-index exists.** Physical WAL pagers map `-shm`, publish dual
+   `WalIndexHdr` copies plus page/hash tables, and detect peer `iChange`,
+   `mxFrame`, salt, and WAL-stamp changes.
+2. **Readers use SQLite read marks.** Managed WAL snapshots take shared
+   `WAL_READ_LOCK(i)` leases and pin a validated committed frame boundary.
+3. **Writers and checkpoints use SQLite roles.** Writers take `WAL_WRITE_LOCK`;
+   checkpoints take `WAL_CKPT_LOCK`, honor held read marks, and publish
+   `nBackfill`/`nBackfillAttempted`.
+4. **Main-file locking is mode-specific.** WAL retains SHARED and leaves write
+   serialization to `-shm`; DELETE uses the rollback-journal protocol in §1.1.
+   This change does not weaken WAL mode.
+5. **Process-local coordination remains intentional.** `SqlitePagerLockManager`
+   aggregates managed readers/writers and prevents same-process lock anomalies,
+   while the main-file and `-shm` byte locks are the cross-process authority.
+6. **Remaining WAL lifecycle gap.** Last-connection `-shm` unlink and the
+   exclusive-locking-mode heap WAL-index fallback are not yet implemented.
 
 ### 1.4 MVCC mode (Phase 2)
 
@@ -183,11 +185,15 @@ Phase 2 scope and limits:
   busy timeout. Nested busy failures are wrapped rather than replaced.
 - Recovery-lock contention is reported as `SqlitePagerLockOperation.Writer`,
   because recovery is only attempted on behalf of a writable open or a writer.
-- Retry is a flat 10 ms poll. There is no exponential backoff and no equivalent of
-  `sqlite3_busy_handler`.
-- Ownership contention is intentionally a *different* exception type
-  (`SqlitePagerClientOwnershipException`) so callers can distinguish "another
-  client owns this database" from "this role is momentarily busy".
+- Main-file and `-shm` retry paths use `SqliteBusyBackoff`, matching SQLite's
+  default increasing delays within the configured timeout.
+- Initial main-file SHARED contention is intentionally wrapped in
+  `SqlitePagerClientOwnershipException` so callers can distinguish "the pager
+  could not open" from contention at a later reader, writer, or checkpoint
+  boundary.
+- A DELETE commit that cannot drain readers reports Writer/Busy without faulting
+  the pager or ending the transaction. It retains PENDING for a retry and releases
+  it on rollback or disposal.
 
 ### 1.6 SQL transaction modes and the write reservation
 
@@ -210,11 +216,11 @@ managed in-memory database share.
   `SqliteException` with `SqliteErrorCode` 5. There is no busy timeout, matching
   SQLite's default `busy_timeout=0`.
 
-This layer does not weaken Stage 0: it adds no cross-process coordination and
-relies on the fact that a managed physical database is already owned exclusively
-by one process, so every contending connection is in-process. It is also
-independent of `SqlitePagerLockManager`, whose writer lease is taken and released
-inside a single commit and therefore cannot be held across a SQL transaction.
+This SQL-layer reservation remains independent of the cross-process pager
+protocol. The pager holds its process-local writer lease and, in DELETE mode,
+main-file SHARED + RESERVED from pager transaction begin through commit,
+rollback, or disposal. PENDING + EXCLUSIVE are added only at commit. WAL mode
+continues to use its existing `-shm` writer protocol.
 
 The resulting classic-model contract is:
 
@@ -269,12 +275,15 @@ and is only refreshed on pooling reset.
 - **Read-only open** takes only a reader byte, never repairs anything, refuses to
   create a missing `-shm`, and refuses to establish a snapshot that would require
   WAL repair.
-- **Managed → SQLite handoff is one-way per session.** Commit, checkpoint, then
-  dispose *every* managed pager and connection for that path; ownership is released
-  on the last dispose. Only then may SQLite open the database.
-- **SQLite → managed handoff.** SQLite may delete or replace `-wal` and `-shm`, so
-  reopen writable with the managed provider first and let managed WAL or
-  rollback-journal recovery complete before resuming normal use.
+- **WAL coexistence is live.** Managed and stock SQLite readers/writers coordinate
+  through the mapped WAL-index, `-shm` locks, and the lifetime main-file SHARED
+  lock.
+- **DELETE coexistence is live.** Idle pagers hold no main-file lock; operations
+  acquire SHARED, write transactions reserve at begin, and commits publish only
+  while PENDING + EXCLUSIVE are held.
+- **Long-lived DELETE pagers rescan under SHARED.** A managed pager therefore
+  observes peer-process main-file commits at the next operation instead of
+  trusting only the process-local generation.
 
 ### 1.9 Foreign read-only opens
 
@@ -569,10 +578,13 @@ add a distinct snapshot-invalidated result for readers whose mark was reset.
 
 ### Stage 6 — retire process-exclusive ownership
 
-Only after Stages 1–5 land: replace the 512-byte main-file ownership lock with
-SQLite's `PENDING`/`RESERVED`/`SHARED` protocol, including DELETE-mode rollback
-journal locking, and delete `SqliteManagedFileOwnership`. Until then the ownership
-lock must remain and must keep failing closed.
+Stage 6 is attached. `SqliteManagedFileOwnership` was retained and repurposed as
+the canonical-path broker needed to normalize Windows handle-scoped locks, Linux
+OFD locks, and macOS process-scoped locks. WAL pagers hold lifetime SHARED while
+DELETE pagers execute the complete SHARED → RESERVED → PENDING → EXCLUSIVE
+protocol described in §1.1. Focused stock-SQLite worker tests cover reader/writer
+conflicts, PENDING reader exclusion, and release after transaction or pager
+disposal.
 
 ## 3. Invariants that hold in every stage
 
@@ -588,11 +600,11 @@ lock must remain and must keep failing closed.
 ## 4. Characterization coverage
 
 `src/Ahtola.Tests/SqliteWalInteroperabilityContractTests.cs` pins
-the Stage 0 boundary:
+the attached WAL boundary:
 
 | Test | Contract clause |
 | --- | --- |
-| `ManagedWalCommitPublishesValidatedSqliteWalIndex` | Stage 1 — physical pager publishes dual-header WAL-index under Stage 0 ownership |
+| `ManagedWalCommitPublishesValidatedSqliteWalIndex` | Stage 1 — physical pager publishes a validated dual-header WAL-index |
 | `ManagedWriterClaimsSqliteWalWriteLockByte` | §1.2 — the writer occupies byte 120 |
 | `ManagedWritableOpenClaimsSqliteWalRecoveryLockByte` | §1.2, §1.6 — a writable open occupies byte 122 |
 | `ManagedReaderClaimsTheFirstFreeSqliteReadMarkLockByte` | §1.2 — readers walk bytes 123–127 (Windows only; see below) |
@@ -620,12 +632,14 @@ foreign read-only boundary against `Microsoft.Data.Sqlite` as the owner:
 
 Related existing coverage:
 
-- `SqlitePagerPortableLockCoordinatorTests` — cross-process ownership, ordinary
-  SQLite peers, and recovery before handoff.
+- `SqlitePagerPortableLockCoordinatorTests` — cross-process WAL SHARED
+  coexistence; DELETE SHARED/RESERVED/PENDING/EXCLUSIVE conflicts; release on
+  rollback, transaction disposal, and pager disposal; hot-journal recovery; and
+  peer-commit freshness.
 - `SqlitePagerLockingStorageTests` — lock-manager role interleaving and
   cross-process busy behavior.
-- `SqlitePagerWalConcurrencyRecoverySliceTests` — ownership retry and recovery
-  failure surfacing.
+- `SqlitePagerWalConcurrencyRecoverySliceTests` — main-file lock retry and
+  recovery failure surfacing.
 - `ManagedJournalPageMigrationTests` — WAL incarnation change detection.
 - `SqliteWalProcessIsolationHarnessTests` — detached-only process worker races,
   crash windows, fail-closed tail recovery, and post-handoff SQLite artifact

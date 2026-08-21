@@ -36,7 +36,7 @@ public sealed partial class PhysicalFileSystem :
     }
 
     public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
-        => OpenFile(path, mode, readOnly, FileShare.Read);
+        => OpenFile(path, mode, readOnly, FileShare.Read, pagerLockPath: null);
 
     IFile ITemporaryFileSystem.OpenTemporaryFile(string path)
     {
@@ -51,9 +51,14 @@ public sealed partial class PhysicalFileSystem :
     }
 
     internal IFile OpenPagerFile(string path, FileOpenMode mode, bool readOnly = false)
-        => OpenFile(path, mode, readOnly, FileShare.ReadWrite | FileShare.Delete);
+        => OpenFile(path, mode, readOnly, FileShare.ReadWrite | FileShare.Delete, path);
 
-    private IFile OpenFile(string path, FileOpenMode mode, bool readOnly, FileShare share)
+    private IFile OpenFile(
+        string path,
+        FileOpenMode mode,
+        bool readOnly,
+        FileShare share,
+        string? pagerLockPath)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         if (readOnly && mode == FileOpenMode.CreateNew)
@@ -69,7 +74,7 @@ public sealed partial class PhysicalFileSystem :
 
         var access = readOnly ? FileAccess.Read : FileAccess.ReadWrite;
         var handle = File.OpenHandle(path, fileMode, access, share, FileOptions.None);
-        return new PhysicalFile(handle, readOnly);
+        return new PhysicalFile(handle, readOnly, pagerLockPath);
     }
 
     public void DeleteFile(string path)
@@ -212,10 +217,13 @@ internal sealed class SqlitePagerPhysicalFileSystem(PhysicalFileSystem fileSyste
 public sealed class PhysicalFile : IFile
 {
     private readonly SafeFileHandle _handle;
+    private readonly string? _pagerLockPath;
+    private int _disposed;
 
-    internal PhysicalFile(SafeFileHandle handle, bool readOnly)
+    internal PhysicalFile(SafeFileHandle handle, bool readOnly, string? pagerLockPath = null)
     {
         _handle = handle;
+        _pagerLockPath = pagerLockPath;
         IsReadOnly = readOnly;
     }
 
@@ -278,11 +286,22 @@ public sealed class PhysicalFile : IFile
         RandomAccess.FlushToDisk(_handle);
     }
 
-    public void Dispose() => _handle.Dispose();
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+        if (_pagerLockPath is not null
+            && SqliteManagedFileOwnershipRegistry.TryDeferPagerHandleClose(_pagerLockPath, _handle))
+        {
+            return;
+        }
+
+        _handle.Dispose();
+    }
 
     private void ThrowIfDisposed()
     {
-        if (_handle.IsClosed)
+        if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(PhysicalFile));
     }
 }
