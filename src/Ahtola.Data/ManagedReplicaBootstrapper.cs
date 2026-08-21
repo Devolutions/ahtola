@@ -1242,7 +1242,10 @@ internal static class ManagedReplicaBootstrapper
         => CreatePullRequest(clientRevision: null, longPollTimeout, requestLogicalProtocol: false);
 
     /// <summary>
-    /// Builds a <c>PullUpdatesReqProtoBody</c> request. <paramref name="clientRevision"/> is
+    /// Builds a <c>PullUpdatesReqProtoBody</c> request. Tag 1 (<c>encoding</c>) is explicitly
+    /// emitted as <c>PageUpdatesEncodingReq.Raw</c> (0), even though that is the proto3 default,
+    /// so the wire request negotiates the only page encoding this managed client supports.
+    /// <paramref name="clientRevision"/> is
     /// always emitted (tag 3) whenever it is non-empty, independent of whether a long-poll
     /// timeout is configured: the server cannot compute an incremental diff without it. Setting
     /// <paramref name="requestLogicalProtocol"/> encodes tag 8 (<c>stream_kind</c>) as
@@ -1250,7 +1253,9 @@ internal static class ManagedReplicaBootstrapper
     /// </summary>
     private static byte[] CreatePullRequest(string? clientRevision, TimeSpan? longPollTimeout, bool requestLogicalProtocol)
     {
-        var request = new List<byte>(clientRevision is null ? 6 : clientRevision.Length + 12);
+        var request = new List<byte>(clientRevision is null ? 8 : clientRevision.Length + 14);
+        WriteVarint(request, 1u << 3);
+        WriteVarint(request, 0); // PageUpdatesEncodingReq::Raw
         if (!string.IsNullOrEmpty(clientRevision))
         {
             var revision = StrictUtf8.GetBytes(clientRevision);

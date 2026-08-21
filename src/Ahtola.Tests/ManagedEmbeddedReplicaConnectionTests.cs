@@ -455,7 +455,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             request.Content!.Headers.ContentType!.MediaType.Should().Be("application/protobuf");
 
             var fields = ReadVarintFields(request.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult());
-            fields.Should().ContainSingle();
+            fields.Should().HaveCount(2);
+            fields[1].Should().Be(0, "the bootstrap must explicitly request PageUpdatesEncodingReq.Raw");
             fields[4].Should().Be(3000);
         });
         var options = new AhtolaReplicaOptions(
@@ -1401,8 +1402,9 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         request =>
         {
             var bytes = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-            if (bytes.Length > 0)
-                capturedRequests.Add(ReadFields(bytes));
+            var fields = ReadFields(bytes);
+            if (fields.ContainsKey(3))
+                capturedRequests.Add(fields);
         });
         var options = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null)
         {
@@ -1412,7 +1414,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         try
         {
             using var connection = AhtolaConnection.CreateReplica(options);
-            connection.Open(); // bootstrap (no revision, empty request) + fresh-bootstrap catch-up
+            connection.Open(); // bootstrap (raw encoding only, no revision) + fresh-bootstrap catch-up
             await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None).ConfigureAwait(false);
 
             // The fresh-bootstrap catch-up and the explicit Sync() both know the remote is
@@ -1422,6 +1424,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             capturedRequests.Should().HaveCount(2);
             foreach (var fields in capturedRequests)
             {
+                fields[1].Number.Should().Be(0,
+                    "logical incremental pulls must still request raw encoding for any page fallback");
                 fields[3].Text.Should().Be("revision-42");
                 fields[8].Number.Should().Be(1);
             }
@@ -2649,7 +2653,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
-    public async Task SyncAsyncReportsUpToDateForTheStoredRevision()
+    public async Task SyncAsyncRequestsRawEncodingAndReportsUpToDateForTheStoredRevision()
     {
         var path = NewReplicaPath("managed-embedded-replica-up-to-date");
         var image = CreateDatabaseImage(path + ".source");
@@ -2658,14 +2662,16 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                 CreatePullResponse("revision-42", [], declaredPages: 1),
             ], request =>
             {
-                if (request.Content!.Headers.ContentLength == 0)
-                    return;
-                var fields = ReadFields(request.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult());
+                var fields = ReadFields(request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult());
                 if (!fields.ContainsKey(3))
                 {
+                    fields[1].Number.Should().Be(0,
+                        "the initial pull must explicitly request PageUpdatesEncodingReq.Raw");
                     fields[4].Number.Should().Be(3000);
                     return;
                 }
+                fields[1].Number.Should().Be(0,
+                    "incremental pulls must explicitly request PageUpdatesEncodingReq.Raw");
                 fields[3].Text.Should().Be("revision-42");
                 fields[4].Number.Should().Be(3000);
             });
