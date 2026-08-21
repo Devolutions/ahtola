@@ -37,9 +37,6 @@ internal static class ManagedReplicaSupportMatrix
         }
 
         if (options.RemoteEncryption is not null)
-        {
-            throw new NotSupportedException(
-                "Managed embedded replicas do not support encrypted remote page streams.");
-        }
+            ManagedReplicaEncryption.EnsureSupportedCipher(options.RemoteEncryption.Cipher);
     }
 }

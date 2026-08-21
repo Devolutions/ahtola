@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 
 namespace Ahtola;
 
@@ -72,7 +73,7 @@ internal static class ManagedReplicaBootstrapper
         try
         {
             var (revision, protocol) = await DownloadDatabaseAsync(options, stagingPath, cancellationToken).ConfigureAwait(false);
-            ValidateStagedDatabase(stagingPath);
+            ValidateStagedDatabase(stagingPath, options.RemoteEncryption);
 
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapStagedDatabase);
             cancellationToken.ThrowIfCancellationRequested();
@@ -81,7 +82,7 @@ internal static class ManagedReplicaBootstrapper
 
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapDatabasePublished);
             cancellationToken.ThrowIfCancellationRequested();
-            var tableMap = RebuildTableMapFromSchema(options.Path);
+            var tableMap = RebuildTableMapFromSchema(options.Path, options.RemoteEncryption);
             await WriteMetadataAsync(
                 metadataStagingPath,
                 metadataPath,
@@ -114,10 +115,11 @@ internal static class ManagedReplicaBootstrapper
     /// apply path (bootstrap, incremental pages, replace-base), where no logical schema identity
     /// operations are decoded but a future logical pull may depend on an existing map.
     /// </summary>
-    private static IReadOnlyDictionary<ulong, string> RebuildTableMapFromSchema(string databasePath)
+    private static IReadOnlyDictionary<ulong, string> RebuildTableMapFromSchema(
+        string databasePath, AhtolaRemoteEncryptionOptions? remoteEncryption)
     {
-        using var database = ManagedDatabaseAdapter.Open(databasePath);
-        var connection = database.Connect();
+        using var opened = ManagedReplicaEncryption.OpenDatabase(databasePath, remoteEncryption);
+        var connection = opened.Database.Connect();
         using var statement = connection.Prepare(
             "SELECT rootpage, name FROM sqlite_schema WHERE type = 'table' AND rootpage != 0");
         var map = new Dictionary<ulong, string>();
@@ -331,6 +333,16 @@ internal static class ManagedReplicaBootstrapper
         ArgumentNullException.ThrowIfNull(pendingLocalChanges);
         ManagedReplicaSupportMatrix.ValidateOptions(options);
         var requestLogical = metadata.Protocol == RemotePullProtocol.MvccLogical;
+        if (requestLogical && options.RemoteEncryption is not null)
+        {
+            // Mirrors Turso's ensure_logical_mvcc_pull_supported: the MVCC logical pull protocol
+            // and remote encryption are not a supported combination, so this must fail closed
+            // before ever sending the request rather than silently downgrading to page mode.
+            throw new NotSupportedException(
+                "Managed embedded replica synchronization does not support the MVCC logical pull "
+                + "protocol combined with remote encryption.");
+        }
+
         if (!requestLogical)
         {
             // A non-logical (page) protocol client can only ever receive a Pages response for
@@ -363,6 +375,8 @@ internal static class ManagedReplicaBootstrapper
         ValidateAuthTokenTransport(request.RequestUri!, token);
         if (token is not null)
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        if (options.RemoteEncryption is { } remoteEncryption)
+            request.Headers.TryAddWithoutValidation(AhtolaRemoteClient.EncryptionKeyHeaderName, remoteEncryption.Base64Key);
         var effectiveToken = timeout?.Token ?? cancellationToken;
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, effectiveToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
@@ -822,7 +836,7 @@ internal static class ManagedReplicaBootstrapper
                 staging.Flush(flushToDisk: true);
             }
 
-            ValidateStagedDatabase(stagingPath);
+            ValidateStagedDatabase(stagingPath, options.RemoteEncryption);
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyStagedDatabase);
             cancellationToken.ThrowIfCancellationRequested();
             File.Replace(stagingPath, options.Path, backupPath, ignoreMetadataErrors: false);
@@ -832,8 +846,8 @@ internal static class ManagedReplicaBootstrapper
 
             if (header.ApplyMode == PullApplyMode.ReplaceBase && pendingLocalChanges.Count > 0)
             {
-                using var database = ManagedDatabaseAdapter.Open(options.Path);
-                var connection = database.Connect();
+                using var opened = ManagedReplicaEncryption.OpenDatabase(options.Path, options.RemoteEncryption);
+                var connection = opened.Database.Connect();
                 ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
                 try
                 {
@@ -856,7 +870,7 @@ internal static class ManagedReplicaBootstrapper
             // freshly detected protocol is recorded too, so a protocol-2 remote that answered this
             // particular pull with Pages (e.g. Pages+ReplaceBase) still enables a logical request
             // on the next pull rather than sticking to pages forever.
-            var tableMap = RebuildTableMapFromSchema(options.Path);
+            var tableMap = RebuildTableMapFromSchema(options.Path, options.RemoteEncryption);
             await WriteMetadataAsync(
                     metadataStagingPath,
                     metadataPath,
@@ -998,6 +1012,8 @@ internal static class ManagedReplicaBootstrapper
         ValidateAuthTokenTransport(request.RequestUri!, authToken);
         if (authToken is not null)
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+        if (options.RemoteEncryption is { } remoteEncryption)
+            request.Headers.TryAddWithoutValidation(AhtolaRemoteClient.EncryptionKeyHeaderName, remoteEncryption.Base64Key);
 
         using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
         var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
@@ -1017,6 +1033,18 @@ internal static class ManagedReplicaBootstrapper
             throw new InvalidDataException(
                 "Managed embedded replica bootstrap requires a raw page stream; the server returned an MVCC logical-log stream.");
         }
+        if (options.RemoteEncryption is not null && header.Protocol == RemotePullProtocol.MvccLogical)
+        {
+            // Fail closed as soon as the remote's advertised protocol is known, before ever
+            // installing a bootstrap image that would require an unsupported MVCC-logical
+            // catch-up pull later (see CheckForUpdatesAsync's matching guard). Mirrors Turso's
+            // ensure_logical_mvcc_pull_supported: MVCC logical pull and remote encryption are not
+            // a supported combination.
+            throw new NotSupportedException(
+                "Managed embedded replica bootstrap does not support a remote that advertises the "
+                + "MVCC logical pull protocol combined with remote encryption.");
+        }
+
         if (expectedHeader is { } expected
             && (header.Revision != expected.Revision
                 || header.DatabasePages != expected.DatabasePages
@@ -1122,18 +1150,23 @@ internal static class ManagedReplicaBootstrapper
     }
 
 
-    private static void ValidateStagedDatabase(string stagingPath)
+    private static void ValidateStagedDatabase(string stagingPath, AhtolaRemoteEncryptionOptions? remoteEncryption)
     {
-        using (var stream = new FileStream(stagingPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        if (remoteEncryption is null)
         {
+            using var stream = new FileStream(stagingPath, FileMode.Open, FileAccess.Read, FileShare.Read);
             Span<byte> header = stackalloc byte[SqliteHeader.Length];
             stream.ReadExactly(header);
             if (!header.SequenceEqual(SqliteHeader))
                 throw new InvalidDataException("The bootstrapped page stream does not contain a SQLite database header.");
         }
 
-        using var database = ManagedDatabaseAdapter.Open(stagingPath);
-        _ = database.Connect();
+        // For an encrypted stream, page 1 begins with the Ahtola encrypted-page magic rather than
+        // the plaintext SQLite header, so the plaintext pre-check above is skipped: opening below
+        // exercises the storage layer's own encrypted-header/reserved-byte validation instead
+        // (see SqlitePageStore.OpenCore/OpenWithCodec), which fails closed on any mismatch.
+        using var opened = ManagedReplicaEncryption.OpenDatabase(stagingPath, remoteEncryption);
+        _ = opened.Database.Connect();
     }
 
     private static async Task WriteMetadataAsync(

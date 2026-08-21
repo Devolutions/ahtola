@@ -19,6 +19,11 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     private const int LogicalApplyCheckpointedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyCheckpointed;
     private const int LogicalApplyMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyMetadataPublished;
 
+    // 32-byte (AES-256-GCM) hex keys used to build genuinely encrypted replica fixtures; mirrors
+    // ManagedEncryptedFileOpenContractTests' Aes256Key/WrongAes256Key pair.
+    private const string ReplicaEncryptionKeyHex = "202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F";
+    private const string ReplicaEncryptionWrongKeyHex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+
     [Test]
     public void ReplicaOptionsNormalizeLibsqlUrlsToHttps()
     {
@@ -2415,7 +2420,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
-    [TestCase(UnsupportedReplicaMode.RemoteEncryption)]
+    [TestCase(UnsupportedReplicaMode.UnsupportedEncryptionCipher)]
     [TestCase(UnsupportedReplicaMode.PartialQuery)]
     [TestCase(UnsupportedReplicaMode.PartialPrefixLazy)]
     public void CreateReplicaRejectsUnsupportedModesBeforeOpeningOrMutatingLocalState(
@@ -2438,6 +2443,195 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             File.Exists(path).Should().BeFalse();
             File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
             File.Exists(path + ManagedReplicaChangeJournal.Suffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaBootstrapsAnEncryptedRemoteDatabaseWithNonzeroReservedBytes()
+    {
+        // The source database is genuinely AES-256-GCM encrypted (28 reserved bytes per page;
+        // page 1 begins with the "AHTLA" header rather than plaintext SQLite magic). Bootstrap
+        // must materialize it using the storage layer's own encrypted-header/reserved-byte
+        // treatment (see ManagedReplicaEncryption.OpenDatabase) instead of the previous blanket
+        // "remote encryption is unsupported" rejection, and must forward the remote encryption
+        // key as an HTTP header on the pull request (mirrors Turso's remote_encryption_key).
+        var path = NewReplicaPath("managed-replica-encrypted-bootstrap");
+        var sourcePath = path + ".source";
+        var image = CreateEncryptedDatabaseImage(sourcePath, ReplicaEncryptionKeyHex, marker: 77);
+        image.AsSpan(0, 5).ToArray().Should().Equal(
+            "AHTLA"u8.ToArray(), "the fixture must be genuinely encrypted, not merely labeled as such");
+
+        var receivedEncryptionKeys = new List<string?>();
+        var handler = new PullUpdatesHandler(
+            CreatePullResponse("revision-42", image),
+            request => receivedEncryptionKeys.Add(
+                request.Headers.TryGetValues(AhtolaRemoteClient.EncryptionKeyHeaderName, out var values)
+                    ? values.FirstOrDefault()
+                    : null));
+        var options = CreateEncryptedOptions(path, handler, ReplicaEncryptionKeyHex);
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+
+                ReadBootstrapMarker(connection).Should().Be(77);
+                handler.CallCount.Should().Be(1);
+                receivedEncryptionKeys.Should().ContainSingle().Which.Should().Be(options.RemoteEncryption!.Base64Key);
+            }
+
+            File.ReadAllBytes(path).AsSpan(0, 5).ToArray().Should().Equal(
+                "AHTLA"u8.ToArray(), "the bootstrapped local file must remain encrypted at rest");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaRejectsAnEncryptedRemoteDatabaseWhenTheConfiguredKeyDoesNotMatch()
+    {
+        // A wrong (but valid-length) key cannot authenticate the AES-GCM tag on page 1, so the
+        // storage layer's decrypt path must fail closed rather than silently accepting
+        // corrupted plaintext; the failed bootstrap must also roll back completely.
+        var path = NewReplicaPath("managed-replica-encrypted-wrong-key");
+        var sourcePath = path + ".source";
+        var image = CreateEncryptedDatabaseImage(sourcePath, ReplicaEncryptionKeyHex);
+
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image));
+        var options = CreateEncryptedOptions(path, handler, ReplicaEncryptionWrongKeyHex);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<InvalidDataException>(() => connection.Open())!
+                .Message.Should().Contain("failed authentication");
+
+            handler.CallCount.Should().Be(1);
+            File.Exists(path).Should().BeFalse(
+                "a failed bootstrap must roll back rather than leave a database that cannot be decrypted with the configured key");
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaRejectsAPlaintextPageStreamWhenRemoteEncryptionIsConfigured()
+    {
+        // The remote's page stream is ordinary plaintext SQLite pages (reserved bytes = 0), but
+        // the replica is configured to expect an AES-256-GCM encrypted stream. The storage
+        // layer must detect that mismatch and fail closed (SqlitePageStore rejects a plaintext
+        // SQLite header when encryption was requested, refusing any plaintext fallback) rather
+        // than silently accepting an unencrypted page 1 as if it had already been decrypted --
+        // bootstrap must enforce the correct reserved-byte/header treatment rather than
+        // trusting the caller's RemoteEncryption configuration blindly.
+        var path = NewReplicaPath("managed-replica-plaintext-with-encryption-configured");
+        var sourcePath = path + ".source";
+        var image = CreateDatabaseImage(sourcePath);
+
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image));
+        var options = CreateEncryptedOptions(path, handler, ReplicaEncryptionKeyHex);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<InvalidDataException>(() => connection.Open())!
+                .Message.Should().Contain("plaintext SQLite header");
+
+            handler.CallCount.Should().Be(1);
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaRejectsAnMvccLogicalRemoteAdvertisedDuringBootstrapWhenRemoteEncryptionIsConfigured()
+    {
+        // protocol: 2 advertises the MVCC logical pull protocol that would govern any later
+        // incremental pull (see CreateReplicaBootstrapsRawPagesFromALogicalProtocolRemote); the
+        // managed engine does not support combining that protocol with remote encryption
+        // (mirrors Turso's ensure_logical_mvcc_pull_supported), so bootstrap must fail closed
+        // before ever installing local state that would need an unsupported logical catch-up.
+        var path = NewReplicaPath("managed-replica-mvcc-encryption-bootstrap-reject");
+        var sourcePath = path + ".source";
+        var image = CreateDatabaseImage(sourcePath);
+
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image, protocol: 2));
+        var options = CreateEncryptedOptions(path, handler, ReplicaEncryptionKeyHex);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<NotSupportedException>(() => connection.Open())!
+                .Message.Should().Contain("MVCC logical pull protocol combined with remote encryption");
+
+            handler.CallCount.Should().Be(
+                1, "the guard must fire from the bootstrap download itself, before any catch-up request");
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task CheckForUpdatesRejectsAnMvccLogicalMetadataProtocolWhenRemoteEncryptionIsConfigured()
+    {
+        // Establishes a replica whose stored metadata already records the MVCC logical pull
+        // protocol via a normal, unencrypted bootstrap (protocol: 2, matching
+        // CreateReplicaBootstrapsRawPagesFromALogicalProtocolRemote), then drives
+        // CheckForUpdatesAsync directly with RemoteEncryption configured against that same
+        // metadata. Mirrors Turso's ensure_logical_mvcc_pull_supported: this is the SECOND,
+        // independent guard (CheckForUpdatesAsync's own, not the bootstrap-time one in
+        // DownloadDatabaseAsync) -- it must fail closed as soon as a logical pull would be
+        // requested against an encrypted remote, without relying solely on the bootstrap-time
+        // check above.
+        var path = NewReplicaPath("managed-replica-mvcc-encryption-checkforupdates-reject");
+        var sourcePath = path + ".source";
+        var image = CreateDatabaseImage(sourcePath);
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up: nothing new
+        ]);
+        var options = CreateOptions(path, handler);
+
+        try
+        {
+            ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata;
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            }
+
+            metadata.Protocol.Should().Be(
+                RemotePullProtocol.MvccLogical, "the fresh bootstrap above must have recorded an MVCC logical protocol");
+
+            var encryptedOptions = CreateEncryptedOptions(path, handler, ReplicaEncryptionKeyHex);
+
+            Func<Task> checkForUpdates = () => ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                encryptedOptions, metadata, new AhtolaSyncOptions(), [], CancellationToken.None);
+            await checkForUpdates.Should().ThrowAsync<NotSupportedException>()
+                .WithMessage("*MVCC logical pull protocol combined with remote encryption*");
+
+            handler.CallCount.Should().Be(2, "the guard must fail before any additional network request");
         }
         finally
         {
@@ -3550,14 +3744,17 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         var options = CreateOptions(path, handler);
         return mode switch
         {
-            UnsupportedReplicaMode.RemoteEncryption => new AhtolaReplicaOptions(
+            UnsupportedReplicaMode.UnsupportedEncryptionCipher => new AhtolaReplicaOptions(
                 path,
                 options.RemoteUri,
                 options.AuthToken)
             {
+                // Aes128Gcm/Aes256Gcm are supported by the managed engine (see
+                // ManagedReplicaEncryption); this mode instead exercises an unimplemented cipher
+                // to prove it still fails closed via ManagedReplicaSupportMatrix.ValidateOptions.
                 RemoteEncryption = new AhtolaRemoteEncryptionOptions(
                     "c2VjcmV0",
-                    AhtolaRemoteEncryptionCipher.Aes256Gcm),
+                    AhtolaRemoteEncryptionCipher.ChaCha20Poly1305),
                 HttpPolicy = options.HttpPolicy,
             },
             UnsupportedReplicaMode.PartialQuery => new AhtolaReplicaOptions(
@@ -3582,6 +3779,48 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             _ => throw new ArgumentOutOfRangeException(nameof(mode)),
         };
     }
+
+    private static string ManagedEncryptionConnectionString(string path, string hexKey)
+        => $"Data Source={path};Local Provider=Managed;Encryption Cipher=Aes256Gcm;Encryption Key={hexKey}";
+
+    /// <summary>
+    /// Builds a genuinely AES-256-GCM encrypted source database image (28 reserved bytes per
+    /// page; page 1 begins with the "AHTLA" header, not the plaintext SQLite magic) for feeding
+    /// through <see cref="CreatePullResponse"/> in encrypted-bootstrap tests.
+    /// </summary>
+    private static void CreateEncryptedInitializedDatabase(string path, string hexKey, int marker)
+    {
+        using var connection = new AhtolaConnection(ManagedEncryptionConnectionString(path, hexKey));
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+        connection.ExecuteNonQuery($"INSERT INTO bootstrap_marker VALUES ({marker});");
+    }
+
+    private static byte[] CreateEncryptedDatabaseImage(string path, string hexKey, int marker = 42)
+    {
+        try
+        {
+            CreateEncryptedInitializedDatabase(path, hexKey, marker);
+            return File.ReadAllBytes(path);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    private static AhtolaReplicaOptions CreateEncryptedOptions(
+        string path,
+        HttpMessageHandler handler,
+        string hexKey,
+        AhtolaRemoteEncryptionCipher cipher = AhtolaRemoteEncryptionCipher.Aes256Gcm)
+        => new(path, new Uri("https://example.test/cluster"), authToken: "token-42")
+        {
+            LongPollTimeout = TimeSpan.FromSeconds(3),
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+            RemoteEncryption = new AhtolaRemoteEncryptionOptions(
+                Convert.ToBase64String(Convert.FromHexString(hexKey)), cipher),
+        };
 
     private static void DeleteReplicaFiles(string path)
     {
@@ -3970,7 +4209,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
 
     public enum UnsupportedReplicaMode
     {
-        RemoteEncryption,
+        UnsupportedEncryptionCipher,
         PartialQuery,
         PartialPrefixLazy,
     }
