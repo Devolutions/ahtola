@@ -354,15 +354,79 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         }
 
         await ManagedReplicaBootstrapper.BootstrapAsync(options, cancellationToken).ConfigureAwait(false);
+
+        // Captured immediately after a successful bootstrap publish so a failed catch-up's
+        // rollback below can verify -- under a freshly (re)acquired apply lease -- that this
+        // exact generation is still the one on disk before deleting it. See
+        // RollBackFailedCatchUpIfStillThisGenerationAsync.
+        var bootstrappedRevision = ManagedReplicaBootstrapper.LoadMetadata(options.Path)?.Revision
+            ?? throw new InvalidOperationException(
+                "Managed embedded replica bootstrap did not publish metadata.");
+
         try
         {
             await RunCatchUpIfMvccLogicalAsync(options, cancellationToken).ConfigureAwait(false);
         }
         catch
         {
-            ManagedReplicaBootstrapper.DeleteBootstrappedReplicaFiles(options.Path);
+            await RollBackFailedCatchUpIfStillThisGenerationAsync(options, bootstrappedRevision)
+                .ConfigureAwait(false);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Rolls a bootstrap fully back after its mandatory post-bootstrap catch-up failed -- but
+    /// only if the replica is still durably sitting in exactly the broken "bootstrapped, never
+    /// caught up" generation identified by <paramref name="bootstrappedRevision"/>.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RunCatchUpIfMvccLogicalAsync"/> releases the apply lease (via
+    /// <c>ManagedReplicaBootstrapper.CheckForUpdatesAsync</c>'s own <c>await using</c> lease
+    /// scope) before its failure ever reaches this catch handler, so deleting unconditionally
+    /// here -- as this method used to -- is not race-free: any other publisher for the very same
+    /// physical replica (most commonly an already-open connection's ordinary
+    /// <see cref="SyncAsync(CancellationToken)"/> reaching this path through a differently-aliased
+    /// <see cref="ManagedReplicaSyncRegistry.Entry"/> for the same underlying file -- see
+    /// <c>ManagedReplicaApplyLock</c>'s physical-identity keying -- but in principle any
+    /// concurrent caller of <c>ManagedReplicaBootstrapper.CheckForUpdatesAsync</c> for this path)
+    /// could acquire the now-free apply lease, publish a newer, entirely valid revision, and
+    /// release, all before this rollback gets around to running. Reacquiring the lease here and
+    /// re-verifying the on-disk revision before deleting closes that gap: this rollback only ever
+    /// deletes the exact generation it set out to undo, never state a concurrent publisher
+    /// legitimately moved past it.
+    /// </remarks>
+    private static async Task RollBackFailedCatchUpIfStillThisGenerationAsync(
+        AhtolaReplicaOptions options,
+        string bootstrappedRevision)
+    {
+        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapCatchUpFailureObserved);
+
+        // CancellationToken.None throughout: this cleanup must run to completion regardless of
+        // why catch-up failed -- including because the caller's own cancellation token fired --
+        // or a canceled catch-up would leave a permanently broken, never-caught-up replica on
+        // disk instead of being retried cleanly by the next Open().
+        await using var lease = await ManagedReplicaApplyLock
+            .AcquireExclusiveAsync(options.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+
+        var current = ManagedReplicaBootstrapper.LoadMetadata(options.Path);
+        if (current is null)
+        {
+            // Already gone: a concurrent rollback (or an equivalent failure reachable through a
+            // differently-aliased path to the same replica) already cleaned this generation up.
+            return;
+        }
+
+        if (!string.Equals(current.Value.Revision, bootstrappedRevision, StringComparison.Ordinal))
+        {
+            // Some other publisher has already moved this replica past the specific bootstrap
+            // generation that failed to catch up. That newer state is not this rollback's to
+            // judge or destroy -- leave it alone.
+            return;
+        }
+
+        ManagedReplicaBootstrapper.DeleteBootstrappedReplicaFiles(options.Path);
     }
 
     /// <summary>

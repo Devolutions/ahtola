@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Ahtola.Core.Storage;
 
 namespace Ahtola;
 
@@ -56,39 +57,124 @@ internal static class ManagedReplicaApplyLock
 
 /// <summary>
 /// In-process-only interim implementation of <see cref="IManagedReplicaApplyLockCoordinator"/>: a
-/// per-normalized-path FIFO exclusive async gate backed by <see cref="SemaphoreSlim"/>. Provides
+/// per-canonicalized-path FIFO exclusive async gate backed by <see cref="SemaphoreSlim"/>. Provides
 /// mutual exclusion within this process alone and intentionally makes no attempt at cross-process
 /// coordination -- that gap is exactly what the forthcoming DELETE-mode OS lock closes.
 /// </summary>
 /// <remarks>
-/// Gates are created lazily per normalized path and never removed. A real replica process only
-/// ever touches a small, effectively static set of distinct database paths over its lifetime, so
-/// this keeps the implementation simple and lock-free on the hot (uncontended) path rather than
-/// adding reference-counted teardown for a resource (one <see cref="SemaphoreSlim"/> per distinct
-/// path) that is not worth the extra bookkeeping.
+/// Gates are created lazily per resolved <see cref="LockKey"/> and never removed. A real replica
+/// process only ever touches a small, effectively static set of distinct database paths over its
+/// lifetime, so this keeps the implementation simple and lock-free on the hot (uncontended) path
+/// rather than adding reference-counted teardown for a resource (one <see cref="SemaphoreSlim"/>
+/// per distinct key) that is not worth the extra bookkeeping.
 /// </remarks>
 internal sealed class InProcessManagedReplicaApplyLockCoordinator : IManagedReplicaApplyLockCoordinator
 {
     internal static readonly InProcessManagedReplicaApplyLockCoordinator Instance = new();
 
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> Gates = new(PathComparer);
-
-    private static StringComparer PathComparer =>
-        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+    private static readonly ConcurrentDictionary<LockKey, SemaphoreSlim> Gates = new();
 
     public async ValueTask<IAsyncDisposable> AcquireExclusiveAsync(string path, CancellationToken cancellationToken)
     {
-        var normalizedPath = NormalizePath(path);
-        var gate = Gates.GetOrAdd(normalizedPath, static _ => new SemaphoreSlim(1, 1));
+        var key = ResolveLockKey(path);
+        var gate = Gates.GetOrAdd(key, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         return new Lease(gate);
     }
 
-    private static string NormalizePath(string path)
+    /// <summary>
+    /// Resolves the mutual-exclusion key for <paramref name="path"/> using true physical file (or,
+    /// failing that, physical parent-directory) identity wherever the platform supports it, so a
+    /// symbolic link, junction/mount point, hard link, or Windows short (8.3) name that aliases the
+    /// same underlying file or directory resolves to the SAME key as the canonical path. A purely
+    /// textual normalization (<see cref="Path.GetFullPath(string)"/> alone) cannot make that
+    /// guarantee -- two textually different paths naming the same physical file would get
+    /// different keys and could race each other through this coordinator instead of serializing.
+    /// </summary>
+    private static LockKey ResolveLockKey(string path)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
-        return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        var fullPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+
+        try
+        {
+            // The common case: the database file already exists (every apply after the replica's
+            // first bootstrap). Its own physical identity is the strongest available key and, by
+            // construction, is immune to every aliasing vector the review called out. Name/TextPath
+            // are deliberately left null: equality for this kind must depend on Identity alone, or
+            // two differently-spelled aliases of the same physical file would wrongly get different
+            // keys.
+            return new LockKey(LockKeyKind.PhysicalFile, SqliteWalSharedMemoryCarrierIdentity.FromPath(fullPath), null, null);
+        }
+        catch (FileNotFoundException)
+        {
+            // The target does not exist yet (first-ever bootstrap for this path); fall through to
+            // canonicalizing its parent directory instead.
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // Same as above, but a directory component of the path is also missing.
+        }
+        catch (PlatformNotSupportedException)
+        {
+            return new LockKey(LockKeyKind.TextFallback, default, null, NormalizeForTextFallback(fullPath));
+        }
+
+        var parentDirectory = Path.GetDirectoryName(fullPath);
+        var fileName = Path.GetFileName(fullPath);
+        if (string.IsNullOrEmpty(parentDirectory) || string.IsNullOrEmpty(fileName))
+        {
+            // No parent-directory component to canonicalize (a degenerate/rooted path); nothing
+            // physical is left to resolve against, so fall back to the plain textual key.
+            return new LockKey(LockKeyKind.TextFallback, default, null, NormalizeForTextFallback(fullPath));
+        }
+
+        try
+        {
+            var parentIdentity = SqliteWalSharedMemoryCarrierIdentity.FromDirectoryPath(parentDirectory);
+            var normalizedFileName = OperatingSystem.IsWindows() ? fileName.ToUpperInvariant() : fileName;
+            return new LockKey(LockKeyKind.PhysicalParentAndName, parentIdentity, normalizedFileName, null);
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // The parent directory does not exist yet either (for example, the very first
+            // bootstrap into a brand-new directory tree). There is nothing physical left to
+            // canonicalize, so fall back to the textual key -- a narrower race window than before
+            // this fix, since it now only applies while the parent directory itself is missing
+            // rather than for every not-yet-bootstrapped path.
+            return new LockKey(LockKeyKind.TextFallback, default, null, NormalizeForTextFallback(fullPath));
+        }
+        catch (PlatformNotSupportedException)
+        {
+            return new LockKey(LockKeyKind.TextFallback, default, null, NormalizeForTextFallback(fullPath));
+        }
     }
+
+    private static string NormalizeForTextFallback(string fullPath)
+        => OperatingSystem.IsWindows() ? fullPath.ToUpperInvariant() : fullPath;
+
+    private enum LockKeyKind
+    {
+        /// <summary>Keyed by the physical identity of the target file itself, which already exists.</summary>
+        PhysicalFile,
+
+        /// <summary>Keyed by the physical identity of the target's parent directory plus its (case-normalized) file name, because the target itself does not exist yet.</summary>
+        PhysicalParentAndName,
+
+        /// <summary>Keyed by a purely textual normalization; used only when neither physical resolution above is available on this platform or for this path.</summary>
+        TextFallback,
+    }
+
+    /// <summary>
+    /// Mutual-exclusion key for one database path. Equality is structural over all four fields, so
+    /// two keys of different <see cref="LockKeyKind"/>s are never equal even if their unused fields
+    /// happen to share default values.
+    /// </summary>
+    private readonly record struct LockKey(
+        LockKeyKind Kind,
+        SqliteWalSharedMemoryCarrierIdentity Identity,
+        string? Name,
+        string? TextPath);
 
     private sealed class Lease(SemaphoreSlim gate) : IAsyncDisposable
     {

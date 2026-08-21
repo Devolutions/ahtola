@@ -595,6 +595,77 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public void FailedCatchUpRollbackDoesNotDestroyANewerRevisionPublishedDuringTheRollbackWindow()
+    {
+        var path = NewReplicaPath("managed-replica-catchup-rollback-race");
+        var image = CreateDatabaseImage(path + ".source");
+
+        // Only the bootstrap page response is queued: exactly like
+        // FailedFreshBootstrapCatchUpRollsBackTheWholeBootstrapForACleanRetry, the mandatory
+        // post-bootstrap catch-up pull's HTTP call has nothing left to dequeue and fails. This
+        // time, a second, fully independent caller races into the gap between that failure and
+        // the rollback's own cleanup and publishes a newer, entirely valid revision there.
+        var failingHandler = new PullUpdatesHandler([CreatePullResponse("revision-42", image, protocol: 2)]);
+        var options = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null, bootstrapIfEmpty: true)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(failingHandler),
+        };
+
+        // Represents an already-open connection reaching the very same physical replica through a
+        // path that is textually different but physically identical (see ManagedReplicaApplyLock's
+        // physical-identity keying, which is exactly what makes the two contend for the same
+        // lease) -- or simply any other concurrent CheckForUpdatesAsync caller for this path. It is
+        // invoked directly, bypassing ManagedReplicaSyncRegistry entirely: the registry already
+        // serializes ordinary same-path callers behind the still-active bootstrap+catch-up
+        // publication, so a registry-mediated caller could never actually observe this window --
+        // only a caller reaching the apply lock through some other route can.
+        var concurrentPublisherHandler = new PullUpdatesHandler([CreateLogicalPullResponse("revision-99", body: [])]);
+        var concurrentPublisherOptions = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null, bootstrapIfEmpty: false)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(concurrentPublisherHandler),
+        };
+
+        try
+        {
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point != ManagedReplicaDurableBoundary.BootstrapCatchUpFailureObserved)
+                           return;
+
+                       // Runs synchronously, on the same call stack as the failing Open() call,
+                       // strictly between catch-up throwing and the rollback's own (re)acquisition
+                       // of the apply lease. Completing a whole, independent apply here -- rather
+                       // than merely holding the lease open -- proves the rollback's lease
+                       // reacquisition plus revision re-check (not just "the lease was held") is
+                       // what keeps a legitimately newer publish safe.
+                       var bootstrapped = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+                       ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                               concurrentPublisherOptions.WithoutLongPoll(),
+                               bootstrapped,
+                               new AhtolaSyncOptions(),
+                               CancellationToken.None)
+                           .GetAwaiter().GetResult();
+                   }))
+            {
+                Assert.Throws<InvalidOperationException>(() => AhtolaConnection.CreateReplica(options).Open());
+            }
+
+            // The concurrent publisher's revision-99 must survive: the rollback must have
+            // reacquired the apply lease, seen the on-disk revision no longer matches the
+            // bootstrap generation it set out to undo, and backed off instead of deleting.
+            File.Exists(path).Should().BeTrue(
+                "a concurrent caller's newer, valid publish must never be destroyed by another caller's failed-bootstrap rollback");
+            File.Exists(path + ".ahtola-replica-meta").Should().BeTrue();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-99");
+            concurrentPublisherHandler.CallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public async Task ConcurrentFirstOpensForTheSameMissingPathDoNotRaceEachOthersBootstrap()
     {
         var path = NewReplicaPath("managed-replica-concurrent-first-open");
@@ -2771,6 +2842,155 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public async Task ApplyLockTreatsASymbolicFileAliasAsTheSamePhysicalTargetAsItsRealPath()
+    {
+        // Closes the path-aliasing bypass: a purely textual Path.GetFullPath normalization would
+        // give the real path and a symbolic-link alias of it DIFFERENT lock keys, letting a writer
+        // through each one run the apply sequence concurrently instead of serializing. Physical
+        // file identity must treat them as the same target.
+        var path = NewReplicaPath("managed-replica-apply-lock-file-alias");
+        CreateInitializedDatabase(path);
+        var aliasPath = path + ".alias";
+
+        try
+        {
+            try
+            {
+                File.CreateSymbolicLink(aliasPath, path);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                Assert.Ignore("Creating symbolic links is not permitted on this host.");
+            }
+            catch (PlatformNotSupportedException)
+            {
+                Assert.Ignore("Symbolic links are not supported on this host.");
+            }
+
+            var firstLeaseAcquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseFirstLease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            var firstLeaseTask = Task.Run(async () =>
+            {
+                await using var lease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(path, CancellationToken.None);
+                firstLeaseAcquired.TrySetResult();
+                await releaseFirstLease.Task;
+            });
+
+            await firstLeaseAcquired.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var secondLeaseTask = Task.Run(async () =>
+            {
+                await using var lease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(aliasPath, CancellationToken.None);
+            });
+
+            // Give the alias-path acquisition a moment to reach (and start blocking on) the same
+            // physical-identity key before releasing the first lease -- this is what proves the
+            // alias resolves to the SAME lock rather than a merely lucky interleaving.
+            await Task.Delay(100);
+            secondLeaseTask.IsCompleted.Should().BeFalse(
+                "a symbolic-link alias of the same physical file must resolve to the same apply-lock key as its real path and serialize behind the held lease, never acquire it concurrently");
+
+            releaseFirstLease.TrySetResult();
+            await firstLeaseTask;
+            await secondLeaseTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            if (File.Exists(aliasPath))
+                File.Delete(aliasPath);
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ConcurrentFirstBootstrapsThroughADirectorySymbolicAliasSerializeInsteadOfRacingTheFileSwap()
+    {
+        // Same closed bypass as the file-alias case above, but for the OTHER lock-key branch: a
+        // first-ever bootstrap target that does not exist yet, keyed off its PARENT directory's
+        // physical identity plus file name. A directory symbolic link/junction that aliases the
+        // parent must still resolve to the same key as the real parent directory.
+        var realDirectory = Path.Combine(TestContext.CurrentContext.WorkDirectory, $"managed-replica-alias-real-{Guid.NewGuid():N}");
+        var aliasDirectory = Path.Combine(TestContext.CurrentContext.WorkDirectory, $"managed-replica-alias-link-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(realDirectory);
+        var realPath = Path.Combine(realDirectory, "replica.db");
+
+        try
+        {
+            try
+            {
+                Directory.CreateSymbolicLink(aliasDirectory, realDirectory);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                Assert.Ignore("Creating symbolic links is not permitted on this host.");
+            }
+            catch (PlatformNotSupportedException)
+            {
+                Assert.Ignore("Symbolic links are not supported on this host.");
+            }
+
+            var aliasPath = Path.Combine(aliasDirectory, "replica.db");
+            var image = CreateDatabaseImage(realPath + ".source");
+            var firstHandler = new PullUpdatesHandler([CreatePullResponse("revision-42", image)]);
+            var secondHandler = new PullUpdatesHandler([CreatePullResponse("revision-99", image)]);
+            var firstOptions = CreateOptions(realPath, firstHandler);
+            var secondOptions = CreateOptions(aliasPath, secondHandler);
+
+            var firstHasAcquiredLease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var firstReported = false;
+
+            Task firstBootstrap;
+            Task secondBootstrap;
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired && !firstReported)
+                       {
+                           firstReported = true;
+                           firstHasAcquiredLease.TrySetResult();
+                           releaseFirst.Task.Wait(TimeSpan.FromSeconds(5));
+                       }
+                   }))
+            {
+                firstBootstrap = ManagedReplicaBootstrapper.BootstrapAsync(firstOptions, CancellationToken.None);
+                await firstHasAcquiredLease.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+                secondBootstrap = ManagedReplicaBootstrapper.BootstrapAsync(secondOptions, CancellationToken.None);
+
+                // Give the second attempt -- reaching the identical physical target through a
+                // directory symbolic-link alias of the first's parent directory -- a moment to
+                // reach (and start blocking on) the very same apply lease before releasing the
+                // first: this is what proves the alias resolves to the same key rather than a
+                // lucky interleaving.
+                await Task.Delay(100);
+                secondBootstrap.IsCompleted.Should().BeFalse(
+                    "a directory symbolic-link alias of the target's parent must resolve to the same apply-lock key as the real parent directory, so the second bootstrap serializes behind the first's held lease instead of racing the file swap");
+
+                releaseFirst.TrySetResult();
+                await firstBootstrap;
+
+                Func<Task> awaitSecond = () => secondBootstrap.WaitAsync(TimeSpan.FromSeconds(5));
+                await awaitSecond.Should().ThrowAsync<NotSupportedException>(
+                    "the loser must see the same clean bootstrap-target-exists rejection a sequential caller would get through the alias, never a raw File.Move race");
+            }
+
+            File.ReadAllBytes(realPath).Should().Equal(image);
+            ManagedReplicaBootstrapper.LoadMetadata(realPath)!.Value.Revision.Should().Be("revision-42");
+            firstHandler.CallCount.Should().Be(1);
+            secondHandler.CallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(realPath);
+            if (Directory.Exists(aliasDirectory))
+                Directory.Delete(aliasDirectory);
+            if (Directory.Exists(realDirectory))
+                Directory.Delete(realDirectory, recursive: true);
+        }
+    }
+
+    [Test]
     public async Task IncrementalPullRejectsLocalDivergenceThatLandsAfterTheNetworkRoundTripUnderTheApplyLease()
     {
         var path = NewReplicaPath("managed-replica-post-lease-divergence");
@@ -2812,6 +3032,96 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             // yet). The apply itself must never have run: metadata stays on the prior revision.
             handler.CallCount.Should().Be(2, "the network round trip for the rejected pull still happens; only the apply is blocked");
             ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ConcurrentPullsAgainstTheSameStaleBaseNeverLetTheLoserRegressTheWinnersNewerRevision()
+    {
+        var path = NewReplicaPath("managed-replica-concurrent-pull-stale-base");
+        var image = CreateDatabaseImage(path + ".source");
+
+        // Bootstrap once, out of band, to reach a clean on-disk "revision-42" MVCC logical-log
+        // replica; both concurrent CheckForUpdatesAsync callers below race against this exact same
+        // snapshot as their starting point -- mirroring two waiters who both read stale local state
+        // before either one actually reaches the apply lease. A logical-protocol Open() always
+        // performs a mandatory post-bootstrap catch-up pull, so a second (no-op, same-revision)
+        // response must be queued for it too.
+        var bootstrapHandler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+        ]);
+        using (var bootstrapConnection = AhtolaConnection.CreateReplica(CreateOptions(path, bootstrapHandler)))
+            bootstrapConnection.Open();
+        var baseMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+        baseMetadata.Revision.Should().Be("revision-42");
+
+        // Winner: uncontested, reaches the apply lease first and publishes revision-100.
+        var winnerHandler = new PullUpdatesHandler([CreateLogicalPullResponse("revision-100", body: [])]);
+        var winnerOptions = CreateOptions(path, winnerHandler);
+
+        // Loser: negotiated its first response against the SAME "revision-42" snapshot as the
+        // winner, but does not reach the apply lease until after the winner has already published.
+        // That first response (revision-55) is OLDER than what the winner already published and
+        // must never be applied over it; its second, post-retry response -- correctly negotiated
+        // against the now-current revision-100 base -- legitimately advances to revision-101. Only
+        // reaching revision-101 (not revision-55, and not merely staying at revision-100) proves the
+        // stale response was discarded AND the retry actually ran to completion against the fresh
+        // base, rather than the loser simply failing or no-op'ing.
+        var loserHandler = new PullUpdatesHandler(
+        [
+            CreateLogicalPullResponse("revision-55", body: []),
+            CreateLogicalPullResponse("revision-101", body: []),
+        ]);
+        var loserOptions = CreateOptions(path, loserHandler);
+
+        var winnerHasAcquiredLease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseWinner = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var winnerReported = false;
+
+        try
+        {
+            Task<AhtolaSyncResult> winnerTask;
+            Task<AhtolaSyncResult> loserTask;
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired && !winnerReported)
+                       {
+                           winnerReported = true;
+                           winnerHasAcquiredLease.TrySetResult();
+                           releaseWinner.Task.Wait(TimeSpan.FromSeconds(5));
+                       }
+                   }))
+            {
+                winnerTask = Task.Run(() => ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                    winnerOptions, baseMetadata, new AhtolaSyncOptions(), CancellationToken.None));
+                await winnerHasAcquiredLease.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+                loserTask = Task.Run(() => ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                    loserOptions, baseMetadata, new AhtolaSyncOptions(), CancellationToken.None));
+
+                // Give the loser's own network round trip and lease-acquisition attempt time to
+                // reach (and start blocking on) the very same per-path exclusive lease the winner
+                // still holds: this is what proves serialization rather than a lucky interleaving.
+                await Task.Delay(100);
+                loserTask.IsCompleted.Should().BeFalse(
+                    "the second waiter must serialize behind the first's still-held apply lease, never race the apply");
+
+                releaseWinner.TrySetResult();
+                await winnerTask;
+                await loserTask;
+            }
+
+            winnerHandler.CallCount.Should().Be(1);
+            loserHandler.CallCount.Should().Be(2,
+                "the loser's stale first response must be discarded and the whole pull retried against the fresh base");
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-101",
+                "the loser's stale response (revision-55) must never be applied over the winner's already-published revision-100");
         }
         finally
         {

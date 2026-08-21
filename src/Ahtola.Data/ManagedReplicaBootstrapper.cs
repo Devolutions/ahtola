@@ -372,143 +372,250 @@ internal static class ManagedReplicaBootstrapper
     {
         ArgumentNullException.ThrowIfNull(pendingLocalChanges);
         ManagedReplicaSupportMatrix.ValidateOptions(options);
-        var requestLogical = metadata.Protocol == RemotePullProtocol.MvccLogical;
-        if (!requestLogical)
-        {
-            // A non-logical (page) protocol client can only ever receive a Pages response for
-            // any given pull, so this is known upfront and the guard can (and should) run before
-            // spending a network round-trip on a request that would have to be rejected anyway.
-            // This is the ORIGINAL, unconditional file-level check only (no pendingLocalChanges
-            // rejection): a page-protocol replica has never reconciled local writes via the pull
-            // path, so it has always tolerated unrelated journal-tracked pending push entries as
-            // long as the file itself has not diverged, and that historical behavior is
-            // preserved exactly here. A logical-protocol client cannot be checked here: its
-            // response might turn out to be a Pages stream too (see the equivalent, STRICTER
-            // check further down, after the actual stream kind of THIS response is known), or it
-            // might be a logical stream that needs no such check at all.
-            EnsureNoLocalDivergence(options.Path, metadata);
-        }
 
-        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pulling));
-        var payload = CreatePullRequest(metadata.Revision, options.LongPollTimeout, requestLogical);
-        using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
-        using var scope = options.EnterApplicationHttpScope();
-        using var client = options.HttpPolicy.MessageHandler is { } handler ? new HttpClient(handler, false) : new HttpClient();
-        client.Timeout = Timeout.InfiniteTimeSpan;
-        using var request = new HttpRequestMessage(HttpMethod.Post, CreatePullUpdatesUri(options.RemoteUri))
+        // The whole pull-and-apply cycle below is retried, in place, whenever the apply lease
+        // reveals that local state already moved past the snapshot (metadata, pending local
+        // changes) this iteration's request/response were negotiated against -- see
+        // TryUseCurrentLocalStateAsPullBase. That can only happen when a concurrent
+        // CheckForUpdatesAsync call (another sync/bootstrap-catch-up racing through the very same
+        // per-path apply lease, or -- today, before the cross-process OS lock lands -- a second
+        // process) commits its own apply while this call was waiting on the network or the lease,
+        // both of which are deliberately outside the lease's scope (see ManagedReplicaApplyLock).
+        // Retrying here, before any apply, means a stale response can never be applied on top of a
+        // base it was not actually built from: doing so could silently regress metadata (rewind
+        // Revision) or discard an intervening local change instead of reconciling it.
+        while (true)
         {
-            Content = new ByteArrayContent(payload),
-        };
-        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
-        request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
-        var token = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
-        ValidateAuthTokenTransport(request.RequestUri!, token);
-        if (token is not null)
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        var effectiveToken = timeout?.Token ?? cancellationToken;
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, effectiveToken).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
-        await using var stream = await response.Content.ReadAsStreamAsync(effectiveToken).ConfigureAwait(false);
-        var reader = new DelimitedProtobufReader(stream);
-        var message = await reader.ReadAsync(MaxHeaderLength, effectiveToken).ConfigureAwait(false)
-            ?? throw new InvalidDataException("The pull-updates response did not contain a protobuf header.");
-        var header = ParseHeader(message);
-
-        if (header.StreamKind == PullStreamKind.MvccLogicalLog)
-        {
-            if (header.ApplyMode == PullApplyMode.ReplaceBase)
-            {
-                throw new InvalidDataException(
-                    "The pull-updates response returned replace_base apply mode with an MVCC logical-log stream.");
-            }
+            var requestLogical = metadata.Protocol == RemotePullProtocol.MvccLogical;
             if (!requestLogical)
             {
-                throw new InvalidDataException(
-                    "The pull-updates response returned an MVCC logical-log stream, but a logical pull was not requested.");
+                // A non-logical (page) protocol client can only ever receive a Pages response for
+                // any given pull, so this is known upfront and the guard can (and should) run before
+                // spending a network round-trip on a request that would have to be rejected anyway.
+                // This is the ORIGINAL, unconditional file-level check only (no pendingLocalChanges
+                // rejection): a page-protocol replica has never reconciled local writes via the pull
+                // path, so it has always tolerated unrelated journal-tracked pending push entries as
+                // long as the file itself has not diverged, and that historical behavior is
+                // preserved exactly here. A logical-protocol client cannot be checked here: its
+                // response might turn out to be a Pages stream too (see the equivalent, STRICTER
+                // check further down, after the actual stream kind of THIS response is known), or it
+                // might be a logical stream that needs no such check at all.
+                EnsureNoLocalDivergence(options.Path, metadata);
             }
 
-            var body = await ReadRemainingBytesAsync(stream, effectiveToken).ConfigureAwait(false);
+            syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pulling));
+            var payload = CreatePullRequest(metadata.Revision, options.LongPollTimeout, requestLogical);
+            using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
+            using var scope = options.EnterApplicationHttpScope();
+            using var client = options.HttpPolicy.MessageHandler is { } handler ? new HttpClient(handler, false) : new HttpClient();
+            client.Timeout = Timeout.InfiniteTimeSpan;
+            using var request = new HttpRequestMessage(HttpMethod.Post, CreatePullUpdatesUri(options.RemoteUri))
+            {
+                Content = new ByteArrayContent(payload),
+            };
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
+            request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
+            var token = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
+            ValidateAuthTokenTransport(request.RequestUri!, token);
+            if (token is not null)
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            var effectiveToken = timeout?.Token ?? cancellationToken;
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, effectiveToken).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            await using var stream = await response.Content.ReadAsStreamAsync(effectiveToken).ConfigureAwait(false);
+            var reader = new DelimitedProtobufReader(stream);
+            var message = await reader.ReadAsync(MaxHeaderLength, effectiveToken).ConfigureAwait(false)
+                ?? throw new InvalidDataException("The pull-updates response did not contain a protobuf header.");
+            var header = ParseHeader(message);
 
-            // One exclusive apply lease spans the whole logical apply (below): commit, checkpoint,
-            // and metadata publication, or the callee's own rollback on failure. See
-            // ManagedReplicaApplyLock for why this seam is deliberately narrow (acquired only for
-            // the local apply, never for the network round trip above).
-            await using var logicalApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, effectiveToken)
+            if (header.StreamKind == PullStreamKind.MvccLogicalLog)
+            {
+                if (header.ApplyMode == PullApplyMode.ReplaceBase)
+                {
+                    throw new InvalidDataException(
+                        "The pull-updates response returned replace_base apply mode with an MVCC logical-log stream.");
+                }
+                if (!requestLogical)
+                {
+                    throw new InvalidDataException(
+                        "The pull-updates response returned an MVCC logical-log stream, but a logical pull was not requested.");
+                }
+
+                var body = await ReadRemainingBytesAsync(stream, effectiveToken).ConfigureAwait(false);
+
+                // One exclusive apply lease spans the whole logical apply (below): commit, checkpoint,
+                // and metadata publication, or the callee's own rollback on failure. See
+                // ManagedReplicaApplyLock for why this seam is deliberately narrow (acquired only for
+                // the local apply, never for the network round trip above).
+                await using var logicalApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, effectiveToken)
+                    .ConfigureAwait(false);
+                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
+                effectiveToken.ThrowIfCancellationRequested();
+
+                // The request above (and this response) were negotiated against `metadata` and
+                // `pendingLocalChanges` as they stood BEFORE the network round trip and the wait
+                // for this lease -- both entirely outside its scope by design. Re-validate that
+                // base is still current now that the lease is actually held: if another caller
+                // already advanced local state in the meantime, this response is stale relative to
+                // it and must never be applied; retry the whole pull against the now-current base
+                // instead of silently regressing metadata or discarding an intervening local change.
+                if (!TryUseCurrentLocalStateAsPullBase(
+                        options.Path, metadata, pendingLocalChanges,
+                        out var freshLogicalMetadata, out var freshLogicalPendingLocalChanges))
+                {
+                    metadata = freshLogicalMetadata;
+                    pendingLocalChanges = freshLogicalPendingLocalChanges;
+                    continue;
+                }
+
+                var (outcome, statistics) = await ApplyLogicalUpdatesAsync(
+                    options, metadata, header, body, syncOptions, pendingLocalChanges,
+                    payload.Length, reader.BytesRead + body.Length, effectiveToken)
+                    .ConfigureAwait(false);
+                return new AhtolaSyncResult(outcome, statistics);
+            }
+
+            // Pages stream (Incremental or ReplaceBase for a page-protocol remote, or a protocol-2
+            // remote using Pages+ReplaceBase for a validated full atomic replacement).
+            var pages = new List<PullPage>();
+            while (await reader.ReadAsync(MaxPageMessageLength, effectiveToken).ConfigureAwait(false) is { } page)
+            {
+                pages.Add(ParsePage(page));
+            }
+            if (pages.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
+            {
+                syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
+                return new AhtolaSyncResult(AhtolaSyncOutcome.UpToDate,
+                    new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, metadata.Revision));
+            }
+
+            if (pages.Count == 0)
+                throw new InvalidDataException("The pull-updates response changed revision without returning page data.");
+            if (string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
+                throw new InvalidDataException("The pull-updates response returned page data without changing revision.");
+            if (header.ApplyMode == PullApplyMode.ReplaceBase && (ulong)pages.Count != header.DatabasePages)
+            {
+                throw new InvalidDataException(
+                    "The pull-updates response used replace_base apply mode without returning every database page exactly once.");
+            }
+
+            // One exclusive apply lease spans the sidecar/fingerprint re-check below through the
+            // page-based apply and its metadata publication (or rollback). Acquired here -- after the
+            // network round trip, before any sidecar inspection -- so a concurrent local write can
+            // never land between "checked clean" and "applied" the way it could when the historical
+            // page-protocol path relied solely on the pre-network EnsureNoLocalDivergence check.
+            await using var pagesApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, effectiveToken)
                 .ConfigureAwait(false);
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
             effectiveToken.ThrowIfCancellationRequested();
 
-            var (outcome, statistics) = await ApplyLogicalUpdatesAsync(
-                options, metadata, header, body, syncOptions, pendingLocalChanges,
-                payload.Length, reader.BytesRead + body.Length, effectiveToken)
+            // The response turned out to be a Pages stream (Incremental or ReplaceBase) even though
+            // the remembered protocol is MvccLogical (a protocol-2 remote can still answer any given
+            // pull this way, e.g. after its logical log was garbage-collected). Unlike the ordinary,
+            // historical page-protocol path above, a logical-protocol replica's local writes are
+            // expected to keep living in the WAL between syncs (tracked by the change journal,
+            // reconciled by precollect/reapply for LOGICAL responses) -- but a raw page-based apply
+            // has no such reconciliation mechanism at all, so this surprise combination needs its
+            // OWN, apply-mode-aware guard: Incremental still rejects pending changes because a
+            // partial page patch cannot rebase journaled SQL. ReplaceBase installs every page, so
+            // pending statements can be replayed onto the new snapshot before metadata publication.
+            //
+            // The ordinary, historical page-protocol path (requestLogical == false) re-validates here
+            // too: EnsureNoLocalDivergence already ran once before the network call above, but only
+            // this post-network, lock-held check is authoritative -- a local write landing during the
+            // round trip must still be caught before the apply below mutates anything. Always the
+            // strict fingerprint/sidecar check here (never the checkpoint-and-discard behavior
+            // EnsurePagesApplyIsSafe uses for ReplaceBase): a page-protocol replica has no push
+            // mechanism, so there is no way to know local WAL content is already reflected upstream.
+            if (requestLogical)
+            {
+                // Same staleness hazard as the logical-log branch above, and for the same reason:
+                // this response (Incremental or ReplaceBase) was negotiated against `metadata` as
+                // it stood before the network round trip and the wait for this lease.
+                // CheckpointAndCleanSidecarsBeforePagesApply (the ReplaceBase sub-case below) has no
+                // fingerprint to compare against, because a logical-protocol replica's WAL is
+                // expected to keep evolving between syncs -- without this reload-and-compare, a
+                // stale ReplaceBase response could overwrite local state that a concurrent caller
+                // already advanced past it. Retry against the current base instead of applying it.
+                if (!TryUseCurrentLocalStateAsPullBase(
+                        options.Path, metadata, pendingLocalChanges,
+                        out var freshPagesMetadata, out var freshPagesPendingLocalChanges))
+                {
+                    metadata = freshPagesMetadata;
+                    pendingLocalChanges = freshPagesPendingLocalChanges;
+                    continue;
+                }
+
+                EnsurePagesApplyIsSafe(options.Path, metadata, pendingLocalChanges, header.ApplyMode);
+            }
+            else
+            {
+                CheckFileDivergence(options.Path, metadata);
+            }
+
+            await ApplyIncrementalPagesAsync(
+                    options, header, pages, metadata.ClientId, pendingLocalChanges, effectiveToken)
                 .ConfigureAwait(false);
-            return new AhtolaSyncResult(outcome, statistics);
-        }
-
-        // Pages stream (Incremental or ReplaceBase for a page-protocol remote, or a protocol-2
-        // remote using Pages+ReplaceBase for a validated full atomic replacement).
-        var pages = new List<PullPage>();
-        while (await reader.ReadAsync(MaxPageMessageLength, effectiveToken).ConfigureAwait(false) is { } page)
-        {
-            pages.Add(ParsePage(page));
-        }
-        if (pages.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
-        {
+            syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
             syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
-            return new AhtolaSyncResult(AhtolaSyncOutcome.UpToDate,
-                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, metadata.Revision));
+            return new AhtolaSyncResult(AhtolaSyncOutcome.RemoteChangesApplied,
+                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, header.Revision));
         }
+    }
 
-        if (pages.Count == 0)
-            throw new InvalidDataException("The pull-updates response changed revision without returning page data.");
-        if (string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
-            throw new InvalidDataException("The pull-updates response returned page data without changing revision.");
-        if (header.ApplyMode == PullApplyMode.ReplaceBase && (ulong)pages.Count != header.DatabasePages)
+    /// <summary>
+    /// Reloads the durable local state (metadata revision and pending-push change journal) from
+    /// disk while the apply lease for this pull is held, and compares it against the snapshot
+    /// (<paramref name="requestBaseMetadata"/>, <paramref name="requestBasePendingLocalChanges"/>)
+    /// the in-flight request and response were actually built from -- both captured before the
+    /// network round trip and the wait for the lease, entirely outside its scope by design (see
+    /// <see cref="ManagedReplicaApplyLock"/>). Returns false when local state already moved past
+    /// that base: another writer (a concurrent sync/bootstrap-catch-up racing through this same
+    /// lock, or -- today, before the cross-process OS lock lands -- another process) already
+    /// committed its own apply, or a new local change was journaled or acknowledged, while this
+    /// call waited. Applying a response negotiated against a base that no longer exists would
+    /// silently regress metadata (rewind <see cref="ManagedReplicaMetadata.Revision"/>) or discard
+    /// the intervening local change instead of reconciling it, so callers must discard the
+    /// in-flight response and retry the whole pull against <paramref name="freshMetadata"/> and
+    /// <paramref name="freshPendingLocalChanges"/> instead.
+    /// </summary>
+    private static bool TryUseCurrentLocalStateAsPullBase(
+        string databasePath,
+        ManagedReplicaMetadata requestBaseMetadata,
+        IReadOnlyList<ReplicaLocalChange> requestBasePendingLocalChanges,
+        out ManagedReplicaMetadata freshMetadata,
+        out IReadOnlyList<ReplicaLocalChange> freshPendingLocalChanges)
+    {
+        freshMetadata = LoadMetadata(databasePath)
+            ?? throw new NotSupportedException(
+                "Managed embedded replica metadata was removed while an update was in flight.");
+        freshPendingLocalChanges = ManagedReplicaChangeJournal.Open(databasePath).ReadBatch(int.MaxValue).Changes;
+
+        return string.Equals(freshMetadata.Revision, requestBaseMetadata.Revision, StringComparison.Ordinal)
+            && HaveSamePendingLocalChangeSequence(requestBasePendingLocalChanges, freshPendingLocalChanges);
+    }
+
+    /// <summary>
+    /// Compares two pending-local-change snapshots by their journal <see
+    /// cref="ReplicaLocalChange.Sequence"/> numbers only, in order, rather than by full record
+    /// equality: a given sequence's content is immutable once committed (the journal only ever
+    /// appends new entries with new sequence numbers, or removes acknowledged ones), but each
+    /// reload deserializes fresh byte arrays for <c>BeforeRecord</c> that would never
+    /// reference-equal an earlier snapshot's arrays even when nothing actually changed --
+    /// comparing the auto-generated record-struct equality directly would report every reload as
+    /// "changed" and make the retry loop above never converge.
+    /// </summary>
+    private static bool HaveSamePendingLocalChangeSequence(
+        IReadOnlyList<ReplicaLocalChange> a, IReadOnlyList<ReplicaLocalChange> b)
+    {
+        if (a.Count != b.Count)
+            return false;
+        for (var i = 0; i < a.Count; i++)
         {
-            throw new InvalidDataException(
-                "The pull-updates response used replace_base apply mode without returning every database page exactly once.");
+            if (a[i].Sequence != b[i].Sequence)
+                return false;
         }
-
-        // One exclusive apply lease spans the sidecar/fingerprint re-check below through the
-        // page-based apply and its metadata publication (or rollback). Acquired here -- after the
-        // network round trip, before any sidecar inspection -- so a concurrent local write can
-        // never land between "checked clean" and "applied" the way it could when the historical
-        // page-protocol path relied solely on the pre-network EnsureNoLocalDivergence check.
-        await using var pagesApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, effectiveToken)
-            .ConfigureAwait(false);
-        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
-        effectiveToken.ThrowIfCancellationRequested();
-
-        // The response turned out to be a Pages stream (Incremental or ReplaceBase) even though
-        // the remembered protocol is MvccLogical (a protocol-2 remote can still answer any given
-        // pull this way, e.g. after its logical log was garbage-collected). Unlike the ordinary,
-        // historical page-protocol path above, a logical-protocol replica's local writes are
-        // expected to keep living in the WAL between syncs (tracked by the change journal,
-        // reconciled by precollect/reapply for LOGICAL responses) -- but a raw page-based apply
-        // has no such reconciliation mechanism at all, so this surprise combination needs its
-        // OWN, apply-mode-aware guard: Incremental still rejects pending changes because a
-        // partial page patch cannot rebase journaled SQL. ReplaceBase installs every page, so
-        // pending statements can be replayed onto the new snapshot before metadata publication.
-        //
-        // The ordinary, historical page-protocol path (requestLogical == false) re-validates here
-        // too: EnsureNoLocalDivergence already ran once before the network call above, but only
-        // this post-network, lock-held check is authoritative -- a local write landing during the
-        // round trip must still be caught before the apply below mutates anything. Always the
-        // strict fingerprint/sidecar check here (never the checkpoint-and-discard behavior
-        // EnsurePagesApplyIsSafe uses for ReplaceBase): a page-protocol replica has no push
-        // mechanism, so there is no way to know local WAL content is already reflected upstream.
-        if (requestLogical)
-            EnsurePagesApplyIsSafe(options.Path, metadata, pendingLocalChanges, header.ApplyMode);
-        else
-            CheckFileDivergence(options.Path, metadata);
-
-        await ApplyIncrementalPagesAsync(
-                options, header, pages, metadata.ClientId, pendingLocalChanges, effectiveToken)
-            .ConfigureAwait(false);
-        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
-        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
-        return new AhtolaSyncResult(AhtolaSyncOutcome.RemoteChangesApplied,
-            new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, header.Revision));
+        return true;
     }
 
     /// <summary>
