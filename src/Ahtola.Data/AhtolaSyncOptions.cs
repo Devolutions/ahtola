@@ -20,9 +20,8 @@ public enum AhtolaPartialBootstrapKind
 
 /// <summary>
 /// Configures partial bootstrap and lazy page loading for an embedded replica.
-/// The pure-managed provider supports eager prefix selection only: the prefix must cover
-/// the complete remote database because the managed pager has no lazy page-fault storage.
-/// Query selection, segment loading, and prefetch are not supported by that provider.
+/// The pure-managed provider supports prefix selection and fetches missing pages on demand
+/// from the pinned bootstrap revision. Query selection is not supported by that provider.
 /// </summary>
 public sealed class AhtolaPartialBootstrapOptions
 {
@@ -45,8 +44,8 @@ public sealed class AhtolaPartialBootstrapOptions
 
     /// <summary>
     /// Creates a prefix strategy that bootstraps complete 4 KiB pages within the first
-    /// <paramref name="length"/> bytes. The pure-managed provider can open the replica only
-    /// when this range covers the complete remote database.
+    /// <paramref name="length"/> bytes. The pure-managed provider lazily fetches pages outside
+    /// this range when the pager first reads them.
     /// </summary>
     public static AhtolaPartialBootstrapOptions Prefix(
         int length,

@@ -13,6 +13,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     private IManagedDatabaseAdapter? _database;
     private AhtolaEncryptionFileSystem? _encryptionFileSystem;
     private ManagedReplicaBootstrapper.ManagedReplicaMetadata? _metadata;
+    private ManagedReplicaPageMaterializationRegistry.Lease? _materializationLease;
     private readonly AhtolaReplicaOptions _options;
     private readonly ManagedReplicaSyncRegistry.Entry _syncEntry;
     private volatile ManagedReplicaChangeJournal _changeJournal;
@@ -31,6 +32,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         IManagedDatabaseAdapter database,
         AhtolaEncryptionFileSystem? encryptionFileSystem,
         ManagedReplicaBootstrapper.ManagedReplicaMetadata? metadata,
+        ManagedReplicaPageMaterializationRegistry.Lease? materializationLease,
         AhtolaReplicaOptions options,
         ManagedReplicaChangeJournal changeJournal,
         ManagedReplicaSyncRegistry.Entry syncEntry)
@@ -38,6 +40,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         _database = database;
         _encryptionFileSystem = encryptionFileSystem;
         _metadata = metadata;
+        _materializationLease = materializationLease;
         _options = options;
         _changeJournal = changeJournal;
         _syncEntry = syncEntry;
@@ -47,6 +50,12 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
 
     public IManagedDatabaseAdapter Database
         => _database ?? throw new ObjectDisposedException(nameof(ManagedReplicaConnectionHost));
+
+    internal bool TryGetDatabase(out IManagedDatabaseAdapter? database)
+    {
+        database = _database;
+        return database is not null;
+    }
 
     public bool SupportsSync => _metadata is not null;
 
@@ -322,14 +331,16 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         AhtolaReplicaOptions options,
         ManagedReplicaSyncRegistry.Entry syncEntry)
     {
-        var (database, encryptionFileSystem) = OpenDatabase(options);
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(options.Path);
+        var (database, encryptionFileSystem, materializationLease) = OpenDatabase(options, metadata);
         try
         {
             _ = database.Connect();
             return new ManagedReplicaConnectionHost(
                 database,
                 encryptionFileSystem,
-                ManagedReplicaBootstrapper.LoadMetadata(options.Path),
+                metadata,
+                materializationLease,
                 options,
                 ManagedReplicaChangeJournal.Open(options.Path),
                 syncEntry);
@@ -339,6 +350,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         {
             database.Dispose();
             encryptionFileSystem?.Dispose();
+            materializationLease?.Dispose();
             throw;
         }
     }
@@ -350,14 +362,54 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     /// as long as it remains open -- it is consulted on every subsequent page read/write, not
     /// only at open time.
     /// </summary>
-    private static (IManagedDatabaseAdapter Database, AhtolaEncryptionFileSystem? FileSystem) OpenDatabase(
-        AhtolaReplicaOptions options)
+    private static (
+        IManagedDatabaseAdapter Database,
+        AhtolaEncryptionFileSystem? EncryptionFileSystem,
+        ManagedReplicaPageMaterializationRegistry.Lease? MaterializationLease) OpenDatabase(
+        AhtolaReplicaOptions options,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata? metadata)
     {
+        var stateExists = File.Exists(
+            options.Path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+        var publication = ManagedReplicaBootstrapper.GetBootstrapPublicationInfo(options.Path);
+        if (publication.RequiresPageState && !stateExists)
+        {
+            throw new InvalidDataException(
+                "Managed replica bootstrap state requires lazy-page state that is missing.");
+        }
+
+        if (stateExists)
+        {
+            var requiredMetadata = metadata
+                ?? throw new InvalidDataException(
+                    "Managed replica lazy-page state exists without revision metadata.");
+            var materializationLease = ManagedReplicaPageMaterializationRegistry.Acquire(
+                PhysicalFileSystem.Instance,
+                options.Path,
+                requiredMetadata.Revision,
+                new ManagedReplicaPullPageSource(options),
+                options.PartialBootstrap?.Prefetch ?? false);
+            try
+            {
+                var database = ManagedDatabaseAdapter.OpenFile(
+                    options.Path,
+                    materializationLease.FileSystem,
+                    readOnly: false);
+                _ = database.Connect();
+                return (database, null, materializationLease);
+            }
+            catch
+            {
+                materializationLease.Dispose();
+                throw;
+            }
+        }
+
         var opened = ManagedReplicaEncryption.OpenDatabase(options.Path, options.RemoteEncryption);
         try
         {
             _ = opened.Database.Connect();
-            return (opened.Database, opened.FileSystem);
+            return (opened.Database, opened.FileSystem, null);
         }
         catch
         {
@@ -400,7 +452,22 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     }
 
     private static bool IsReplicaFilePresent(string path)
-        => File.Exists(path) && new FileInfo(path).Length > 0;
+    {
+        var publication = ManagedReplicaBootstrapper.GetBootstrapPublicationInfo(path);
+        var metadataExists = File.Exists(path + ManagedReplicaBootstrapper.MetadataSuffix);
+        var pageStateExists = File.Exists(
+            path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+        if (!File.Exists(path)
+            || new FileInfo(path).Length == 0
+            || !publication.IsComplete
+            || publication.MarkerExists && !metadataExists
+            || publication.RequiresPageState && !pageStateExists)
+        {
+            return false;
+        }
+
+        return !pageStateExists || metadataExists;
+    }
 
     private static async Task BootstrapAndCatchUpAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
     {
@@ -409,12 +476,6 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             // Another Open() call already completed bootstrap+catch-up while this one waited
             // its turn for exclusive publication access; nothing left to do.
             return;
-        }
-
-        if (File.Exists(options.Path))
-        {
-            throw new NotSupportedException(
-                "Managed embedded replica bootstrap only installs a database at a missing replica path.");
         }
 
         await ManagedReplicaBootstrapper.BootstrapAsync(options, cancellationToken).ConfigureAwait(false);
@@ -508,6 +569,14 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         if (metadata is not { Protocol: RemotePullProtocol.MvccLogical } value)
             return;
 
+        value = await ManagedReplicaBootstrapper
+            .CompletePartialReplicaAsync(
+                options,
+                value,
+                allowTrackedLocalMutations: false,
+                retainedMaterializer: null,
+                cancellationToken)
+            .ConfigureAwait(false);
         _ = await ManagedReplicaBootstrapper.CheckForUpdatesAsync(
                 options.WithoutLongPoll(),
                 value,
@@ -552,9 +621,25 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         AhtolaSyncOptions syncOptions,
         CancellationToken cancellationToken)
     {
-        var push = await PushLocalChangesAsync(replicaOptions, metadata, syncOptions, cancellationToken)
+        var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0;
+        var retainedMaterializer = _materializationLease?.FileSystem;
+        var push = await PushLocalChangesAsync(
+                replicaOptions,
+                metadata,
+                syncOptions,
+                retainedMaterializer,
+                cancellationToken)
             .ConfigureAwait(false);
         metadata = push.Metadata;
+        metadata = await ManagedReplicaBootstrapper
+            .CompletePartialReplicaAsync(
+                replicaOptions,
+                metadata,
+                allowTrackedLocalMutations: hasTrackedLocalChanges,
+                retainedMaterializer,
+                cancellationToken)
+            .ConfigureAwait(false);
+        _metadata = metadata;
 
         // Anything still sitting in the change journal after the push batch above (capped by
         // PushOperationsThreshold) has not reached the server, so the pull below must reconcile
@@ -587,9 +672,15 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             Interlocked.Exchange(ref _connection, null);
             ReleaseSqlTransactionOperation();
             var database = Interlocked.Exchange(ref _database, null);
-            database?.Dispose();
-            var encryptionFileSystem = Interlocked.Exchange(ref _encryptionFileSystem, null);
-            encryptionFileSystem?.Dispose();
+            try
+            {
+                database?.Dispose();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _encryptionFileSystem, null)?.Dispose();
+                Interlocked.Exchange(ref _materializationLease, null)?.Dispose();
+            }
         }
         finally
         {
@@ -608,22 +699,58 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
 
     internal void ReopenAfterPublication()
     {
-        var (database, encryptionFileSystem) = OpenDatabase(_options);
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(_options.Path);
+        var retainedLease = _materializationLease;
+        IManagedDatabaseAdapter? database = null;
+        AhtolaEncryptionFileSystem? encryptionFileSystem = null;
+        ManagedReplicaPageMaterializationRegistry.Lease? materializationLease = null;
+        var reusedRetainedLease = retainedLease is not null
+            && File.Exists(_options.Path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
         try
         {
+            if (reusedRetainedLease)
+            {
+                database = ManagedDatabaseAdapter.OpenFile(
+                    _options.Path,
+                    retainedLease!.FileSystem,
+                    readOnly: false);
+                materializationLease = retainedLease;
+            }
+            else
+            {
+                if (retainedLease is not null)
+                {
+                    _materializationLease = null;
+                    retainedLease.Dispose();
+                }
+                var opened = OpenDatabase(_options, metadata);
+                database = opened.Database;
+                encryptionFileSystem = opened.EncryptionFileSystem;
+                materializationLease = opened.MaterializationLease;
+            }
+
             var changeJournal = ManagedReplicaChangeJournal.Open(_options.Path);
             InstallChangeCapture(database.Connection);
             if (Interlocked.CompareExchange(ref _database, database, null) is not null)
                 throw new InvalidOperationException("Managed embedded replica host reopened more than once.");
+            _metadata = metadata;
+            _materializationLease = materializationLease;
             _changeJournal = changeJournal;
             _encryptionFileSystem = encryptionFileSystem;
             database = null!;
             encryptionFileSystem = null;
+            materializationLease = null;
         }
         finally
         {
             database?.Dispose();
             encryptionFileSystem?.Dispose();
+            if (materializationLease is not null)
+            {
+                if (reusedRetainedLease)
+                    _materializationLease = null;
+                materializationLease.Dispose();
+            }
         }
     }
 
@@ -757,6 +884,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         AhtolaReplicaOptions replicaOptions,
         ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
         AhtolaSyncOptions syncOptions,
+        ManagedReplicaPageMaterializingFileSystem? retainedMaterializer,
         CancellationToken cancellationToken)
     {
         var maximumChanges = replicaOptions.PushOperationsThreshold is { } threshold
@@ -785,7 +913,11 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                 cancellationToken)
             .ConfigureAwait(false);
         var updatedMetadata = await ManagedReplicaBootstrapper
-            .RecordLocalPushAsync(replicaOptions, metadata, cancellationToken)
+            .RecordLocalPushAsync(
+                replicaOptions,
+                metadata,
+                retainedMaterializer,
+                cancellationToken)
             .ConfigureAwait(false);
         _changeJournal.Acknowledge(batch.Watermark);
         return new LocalPushResult(batch.Changes.Count, updatedMetadata);

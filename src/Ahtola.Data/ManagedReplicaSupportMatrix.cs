@@ -24,10 +24,12 @@ internal static class ManagedReplicaSupportMatrix
                     "Managed embedded replicas do not support the selected partial bootstrap mode.");
             }
 
-            if (partialBootstrap.SegmentSize is not null || partialBootstrap.Prefetch)
+            if (partialBootstrap.SegmentSize is { } segmentSize
+                && (segmentSize < ManagedReplicaBootstrapper.PageSize
+                    || segmentSize % ManagedReplicaBootstrapper.PageSize != 0))
             {
                 throw new NotSupportedException(
-                    "Managed embedded replicas support eager prefix bootstrap only; lazy segment loading and prefetch are not supported.");
+                    "Managed embedded replica lazy segment size must be a whole number of 4 KiB pages.");
             }
 
             if (partialBootstrap.PrefixLength < 4096)

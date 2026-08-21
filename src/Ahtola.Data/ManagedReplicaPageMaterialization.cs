@@ -39,6 +39,7 @@ internal sealed class ManagedReplicaPageMaterializingFileSystem :
     IDisposable
 {
     internal const string StateSuffix = ".ahtola-replica-pages";
+    internal const string OwnershipLockSuffix = StateSuffix + ".lock";
     internal const int DefaultSegmentSize = 128 * 1024;
 
     private readonly IFileSystem _inner;
@@ -59,6 +60,7 @@ internal sealed class ManagedReplicaPageMaterializingFileSystem :
         ArgumentException.ThrowIfNullOrWhiteSpace(expectedRevision);
         ArgumentNullException.ThrowIfNull(pageSource);
 
+        var enforcePhysicalOwnership = UsesPhysicalStorage(inner);
         _decoratedInner = inner;
         _inner = CreateStorageFileSystem(inner);
         _databasePath = NormalizePath(databasePath);
@@ -67,7 +69,8 @@ internal sealed class ManagedReplicaPageMaterializingFileSystem :
             databasePath,
             expectedRevision,
             pageSource,
-            prefetchSegments);
+            prefetchSegments,
+            enforcePhysicalOwnership);
     }
 
     internal static void InitializeState(
@@ -94,6 +97,48 @@ internal sealed class ManagedReplicaPageMaterializingFileSystem :
     {
         ThrowIfDisposed();
         return _materializer.IsSegmentMaterialized(pageId);
+    }
+
+    internal bool HasLocalMutations
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return _materializer.HasLocalMutations;
+        }
+    }
+
+    internal bool LocalMutationsPushed
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return _materializer.LocalMutationsPushed;
+        }
+    }
+
+    internal void MarkLocalMutationsPushed()
+    {
+        ThrowIfDisposed();
+        _materializer.MarkLocalMutationsPushed();
+    }
+
+    internal Task MaterializeAllAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        return _materializer.MaterializeAllAsync(cancellationToken);
+    }
+
+    internal string ComputeDatabaseFingerprint()
+    {
+        ThrowIfDisposed();
+        return _materializer.ComputeDatabaseFingerprint();
+    }
+
+    internal void EnableSegmentPrefetch()
+    {
+        ThrowIfDisposed();
+        _materializer.EnableSegmentPrefetch();
     }
 
     IFileSystem IFileSystemDecorator.InnerFileSystem => _decoratedInner;
@@ -153,6 +198,15 @@ internal sealed class ManagedReplicaPageMaterializingFileSystem :
             _ => fileSystem,
         };
 
+    private static bool UsesPhysicalStorage(IFileSystem fileSystem)
+        => fileSystem switch
+        {
+            PhysicalFileSystem => true,
+            AhtolaEncryptionFileSystem encrypted => encrypted.Inner is PhysicalFileSystem,
+            AhtolaPageCodecFileSystem codec => codec.Inner is PhysicalFileSystem,
+            _ => false,
+        };
+
     private static StringComparer PathComparer =>
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
@@ -192,18 +246,121 @@ internal sealed class ManagedReplicaPageMaterializingFileSystem :
     }
 }
 
+internal static class ManagedReplicaPageMaterializationRegistry
+{
+    private static readonly object Gate = new();
+    private static readonly Dictionary<string, Entry> Entries = new(PathComparer);
+
+    internal static Lease Acquire(
+        IFileSystem inner,
+        string databasePath,
+        string expectedRevision,
+        IManagedReplicaPageSource pageSource,
+        bool prefetchSegments)
+    {
+        ArgumentNullException.ThrowIfNull(inner);
+        ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedRevision);
+        ArgumentNullException.ThrowIfNull(pageSource);
+
+        var key = NormalizePath(databasePath);
+        lock (Gate)
+        {
+            if (!Entries.TryGetValue(key, out var entry))
+            {
+                entry = new Entry(
+                    new ManagedReplicaPageMaterializingFileSystem(
+                        inner,
+                        databasePath,
+                        expectedRevision,
+                        pageSource,
+                        prefetchSegments),
+                    expectedRevision);
+                Entries.Add(key, entry);
+            }
+            else if (!string.Equals(entry.Revision, expectedRevision, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "Managed replica page materialization is already open at a different server revision.");
+            }
+            else if (prefetchSegments)
+            {
+                entry.FileSystem.EnableSegmentPrefetch();
+            }
+
+            entry.ReferenceCount++;
+            return new Lease(key, entry.FileSystem);
+        }
+    }
+
+    private static void Release(string key)
+    {
+        lock (Gate)
+        {
+            if (!Entries.TryGetValue(key, out var entry))
+                return;
+
+            entry.ReferenceCount--;
+            if (entry.ReferenceCount == 0)
+            {
+                try
+                {
+                    entry.FileSystem.Dispose();
+                }
+                finally
+                {
+                    Entries.Remove(key);
+                }
+            }
+        }
+    }
+
+    private static StringComparer PathComparer =>
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
+    private static string NormalizePath(string path)
+        => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+
+    private sealed class Entry(
+        ManagedReplicaPageMaterializingFileSystem fileSystem,
+        string revision)
+    {
+        internal ManagedReplicaPageMaterializingFileSystem FileSystem { get; } = fileSystem;
+
+        internal string Revision { get; } = revision;
+
+        internal int ReferenceCount { get; set; }
+    }
+
+    internal sealed class Lease(string key, ManagedReplicaPageMaterializingFileSystem fileSystem) : IDisposable
+    {
+        private int _disposed;
+
+        internal ManagedReplicaPageMaterializingFileSystem FileSystem { get; } = fileSystem;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                Release(key);
+        }
+    }
+}
+
 internal sealed class ManagedReplicaPageMaterializer : IDisposable
 {
-    private const int StateVersion = 1;
-    private const int CommitVersion = 1;
+    private const int StateVersion = 3;
+    private const int CommitVersion = 2;
+    private const int MutationIntentVersion = 1;
     private const int HeaderPrefixLength = 36;
-    private const int CommitPayloadPrefixLength = 24;
+    private const int CommitPayloadPrefixLength = 28;
+    private const int MutationIntentPayloadLength = 104;
     private const int HashLength = 32;
     private const int MaximumRevisionLength = 64 * 1024;
     private const int MaximumCommitPayloadLength = 64 * 1024 * 1024;
     private const ulong NoTruncation = ulong.MaxValue;
     private static readonly byte[] HeaderMagic = "AHTLPM01"u8.ToArray();
     private static readonly byte[] CommitMagic = "MPRC"u8.ToArray();
+    private static readonly byte[] MutationIntentMagic = "MPRI"u8.ToArray();
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
     private readonly object _stateGate = new();
@@ -211,17 +368,19 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
     private readonly CancellationTokenSource _shutdown = new();
     private readonly IFile _databaseFile;
     private readonly IFile _stateFile;
+    private readonly FileStream? _ownershipLock;
     private readonly IManagedReplicaPageSource _pageSource;
     private readonly Dictionary<ulong, LoadGroup> _loads = [];
     private readonly PageRangeSet _materialized;
-    private readonly PageRangeSet _pendingMaterialized = new();
     private readonly string _revision;
     private readonly int _pageSize;
     private readonly ulong _remotePageCount;
     private readonly ulong _segmentPages;
-    private readonly bool _prefetchSegments;
+    private int _prefetchSegments;
     private ulong _currentPageCount;
-    private ulong? _pendingTruncateTo;
+    private bool _hasLocalMutations;
+    private bool _localMutationsPushed;
+    private int _unusable;
     private int _disposed;
 
     internal ManagedReplicaPageMaterializer(
@@ -229,15 +388,19 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
         string databasePath,
         string expectedRevision,
         IManagedReplicaPageSource pageSource,
-        bool prefetchSegments)
+        bool prefetchSegments,
+        bool enforcePhysicalOwnership)
     {
         _pageSource = pageSource;
-        _prefetchSegments = prefetchSegments;
+        _prefetchSegments = prefetchSegments ? 1 : 0;
 
+        FileStream? ownershipLock = null;
         IFile? stateFile = null;
         IFile? databaseFile = null;
         try
         {
+            if (enforcePhysicalOwnership)
+                ownershipLock = AcquireOwnershipLock(databasePath);
             stateFile = fileSystem.OpenFile(
                 databasePath + ManagedReplicaPageMaterializingFileSystem.StateSuffix,
                 FileOpenMode.OpenExisting);
@@ -249,6 +412,8 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
             }
 
             databaseFile = fileSystem.OpenFile(databasePath, FileOpenMode.OpenExisting);
+            if (loaded.PendingMutation is { } pendingMutation)
+                loaded = RecoverPendingMutation(stateFile, databaseFile, loaded, pendingMutation);
             var expectedLength = checked((long)loaded.CurrentPageCount * loaded.PageSize);
             if (databaseFile.Length != expectedLength)
             {
@@ -266,15 +431,20 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
             stateFile = null;
             _databaseFile = databaseFile;
             databaseFile = null;
+            _ownershipLock = ownershipLock;
+            ownershipLock = null;
             _materialized = loaded.Materialized;
             _revision = loaded.Revision;
             _pageSize = loaded.PageSize;
             _remotePageCount = loaded.RemotePageCount;
             _currentPageCount = loaded.CurrentPageCount;
             _segmentPages = loaded.SegmentSize / checked((ulong)loaded.PageSize);
+            _hasLocalMutations = loaded.HasLocalMutations;
+            _localMutationsPushed = loaded.LocalMutationsPushed;
         }
         finally
         {
+            ownershipLock?.Dispose();
             stateFile?.Dispose();
             databaseFile?.Dispose();
         }
@@ -331,7 +501,9 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
             var commit = BuildCommit(
                 databasePages,
                 NoTruncation,
-                materialized.Snapshot());
+                materialized.Snapshot(),
+                hasLocalMutations: false,
+                localMutationsPushed: false);
             state.Write(0, header);
             state.Write(header.Length, commit);
             state.FlushToDisk();
@@ -395,6 +567,101 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
         }
     }
 
+    internal bool HasLocalMutations
+    {
+        get
+        {
+            lock (_stateGate)
+                return _hasLocalMutations;
+        }
+    }
+
+    internal bool LocalMutationsPushed
+    {
+        get
+        {
+            lock (_stateGate)
+                return _localMutationsPushed;
+        }
+    }
+
+    internal void MarkLocalMutationsPushed()
+    {
+        ThrowIfDisposed();
+        _publicationGate.Wait();
+        try
+        {
+            ThrowIfDisposed();
+            bool hasLocalMutations;
+            lock (_stateGate)
+                hasLocalMutations = _hasLocalMutations;
+            AppendCommit(
+                _currentPageCount,
+                NoTruncation,
+                [],
+                hasLocalMutations,
+                localMutationsPushed: true);
+            lock (_stateGate)
+                _localMutationsPushed = true;
+        }
+        finally
+        {
+            _publicationGate.Release();
+        }
+    }
+
+    internal async Task MaterializeAllAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+
+        ulong currentPageCount;
+        lock (_stateGate)
+            currentPageCount = _currentPageCount;
+
+        for (ulong start = 0; start < currentPageCount; start += _segmentPages)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var endExclusive = Math.Min(checked(start + _segmentPages), currentPageCount);
+            await EnsurePagesAsync(start, endExclusive, cancellationToken).ConfigureAwait(false);
+        }
+
+        lock (_stateGate)
+        {
+            if (!IsRangeMaterializedNoLock(0, _currentPageCount))
+                throw new InvalidDataException("The managed replica could not materialize its complete local image.");
+        }
+    }
+
+    internal string ComputeDatabaseFingerprint()
+    {
+        ThrowIfDisposed();
+        _publicationGate.Wait();
+        try
+        {
+            ThrowIfDisposed();
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = new byte[128 * 1024];
+            for (long position = 0; position < _databaseFile.Length;)
+            {
+                var length = checked((int)Math.Min(buffer.Length, _databaseFile.Length - position));
+                var read = _databaseFile.Read(position, buffer.AsSpan(0, length));
+                if (read != length)
+                    throw new InvalidDataException("Managed replica database changed while it was being fingerprinted.");
+                hash.AppendData(buffer, 0, read);
+                position += read;
+            }
+
+            return Convert.ToHexString(hash.GetHashAndReset());
+        }
+        finally
+        {
+            _publicationGate.Release();
+        }
+    }
+
+    internal void EnableSegmentPrefetch()
+        => Volatile.Write(ref _prefetchSegments, 1);
+
     internal void Write(IFile file, long position, ReadOnlySpan<byte> source)
     {
         ThrowIfDisposed();
@@ -420,30 +687,67 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
                     "A managed replica database write would leave a partial trailing page.");
             }
 
+            ulong originalPageCount;
+            PageRange[] materializedByWrite;
             lock (_stateGate)
-                ValidateWriteCoverageNoLock(writeStart, writeEnd);
-
-            file.Write(position, source);
-            var length = file.Length;
-            if (length % _pageSize != 0)
             {
-                throw new InvalidDataException(
-                    "A managed replica database write left a partial trailing page.");
+                ValidateWriteCoverageNoLock(writeStart, writeEnd);
+                originalPageCount = _currentPageCount;
+                materializedByWrite = GetCompletelyWrittenMissingPagesNoLock(
+                    writeStart,
+                    writeEnd,
+                    resultingLength / (ulong)_pageSize);
             }
 
-            var currentPages = checked((ulong)(length / _pageSize));
-            lock (_stateGate)
+            var before = ReadPadded(file, position, source.Length);
+            var intent = new MutationIntent(
+                MutationKind.Write,
+                originalPageCount,
+                resultingLength / (ulong)_pageSize,
+                writeStart,
+                checked((ulong)source.Length),
+                SHA256.HashData(before),
+                SHA256.HashData(source));
+            AppendStateRecord(BuildMutationIntent(intent));
+
+            try
             {
-                _currentPageCount = currentPages;
-                var firstCompletePage = checked((writeStart + (ulong)_pageSize - 1) / (ulong)_pageSize);
-                var lastCompletePageExclusive = writeEnd / (ulong)_pageSize;
-                for (var page = firstCompletePage;
-                     page < lastCompletePageExclusive && page < currentPages;
-                     page++)
+                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.PageMutationIntentPersisted);
+                file.Write(position, source);
+                file.FlushToDisk();
+                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.PageMutationDatabasePersisted);
+                var length = file.Length;
+                if (length % _pageSize != 0)
                 {
-                    if (!IsMaterializedNoLock(page))
-                        _pendingMaterialized.Add(new PageRange(page, 1));
+                    throw new InvalidDataException(
+                        "A managed replica database write left a partial trailing page.");
                 }
+
+                var currentPages = checked((ulong)(length / _pageSize));
+                if (currentPages != intent.TargetPageCount)
+                {
+                    throw new InvalidDataException(
+                        "A managed replica database write produced an unexpected file length.");
+                }
+
+                AppendCommit(
+                    currentPages,
+                    NoTruncation,
+                    materializedByWrite,
+                    hasLocalMutations: true,
+                    localMutationsPushed: false);
+                lock (_stateGate)
+                {
+                    _currentPageCount = currentPages;
+                    _materialized.Add(materializedByWrite);
+                    _hasLocalMutations = true;
+                    _localMutationsPushed = false;
+                }
+            }
+            catch
+            {
+                Volatile.Write(ref _unusable, 1);
+                throw;
             }
         }
         finally
@@ -471,11 +775,24 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
         }
     }
 
+    private PageRange[] GetCompletelyWrittenMissingPagesNoLock(
+        ulong writeStart,
+        ulong writeEnd,
+        ulong resultingPageCount)
+        => GetCompletelyWrittenMissingPages(
+            writeStart,
+            writeEnd,
+            resultingPageCount,
+            _pageSize,
+            _materialized);
+
     internal void SetLength(IFile file, long length)
     {
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(file);
         ArgumentOutOfRangeException.ThrowIfNegative(length);
+        if (length == 0)
+            throw new InvalidDataException("A managed replica database cannot be truncated to zero pages.");
         if (length % _pageSize != 0)
         {
             throw new InvalidDataException(
@@ -486,20 +803,51 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
         try
         {
             ThrowIfDisposed();
-            file.SetLength(length);
             var pageCount = checked((ulong)(length / _pageSize));
+            ulong originalPageCount;
             lock (_stateGate)
+                originalPageCount = _currentPageCount;
+            if (pageCount == originalPageCount)
             {
-                if (pageCount < _currentPageCount)
-                {
-                    _materialized.Trim(pageCount);
-                    _pendingMaterialized.Trim(pageCount);
-                    _pendingTruncateTo = _pendingTruncateTo is { } prior
-                        ? Math.Min(prior, pageCount)
-                        : pageCount;
-                }
+                file.SetLength(length);
+                return;
+            }
 
-                _currentPageCount = pageCount;
+            var intent = new MutationIntent(
+                MutationKind.Resize,
+                originalPageCount,
+                pageCount,
+                Position: 0,
+                Length: 0,
+                new byte[HashLength],
+                new byte[HashLength]);
+            AppendStateRecord(BuildMutationIntent(intent));
+
+            try
+            {
+                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.PageMutationIntentPersisted);
+                file.SetLength(length);
+                file.FlushToDisk();
+                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.PageMutationDatabasePersisted);
+                AppendCommit(
+                    pageCount,
+                    pageCount < originalPageCount ? pageCount : NoTruncation,
+                    [],
+                    hasLocalMutations: true,
+                    localMutationsPushed: false);
+                lock (_stateGate)
+                {
+                    if (pageCount < originalPageCount)
+                        _materialized.Trim(pageCount);
+                    _currentPageCount = pageCount;
+                    _hasLocalMutations = true;
+                    _localMutationsPushed = false;
+                }
+            }
+            catch
+            {
+                Volatile.Write(ref _unusable, 1);
+                throw;
             }
         }
         finally
@@ -518,33 +866,6 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
         {
             ThrowIfDisposed();
             file.FlushToDisk();
-
-            PageRange[] pending;
-            ulong currentPages;
-            ulong? truncateTo;
-            lock (_stateGate)
-            {
-                pending = _pendingMaterialized.Snapshot();
-                currentPages = _currentPageCount;
-                truncateTo = _pendingTruncateTo;
-            }
-
-            if (pending.Length == 0 && truncateTo is null)
-                return;
-
-            AppendCommit(
-                currentPages,
-                truncateTo ?? NoTruncation,
-                pending);
-            lock (_stateGate)
-            {
-                if (truncateTo is { } truncation)
-                    _materialized.Trim(truncation);
-                _materialized.Trim(currentPages);
-                _materialized.Add(pending);
-                _pendingMaterialized.Clear();
-                _pendingTruncateTo = null;
-            }
         }
         finally
         {
@@ -563,6 +884,7 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
         {
             _databaseFile.Dispose();
             _stateFile.Dispose();
+            _ownershipLock?.Dispose();
         }
         finally
         {
@@ -591,7 +913,7 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
 
             var candidateStart = requiredStart;
             var candidateEnd = requiredEndExclusive;
-            if (_prefetchSegments)
+            if (Volatile.Read(ref _prefetchSegments) != 0)
             {
                 candidateStart = requiredStart / _segmentPages * _segmentPages;
                 candidateEnd = Math.Min(
@@ -726,7 +1048,12 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
 
             _databaseFile.FlushToDisk();
             var ranges = PageRangeSet.FromPageIds(publishedIds, _currentPageCount).Snapshot();
-            AppendCommit(_currentPageCount, NoTruncation, ranges);
+            AppendCommit(
+                _currentPageCount,
+                NoTruncation,
+                ranges,
+                _hasLocalMutations,
+                _localMutationsPushed);
             lock (_stateGate)
                 _materialized.Add(ranges);
         }
@@ -778,30 +1105,53 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
     }
 
     private bool IsMaterializedNoLock(ulong pageId)
-        => _materialized.Contains(pageId) || _pendingMaterialized.Contains(pageId);
+        => _materialized.Contains(pageId);
 
     private void AppendCommit(
         ulong currentPageCount,
         ulong truncateTo,
-        IReadOnlyList<PageRange> ranges)
+        IReadOnlyList<PageRange> ranges,
+        bool hasLocalMutations,
+        bool localMutationsPushed)
+        => AppendStateRecord(
+            BuildCommit(
+                currentPageCount,
+                truncateTo,
+                ranges,
+                hasLocalMutations,
+                localMutationsPushed));
+
+    private void AppendStateRecord(byte[] record)
     {
-        var record = BuildCommit(currentPageCount, truncateTo, ranges);
-        var originalLength = _stateFile.Length;
         try
         {
-            _stateFile.Write(originalLength, record);
-            _stateFile.FlushToDisk();
+            AppendRecord(_stateFile, record);
+        }
+        catch (StateRecordRollbackException)
+        {
+            Volatile.Write(ref _unusable, 1);
+            throw;
+        }
+    }
+
+    private static void AppendRecord(IFile stateFile, byte[] record)
+    {
+        var originalLength = stateFile.Length;
+        try
+        {
+            stateFile.Write(originalLength, record);
+            stateFile.FlushToDisk();
         }
         catch (Exception writeException)
         {
             try
             {
-                _stateFile.SetLength(originalLength);
-                _stateFile.FlushToDisk();
+                stateFile.SetLength(originalLength);
+                stateFile.FlushToDisk();
             }
             catch (Exception rollbackException)
             {
-                throw new InvalidDataException(
+                throw new StateRecordRollbackException(
                     "Managed replica page-state publication failed and its partial record could not be removed.",
                     new AggregateException(writeException, rollbackException));
             }
@@ -843,7 +1193,10 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
             revisionLength);
 
         var materialized = new PageRangeSet();
+        var hasLocalMutations = false;
+        var localMutationsPushed = false;
         var currentPageCount = remotePageCount;
+        MutationIntent? pendingMutation = null;
         var offset = (long)headerLength;
         var validLength = offset;
         while (offset < stateFile.Length)
@@ -852,10 +1205,14 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
                 break;
 
             var recordPrefix = ReadExactly(stateFile, offset, 8);
-            if (!recordPrefix.AsSpan(0, CommitMagic.Length).SequenceEqual(CommitMagic))
+            var isCommit = recordPrefix.AsSpan(0, CommitMagic.Length).SequenceEqual(CommitMagic);
+            var isMutationIntent = recordPrefix
+                .AsSpan(0, MutationIntentMagic.Length)
+                .SequenceEqual(MutationIntentMagic);
+            if (!isCommit && !isMutationIntent)
                 throw new InvalidDataException("Managed replica page state contains an invalid record.");
             var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(recordPrefix.AsSpan(4));
-            if (payloadLength < CommitPayloadPrefixLength
+            if (payloadLength < 0
                 || payloadLength > MaximumCommitPayloadLength)
             {
                 throw new InvalidDataException(
@@ -869,42 +1226,97 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
             var record = ReadExactly(stateFile, offset, recordLength);
             ValidateHash(record, recordLength - HashLength, "Managed replica page state record");
             var payload = record.AsSpan(8, payloadLength);
-            if (BinaryPrimitives.ReadInt32LittleEndian(payload) != CommitVersion)
-                throw new InvalidDataException("Managed replica page state contains an unsupported record.");
-
-            var nextCurrentPageCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[4..]);
-            var truncateTo = BinaryPrimitives.ReadUInt64LittleEndian(payload[12..]);
-            var rangeCount = BinaryPrimitives.ReadInt32LittleEndian(payload[20..]);
-            if (rangeCount < 0
-                || payloadLength != checked(CommitPayloadPrefixLength + rangeCount * 16))
+            if (isMutationIntent)
             {
-                throw new InvalidDataException("Managed replica page state contains invalid page ranges.");
-            }
-            if (nextCurrentPageCount > uint.MaxValue)
-                throw new InvalidDataException("Managed replica page state exceeds the managed pager page limit.");
-
-            if (truncateTo != NoTruncation)
-                materialized.Trim(truncateTo);
-            currentPageCount = nextCurrentPageCount;
-            materialized.Trim(currentPageCount);
-
-            var ranges = new PageRange[rangeCount];
-            var rangeOffset = CommitPayloadPrefixLength;
-            for (var index = 0; index < ranges.Length; index++)
-            {
-                var start = BinaryPrimitives.ReadUInt64LittleEndian(payload[rangeOffset..]);
-                var count = BinaryPrimitives.ReadUInt64LittleEndian(payload[(rangeOffset + 8)..]);
-                var range = new PageRange(start, count);
-                if (count == 0 || range.EndExclusive > currentPageCount)
+                if (payloadLength != MutationIntentPayloadLength
+                    || BinaryPrimitives.ReadInt32LittleEndian(payload) != MutationIntentVersion)
                 {
                     throw new InvalidDataException(
-                        "Managed replica page state contains a page range outside the local database.");
+                        "Managed replica page state contains an unsupported mutation intent.");
                 }
-                ranges[index] = range;
-                rangeOffset += 16;
+                if (pendingMutation is not null)
+                {
+                    throw new InvalidDataException(
+                        "Managed replica page state contains overlapping mutation intents.");
+                }
+
+                var kind = (MutationKind)BinaryPrimitives.ReadInt32LittleEndian(payload[4..]);
+                if (kind is not MutationKind.Write and not MutationKind.Resize)
+                    throw new InvalidDataException("Managed replica page state contains an invalid mutation kind.");
+                var originalPageCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[8..]);
+                var targetPageCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[16..]);
+                var position = BinaryPrimitives.ReadUInt64LittleEndian(payload[24..]);
+                var length = BinaryPrimitives.ReadUInt64LittleEndian(payload[32..]);
+                if (originalPageCount == 0
+                    || originalPageCount > uint.MaxValue
+                    || targetPageCount == 0
+                    || targetPageCount > uint.MaxValue
+                    || position > long.MaxValue
+                    || length > int.MaxValue
+                    || kind == MutationKind.Resize && (position != 0 || length != 0))
+                {
+                    throw new InvalidDataException(
+                        "Managed replica page state contains an invalid mutation intent.");
+                }
+
+                pendingMutation = new MutationIntent(
+                    kind,
+                    originalPageCount,
+                    targetPageCount,
+                    position,
+                    length,
+                    payload.Slice(40, HashLength).ToArray(),
+                    payload.Slice(72, HashLength).ToArray());
+                hasLocalMutations = true;
+                localMutationsPushed = false;
+            }
+            else
+            {
+                if (payloadLength < CommitPayloadPrefixLength
+                    || BinaryPrimitives.ReadInt32LittleEndian(payload) != CommitVersion)
+                    throw new InvalidDataException("Managed replica page state contains an unsupported record.");
+
+                var nextCurrentPageCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[4..]);
+                var truncateTo = BinaryPrimitives.ReadUInt64LittleEndian(payload[12..]);
+                var rangeCount = BinaryPrimitives.ReadInt32LittleEndian(payload[20..]);
+                var flags = BinaryPrimitives.ReadUInt32LittleEndian(payload[24..]);
+                if ((flags & ~3u) != 0)
+                    throw new InvalidDataException("Managed replica page state contains unsupported record flags.");
+                hasLocalMutations = (flags & 1u) != 0;
+                localMutationsPushed = (flags & 2u) != 0;
+                if (rangeCount < 0
+                    || payloadLength != checked(CommitPayloadPrefixLength + rangeCount * 16))
+                {
+                    throw new InvalidDataException("Managed replica page state contains invalid page ranges.");
+                }
+                if (nextCurrentPageCount > uint.MaxValue)
+                    throw new InvalidDataException("Managed replica page state exceeds the managed pager page limit.");
+
+                if (truncateTo != NoTruncation)
+                    materialized.Trim(truncateTo);
+                currentPageCount = nextCurrentPageCount;
+                materialized.Trim(currentPageCount);
+
+                var ranges = new PageRange[rangeCount];
+                var rangeOffset = CommitPayloadPrefixLength;
+                for (var index = 0; index < ranges.Length; index++)
+                {
+                    var start = BinaryPrimitives.ReadUInt64LittleEndian(payload[rangeOffset..]);
+                    var count = BinaryPrimitives.ReadUInt64LittleEndian(payload[(rangeOffset + 8)..]);
+                    var range = new PageRange(start, count);
+                    if (count == 0 || range.EndExclusive > currentPageCount)
+                    {
+                        throw new InvalidDataException(
+                            "Managed replica page state contains a page range outside the local database.");
+                    }
+                    ranges[index] = range;
+                    rangeOffset += 16;
+                }
+
+                materialized.Add(ranges);
+                pendingMutation = null;
             }
 
-            materialized.Add(ranges);
             offset += recordLength;
             validLength = offset;
         }
@@ -924,7 +1336,128 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
             remotePageCount,
             currentPageCount,
             segmentSize,
-            materialized);
+            hasLocalMutations,
+            localMutationsPushed,
+            materialized,
+            pendingMutation);
+    }
+
+    private static LoadedState RecoverPendingMutation(
+        IFile stateFile,
+        IFile databaseFile,
+        LoadedState loaded,
+        MutationIntent intent)
+    {
+        if (databaseFile.Length <= 0 || databaseFile.Length % loaded.PageSize != 0)
+        {
+            throw new InvalidDataException(
+                "Managed replica page-state recovery found an invalid database length.");
+        }
+
+        var actualPageCount = checked((ulong)(databaseFile.Length / loaded.PageSize));
+        if (actualPageCount != intent.OriginalPageCount
+            && actualPageCount != intent.TargetPageCount)
+        {
+            throw new InvalidDataException(
+                "Managed replica page-state recovery found an unexpected database length.");
+        }
+
+        PageRange[] ranges;
+        if (intent.Kind == MutationKind.Resize)
+        {
+            ranges = [];
+        }
+        else
+        {
+            var actual = ReadPadded(
+                databaseFile,
+                checked((long)intent.Position),
+                checked((int)intent.Length));
+            Span<byte> actualHash = stackalloc byte[HashLength];
+            SHA256.HashData(actual, actualHash);
+            var matchesBefore = CryptographicOperations.FixedTimeEquals(actualHash, intent.BeforeHash);
+            var matchesAfter = CryptographicOperations.FixedTimeEquals(actualHash, intent.AfterHash);
+            var writtenRanges = GetCompletelyWrittenMissingPages(
+                intent.Position,
+                checked(intent.Position + intent.Length),
+                actualPageCount,
+                loaded.PageSize,
+                loaded.Materialized);
+            if (matchesBefore && matchesAfter && writtenRanges.Length != 0)
+            {
+                throw new InvalidDataException(
+                    "Managed replica page-state recovery cannot distinguish an interrupted zero-page write.");
+            }
+            if (matchesAfter && actualPageCount == intent.TargetPageCount)
+            {
+                ranges = writtenRanges;
+            }
+            else if (matchesBefore)
+            {
+                ranges = [];
+            }
+            else
+            {
+                throw new InvalidDataException(
+                    "Managed replica page-state recovery detected a torn database write.");
+            }
+        }
+
+        var truncateTo = actualPageCount < loaded.CurrentPageCount
+            ? actualPageCount
+            : NoTruncation;
+        AppendRecord(
+            stateFile,
+            BuildCommit(
+                actualPageCount,
+                truncateTo,
+                ranges,
+                hasLocalMutations: true,
+                localMutationsPushed: false));
+        if (truncateTo != NoTruncation)
+            loaded.Materialized.Trim(truncateTo);
+        loaded.Materialized.Trim(actualPageCount);
+        loaded.Materialized.Add(ranges);
+        return loaded with
+        {
+            CurrentPageCount = actualPageCount,
+            HasLocalMutations = true,
+            LocalMutationsPushed = false,
+            PendingMutation = null,
+        };
+    }
+
+    private static PageRange[] GetCompletelyWrittenMissingPages(
+        ulong writeStart,
+        ulong writeEnd,
+        ulong resultingPageCount,
+        int pageSize,
+        PageRangeSet materialized)
+    {
+        var ranges = new PageRangeSet();
+        var unsignedPageSize = checked((ulong)pageSize);
+        var firstCompletePage = checked((writeStart + unsignedPageSize - 1) / unsignedPageSize);
+        var lastCompletePageExclusive = Math.Min(writeEnd / unsignedPageSize, resultingPageCount);
+        for (var page = firstCompletePage; page < lastCompletePageExclusive; page++)
+        {
+            if (!materialized.Contains(page))
+                ranges.Add(new PageRange(page, 1));
+        }
+
+        return ranges.Snapshot();
+    }
+
+    private static byte[] ReadPadded(IFile file, long position, int length)
+    {
+        var bytes = new byte[length];
+        if (length == 0 || position >= file.Length)
+            return bytes;
+
+        var available = checked((int)Math.Min(length, file.Length - position));
+        var read = file.Read(position, bytes.AsSpan(0, available));
+        if (read != available)
+            throw new InvalidDataException("Managed replica database changed while preparing a durable mutation.");
+        return bytes;
     }
 
     private static byte[] BuildHeader(
@@ -949,7 +1482,9 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
     private static byte[] BuildCommit(
         ulong currentPageCount,
         ulong truncateTo,
-        IReadOnlyList<PageRange> ranges)
+        IReadOnlyList<PageRange> ranges,
+        bool hasLocalMutations,
+        bool localMutationsPushed)
     {
         var payloadLength = checked(CommitPayloadPrefixLength + ranges.Count * 16);
         if (payloadLength > MaximumCommitPayloadLength)
@@ -964,6 +1499,9 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
         BinaryPrimitives.WriteUInt64LittleEndian(payload[4..], currentPageCount);
         BinaryPrimitives.WriteUInt64LittleEndian(payload[12..], truncateTo);
         BinaryPrimitives.WriteInt32LittleEndian(payload[20..], ranges.Count);
+        var flags = (hasLocalMutations ? 1u : 0u)
+            | (localMutationsPushed ? 2u : 0u);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload[24..], flags);
         var offset = CommitPayloadPrefixLength;
         foreach (var range in ranges)
         {
@@ -974,6 +1512,28 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
             offset += 16;
         }
 
+        SHA256.HashData(record.AsSpan(0, hashOffset), record.AsSpan(hashOffset, HashLength));
+        return record;
+    }
+
+    private static byte[] BuildMutationIntent(MutationIntent intent)
+    {
+        if (intent.BeforeHash.Length != HashLength || intent.AfterHash.Length != HashLength)
+            throw new InvalidDataException("Managed replica page-state mutation has an invalid hash.");
+
+        var hashOffset = checked(8 + MutationIntentPayloadLength);
+        var record = new byte[checked(hashOffset + HashLength)];
+        MutationIntentMagic.CopyTo(record, 0);
+        BinaryPrimitives.WriteInt32LittleEndian(record.AsSpan(4), MutationIntentPayloadLength);
+        var payload = record.AsSpan(8, MutationIntentPayloadLength);
+        BinaryPrimitives.WriteInt32LittleEndian(payload, MutationIntentVersion);
+        BinaryPrimitives.WriteInt32LittleEndian(payload[4..], (int)intent.Kind);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload[8..], intent.OriginalPageCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload[16..], intent.TargetPageCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload[24..], intent.Position);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload[32..], intent.Length);
+        intent.BeforeHash.CopyTo(payload[40..]);
+        intent.AfterHash.CopyTo(payload[72..]);
         SHA256.HashData(record.AsSpan(0, hashOffset), record.AsSpan(hashOffset, HashLength));
         return record;
     }
@@ -1011,7 +1571,42 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
     }
 
     private void ThrowIfDisposed()
-        => ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        if (Volatile.Read(ref _unusable) != 0)
+        {
+            throw new InvalidDataException(
+                "Managed replica page-state mutation was interrupted; close and reopen the replica to recover it.");
+        }
+    }
+
+    private static FileStream AcquireOwnershipLock(string databasePath)
+    {
+        FileStream? stream = null;
+        try
+        {
+            stream = new FileStream(
+                databasePath + ManagedReplicaPageMaterializingFileSystem.OwnershipLockSuffix,
+                FileMode.OpenOrCreate,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                FileOptions.WriteThrough);
+            var result = stream;
+            stream = null;
+            return result;
+        }
+        catch (IOException exception)
+        {
+            throw new IOException(
+                "Managed replica lazy-page state is already open in another process.",
+                exception);
+        }
+        finally
+        {
+            stream?.Dispose();
+        }
+    }
 
     private sealed class LoadGroup(ulong[] pageIds)
     {
@@ -1027,7 +1622,28 @@ internal sealed class ManagedReplicaPageMaterializer : IDisposable
         ulong RemotePageCount,
         ulong CurrentPageCount,
         ulong SegmentSize,
-        PageRangeSet Materialized);
+        bool HasLocalMutations,
+        bool LocalMutationsPushed,
+        PageRangeSet Materialized,
+        MutationIntent? PendingMutation);
+
+    private sealed class StateRecordRollbackException(string message, Exception innerException)
+        : IOException(message, innerException);
+
+    private enum MutationKind
+    {
+        Write = 1,
+        Resize = 2,
+    }
+
+    private readonly record struct MutationIntent(
+        MutationKind Kind,
+        ulong OriginalPageCount,
+        ulong TargetPageCount,
+        ulong Position,
+        ulong Length,
+        byte[] BeforeHash,
+        byte[] AfterHash);
 
     private readonly record struct PageRange(ulong Start, ulong Count)
     {

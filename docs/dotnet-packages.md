@@ -440,13 +440,18 @@ pulls; unsafe residual deletes or schema changes fail closed until they have
 been pushed. Protocol-1 databases keep the page-incremental path.
 
 The pure-managed provider supports `AhtolaPartialBootstrapOptions.Prefix(...)`
-as an **eager page selector** for the initial pull. It sends Turso's
-`server_pages_selector` range, but publishes and opens the replica only when
-that range covers every page in the server-declared database size. If pages
-would be missing, `Open` throws before a database or metadata file is
-installed because the managed pager has no lazy page-fault storage. Query
-selection, `SegmentSize`, and `Prefetch` are rejected before any network or
-local-state mutation.
+as the initial page selector. It publishes the selected complete 4 KiB pages,
+records the missing ranges in an integrity-protected durable sidecar, and
+fetches a missing page from the pinned bootstrap revision before the pager can
+observe its bytes. Concurrent faults are coalesced, `SegmentSize` controls the
+fetch segment, and `Prefetch` opts into fetching the rest of that segment.
+The bootstrap marker, metadata, and page-state sidecar are durable before the
+sparse database becomes visible. A physical partial replica has one
+process-exclusive materializer, and write-ahead mutation intents make an
+interrupted local page write recoverable without treating sparse zeroes as
+data. Query-selected bootstrap remains unsupported. Before an ordinary sync
+advances the revision, Ahtola pushes tracked local changes, completes the
+pinned image, and transitions back to the normal full-file publication path.
 
 Embedded replicas support `DbBatch` through both facades. Enum parameters bind
 as their underlying SQLite integer value. Extra parameters that are not
