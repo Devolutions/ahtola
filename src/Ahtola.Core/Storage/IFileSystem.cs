@@ -123,3 +123,26 @@ public interface IFile : IDisposable
     /// <summary>Flushes buffered data and metadata to durable storage.</summary>
     void FlushToDisk();
 }
+
+/// <summary>
+/// Optional capability for a sparse database file whose missing byte ranges
+/// must be populated before they can be read.
+/// </summary>
+/// <remarks>
+/// The pager probes this capability before entering its internal read locks.
+/// The file still enforces the same check in <see cref="IFile.Read"/> so direct
+/// page-store callers can never mistake a sparse hole for valid zero bytes.
+/// </remarks>
+internal interface IPageMaterializingFile
+{
+    void EnsureMaterialized(long position, int length);
+}
+
+/// <summary>
+/// Identifies a file-system decorator whose underlying identity and optional
+/// capabilities remain authoritative for pager locking and storage policy.
+/// </summary>
+internal interface IFileSystemDecorator
+{
+    IFileSystem InnerFileSystem { get; }
+}

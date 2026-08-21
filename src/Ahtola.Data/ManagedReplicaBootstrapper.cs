@@ -32,6 +32,7 @@ internal static class ManagedReplicaBootstrapper
     internal static void DeleteBootstrappedReplicaFiles(string path)
     {
         DeleteIfExists(path + MetadataSuffix);
+        DeleteIfExists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
         DeleteStagingSidecars(path);
         // Keep the main file present until every sidecar is gone. Apply-lock aliases resolve an
         // existing target by physical identity; deleting it first would let a missing-path key
@@ -1328,6 +1329,91 @@ internal static class ManagedReplicaBootstrapper
         return result;
     }
 
+    internal static async Task<ManagedReplicaPageBatch> FetchPagesAsync(
+        AhtolaReplicaOptions options,
+        string revision,
+        IReadOnlyList<ulong> pageIds,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(revision);
+        ArgumentNullException.ThrowIfNull(pageIds);
+        if (pageIds.Count == 0)
+            throw new ArgumentException("At least one page must be requested.", nameof(pageIds));
+
+        var requestedPageIds = pageIds.OrderBy(static pageId => pageId).ToArray();
+        for (var index = 0; index < requestedPageIds.Length; index++)
+        {
+            if (requestedPageIds[index] > uint.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(pageIds), "A requested page exceeds the wire page-id limit.");
+            if (index > 0 && requestedPageIds[index] == requestedPageIds[index - 1])
+                throw new ArgumentException("Targeted page requests cannot contain duplicates.", nameof(pageIds));
+        }
+
+        var payload = CreateTargetedPagePullRequest(revision, requestedPageIds);
+        using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
+        var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
+        using var scope = options.EnterApplicationHttpScope();
+        using var client = options.HttpPolicy.MessageHandler is { } handler
+            ? new HttpClient(handler, disposeHandler: false)
+            : new HttpClient();
+        client.Timeout = Timeout.InfiniteTimeSpan;
+        using var request = new HttpRequestMessage(HttpMethod.Post, CreatePullUpdatesUri(options.RemoteUri))
+        {
+            Content = new ByteArrayContent(payload),
+        };
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
+        request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
+
+        var authToken = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
+        ValidateAuthTokenTransport(request.RequestUri!, authToken);
+        if (authToken is not null)
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+
+        using var response = await client.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            effectiveCancellationToken).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+
+        await using var stream = await response.Content
+            .ReadAsStreamAsync(effectiveCancellationToken)
+            .ConfigureAwait(false);
+        var reader = new DelimitedProtobufReader(stream);
+        var headerPayload = await reader
+            .ReadAsync(MaxHeaderLength, effectiveCancellationToken)
+            .ConfigureAwait(false)
+            ?? throw new InvalidDataException("The targeted page response did not contain a protobuf header.");
+        var header = ParseHeader(headerPayload);
+        if (header.StreamKind != PullStreamKind.Pages)
+            throw new InvalidDataException("The targeted page response returned a logical-log stream.");
+        if (!string.Equals(header.Revision, revision, StringComparison.Ordinal))
+            throw new InvalidDataException("The targeted page response belongs to a different server revision.");
+
+        var requested = new HashSet<ulong>(requestedPageIds);
+        var received = new HashSet<ulong>();
+        var pages = new List<ManagedReplicaFetchedPage>(requested.Count);
+        while (await reader.ReadAsync(MaxPageMessageLength, effectiveCancellationToken).ConfigureAwait(false) is { } pagePayload)
+        {
+            var page = ParsePage(pagePayload);
+            if (page.PageId >= header.DatabasePages)
+                throw new InvalidDataException("The targeted page response contains a page outside the declared database.");
+            if (!requested.Contains(page.PageId))
+                throw new InvalidDataException("The targeted page response contains a page that was not requested.");
+            if (!received.Add(page.PageId))
+                throw new InvalidDataException("The targeted page response contains a duplicate page.");
+            pages.Add(new ManagedReplicaFetchedPage(page.PageId, page.Data));
+        }
+
+        foreach (var pageId in requestedPageIds)
+        {
+            if (pageId >= header.DatabasePages || !received.Contains(pageId))
+                throw new InvalidDataException("The targeted page response omitted a requested page.");
+        }
+
+        return new ManagedReplicaPageBatch(header.Revision, header.DatabasePages, pages);
+    }
+
 
     private static void ValidateStagedDatabase(string stagingPath, AhtolaRemoteEncryptionOptions? remoteEncryption)
     {
@@ -1696,6 +1782,145 @@ internal static class ManagedReplicaBootstrapper
             ? checked((uint)(partialBootstrap.PrefixLength / PageSize))
             : null;
 
+    private static byte[] CreateTargetedPagePullRequest(
+        string revision,
+        IReadOnlyList<ulong> pageIds)
+    {
+        var revisionBytes = StrictUtf8.GetBytes(revision);
+        var selector = SerializeRoaringPageSelector(pageIds);
+        var request = new List<byte>(checked(revisionBytes.Length + selector.Length + 16));
+        WriteVarint(request, 2u << 3 | 2);
+        WriteVarint(request, checked((ulong)revisionBytes.Length));
+        request.AddRange(revisionBytes);
+        WriteVarint(request, 5u << 3 | 2);
+        WriteVarint(request, checked((ulong)selector.Length));
+        request.AddRange(selector);
+        return request.ToArray();
+    }
+
+    /// <summary>
+    /// Writes the portable RoaringBitmap format used by Turso's
+    /// <c>server_pages_selector</c>. Run containers are intentionally omitted;
+    /// array and bitmap containers cover every page set without another package.
+    /// </summary>
+    private static byte[] SerializeRoaringPageSelector(IReadOnlyList<ulong> pageIds)
+    {
+        var containers = new SortedDictionary<ushort, List<ushort>>();
+        foreach (var pageId in pageIds)
+        {
+            var value = checked((uint)pageId);
+            var key = checked((ushort)(value >> 16));
+            var low = checked((ushort)(value & ushort.MaxValue));
+            if (!containers.TryGetValue(key, out var lows))
+            {
+                lows = [];
+                containers.Add(key, lows);
+            }
+            lows.Add(low);
+        }
+
+        var serializedContainers = new RoaringContainer[containers.Count];
+        var containerIndex = 0;
+        foreach (var (key, lows) in containers)
+        {
+            lows.Sort();
+            serializedContainers[containerIndex++] = new RoaringContainer(
+                key,
+                lows.Count,
+                lows.ToArray());
+        }
+
+        return SerializeRoaringPageSelector(serializedContainers);
+    }
+
+    private static byte[] SerializeRoaringPageSelector(
+        IReadOnlyList<RoaringContainer> containers)
+    {
+        const uint noRunContainerCookie = 12346;
+        const int maximumArrayCardinality = 4096;
+        const int bitmapContainerSize = 8192;
+        if (containers.Count == 0)
+            throw new ArgumentException("At least one RoaringBitmap container is required.", nameof(containers));
+
+        var headerLength = checked(8 + containers.Count * 8);
+        var dataLength = 0;
+        foreach (var container in containers)
+        {
+            if (container.Cardinality is < 1 or > 65536
+                || (container.Values is not null
+                    && container.Values.Length != container.Cardinality))
+            {
+                throw new InvalidDataException("A RoaringBitmap container has an invalid cardinality.");
+            }
+
+            dataLength = checked(dataLength + (container.Cardinality <= maximumArrayCardinality
+                ? container.Cardinality * sizeof(ushort)
+                : bitmapContainerSize));
+        }
+
+        var bytes = new byte[checked(headerLength + dataLength)];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, noRunContainerCookie);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(4), checked((uint)containers.Count));
+        var dataOffset = headerLength;
+        for (var containerIndex = 0; containerIndex < containers.Count; containerIndex++)
+        {
+            var container = containers[containerIndex];
+            var descriptorOffset = checked(8 + containerIndex * 4);
+            BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(descriptorOffset), container.Key);
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                bytes.AsSpan(descriptorOffset + 2),
+                checked((ushort)(container.Cardinality - 1)));
+            var offsetOffset = checked(8 + containers.Count * 4 + containerIndex * 4);
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offsetOffset), checked((uint)dataOffset));
+
+            if (container.Cardinality <= maximumArrayCardinality)
+            {
+                if (container.Values is null)
+                {
+                    for (var low = 0; low < container.Cardinality; low++)
+                    {
+                        BinaryPrimitives.WriteUInt16LittleEndian(
+                            bytes.AsSpan(dataOffset),
+                            checked((ushort)low));
+                        dataOffset += sizeof(ushort);
+                    }
+                }
+                else
+                {
+                    foreach (var low in container.Values)
+                    {
+                        BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(dataOffset), low);
+                        dataOffset += sizeof(ushort);
+                    }
+                }
+            }
+            else if (container.Values is null)
+            {
+                for (var word = 0; word < 1024; word++)
+                {
+                    var remainingBits = container.Cardinality - word * 64;
+                    var value = remainingBits >= 64
+                        ? ulong.MaxValue
+                        : remainingBits <= 0
+                            ? 0
+                            : (1UL << remainingBits) - 1;
+                    BinaryPrimitives.WriteUInt64LittleEndian(
+                        bytes.AsSpan(dataOffset + word * sizeof(ulong)),
+                        value);
+                }
+                dataOffset += bitmapContainerSize;
+            }
+            else
+            {
+                foreach (var low in container.Values)
+                    bytes[dataOffset + low / 8] |= checked((byte)(1 << (low & 7)));
+                dataOffset += bitmapContainerSize;
+            }
+        }
+
+        return bytes;
+    }
+
     private static Uri CreatePullUpdatesUri(Uri endpoint)
     {
         var builder = new UriBuilder(endpoint)
@@ -1916,6 +2141,7 @@ internal static class ManagedReplicaBootstrapper
         databasePath + "-shm",
         databasePath + "-journal",
         databasePath + MetadataSuffix,
+        databasePath + ManagedReplicaPageMaterializingFileSystem.StateSuffix,
         databasePath + ManagedReplicaChangeJournal.Suffix,
     ];
 
@@ -1993,6 +2219,10 @@ internal static class ManagedReplicaBootstrapper
         RemotePullProtocol Protocol,
         ManagedReplicaLogicalLogMetadata? LogicalMetadata);
     private readonly record struct PullPage(ulong PageId, byte[] Data);
+    private readonly record struct RoaringContainer(
+        ushort Key,
+        int Cardinality,
+        ushort[]? Values);
 
     private sealed class DelimitedProtobufReader(Stream stream)
     {

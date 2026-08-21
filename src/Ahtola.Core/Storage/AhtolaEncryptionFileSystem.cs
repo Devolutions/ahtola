@@ -77,6 +77,7 @@ public sealed class AhtolaEncryptionFileSystem : IFileSystem, IDisposable
             {
                 AhtolaEncryptionFileSystem encrypted => Unwrap(encrypted._inner),
                 AhtolaPageCodecFileSystem codec => Unwrap(codec.Inner),
+                IFileSystemDecorator decorator => Unwrap(decorator.InnerFileSystem),
                 _ => fileSystem,
             };
 
