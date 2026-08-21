@@ -796,6 +796,36 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
         return FromHandle(handle);
     }
 
+    /// <summary>
+    /// Resolves the physical identity of a directory rather than a file. Used to canonicalize the
+    /// containing directory of a path that does not exist yet (for example, a replica database
+    /// file before its first bootstrap), so that two textually different paths naming the same
+    /// physical directory -- via a symbolic link, junction/mount point, hard link, or Windows
+    /// short (8.3) name alias -- resolve to the same identity.
+    /// </summary>
+    internal static SqliteWalSharedMemoryCarrierIdentity FromDirectoryPath(string directoryPath)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Windows' CreateFile denies read access to a directory unless the caller passes
+            // FILE_FLAG_BACKUP_SEMANTICS, and File.OpenHandle never sets that flag, so a directory
+            // must be opened through this dedicated native path instead of File.OpenHandle.
+            using var handle = Native.OpenDirectoryHandleWindows(directoryPath);
+            return FromHandle(handle);
+        }
+
+        // POSIX open() succeeds on a directory with read-only access alone (the caller simply
+        // cannot read() bytes from the resulting descriptor), so the ordinary file-handle path
+        // that FromPath uses already works unchanged here.
+        using var posixHandle = System.IO.File.OpenHandle(
+            directoryPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            FileOptions.None);
+        return FromHandle(posixHandle);
+    }
+
     internal static SqliteWalSharedMemoryCarrierIdentity FromHandle(SafeFileHandle handle)
     {
         ArgumentNullException.ThrowIfNull(handle);
@@ -896,6 +926,13 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
 
     private static partial class Native
     {
+        private const uint GenericRead = 0x8000_0000;
+        private const uint FileShareRead = 0x0000_0001;
+        private const uint FileShareWrite = 0x0000_0002;
+        private const uint FileShareDelete = 0x0000_0004;
+        private const uint OpenExisting = 3;
+        private const uint FileFlagBackupSemantics = 0x0200_0000;
+
         [LibraryImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static partial bool GetFileInformationByHandle(
@@ -923,5 +960,41 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
         internal static partial int StatMac(
             string path,
             out MacFileStatus information);
+
+        /// <summary>
+        /// Opens a directory for metadata-only access on Windows. <see cref="System.IO.File.OpenHandle"/>
+        /// always denies directories (it never sets <c>FILE_FLAG_BACKUP_SEMANTICS</c>), so directory
+        /// identity resolution goes through this dedicated <c>CreateFile</c> call instead.
+        /// </summary>
+        [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+        private static partial SafeFileHandle CreateFileW(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            IntPtr hTemplateFile);
+
+        internal static SafeFileHandle OpenDirectoryHandleWindows(string directoryPath)
+        {
+            var handle = CreateFileW(
+                directoryPath,
+                GenericRead,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics,
+                IntPtr.Zero);
+
+            if (handle.IsInvalid)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                handle.Dispose();
+                ThrowNativeIOException("CreateFile", error);
+            }
+            return handle;
+        }
+        }
     }
 }

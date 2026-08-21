@@ -24,6 +24,17 @@ internal enum ManagedReplicaDurableBoundary
     /// by which API they invoked, not by a separate boundary value.
     /// </summary>
     ReplicaApplyLockAcquired,
+
+    /// <summary>
+    /// Hit at the very start of the failed-bootstrap-catch-up rollback path (see
+    /// <c>ManagedReplicaConnectionHost.RollBackFailedCatchUpIfStillThisGenerationAsync</c>),
+    /// after the mandatory post-bootstrap catch-up has thrown but before the rollback
+    /// (re)acquires the apply lease to verify the on-disk revision is still the exact
+    /// bootstrapped generation it set out to undo. Tests use this to publish a competing, newer
+    /// revision for the same path in that window and prove the rollback detects it and backs
+    /// off instead of deleting unconditionally.
+    /// </summary>
+    BootstrapCatchUpFailureObserved,
 }
 
 /// <summary>
