@@ -41,6 +41,8 @@ internal interface IManagedReplicaApplyLockCoordinator
 internal static class ManagedReplicaApplyLock
 {
     internal const string CarrierSuffix = ".ahtola-replica-apply-lock";
+    private const long PendingByte = 0x4000_0000;
+    private const long SQLiteExclusiveRangeLength = 512;
     private static IManagedReplicaApplyLockCoordinator _current = CrossProcessManagedReplicaApplyLockCoordinator.Instance;
 
     internal static IManagedReplicaApplyLockCoordinator Current
@@ -51,6 +53,17 @@ internal static class ManagedReplicaApplyLock
 
     internal static ValueTask<IAsyncDisposable> AcquireExclusiveAsync(string path, CancellationToken cancellationToken)
         => Current.AcquireExclusiveAsync(path, cancellationToken);
+
+    internal static IDisposable? AcquireMainFileReplacementLock(
+        string path,
+        CancellationToken cancellationToken)
+        => File.Exists(path)
+            ? new SqliteWalByteRangeLock(path).AcquireExclusive(
+                PendingByte,
+                SQLiteExclusiveRangeLength,
+                Timeout.InfiniteTimeSpan,
+                cancellationToken)
+            : null;
 }
 
 internal sealed class CrossProcessManagedReplicaApplyLockCoordinator : IManagedReplicaApplyLockCoordinator

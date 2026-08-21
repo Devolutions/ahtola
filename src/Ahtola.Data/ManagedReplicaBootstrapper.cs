@@ -1646,6 +1646,7 @@ internal static class ManagedReplicaBootstrapper
             $".{Path.GetFileName(options.Path)}.protected-{Guid.NewGuid():N}.tmp");
         var databaseInstalled = false;
         var metadataInstalled = false;
+        IDisposable? mainFileReplacementLock = null;
         try
         {
             File.Copy(options.Path, stagingPath, overwrite: false);
@@ -1727,7 +1728,12 @@ internal static class ManagedReplicaBootstrapper
             }
             if (metadata.RevertState.HasValue)
                 metadata = ManagedReplicaRevertWal.MarkRemoteApplyStarted(options.Path, metadata);
+            mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
+                options.Path,
+                cancellationToken);
             File.Replace(stagingPath, options.Path, backupPath, ignoreMetadataErrors: false);
+            mainFileReplacementLock?.Dispose();
+            mainFileReplacementLock = null;
             databaseInstalled = true;
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished);
             cancellationToken.ThrowIfCancellationRequested();
@@ -1760,11 +1766,23 @@ internal static class ManagedReplicaBootstrapper
             // on the next pull rather than sticking to pages forever.
             var remoteBaseSha256 = PublishRemoteBaseSnapshot(options.Path, metadata, options.Path);
             var tableMap = RebuildTableMapFromSchema(options.Path, options.RemoteEncryption);
+            var installedFingerprint = ComputeDatabaseFingerprint(options.Path);
+            mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
+                options.Path,
+                cancellationToken);
+            if (!string.Equals(
+                    ComputeDatabaseFingerprint(options.Path),
+                    installedFingerprint,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "Managed embedded replica changed while its replacement metadata was being published.");
+            }
             await WriteMetadataAsync(
                     metadataStagingPath,
                     metadataPath,
                     header.Revision,
-                    ComputeDatabaseFingerprint(options.Path),
+                    installedFingerprint,
                     header.Protocol,
                     tableMap,
                     cancellationToken,
@@ -1789,7 +1807,11 @@ internal static class ManagedReplicaBootstrapper
             // Once metadata is durable it fingerprints the installed image. A later
             // interruption must preserve that matched pair rather than restore only DB.
             if (databaseInstalled && !metadataInstalled && File.Exists(backupPath))
+            {
+                mainFileReplacementLock?.Dispose();
+                mainFileReplacementLock = null;
                 File.Replace(backupPath, options.Path, destinationBackupFileName: null, ignoreMetadataErrors: false);
+            }
             throw;
         }
         finally
@@ -1800,6 +1822,7 @@ internal static class ManagedReplicaBootstrapper
             DeleteIfExists(protectedStagingPath);
             DeleteStagingSidecars(protectedStagingPath);
             DeleteIfExists(backupPath);
+            mainFileReplacementLock?.Dispose();
         }
     }
 

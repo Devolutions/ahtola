@@ -910,6 +910,10 @@ internal static class ManagedReplicaRevertWal
             if (stagedBoundary is { } staged)
                 ManagedReplicaFaultInjection.Hit(staged);
             cancellationToken.ThrowIfCancellationRequested();
+            using var mainFileReplacementLock =
+                ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
+                    databasePath,
+                    cancellationToken);
             DeleteSqliteSidecars(databasePath);
             File.Replace(
                 databaseStagingPath,
