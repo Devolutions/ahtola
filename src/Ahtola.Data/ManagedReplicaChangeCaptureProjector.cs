@@ -75,13 +75,20 @@ internal static class ManagedReplicaChangeCaptureProjector
 
         if (change.Operation == SqliteChangeOperation.Delete)
         {
-            before = change.BeforeRecord
+            var beforeRecord = change.BeforeRecord
                 ?? throw new AhtolaReplicaChangeCaptureException(
                     "Managed embedded replica change journal has a delete entry for table "
                     + $"'{change.Table}' (rowid {change.RowId}) with no captured before-image. "
                     + "This happens only for entries written by an older journal format that "
                     + "did not capture delete pre-images; push the pending changes to advance "
                     + "past it before peeking pending change-data-capture.");
+
+            // change.BeforeRecord is the change journal's own stored buffer (the same array
+            // instance is returned by every ReadBatch call until the entry is acknowledged), so
+            // it must be cloned before handing it to a caller: mutating the returned array must
+            // never corrupt the journal's still-durable state or a later delete replay that
+            // decodes the very same buffer.
+            before = (byte[])beforeRecord.Clone();
         }
         else
         {
@@ -94,12 +101,21 @@ internal static class ManagedReplicaChangeCaptureProjector
                 && lastSequence == change.Sequence;
             if (isFinalTouch)
             {
+                // includeGeneratedColumns: true so this "after" image includes VIRTUAL/STORED
+                // generated columns in table-declaration order, matching the real turso_cdc
+                // row's full in-memory row image instead of pragma_table_info's subset.
                 var values = ManagedReplicaLogicalReplayer.TryCaptureCurrentRowValues(
                     connection,
                     change.Table,
-                    change.RowId);
+                    change.RowId,
+                    includeGeneratedColumns: true);
                 if (values is not null)
+                {
+                    // SqliteRecordCodec.Encode always allocates a fresh, exactly-sized array
+                    // (never a cached/pooled buffer), so - unlike the before-image above - no
+                    // additional clone is needed here for caller-mutation isolation.
                     after = SqliteRecordCodec.Encode(values);
+                }
             }
         }
 

@@ -48,6 +48,9 @@ public enum AhtolaReplicaChangeType
 /// non-null for delete: a delete whose pre-image was not captured (only possible for a change
 /// journal written by a pre-v4 journal format) makes the whole peek fail closed with
 /// <see cref="AhtolaReplicaChangeCaptureException"/> instead of returning a misleadingly empty row.
+/// This is always an independent copy of the change journal's own stored buffer, never an alias
+/// to it: mutating the returned array cannot corrupt the journal's still-durable state or a
+/// later delete replay that decodes the same underlying entry.
 /// </param>
 /// <param name="After">
 /// The row's post-image as an encoded SQLite record, matching the <c>after</c> column, or
@@ -56,7 +59,10 @@ public enum AhtolaReplicaChangeType
 /// is only correct when no later pending change in the same batch touches the same
 /// (<see cref="TableName"/>, <see cref="RowId"/>) key again; when a later change supersedes it,
 /// this is left <see langword="null"/> (the row degrades to id-only image availability) rather
-/// than returning stale or fabricated data.
+/// than returning stale or fabricated data. Includes every column declared on the table in
+/// declaration order — including VIRTUAL and STORED generated columns — matching the real
+/// <c>turso_cdc</c> row's full in-memory row image, not the narrower subset a schema
+/// introspection limited to storable columns would report.
 /// </param>
 /// <remarks>
 /// <c>updates</c> (the real CDC table's packed all-columns-changed column, only ever populated in
@@ -93,8 +99,9 @@ public sealed record AhtolaReplicaChangeCaptureBatch(
 
 /// <summary>
 /// Indicates that a still-pending managed embedded replica local change cannot be safely
-/// represented as a row in Ahtola's public change-data-capture contract. Peeking pending
-/// change-data-capture fails closed rather than silently omitting or approximating the
-/// unrepresentable entry; see <see cref="AhtolaConnection.PeekPendingChangeCapture"/>.
+/// represented as a row in Ahtola's public change-data-capture contract, or that the whole peek
+/// cannot be safely performed right now (a local transaction is open). Peeking pending
+/// change-data-capture fails closed rather than silently omitting, approximating, or projecting
+/// not-yet-committed state; see <see cref="AhtolaConnection.PeekPendingChangeCapture"/>.
 /// </summary>
 public sealed class AhtolaReplicaChangeCaptureException(string message) : AhtolaException(message);

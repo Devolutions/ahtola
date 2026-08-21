@@ -580,9 +580,12 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     /// The connection is not a managed embedded replica connection.
     /// </exception>
     /// <exception cref="AhtolaReplicaChangeCaptureException">
-    /// The pending batch contains an entry that cannot be safely represented in the
+    /// Either a local transaction is currently open on this connection (peeking while a
+    /// transaction is in progress could observe not-yet-committed writes, or writes the
+    /// transaction later rolls back, and silently bake them into the projected row), or the
+    /// pending batch contains an entry that cannot be safely represented in the
     /// change-data-capture row contract (a schema/DDL change, or a delete with no captured
-    /// pre-image).
+    /// pre-image). Commit or roll back an open transaction and peek again.
     /// </exception>
     public AhtolaReplicaChangeCaptureBatch PeekPendingChangeCapture()
         => (_managedReplicaHost ?? throw new InvalidOperationException(

@@ -109,8 +109,43 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     /// change-data-capture row contract. Pure read: it does not acknowledge the journal
     /// watermark, so it has no effect on a subsequent push.
     /// </summary>
+    /// <exception cref="AhtolaReplicaChangeCaptureException">
+    /// A local transaction is currently open on this connection. Projecting an "after" image
+    /// while a transaction is in progress could observe writes that are not yet committed - or
+    /// that the transaction later rolls back - and silently bake them into the projected row as
+    /// if they were committed. Commit or roll back the open transaction first.
+    /// </exception>
     public AhtolaReplicaChangeCaptureBatch PeekPendingChangeCapture()
-        => ManagedReplicaChangeCaptureProjector.Project(Database.Connection, _changeJournal.ReadBatch(int.MaxValue));
+    {
+        // Held for the whole call so a concurrent publish's quiesce-and-close cannot interleave
+        // with it: EnterLocalOperation blocks that cycle from proceeding past its own "wait for
+        // zero active local operations" step until this lease is released, which is exactly what
+        // keeps CloseForPublication/ReopenAfterPublication (the database/journal generation
+        // swap) from running underneath this projection and mixing generations.
+        using var operation = EnterLocalOperation(CancellationToken.None);
+
+        lock (_changeGate)
+        {
+            if (_localTransactionActive)
+            {
+                throw new AhtolaReplicaChangeCaptureException(
+                    "Cannot peek pending change-data-capture while a local transaction is open "
+                    + "on this connection. Projecting an \"after\" image while a transaction is "
+                    + "in progress could observe not-yet-committed writes, or writes the "
+                    + "transaction later rolls back, and silently bake them into the projected "
+                    + "row as if they were committed. Commit or roll back the open transaction "
+                    + "before peeking pending change-data-capture.");
+            }
+        }
+
+        // Stable locals captured while the lease above is held, so both come from the same
+        // database/journal generation for the whole call: Database and _changeJournal are only
+        // ever swapped together, by CloseForPublication/ReopenAfterPublication, which that lease
+        // blocks for as long as it is held.
+        var database = Database;
+        var journal = _changeJournal;
+        return ManagedReplicaChangeCaptureProjector.Project(database.Connection, journal.ReadBatch(int.MaxValue));
+    }
 
     public void StatementStarted(string sql)
     {
