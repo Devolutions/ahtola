@@ -12,7 +12,14 @@ namespace Ahtola.Tests;
 /// <c>turso_cdc</c> table for the fields it can represent, documents where it intentionally
 /// cannot (an update's before-image, multi-row transaction grouping), fails closed for
 /// unrepresentable entries instead of guessing, and that peeking is side-effect-free: it can
-/// never corrupt, or be corrupted by, a genuine push's acknowledgement.
+/// never corrupt, or be corrupted by, a genuine push's acknowledgement. They also prove three
+/// further correctness properties the public contract depends on: a peek fails closed while a
+/// local transaction is open instead of risking an after-image built from not-yet-committed (or
+/// later rolled-back) writes; a peek can never race a concurrent publish into observing a torn
+/// or mixed database/journal generation; a returned before-image is always an independent copy
+/// the caller can freely mutate without corrupting the journal's own buffer; and an after-image
+/// includes virtual generated columns, matching the real <c>turso_cdc</c> row's full declared
+/// column set rather than <c>pragma_table_info</c>'s narrower, generated-column-excluding subset.
 /// </summary>
 public sealed class ManagedReplicaChangeCaptureBridgeTests
 {
@@ -301,6 +308,197 @@ public sealed class ManagedReplicaChangeCaptureBridgeTests
 
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*managed embedded replica connections*");
+    }
+
+    [Test]
+    public void PeekPendingChangeCaptureThrowsWhileALocalTransactionIsOpenAndSucceedsAgainAfterRollback()
+    {
+        var path = NewReplicaPath("cdc-bridge-peek-txn-guard");
+        try
+        {
+            using (var setup = new AhtolaConnection($"Data Source={path};Local Provider=Managed"))
+            {
+                setup.Open();
+                setup.ExecuteNonQuery("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)");
+            }
+
+            using var replica = AhtolaConnection.CreateReplica(
+                new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null));
+            replica.Open();
+
+            replica.ExecuteNonQuery("INSERT INTO t VALUES (1, 'committed')");
+
+            replica.ExecuteNonQuery("BEGIN;");
+            replica.ExecuteNonQuery("INSERT INTO t VALUES (2, 'uncommitted')");
+
+            // A later write in this same still-open transaction (or a rollback of it) could
+            // otherwise silently change what an in-progress peek's after-image observed:
+            // rejecting outright while the transaction is open is what actually closes that
+            // hole, rather than merely documenting it.
+            Action act = () => replica.PeekPendingChangeCapture();
+
+            act.Should().Throw<AhtolaReplicaChangeCaptureException>()
+                .WithMessage("*transaction*");
+
+            replica.ExecuteNonQuery("ROLLBACK;");
+
+            // Rolling back must fully clear the guard rather than leaving it stuck closed, and
+            // the projected batch must reflect only the row committed before the transaction
+            // opened: the transaction's own insert was only ever staged pending its own commit,
+            // so it never reached the change journal and leaves nothing behind to filter out.
+            var peek = replica.PeekPendingChangeCapture();
+            peek.Rows.Should().ContainSingle();
+            var insertRow = peek.Rows[0];
+            insertRow.ChangeType.Should().Be(AhtolaReplicaChangeType.Insert);
+            insertRow.RowId.Should().Be(1);
+            SqliteRecordCodec.Decode(insertRow.After!).Should().Equal(SqlValue.Integer(1), SqlValue.Text("committed"));
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PeekPendingChangeCaptureNeverRacesWithAConcurrentPublish()
+    {
+        var path = NewReplicaPath("cdc-bridge-peek-publish-race");
+        try
+        {
+            using (var setup = new AhtolaConnection($"Data Source={path};Local Provider=Managed"))
+            {
+                setup.Open();
+                setup.ExecuteNonQuery("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)");
+                setup.ExecuteNonQuery("INSERT INTO t VALUES (1, 'seed')");
+            }
+
+            // Bypasses AhtolaConnection to drive the host directly, matching how
+            // AhtolaConnection.CreateReplica(...) itself obtains one internally.
+            var host = ManagedReplicaConnectionHost.Open(
+                new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null));
+            try
+            {
+                using var stop = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+                Exception? peekFailure = null;
+                Exception? publishFailure = null;
+
+                var peekLoop = Task.Run(() =>
+                {
+                    try
+                    {
+                        while (!stop.IsCancellationRequested)
+                            host.PeekPendingChangeCapture();
+                    }
+                    catch (Exception ex)
+                    {
+                        peekFailure = ex;
+                    }
+                });
+
+                var publishLoop = Task.Run(async () =>
+                {
+                    try
+                    {
+                        while (!stop.IsCancellationRequested)
+                        {
+                            // A real publish always closes and reopens the database/journal
+                            // generation, even when - as here - the staged operation itself
+                            // does nothing: this is exactly the generation swap a concurrent
+                            // peek must never observe torn or mixed.
+                            await host.QuiesceAndReopenAsync(_ => Task.CompletedTask, CancellationToken.None);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        publishFailure = ex;
+                    }
+                });
+
+                await Task.WhenAll(peekLoop, publishLoop);
+
+                peekFailure.Should().BeNull(
+                    "a concurrent publish must never surface a torn or mixed database/journal generation to a peek");
+                publishFailure.Should().BeNull("a concurrent peek must never interfere with a publish either");
+            }
+            finally
+            {
+                host.Dispose();
+            }
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void ProjectDeepClonesTheDeleteBeforeImageInsteadOfAliasingTheJournalsBuffer()
+    {
+        using var database = ManagedDatabaseAdapter.Open(":memory:");
+        var connection = database.Connect();
+
+        // Stands in for the change journal's own stored before-image buffer: the real journal
+        // keeps returning this SAME array instance from ReadBatch until the entry is
+        // acknowledged, so this test proves Project() never hands that instance out directly.
+        var journalBuffer = new byte[] { 10, 20, 30, 40 };
+        var originalSnapshot = (byte[])journalBuffer.Clone();
+
+        var change = ReplicaLocalChange.Row(SqliteChangeOperation.Delete, "main", "t", 1, journalBuffer) with { Sequence = 1 };
+        var batch = new ReplicaLocalChangeBatch(FirstSequence: 1, Watermark: 2, Changes: [change]);
+
+        var projected = ManagedReplicaChangeCaptureProjector.Project(connection, batch);
+        var before = projected.Rows[0].Before!;
+
+        before.Should().NotBeSameAs(journalBuffer, "callers must receive an independent copy, never the journal's own buffer");
+        before.Should().Equal(journalBuffer);
+
+        // A caller mutating its own copy must never be able to reach back into, and corrupt,
+        // the journal's stored buffer - which a later, still-pending peek or an eventual push
+        // would otherwise observe as silently altered.
+        before[0] = unchecked((byte)(before[0] + 1));
+
+        journalBuffer.Should().Equal(originalSnapshot, "mutating the returned Before image must never corrupt the journal's own buffer");
+    }
+
+    [Test]
+    public void ProjectIncludesVirtualGeneratedColumnsInTheAfterImageMatchingRealChangeDataCapture()
+    {
+        using var database = ManagedDatabaseAdapter.Open(":memory:");
+        var connection = database.Connect();
+
+        Exec(
+            connection,
+            "CREATE TABLE t("
+            + "id INTEGER PRIMARY KEY, "
+            + "a INT, "
+            + "b INT, "
+            + "total INT GENERATED ALWAYS AS (a + b) VIRTUAL)");
+        Exec(connection, "PRAGMA capture_data_changes_conn('full')");
+
+        Exec(connection, "INSERT INTO t (id, a, b) VALUES (1, 3, 4)");
+
+        var batch = new ReplicaLocalChangeBatch(
+            FirstSequence: 1,
+            Watermark: 2,
+            Changes: [ReplicaLocalChange.Row(SqliteChangeOperation.Insert, "main", "t", 1) with { Sequence = 1 }]);
+
+        var projected = ManagedReplicaChangeCaptureProjector.Project(connection, batch);
+
+        projected.Rows.Should().ContainSingle();
+        var insertRow = projected.Rows[0];
+
+        // The real turso_cdc row is the ground truth: its after-image is built from the
+        // engine's full in-memory row and always includes generated columns, so the projected
+        // bridge row must match it exactly rather than pragma_table_info's narrower,
+        // generated-column-excluding subset.
+        var insertCdc = SingleCdcRow(connection, changeType: 1, id: 1);
+        DecodeAfter(insertRow).Should().Equal(SqliteRecordCodec.Decode(AsBlob(insertCdc[6]).Span));
+
+        DecodeAfter(insertRow).Should().Equal(
+            SqlValue.Integer(1),
+            SqlValue.Integer(3),
+            SqlValue.Integer(4),
+            SqlValue.Integer(7));
     }
 
     // --- helpers ---
