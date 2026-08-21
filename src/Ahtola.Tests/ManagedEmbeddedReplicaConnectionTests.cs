@@ -17,6 +17,21 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     private const int LogicalApplyCommittedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyCommitted;
     private const int LogicalApplyCheckpointedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyCheckpointed;
     private const int LogicalApplyMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyMetadataPublished;
+    private const int RevertWalStagedBoundary = (int)ManagedReplicaDurableBoundary.RevertWalStaged;
+    private const int RevertWalPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertWalPublished;
+    private const int RevertMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertMetadataPublished;
+    private const int RevertCheckpointedBoundary = (int)ManagedReplicaDurableBoundary.RevertCheckpointed;
+    private const int RevertRemoteApplyIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertRemoteApplyIntentPublished;
+    private const int RevertCommittedRestoreIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedRestoreIntentPublished;
+    private const int RevertCommittedRestoreStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedRestoreStagedDatabase;
+    private const int RevertCommittedRestoreDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedRestoreDatabasePublished;
+    private const int RevertCommittedReadyMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedReadyMetadataPublished;
+    private const int RevertPushIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertPushIntentPublished;
+    private const int RevertConflictRestoreIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertConflictRestoreIntentPublished;
+    private const int RevertRestoreStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.RevertRestoreStagedDatabase;
+    private const int RevertRestoreDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertRestoreDatabasePublished;
+    private const int RevertRestoreMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertRestoreMetadataPublished;
+    private const int RevertRetiredBoundary = (int)ManagedReplicaDurableBoundary.RevertRetired;
 
     [Test]
     public void ReplicaOptionsNormalizeLibsqlUrlsToHttps()
@@ -1621,6 +1636,619 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
             metadata.Revision.Should().Be("revision-43");
             metadata.Protocol.Should().Be(RemotePullProtocol.MvccLogical);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(RevertWalStagedBoundary, false)]
+    [TestCase(RevertWalPublishedBoundary, false)]
+    [TestCase(RevertMetadataPublishedBoundary, true)]
+    [TestCase(RevertCheckpointedBoundary, true)]
+    [TestCase(RevertRemoteApplyIntentPublishedBoundary, true)]
+    public void ReplaceBaseCheckpointRevertCaptureIsCrashSafeAtEveryPublicationBoundary(
+        int boundaryValue,
+        bool expectedPendingRevert)
+    {
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var path = NewReplicaPath($"managed-replica-revert-capture-{boundary}");
+        try
+        {
+            var (options, originalImage) = PrepareReplicaWithFullyPushedWal(path);
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == boundary)
+                               throw new InvalidOperationException("Injected checkpoint revert capture interruption.");
+                       }))
+                {
+                    Assert.ThrowsAsync<InvalidOperationException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                }
+            }
+
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            metadata.RevertState.HasValue.Should().Be(expectedPendingRevert);
+            if (expectedPendingRevert)
+            {
+                File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+                ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata);
+                File.ReadAllBytes(path).Should().Equal(originalImage);
+                ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+                File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            }
+            else
+            {
+                File.ReadAllBytes(path).Should().Equal(originalImage);
+                File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+                ManagedReplicaRevertWal.EnsureSynchronizationReady(path, metadata);
+                File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            }
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(RevertCommittedRestoreIntentPublishedBoundary)]
+    [TestCase(RevertCommittedRestoreStagedDatabaseBoundary)]
+    [TestCase(RevertCommittedRestoreDatabasePublishedBoundary)]
+    [TestCase(RevertCommittedReadyMetadataPublishedBoundary)]
+    public void CheckpointCommittedImagePreparationRecoversAtEveryPublicationBoundary(int boundaryValue)
+    {
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var path = NewReplicaPath($"managed-replica-revert-committed-{boundary}");
+        try
+        {
+            _ = PreparePendingCheckpointRevert(path);
+            var committedImage = File.ReadAllBytes(path);
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == boundary)
+                           throw new InvalidOperationException("Injected committed-image recovery interruption.");
+                   }))
+            {
+                Assert.Throws<InvalidOperationException>(
+                    () => ManagedReplicaRevertWal.PrepareSynchronization(path, metadata));
+            }
+
+            metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            metadata = ManagedReplicaRevertWal.PrepareSynchronization(path, metadata);
+
+            File.ReadAllBytes(path).Should().Equal(committedImage);
+            metadata.RevertState!.Value.Phase.Should()
+                .Be(ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady);
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(RevertRestoreStagedDatabaseBoundary)]
+    [TestCase(RevertRestoreDatabasePublishedBoundary)]
+    [TestCase(RevertRestoreMetadataPublishedBoundary)]
+    [TestCase(RevertRetiredBoundary)]
+    [TestCase(RevertConflictRestoreIntentPublishedBoundary)]
+    public void CheckpointRevertRestoreRecoversAtEveryPublicationBoundary(int boundaryValue)
+    {
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var path = NewReplicaPath($"managed-replica-revert-restore-{boundary}");
+        try
+        {
+            var (originalImage, metadata) = PreparePendingCheckpointRevert(path);
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == boundary)
+                           throw new InvalidOperationException("Injected checkpoint revert restore interruption.");
+                   }))
+            {
+                Assert.Throws<InvalidOperationException>(
+                    () => ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata));
+            }
+
+            var recoveredMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            if (recoveredMetadata.RevertState.HasValue)
+                ManagedReplicaRevertWal.RestorePendingCheckpoint(path, recoveredMetadata);
+            else
+                ManagedReplicaRevertWal.EnsureSynchronizationReady(path, recoveredMetadata);
+
+            File.ReadAllBytes(path).Should().Equal(originalImage);
+            var finalMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            finalMetadata.RevertState.Should().BeNull();
+            ManagedReplicaBootstrapper.EnsureNoLocalDivergence(path, finalMetadata);
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointRecoveryRunsBeforeOpeningAnInterruptedRemoteImage()
+    {
+        var path = NewReplicaPath("managed-replica-revert-open-recovery");
+        try
+        {
+            var (options, _) = PrepareReplicaWithFullyPushedWal(path);
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            using (var pager = Core.Storage.SqlitePager.Open(
+                       Core.Storage.PhysicalFileSystem.Instance,
+                       path,
+                       path + "-wal"))
+            {
+                ManagedReplicaRevertWal.CaptureAndCheckpoint(
+                    path,
+                    metadata,
+                    pager,
+                    CancellationToken.None);
+            }
+
+            metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            _ = ManagedReplicaRevertWal.MarkRemoteApplyStarted(path, metadata);
+            var remoteImage = CreateDatabaseImageWithMarker(path + ".remote", 84);
+            File.WriteAllBytes(path, CreateDatabaseImageWithMarker(path + ".replayed", 999));
+            StageCommittedMainFileChangesInWal(path, remoteImage);
+            new FileInfo(path + "-wal").Length.Should().BeGreaterThan(Core.Storage.SqliteWalHeader.Size);
+
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            ReadBootstrapMarker(connection).Should().Be(43);
+            var recovered = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            recovered.RevertState!.Value.Phase.Should()
+                .Be(ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady);
+            new FileInfo(path + "-wal").Length.Should().BeLessThanOrEqualTo(Core.Storage.SqliteWalHeader.Size);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void CheckpointRevertRestoreRejectsCorruptOrMissingSidecar(bool deleteSidecar)
+    {
+        var path = NewReplicaPath(
+            deleteSidecar
+                ? "managed-replica-revert-missing"
+                : "managed-replica-revert-corrupt");
+        try
+        {
+            var (_, metadata) = PreparePendingCheckpointRevert(path);
+            var sidecarPath = path + ManagedReplicaRevertWal.Suffix;
+            if (deleteSidecar)
+            {
+                File.Delete(sidecarPath);
+            }
+            else
+            {
+                var bytes = File.ReadAllBytes(sidecarPath);
+                bytes[^1] ^= 0x80;
+                File.WriteAllBytes(sidecarPath, bytes);
+            }
+
+            Assert.Throws<InvalidDataException>(
+                () => ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata));
+            Assert.Throws<InvalidDataException>(
+                () => ManagedReplicaRevertWal.EnsureSynchronizationReady(path, metadata));
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CheckpointRevertMetadataRejectsCorruptWatermark()
+    {
+        var path = NewReplicaPath("managed-replica-revert-corrupt-watermark");
+        try
+        {
+            _ = PreparePendingCheckpointRevert(path);
+            var metadataPath = path + ".ahtola-replica-meta";
+            var lines = File.ReadAllLines(metadataPath);
+            var revertStateIndex = Array.FindIndex(
+                lines,
+                static line => line.StartsWith("revert_state_base64=", StringComparison.Ordinal));
+            revertStateIndex.Should().BeGreaterThanOrEqualTo(0);
+            var encodedState = lines[revertStateIndex]["revert_state_base64=".Length..];
+            var stateBytes = Convert.FromBase64String(encodedState);
+            stateBytes[1] ^= 0x01;
+            lines[revertStateIndex] = "revert_state_base64=" + Convert.ToBase64String(stateBytes);
+            File.WriteAllText(metadataPath, string.Join('\n', lines) + "\n", new UTF8Encoding(false));
+
+            var exception = Assert.Throws<InvalidDataException>(
+                () => ManagedReplicaBootstrapper.LoadMetadata(path));
+            exception!.Message.Should().Contain("integrity check");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CheckpointRevertRestoreAcceptsTheAuthenticatedSourceWalAfterMainFileInstallation()
+    {
+        var path = NewReplicaPath("managed-replica-revert-mid-checkpoint");
+        try
+        {
+            var (originalImage, metadata) = PreparePendingCheckpointRevert(
+                path,
+                ManagedReplicaDurableBoundary.RevertMetadataPublished);
+            using (var wal = Core.Storage.SqliteWalFile.Open(
+                       Core.Storage.PhysicalFileSystem.Instance,
+                       path + "-wal",
+                       readOnly: true))
+            {
+                var postimage = wal.ReadFrame(metadata.RevertState!.Value.SourceWalWatermark);
+                using var database = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Write,
+                    FileShare.None,
+                    bufferSize: postimage.PageData.Length,
+                    FileOptions.WriteThrough);
+                database.Position = checked((long)(postimage.Header.PageNumber - 1) * postimage.PageData.Length);
+                database.Write(postimage.PageData);
+                database.Flush(flushToDisk: true);
+            }
+
+            File.ReadAllBytes(path).Should().NotEqual(originalImage);
+            ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata);
+            File.ReadAllBytes(path).Should().Equal(originalImage);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CheckpointRevertRestoreIsSelfContainedAfterRemoteDatabasePublication()
+    {
+        var path = NewReplicaPath("managed-replica-revert-after-replacement");
+        try
+        {
+            var (originalImage, metadata) = PreparePendingCheckpointRevert(path);
+            metadata = ManagedReplicaRevertWal.MarkRemoteApplyStarted(path, metadata);
+            var replacementImage = CreateDatabaseImageWithMarker(path + ".remote", 999);
+            File.WriteAllBytes(path, replacementImage);
+            foreach (var suffix in new[] { "-wal", "-shm", "-journal" })
+            {
+                if (File.Exists(path + suffix))
+                    File.Delete(path + suffix);
+            }
+
+            ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata);
+            File.ReadAllBytes(path).Should().Equal(originalImage);
+            var restoredMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            restoredMetadata.RevertState.Should().BeNull();
+            ManagedReplicaBootstrapper.EnsureNoLocalDivergence(path, restoredMetadata);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointPushConflictRestoresExactOriginalImageAndRetainsJournal()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-conflict");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    ReplicaPushHandler.BatchErrorResponse(
+                        5,
+                        2,
+                        "conflicting local change",
+                        "SQLITE_CONSTRAINT")));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            var exception = Assert.ThrowsAsync<AhtolaReplicaConflictException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.Conflict);
+            ReadAllBytesShared(path).Should().Equal(scenario.OriginalImage);
+            ReadBootstrapMarker(connection).Should().Be(42);
+            connection.ReadManagedReplicaLocalChanges(10).Changes
+                .Select(change => change.Sequence).Should().Equal(2);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            scenario.Handler.PushCallCount.Should().Be(2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointTransientPushFailureKeepsCommittedImageAndRecoveryBundle()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-transient");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                    {
+                        Content = new StringContent("unavailable"),
+                    }));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            var exception = Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.TransientTransport);
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            ReadBootstrapMarker(connection).Should().Be(44);
+            connection.ReadManagedReplicaLocalChanges(10).Changes
+                .Select(change => change.Sequence).Should().Equal(2);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+            scenario.Handler.PushCallCount.Should().Be(2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointInvalidPushFailureDoesNotRestore()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-invalid");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    ReplicaPushHandler.BatchErrorResponse(
+                        5,
+                        2,
+                        "malformed statement",
+                        "SQLITE_ERROR")));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            var exception = Assert.ThrowsAsync<AhtolaRemoteSqlException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointCancellationDoesNotRestore()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-cancel");
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                (_, token) =>
+                {
+                    cancellation.Cancel();
+                    return Task.FromCanceled<HttpResponseMessage>(token);
+                });
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            Assert.CatchAsync<OperationCanceledException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token));
+
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointRejectsCheckpointedLocalActivityAfterTransientFailure()
+    {
+        var path = NewReplicaPath("managed-replica-revert-new-local-activity");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                    {
+                        Content = new StringContent("unavailable"),
+                    }));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            connection.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 45;");
+            connection.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
+
+            var exception = Assert.ThrowsAsync<InvalidOperationException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            exception!.Message.Should().Contain("committed database image changed");
+            connection.ReadManagedReplicaLocalChanges(10).Changes
+                .Select(change => change.Sequence).Should().Equal(2, 3);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+            scenario.Handler.PushCallCount.Should().Be(2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PendingCheckpointPushIntentInterruptionResumesBeforeSendingTheBatch()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-intent");
+        var recoveryCall = 0;
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                (_, _) => Task.FromResult(
+                    ++recoveryCall == 1
+                        ? ReplicaPushHandler.EmptyWatermarkResponse()
+                        : ReplicaPushHandler.SuccessfulBatchResponse(5)));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.RevertPushIntentPublished)
+                           throw new InvalidOperationException("Injected push-intent interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState!.Value.Phase.Should()
+                .Be(ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown);
+            scenario.Handler.PushCallCount.Should().Be(1);
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+            scenario.Handler.PushCallCount.Should().Be(3);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PendingCheckpointAmbiguousPushUsesRemoteWatermarkBeforeRetry()
+    {
+        var path = NewReplicaPath("managed-replica-revert-ambiguous-push");
+        var recoveryCall = 0;
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                (_, _) => ++recoveryCall == 1
+                    ? Task.FromException<HttpResponseMessage>(
+                        new HttpRequestException("Response was lost after the remote commit."))
+                    : Task.FromResult(ReplicaPushHandler.WatermarkResponse(0, 2)));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            Assert.ThrowsAsync<HttpRequestException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            scenario.Handler.PushCallCount.Should().Be(3);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PendingCheckpointSuccessfulPushCompletesCommittedImageAndRetiresRecovery()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-success");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(ReplicaPushHandler.SuccessfulBatchResponse(5)));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            ReadBootstrapMarker(connection).Should().Be(44);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            scenario.Handler.PushCallCount.Should().Be(2);
+            scenario.Handler.PullCallCount.Should().Be(4);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointCorruptionFailsClosedBeforeConflictPush()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-corrupt");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    ReplicaPushHandler.BatchErrorResponse(
+                        5,
+                        2,
+                        "conflicting local change",
+                        "SQLITE_CONSTRAINT")));
+            var sidecarPath = path + ManagedReplicaRevertWal.Suffix;
+            using (var stream = new FileStream(sidecarPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                stream.Position = stream.Length - 1;
+                var lastByte = stream.ReadByte();
+                stream.Position = stream.Length - 1;
+                stream.WriteByte((byte)(lastByte ^ 0xff));
+                stream.Flush(flushToDisk: true);
+            }
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            var exception = Assert.Throws<InvalidDataException>(() => connection.Open());
+
+            exception!.Message.Should().Contain("integrity check");
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(10).Changes.Should().ContainSingle();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            scenario.Handler.PushCallCount.Should().Be(1);
         }
         finally
         {
@@ -3262,6 +3890,18 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     private static string NewReplicaPath(string prefix)
         => Path.Combine(TestContext.CurrentContext.WorkDirectory, $"{prefix}-{Guid.NewGuid():N}.db");
 
+    private static byte[] ReadAllBytesShared(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        var bytes = new byte[checked((int)stream.Length)];
+        stream.ReadExactly(bytes);
+        return bytes;
+    }
+
     private static byte[] CreateDatabaseImage(string path)
     {
         try { CreateInitializedDatabase(path); return File.ReadAllBytes(path); }
@@ -3315,6 +3955,129 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
 
         transaction.Commit();
+    }
+
+    private static (AhtolaReplicaOptions Options, byte[] OriginalImage) PrepareReplicaWithFullyPushedWal(string path)
+    {
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var replacedImage = CreateDatabaseImageWithMarker(path + ".replaced", 84);
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateReplaceBasePullResponse("revision-43", replacedImage),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        using (var local = AhtolaConnection.CreateReplica(options))
+        {
+            local.Open();
+            local.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 43;");
+        }
+        StageCommittedMainFileChangesInWal(path, initialImage);
+        return (options, File.ReadAllBytes(path));
+    }
+
+    private static (
+        byte[] OriginalImage,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata Metadata) PreparePendingCheckpointRevert(
+        string path,
+        ManagedReplicaDurableBoundary interruptionBoundary = ManagedReplicaDurableBoundary.RevertCheckpointed)
+    {
+        var (options, originalImage) = PrepareReplicaWithFullyPushedWal(path);
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+        using (var pager = Core.Storage.SqlitePager.Open(
+                   Core.Storage.PhysicalFileSystem.Instance,
+                   path,
+                   path + "-wal"))
+        {
+            if (interruptionBoundary == ManagedReplicaDurableBoundary.RevertMetadataPublished)
+            {
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == interruptionBoundary)
+                               throw new InvalidOperationException("Injected pre-checkpoint interruption.");
+                       }))
+                {
+                    Assert.Throws<InvalidOperationException>(
+                        () => ManagedReplicaRevertWal.CaptureAndCheckpoint(
+                            path,
+                            metadata,
+                            pager,
+                            CancellationToken.None));
+                }
+            }
+            else
+            {
+                ManagedReplicaRevertWal.CaptureAndCheckpoint(
+                    path,
+                    metadata,
+                    pager,
+                    CancellationToken.None);
+            }
+        }
+
+        metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+        metadata.RevertState.Should().NotBeNull();
+        return (originalImage, metadata);
+    }
+
+    private static PendingCheckpointPushScenario PreparePendingCheckpointPush(
+        string path,
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> pendingPushResponse)
+    {
+        var originalImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var replacedImage = CreateDatabaseImageWithMarker(path + ".replaced", 84);
+        var pushAttempt = 0;
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", originalImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateReplaceBasePullResponse("revision-43", replacedImage),
+            CreateLogicalPullResponse("revision-43", body: []),
+        ],
+        (request, cancellationToken) =>
+        {
+            pushAttempt++;
+            return pushAttempt == 1
+                ? Task.FromResult(ReplicaPushHandler.SuccessfulBatchResponse(5))
+                : pendingPushResponse(request, cancellationToken);
+        });
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        using (var local = AhtolaConnection.CreateReplica(options))
+        {
+            local.Open();
+            local.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 43;");
+            local.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 44;");
+        }
+        var committedImage = File.ReadAllBytes(path);
+        StageCommittedMainFileChangesInWal(path, originalImage);
+
+        using (var connection = AhtolaConnection.CreateReplica(options))
+        {
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.RevertCheckpointed)
+                           throw new InvalidOperationException("Injected post-checkpoint interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+        }
+
+        File.ReadAllBytes(path).Should().Equal(committedImage);
+        ManagedReplicaChangeJournal.Open(path).ReadBatch(10).Changes
+            .Select(change => change.Sequence).Should().Equal(2);
+        ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+        return new PendingCheckpointPushScenario(
+            options,
+            handler,
+            originalImage,
+            committedImage);
     }
 
     private static byte[] CreateJournalDatabaseImage(string path)
@@ -3384,15 +4147,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
 
     private static void DeleteReplicaFiles(string path)
     {
-        foreach (var file in new[]
-                 {
-                     path,
-                     path + "-wal",
-                     path + "-shm",
-                     path + "-journal",
-                     path + ".ahtola-replica-meta",
-                     path + ManagedReplicaChangeJournal.Suffix,
-                 })
+        foreach (var file in ManagedReplicaBootstrapper.GetLocalArtifactPaths(path))
         {
             if (File.Exists(file))
                 File.Delete(file);
@@ -3841,11 +4596,33 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
-    private sealed class ReplicaPushHandler(
-        IEnumerable<byte[]> pullResponses,
-        Func<HttpRequestMessage, HttpResponseMessage> pushResponse) : HttpMessageHandler
+    private readonly record struct PendingCheckpointPushScenario(
+    AhtolaReplicaOptions Options,
+    ReplicaPushHandler Handler,
+    byte[] OriginalImage,
+    byte[] CommittedImage);
+
+    private sealed class ReplicaPushHandler : HttpMessageHandler
     {
-        private readonly Queue<byte[]> _pullResponses = new(pullResponses);
+        private readonly Queue<byte[]> _pullResponses;
+        private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _pushResponse;
+
+        public ReplicaPushHandler(
+            IEnumerable<byte[]> pullResponses,
+            Func<HttpRequestMessage, HttpResponseMessage> pushResponse)
+            : this(
+                pullResponses,
+                (request, _) => Task.FromResult(pushResponse(request)))
+        {
+        }
+
+        public ReplicaPushHandler(
+            IEnumerable<byte[]> pullResponses,
+            Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> pushResponse)
+        {
+            _pullResponses = new Queue<byte[]>(pullResponses);
+            _pushResponse = pushResponse;
+        }
 
         public int PullCallCount { get; private set; }
 
@@ -3869,7 +4646,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
 
             PushCallCount++;
             PushStarted.TrySetResult(true);
-            return Task.FromResult(pushResponse(request));
+            return _pushResponse(request, cancellationToken);
         }
 
         public static HttpResponseMessage SuccessfulBatchResponse(int stepCount)
@@ -3877,6 +4654,26 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
 
         public static HttpResponseMessage BatchErrorResponse(int stepCount, int errorStep, string message, string code)
             => BatchResponse(stepCount, errorStep, message, code);
+
+        public static HttpResponseMessage EmptyWatermarkResponse()
+            => WatermarkResponseCore("[]");
+
+        public static HttpResponseMessage WatermarkResponse(long pullGeneration, long changeId)
+            => WatermarkResponseCore(
+                $"[[{{\"type\":\"integer\",\"value\":{pullGeneration}}},"
+                + $"{{\"type\":\"integer\",\"value\":{changeId}}}]]");
+
+        private static HttpResponseMessage WatermarkResponseCore(string rows)
+            => new(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"results\":["
+                    + "{\"type\":\"ok\",\"response\":{\"type\":\"execute\",\"result\":"
+                    + $"{{\"cols\":[],\"rows\":{rows},\"affected_row_count\":0}}}}}},"
+                    + "{\"type\":\"ok\",\"response\":{\"type\":\"close\"}}]}",
+                    Encoding.UTF8,
+                    "application/json"),
+            };
 
         private static HttpResponseMessage BatchResponse(int stepCount, int? errorStep, string? message, string? code)
         {

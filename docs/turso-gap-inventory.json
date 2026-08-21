@@ -2512,13 +2512,13 @@
     {
       "id": "sync-no-revert-db-checkpoint-safety",
       "layer": "sync",
-      "kind": "missing",
+      "kind": "partial",
       "turso_ref": "turso-src/sync/engine/src/database_sync_engine.rs::open_revert_db_conn, checkpoint_passive, checkpoint (revert_db_wal_path, create_revert_db_wal_path)",
-      "ahtola_ref": "none",
-      "severity": "s4-intentional",
+      "ahtola_ref": "src/Ahtola.Core/Storage/SqlitePager.cs (CheckpointToMainStoreAndResetWal capture callback), src/Ahtola.Data/ManagedReplicaRevertWal.cs, src/Ahtola.Data/ManagedReplicaBootstrapper.cs (v4 recovery metadata), src/Ahtola.Data/ManagedReplicaConnectionHost.cs (typed conflict restore trigger)",
+      "severity": "s1-correctness",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Updated 2026-08-20: this is managed-native correctness work independent of the optional Turso.Data.Sync companion. ReplaceBase checkpointing durably captures exact pre-checkpoint and committed page images in an integrity-checked SQLite <db>-wal-revert before main-file overwrite, publishes a checksummed source-WAL epoch/watermark in v4 metadata, and resumes interrupted checkpoints from the committed image. Only AhtolaReplicaPushFailureKind.Conflict restores the exact pre-checkpoint image; transient transport, cancellation, and invalid-local-state failures retain the recovery bundle and pending journal. Missing/corrupt state fails closed. Still partial versus Turso's reusable passive synced-prefix/history model, tracked by sync-checkpoint-mode-mismatch-vs-managed-storage.",
       "status": "closed"
     },
     {

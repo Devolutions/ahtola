@@ -15,6 +15,21 @@ internal enum ManagedReplicaDurableBoundary
     LogicalApplyCommitted,
     LogicalApplyCheckpointed,
     LogicalApplyMetadataPublished,
+    RevertWalStaged,
+    RevertWalPublished,
+    RevertMetadataPublished,
+    RevertCheckpointed,
+    RevertRemoteApplyIntentPublished,
+    RevertCommittedRestoreIntentPublished,
+    RevertCommittedRestoreStagedDatabase,
+    RevertCommittedRestoreDatabasePublished,
+    RevertCommittedReadyMetadataPublished,
+    RevertPushIntentPublished,
+    RevertConflictRestoreIntentPublished,
+    RevertRestoreStagedDatabase,
+    RevertRestoreDatabasePublished,
+    RevertRestoreMetadataPublished,
+    RevertRetired,
 }
 
 /// <summary>

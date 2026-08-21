@@ -327,10 +327,46 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         CancellationToken cancellationToken)
     {
         if (IsReplicaFilePresent(options.Path))
+        {
+            await PrepareExistingReplicaForOpenAsync(syncEntry, options.Path, cancellationToken)
+                .ConfigureAwait(false);
             return;
+        }
 
         await syncEntry.PublishAsync(
                 token => BootstrapAndCatchUpAsync(options, token),
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static async Task PrepareExistingReplicaForOpenAsync(
+        ManagedReplicaSyncRegistry.Entry syncEntry,
+        string databasePath,
+        CancellationToken cancellationToken)
+    {
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(databasePath);
+        var hasRecoveryArtifacts = ManagedReplicaRevertWal.GetArtifactPaths(databasePath).Any(File.Exists);
+        if (metadata is null)
+        {
+            if (hasRecoveryArtifacts)
+            {
+                throw new InvalidDataException(
+                    "Managed embedded replica checkpoint recovery artifacts have no matching metadata.");
+            }
+            return;
+        }
+        if (!metadata.Value.RevertState.HasValue && !hasRecoveryArtifacts)
+            return;
+
+        await syncEntry.PublishAsync(
+                cancellationToken =>
+                {
+                    var current = ManagedReplicaBootstrapper.LoadMetadata(databasePath)
+                                  ?? throw new InvalidDataException(
+                                      "Managed embedded replica checkpoint recovery metadata is missing.");
+                    _ = ManagedReplicaRevertWal.PrepareSynchronization(databasePath, current);
+                    return Task.CompletedTask;
+                },
                 cancellationToken)
             .ConfigureAwait(false);
     }
@@ -424,28 +460,46 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         AhtolaSyncOptions syncOptions,
         CancellationToken cancellationToken)
     {
-        var push = await PushLocalChangesAsync(replicaOptions, metadata, syncOptions, cancellationToken)
-            .ConfigureAwait(false);
-        metadata = push.Metadata;
+        metadata = ManagedReplicaRevertWal.PrepareSynchronization(replicaOptions.Path, metadata);
+        var maximumChanges = GetPushBatchLimit(replicaOptions);
+        var remainingProbeLimit = maximumChanges == int.MaxValue
+            ? int.MaxValue
+            : maximumChanges + 1;
+        long pushedChangeCount = 0;
+        while (true)
+        {
+            var push = await PushLocalChangesAsync(replicaOptions, metadata, syncOptions, cancellationToken)
+                .ConfigureAwait(false);
+            metadata = push.Metadata;
+            pushedChangeCount = checked(pushedChangeCount + push.ChangeCount);
 
-        // Anything still sitting in the change journal after the push batch above (capped by
-        // PushOperationsThreshold) has not reached the server, so the pull below must reconcile
-        // it rather than let its own remote row-level apply silently overwrite it.
+            var remaining = _changeJournal.ReadBatch(remainingProbeLimit);
+            if (metadata.RevertState.HasValue
+                || remaining.Changes.Count <= maximumChanges)
+            {
+                break;
+            }
+        }
+
         var pendingLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes;
+        var acknowledgedLocalChanges = _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark);
         var result = await ManagedReplicaBootstrapper.CheckForUpdatesAsync(
                 replicaOptions,
                 metadata,
                 syncOptions,
                 pendingLocalChanges,
+                acknowledgedLocalChanges,
                 cancellationToken)
             .ConfigureAwait(false);
         _metadata = ManagedReplicaBootstrapper.LoadMetadata(replicaOptions.Path);
+        if (result.Outcome == AhtolaSyncOutcome.RemoteChangesApplied && _metadata is { } published)
+            _changeJournal.PruneAcknowledged(published.JournalBaseWatermark);
         return result with
         {
             Statistics = result.Statistics with
             {
-                CdcOperations = checked(result.Statistics.CdcOperations + push.ChangeCount),
-                LastPush = push.ChangeCount == 0 ? result.Statistics.LastPush : DateTimeOffset.UtcNow,
+                CdcOperations = checked(result.Statistics.CdcOperations + pushedChangeCount),
+                LastPush = pushedChangeCount == 0 ? result.Statistics.LastPush : DateTimeOffset.UtcNow,
             },
         };
     }
@@ -477,6 +531,27 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
 
     internal void ReopenAfterPublication()
     {
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(_options.Path);
+        if (metadata is { } value)
+        {
+            if (value.RevertState is null
+                || value.RevertState is
+                {
+                    Phase: ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.Captured
+                    or ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.RestoreCommitted
+                    or ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.RestoreOriginal,
+                })
+            {
+                value = ManagedReplicaRevertWal.PrepareSynchronization(_options.Path, value);
+            }
+            _metadata = value;
+        }
+        else if (ManagedReplicaRevertWal.GetArtifactPaths(_options.Path).Any(File.Exists))
+        {
+            throw new InvalidDataException(
+                "Managed embedded replica checkpoint recovery artifacts have no matching metadata.");
+        }
+
         var database = OpenDatabase(_options.Path);
         try
         {
@@ -557,12 +632,31 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         AhtolaSyncOptions syncOptions,
         CancellationToken cancellationToken)
     {
-        var maximumChanges = replicaOptions.PushOperationsThreshold is { } threshold
-            ? checked((int)Math.Min(threshold, int.MaxValue))
-            : 1000;
-        var batch = _changeJournal.ReadBatch(maximumChanges);
+        var recoveringUnknownPush = metadata.RevertState is
+        {
+            Phase: ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown,
+        };
+        ReplicaLocalChangeBatch batch;
+        if (recoveringUnknownPush)
+        {
+            var state = metadata.RevertState!.Value;
+            batch = _changeJournal.ReadBatch(state.AttemptedFirstSequence, state.AttemptedWatermark);
+        }
+        else
+        {
+            var maximumChanges = metadata.RevertState.HasValue
+                ? int.MaxValue
+                : GetPushBatchLimit(replicaOptions);
+            batch = _changeJournal.ReadBatch(maximumChanges);
+        }
         if (batch.Changes.Count == 0)
-            return new LocalPushResult(0, metadata);
+        {
+            var completedMetadata = ManagedReplicaRevertWal.CompletePreparedCheckpoint(
+                replicaOptions.Path,
+                metadata);
+            _metadata = completedMetadata;
+            return new LocalPushResult(0, completedMetadata);
+        }
 
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pushing));
         using var client = replicaOptions.HttpPolicy.MessageHandler is { } handler
@@ -576,19 +670,75 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             replicaOptions.RemoteEncryption,
             disposeHttpClient: false);
 
-        await remote.PushReplicaChangesAsync(
-                batch,
-                metadata.ClientId,
-                sourcePullGeneration: 0,
-                ToCommandTimeoutSeconds(replicaOptions.HttpPolicy.RequestTimeout),
-                cancellationToken)
-            .ConfigureAwait(false);
+        const long sourcePullGeneration = 0;
+        if (recoveringUnknownPush)
+        {
+            var remoteWatermark = await remote.ReadReplicaPushWatermarkAsync(
+                    metadata.ClientId,
+                    ToCommandTimeoutSeconds(replicaOptions.HttpPolicy.RequestTimeout),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (remoteWatermark is { } watermark)
+            {
+                if (watermark.PullGeneration > sourcePullGeneration)
+                {
+                    throw new AhtolaException(
+                        "Remote replica push acknowledgement is ahead of the local pull generation.",
+                        AhtolaReplicaPushFailureKind.InvalidLocalState);
+                }
+                if (watermark.PullGeneration == sourcePullGeneration
+                    && watermark.ChangeId >= batch.Changes[^1].Sequence)
+                {
+                    _changeJournal.Acknowledge(batch.Watermark);
+                    var acknowledgedMetadata = await ManagedReplicaBootstrapper
+                        .RecordLocalPushAsync(replicaOptions, metadata, cancellationToken)
+                        .ConfigureAwait(false);
+                    return new LocalPushResult(batch.Changes.Count, acknowledgedMetadata);
+                }
+                if (watermark.PullGeneration == sourcePullGeneration
+                    && watermark.ChangeId >= batch.FirstSequence)
+                {
+                    throw new AhtolaException(
+                        "Remote replica push acknowledgement splits the pending local batch.",
+                        AhtolaReplicaPushFailureKind.InvalidLocalState);
+                }
+            }
+        }
+
+        metadata = ManagedReplicaRevertWal.MarkPushStarted(replicaOptions.Path, metadata, batch);
+        _metadata = metadata;
+        try
+        {
+            await remote.PushReplicaChangesAsync(
+                    batch,
+                    metadata.ClientId,
+                    sourcePullGeneration,
+                    ToCommandTimeoutSeconds(replicaOptions.HttpPolicy.RequestTimeout),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (
+            metadata.RevertState.HasValue
+            && AhtolaReplicaPushFailure.Classify(exception) == AhtolaReplicaPushFailureKind.Conflict)
+        {
+            ManagedReplicaRevertWal.RestorePendingCheckpoint(
+                replicaOptions.Path,
+                metadata,
+                CancellationToken.None);
+            _metadata = ManagedReplicaBootstrapper.LoadMetadata(replicaOptions.Path);
+            throw;
+        }
+        _changeJournal.Acknowledge(batch.Watermark);
         var updatedMetadata = await ManagedReplicaBootstrapper
             .RecordLocalPushAsync(replicaOptions, metadata, cancellationToken)
             .ConfigureAwait(false);
-        _changeJournal.Acknowledge(batch.Watermark);
         return new LocalPushResult(batch.Changes.Count, updatedMetadata);
     }
+
+    private static int GetPushBatchLimit(AhtolaReplicaOptions replicaOptions)
+        => replicaOptions.PushOperationsThreshold is { } threshold
+            ? checked((int)Math.Min(threshold, int.MaxValue))
+            : 1000;
 
     private static int ToCommandTimeoutSeconds(TimeSpan timeout)
     {

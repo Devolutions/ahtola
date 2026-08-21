@@ -65,8 +65,8 @@ for the shapes it covers.
 | functions | 24 | 16 | 0 | 6 | 2 | 0 | 41 |
 | storage | 20 | 7 | 9 | 1 | 1 | 2 | 32 |
 | mvcc | 14 | 11 | 2 | 1 | 0 | 0 | 42 |
-| sync | 18 | 11 | 2 | 3 | 2 | 0 | 1 |
-| **total** | **171** | **98** | **25** | **39** | **7** | **2** | **606 distinct lines** |
+| sync | 18 | 10 | 3 | 3 | 2 | 0 | 1 |
+| **total** | **171** | **97** | **26** | **39** | **7** | **2** | **606 distinct lines** |
 
 \* Sum of expected-failure lines mapped to each layer's entries. Lines multi-map by design (one symptom can trace to several layers), so column sums exceed 606; the distinct-line total is exactly 606 (100% coverage).
 
@@ -756,7 +756,7 @@ qualified subset in the matrix above.
 | `sync-no-mvcc-logical-log-replay` | closed | s2-capability | L | 0 | 0 | The managed pull path decodes Turso v0.7.2 portable `lml3` transactions, validates range/frame CRCs and bounds, replays header/schema/row changes atomically, persists protocol/table maps, filters client echoes, and compensates post-commit metadata failures. |
 | `sync-no-page-protocol-pull-decode` | partial | s2-capability | M | 0 | 0 | Raw 4-KiB page bootstrap/incremental streams and protocol-2 full ReplaceBase fallback are decoded and atomically published. zstd and partial page-selection streams remain explicitly rejected. |
 | `sync-no-partial-sync-lazy-page-storage` | missing | s2-capability | L | 0 | 0 | Ahtola already defines a rich C# surface for partial bootstrap (prefix-length or server-side-query page selection, lazy segment size, prefetch flag), matching the shape o… |
-| `sync-no-revert-db-checkpoint-safety` | missing | s1-correctness | L | 0 | 0 | Turso's checkpoint keeps a shadow 'revert' WAL (`<db>-wal-revert`) so a passive checkpoint of synced frames can be rolled back if the corresponding push to remote later r… |
+| `sync-no-revert-db-checkpoint-safety` | partial | s1-correctness | L | 0 | 0 | Managed ReplaceBase checkpointing now durably publishes an integrity-checked `<db>-wal-revert` plus source-WAL watermark metadata before overwriting or truncating rollback-relevant frames. The sidecar contains both the exact pre-checkpoint bytes and the committed checkpoint image: interrupted publication resumes from the committed image, while only a typed push conflict restores the pre-checkpoint bytes. Missing/corrupt recovery state fails closed and pending journal entries remain durable. Turso's reusable passive-prefix/history checkpoint policy remains tracked by `sync-checkpoint-mode-mismatch-vs-managed-storage`. |
 | `sync-partial-encryption-mutual-exclusion-unenforced` | divergent | s1-correctness | S | 0 | 0 | Turso hard-errors when partial-sync + remote-encryption + MVCC-logical-pull are combined incompatibly. Ahtola's AhtolaReplicaOptions.Validate() checks PartialBootstrap/Bo… |
 | `sync-remote-encryption-header-not-wired-for-remote-client` | missing | s2-capability | S | 0 | 0 | AhtolaRemoteEncryptionOptions models the cipher/base64 key surface used to compute reserved-bytes for encrypted Turso Cloud databases (consumed by the not-yet-existing re… |
 | `sync-remote-execute-stream-only-two-request-kinds` | divergent | s4-intentional | S | 0 | 0 | Turso's own vendored server_proto.rs already restricts the Hrana-like pipeline to Execute and Batch stream kinds (no cursor/describe/sequence/store_sql variants seen in f… |
