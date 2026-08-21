@@ -584,16 +584,15 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             return new LocalPushResult(0, metadata);
 
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pushing));
-        using var client = replicaOptions.HttpPolicy.MessageHandler is { } handler
-            ? new HttpClient(handler, disposeHandler: false)
-            : new HttpClient();
+        using var client = replicaOptions.HttpPolicy.CreateHttpClient(replicaOptions.RemoteEncryption is not null);
         client.Timeout = Timeout.InfiniteTimeSpan;
         using var remote = new AhtolaRemoteClient(
             client,
             replicaOptions.RemoteUri,
             replicaOptions.AuthToken,
             replicaOptions.RemoteEncryption,
-            disposeHttpClient: false);
+            disposeHttpClient: false,
+            automaticRedirectsDisabled: true);
 
         await remote.PushReplicaChangesAsync(
                 batch,

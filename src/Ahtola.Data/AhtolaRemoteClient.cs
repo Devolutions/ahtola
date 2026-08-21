@@ -27,7 +27,13 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         Uri endpoint,
         string? authToken,
         AhtolaRemoteEncryptionOptions? remoteEncryption = null)
-        : this(new HttpClient(), endpoint, authToken, remoteEncryption, disposeHttpClient: true)
+        : this(
+            AhtolaRemoteTransportSecurity.CreateRedirectSafeHttpClient(),
+            endpoint,
+            authToken,
+            remoteEncryption,
+            disposeHttpClient: true,
+            automaticRedirectsDisabled: true)
     {
     }
 
@@ -36,7 +42,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         Uri endpoint,
         string? authToken,
         AhtolaRemoteEncryptionOptions? remoteEncryption = null,
-        bool disposeHttpClient = false)
+        bool disposeHttpClient = false,
+        bool automaticRedirectsDisabled = false)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         ArgumentNullException.ThrowIfNull(endpoint);
@@ -48,6 +55,9 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         AhtolaRemoteTransportSecurity.Validate(
             _pipelineUri,
             _authToken,
+            remoteEncryptionConfigured: _remoteEncryptionKey is not null);
+        AhtolaRemoteTransportSecurity.ValidateRedirectContract(
+            automaticRedirectsDisabled,
             remoteEncryptionConfigured: _remoteEncryptionKey is not null);
         _disposeHttpClient = disposeHttpClient;
     }
@@ -272,19 +282,15 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         var json = JsonSerializer.Serialize(
             request,
             AhtolaRemoteJsonContext.Default.RemotePipelineRequest);
-        using var content = new StringContent(json, Encoding.UTF8, "application/json");
-        using var httpRequest = new HttpRequestMessage(HttpMethod.Post, _pipelineUri)
-        {
-            Content = content,
-        };
-
-        if (_authToken is not null)
-            httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _authToken);
-        if (_remoteEncryptionKey is not null)
-            httpRequest.Headers.TryAddWithoutValidation(EncryptionKeyHeaderName, _remoteEncryptionKey);
-
-        using var response = await _httpClient
-            .SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, effectiveCancellationToken)
+        using var response = await AhtolaRemoteTransportSecurity
+            .SendAsync(
+                _httpClient,
+                _pipelineUri,
+                requestUri => CreatePipelineHttpRequest(requestUri, json),
+                _authToken,
+                remoteEncryptionConfigured: _remoteEncryptionKey is not null,
+                HttpCompletionOption.ResponseHeadersRead,
+                effectiveCancellationToken)
             .ConfigureAwait(false);
 
         var body = await response.Content.ReadAsStringAsync(effectiveCancellationToken).ConfigureAwait(false);
@@ -320,6 +326,20 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(commandTimeout));
         return timeout;
+    }
+
+    private HttpRequestMessage CreatePipelineHttpRequest(Uri requestUri, string json)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        };
+
+        if (_authToken is not null)
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _authToken);
+        if (_remoteEncryptionKey is not null)
+            request.Headers.TryAddWithoutValidation(EncryptionKeyHeaderName, _remoteEncryptionKey);
+        return request;
     }
 
     internal static T DeserializeRemoteResult<T>(JsonElement result)

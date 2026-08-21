@@ -226,6 +226,13 @@ public sealed class AhtolaSyncHttpPolicy
     public HttpMessageHandler? MessageHandler { get; }
 
     /// <summary>
+    /// Gets or initializes whether <see cref="MessageHandler"/> is guaranteed not to follow HTTP
+    /// redirects internally. Set this only for handlers that return redirect responses to Ahtola,
+    /// which validates and follows supported redirects itself.
+    /// </summary>
+    public bool MessageHandlerDisablesAutomaticRedirects { get; init; }
+
+    /// <summary>
     /// Gets whether the connection owns and disposes <see cref="MessageHandler"/>.
     /// </summary>
     public bool DisposeMessageHandler { get; }
@@ -234,6 +241,17 @@ public sealed class AhtolaSyncHttpPolicy
     /// Gets the per-request HTTP timeout.
     /// </summary>
     public TimeSpan RequestTimeout { get; }
+
+    internal HttpClient CreateHttpClient(bool remoteEncryptionConfigured)
+    {
+        var automaticRedirectsDisabled = MessageHandler is null || MessageHandlerDisablesAutomaticRedirects;
+        AhtolaRemoteTransportSecurity.ValidateRedirectContract(
+            automaticRedirectsDisabled,
+            remoteEncryptionConfigured);
+        return MessageHandler is null
+            ? AhtolaRemoteTransportSecurity.CreateRedirectSafeHttpClient()
+            : new HttpClient(MessageHandler, disposeHandler: false);
+    }
 
     internal HttpMessageHandler? ClaimMessageHandlerOwnership()
     {
