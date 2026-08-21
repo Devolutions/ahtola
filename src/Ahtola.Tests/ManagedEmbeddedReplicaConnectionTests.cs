@@ -18,6 +18,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     private const int LogicalApplyCommittedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyCommitted;
     private const int LogicalApplyCheckpointedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyCheckpointed;
     private const int LogicalApplyMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyMetadataPublished;
+    private const int ReplicaApplyLockAcquiredBoundary = (int)ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired;
 
     // 32-byte (AES-256-GCM) hex keys used to build genuinely encrypted replica fixtures; mirrors
     // ManagedEncryptedFileOpenContractTests' Aes256Key/WrongAes256Key pair.
@@ -1961,6 +1962,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [TestCase(ReplicaApplyLockAcquiredBoundary, false)]
     [TestCase(LogicalApplyCommittedBoundary, false)]
     [TestCase(LogicalApplyCheckpointedBoundary, false)]
     [TestCase(LogicalApplyMetadataPublishedBoundary, true)]
@@ -2999,6 +3001,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [TestCase(ReplicaApplyLockAcquiredBoundary)]
     [TestCase(BootstrapStagedDatabaseBoundary)]
     [TestCase(BootstrapDatabasePublishedBoundary)]
     public async Task BootstrapCancellationAtDurableBoundaryLeavesNoUnpairedReplicaFiles(
@@ -3039,6 +3042,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [TestCase(ReplicaApplyLockAcquiredBoundary, false)]
     [TestCase(IncrementalApplyStagedDatabaseBoundary, false)]
     [TestCase(IncrementalApplyDatabasePublishedBoundary, false)]
     [TestCase(IncrementalApplyMetadataPublishedBoundary, true)]
@@ -3088,6 +3092,239 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             using var command = reopened.CreateCommand();
             command.CommandText = "SELECT value FROM bootstrap_marker;";
             command.ExecuteScalar().Should().Be(expectedRemoteImage ? 84L : 42L);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task IncrementalApplyLeaseIsReleasedAfterCancellationAllowingAnImmediateRetryOnTheSameConnection()
+    {
+        var path = NewReplicaPath("managed-replica-incremental-lease-retry");
+        var initialImage = CreateDatabaseImage(path + ".initial");
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler([
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage), // consumed by the canceled attempt, never applied
+            CreatePullResponse("revision-43", updatedImage), // consumed by the retry, applied
+        ]);
+        var options = CreateOptions(path, handler);
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired)
+                           cancellation.Cancel();
+                   }))
+            {
+                Assert.CatchAsync<OperationCanceledException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token));
+            }
+
+            using (var verifyCommand = connection.CreateCommand())
+            {
+                verifyCommand.CommandText = "SELECT value FROM bootstrap_marker;";
+                verifyCommand.ExecuteScalar().Should().Be(
+                    42L, "cancellation fired before the lease-guarded fingerprint check and apply ever ran");
+            }
+            handler.CallCount.Should().Be(2);
+
+            // Retry on the SAME connection, with no reopen in between: if the apply lease
+            // acquired (and abandoned mid-cancellation) by the first attempt were not released by
+            // its `await using` disposal, this call would hang forever waiting on the same
+            // per-path semaphore instead of completing.
+            var retryResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            retryResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            retryResult.Statistics.Revision.Should().Be("revision-43");
+
+            using (var retryCommand = connection.CreateCommand())
+            {
+                retryCommand.CommandText = "SELECT value FROM bootstrap_marker;";
+                retryCommand.ExecuteScalar().Should().Be(84L);
+            }
+            handler.CallCount.Should().Be(3);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task LogicalApplyLeaseIsReleasedAfterCancellationAllowingAnImmediateRetryOnTheSameConnection()
+    {
+        var path = NewReplicaPath("managed-replica-logical-lease-retry");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "widgets",
+            rowId: 9,
+            columnValue: "alice",
+            schemaSql: "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)",
+            salt: 950UL);
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up: nothing new
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]), // canceled attempt
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]), // retry, applied
+        ]);
+        var options = CreateOptions(path, handler);
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired)
+                           cancellation.Cancel();
+                   }))
+            {
+                Assert.CatchAsync<OperationCanceledException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token));
+            }
+
+            using (var existsCommand = connection.CreateCommand())
+            {
+                existsCommand.CommandText = "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'widgets';";
+                Convert.ToInt64(existsCommand.ExecuteScalar()).Should().Be(
+                    0L, "cancellation fired before ApplyLogicalUpdatesAsync ever started");
+            }
+            handler.CallCount.Should().Be(3);
+
+            // Retry on the SAME connection, with no reopen in between: proves the apply lease
+            // acquired (and abandoned mid-cancellation) by the first attempt was released via its
+            // `await using` disposal, rather than leaking and deadlocking every subsequent sync on
+            // this same replica path.
+            var retryResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            retryResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            retryResult.Statistics.Revision.Should().Be("revision-43");
+
+            using (var rowCommand = connection.CreateCommand())
+            {
+                rowCommand.CommandText = "SELECT name FROM widgets WHERE id = 9;";
+                rowCommand.ExecuteScalar().Should().Be("alice");
+            }
+            handler.CallCount.Should().Be(4);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ConcurrentBootstrapsOfTheSamePathSerializeAndTheLoserFailsCleanlyInsteadOfRacingTheFileSwap()
+    {
+        var path = NewReplicaPath("managed-replica-concurrent-bootstrap");
+        var image = CreateDatabaseImage(path + ".source");
+        var firstHandler = new PullUpdatesHandler([CreatePullResponse("revision-42", image)]);
+        var secondHandler = new PullUpdatesHandler([CreatePullResponse("revision-99", image)]);
+        var firstOptions = CreateOptions(path, firstHandler);
+        var secondOptions = CreateOptions(path, secondHandler);
+
+        var firstHasAcquiredLease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstReported = false;
+
+        try
+        {
+            Task firstBootstrap;
+            Task secondBootstrap;
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired && !firstReported)
+                       {
+                           firstReported = true;
+                           firstHasAcquiredLease.TrySetResult();
+                           releaseFirst.Task.Wait(TimeSpan.FromSeconds(5));
+                       }
+                   }))
+            {
+                firstBootstrap = ManagedReplicaBootstrapper.BootstrapAsync(firstOptions, CancellationToken.None);
+                await firstHasAcquiredLease.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+                secondBootstrap = ManagedReplicaBootstrapper.BootstrapAsync(secondOptions, CancellationToken.None);
+
+                // Give the second attempt a moment to reach (and start blocking on) the very same
+                // per-path exclusive lease before releasing the first: this is what proves
+                // serialization rather than a lucky interleaving.
+                await Task.Delay(100);
+                secondBootstrap.IsCompleted.Should().BeFalse(
+                    "the second bootstrap must serialize behind the first's still-held apply lease, never race the file swap");
+
+                releaseFirst.TrySetResult();
+                await firstBootstrap;
+
+                Func<Task> awaitSecond = () => secondBootstrap.WaitAsync(TimeSpan.FromSeconds(5));
+                await awaitSecond.Should().ThrowAsync<NotSupportedException>(
+                    "the loser must see the same clean bootstrap-target-exists rejection a sequential caller would get, never a raw File.Move race");
+            }
+
+            File.ReadAllBytes(path).Should().Equal(image);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+            firstHandler.CallCount.Should().Be(1);
+            secondHandler.CallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task IncrementalPullRejectsLocalDivergenceThatLandsAfterTheNetworkRoundTripUnderTheApplyLease()
+    {
+        var path = NewReplicaPath("managed-replica-post-lease-divergence");
+        var initialImage = CreateDatabaseImage(path + ".initial");
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler([
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        var options = CreateOptions(path, handler);
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point != ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired)
+                           return;
+
+                       // Simulate a rogue local writer landing exactly in the window between the
+                       // network round trip completing (pages already fully read into memory) and
+                       // the apply below: this connection's own file handle is guaranteed closed
+                       // here, since ManagedReplicaSyncRegistry.CloseForPublication runs on every
+                       // registered host before the staged operation even starts.
+                       using var rogueWrite = new FileStream(options.Path, FileMode.Open, FileAccess.Write, FileShare.None);
+                       rogueWrite.Position = 60; // SQLite's user-version header field is safe to alter externally.
+                       rogueWrite.WriteByte(1);
+                       rogueWrite.Flush(flushToDisk: true);
+                   }))
+            {
+                Assert.ThrowsAsync<NotSupportedException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            // The post-lease fingerprint re-check must catch the write that landed during the
+            // network round trip -- not just the pre-network EnsureNoLocalDivergence check, which
+            // already ran cleanly before this sync call even started (the file had not diverged
+            // yet). The apply itself must never have run: metadata stays on the prior revision.
+            handler.CallCount.Should().Be(2, "the network round trip for the rejected pull still happens; only the apply is blocked");
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
         }
         finally
         {
