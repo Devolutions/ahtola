@@ -8,7 +8,12 @@ namespace Ahtola;
 
 internal sealed partial class AhtolaRemoteClient : IDisposable
 {
-    private const string EncryptionKeyHeaderName = "x-turso-encryption-key";
+    /// <summary>
+    /// HTTP header used to convey the remote encryption key alongside a push/pull request. Also
+    /// used by <see cref="ManagedReplicaBootstrapper"/>'s raw HTTP bootstrap/pull requests so both
+    /// paths speak the identical remote-encryption wire protocol.
+    /// </summary>
+    internal const string EncryptionKeyHeaderName = "x-turso-encryption-key";
 
     private readonly HttpClient _httpClient;
     private readonly string? _authToken;
@@ -22,7 +27,13 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         Uri endpoint,
         string? authToken,
         AhtolaRemoteEncryptionOptions? remoteEncryption = null)
-        : this(new HttpClient(), endpoint, authToken, remoteEncryption, disposeHttpClient: true)
+        : this(
+            AhtolaRemoteTransportSecurity.CreateRedirectSafeHttpClient(),
+            endpoint,
+            authToken,
+            remoteEncryption,
+            disposeHttpClient: true,
+            automaticRedirectsDisabled: true)
     {
     }
 
@@ -31,7 +42,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         Uri endpoint,
         string? authToken,
         AhtolaRemoteEncryptionOptions? remoteEncryption = null,
-        bool disposeHttpClient = false)
+        bool disposeHttpClient = false,
+        bool automaticRedirectsDisabled = false)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         ArgumentNullException.ThrowIfNull(endpoint);
@@ -40,7 +52,13 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         _pipelineUri = CreatePipelineUri(endpoint);
         _authToken = string.IsNullOrWhiteSpace(authToken) ? null : authToken;
         _remoteEncryptionKey = remoteEncryption?.Base64Key;
-        ValidateAuthTokenTransport(_pipelineUri, _authToken);
+        AhtolaRemoteTransportSecurity.Validate(
+            _pipelineUri,
+            _authToken,
+            remoteEncryptionConfigured: _remoteEncryptionKey is not null);
+        AhtolaRemoteTransportSecurity.ValidateRedirectContract(
+            automaticRedirectsDisabled,
+            remoteEncryptionConfigured: _remoteEncryptionKey is not null);
         _disposeHttpClient = disposeHttpClient;
     }
 
@@ -210,7 +228,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         {
             Requests = [RemoteStreamRequest.Batch(new RemoteBatch { Steps = steps })],
         };
-        var response = await SendPipelineAsync(request, commandTimeout, cancellationToken).ConfigureAwait(false);
+        var response = await SendPipelineAsync(request, commandTimeout, cancellationToken, replicaPush: true).ConfigureAwait(false);
         UpdateSession(response, closeAfter: false);
 
         var succeeded = new bool[steps.Count];
@@ -223,10 +241,57 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         foreach (var step in replayedChangeSteps)
         {
             if (!succeeded[step])
-                throw new AhtolaException("Remote replica push skipped a local change.");
+                throw new AhtolaException("Remote replica push skipped a local change.", AhtolaReplicaPushFailureKind.InvalidLocalState);
         }
         if (!succeeded[watermarkStep] || !succeeded[commitStep])
-            throw new AhtolaException("Remote replica push did not commit its acknowledgement watermark.");
+            throw new AhtolaException("Remote replica push did not commit its acknowledgement watermark.", AhtolaReplicaPushFailureKind.InvalidLocalState);
+    }
+
+    internal async Task<(long PullGeneration, long ChangeId)?> ReadReplicaPushWatermarkAsync(
+        string clientId,
+        int commandTimeout,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
+        var parameters = new AhtolaParameterCollection();
+        parameters.Add(clientId);
+
+        RemoteStatementResult result;
+        try
+        {
+            result = await ExecuteAsync(
+                    "SELECT pull_gen, change_id FROM turso_sync_last_change_id WHERE client_id = ?",
+                    parameters,
+                    wantRows: true,
+                    commandTimeout,
+                    closeAfter: true,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (AhtolaRemoteSqlException exception) when (
+            exception.RemoteErrorMessage?.Contains("no such table", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            return null;
+        }
+
+        if (result.Rows.Count == 0)
+            return null;
+        if (result.Rows.Count != 1 || result.Rows[0].Count != 2)
+        {
+            throw new AhtolaException(
+                "Remote replica push acknowledgement returned an invalid result shape.",
+                AhtolaReplicaPushFailureKind.InvalidLocalState);
+        }
+
+        var pullGeneration = result.Rows[0][0].GetInt64();
+        var changeId = result.Rows[0][1].GetInt64();
+        if (pullGeneration < 0 || changeId < 0)
+        {
+            throw new AhtolaException(
+                "Remote replica push acknowledgement returned an invalid watermark.",
+                AhtolaReplicaPushFailureKind.InvalidLocalState);
+        }
+        return (pullGeneration, changeId);
     }
 
     public async Task CloseAsync(int commandTimeout, CancellationToken cancellationToken)
@@ -255,7 +320,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
     private async Task<RemotePipelineResponse> SendPipelineAsync(
         RemotePipelineRequest request,
         int commandTimeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool replicaPush = false)
     {
         using var timeout = CreateTimeout(commandTimeout, cancellationToken);
         var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
@@ -263,19 +329,15 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         var json = JsonSerializer.Serialize(
             request,
             AhtolaRemoteJsonContext.Default.RemotePipelineRequest);
-        using var content = new StringContent(json, Encoding.UTF8, "application/json");
-        using var httpRequest = new HttpRequestMessage(HttpMethod.Post, _pipelineUri)
-        {
-            Content = content,
-        };
-
-        if (_authToken is not null)
-            httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _authToken);
-        if (_remoteEncryptionKey is not null)
-            httpRequest.Headers.TryAddWithoutValidation(EncryptionKeyHeaderName, _remoteEncryptionKey);
-
-        using var response = await _httpClient
-            .SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, effectiveCancellationToken)
+        using var response = await AhtolaRemoteTransportSecurity
+            .SendAsync(
+                _httpClient,
+                _pipelineUri,
+                requestUri => CreatePipelineHttpRequest(requestUri, json),
+                _authToken,
+                remoteEncryptionConfigured: _remoteEncryptionKey is not null,
+                HttpCompletionOption.ResponseHeadersRead,
+                effectiveCancellationToken)
             .ConfigureAwait(false);
 
         var body = await response.Content.ReadAsStringAsync(effectiveCancellationToken).ConfigureAwait(false);
@@ -286,7 +348,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                     $"Remote replica push conflicted with HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {body}");
             throw new AhtolaException(
                 $"Remote request failed with HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {body}",
-                response.StatusCode);
+                response.StatusCode,
+                replicaPush);
         }
 
         try
@@ -312,6 +375,20 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         return timeout;
     }
 
+    private HttpRequestMessage CreatePipelineHttpRequest(Uri requestUri, string json)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        };
+
+        if (_authToken is not null)
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _authToken);
+        if (_remoteEncryptionKey is not null)
+            request.Headers.TryAddWithoutValidation(EncryptionKeyHeaderName, _remoteEncryptionKey);
+        return request;
+    }
+
     internal static T DeserializeRemoteResult<T>(JsonElement result)
     {
         try
@@ -323,18 +400,6 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         {
             throw new AhtolaException($"Unable to parse remote response: {ex.Message}");
         }
-    }
-
-    private static void ValidateAuthTokenTransport(Uri endpoint, string? authToken)
-    {
-        if (authToken is null
-            || endpoint.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
-            || endpoint.IsLoopback)
-        {
-            return;
-        }
-
-        throw new InvalidOperationException("Auth Token requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
     }
 
     private static RemoteStatement BuildStatement(string sql, AhtolaParameterCollection parameters, bool wantRows)
@@ -553,7 +618,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         if (batch.StepErrors.Count != expectedCount || batch.StepResults.Count != expectedCount)
         {
             throw new AhtolaException(
-                $"Remote batch returned an unexpected result shape: {batch.StepResults.Count} results, {batch.StepErrors.Count} errors, expected {expectedCount}.");
+                $"Remote batch returned an unexpected result shape: {batch.StepResults.Count} results, {batch.StepErrors.Count} errors, expected {expectedCount}.",
+                replicaPush ? AhtolaReplicaPushFailureKind.InvalidLocalState : (AhtolaReplicaPushFailureKind?)null);
         }
 
         for (var i = 0; i < batch.StepErrors.Count; i++)
@@ -615,8 +681,9 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         AhtolaReplicaConflictKind conflictKind = AhtolaReplicaConflictKind.Unknown,
         long? localChangeSequence = null)
     {
+        var invalidLocalState = replicaPush ? AhtolaReplicaPushFailureKind.InvalidLocalState : (AhtolaReplicaPushFailureKind?)null;
         if (error is null)
-            return new AhtolaRemoteSqlException("Remote SQL execution failed.", null, null);
+            return new AhtolaRemoteSqlException("Remote SQL execution failed.", null, null, invalidLocalState);
 
         if (replicaPush && IsConflict(error))
         {
@@ -630,7 +697,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         var message = string.IsNullOrWhiteSpace(error.Code)
             ? $"Remote SQL execution failed: {error.Message}"
             : $"Remote SQL execution failed: {error.Message} ({error.Code})";
-        return new AhtolaRemoteSqlException(message, error.Code, error.Message);
+        return new AhtolaRemoteSqlException(message, error.Code, error.Message, invalidLocalState);
     }
 
     private static bool IsConflict(RemoteError error)
@@ -647,7 +714,14 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         if (!string.IsNullOrWhiteSpace(response.BaseUrl))
         {
             var pipelineUri = CreatePipelineUri(new Uri(_pipelineUri, response.BaseUrl));
-            ValidateAuthTokenTransport(pipelineUri, _authToken);
+            AhtolaRemoteTransportSecurity.ValidateRedirectOrigin(
+                _pipelineUri,
+                pipelineUri,
+                credentialsConfigured: _authToken is not null || _remoteEncryptionKey is not null);
+            AhtolaRemoteTransportSecurity.Validate(
+                pipelineUri,
+                _authToken,
+                remoteEncryptionConfigured: _remoteEncryptionKey is not null);
             _pipelineUri = pipelineUri;
         }
 
@@ -905,8 +979,12 @@ internal sealed class RemoteError
 
 internal sealed class AhtolaRemoteSqlException : AhtolaException
 {
-    public AhtolaRemoteSqlException(string message, string? remoteErrorCode, string? remoteErrorMessage)
-        : base(message)
+    public AhtolaRemoteSqlException(
+        string message,
+        string? remoteErrorCode,
+        string? remoteErrorMessage,
+        AhtolaReplicaPushFailureKind? replicaPushFailureKind = null)
+        : base(message, replicaPushFailureKind)
     {
         RemoteErrorCode = remoteErrorCode;
         RemoteErrorMessage = remoteErrorMessage;

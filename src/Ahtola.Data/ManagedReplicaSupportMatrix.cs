@@ -8,23 +8,38 @@ internal static class ManagedReplicaSupportMatrix
     public static void ValidateOptions(AhtolaReplicaOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
+        options.Validate();
 
-        if (options.PartialBootstrap is not null)
+        if (options.PartialBootstrap is { } partialBootstrap)
         {
-            throw new NotSupportedException(
-                "Managed embedded replicas support only a complete raw 4 KiB page bootstrap; partial, query, and lazy bootstrap are not supported.");
-        }
+            if (partialBootstrap.Kind == AhtolaPartialBootstrapKind.Query)
+            {
+                throw new NotSupportedException(
+                    "Managed embedded replicas do not support query-selected bootstrap pages.");
+            }
 
-        if (options.PullBytesThreshold is not null)
-        {
-            throw new NotSupportedException(
-                "Managed embedded replicas support only a single complete raw 4 KiB page bootstrap; chunked bootstrap is not supported.");
+            if (partialBootstrap.Kind != AhtolaPartialBootstrapKind.Prefix)
+            {
+                throw new NotSupportedException(
+                    "Managed embedded replicas do not support the selected partial bootstrap mode.");
+            }
+
+            if (partialBootstrap.SegmentSize is { } segmentSize
+                && (segmentSize < ManagedReplicaBootstrapper.PageSize
+                    || segmentSize % ManagedReplicaBootstrapper.PageSize != 0))
+            {
+                throw new NotSupportedException(
+                    "Managed embedded replica lazy segment size must be a whole number of 4 KiB pages.");
+            }
+
+            if (partialBootstrap.PrefixLength < 4096)
+            {
+                throw new NotSupportedException(
+                    "Managed embedded replica prefix bootstrap must select at least one complete 4 KiB page.");
+            }
         }
 
         if (options.RemoteEncryption is not null)
-        {
-            throw new NotSupportedException(
-                "Managed embedded replicas do not support encrypted remote page streams.");
-        }
+            ManagedReplicaEncryption.EnsureSupportedCipher(options.RemoteEncryption.Cipher);
     }
 }

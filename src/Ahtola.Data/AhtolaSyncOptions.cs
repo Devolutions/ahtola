@@ -20,6 +20,8 @@ public enum AhtolaPartialBootstrapKind
 
 /// <summary>
 /// Configures partial bootstrap and lazy page loading for an embedded replica.
+/// The pure-managed provider supports prefix selection and fetches missing pages on demand
+/// from the pinned bootstrap revision. Query selection is not supported by that provider.
 /// </summary>
 public sealed class AhtolaPartialBootstrapOptions
 {
@@ -41,7 +43,9 @@ public sealed class AhtolaPartialBootstrapOptions
     }
 
     /// <summary>
-    /// Creates a prefix strategy that bootstraps pages within the first <paramref name="length"/> bytes.
+    /// Creates a prefix strategy that bootstraps complete 4 KiB pages within the first
+    /// <paramref name="length"/> bytes. The pure-managed provider lazily fetches pages outside
+    /// this range when the pager first reads them.
     /// </summary>
     public static AhtolaPartialBootstrapOptions Prefix(
         int length,
@@ -59,6 +63,7 @@ public sealed class AhtolaPartialBootstrapOptions
 
     /// <summary>
     /// Creates a query strategy that bootstraps pages touched by <paramref name="query"/> on the server.
+    /// The pure-managed provider rejects this strategy explicitly.
     /// </summary>
     public static AhtolaPartialBootstrapOptions QueryPages(
         string query,
@@ -220,6 +225,13 @@ public sealed class AhtolaSyncHttpPolicy
     public HttpMessageHandler? MessageHandler { get; }
 
     /// <summary>
+    /// Gets or initializes whether <see cref="MessageHandler"/> is guaranteed not to follow HTTP
+    /// redirects internally. Set this only for handlers that return redirect responses to Ahtola,
+    /// which validates and follows supported redirects itself.
+    /// </summary>
+    public bool MessageHandlerDisablesAutomaticRedirects { get; init; }
+
+    /// <summary>
     /// Gets whether the connection owns and disposes <see cref="MessageHandler"/>.
     /// </summary>
     public bool DisposeMessageHandler { get; }
@@ -228,6 +240,17 @@ public sealed class AhtolaSyncHttpPolicy
     /// Gets the per-request HTTP timeout.
     /// </summary>
     public TimeSpan RequestTimeout { get; }
+
+    internal HttpClient CreateHttpClient(bool remoteEncryptionConfigured)
+    {
+        var automaticRedirectsDisabled = MessageHandler is null || MessageHandlerDisablesAutomaticRedirects;
+        AhtolaRemoteTransportSecurity.ValidateRedirectContract(
+            automaticRedirectsDisabled,
+            remoteEncryptionConfigured);
+        return MessageHandler is null
+            ? AhtolaRemoteTransportSecurity.CreateRedirectSafeHttpClient()
+            : new HttpClient(MessageHandler, disposeHandler: false);
+    }
 
     internal HttpMessageHandler? ClaimMessageHandlerOwnership()
     {

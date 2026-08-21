@@ -446,7 +446,8 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         }
         finally
         {
-            _managedDatabase = host.Database;
+            if (host.TryGetDatabase(out var database))
+                _managedDatabase = database;
         }
     }
 
@@ -538,7 +539,9 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     internal bool BeginManagedReplicaSqlTransaction(string sql, CancellationToken cancellationToken)
     {
-        if (SqlTransactionControl.GetFirstKeyword(sql)?.Equals("BEGIN", StringComparison.OrdinalIgnoreCase) != true
+        var keyword = SqlTransactionControl.GetFirstKeyword(sql);
+        if ((keyword?.Equals("BEGIN", StringComparison.OrdinalIgnoreCase) != true
+             && keyword?.Equals("SAVEPOINT", StringComparison.OrdinalIgnoreCase) != true)
             || _managedReplicaHost is not { } host)
         {
             return false;
@@ -565,6 +568,32 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         => (_managedReplicaHost ?? throw new InvalidOperationException(
                 "Local replica changes are available only for managed embedded replica connections."))
             .ReadLocalChanges(maximumChanges);
+
+    /// <summary>
+    /// Returns a read-only snapshot of this managed embedded replica connection's currently
+    /// pending (not yet pushed) local changes, projected into Ahtola's public change-data-capture
+    /// row contract (the same row shape as the real <c>turso_cdc</c> table). This performs no
+    /// network I/O, never writes a real CDC table, and never advances the push acknowledgement
+    /// watermark: calling it repeatedly, or interleaving it with an unrelated push, has no effect
+    /// on either. See <see cref="AhtolaReplicaChangeRow"/> for the exact per-row guarantees and
+    /// documented limitations (transaction grouping, delete pre-image requirements, and
+    /// "after"-image reconstruction for rows superseded later in the same pending batch).
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The connection is not a managed embedded replica connection.
+    /// </exception>
+    /// <exception cref="AhtolaReplicaChangeCaptureException">
+    /// Either a local transaction is currently open on this connection (peeking while a
+    /// transaction is in progress could observe not-yet-committed writes, or writes the
+    /// transaction later rolls back, and silently bake them into the projected row), or the
+    /// pending batch contains an entry that cannot be safely represented in the
+    /// change-data-capture row contract (a schema/DDL change, or a delete with no captured
+    /// pre-image). Commit or roll back an open transaction and peek again.
+    /// </exception>
+    public AhtolaReplicaChangeCaptureBatch PeekPendingChangeCapture()
+        => (_managedReplicaHost ?? throw new InvalidOperationException(
+                "Pending change-data-capture is available only for managed embedded replica connections."))
+            .PeekPendingChangeCapture();
 
     void ILocalReaderConnection.ReaderOpened(IConnectionOwnedReader reader)
     {
@@ -1065,18 +1094,18 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         if (_nativeDatabase is not null || _managedReplicaHost is not null || _managedDatabase is not null || _remoteClient is not null)
             throw new InvalidOperationException("The connection is already open.");
         ValidateAutomaticSyncPolicy();
-                if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
-                {
-                    if (_connectionOptions.IsRemote
-                        || _connectionOptions.LocalProvider != AhtolaLocalProvider.Managed)
-                    {
-                        throw new NotSupportedException(
-                            "Password requires Local Provider=Managed for file-backed Ahtola AES-GCM databases.");
-                    }
-                }
-
-                ValidatePoolingOptions();
+        if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
+        {
+            if (_connectionOptions.IsRemote
+                || _connectionOptions.LocalProvider != AhtolaLocalProvider.Managed)
+            {
+                throw new NotSupportedException(
+                    "Password requires Local Provider=Managed for file-backed Ahtola AES-GCM databases.");
             }
+        }
+
+        ValidatePoolingOptions();
+    }
 
     private void ValidateCanBeginTransaction()
     {
@@ -1101,11 +1130,11 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             && !_connectionOptions.GetEncryptionCipher().HasValue
                         && string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"])
                         && string.IsNullOrWhiteSpace(_connectionOptions["Password"]);
-                    if (!eligibleManagedFile)
-                    {
-                        throw new NotSupportedException(
-                            "Pooling=True is supported only for unencrypted managed local file databases.");
-                    }
+        if (!eligibleManagedFile)
+        {
+            throw new NotSupportedException(
+                "Pooling=True is supported only for unencrypted managed local file databases.");
+        }
     }
 
     private void ValidateAutomaticSyncPolicy()
@@ -1195,17 +1224,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         if (exception is AhtolaReplicaConflictException || cancellationToken.IsCancellationRequested)
             return false;
 
-        return exception switch
-        {
-            AhtolaException ahtolaException => ahtolaException.IsTransientRemoteHttpFailure,
-            HttpRequestException requestException => requestException.StatusCode is null
-                or System.Net.HttpStatusCode.RequestTimeout
-                or System.Net.HttpStatusCode.TooManyRequests
-                || requestException.StatusCode is { } status
-                && (int)status is >= 500 and <= 599,
-            TaskCanceledException => true,
-            _ => false,
-        };
+        return AhtolaReplicaPushFailure.Classify(exception) == AhtolaReplicaPushFailureKind.TransientTransport;
     }
 
     private Exception? StopAutomaticManagedReplicaSync()

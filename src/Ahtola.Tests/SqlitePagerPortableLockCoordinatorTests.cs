@@ -443,6 +443,338 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
     }
 
     [Test]
+    [NonParallelizable]
+    public void DeleteModeReservedAllowsPeerReaderAndRejectsPeerWriterUntilRollback()
+    {
+        RequireMainFileLockSupport();
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            CreateDeleteModeDatabase(databasePath);
+            using var pager = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal");
+            pager.JournalMode.Should().Be(SqliteJournalMode.Delete);
+            var pageOne = pager.ReadCommittedPage(1);
+
+            using var transaction = pager.BeginTransaction(pager.CommittedPageCount, TimeSpan.Zero);
+            transaction.WritePage(1, pageOne);
+            RunDeleteModeWorker(databasePath, "read", "available");
+            RunDeleteModeWorker(databasePath, "write", "busy");
+
+            transaction.Rollback();
+            RunDeleteModeWorker(databasePath, "write", "available");
+        }
+        finally
+        {
+            NativeSqliteConnection.ClearAllPools();
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void DeleteModePendingBlocksNewReadersUntilExistingReaderReleases()
+    {
+        RequireMainFileLockSupport();
+        var workDirectory = CreateWorkDirectory();
+        Process? reader = null;
+        var releasePath = Path.Combine(workDirectory, "release-reader");
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            CreateDeleteModeDatabase(databasePath);
+            var readyPath = Path.Combine(workDirectory, "reader-ready");
+            reader = StartWorker(
+                nameof(CrossProcessDeleteModeLockWorker),
+                new Dictionary<string, string>
+                {
+                    ["AHTOLA_DELETE_LOCK_WORKER_DATABASE_PATH"] = databasePath,
+                    ["AHTOLA_DELETE_LOCK_WORKER_ACTION"] = "hold-reader",
+                    ["AHTOLA_DELETE_LOCK_WORKER_READY_PATH"] = readyPath,
+                    ["AHTOLA_DELETE_LOCK_WORKER_RELEASE_PATH"] = releasePath,
+                });
+            WaitForFile(reader, readyPath);
+
+            using var pager = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal",
+                busyTimeout: TimeSpan.FromSeconds(10));
+            var pageOne = pager.ReadCommittedPage(1);
+            using var transaction = pager.BeginTransaction(
+                pager.CommittedPageCount,
+                TimeSpan.FromSeconds(10));
+            transaction.WritePage(1, pageOne);
+            var commit = Task.Run(transaction.Commit);
+            try
+            {
+                RunDeleteModeWorker(databasePath, "wait-reader-busy", "busy");
+                commit.IsCompleted.Should().BeFalse();
+            }
+            finally
+            {
+                File.WriteAllText(releasePath, string.Empty);
+                AssertWorkerExit(reader);
+                reader.Dispose();
+                reader = null;
+            }
+
+            commit.WaitAsync(TimeSpan.FromSeconds(10)).GetAwaiter().GetResult();
+            transaction.State.Should().Be(SqlitePagerTransactionState.Committed);
+            RunDeleteModeWorker(databasePath, "write", "available");
+        }
+        finally
+        {
+            File.WriteAllText(releasePath, string.Empty);
+            if (reader is not null)
+            {
+                AssertWorkerExit(reader);
+                reader.Dispose();
+            }
+            NativeSqliteConnection.ClearAllPools();
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void DeleteModeBusyCommitRetainsPendingUntilTransactionDisposal()
+    {
+        RequireMainFileLockSupport();
+        var workDirectory = CreateWorkDirectory();
+        Process? reader = null;
+        var releasePath = Path.Combine(workDirectory, "release-reader");
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            CreateDeleteModeDatabase(databasePath);
+            var readyPath = Path.Combine(workDirectory, "reader-ready");
+            reader = StartWorker(
+                nameof(CrossProcessDeleteModeLockWorker),
+                new Dictionary<string, string>
+                {
+                    ["AHTOLA_DELETE_LOCK_WORKER_DATABASE_PATH"] = databasePath,
+                    ["AHTOLA_DELETE_LOCK_WORKER_ACTION"] = "hold-reader",
+                    ["AHTOLA_DELETE_LOCK_WORKER_READY_PATH"] = readyPath,
+                    ["AHTOLA_DELETE_LOCK_WORKER_RELEASE_PATH"] = releasePath,
+                });
+            WaitForFile(reader, readyPath);
+
+            using var pager = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal");
+            var pageOne = pager.ReadCommittedPage(1);
+            using var transaction = pager.BeginTransaction(pager.CommittedPageCount, TimeSpan.Zero);
+            transaction.WritePage(1, pageOne);
+
+            var busy = Assert.Throws<SqlitePagerBusyException>(() => transaction.Commit());
+            busy!.Operation.Should().Be(SqlitePagerLockOperation.Writer);
+            busy.Reason.Should().Be(SqlitePagerBusyReason.Busy);
+            RunDeleteModeWorker(databasePath, "read", "busy");
+
+            transaction.Dispose();
+            transaction.State.Should().Be(SqlitePagerTransactionState.RolledBack);
+            RunDeleteModeWorker(databasePath, "read", "available");
+
+            File.WriteAllText(releasePath, string.Empty);
+            AssertWorkerExit(reader);
+            reader.Dispose();
+            reader = null;
+            RunDeleteModeWorker(databasePath, "write", "available");
+        }
+        finally
+        {
+            File.WriteAllText(releasePath, string.Empty);
+            if (reader is not null)
+            {
+                AssertWorkerExit(reader);
+                reader.Dispose();
+            }
+            NativeSqliteConnection.ClearAllPools();
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void DeleteModePagerDisposalReleasesActiveReaderAndWriterLocks()
+    {
+        RequireMainFileLockSupport();
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            CreateDeleteModeDatabase(databasePath);
+            using var pager = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal");
+            using var reader = pager.BeginReadTransaction();
+            using var transaction = pager.BeginTransaction(pager.CommittedPageCount, TimeSpan.Zero);
+
+            RunDeleteModeWorker(databasePath, "write", "busy");
+            pager.Dispose();
+
+            reader.IsActive.Should().BeFalse();
+            transaction.State.Should().Be(SqlitePagerTransactionState.RolledBack);
+            RunDeleteModeWorker(databasePath, "write", "available");
+        }
+        finally
+        {
+            NativeSqliteConnection.ClearAllPools();
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void IdleDeleteModePagerObservesPeerCommitUnderNextSharedLock()
+    {
+        RequireMainFileLockSupport();
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            CreateDeleteModeDatabase(databasePath);
+            using var pager = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal");
+            var before = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1)).ChangeCounter;
+
+            RunDeleteModeWorker(databasePath, "insert", "available");
+
+            var after = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1)).ChangeCounter;
+            after.Should().NotBe(before);
+        }
+        finally
+        {
+            NativeSqliteConnection.ClearAllPools();
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ReadOnlyDeleteModePagerOpensWithoutCreatingSharedMemoryCarrier()
+    {
+        RequireMainFileLockSupport();
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            var sharedMemoryPath = databasePath + "-shm";
+            CreateDeleteModeDatabase(databasePath);
+            File.Exists(sharedMemoryPath).Should().BeFalse();
+
+            using var pager = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal",
+                readOnly: true);
+
+            pager.JournalMode.Should().Be(SqliteJournalMode.Delete);
+            pager.ReadCommittedPage(1).Should().HaveCount(SqlitePageSize.Default);
+            File.Exists(sharedMemoryPath).Should().BeFalse();
+        }
+        finally
+        {
+            NativeSqliteConnection.ClearAllPools();
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void DeleteModeOpenReleasesSharedWhileWaitingForLocalWriter()
+    {
+        RequireMainFileLockSupport();
+        var workDirectory = CreateWorkDirectory();
+        Thread? openThread = null;
+        SqlitePager? peer = null;
+        Exception? openFailure = null;
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            CreateDeleteModeDatabase(databasePath);
+            using var pager = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal");
+            using var transaction = pager.BeginTransaction(
+                pager.CommittedPageCount,
+                TimeSpan.FromSeconds(2));
+            transaction.WritePage(1, pager.ReadCommittedPage(1));
+
+            openThread = new Thread(() =>
+            {
+                try
+                {
+                    peer = SqlitePager.Open(
+                        PhysicalFileSystem.Instance,
+                        databasePath,
+                        databasePath + "-wal",
+                        busyTimeout: TimeSpan.FromSeconds(5));
+                }
+                catch (Exception exception)
+                {
+                    openFailure = exception;
+                }
+            });
+            openThread.Start();
+            SpinWait.SpinUntil(
+                    () => openThread.ThreadState.HasFlag(System.Threading.ThreadState.WaitSleepJoin),
+                    TimeSpan.FromSeconds(2))
+                .Should()
+                .BeTrue("the peer open must contend with the local writer before commit");
+
+            transaction.Commit();
+            openThread.Join(TimeSpan.FromSeconds(5)).Should().BeTrue();
+            openFailure.Should().BeNull();
+            peer.Should().NotBeNull();
+        }
+        finally
+        {
+            peer?.Dispose();
+            openThread?.Join(TimeSpan.FromSeconds(5));
+            NativeSqliteConnection.ClearAllPools();
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void DeleteModePagerFaultsWhenPeerSwitchesMainFileToWal()
+    {
+        RequireMainFileLockSupport();
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            CreateDeleteModeDatabase(databasePath);
+            using var pager = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal");
+
+            RunDeleteModeWorker(databasePath, "switch-wal", "available");
+
+            var changed = Assert.Throws<InvalidDataException>(() => pager.ReadCommittedPage(1));
+            changed!.Message.Should().Contain("journal mode changed");
+            pager.State.Should().Be(SqlitePagerState.Faulted);
+        }
+        finally
+        {
+            NativeSqliteConnection.ClearAllPools();
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
     [Category("ProcessWorker")]
     [NonParallelizable]
     public void CrossProcessOrdinarySqliteWorkerObservesManagedOwnership()
@@ -544,6 +876,42 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
         }
     }
 
+    [Test]
+    [Category("ProcessWorker")]
+    [NonParallelizable]
+    public void CrossProcessDeleteModeLockWorker()
+    {
+        var databasePath = Environment.GetEnvironmentVariable("AHTOLA_DELETE_LOCK_WORKER_DATABASE_PATH");
+        if (string.IsNullOrEmpty(databasePath))
+            return;
+
+        var action = Environment.GetEnvironmentVariable("AHTOLA_DELETE_LOCK_WORKER_ACTION")
+            ?? throw new InvalidOperationException("The DELETE-mode lock worker is missing its action.");
+        switch (action)
+        {
+            case "hold-reader":
+                HoldDeleteModeReader(databasePath);
+                break;
+            case "wait-reader-busy":
+                WaitForDeleteModeReaderBusy(databasePath);
+                break;
+            case "read":
+                AssertDeleteModeWorkerOutcome(databasePath, ReadDeleteModeDatabase);
+                break;
+            case "write":
+                AssertDeleteModeWorkerOutcome(databasePath, ProbeDeleteModeWriter);
+                break;
+            case "insert":
+                AssertDeleteModeWorkerOutcome(databasePath, InsertDeleteModeRow);
+                break;
+            case "switch-wal":
+                AssertDeleteModeWorkerOutcome(databasePath, SwitchDeleteModeDatabaseToWal);
+                break;
+            default:
+                throw new InvalidOperationException("The DELETE-mode lock worker received an unknown action.");
+        }
+    }
+
     private static SqlValue ReadScalar(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);
@@ -580,6 +948,179 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
                 ["TURSO_SQLITE_LOCK_WORKER_EXPECTED_RESULT"] = expectedResult,
             });
         AssertWorkerExit(worker);
+    }
+
+    private static void RunDeleteModeWorker(string databasePath, string action, string expectedResult)
+    {
+        using var worker = StartWorker(
+            nameof(CrossProcessDeleteModeLockWorker),
+            new Dictionary<string, string>
+            {
+                ["AHTOLA_DELETE_LOCK_WORKER_DATABASE_PATH"] = databasePath,
+                ["AHTOLA_DELETE_LOCK_WORKER_ACTION"] = action,
+                ["AHTOLA_DELETE_LOCK_WORKER_EXPECTED_RESULT"] = expectedResult,
+            });
+        AssertWorkerExit(worker);
+    }
+
+    private static void CreateDeleteModeDatabase(string databasePath)
+    {
+        using var connection = OpenDeleteModeConnection(databasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "PRAGMA journal_mode=DELETE;"
+            + "CREATE TABLE lock_probe(value INTEGER NOT NULL);"
+            + "INSERT INTO lock_probe VALUES (1);";
+        command.ExecuteNonQuery();
+        NativeSqliteConnection.ClearAllPools();
+    }
+
+    private static NativeSqliteConnection OpenDeleteModeConnection(string databasePath)
+    {
+        var connection = new NativeSqliteConnection(
+            $"Data Source={databasePath};Mode=ReadWriteCreate;Default Timeout=1;Pooling=False");
+        connection.Open();
+        using var timeout = connection.CreateCommand();
+        timeout.CommandText = "PRAGMA busy_timeout=0;";
+        timeout.ExecuteNonQuery();
+        return connection;
+    }
+
+    private static void ReadDeleteModeDatabase(string databasePath)
+    {
+        using var connection = OpenDeleteModeConnection(databasePath);
+        using (var begin = connection.CreateCommand())
+        {
+            begin.CommandText = "BEGIN DEFERRED;";
+            begin.ExecuteNonQuery();
+        }
+
+        using (var read = connection.CreateCommand())
+        {
+            read.CommandText = "SELECT COUNT(*) FROM lock_probe;";
+            Convert.ToInt64(read.ExecuteScalar()).Should().BeGreaterThanOrEqualTo(1);
+        }
+
+        using var rollback = connection.CreateCommand();
+        rollback.CommandText = "ROLLBACK;";
+        rollback.ExecuteNonQuery();
+    }
+
+    private static void ProbeDeleteModeWriter(string databasePath)
+    {
+        using var connection = OpenDeleteModeConnection(databasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText = "BEGIN IMMEDIATE; ROLLBACK;";
+        command.ExecuteNonQuery();
+    }
+
+    private static void InsertDeleteModeRow(string databasePath)
+    {
+        using var connection = OpenDeleteModeConnection(databasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO lock_probe VALUES (2);";
+        command.ExecuteNonQuery();
+    }
+
+    private static void SwitchDeleteModeDatabaseToWal(string databasePath)
+    {
+        using var connection = OpenDeleteModeConnection(databasePath);
+        using (var mode = connection.CreateCommand())
+        {
+            mode.CommandText = "PRAGMA journal_mode=WAL;";
+            Convert.ToString(mode.ExecuteScalar()).Should().Be("wal");
+        }
+
+        using var insert = connection.CreateCommand();
+        insert.CommandText = "INSERT INTO lock_probe VALUES (3);";
+        insert.ExecuteNonQuery();
+    }
+
+    private static void AssertDeleteModeWorkerOutcome(
+        string databasePath,
+        Action<string> operation)
+    {
+        var expectedResult = Environment.GetEnvironmentVariable("AHTOLA_DELETE_LOCK_WORKER_EXPECTED_RESULT")
+            ?? throw new InvalidOperationException("The DELETE-mode lock worker is missing its expected result.");
+        SqliteException? busy = null;
+        try
+        {
+            operation(databasePath);
+        }
+        catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6)
+        {
+            busy = exception;
+        }
+
+        switch (expectedResult)
+        {
+            case "available":
+                busy.Should().BeNull();
+                break;
+            case "busy":
+                busy.Should().NotBeNull();
+                break;
+            default:
+                throw new InvalidOperationException("The DELETE-mode lock worker received an unknown expected result.");
+        }
+    }
+
+    private static void HoldDeleteModeReader(string databasePath)
+    {
+        var readyPath = Environment.GetEnvironmentVariable("AHTOLA_DELETE_LOCK_WORKER_READY_PATH")
+            ?? throw new InvalidOperationException("The DELETE-mode reader worker is missing its ready path.");
+        var releasePath = Environment.GetEnvironmentVariable("AHTOLA_DELETE_LOCK_WORKER_RELEASE_PATH")
+            ?? throw new InvalidOperationException("The DELETE-mode reader worker is missing its release path.");
+        using var connection = OpenDeleteModeConnection(databasePath);
+        using (var begin = connection.CreateCommand())
+        {
+            begin.CommandText = "BEGIN DEFERRED;";
+            begin.ExecuteNonQuery();
+        }
+        using (var read = connection.CreateCommand())
+        {
+            read.CommandText = "SELECT COUNT(*) FROM lock_probe;";
+            Convert.ToInt64(read.ExecuteScalar()).Should().BeGreaterThanOrEqualTo(1);
+        }
+        File.WriteAllText(readyPath, string.Empty);
+
+        var stopwatch = Stopwatch.StartNew();
+        while (!File.Exists(releasePath))
+        {
+            if (stopwatch.Elapsed >= TimeSpan.FromSeconds(30))
+                Assert.Fail("The DELETE-mode reader worker was not released within 30 seconds.");
+            Thread.Sleep(TimeSpan.FromMilliseconds(10));
+        }
+    }
+
+    private static void WaitForDeleteModeReaderBusy(string databasePath)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            try
+            {
+                ReadDeleteModeDatabase(databasePath);
+            }
+            catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6)
+            {
+                return;
+            }
+
+            Thread.Sleep(TimeSpan.FromMilliseconds(10));
+        }
+
+        Assert.Fail("A new SQLite reader did not observe the managed PENDING lock within 10 seconds.");
+    }
+
+    private static void RequireMainFileLockSupport()
+    {
+        if (!OperatingSystem.IsWindows()
+            && !(OperatingSystem.IsLinux() && Environment.Is64BitProcess)
+            && !OperatingSystem.IsMacOS())
+        {
+            Assert.Ignore("SQLite main-file byte-range locks require Windows, 64-bit Linux, or macOS.");
+        }
     }
 
     private static Process StartWorker(string testName, IReadOnlyDictionary<string, string> environment)

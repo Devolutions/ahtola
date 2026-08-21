@@ -74,6 +74,7 @@ public sealed partial class SqliteWalByteRangeLock
 {
     private const uint LockFileFailImmediately = 0x0000_0001;
     private const uint LockFileExclusiveLock = 0x0000_0002;
+    private const int LinuxOfdGetLock = 36;
     private const int LinuxOfdSetLock = 37;
     private const short LinuxReadLock = 0;
     private const short LinuxWriteLock = 1;
@@ -83,6 +84,7 @@ public sealed partial class SqliteWalByteRangeLock
     private const int LinuxResourceTemporarilyUnavailable = 11;
     private const int LinuxInvalidArgument = 22;
     // Darwin sys/fcntl.h: F_SETLK=8, F_RDLCK=1, F_UNLCK=2, F_WRLCK=3.
+    private const int MacGetLock = 7;
     private const int MacSetLock = 8;
     private const short MacReadLock = 1;
     private const short MacWriteLock = 3;
@@ -318,7 +320,7 @@ public sealed partial class SqliteWalByteRangeLock
             FileShare.ReadWrite | FileShare.Delete,
             FileOptions.None);
 
-    private static bool TryLock(
+    internal static bool TryLock(
         SafeFileHandle handle,
         long offset,
         long length,
@@ -433,6 +435,58 @@ public sealed partial class SqliteWalByteRangeLock
             if (Native.FcntlMac(handle, MacSetLock, ref fileLock) != 0)
                 ThrowNativeIOException("fcntl(F_SETLK unlock)", Marshal.GetLastPInvokeError());
             return;
+        }
+
+        EnsurePlatformSupported();
+        throw new InvalidOperationException("The SQLite WAL byte-range lock platform selection is inconsistent.");
+    }
+
+    internal static bool HasConflictingExclusiveLock(
+        SafeFileHandle handle,
+        long offset,
+        long length)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            if (!TryLock(
+                    handle,
+                    offset,
+                    length,
+                    SqliteWalByteRangeLockMode.Exclusive,
+                    out _))
+            {
+                return true;
+            }
+
+            Unlock(handle, offset, length);
+            return false;
+        }
+
+        if (OperatingSystem.IsLinux() && Environment.Is64BitProcess)
+        {
+            var fileLock = new LinuxFileLock(LinuxWriteLock, LinuxSeekSet, offset, length);
+            if (Native.FcntlLinux(handle, LinuxOfdGetLock, ref fileLock) != 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                if (error == LinuxInvalidArgument)
+                {
+                    throw new PlatformNotSupportedException(
+                        "The current Linux kernel does not support the required F_OFD_GETLK SQLite locks.",
+                        new Win32Exception(error));
+                }
+
+                ThrowNativeIOException("fcntl(F_OFD_GETLK)", error);
+            }
+
+            return fileLock.Type != LinuxUnlock;
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            var fileLock = new MacFileLock(MacWriteLock, MacSeekSet, offset, length);
+            if (Native.FcntlMac(handle, MacGetLock, ref fileLock) != 0)
+                ThrowNativeIOException("fcntl(F_GETLK)", Marshal.GetLastPInvokeError());
+            return fileLock.Type != MacUnlock;
         }
 
         EnsurePlatformSupported();
@@ -616,6 +670,54 @@ public sealed partial class SqliteWalByteRangeLock
 
 }
 
+/// <summary>
+/// Keeps one physical file handle open while a higher-level SQLite protocol
+/// changes the modes of several byte ranges on that same carrier.
+/// </summary>
+internal sealed class SqliteByteRangeLockHandle : IDisposable
+{
+    private SafeFileHandle? _handle;
+
+    internal SqliteByteRangeLockHandle(string path, bool writable)
+    {
+        _ = new SqliteWalByteRangeLock(path);
+        _handle = File.OpenHandle(
+            Path.GetFullPath(path),
+            FileMode.Open,
+            writable ? FileAccess.ReadWrite : FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            FileOptions.None);
+    }
+
+    internal bool TryLock(
+        long offset,
+        long length,
+        SqliteWalByteRangeLockMode mode,
+        out IOException? contention)
+        => SqliteWalByteRangeLock.TryLock(
+            GetHandle(),
+            offset,
+            length,
+            mode,
+            out contention);
+
+    internal void Unlock(long offset, long length)
+        => SqliteWalByteRangeLock.Unlock(GetHandle(), offset, length);
+
+    internal bool HasConflictingExclusiveLock(long offset, long length)
+        => SqliteWalByteRangeLock.HasConflictingExclusiveLock(GetHandle(), offset, length);
+
+    public void Dispose()
+    {
+        var handle = Interlocked.Exchange(ref _handle, null);
+        handle?.Dispose();
+    }
+
+    private SafeFileHandle GetHandle()
+        => Volatile.Read(ref _handle)
+           ?? throw new ObjectDisposedException(nameof(SqliteByteRangeLockHandle));
+}
+
 /// <summary>Releases the exact SQLite WAL byte range acquired by its owner.</summary>
 public sealed class SqliteWalByteRangeLockLease : IDisposable
 {
@@ -675,6 +777,16 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
 {
     internal static SqliteWalSharedMemoryCarrierIdentity FromPath(string path)
     {
+        if (OperatingSystem.IsMacOS())
+        {
+            if (Native.StatMac(path, out var information) != 0)
+                ThrowNativeIOException("stat", Marshal.GetLastPInvokeError());
+
+            return new SqliteWalSharedMemoryCarrierIdentity(
+                unchecked((ulong)(uint)information.Device),
+                information.Inode);
+        }
+
         using var handle = System.IO.File.OpenHandle(
             path,
             FileMode.Open,
@@ -682,6 +794,36 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
             FileShare.ReadWrite | FileShare.Delete,
             FileOptions.None);
         return FromHandle(handle);
+    }
+
+    /// <summary>
+    /// Resolves the physical identity of a directory rather than a file. Used to canonicalize the
+    /// containing directory of a path that does not exist yet (for example, a replica database
+    /// file before its first bootstrap), so that two textually different paths naming the same
+    /// physical directory -- via a symbolic link, junction/mount point, hard link, or Windows
+    /// short (8.3) name alias -- resolve to the same identity.
+    /// </summary>
+    internal static SqliteWalSharedMemoryCarrierIdentity FromDirectoryPath(string directoryPath)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Windows' CreateFile denies read access to a directory unless the caller passes
+            // FILE_FLAG_BACKUP_SEMANTICS, and File.OpenHandle never sets that flag, so a directory
+            // must be opened through this dedicated native path instead of File.OpenHandle.
+            using var handle = Native.OpenDirectoryHandleWindows(directoryPath);
+            return FromHandle(handle);
+        }
+
+        // POSIX open() succeeds on a directory with read-only access alone (the caller simply
+        // cannot read() bytes from the resulting descriptor), so the ordinary file-handle path
+        // that FromPath uses already works unchanged here.
+        using var posixHandle = System.IO.File.OpenHandle(
+            directoryPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            FileOptions.None);
+        return FromHandle(posixHandle);
     }
 
     internal static SqliteWalSharedMemoryCarrierIdentity FromHandle(SafeFileHandle handle)
@@ -784,6 +926,13 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
 
     private static partial class Native
     {
+        private const uint GenericRead = 0x8000_0000;
+        private const uint FileShareRead = 0x0000_0001;
+        private const uint FileShareWrite = 0x0000_0002;
+        private const uint FileShareDelete = 0x0000_0004;
+        private const uint OpenExisting = 3;
+        private const uint FileFlagBackupSemantics = 0x0200_0000;
+
         [LibraryImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static partial bool GetFileInformationByHandle(
@@ -801,5 +950,56 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
         internal static partial int FstatMac(
             SafeFileHandle fileDescriptor,
             out MacFileStatus information);
+
+        [LibraryImport(
+            "libc",
+            EntryPoint = "stat",
+            StringMarshalling = StringMarshalling.Utf8,
+            SetLastError = true)]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        internal static partial int StatMac(
+            string path,
+            out MacFileStatus information);
+
+        /// <summary>
+        /// Opens a directory for metadata-only access on Windows. <see cref="System.IO.File.OpenHandle"/>
+        /// always denies directories (it never sets <c>FILE_FLAG_BACKUP_SEMANTICS</c>), so directory
+        /// identity resolution goes through this dedicated <c>CreateFile</c> call instead.
+        /// </summary>
+        [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+        private static partial SafeFileHandle CreateFileW(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            IntPtr hTemplateFile);
+
+        internal static SafeFileHandle OpenDirectoryHandleWindows(string directoryPath)
+        {
+            var handle = CreateFileW(
+                directoryPath,
+                GenericRead,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics,
+                IntPtr.Zero);
+
+            if (handle.IsInvalid)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                handle.Dispose();
+                if (error is 2 or 3)
+                {
+                    throw new DirectoryNotFoundException(
+                        $"CreateFile failed because directory '{directoryPath}' does not exist.",
+                        new Win32Exception(error));
+                }
+                ThrowNativeIOException("CreateFile", error);
+            }
+            return handle;
+        }
     }
 }

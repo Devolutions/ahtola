@@ -75,7 +75,7 @@ public class SqlitePagerLockingStorageTests
     }
 
     [Test]
-    public void TransactionRetriesWithExclusiveLeaseWhenModeChangesDuringLockAcquisition()
+    public void TransactionRetriesWithDeleteWriterLeaseWhenModeChangesDuringLockAcquisition()
     {
         var fileSystem = new InMemoryFileSystem();
         var locks = new SqlitePagerLockManager();
@@ -118,8 +118,9 @@ public class SqlitePagerLockingStorageTests
             transactionThread.Join(TimeSpan.FromSeconds(2)).Should().BeTrue();
             transactionFailure.Should().BeNull();
             transaction.Should().NotBeNull();
-            locks.State.Should().Be(SqlitePagerLockState.Checkpoint);
-            Assert.Throws<SqlitePagerBusyException>(() => pager.BeginReadTransaction());
+            locks.State.Should().Be(SqlitePagerLockState.Writer);
+            using var concurrentReader = pager.BeginReadTransaction();
+            locks.State.Should().Be(SqlitePagerLockState.WriterAndReaders);
         }
         finally
         {

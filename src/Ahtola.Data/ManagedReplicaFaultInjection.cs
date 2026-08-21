@@ -6,6 +6,7 @@ namespace Ahtola;
 internal enum ManagedReplicaDurableBoundary
 {
     BootstrapStagedDatabase,
+    BootstrapSafetyStatePublished,
     BootstrapDatabasePublished,
     IncrementalApplyStagedDatabase,
     IncrementalApplyDatabasePublished,
@@ -15,6 +16,44 @@ internal enum ManagedReplicaDurableBoundary
     LogicalApplyCommitted,
     LogicalApplyCheckpointed,
     LogicalApplyMetadataPublished,
+
+    /// <summary>
+    /// Hit immediately after the single exclusive apply lease (see
+    /// <c>ManagedReplicaApplyLock</c>) is acquired, before the caller re-checks sidecars/
+    /// fingerprint and applies. Shared by all three acquisition sites (bootstrap install,
+    /// logical apply, incremental/replace-base page apply): tests distinguish which site fired
+    /// by which API they invoked, not by a separate boundary value.
+    /// </summary>
+    ReplicaApplyLockAcquired,
+
+    /// <summary>
+    /// Hit at the very start of the failed-bootstrap-catch-up rollback path (see
+    /// <c>ManagedReplicaConnectionHost.RollBackFailedCatchUpIfStillThisGenerationAsync</c>),
+    /// after the mandatory post-bootstrap catch-up has thrown but before the rollback
+    /// (re)acquires the apply lease to verify the on-disk revision is still the exact
+    /// bootstrapped generation it set out to undo. Tests use this to publish a competing, newer
+    /// revision for the same path in that window and prove the rollback detects it and backs
+    /// off instead of deleting unconditionally.
+    /// </summary>
+    BootstrapCatchUpFailureObserved,
+    PageMutationIntentPersisted,
+    PageMutationDatabasePersisted,
+    PartialImageCompletionStarted,
+    RevertWalStaged,
+    RevertWalPublished,
+    RevertMetadataPublished,
+    RevertCheckpointed,
+    RevertRemoteApplyIntentPublished,
+    RevertCommittedRestoreIntentPublished,
+    RevertCommittedRestoreStagedDatabase,
+    RevertCommittedRestoreDatabasePublished,
+    RevertCommittedReadyMetadataPublished,
+    RevertPushIntentPublished,
+    RevertConflictRestoreIntentPublished,
+    RevertRestoreStagedDatabase,
+    RevertRestoreDatabasePublished,
+    RevertRestoreMetadataPublished,
+    RevertRetired,
 }
 
 /// <summary>

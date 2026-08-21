@@ -55,7 +55,7 @@ internal sealed class ManagedReplicaChangeJournal
     internal const string Suffix = ".ahtola-replica-journal";
 
     private const ulong Magic = 0x4C_4E_52_4A_4C_4F_54_41; // "ATOLJRNL"
-    private const int Version = 4;
+    private const int Version = 5;
     private const int MaxStringBytes = 1024 * 1024;
     private const int MaxBinaryBytes = 16 * 1024 * 1024;
 
@@ -89,7 +89,7 @@ internal sealed class ManagedReplicaChangeJournal
         if (reader.ReadUInt64() != Magic)
             throw new InvalidDataException("Managed replica change journal has an unsupported format.");
         var formatVersion = reader.ReadInt32();
-        if (formatVersion is not (1 or 2 or 3 or Version))
+        if (formatVersion is not (1 or 2 or 3 or 4 or Version))
             throw new InvalidDataException("Managed replica change journal has an unsupported format.");
 
         var sequence = reader.ReadInt64();
@@ -110,7 +110,7 @@ internal sealed class ManagedReplicaChangeJournal
         {
             var change = ReadChange(reader, formatVersion);
             if (change.Sequence <= previous
-                || (formatVersion != 1 && change.Sequence < persistedWatermark)
+                || (formatVersion is 2 or 3 or 4 && change.Sequence < persistedWatermark)
                 || change.Sequence > sequence)
                 throw new InvalidDataException("Managed replica change journal is not ordered.");
             changes.Add(change);
@@ -125,18 +125,62 @@ internal sealed class ManagedReplicaChangeJournal
         return new ManagedReplicaChangeJournal(path, sequence, watermark, changes);
     }
 
+    internal long RetentionBase
+    {
+        get
+        {
+            lock (_gate)
+                return _changes.Count == 0 ? _watermark : Math.Min(_changes[0].Sequence, _watermark);
+        }
+    }
+
     public ReplicaLocalChangeBatch ReadBatch(int maximumChanges)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumChanges);
         lock (_gate)
         {
-            var count = Math.Min(maximumChanges, _changes.Count);
+            var pending = _changes.Where(change => change.Sequence >= _watermark);
+            var count = Math.Min(maximumChanges, _changes.Count(change => change.Sequence >= _watermark));
             if (count == 0)
                 return new ReplicaLocalChangeBatch(_watermark, _watermark, []);
 
-            var batch = _changes.Take(count).ToArray();
+            var batch = pending.Take(count).ToArray();
             var watermark = batch[^1].Sequence + 1;
             return new ReplicaLocalChangeBatch(batch[0].Sequence, watermark, batch);
+        }
+    }
+
+    public ReplicaLocalChangeBatch ReadBatch(long firstSequence, long watermark)
+    {
+        if (firstSequence <= 0 || watermark <= firstSequence)
+            throw new ArgumentOutOfRangeException(nameof(firstSequence));
+
+        lock (_gate)
+        {
+            var batch = _changes
+                .Where(change => change.Sequence >= firstSequence && change.Sequence < watermark)
+                .ToArray();
+            if (batch.Length == 0
+                || batch[0].Sequence != firstSequence
+                || batch[^1].Sequence != watermark - 1
+                || batch.Length != watermark - firstSequence)
+            {
+                throw new InvalidDataException(
+                    "Managed replica change journal no longer contains the protected push batch.");
+            }
+
+            return new ReplicaLocalChangeBatch(firstSequence, watermark, batch);
+        }
+    }
+
+    public IReadOnlyList<ReplicaLocalChange> ReadAcknowledged(long afterWatermark)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(afterWatermark);
+        lock (_gate)
+        {
+            return _changes
+                .Where(change => change.Sequence >= afterWatermark && change.Sequence < _watermark)
+                .ToArray();
         }
     }
 
@@ -178,11 +222,24 @@ internal sealed class ManagedReplicaChangeJournal
             if (watermark == _watermark)
                 return;
 
-            var retained = _changes.Where(change => change.Sequence >= watermark).ToArray();
-            Persist(_sequence, watermark, retained);
+            Persist(_sequence, watermark, _changes);
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.JournalAcknowledgementPersisted);
-            _changes.RemoveAll(change => change.Sequence < watermark);
             _watermark = watermark;
+        }
+    }
+
+    public void PruneAcknowledged(long throughWatermark)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(throughWatermark);
+        lock (_gate)
+        {
+            var effectiveWatermark = Math.Min(throughWatermark, _watermark);
+            if (_changes.Count == 0 || _changes[0].Sequence >= effectiveWatermark)
+                return;
+
+            var retained = _changes.Where(change => change.Sequence >= effectiveWatermark).ToArray();
+            Persist(_sequence, _watermark, retained);
+            _changes.RemoveAll(change => change.Sequence < effectiveWatermark);
         }
     }
 

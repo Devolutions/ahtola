@@ -222,6 +222,29 @@ internal static class ManagedReplicaLogicalReplayer
         }
     }
 
+    public static void ReplayPendingLocalSchemaChanges(
+        IManagedConnectionAdapter connection,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(pendingLocalChanges);
+
+        var addColumns = CollectPendingAddColumns(pendingLocalChanges);
+        foreach (var change in pendingLocalChanges)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (change.Kind != ReplicaLocalChangeKind.Schema)
+                continue;
+            if (ManagedReplicaSchemaDdlText.TryParseAlterTableAddColumn(change.Sql) is not null)
+                continue;
+
+            ExecuteDdl(connection, ManagedReplicaSchemaDdlText.EnsureCreateTableIfNotExists(change.Sql));
+        }
+
+        ReplayPendingLocalAddColumns(connection, addColumns, cancellationToken);
+    }
+
     /// <summary>
     /// Replays the original SQL of still-unpushed local statements onto a freshly installed
     /// ReplaceBase snapshot. Consecutive journal rows that share one statement (empty or repeated
@@ -334,26 +357,86 @@ internal static class ManagedReplicaLogicalReplayer
         return SqliteRecordCodec.Decode(change.BeforeRecord);
     }
 
-    private static IReadOnlyList<SqlValue>? TryCaptureCurrentRowValues(
+    /// <summary>
+    /// Reads a table's current row values by rowid, or <see langword="null"/> when the row is
+    /// not currently present (including tables with no accessible rowid). Shared with
+    /// <see cref="ManagedReplicaChangeCaptureProjector"/>, which uses the same live-read
+    /// technique to reconstruct an "after" image for the public change-data-capture bridge.
+    /// </summary>
+    /// <param name="connection">The connection to read the row through.</param>
+    /// <param name="tableName">The table the rowid belongs to.</param>
+    /// <param name="rowId">The rowid to read.</param>
+    /// <param name="includeGeneratedColumns">
+    /// When <see langword="false"/> (the default, used by local-change replay), the column set
+    /// is <see cref="GetTableColumnsInfo"/>'s <c>pragma_table_info</c>-derived list, which
+    /// excludes VIRTUAL/STORED generated columns because replay builds a literal
+    /// <c>INSERT</c>/<c>UPDATE</c> statement naming each column explicitly, and a generated
+    /// column can never be assigned that way. When <see langword="true"/> (used only by the
+    /// change-data-capture bridge's "after" image reconstruction), every declared column -
+    /// generated or not - is read instead, matching the real <c>turso_cdc</c> row's full
+    /// in-memory row image (see <see cref="GetFullTableColumnNamesForChangeCapture"/>).
+    /// </param>
+    internal static IReadOnlyList<SqlValue>? TryCaptureCurrentRowValues(
         IManagedConnectionAdapter connection,
         string tableName,
-        long rowId)
+        long rowId,
+        bool includeGeneratedColumns = false)
     {
         var info = GetTableColumnsInfo(connection, tableName);
-        if (info.ColumnNames.Count == 0 || info.IsWithoutRowId || info.RowidReferenceName is not { } rowidReference)
+        if (info.ColumnNames.Count == 0 || info.IsWithoutRowId)
             return null;
 
-        var columnList = string.Join(", ", info.ColumnNames.Select(QuoteIdentifier));
+        var columnNames = includeGeneratedColumns
+            ? GetFullTableColumnNamesForChangeCapture(connection, tableName)
+            : info.ColumnNames;
+        if (columnNames.Count == 0)
+            return null;
+        var rowidReference = includeGeneratedColumns
+            ? ResolveRowidReferenceName(columnNames)
+            : info.RowidReferenceName;
+        if (rowidReference is null)
+            return null;
+
+        var columnList = string.Join(", ", columnNames.Select(QuoteIdentifier));
         using var statement = connection.Prepare(
             $"SELECT {columnList} FROM {QuoteIdentifier(tableName)} WHERE {QuoteIdentifier(rowidReference)} = ?");
         statement.Bind(1, SqlValue.Integer(rowId));
         if (statement.Step() != StatementStepResult.Row)
             return null;
 
-        var values = new SqlValue[info.ColumnNames.Count];
+        var values = new SqlValue[columnNames.Count];
         for (var i = 0; i < values.Length; i++)
             values[i] = statement.GetValue(i);
         return values;
+    }
+
+    /// <summary>
+    /// Returns every column of a table in declared order, including VIRTUAL and STORED
+    /// generated columns, which <see cref="GetTableColumnsInfo"/> deliberately excludes (see
+    /// <see cref="TryCaptureCurrentRowValues"/> for why). <c>pragma_table_xinfo</c> reports
+    /// every column - unlike <c>pragma_table_info</c>, which silently renumbers past generated
+    /// columns - with <c>hidden</c> distinguishing ordinary (0), VIRTUAL generated (2), and
+    /// STORED generated (3) columns; <c>hidden == 1</c> (a virtual-table shadow column) is
+    /// skipped defensively even though it cannot occur for an ordinary table.
+    /// </summary>
+    private static IReadOnlyList<string> GetFullTableColumnNamesForChangeCapture(
+        IManagedConnectionAdapter connection,
+        string tableName)
+    {
+        var columnNames = new List<string>();
+        using var statement = connection.Prepare(
+            "SELECT name, hidden FROM pragma_table_xinfo(?) ORDER BY cid");
+        statement.Bind(1, SqlValue.Text(tableName));
+        while (statement.Step() == StatementStepResult.Row)
+        {
+            var hidden = checked((int)statement.GetValue(1).AsInteger());
+            if (hidden == 1)
+                continue;
+
+            columnNames.Add(statement.GetValue(0).AsText());
+        }
+
+        return columnNames;
     }
 
     /// <summary>

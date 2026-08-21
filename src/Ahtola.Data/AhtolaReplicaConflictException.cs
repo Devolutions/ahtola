@@ -36,7 +36,7 @@ public sealed class AhtolaReplicaConflictException : AhtolaException
         string? remoteErrorCode = null,
         AhtolaReplicaConflictKind conflictKind = AhtolaReplicaConflictKind.Unknown,
         long? localChangeSequence = null)
-        : base(message)
+        : base(message, AhtolaReplicaPushFailureKind.Conflict)
     {
         RemoteErrorCode = remoteErrorCode;
         ConflictKind = conflictKind;

@@ -121,7 +121,9 @@ public sealed class AhtolaReplicaOptions
     public long? PushOperationsThreshold { get; init; }
 
     /// <summary>
-    /// Gets or initializes the bootstrap pull chunk target in bytes.
+    /// Gets or initializes the target size in bytes for each initial bootstrap pull.
+    /// The target is rounded up to complete 4 KiB pages, and the complete database
+    /// image is staged eagerly before it is published.
     /// </summary>
     public long? PullBytesThreshold { get; init; }
 
@@ -138,6 +140,15 @@ public sealed class AhtolaReplicaOptions
 
     internal void Validate()
     {
+        ArgumentNullException.ThrowIfNull(HttpPolicy);
+        AhtolaRemoteTransportSecurity.Validate(
+            RemoteUri,
+            AuthToken,
+            remoteEncryptionConfigured: RemoteEncryption is not null);
+        AhtolaRemoteTransportSecurity.ValidateRedirectContract(
+            HttpPolicy.MessageHandler is null || HttpPolicy.MessageHandlerDisablesAutomaticRedirects,
+            remoteEncryptionConfigured: RemoteEncryption is not null);
+
         if (LongPollTimeout is { } longPollTimeout
             && (longPollTimeout < TimeSpan.FromMilliseconds(1)
                 || longPollTimeout.TotalMilliseconds > int.MaxValue))
@@ -171,8 +182,6 @@ public sealed class AhtolaReplicaOptions
             throw new InvalidOperationException(
                 "PullBytesThreshold cannot be combined with query partial bootstrap because the server selects the query page set.");
         }
-        ArgumentNullException.ThrowIfNull(HttpPolicy);
-        ArgumentNullException.ThrowIfNull(HttpPolicy);
     }
 
     private static Uri NormalizeRemoteUri(Uri remoteUri)

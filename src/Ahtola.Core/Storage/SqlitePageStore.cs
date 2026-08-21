@@ -84,137 +84,137 @@ public sealed class SqlitePageStore : IDisposable
             IPageCodec? pageCodec = null)
             => OpenCore(fileSystem, path, readOnly, encryption, pageCodec, allowTrailingPages: false);
 
-        /// <summary>
-        /// Opens a store for a pager that retains a committed WAL while completing a
-        /// shrink checkpoint. Only the pager may accept physical pages after the
-        /// authoritative database size, and it must prove they are recoverable from
-        /// the retained WAL before exposing the database.
-        /// </summary>
-        internal static SqlitePageStore OpenForPager(
-            IFileSystem fileSystem,
-            string path,
-            bool readOnly = false,
-            AhtolaEncryptionOptions? encryption = null,
-            IPageCodec? pageCodec = null)
-            => OpenCore(fileSystem, path, readOnly, encryption, pageCodec, allowTrailingPages: true);
+    /// <summary>
+    /// Opens a store for a pager that retains a committed WAL while completing a
+    /// shrink checkpoint. Only the pager may accept physical pages after the
+    /// authoritative database size, and it must prove they are recoverable from
+    /// the retained WAL before exposing the database.
+    /// </summary>
+    internal static SqlitePageStore OpenForPager(
+        IFileSystem fileSystem,
+        string path,
+        bool readOnly = false,
+        AhtolaEncryptionOptions? encryption = null,
+        IPageCodec? pageCodec = null)
+        => OpenCore(fileSystem, path, readOnly, encryption, pageCodec, allowTrailingPages: true);
 
-        private static SqlitePageStore OpenCore(
-            IFileSystem fileSystem,
-            string path,
-            bool readOnly,
-            AhtolaEncryptionOptions? encryption,
-            IPageCodec? pageCodec,
-            bool allowTrailingPages)
+    private static SqlitePageStore OpenCore(
+        IFileSystem fileSystem,
+        string path,
+        bool readOnly,
+        AhtolaEncryptionOptions? encryption,
+        IPageCodec? pageCodec,
+        bool allowTrailingPages)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
+
+        IPageCodec? boundCodec = null;
+        var ownsCodec = false;
+        var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly);
+        try
         {
-            ArgumentNullException.ThrowIfNull(fileSystem);
-            ArgumentException.ThrowIfNullOrEmpty(path);
-            PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
+            var length = file.Length;
+            if (length < SqliteDatabaseHeader.Size)
+                throw new InvalidDataException("File is too small to contain a SQLite database header.");
 
-            IPageCodec? boundCodec = null;
-            var ownsCodec = false;
-            var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly);
-            try
+            Span<byte> rawHeader = stackalloc byte[SqliteDatabaseHeader.Size];
+            if (file.Read(0, rawHeader) != SqliteDatabaseHeader.Size)
+                throw new InvalidDataException("Failed to read the complete SQLite database header.");
+
+            SqliteDatabaseHeader header;
+            if (pageCodec is not null)
             {
-                var length = file.Length;
-                if (length < SqliteDatabaseHeader.Size)
-                    throw new InvalidDataException("File is too small to contain a SQLite database header.");
-
-                Span<byte> rawHeader = stackalloc byte[SqliteDatabaseHeader.Size];
-                if (file.Read(0, rawHeader) != SqliteDatabaseHeader.Size)
-                    throw new InvalidDataException("Failed to read the complete SQLite database header.");
-
-                SqliteDatabaseHeader header;
-                if (pageCodec is not null)
-                {
-                    PageCodecSupport.ValidateExternalCodec(pageCodec);
-                    boundCodec = pageCodec;
-                    ownsCodec = false;
-                    header = OpenWithCodec(file, length, boundCodec, rawHeader, requireAhtolaMagic: false);
-                }
-                else if (IsAhtolaEncrypted(rawHeader))
-                {
-                    if (encryption is null)
-                    {
-                        throw new InvalidDataException(
-                            "Database is encrypted with Ahtola page encryption. Supply AhtolaEncryptionOptions; plaintext fallback is not permitted.");
-                    }
-
-                    var pageSize = SqlitePageSize.Decode(BinaryPrimitives.ReadUInt16BigEndian(rawHeader[16..]));
-                    boundCodec = EncryptionPageCodec.Create(encryption, pageSize);
-                    ownsCodec = true;
-                    header = OpenWithCodec(file, length, boundCodec, rawHeader, requireAhtolaMagic: true);
-                }
-                else
-                {
-                    if (encryption is not null)
-                    {
-                        throw new InvalidDataException(
-                            "Encryption was requested, but the database contains a plaintext SQLite header. Plaintext fallback is not permitted.");
-                    }
-
-                    header = SqliteDatabaseHeader.Parse(rawHeader);
-                }
-
-                ValidateFileLayout(length, header, allowTrailingPages);
-
-                return new SqlitePageStore(file, header, boundCodec, ownsCodec) { Path = path };
+                PageCodecSupport.ValidateExternalCodec(pageCodec);
+                boundCodec = pageCodec;
+                ownsCodec = false;
+                header = OpenWithCodec(file, length, boundCodec, rawHeader, requireAhtolaMagic: false);
             }
-            catch
+            else if (IsAhtolaEncrypted(rawHeader))
             {
-                file.Dispose();
-                PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
-                throw;
+                if (encryption is null)
+                {
+                    throw new InvalidDataException(
+                        "Database is encrypted with Ahtola page encryption. Supply AhtolaEncryptionOptions; plaintext fallback is not permitted.");
+                }
+
+                var pageSize = SqlitePageSize.Decode(BinaryPrimitives.ReadUInt16BigEndian(rawHeader[16..]));
+                boundCodec = EncryptionPageCodec.Create(encryption, pageSize);
+                ownsCodec = true;
+                header = OpenWithCodec(file, length, boundCodec, rawHeader, requireAhtolaMagic: true);
             }
+            else
+            {
+                if (encryption is not null)
+                {
+                    throw new InvalidDataException(
+                        "Encryption was requested, but the database contains a plaintext SQLite header. Plaintext fallback is not permitted.");
+                }
+
+                header = SqliteDatabaseHeader.Parse(rawHeader);
+            }
+
+            ValidateFileLayout(length, header, allowTrailingPages);
+
+            return new SqlitePageStore(file, header, boundCodec, ownsCodec) { Path = path };
+        }
+        catch
+        {
+            file.Dispose();
+            PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
+            throw;
+        }
+    }
+
+    private static SqliteDatabaseHeader OpenWithCodec(
+        IFile file,
+        long length,
+        IPageCodec codec,
+        ReadOnlySpan<byte> rawHeader,
+        bool requireAhtolaMagic)
+    {
+        var bootstrapLength = (int)Math.Min(length, Math.Max(SqliteDatabaseHeader.Size, PageCodecHeaderInfo.SqliteBootstrapHeaderLength));
+        Span<byte> bootstrap = stackalloc byte[bootstrapLength];
+        if (file.Read(0, bootstrap) != bootstrapLength)
+            throw new InvalidDataException("Failed to read the page-codec bootstrap prefix.");
+
+        var layout = codec.BootstrapPageInfo(bootstrap);
+        var pageSize = layout.PageSize;
+        if (length < pageSize)
+            throw new InvalidDataException("Database is smaller than its declared page size.");
+        if (length % pageSize != 0)
+            throw new InvalidDataException("Database file is not a whole number of pages.");
+
+        if (codec is EncryptionPageCodec encryptionCodec)
+        {
+            if (requireAhtolaMagic && !IsAhtolaEncrypted(rawHeader))
+                throw new InvalidDataException("Encrypted Ahtola database is missing the AHTLA header magic.");
+            encryptionCodec.ValidateEncryptedHeader(rawHeader);
         }
 
-        private static SqliteDatabaseHeader OpenWithCodec(
-            IFile file,
-            long length,
-            IPageCodec codec,
-            ReadOnlySpan<byte> rawHeader,
-            bool requireAhtolaMagic)
+        var encodedFirstPage = new byte[pageSize];
+        if (file.Read(0, encodedFirstPage) != pageSize)
+            throw new InvalidDataException("Failed to read the complete first page.");
+
+        var plaintextFirstPage = new byte[pageSize];
+        PageCodecSupport.Decode(codec, PageLocation.Database, 1, encodedFirstPage, plaintextFirstPage);
+        var header = SqliteDatabaseHeader.Parse(plaintextFirstPage);
+        if (header.PageSize != pageSize)
         {
-            var bootstrapLength = (int)Math.Min(length, Math.Max(SqliteDatabaseHeader.Size, PageCodecHeaderInfo.SqliteBootstrapHeaderLength));
-            Span<byte> bootstrap = stackalloc byte[bootstrapLength];
-            if (file.Read(0, bootstrap) != bootstrapLength)
-                throw new InvalidDataException("Failed to read the page-codec bootstrap prefix.");
-
-            var layout = codec.BootstrapPageInfo(bootstrap);
-            var pageSize = layout.PageSize;
-            if (length < pageSize)
-                throw new InvalidDataException("Database is smaller than its declared page size.");
-            if (length % pageSize != 0)
-                throw new InvalidDataException("Database file is not a whole number of pages.");
-
-            if (codec is EncryptionPageCodec encryptionCodec)
-            {
-                if (requireAhtolaMagic && !IsAhtolaEncrypted(rawHeader))
-                    throw new InvalidDataException("Encrypted Ahtola database is missing the AHTLA header magic.");
-                encryptionCodec.ValidateEncryptedHeader(rawHeader);
-            }
-
-            var encodedFirstPage = new byte[pageSize];
-            if (file.Read(0, encodedFirstPage) != pageSize)
-                throw new InvalidDataException("Failed to read the complete first page.");
-
-            var plaintextFirstPage = new byte[pageSize];
-            PageCodecSupport.Decode(codec, PageLocation.Database, 1, encodedFirstPage, plaintextFirstPage);
-            var header = SqliteDatabaseHeader.Parse(plaintextFirstPage);
-            if (header.PageSize != pageSize)
-            {
-                throw new InvalidDataException(
-                    $"Page codec bootstrap page size {pageSize} disagrees with decoded header page size {header.PageSize}.");
-            }
-
-            var requiredReserved = codec.RequiredReservedBytes;
-            if (requiredReserved != 0 && header.ReservedSpace != requiredReserved)
-            {
-                throw new InvalidDataException(
-                    $"Database reserves {header.ReservedSpace} bytes per page, but the page codec requires {requiredReserved}.");
-            }
-
-            return header;
+            throw new InvalidDataException(
+                $"Page codec bootstrap page size {pageSize} disagrees with decoded header page size {header.PageSize}.");
         }
+
+        var requiredReserved = codec.RequiredReservedBytes;
+        if (requiredReserved != 0 && header.ReservedSpace != requiredReserved)
+        {
+            throw new InvalidDataException(
+                $"Database reserves {header.ReservedSpace} bytes per page, but the page codec requires {requiredReserved}.");
+        }
+
+        return header;
+    }
 
     /// <summary>
     /// Creates a fresh single-page SQLite database file whose root page is an
@@ -285,11 +285,11 @@ public sealed class SqlitePageStore : IDisposable
         catch
         {
             try
-        {
+            {
                 file.Dispose();
             }
             catch
-        {
+            {
             }
 
             try
@@ -334,18 +334,19 @@ public sealed class SqlitePageStore : IDisposable
                 $"Page number is out of range for a database of {count} page(s).");
         }
 
+        EnsurePageMaterialized(pageNumber);
         var offset = PageOffset(pageNumber);
-                if (_pageCodec is not null)
+        if (_pageCodec is not null)
         {
-                    var encodedPage = new byte[PageSize];
-                    var encodedRead = _file.Read(offset, encodedPage);
-                    if (encodedRead != PageSize)
+            var encodedPage = new byte[PageSize];
+            var encodedRead = _file.Read(offset, encodedPage);
+            if (encodedRead != PageSize)
             {
                 throw new InvalidDataException(
                             $"Short read on encoded page {pageNumber}: expected {PageSize} bytes, got {encodedRead}. The file may be truncated.");
             }
 
-                    PageCodecSupport.Decode(_pageCodec, PageLocation.Database, pageNumber, encodedPage, destination);
+            PageCodecSupport.Decode(_pageCodec, PageLocation.Database, pageNumber, encodedPage, destination);
             return;
         }
 
@@ -377,12 +378,26 @@ public sealed class SqlitePageStore : IDisposable
                 $"Page number is out of range for a database of {count} page(s).");
         }
 
+        EnsurePageMaterialized(pageNumber);
         var page = new byte[PageSize];
         var read = _file.Read(PageOffset(pageNumber), page);
         if (read != PageSize)
             throw new InvalidDataException($"Short raw read on page {pageNumber}: expected {PageSize} bytes, got {read}.");
         return page;
     }
+
+    internal void EnsurePageMaterialized(uint pageNumber)
+    {
+        ThrowIfDisposed();
+        if (_file is IPageMaterializingFile materializingFile
+            && pageNumber >= 1
+            && pageNumber <= PageCount)
+        {
+            materializingFile.EnsureMaterialized(PageOffset(pageNumber), PageSize);
+        }
+    }
+
+    internal bool SupportsPageMaterialization => _file is IPageMaterializingFile;
 
     internal void RefreshHeader()
     {
@@ -696,23 +711,23 @@ public sealed class SqlitePageStore : IDisposable
 
         _disposed = true;
         _file.Dispose();
-                PageCodecSupport.DisposeOwned(_pageCodec, _ownsPageCodec);
+        PageCodecSupport.DisposeOwned(_pageCodec, _ownsPageCodec);
     }
 
     private long PageOffset(uint pageNumber) => (long)(pageNumber - 1) * PageSize;
 
     private void WriteRawPage(uint pageNumber, ReadOnlySpan<byte> page)
     {
-                if (_pageCodec is null)
-                {
-                    _file.Write(PageOffset(pageNumber), page);
-                    return;
-                }
+        if (_pageCodec is null)
+        {
+            _file.Write(PageOffset(pageNumber), page);
+            return;
+        }
 
-                var onDiskPage = new byte[PageSize];
-                PageCodecSupport.Encode(_pageCodec, PageLocation.Database, pageNumber, page, onDiskPage);
-                _file.Write(PageOffset(pageNumber), onDiskPage);
-            }
+        var onDiskPage = new byte[PageSize];
+        PageCodecSupport.Encode(_pageCodec, PageLocation.Database, pageNumber, page, onDiskPage);
+        _file.Write(PageOffset(pageNumber), onDiskPage);
+    }
 
     private static bool IsAhtolaEncrypted(ReadOnlySpan<byte> header)
         => header.Length >= 5 && header[..5].SequenceEqual("AHTLA"u8);

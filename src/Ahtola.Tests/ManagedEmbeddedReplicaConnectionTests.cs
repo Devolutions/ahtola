@@ -1,4 +1,5 @@
 using AwesomeAssertions;
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -10,6 +11,8 @@ namespace Ahtola.Tests;
 public sealed class ManagedEmbeddedReplicaConnectionTests
 {
     private const int BootstrapStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.BootstrapStagedDatabase;
+    private const int BootstrapSafetyStatePublishedBoundary =
+        (int)ManagedReplicaDurableBoundary.BootstrapSafetyStatePublished;
     private const int BootstrapDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.BootstrapDatabasePublished;
     private const int IncrementalApplyStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.IncrementalApplyStagedDatabase;
     private const int IncrementalApplyDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished;
@@ -17,6 +20,27 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     private const int LogicalApplyCommittedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyCommitted;
     private const int LogicalApplyCheckpointedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyCheckpointed;
     private const int LogicalApplyMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.LogicalApplyMetadataPublished;
+    private const int ReplicaApplyLockAcquiredBoundary = (int)ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired;
+
+    // 32-byte (AES-256-GCM) hex keys used to build genuinely encrypted replica fixtures; mirrors
+    // ManagedEncryptedFileOpenContractTests' Aes256Key/WrongAes256Key pair.
+    private const string ReplicaEncryptionKeyHex = "202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F";
+    private const string ReplicaEncryptionWrongKeyHex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+    private const int RevertWalStagedBoundary = (int)ManagedReplicaDurableBoundary.RevertWalStaged;
+    private const int RevertWalPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertWalPublished;
+    private const int RevertMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertMetadataPublished;
+    private const int RevertCheckpointedBoundary = (int)ManagedReplicaDurableBoundary.RevertCheckpointed;
+    private const int RevertRemoteApplyIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertRemoteApplyIntentPublished;
+    private const int RevertCommittedRestoreIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedRestoreIntentPublished;
+    private const int RevertCommittedRestoreStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedRestoreStagedDatabase;
+    private const int RevertCommittedRestoreDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedRestoreDatabasePublished;
+    private const int RevertCommittedReadyMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedReadyMetadataPublished;
+    private const int RevertPushIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertPushIntentPublished;
+    private const int RevertConflictRestoreIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertConflictRestoreIntentPublished;
+    private const int RevertRestoreStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.RevertRestoreStagedDatabase;
+    private const int RevertRestoreDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertRestoreDatabasePublished;
+    private const int RevertRestoreMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertRestoreMetadataPublished;
+    private const int RevertRetiredBoundary = (int)ManagedReplicaDurableBoundary.RevertRetired;
 
     [Test]
     public void ReplicaOptionsNormalizeLibsqlUrlsToHttps()
@@ -455,7 +479,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             request.Content!.Headers.ContentType!.MediaType.Should().Be("application/protobuf");
 
             var fields = ReadVarintFields(request.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult());
-            fields.Should().ContainSingle();
+            fields.Should().HaveCount(2);
+            fields[1].Should().Be(0, "the bootstrap must explicitly request PageUpdatesEncodingReq.Raw");
             fields[4].Should().Be(3000);
         });
         var options = new AhtolaReplicaOptions(
@@ -478,6 +503,400 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             handler.CallCount.Should().Be(1);
             File.Exists(path).Should().BeTrue();
             File.ReadAllText(path + ".ahtola-replica-meta").Should().Contain("server_revision_base64=cmV2aXNpb24tNDI=");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ChunkedBootstrapPullsExactPageRangesAndMatchesOneShotImage()
+    {
+        var sourcePath = NewReplicaPath("managed-replica-chunked-bootstrap-source");
+        var oneShotPath = NewReplicaPath("managed-replica-one-shot-bootstrap");
+        var chunkedPath = NewReplicaPath("managed-replica-chunked-bootstrap");
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_payload(value BLOB NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_payload VALUES (zeroblob(20000));");
+            }
+
+            var databaseImage = File.ReadAllBytes(sourcePath);
+            var pageCount = checked(databaseImage.Length / 4096);
+            pageCount.Should().BeGreaterThan(4);
+            const int pagesPerChunk = 2;
+            var expectedRequestCount = (pageCount + pagesPerChunk - 1) / pagesPerChunk;
+            var chunkResponses = Enumerable.Range(0, expectedRequestCount)
+                .Select(index =>
+                {
+                    var start = index * pagesPerChunk;
+                    var end = Math.Min(start + pagesPerChunk, pageCount);
+                    return CreatePullResponseForPageRange("revision-42", databaseImage, start, end);
+                })
+                .ToArray();
+            var capturedRequests = new List<BootstrapPullRequest>();
+            var chunkedHandler = new PullUpdatesHandler(
+                chunkResponses,
+                request => capturedRequests.Add(
+                    ReadBootstrapPullRequest(request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult())));
+            var oneShotHandler = new PullUpdatesHandler(CreatePullResponse("revision-42", databaseImage));
+
+            await ManagedReplicaBootstrapper.BootstrapAsync(
+                CreateOptions(oneShotPath, oneShotHandler),
+                CancellationToken.None);
+            await ManagedReplicaBootstrapper.BootstrapAsync(
+                new AhtolaReplicaOptions(
+                    chunkedPath,
+                    new Uri("https://example.test/cluster"),
+                    authToken: "token-42")
+                {
+                    PullBytesThreshold = 4097,
+                    HttpPolicy = new AhtolaSyncHttpPolicy(chunkedHandler),
+                },
+                CancellationToken.None);
+
+            chunkedHandler.CallCount.Should().Be(expectedRequestCount);
+            capturedRequests.Should().HaveCount(expectedRequestCount);
+            for (var index = 0; index < capturedRequests.Count; index++)
+            {
+                var start = index * pagesPerChunk;
+                var end = Math.Min(start + pagesPerChunk, pageCount);
+                capturedRequests[index].ServerRevision.Should().Be(index == 0 ? null : "revision-42");
+                capturedRequests[index].SelectedPages.Should().Equal(
+                    Enumerable.Range(start, end - start).Select(page => checked((uint)page)));
+            }
+
+            File.ReadAllBytes(chunkedPath).Should().Equal(databaseImage);
+            File.ReadAllBytes(chunkedPath).Should().Equal(File.ReadAllBytes(oneShotPath));
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+            DeleteReplicaFiles(oneShotPath);
+            DeleteReplicaFiles(chunkedPath);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaPrefixBootstrapSelectsTheRequestedPageRangeAndOpensWhenComplete()
+    {
+        var path = NewReplicaPath("managed-replica-prefix-bootstrap");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        (databaseImage.Length % 4096).Should().Be(0);
+        var pageCount = checked(databaseImage.Length / 4096);
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-prefix", databaseImage), request =>
+        {
+            var payload = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+            var selector = ReadLengthDelimitedField(payload, 5);
+            DecodeRoaringPageSelector(selector).Should().Equal(
+                Enumerable.Range(0, pageCount).Select(static page => checked((uint)page)));
+        });
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(databaseImage.Length));
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+            ReadBootstrapMarker(connection).Should().Be(42);
+            handler.CallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void ChunkedBootstrapFailureDoesNotPublishPartialState()
+    {
+        var sourcePath = NewReplicaPath("managed-replica-chunked-bootstrap-failure-source");
+        var replicaPath = NewReplicaPath("managed-replica-chunked-bootstrap-failure");
+        try
+        {
+            CreateInitializedDatabase(sourcePath);
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_payload(value BLOB NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_payload VALUES (zeroblob(12000));");
+            }
+
+            var databaseImage = File.ReadAllBytes(sourcePath);
+            (databaseImage.Length / 4096).Should().BeGreaterThan(1);
+            var handler = new PullUpdatesHandler(
+                CreatePullResponseForPageRange("revision-42", databaseImage, startPage: 0, endPage: 1));
+            var options = new AhtolaReplicaOptions(
+                replicaPath,
+                new Uri("https://example.test/cluster"),
+                authToken: null)
+            {
+                PullBytesThreshold = 4096,
+                HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+            };
+
+            Assert.ThrowsAsync<InvalidOperationException>(
+                () => ManagedReplicaBootstrapper.BootstrapAsync(options, CancellationToken.None));
+
+            File.Exists(replicaPath).Should().BeFalse();
+            File.Exists(replicaPath + ".ahtola-replica-meta").Should().BeFalse();
+            var directory = Path.GetDirectoryName(replicaPath)!;
+            Directory.GetFiles(
+                    directory,
+                    $".{Path.GetFileName(replicaPath)}.bootstrap-*.tmp")
+                .Should()
+                .BeEmpty();
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+            DeleteReplicaFiles(replicaPath);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaPrefixBootstrapLazilyFetchesMissingPagesAndReusesDurableState()
+    {
+        var path = NewReplicaPath("managed-replica-incomplete-prefix-bootstrap");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        databaseImage.Length.Should().BeGreaterThan(4096);
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                ReadBootstrapMarker(connection).Should().Be(42);
+            }
+
+            handler.RequestedPages.Should().NotBeEmpty();
+            handler.RequestedPages[0].Should().Equal(0u);
+            handler.RequestedPages.Skip(1).SelectMany(static pages => pages).Should().Contain(1u);
+            var callCountAfterFirstOpen = handler.CallCount;
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeTrue();
+
+            using (var reopened = AhtolaConnection.CreateReplica(options))
+            {
+                reopened.Open();
+                ReadBootstrapMarker(reopened).Should().Be(42);
+                var callsBeforeSync = handler.CallCount;
+
+                var result = reopened
+                    .SyncAsync(new AhtolaSyncOptions(), CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult();
+
+                result.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+                handler.CallCount.Should().Be(callsBeforeSync + 1);
+            }
+
+            handler.SyncCallCount.Should().Be(1);
+            handler.CallCount.Should().Be(callCountAfterFirstOpen + 1);
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PartialBootstrapPublishesSafetyStateBeforeTheSparseDatabase()
+    {
+        var path = NewReplicaPath("managed-replica-partial-bootstrap-publication");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+        var observedSafeBoundary = false;
+
+        try
+        {
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point != ManagedReplicaDurableBoundary.BootstrapSafetyStatePublished)
+                           return;
+                       observedSafeBoundary = !File.Exists(path)
+                           && File.Exists(path + ManagedReplicaBootstrapper.MetadataSuffix)
+                           && File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+                       throw new InvalidOperationException("Injected bootstrap publication interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => ManagedReplicaBootstrapper.BootstrapAsync(options, CancellationToken.None));
+            }
+
+            observedSafeBoundary.Should().BeTrue();
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ManagedReplicaBootstrapper.MetadataSuffix).Should().BeFalse();
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();
+
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            reopened.Open();
+            ReadBootstrapMarker(reopened).Should().Be(42);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CompletePartialBootstrapMarkerRequiresItsPageState()
+    {
+        var path = NewReplicaPath("managed-replica-partial-bootstrap-missing-state");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                ReadBootstrapMarker(connection).Should().Be(42);
+            }
+
+            var callsBeforeRecovery = handler.CallCount;
+            File.Delete(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
+
+            using var recovered = AhtolaConnection.CreateReplica(options);
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            handler.CallCount.Should().BeGreaterThan(callsBeforeRecovery);
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void BootstrapMarkerRequiresItsMetadata()
+    {
+        var path = NewReplicaPath("managed-replica-bootstrap-missing-metadata");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(databaseImage.Length));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                ReadBootstrapMarker(connection).Should().Be(42);
+            }
+
+            var callsBeforeRecovery = handler.CallCount;
+            File.Delete(path + ManagedReplicaBootstrapper.MetadataSuffix);
+
+            using var recovered = AhtolaConnection.CreateReplica(options);
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            handler.CallCount.Should().BeGreaterThan(callsBeforeRecovery);
+            File.Exists(path + ManagedReplicaBootstrapper.MetadataSuffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PartialReplicaPushesTrackedLocalChangesBeforeCompletingItsImage()
+    {
+        var path = NewReplicaPath("managed-replica-partial-push");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+            connection.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 84;").Should().Be(1);
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            result.Statistics.CdcOperations.Should().Be(1);
+            handler.PushCallCount.Should().Be(1);
+            ReadBootstrapMarker(connection).Should().Be(84);
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PushedPartialReplicaCanResumeImageCompletionAfterReopen()
+    {
+        var path = NewReplicaPath("managed-replica-partial-push-resume");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                connection.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 84;").Should().Be(1);
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == ManagedReplicaDurableBoundary.PartialImageCompletionStarted)
+                               throw new InvalidOperationException("Injected partial image completion interruption.");
+                       }))
+                {
+                    Assert.ThrowsAsync<InvalidOperationException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                }
+
+                handler.PushCallCount.Should().Be(1);
+                connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+                File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeTrue();
+            }
+
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            reopened.Open();
+
+            var result = await reopened.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            handler.PushCallCount.Should().Be(1);
+            ReadBootstrapMarker(reopened).Should().Be(84);
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();
         }
         finally
         {
@@ -586,6 +1005,77 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             using var command = connection.CreateCommand();
             command.CommandText = "SELECT value FROM bootstrap_marker;";
             command.ExecuteScalar().Should().Be(42L);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void FailedCatchUpRollbackDoesNotDestroyANewerRevisionPublishedDuringTheRollbackWindow()
+    {
+        var path = NewReplicaPath("managed-replica-catchup-rollback-race");
+        var image = CreateDatabaseImage(path + ".source");
+
+        // Only the bootstrap page response is queued: exactly like
+        // FailedFreshBootstrapCatchUpRollsBackTheWholeBootstrapForACleanRetry, the mandatory
+        // post-bootstrap catch-up pull's HTTP call has nothing left to dequeue and fails. This
+        // time, a second, fully independent caller races into the gap between that failure and
+        // the rollback's own cleanup and publishes a newer, entirely valid revision there.
+        var failingHandler = new PullUpdatesHandler([CreatePullResponse("revision-42", image, protocol: 2)]);
+        var options = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null, bootstrapIfEmpty: true)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(failingHandler),
+        };
+
+        // Represents an already-open connection reaching the very same physical replica through a
+        // path that is textually different but physically identical (see ManagedReplicaApplyLock's
+        // physical-identity keying, which is exactly what makes the two contend for the same
+        // lease) -- or simply any other concurrent CheckForUpdatesAsync caller for this path. It is
+        // invoked directly, bypassing ManagedReplicaSyncRegistry entirely: the registry already
+        // serializes ordinary same-path callers behind the still-active bootstrap+catch-up
+        // publication, so a registry-mediated caller could never actually observe this window --
+        // only a caller reaching the apply lock through some other route can.
+        var concurrentPublisherHandler = new PullUpdatesHandler([CreateLogicalPullResponse("revision-99", body: [])]);
+        var concurrentPublisherOptions = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null, bootstrapIfEmpty: false)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(concurrentPublisherHandler),
+        };
+
+        try
+        {
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point != ManagedReplicaDurableBoundary.BootstrapCatchUpFailureObserved)
+                           return;
+
+                       // Runs synchronously, on the same call stack as the failing Open() call,
+                       // strictly between catch-up throwing and the rollback's own (re)acquisition
+                       // of the apply lease. Completing a whole, independent apply here -- rather
+                       // than merely holding the lease open -- proves the rollback's lease
+                       // reacquisition plus revision re-check (not just "the lease was held") is
+                       // what keeps a legitimately newer publish safe.
+                       var bootstrapped = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+                       ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                               concurrentPublisherOptions.WithoutLongPoll(),
+                               bootstrapped,
+                               new AhtolaSyncOptions(),
+                               CancellationToken.None)
+                           .GetAwaiter().GetResult();
+                   }))
+            {
+                Assert.Throws<InvalidOperationException>(() => AhtolaConnection.CreateReplica(options).Open());
+            }
+
+            // The concurrent publisher's revision-99 must survive: the rollback must have
+            // reacquired the apply lease, seen the on-disk revision no longer matches the
+            // bootstrap generation it set out to undo, and backed off instead of deleting.
+            File.Exists(path).Should().BeTrue(
+                "a concurrent caller's newer, valid publish must never be destroyed by another caller's failed-bootstrap rollback");
+            File.Exists(path + ".ahtola-replica-meta").Should().BeTrue();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-99");
+            concurrentPublisherHandler.CallCount.Should().Be(1);
         }
         finally
         {
@@ -1401,8 +1891,9 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         request =>
         {
             var bytes = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-            if (bytes.Length > 0)
-                capturedRequests.Add(ReadFields(bytes));
+            var fields = ReadFields(bytes);
+            if (fields.ContainsKey(3))
+                capturedRequests.Add(fields);
         });
         var options = new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null)
         {
@@ -1412,7 +1903,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         try
         {
             using var connection = AhtolaConnection.CreateReplica(options);
-            connection.Open(); // bootstrap (no revision, empty request) + fresh-bootstrap catch-up
+            connection.Open(); // bootstrap (raw encoding only, no revision) + fresh-bootstrap catch-up
             await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None).ConfigureAwait(false);
 
             // The fresh-bootstrap catch-up and the explicit Sync() both know the remote is
@@ -1422,6 +1913,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             capturedRequests.Should().HaveCount(2);
             foreach (var fields in capturedRequests)
             {
+                fields[1].Number.Should().Be(0,
+                    "logical incremental pulls must still request raw encoding for any page fallback");
                 fields[3].Text.Should().Be("revision-42");
                 fields[8].Number.Should().Be(1);
             }
@@ -1628,6 +2121,619 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [TestCase(RevertWalStagedBoundary, false)]
+    [TestCase(RevertWalPublishedBoundary, false)]
+    [TestCase(RevertMetadataPublishedBoundary, true)]
+    [TestCase(RevertCheckpointedBoundary, true)]
+    [TestCase(RevertRemoteApplyIntentPublishedBoundary, true)]
+    public void ReplaceBaseCheckpointRevertCaptureIsCrashSafeAtEveryPublicationBoundary(
+        int boundaryValue,
+        bool expectedPendingRevert)
+    {
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var path = NewReplicaPath($"managed-replica-revert-capture-{boundary}");
+        try
+        {
+            var (options, originalImage) = PrepareReplicaWithFullyPushedWal(path);
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == boundary)
+                               throw new InvalidOperationException("Injected checkpoint revert capture interruption.");
+                       }))
+                {
+                    Assert.ThrowsAsync<InvalidOperationException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                }
+            }
+
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            metadata.RevertState.HasValue.Should().Be(expectedPendingRevert);
+            if (expectedPendingRevert)
+            {
+                File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+                ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata);
+                File.ReadAllBytes(path).Should().Equal(originalImage);
+                ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+                File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            }
+            else
+            {
+                File.ReadAllBytes(path).Should().Equal(originalImage);
+                File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+                ManagedReplicaRevertWal.EnsureSynchronizationReady(path, metadata);
+                File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            }
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(RevertCommittedRestoreIntentPublishedBoundary)]
+    [TestCase(RevertCommittedRestoreStagedDatabaseBoundary)]
+    [TestCase(RevertCommittedRestoreDatabasePublishedBoundary)]
+    [TestCase(RevertCommittedReadyMetadataPublishedBoundary)]
+    public void CheckpointCommittedImagePreparationRecoversAtEveryPublicationBoundary(int boundaryValue)
+    {
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var path = NewReplicaPath($"managed-replica-revert-committed-{boundary}");
+        try
+        {
+            _ = PreparePendingCheckpointRevert(path);
+            var committedImage = File.ReadAllBytes(path);
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == boundary)
+                           throw new InvalidOperationException("Injected committed-image recovery interruption.");
+                   }))
+            {
+                Assert.Throws<InvalidOperationException>(
+                    () => ManagedReplicaRevertWal.PrepareSynchronization(path, metadata));
+            }
+
+            metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            metadata = ManagedReplicaRevertWal.PrepareSynchronization(path, metadata);
+
+            File.ReadAllBytes(path).Should().Equal(committedImage);
+            metadata.RevertState!.Value.Phase.Should()
+                .Be(ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady);
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(RevertRestoreStagedDatabaseBoundary)]
+    [TestCase(RevertRestoreDatabasePublishedBoundary)]
+    [TestCase(RevertRestoreMetadataPublishedBoundary)]
+    [TestCase(RevertRetiredBoundary)]
+    [TestCase(RevertConflictRestoreIntentPublishedBoundary)]
+    public void CheckpointRevertRestoreRecoversAtEveryPublicationBoundary(int boundaryValue)
+    {
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var path = NewReplicaPath($"managed-replica-revert-restore-{boundary}");
+        try
+        {
+            var (originalImage, metadata) = PreparePendingCheckpointRevert(path);
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == boundary)
+                           throw new InvalidOperationException("Injected checkpoint revert restore interruption.");
+                   }))
+            {
+                Assert.Throws<InvalidOperationException>(
+                    () => ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata));
+            }
+
+            var recoveredMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            if (recoveredMetadata.RevertState.HasValue)
+                ManagedReplicaRevertWal.RestorePendingCheckpoint(path, recoveredMetadata);
+            else
+                ManagedReplicaRevertWal.EnsureSynchronizationReady(path, recoveredMetadata);
+
+            File.ReadAllBytes(path).Should().Equal(originalImage);
+            var finalMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            finalMetadata.RevertState.Should().BeNull();
+            ManagedReplicaBootstrapper.EnsureNoLocalDivergence(path, finalMetadata);
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointRecoveryRunsBeforeOpeningAnInterruptedRemoteImage()
+    {
+        var path = NewReplicaPath("managed-replica-revert-open-recovery");
+        try
+        {
+            var (options, _) = PrepareReplicaWithFullyPushedWal(path);
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            using (var pager = Core.Storage.SqlitePager.Open(
+                       Core.Storage.PhysicalFileSystem.Instance,
+                       path,
+                       path + "-wal"))
+            {
+                ManagedReplicaRevertWal.CaptureAndCheckpoint(
+                    path,
+                    metadata,
+                    pager,
+                    CancellationToken.None);
+            }
+
+            metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            _ = ManagedReplicaRevertWal.MarkRemoteApplyStarted(path, metadata);
+            var remoteImage = CreateDatabaseImageWithMarker(path + ".remote", 84);
+            File.WriteAllBytes(path, CreateDatabaseImageWithMarker(path + ".replayed", 999));
+            StageCommittedMainFileChangesInWal(path, remoteImage);
+            new FileInfo(path + "-wal").Length.Should().BeGreaterThan(Core.Storage.SqliteWalHeader.Size);
+
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            ReadBootstrapMarker(connection).Should().Be(43);
+            var recovered = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            recovered.RevertState!.Value.Phase.Should()
+                .Be(ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady);
+            new FileInfo(path + "-wal").Length.Should().BeLessThanOrEqualTo(Core.Storage.SqliteWalHeader.Size);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void CheckpointRevertRestoreRejectsCorruptOrMissingSidecar(bool deleteSidecar)
+    {
+        var path = NewReplicaPath(
+            deleteSidecar
+                ? "managed-replica-revert-missing"
+                : "managed-replica-revert-corrupt");
+        try
+        {
+            var (_, metadata) = PreparePendingCheckpointRevert(path);
+            var sidecarPath = path + ManagedReplicaRevertWal.Suffix;
+            if (deleteSidecar)
+            {
+                File.Delete(sidecarPath);
+            }
+            else
+            {
+                var bytes = File.ReadAllBytes(sidecarPath);
+                bytes[^1] ^= 0x80;
+                File.WriteAllBytes(sidecarPath, bytes);
+            }
+
+            Assert.Throws<InvalidDataException>(
+                () => ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata));
+            Assert.Throws<InvalidDataException>(
+                () => ManagedReplicaRevertWal.EnsureSynchronizationReady(path, metadata));
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CheckpointRevertMetadataRejectsCorruptWatermark()
+    {
+        var path = NewReplicaPath("managed-replica-revert-corrupt-watermark");
+        try
+        {
+            _ = PreparePendingCheckpointRevert(path);
+            var metadataPath = path + ".ahtola-replica-meta";
+            var lines = File.ReadAllLines(metadataPath);
+            var revertStateIndex = Array.FindIndex(
+                lines,
+                static line => line.StartsWith("revert_state_base64=", StringComparison.Ordinal));
+            revertStateIndex.Should().BeGreaterThanOrEqualTo(0);
+            var encodedState = lines[revertStateIndex]["revert_state_base64=".Length..];
+            var stateBytes = Convert.FromBase64String(encodedState);
+            stateBytes[1] ^= 0x01;
+            lines[revertStateIndex] = "revert_state_base64=" + Convert.ToBase64String(stateBytes);
+            File.WriteAllText(metadataPath, string.Join('\n', lines) + "\n", new UTF8Encoding(false));
+
+            var exception = Assert.Throws<InvalidDataException>(
+                () => ManagedReplicaBootstrapper.LoadMetadata(path));
+            exception!.Message.Should().Contain("integrity check");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CheckpointRevertRestoreAcceptsTheAuthenticatedSourceWalAfterMainFileInstallation()
+    {
+        var path = NewReplicaPath("managed-replica-revert-mid-checkpoint");
+        try
+        {
+            var (originalImage, metadata) = PreparePendingCheckpointRevert(
+                path,
+                ManagedReplicaDurableBoundary.RevertMetadataPublished);
+            using (var wal = Core.Storage.SqliteWalFile.Open(
+                       Core.Storage.PhysicalFileSystem.Instance,
+                       path + "-wal",
+                       readOnly: true))
+            {
+                var postimage = wal.ReadFrame(metadata.RevertState!.Value.SourceWalWatermark);
+                using var database = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Write,
+                    FileShare.None,
+                    bufferSize: postimage.PageData.Length,
+                    FileOptions.WriteThrough);
+                database.Position = checked((long)(postimage.Header.PageNumber - 1) * postimage.PageData.Length);
+                database.Write(postimage.PageData);
+                database.Flush(flushToDisk: true);
+            }
+
+            File.ReadAllBytes(path).Should().NotEqual(originalImage);
+            ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata);
+            File.ReadAllBytes(path).Should().Equal(originalImage);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CheckpointRevertRestoreIsSelfContainedAfterRemoteDatabasePublication()
+    {
+        var path = NewReplicaPath("managed-replica-revert-after-replacement");
+        try
+        {
+            var (originalImage, metadata) = PreparePendingCheckpointRevert(path);
+            metadata = ManagedReplicaRevertWal.MarkRemoteApplyStarted(path, metadata);
+            var replacementImage = CreateDatabaseImageWithMarker(path + ".remote", 999);
+            File.WriteAllBytes(path, replacementImage);
+            foreach (var suffix in new[] { "-wal", "-shm", "-journal" })
+            {
+                if (File.Exists(path + suffix))
+                    File.Delete(path + suffix);
+            }
+
+            ManagedReplicaRevertWal.RestorePendingCheckpoint(path, metadata);
+            File.ReadAllBytes(path).Should().Equal(originalImage);
+            var restoredMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            restoredMetadata.RevertState.Should().BeNull();
+            ManagedReplicaBootstrapper.EnsureNoLocalDivergence(path, restoredMetadata);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointPushConflictRestoresExactOriginalImageAndRetainsJournal()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-conflict");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    ReplicaPushHandler.BatchErrorResponse(
+                        5,
+                        2,
+                        "conflicting local change",
+                        "SQLITE_CONSTRAINT")));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            var exception = Assert.ThrowsAsync<AhtolaReplicaConflictException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.Conflict);
+            ReadAllBytesShared(path).Should().Equal(scenario.RollbackImage);
+            ReadBootstrapMarker(connection).Should().Be(84);
+            connection.ReadManagedReplicaLocalChanges(10).Changes
+                .Select(change => change.Sequence).Should().Equal(2);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            scenario.Handler.PushCallCount.Should().Be(2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointTransientPushFailureKeepsCommittedImageAndRecoveryBundle()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-transient");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                    {
+                        Content = new StringContent("unavailable"),
+                    }));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            var exception = Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.TransientTransport);
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            ReadBootstrapMarker(connection).Should().Be(44);
+            connection.ReadManagedReplicaLocalChanges(10).Changes
+                .Select(change => change.Sequence).Should().Equal(2);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+            scenario.Handler.PushCallCount.Should().Be(2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointInvalidPushFailureDoesNotRestore()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-invalid");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    ReplicaPushHandler.BatchErrorResponse(
+                        5,
+                        2,
+                        "malformed statement",
+                        "SQLITE_ERROR")));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            var exception = Assert.ThrowsAsync<AhtolaRemoteSqlException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointCancellationDoesNotRestore()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-cancel");
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                (_, token) =>
+                {
+                    cancellation.Cancel();
+                    return Task.FromCanceled<HttpResponseMessage>(token);
+                });
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            Assert.CatchAsync<OperationCanceledException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token));
+
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointRejectsCheckpointedLocalActivityAfterTransientFailure()
+    {
+        var path = NewReplicaPath("managed-replica-revert-new-local-activity");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                    {
+                        Content = new StringContent("unavailable"),
+                    }));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            connection.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 45;");
+            connection.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
+
+            var exception = Assert.ThrowsAsync<InvalidOperationException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            exception!.Message.Should().Contain("committed database image changed");
+            connection.ReadManagedReplicaLocalChanges(10).Changes
+                .Select(change => change.Sequence).Should().Equal(2, 3);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeTrue();
+            scenario.Handler.PushCallCount.Should().Be(2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PendingCheckpointPushIntentInterruptionResumesBeforeSendingTheBatch()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-intent");
+        var recoveryCall = 0;
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                (_, _) => Task.FromResult(
+                    ++recoveryCall == 1
+                        ? ReplicaPushHandler.EmptyWatermarkResponse()
+                        : ReplicaPushHandler.SuccessfulBatchResponse(5)));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.RevertPushIntentPublished)
+                           throw new InvalidOperationException("Injected push-intent interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState!.Value.Phase.Should()
+                .Be(ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown);
+            scenario.Handler.PushCallCount.Should().Be(1);
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+            scenario.Handler.PushCallCount.Should().Be(3);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PendingCheckpointAmbiguousPushUsesRemoteWatermarkBeforeRetry()
+    {
+        var path = NewReplicaPath("managed-replica-revert-ambiguous-push");
+        var recoveryCall = 0;
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                (_, _) => ++recoveryCall == 1
+                    ? Task.FromException<HttpResponseMessage>(
+                        new HttpRequestException("Response was lost after the remote commit."))
+                    : Task.FromResult(ReplicaPushHandler.WatermarkResponse(0, 2)));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            Assert.ThrowsAsync<HttpRequestException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            scenario.Handler.PushCallCount.Should().Be(3);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PendingCheckpointSuccessfulPushCompletesCommittedImageAndRetiresRecovery()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-success");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(ReplicaPushHandler.SuccessfulBatchResponse(5)));
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            ReadAllBytesShared(path).Should().Equal(scenario.CommittedImage);
+            ReadBootstrapMarker(connection).Should().Be(44);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().BeNull();
+            File.Exists(path + ManagedReplicaRevertWal.Suffix).Should().BeFalse();
+            scenario.Handler.PushCallCount.Should().Be(2);
+            scenario.Handler.PullCallCount.Should().Be(4);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PendingCheckpointCorruptionFailsClosedBeforeConflictPush()
+    {
+        var path = NewReplicaPath("managed-replica-revert-push-corrupt");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(
+                    ReplicaPushHandler.BatchErrorResponse(
+                        5,
+                        2,
+                        "conflicting local change",
+                        "SQLITE_CONSTRAINT")));
+            var sidecarPath = path + ManagedReplicaRevertWal.Suffix;
+            using (var stream = new FileStream(sidecarPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                stream.Position = stream.Length - 1;
+                var lastByte = stream.ReadByte();
+                stream.Position = stream.Length - 1;
+                stream.WriteByte((byte)(lastByte ^ 0xff));
+                stream.Flush(flushToDisk: true);
+            }
+
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            var exception = Assert.Throws<InvalidDataException>(() => connection.Open());
+
+            exception!.Message.Should().Contain("integrity check");
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(10).Changes.Should().ContainSingle();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+            scenario.Handler.PushCallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
     [Test]
     public async Task ProtocolTwoIncrementalPagesRejectsAFullyPushedWalWriteWithoutAdvancing()
     {
@@ -1763,6 +2869,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [TestCase(ReplicaApplyLockAcquiredBoundary, false)]
     [TestCase(LogicalApplyCommittedBoundary, false)]
     [TestCase(LogicalApplyCheckpointedBoundary, false)]
     [TestCase(LogicalApplyMetadataPublishedBoundary, true)]
@@ -2075,7 +3182,69 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             connection.Open();
             connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
 
-            Assert.ThrowsAsync<AhtolaException>(() => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            var exception = Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.TransientTransport);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.TransientTransport);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            handler.PullCallCount.Should().Be(1);
+            handler.PushCallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task SyncAsyncClassifiesNonConflictRemoteBatchErrorsAsInvalidLocalStateAndRetainsJournal()
+    {
+        var path = NewReplicaPath("managed-replica-push-invalid-local-state");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var handler = new ReplicaPushHandler(
+            [CreatePullResponse("revision-42", image)],
+            _ => ReplicaPushHandler.BatchErrorResponse(5, 2, "malformed statement", "SQLITE_ERROR"));
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+
+            var exception = Assert.ThrowsAsync<AhtolaRemoteSqlException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            handler.PullCallCount.Should().Be(1);
+            handler.PushCallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task SyncAsyncClassifiesNonRetryableHttpPushFailuresAsInvalidLocalStateAndRetainsJournal()
+    {
+        var path = NewReplicaPath("managed-replica-push-http-invalid-local-state");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var handler = new ReplicaPushHandler(
+            [CreatePullResponse("revision-42", image)],
+            _ => new HttpResponseMessage(HttpStatusCode.BadRequest)
+            {
+                Content = new StringContent("malformed pipeline request"),
+            });
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+
+            var exception = Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
             connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
             handler.PullCallCount.Should().Be(1);
             handler.PushCallCount.Should().Be(1);
@@ -2105,6 +3274,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             exception!.RemoteErrorCode.Should().Be("SQLITE_CONSTRAINT");
             exception.ConflictKind.Should().Be(AhtolaReplicaConflictKind.RowWrite);
             exception.LocalChangeSequence.Should().Be(1);
+            exception.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.Conflict);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.Conflict);
             connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
             handler.PullCallCount.Should().Be(1);
             handler.PushCallCount.Should().Be(1);
@@ -2152,10 +3323,9 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
-    [TestCase(UnsupportedReplicaMode.RemoteEncryption)]
-    [TestCase(UnsupportedReplicaMode.PartialPrefix)]
+    [TestCase(UnsupportedReplicaMode.UnsupportedEncryptionCipher)]
     [TestCase(UnsupportedReplicaMode.PartialQuery)]
-    [TestCase(UnsupportedReplicaMode.ChunkedBootstrap)]
+    [TestCase(UnsupportedReplicaMode.PartialPrefixInvalidSegment)]
     public void CreateReplicaRejectsUnsupportedModesBeforeOpeningOrMutatingLocalState(
         UnsupportedReplicaMode mode)
     {
@@ -2166,12 +3336,262 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         try
         {
             using var connection = AhtolaConnection.CreateReplica(options);
-            Assert.Throws<NotSupportedException>(() => connection.Open());
+            var exception = Assert.Throws<NotSupportedException>(() => connection.Open())!;
+            if (mode == UnsupportedReplicaMode.PartialQuery)
+                exception.Message.Should().Contain("query-selected bootstrap pages");
+            if (mode == UnsupportedReplicaMode.PartialPrefixInvalidSegment)
+                exception.Message.Should().Contain("whole number of 4 KiB pages");
 
             handler.CallCount.Should().Be(0);
             File.Exists(path).Should().BeFalse();
             File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
             File.Exists(path + ManagedReplicaChangeJournal.Suffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ReplicaEntryPointsRejectRemoteEncryptionOverNonLoopbackHttpBeforeRequestOrLocalMutation()
+    {
+        var path = NewReplicaPath("managed-replica-encryption-plaintext-http");
+        var handler = new PullUpdatesHandler(CreatePullResponse("unused", new byte[4096]));
+        var options = new AhtolaReplicaOptions(
+            path,
+            new Uri("http://database.example/cluster"),
+            authToken: null)
+        {
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+            RemoteEncryption = new AhtolaRemoteEncryptionOptions(
+                Convert.ToBase64String(Convert.FromHexString(ReplicaEncryptionKeyHex)),
+                AhtolaRemoteEncryptionCipher.Aes256Gcm),
+        };
+
+        try
+        {
+            var action = () => AhtolaConnection.CreateReplica(options);
+
+            action.Should().Throw<InvalidOperationException>()
+                .WithMessage(
+                    "Remote encryption requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
+
+            Func<Task> bootstrap = () => ManagedReplicaBootstrapper.BootstrapAsync(
+                options,
+                CancellationToken.None);
+            await bootstrap.Should().ThrowAsync<InvalidOperationException>()
+                .WithMessage(
+                    "Remote encryption requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
+
+            var metadata = new ManagedReplicaBootstrapper.ManagedReplicaMetadata(
+                "revision-42",
+                "unused",
+                "client-42",
+                RemotePullProtocol.Pages,
+                new Dictionary<ulong, string>());
+            Func<Task> incrementalPull = () => ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                options,
+                metadata,
+                new AhtolaSyncOptions(),
+                CancellationToken.None);
+            await incrementalPull.Should().ThrowAsync<InvalidOperationException>()
+                .WithMessage(
+                    "Remote encryption requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
+
+            handler.CallCount.Should().Be(0);
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+            File.Exists(path + ManagedReplicaChangeJournal.Suffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaBootstrapsAnEncryptedRemoteDatabaseWithNonzeroReservedBytes()
+    {
+        // The source database is genuinely AES-256-GCM encrypted (28 reserved bytes per page;
+        // page 1 begins with the "AHTLA" header rather than plaintext SQLite magic). Bootstrap
+        // must materialize it using the storage layer's own encrypted-header/reserved-byte
+        // treatment (see ManagedReplicaEncryption.OpenDatabase) instead of the previous blanket
+        // "remote encryption is unsupported" rejection, and must forward the remote encryption
+        // key as an HTTP header on the pull request (mirrors Turso's remote_encryption_key).
+        var path = NewReplicaPath("managed-replica-encrypted-bootstrap");
+        var sourcePath = path + ".source";
+        var image = CreateEncryptedDatabaseImage(sourcePath, ReplicaEncryptionKeyHex, marker: 77);
+        image.AsSpan(0, 5).ToArray().Should().Equal(
+            "AHTLA"u8.ToArray(), "the fixture must be genuinely encrypted, not merely labeled as such");
+
+        var receivedEncryptionKeys = new List<string?>();
+        var handler = new PullUpdatesHandler(
+            CreatePullResponse("revision-42", image),
+            request => receivedEncryptionKeys.Add(
+                request.Headers.TryGetValues(AhtolaRemoteClient.EncryptionKeyHeaderName, out var values)
+                    ? values.FirstOrDefault()
+                    : null));
+        var options = CreateEncryptedOptions(path, handler, ReplicaEncryptionKeyHex);
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+
+                ReadBootstrapMarker(connection).Should().Be(77);
+                handler.CallCount.Should().Be(1);
+                receivedEncryptionKeys.Should().ContainSingle().Which.Should().Be(options.RemoteEncryption!.Base64Key);
+            }
+
+            File.ReadAllBytes(path).AsSpan(0, 5).ToArray().Should().Equal(
+                "AHTLA"u8.ToArray(), "the bootstrapped local file must remain encrypted at rest");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaRejectsAnEncryptedRemoteDatabaseWhenTheConfiguredKeyDoesNotMatch()
+    {
+        // A wrong (but valid-length) key cannot authenticate the AES-GCM tag on page 1, so the
+        // storage layer's decrypt path must fail closed rather than silently accepting
+        // corrupted plaintext; the failed bootstrap must also roll back completely.
+        var path = NewReplicaPath("managed-replica-encrypted-wrong-key");
+        var sourcePath = path + ".source";
+        var image = CreateEncryptedDatabaseImage(sourcePath, ReplicaEncryptionKeyHex);
+
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image));
+        var options = CreateEncryptedOptions(path, handler, ReplicaEncryptionWrongKeyHex);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<InvalidDataException>(() => connection.Open())!
+                .Message.Should().Contain("failed authentication");
+
+            handler.CallCount.Should().Be(1);
+            File.Exists(path).Should().BeFalse(
+                "a failed bootstrap must roll back rather than leave a database that cannot be decrypted with the configured key");
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaRejectsAPlaintextPageStreamWhenRemoteEncryptionIsConfigured()
+    {
+        // The remote's page stream is ordinary plaintext SQLite pages (reserved bytes = 0), but
+        // the replica is configured to expect an AES-256-GCM encrypted stream. The storage
+        // layer must detect that mismatch and fail closed (SqlitePageStore rejects a plaintext
+        // SQLite header when encryption was requested, refusing any plaintext fallback) rather
+        // than silently accepting an unencrypted page 1 as if it had already been decrypted --
+        // bootstrap must enforce the correct reserved-byte/header treatment rather than
+        // trusting the caller's RemoteEncryption configuration blindly.
+        var path = NewReplicaPath("managed-replica-plaintext-with-encryption-configured");
+        var sourcePath = path + ".source";
+        var image = CreateDatabaseImage(sourcePath);
+
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image));
+        var options = CreateEncryptedOptions(path, handler, ReplicaEncryptionKeyHex);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<InvalidDataException>(() => connection.Open())!
+                .Message.Should().Contain("plaintext SQLite header");
+
+            handler.CallCount.Should().Be(1);
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaRejectsAnMvccLogicalRemoteAdvertisedDuringBootstrapWhenRemoteEncryptionIsConfigured()
+    {
+        // protocol: 2 advertises the MVCC logical pull protocol that would govern any later
+        // incremental pull (see CreateReplicaBootstrapsRawPagesFromALogicalProtocolRemote); the
+        // managed engine does not support combining that protocol with remote encryption
+        // (mirrors Turso's ensure_logical_mvcc_pull_supported), so bootstrap must fail closed
+        // before ever installing local state that would need an unsupported logical catch-up.
+        var path = NewReplicaPath("managed-replica-mvcc-encryption-bootstrap-reject");
+        var sourcePath = path + ".source";
+        var image = CreateDatabaseImage(sourcePath);
+
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image, protocol: 2));
+        var options = CreateEncryptedOptions(path, handler, ReplicaEncryptionKeyHex);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<NotSupportedException>(() => connection.Open())!
+                .Message.Should().Contain("MVCC logical pull protocol combined with remote encryption");
+
+            handler.CallCount.Should().Be(
+                1, "the guard must fire from the bootstrap download itself, before any catch-up request");
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task CheckForUpdatesRejectsAnMvccLogicalMetadataProtocolWhenRemoteEncryptionIsConfigured()
+    {
+        // Establishes a replica whose stored metadata already records the MVCC logical pull
+        // protocol via a normal, unencrypted bootstrap (protocol: 2, matching
+        // CreateReplicaBootstrapsRawPagesFromALogicalProtocolRemote), then drives
+        // CheckForUpdatesAsync directly with RemoteEncryption configured against that same
+        // metadata. Mirrors Turso's ensure_logical_mvcc_pull_supported: this is the SECOND,
+        // independent guard (CheckForUpdatesAsync's own, not the bootstrap-time one in
+        // DownloadDatabaseAsync) -- it must fail closed as soon as a logical pull would be
+        // requested against an encrypted remote, without relying solely on the bootstrap-time
+        // check above.
+        var path = NewReplicaPath("managed-replica-mvcc-encryption-checkforupdates-reject");
+        var sourcePath = path + ".source";
+        var image = CreateDatabaseImage(sourcePath);
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up: nothing new
+        ]);
+        var options = CreateOptions(path, handler);
+
+        try
+        {
+            ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata;
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            }
+
+            metadata.Protocol.Should().Be(
+                RemotePullProtocol.MvccLogical, "the fresh bootstrap above must have recorded an MVCC logical protocol");
+
+            var encryptedOptions = CreateEncryptedOptions(path, handler, ReplicaEncryptionKeyHex);
+
+            Func<Task> checkForUpdates = () => ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                encryptedOptions, metadata, new AhtolaSyncOptions(), [], CancellationToken.None);
+            await checkForUpdates.Should().ThrowAsync<NotSupportedException>()
+                .WithMessage("*MVCC logical pull protocol combined with remote encryption*");
+
+            handler.CallCount.Should().Be(2, "the guard must fail before any additional network request");
         }
         finally
         {
@@ -2403,6 +3823,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             exception!.RemoteErrorCode.Should().Be("SQLITE_SCHEMA");
             exception.ConflictKind.Should().Be(AhtolaReplicaConflictKind.SchemaChange);
             exception.LocalChangeSequence.Should().Be(1);
+            exception.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.Conflict);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.Conflict);
             connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle()
                 .Which.Kind.Should().Be(ReplicaLocalChangeKind.Schema);
             handler.PullCallCount.Should().Be(1);
@@ -2486,6 +3908,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [TestCase(ReplicaApplyLockAcquiredBoundary)]
     [TestCase(BootstrapStagedDatabaseBoundary)]
     [TestCase(BootstrapDatabasePublishedBoundary)]
     public async Task BootstrapCancellationAtDurableBoundaryLeavesNoUnpairedReplicaFiles(
@@ -2526,6 +3949,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [TestCase(ReplicaApplyLockAcquiredBoundary, false)]
     [TestCase(IncrementalApplyStagedDatabaseBoundary, false)]
     [TestCase(IncrementalApplyDatabasePublishedBoundary, false)]
     [TestCase(IncrementalApplyMetadataPublishedBoundary, true)]
@@ -2575,6 +3999,478 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             using var command = reopened.CreateCommand();
             command.CommandText = "SELECT value FROM bootstrap_marker;";
             command.ExecuteScalar().Should().Be(expectedRemoteImage ? 84L : 42L);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task IncrementalApplyLeaseIsReleasedAfterCancellationAllowingAnImmediateRetryOnTheSameConnection()
+    {
+        var path = NewReplicaPath("managed-replica-incremental-lease-retry");
+        var initialImage = CreateDatabaseImage(path + ".initial");
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler([
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage), // consumed by the canceled attempt, never applied
+            CreatePullResponse("revision-43", updatedImage), // consumed by the retry, applied
+        ]);
+        var options = CreateOptions(path, handler);
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired)
+                           cancellation.Cancel();
+                   }))
+            {
+                Assert.CatchAsync<OperationCanceledException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token));
+            }
+
+            using (var verifyCommand = connection.CreateCommand())
+            {
+                verifyCommand.CommandText = "SELECT value FROM bootstrap_marker;";
+                verifyCommand.ExecuteScalar().Should().Be(
+                    42L, "cancellation fired before the lease-guarded fingerprint check and apply ever ran");
+            }
+            handler.CallCount.Should().Be(2);
+
+            // Retry on the SAME connection, with no reopen in between: if the apply lease
+            // acquired (and abandoned mid-cancellation) by the first attempt were not released by
+            // its `await using` disposal, this call would hang forever waiting on the same
+            // per-path semaphore instead of completing.
+            var retryResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            retryResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            retryResult.Statistics.Revision.Should().Be("revision-43");
+
+            using (var retryCommand = connection.CreateCommand())
+            {
+                retryCommand.CommandText = "SELECT value FROM bootstrap_marker;";
+                retryCommand.ExecuteScalar().Should().Be(84L);
+            }
+            handler.CallCount.Should().Be(3);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task LogicalApplyLeaseIsReleasedAfterCancellationAllowingAnImmediateRetryOnTheSameConnection()
+    {
+        var path = NewReplicaPath("managed-replica-logical-lease-retry");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "widgets",
+            rowId: 9,
+            columnValue: "alice",
+            schemaSql: "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT)",
+            salt: 950UL);
+
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", databaseImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []), // fresh-bootstrap catch-up: nothing new
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]), // canceled attempt
+            CreateLogicalPullResponse("revision-43", logicalBody, rangeMessages: [rangeMessage]), // retry, applied
+        ]);
+        var options = CreateOptions(path, handler);
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired)
+                           cancellation.Cancel();
+                   }))
+            {
+                Assert.CatchAsync<OperationCanceledException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token));
+            }
+
+            using (var existsCommand = connection.CreateCommand())
+            {
+                existsCommand.CommandText = "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'widgets';";
+                Convert.ToInt64(existsCommand.ExecuteScalar()).Should().Be(
+                    0L, "cancellation fired before ApplyLogicalUpdatesAsync ever started");
+            }
+            handler.CallCount.Should().Be(3);
+
+            // Retry on the SAME connection, with no reopen in between: proves the apply lease
+            // acquired (and abandoned mid-cancellation) by the first attempt was released via its
+            // `await using` disposal, rather than leaking and deadlocking every subsequent sync on
+            // this same replica path.
+            var retryResult = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            retryResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            retryResult.Statistics.Revision.Should().Be("revision-43");
+
+            using (var rowCommand = connection.CreateCommand())
+            {
+                rowCommand.CommandText = "SELECT name FROM widgets WHERE id = 9;";
+                rowCommand.ExecuteScalar().Should().Be("alice");
+            }
+            handler.CallCount.Should().Be(4);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ConcurrentBootstrapsOfTheSamePathSerializeAndTheLoserFailsCleanlyInsteadOfRacingTheFileSwap()
+    {
+        var path = NewReplicaPath("managed-replica-concurrent-bootstrap");
+        var image = CreateDatabaseImage(path + ".source");
+        var firstHandler = new PullUpdatesHandler([CreatePullResponse("revision-42", image)]);
+        var secondHandler = new PullUpdatesHandler([CreatePullResponse("revision-99", image)]);
+        var firstOptions = CreateOptions(path, firstHandler);
+        var secondOptions = CreateOptions(path, secondHandler);
+
+        var firstHasAcquiredLease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstReported = false;
+
+        try
+        {
+            Task firstBootstrap;
+            Task secondBootstrap;
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired && !firstReported)
+                       {
+                           firstReported = true;
+                           firstHasAcquiredLease.TrySetResult();
+                           releaseFirst.Task.Wait(TimeSpan.FromSeconds(5));
+                       }
+                   }))
+            {
+                firstBootstrap = ManagedReplicaBootstrapper.BootstrapAsync(firstOptions, CancellationToken.None);
+                await firstHasAcquiredLease.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+                secondBootstrap = ManagedReplicaBootstrapper.BootstrapAsync(secondOptions, CancellationToken.None);
+
+                // Give the second attempt a moment to reach (and start blocking on) the very same
+                // per-path exclusive lease before releasing the first: this is what proves
+                // serialization rather than a lucky interleaving.
+                await Task.Delay(100);
+                secondBootstrap.IsCompleted.Should().BeFalse(
+                    "the second bootstrap must serialize behind the first's still-held apply lease, never race the file swap");
+
+                releaseFirst.TrySetResult();
+                await firstBootstrap;
+
+                Func<Task> awaitSecond = () => secondBootstrap.WaitAsync(TimeSpan.FromSeconds(5));
+                await awaitSecond.Should().ThrowAsync<NotSupportedException>(
+                    "the loser must see the same clean bootstrap-target-exists rejection a sequential caller would get, never a raw File.Move race");
+            }
+
+            File.ReadAllBytes(path).Should().Equal(image);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+            firstHandler.CallCount.Should().Be(1);
+            secondHandler.CallCount.Should().Be(0);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ApplyLockTreatsASymbolicFileAliasAsTheSamePhysicalTargetAsItsRealPath()
+    {
+        // Closes the path-aliasing bypass: a purely textual Path.GetFullPath normalization would
+        // give the real path and a symbolic-link alias of it DIFFERENT lock keys, letting a writer
+        // through each one run the apply sequence concurrently instead of serializing. Physical
+        // file identity must treat them as the same target.
+        var path = NewReplicaPath("managed-replica-apply-lock-file-alias");
+        CreateInitializedDatabase(path);
+        var aliasPath = path + ".alias";
+
+        try
+        {
+            try
+            {
+                File.CreateSymbolicLink(aliasPath, path);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                Assert.Ignore("Creating symbolic links is not permitted on this host.");
+            }
+            catch (PlatformNotSupportedException)
+            {
+                Assert.Ignore("Symbolic links are not supported on this host.");
+            }
+
+            var firstLeaseAcquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseFirstLease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            var firstLeaseTask = Task.Run(async () =>
+            {
+                await using var lease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(path, CancellationToken.None);
+                firstLeaseAcquired.TrySetResult();
+                await releaseFirstLease.Task;
+            });
+
+            await firstLeaseAcquired.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var secondLeaseTask = Task.Run(async () =>
+            {
+                await using var lease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(aliasPath, CancellationToken.None);
+            });
+
+            // Give the alias-path acquisition a moment to reach (and start blocking on) the same
+            // physical-identity key before releasing the first lease -- this is what proves the
+            // alias resolves to the SAME lock rather than a merely lucky interleaving.
+            await Task.Delay(100);
+            secondLeaseTask.IsCompleted.Should().BeFalse(
+                "a symbolic-link alias of the same physical file must resolve to the same apply-lock key as its real path and serialize behind the held lease, never acquire it concurrently");
+
+            releaseFirstLease.TrySetResult();
+            await firstLeaseTask;
+            await secondLeaseTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            if (File.Exists(aliasPath))
+                File.Delete(aliasPath);
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ConcurrentFirstBootstrapsThroughADirectorySymbolicAliasSerializeInsteadOfRacingTheFileSwap()
+    {
+        // Same closed bypass as the file-alias case above, but for the OTHER lock-key branch: a
+        // first-ever bootstrap target that does not exist yet, keyed off its PARENT directory's
+        // physical identity plus file name. A directory symbolic link/junction that aliases the
+        // parent must still resolve to the same key as the real parent directory.
+        var realDirectory = Path.Combine(TestContext.CurrentContext.WorkDirectory, $"managed-replica-alias-real-{Guid.NewGuid():N}");
+        var aliasDirectory = Path.Combine(TestContext.CurrentContext.WorkDirectory, $"managed-replica-alias-link-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(realDirectory);
+        var realPath = Path.Combine(realDirectory, "replica.db");
+
+        try
+        {
+            try
+            {
+                Directory.CreateSymbolicLink(aliasDirectory, realDirectory);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                Assert.Ignore("Creating symbolic links is not permitted on this host.");
+            }
+            catch (PlatformNotSupportedException)
+            {
+                Assert.Ignore("Symbolic links are not supported on this host.");
+            }
+
+            var aliasPath = Path.Combine(aliasDirectory, "replica.db");
+            var image = CreateDatabaseImage(realPath + ".source");
+            var firstHandler = new PullUpdatesHandler([CreatePullResponse("revision-42", image)]);
+            var secondHandler = new PullUpdatesHandler([CreatePullResponse("revision-99", image)]);
+            var firstOptions = CreateOptions(realPath, firstHandler);
+            var secondOptions = CreateOptions(aliasPath, secondHandler);
+
+            var firstHasAcquiredLease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var firstReported = false;
+
+            Task firstBootstrap;
+            Task secondBootstrap;
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired && !firstReported)
+                       {
+                           firstReported = true;
+                           firstHasAcquiredLease.TrySetResult();
+                           releaseFirst.Task.Wait(TimeSpan.FromSeconds(5));
+                       }
+                   }))
+            {
+                firstBootstrap = ManagedReplicaBootstrapper.BootstrapAsync(firstOptions, CancellationToken.None);
+                await firstHasAcquiredLease.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+                secondBootstrap = ManagedReplicaBootstrapper.BootstrapAsync(secondOptions, CancellationToken.None);
+
+                // Give the second attempt -- reaching the identical physical target through a
+                // directory symbolic-link alias of the first's parent directory -- a moment to
+                // reach (and start blocking on) the very same apply lease before releasing the
+                // first: this is what proves the alias resolves to the same key rather than a
+                // lucky interleaving.
+                await Task.Delay(100);
+                secondBootstrap.IsCompleted.Should().BeFalse(
+                    "a directory symbolic-link alias of the target's parent must resolve to the same apply-lock key as the real parent directory, so the second bootstrap serializes behind the first's held lease instead of racing the file swap");
+
+                releaseFirst.TrySetResult();
+                await firstBootstrap;
+
+                Func<Task> awaitSecond = () => secondBootstrap.WaitAsync(TimeSpan.FromSeconds(5));
+                await awaitSecond.Should().ThrowAsync<NotSupportedException>(
+                    "the loser must see the same clean bootstrap-target-exists rejection a sequential caller would get through the alias, never a raw File.Move race");
+            }
+
+            File.ReadAllBytes(realPath).Should().Equal(image);
+            ManagedReplicaBootstrapper.LoadMetadata(realPath)!.Value.Revision.Should().Be("revision-42");
+            firstHandler.CallCount.Should().Be(1);
+            secondHandler.CallCount.Should().Be(0);
+        }
+        finally
+        {
+            DeleteReplicaFiles(realPath);
+            if (Directory.Exists(aliasDirectory))
+                Directory.Delete(aliasDirectory);
+            if (Directory.Exists(realDirectory))
+                Directory.Delete(realDirectory, recursive: true);
+        }
+    }
+
+    [Test]
+    public async Task IncrementalPullRejectsLocalDivergenceThatLandsAfterTheNetworkRoundTripUnderTheApplyLease()
+    {
+        var path = NewReplicaPath("managed-replica-post-lease-divergence");
+        var initialImage = CreateDatabaseImage(path + ".initial");
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler([
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        var options = CreateOptions(path, handler);
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point != ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired)
+                           return;
+
+                       // Simulate a rogue local writer landing exactly in the window between the
+                       // network round trip completing (pages already fully read into memory) and
+                       // the apply below: this connection's own file handle is guaranteed closed
+                       // here, since ManagedReplicaSyncRegistry.CloseForPublication runs on every
+                       // registered host before the staged operation even starts.
+                       using var rogueWrite = new FileStream(options.Path, FileMode.Open, FileAccess.Write, FileShare.None);
+                       rogueWrite.Position = 60; // SQLite's user-version header field is safe to alter externally.
+                       rogueWrite.WriteByte(1);
+                       rogueWrite.Flush(flushToDisk: true);
+                   }))
+            {
+                Assert.ThrowsAsync<NotSupportedException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            // The post-lease fingerprint re-check must catch the write that landed during the
+            // network round trip -- not just the pre-network EnsureNoLocalDivergence check, which
+            // already ran cleanly before this sync call even started (the file had not diverged
+            // yet). The apply itself must never have run: metadata stays on the prior revision.
+            handler.CallCount.Should().Be(2, "the network round trip for the rejected pull still happens; only the apply is blocked");
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ConcurrentPullsAgainstTheSameStaleBaseNeverLetTheLoserRegressTheWinnersNewerRevision()
+    {
+        var path = NewReplicaPath("managed-replica-concurrent-pull-stale-base");
+        var image = CreateDatabaseImage(path + ".source");
+
+        // Bootstrap once, out of band, to reach a clean on-disk "revision-42" MVCC logical-log
+        // replica; both concurrent CheckForUpdatesAsync callers below race against this exact same
+        // snapshot as their starting point -- mirroring two waiters who both read stale local state
+        // before either one actually reaches the apply lease. A logical-protocol Open() always
+        // performs a mandatory post-bootstrap catch-up pull, so a second (no-op, same-revision)
+        // response must be queued for it too.
+        var bootstrapHandler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+        ]);
+        using (var bootstrapConnection = AhtolaConnection.CreateReplica(CreateOptions(path, bootstrapHandler)))
+            bootstrapConnection.Open();
+        var baseMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+        baseMetadata.Revision.Should().Be("revision-42");
+
+        // Winner: uncontested, reaches the apply lease first and publishes revision-100.
+        var winnerHandler = new PullUpdatesHandler([CreateLogicalPullResponse("revision-100", body: [])]);
+        var winnerOptions = CreateOptions(path, winnerHandler);
+
+        // Loser: negotiated its first response against the SAME "revision-42" snapshot as the
+        // winner, but does not reach the apply lease until after the winner has already published.
+        // That first response (revision-55) is OLDER than what the winner already published and
+        // must never be applied over it; its second, post-retry response -- correctly negotiated
+        // against the now-current revision-100 base -- legitimately advances to revision-101. Only
+        // reaching revision-101 (not revision-55, and not merely staying at revision-100) proves the
+        // stale response was discarded AND the retry actually ran to completion against the fresh
+        // base, rather than the loser simply failing or no-op'ing.
+        var loserHandler = new PullUpdatesHandler(
+        [
+            CreateLogicalPullResponse("revision-55", body: []),
+            CreateLogicalPullResponse("revision-101", body: []),
+        ]);
+        var loserOptions = CreateOptions(path, loserHandler);
+
+        var winnerHasAcquiredLease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseWinner = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var winnerReported = false;
+
+        try
+        {
+            Task<AhtolaSyncResult> winnerTask;
+            Task<AhtolaSyncResult> loserTask;
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired && !winnerReported)
+                       {
+                           winnerReported = true;
+                           winnerHasAcquiredLease.TrySetResult();
+                           releaseWinner.Task.Wait(TimeSpan.FromSeconds(5));
+                       }
+                   }))
+            {
+                winnerTask = Task.Run(() => ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                    winnerOptions, baseMetadata, new AhtolaSyncOptions(), CancellationToken.None));
+                await winnerHasAcquiredLease.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+                loserTask = Task.Run(() => ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                    loserOptions, baseMetadata, new AhtolaSyncOptions(), CancellationToken.None));
+
+                // Give the loser's own network round trip and lease-acquisition attempt time to
+                // reach (and start blocking on) the very same per-path exclusive lease the winner
+                // still holds: this is what proves serialization rather than a lucky interleaving.
+                await Task.Delay(100);
+                loserTask.IsCompleted.Should().BeFalse(
+                    "the second waiter must serialize behind the first's still-held apply lease, never race the apply");
+
+                releaseWinner.TrySetResult();
+                await winnerTask;
+                await loserTask;
+            }
+
+            winnerHandler.CallCount.Should().Be(1);
+            loserHandler.CallCount.Should().Be(2,
+                "the loser's stale first response must be discarded and the whole pull retried against the fresh base");
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-101",
+                "the loser's stale response (revision-55) must never be applied over the winner's already-published revision-100");
         }
         finally
         {
@@ -2649,7 +4545,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
-    public async Task SyncAsyncReportsUpToDateForTheStoredRevision()
+    public async Task SyncAsyncRequestsRawEncodingAndReportsUpToDateForTheStoredRevision()
     {
         var path = NewReplicaPath("managed-embedded-replica-up-to-date");
         var image = CreateDatabaseImage(path + ".source");
@@ -2658,14 +4554,16 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                 CreatePullResponse("revision-42", [], declaredPages: 1),
             ], request =>
             {
-                if (request.Content!.Headers.ContentLength == 0)
-                    return;
-                var fields = ReadFields(request.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult());
+                var fields = ReadFields(request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult());
                 if (!fields.ContainsKey(3))
                 {
+                    fields[1].Number.Should().Be(0,
+                        "the initial pull must explicitly request PageUpdatesEncodingReq.Raw");
                     fields[4].Number.Should().Be(3000);
                     return;
                 }
+                fields[1].Number.Should().Be(0,
+                    "incremental pulls must explicitly request PageUpdatesEncodingReq.Raw");
                 fields[3].Text.Should().Be("revision-42");
                 fields[4].Number.Should().Be(3000);
             });
@@ -3196,6 +5094,18 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     private static string NewReplicaPath(string prefix)
         => Path.Combine(TestContext.CurrentContext.WorkDirectory, $"{prefix}-{Guid.NewGuid():N}.db");
 
+    private static byte[] ReadAllBytesShared(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        var bytes = new byte[checked((int)stream.Length)];
+        stream.ReadExactly(bytes);
+        return bytes;
+    }
+
     private static byte[] CreateDatabaseImage(string path)
     {
         try { CreateInitializedDatabase(path); return File.ReadAllBytes(path); }
@@ -3251,6 +5161,128 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         transaction.Commit();
     }
 
+    private static (AhtolaReplicaOptions Options, byte[] OriginalImage) PrepareReplicaWithFullyPushedWal(string path)
+    {
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var replacedImage = CreateDatabaseImageWithMarker(path + ".replaced", 84);
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateReplaceBasePullResponse("revision-43", replacedImage),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        using (var local = AhtolaConnection.CreateReplica(options))
+        {
+            local.Open();
+            local.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 43;");
+        }
+        StageCommittedMainFileChangesInWal(path, initialImage);
+        return (options, File.ReadAllBytes(path));
+    }
+
+    private static (
+        byte[] OriginalImage,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata Metadata) PreparePendingCheckpointRevert(
+        string path,
+        ManagedReplicaDurableBoundary interruptionBoundary = ManagedReplicaDurableBoundary.RevertCheckpointed)
+    {
+        var (options, originalImage) = PrepareReplicaWithFullyPushedWal(path);
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+        using (var pager = Core.Storage.SqlitePager.Open(
+                   Core.Storage.PhysicalFileSystem.Instance,
+                   path,
+                   path + "-wal"))
+        {
+            if (interruptionBoundary == ManagedReplicaDurableBoundary.RevertMetadataPublished)
+            {
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == interruptionBoundary)
+                               throw new InvalidOperationException("Injected pre-checkpoint interruption.");
+                       }))
+                {
+                    Assert.Throws<InvalidOperationException>(
+                        () => ManagedReplicaRevertWal.CaptureAndCheckpoint(
+                            path,
+                            metadata,
+                            pager,
+                            CancellationToken.None));
+                }
+            }
+            else
+            {
+                ManagedReplicaRevertWal.CaptureAndCheckpoint(
+                    path,
+                    metadata,
+                    pager,
+                    CancellationToken.None);
+            }
+        }
+
+        metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+        metadata.RevertState.Should().NotBeNull();
+        return (originalImage, metadata);
+    }
+
+    private static PendingCheckpointPushScenario PreparePendingCheckpointPush(
+        string path,
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> pendingPushResponse)
+    {
+        var originalImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var replacedImage = CreateDatabaseImageWithMarker(path + ".replaced", 84);
+        var pushAttempt = 0;
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", originalImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreateReplaceBasePullResponse("revision-43", replacedImage),
+            CreateLogicalPullResponse("revision-43", body: []),
+        ],
+        (request, cancellationToken) =>
+        {
+            pushAttempt++;
+            return pushAttempt == 1
+                ? Task.FromResult(ReplicaPushHandler.SuccessfulBatchResponse(5))
+                : pendingPushResponse(request, cancellationToken);
+        });
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        using (var local = AhtolaConnection.CreateReplica(options))
+        {
+            local.Open();
+            local.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 43;");
+            local.ExecuteNonQuery("UPDATE bootstrap_marker SET value = 44;");
+        }
+        StageCommittedMainFileChangesInWal(path, originalImage);
+
+        using (var connection = AhtolaConnection.CreateReplica(options))
+        {
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(point =>
+                   {
+                       if (point == ManagedReplicaDurableBoundary.RevertCommittedReadyMetadataPublished)
+                           throw new InvalidOperationException("Injected protected-snapshot interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+        }
+
+        var committedImage = File.ReadAllBytes(path);
+        ManagedReplicaChangeJournal.Open(path).ReadBatch(10).Changes
+            .Select(change => change.Sequence).Should().Equal(2);
+        ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState.Should().NotBeNull();
+        return new PendingCheckpointPushScenario(
+            options,
+            handler,
+            replacedImage,
+            committedImage);
+    }
+
     private static byte[] CreateJournalDatabaseImage(string path)
     {
         try { CreateJournalDatabase(path); return File.ReadAllBytes(path); }
@@ -3261,13 +5293,18 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         string path,
         HttpMessageHandler handler,
         int syncInterval = 0,
-        long? pushOperationsThreshold = null)
+        long? pushOperationsThreshold = null,
+        AhtolaPartialBootstrapOptions? partialBootstrap = null)
         => new(path, new Uri("https://example.test/cluster"), authToken: "token-42")
         {
             LongPollTimeout = TimeSpan.FromSeconds(3),
             SyncInterval = syncInterval,
             PushOperationsThreshold = pushOperationsThreshold,
-            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+            PartialBootstrap = partialBootstrap,
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler)
+            {
+                MessageHandlerDisablesAutomaticRedirects = true,
+            },
         };
 
     private static AhtolaReplicaOptions CreateUnsupportedOptions(
@@ -3278,22 +5315,17 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         var options = CreateOptions(path, handler);
         return mode switch
         {
-            UnsupportedReplicaMode.RemoteEncryption => new AhtolaReplicaOptions(
+            UnsupportedReplicaMode.UnsupportedEncryptionCipher => new AhtolaReplicaOptions(
                 path,
                 options.RemoteUri,
                 options.AuthToken)
             {
+                // Aes128Gcm/Aes256Gcm are supported by the managed engine (see
+                // ManagedReplicaEncryption); this mode instead exercises an unimplemented cipher
+                // to prove it still fails closed via ManagedReplicaSupportMatrix.ValidateOptions.
                 RemoteEncryption = new AhtolaRemoteEncryptionOptions(
                     "c2VjcmV0",
-                    AhtolaRemoteEncryptionCipher.Aes256Gcm),
-                HttpPolicy = options.HttpPolicy,
-            },
-            UnsupportedReplicaMode.PartialPrefix => new AhtolaReplicaOptions(
-                path,
-                options.RemoteUri,
-                options.AuthToken)
-            {
-                PartialBootstrap = AhtolaPartialBootstrapOptions.Prefix(4096),
+                    AhtolaRemoteEncryptionCipher.ChaCha20Poly1305),
                 HttpPolicy = options.HttpPolicy,
             },
             UnsupportedReplicaMode.PartialQuery => new AhtolaReplicaOptions(
@@ -3304,29 +5336,69 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                 PartialBootstrap = AhtolaPartialBootstrapOptions.QueryPages("SELECT 1"),
                 HttpPolicy = options.HttpPolicy,
             },
-            UnsupportedReplicaMode.ChunkedBootstrap => new AhtolaReplicaOptions(
+            UnsupportedReplicaMode.PartialPrefixInvalidSegment => new AhtolaReplicaOptions(
                 path,
                 options.RemoteUri,
                 options.AuthToken)
             {
-                PullBytesThreshold = 4096,
+                PartialBootstrap = AhtolaPartialBootstrapOptions.Prefix(
+                    4096,
+                    segmentSize: 5000,
+                    prefetch: true),
                 HttpPolicy = options.HttpPolicy,
             },
             _ => throw new ArgumentOutOfRangeException(nameof(mode)),
         };
     }
 
+    private static string ManagedEncryptionConnectionString(string path, string hexKey)
+        => $"Data Source={path};Local Provider=Managed;Encryption Cipher=Aes256Gcm;Encryption Key={hexKey}";
+
+    /// <summary>
+    /// Builds a genuinely AES-256-GCM encrypted source database image (28 reserved bytes per
+    /// page; page 1 begins with the "AHTLA" header, not the plaintext SQLite magic) for feeding
+    /// through <see cref="CreatePullResponse"/> in encrypted-bootstrap tests.
+    /// </summary>
+    private static void CreateEncryptedInitializedDatabase(string path, string hexKey, int marker)
+    {
+        using var connection = new AhtolaConnection(ManagedEncryptionConnectionString(path, hexKey));
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+        connection.ExecuteNonQuery($"INSERT INTO bootstrap_marker VALUES ({marker});");
+    }
+
+    private static byte[] CreateEncryptedDatabaseImage(string path, string hexKey, int marker = 42)
+    {
+        try
+        {
+            CreateEncryptedInitializedDatabase(path, hexKey, marker);
+            return File.ReadAllBytes(path);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    private static AhtolaReplicaOptions CreateEncryptedOptions(
+        string path,
+        HttpMessageHandler handler,
+        string hexKey,
+        AhtolaRemoteEncryptionCipher cipher = AhtolaRemoteEncryptionCipher.Aes256Gcm)
+        => new(path, new Uri("https://example.test/cluster"), authToken: "token-42")
+        {
+            LongPollTimeout = TimeSpan.FromSeconds(3),
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler)
+            {
+                MessageHandlerDisablesAutomaticRedirects = true,
+            },
+            RemoteEncryption = new AhtolaRemoteEncryptionOptions(
+                Convert.ToBase64String(Convert.FromHexString(hexKey)), cipher),
+        };
+
     private static void DeleteReplicaFiles(string path)
     {
-        foreach (var file in new[]
-                 {
-                     path,
-                     path + "-wal",
-                     path + "-shm",
-                     path + "-journal",
-                     path + ".ahtola-replica-meta",
-                     path + ManagedReplicaChangeJournal.Suffix,
-                 })
+        foreach (var file in ManagedReplicaBootstrapper.GetLocalArtifactPaths(path))
         {
             if (File.Exists(file))
                 File.Delete(file);
@@ -3374,6 +5446,187 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             WriteDelimitedMessage(response, page);
         }
         return response.ToArray();
+    }
+
+    private static byte[] CreatePullResponseForPageRange(
+        string revision,
+        byte[] databaseImage,
+        int startPage,
+        int endPage)
+    {
+        var pageCount = checked(databaseImage.Length / 4096);
+        startPage.Should().BeGreaterThanOrEqualTo(0);
+        endPage.Should().BeGreaterThan(startPage).And.BeLessThanOrEqualTo(pageCount);
+        var response = new List<byte>(
+            CreatePullResponse(
+                revision,
+                [],
+                declaredPages: checked((ulong)pageCount)));
+        for (var pageId = startPage; pageId < endPage; pageId++)
+        {
+            var page = new List<byte>();
+            if (pageId != 0)
+                WriteVarintField(page, 1, checked((ulong)pageId));
+            WriteLengthDelimitedField(
+                page,
+                2,
+                databaseImage.AsSpan(pageId * 4096, 4096));
+            WriteDelimitedMessage(response, page);
+        }
+
+        return response.ToArray();
+    }
+
+    private static byte[] CreatePageSubsetPullResponse(
+        string revision,
+        byte[] databaseImage,
+        IReadOnlyList<uint> pageIds)
+    {
+        var databasePages = checked((ulong)(databaseImage.Length / 4096));
+        var header = new List<byte>();
+        WriteLengthDelimitedField(header, 1, Encoding.UTF8.GetBytes(revision));
+        WriteVarintField(header, 2, databasePages);
+        WriteLengthDelimitedField(header, 3, []);
+        WriteVarintField(header, 5, 0);
+        WriteVarintField(header, 6, 1);
+        WriteVarintField(header, 8, 1);
+
+        var response = new List<byte>();
+        WriteDelimitedMessage(response, header);
+        foreach (var pageId in pageIds)
+        {
+            if ((ulong)pageId >= databasePages)
+                throw new ArgumentOutOfRangeException(nameof(pageIds));
+            var page = new List<byte>();
+            if (pageId != 0)
+                WriteVarintField(page, 1, pageId);
+            WriteLengthDelimitedField(
+                page,
+                2,
+                databaseImage.AsSpan(checked((int)pageId * 4096), 4096));
+            WriteDelimitedMessage(response, page);
+        }
+
+        return response.ToArray();
+    }
+
+    private static BootstrapPullRequest ReadBootstrapPullRequest(byte[] payload)
+    {
+        string? serverRevision = null;
+        byte[]? selector = null;
+        var offset = 0;
+        while (offset < payload.Length)
+        {
+            var key = ReadVarint(payload, ref offset);
+            var field = checked((int)(key >> 3));
+            switch (key & 7)
+            {
+                case 0:
+                    _ = ReadVarint(payload, ref offset);
+                    break;
+                case 2:
+                    var length = checked((int)ReadVarint(payload, ref offset));
+                    var value = payload.AsSpan(offset, length);
+                    offset += length;
+                    if (field == 2)
+                        serverRevision = Encoding.UTF8.GetString(value);
+                    else if (field == 5)
+                        selector = value.ToArray();
+                    break;
+                default:
+                    throw new InvalidOperationException("Unsupported test protobuf wire type.");
+            }
+        }
+
+        selector.Should().NotBeNull();
+        return new BootstrapPullRequest(serverRevision, DecodeRoaringPageSelector(selector!));
+    }
+
+    private static IReadOnlyList<uint> DecodeRoaringPageSelector(byte[] selector)
+    {
+        const ushort serialCookie = 12347;
+        var offset = 0;
+        var cookie = BinaryPrimitives.ReadUInt32LittleEndian(selector.AsSpan(offset));
+        offset += sizeof(uint);
+        checked((ushort)(cookie & ushort.MaxValue)).Should().Be(serialCookie);
+        var containerCount = checked((int)(cookie >> 16) + 1);
+        var runBitmap = selector.AsSpan(offset, (containerCount + 7) / 8);
+        offset += runBitmap.Length;
+        var keys = new ushort[containerCount];
+        for (var index = 0; index < containerCount; index++)
+        {
+            keys[index] = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+            offset += sizeof(ushort);
+            _ = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+            offset += sizeof(ushort);
+        }
+
+        if (containerCount >= 4)
+            offset += containerCount * sizeof(uint);
+
+        var pages = new List<uint>();
+        for (var index = 0; index < containerCount; index++)
+        {
+            (runBitmap[index / 8] & (1 << (index % 8))).Should().NotBe(0);
+            var runCount = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+            offset += sizeof(ushort);
+            for (var run = 0; run < runCount; run++)
+            {
+                var start = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+                offset += sizeof(ushort);
+                var additionalValues = BinaryPrimitives.ReadUInt16LittleEndian(selector.AsSpan(offset));
+                offset += sizeof(ushort);
+                for (var value = 0; value <= additionalValues; value++)
+                    pages.Add(((uint)keys[index] << 16) | checked((uint)(start + value)));
+            }
+        }
+
+        offset.Should().Be(selector.Length);
+        return pages;
+    }
+
+    private static IReadOnlyList<uint> ReadPortableRoaringBitmap(byte[] payload)
+    {
+        const uint noRunContainerCookie = 12346;
+        const int arrayContainerMaximumCardinality = 4096;
+
+        using var stream = new MemoryStream(payload);
+        using var reader = new BinaryReader(stream);
+        reader.ReadUInt32().Should().Be(noRunContainerCookie);
+        var containerCount = checked((int)reader.ReadUInt32());
+        var containers = new (ushort Key, int Cardinality)[containerCount];
+        for (var container = 0; container < containerCount; container++)
+            containers[container] = (reader.ReadUInt16(), reader.ReadUInt16() + 1);
+        for (var container = 0; container < containerCount; container++)
+            _ = reader.ReadUInt32();
+
+        var pages = new List<uint>();
+        foreach (var (key, cardinality) in containers)
+        {
+            if (cardinality <= arrayContainerMaximumCardinality)
+            {
+                for (var value = 0; value < cardinality; value++)
+                    pages.Add(((uint)key << 16) | reader.ReadUInt16());
+                continue;
+            }
+
+            var remaining = cardinality;
+            for (var wordIndex = 0; wordIndex < 1024; wordIndex++)
+            {
+                var word = reader.ReadUInt64();
+                for (var bit = 0; bit < 64; bit++)
+                {
+                    if ((word & (1UL << bit)) == 0)
+                        continue;
+                    pages.Add(((uint)key << 16) | checked((uint)(wordIndex * 64 + bit)));
+                    remaining--;
+                }
+            }
+            remaining.Should().Be(0);
+        }
+
+        stream.Position.Should().Be(stream.Length);
+        return pages;
     }
 
     private static byte[] BuildLogicalLogRangeMessage(
@@ -3474,6 +5727,48 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
         return fields;
     }
+
+    private static byte[] ReadLengthDelimitedField(byte[] payload, int requestedField)
+    {
+        if (TryReadLengthDelimitedField(payload, requestedField, out var value))
+            return value;
+        throw new InvalidOperationException($"Protobuf field {requestedField} was not found.");
+    }
+
+    private static bool TryReadLengthDelimitedField(
+        byte[] payload,
+        int requestedField,
+        out byte[] value)
+    {
+        var offset = 0;
+        while (offset < payload.Length)
+        {
+            var key = ReadVarint(payload, ref offset);
+            var field = checked((int)(key >> 3));
+            var wireType = checked((int)(key & 7));
+            if (wireType == 0)
+            {
+                _ = ReadVarint(payload, ref offset);
+                continue;
+            }
+            if (wireType != 2)
+                throw new InvalidOperationException("Unsupported test protobuf wire type.");
+
+            var length = checked((int)ReadVarint(payload, ref offset));
+            if (length > payload.Length - offset)
+                throw new InvalidOperationException("Invalid test protobuf field length.");
+            if (field == requestedField)
+            {
+                value = payload.AsSpan(offset, length).ToArray();
+                return true;
+            }
+            offset += length;
+        }
+
+        value = [];
+        return false;
+    }
+
     private static ulong ReadVarint(byte[] source, ref int offset)
     {
         ulong result = 0;
@@ -3526,11 +5821,14 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
 
     public enum UnsupportedReplicaMode
     {
-        RemoteEncryption,
-        PartialPrefix,
+        UnsupportedEncryptionCipher,
         PartialQuery,
-        ChunkedBootstrap,
+        PartialPrefixInvalidSegment,
     }
+
+    private readonly record struct BootstrapPullRequest(
+        string? ServerRevision,
+        IReadOnlyList<uint> SelectedPages);
 
     public enum PullResponseFramingFailure
     {
@@ -3550,6 +5848,71 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         public List<AhtolaSyncProgressStage> Stages { get; } = [];
 
         public void Report(AhtolaSyncProgress value) => Stages.Add(value.Stage);
+    }
+
+    private sealed class LazyPagePullHandler(string revision, byte[] databaseImage) : HttpMessageHandler
+    {
+        private readonly object _gate = new();
+        private readonly List<uint[]> _requestedPages = [];
+        private int _callCount;
+        private int _syncCallCount;
+        private int _pushCallCount;
+
+        public int CallCount => Volatile.Read(ref _callCount);
+
+        public int SyncCallCount => Volatile.Read(ref _syncCallCount);
+
+        public int PushCallCount => Volatile.Read(ref _pushCallCount);
+
+        public IReadOnlyList<uint[]> RequestedPages
+        {
+            get
+            {
+                lock (_gate)
+                    return _requestedPages.Select(static pages => pages.ToArray()).ToArray();
+            }
+        }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            if (!request.RequestUri!.AbsolutePath.EndsWith("/pull-updates", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref _pushCallCount);
+                return ReplicaPushHandler.SuccessfulBatchResponse(stepCount: 5);
+            }
+
+            var payload = await request.Content!.ReadAsByteArrayAsync(cancellationToken);
+            Interlocked.Increment(ref _callCount);
+            byte[] response;
+            if (TryReadLengthDelimitedField(payload, 5, out var selector))
+            {
+                var cookie = BinaryPrimitives.ReadUInt32LittleEndian(selector);
+                var pageIds = (checked((ushort)(cookie & ushort.MaxValue)) == 12347
+                        ? DecodeRoaringPageSelector(selector)
+                        : ReadPortableRoaringBitmap(selector))
+                    .ToArray();
+                lock (_gate)
+                    _requestedPages.Add(pageIds);
+                response = CreatePageSubsetPullResponse(revision, databaseImage, pageIds);
+            }
+            else
+            {
+                Interlocked.Increment(ref _syncCallCount);
+                response = CreatePullResponse(
+                    revision,
+                    [],
+                    declaredPages: checked((ulong)(databaseImage.Length / 4096)));
+            }
+
+            var message = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(response),
+            };
+            message.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
+            return message;
+        }
     }
 
     private sealed class PullUpdatesHandler : HttpMessageHandler
@@ -3775,11 +6138,33 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
-    private sealed class ReplicaPushHandler(
-        IEnumerable<byte[]> pullResponses,
-        Func<HttpRequestMessage, HttpResponseMessage> pushResponse) : HttpMessageHandler
+    private readonly record struct PendingCheckpointPushScenario(
+        AhtolaReplicaOptions Options,
+        ReplicaPushHandler Handler,
+        byte[] RollbackImage,
+        byte[] CommittedImage);
+
+    private sealed class ReplicaPushHandler : HttpMessageHandler
     {
-        private readonly Queue<byte[]> _pullResponses = new(pullResponses);
+        private readonly Queue<byte[]> _pullResponses;
+        private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _pushResponse;
+
+        public ReplicaPushHandler(
+            IEnumerable<byte[]> pullResponses,
+            Func<HttpRequestMessage, HttpResponseMessage> pushResponse)
+            : this(
+                pullResponses,
+                (request, _) => Task.FromResult(pushResponse(request)))
+        {
+        }
+
+        public ReplicaPushHandler(
+            IEnumerable<byte[]> pullResponses,
+            Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> pushResponse)
+        {
+            _pullResponses = new Queue<byte[]>(pullResponses);
+            _pushResponse = pushResponse;
+        }
 
         public int PullCallCount { get; private set; }
 
@@ -3803,7 +6188,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
 
             PushCallCount++;
             PushStarted.TrySetResult(true);
-            return Task.FromResult(pushResponse(request));
+            return _pushResponse(request, cancellationToken);
         }
 
         public static HttpResponseMessage SuccessfulBatchResponse(int stepCount)
@@ -3811,6 +6196,26 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
 
         public static HttpResponseMessage BatchErrorResponse(int stepCount, int errorStep, string message, string code)
             => BatchResponse(stepCount, errorStep, message, code);
+
+        public static HttpResponseMessage EmptyWatermarkResponse()
+            => WatermarkResponseCore("[]");
+
+        public static HttpResponseMessage WatermarkResponse(long pullGeneration, long changeId)
+            => WatermarkResponseCore(
+                $"[[{{\"type\":\"integer\",\"value\":{pullGeneration}}},"
+                + $"{{\"type\":\"integer\",\"value\":{changeId}}}]]");
+
+        private static HttpResponseMessage WatermarkResponseCore(string rows)
+            => new(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"results\":["
+                    + "{\"type\":\"ok\",\"response\":{\"type\":\"execute\",\"result\":"
+                    + $"{{\"cols\":[],\"rows\":{rows},\"affected_row_count\":0}}}}}},"
+                    + "{\"type\":\"ok\",\"response\":{\"type\":\"close\"}}]}",
+                    Encoding.UTF8,
+                    "application/json"),
+            };
 
         private static HttpResponseMessage BatchResponse(int stepCount, int? errorStep, string? message, string? code)
         {

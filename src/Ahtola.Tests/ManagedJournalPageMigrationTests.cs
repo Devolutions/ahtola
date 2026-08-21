@@ -269,7 +269,7 @@ public sealed class ManagedJournalPageMigrationTests
     }
 
     [Test]
-    public void ActivePagerReaderPreventsDeleteModeWriteTransaction()
+    public void DeleteModeWriterReservesBesideReaderButCommitWaitsForExclusive()
     {
         var fileSystem = new InMemoryFileSystem();
         using var pager = SqlitePager.Create(
@@ -279,14 +279,18 @@ public sealed class ManagedJournalPageMigrationTests
             SqliteWalHeader.Create(SqlitePageSize.Default, salt1: 11, salt2: 12));
         pager.SwitchJournalMode(SqliteJournalMode.Delete);
 
-        using (pager.BeginReadTransaction())
-        {
-            Assert.Throws<SqlitePagerBusyException>(
-                () => pager.BeginTransaction(pager.CommittedPageCount, TimeSpan.Zero));
-        }
+        using var reader = pager.BeginReadTransaction();
+        using var transaction = pager.BeginTransaction(pager.CommittedPageCount, TimeSpan.Zero);
+        transaction.WritePage(1, reader.ReadPage(1));
 
-        using var transaction = pager.BeginTransaction(pager.CommittedPageCount);
-        transaction.Rollback();
+        var busy = Assert.Throws<SqlitePagerBusyException>(() => transaction.Commit());
+        busy!.Operation.Should().Be(SqlitePagerLockOperation.Writer);
+        busy.Reason.Should().Be(SqlitePagerBusyReason.Busy);
+        transaction.State.Should().Be(SqlitePagerTransactionState.Active);
+
+        reader.Dispose();
+        transaction.Commit();
+        transaction.State.Should().Be(SqlitePagerTransactionState.Committed);
     }
 
     [Test]

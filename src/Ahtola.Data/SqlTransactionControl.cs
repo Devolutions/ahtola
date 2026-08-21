@@ -7,6 +7,16 @@ internal enum SqlTransactionCompletion
     Rollback,
 }
 
+internal enum SqlSavepointAction
+{
+    None,
+    Savepoint,
+    Release,
+    RollbackTo,
+}
+
+internal readonly record struct SqlSavepointCommand(SqlSavepointAction Action, string? Name);
+
 internal static class SqlTransactionControl
 {
     public static string? GetFirstKeyword(string sql)
@@ -31,14 +41,90 @@ internal static class SqlTransactionControl
         if (!command.Equals("ROLLBACK", StringComparison.OrdinalIgnoreCase))
             return SqlTransactionCompletion.None;
 
-        var tail = ReadKeyword(sql, ref index);
-        if (tail.Equals("TRANSACTION", StringComparison.OrdinalIgnoreCase))
-            tail = ReadKeyword(sql, ref index);
-
-        return tail.Equals("TO", StringComparison.OrdinalIgnoreCase)
+        return GetSavepointCommand(sql).Action == SqlSavepointAction.RollbackTo
             ? SqlTransactionCompletion.None
             : SqlTransactionCompletion.Rollback;
     }
+
+    public static SqlSavepointCommand GetSavepointCommand(string sql)
+    {
+        var index = 0;
+        SkipLeadingEmptyStatements(sql, ref index);
+        var command = ReadKeyword(sql, ref index);
+        if (command.Equals("SAVEPOINT", StringComparison.OrdinalIgnoreCase))
+            return new SqlSavepointCommand(SqlSavepointAction.Savepoint, ReadIdentifier(sql, ref index).Text);
+
+        if (command.Equals("RELEASE", StringComparison.OrdinalIgnoreCase))
+        {
+            var name = ReadIdentifier(sql, ref index);
+            if (!name.IsQuoted && name.Text.Equals("SAVEPOINT", StringComparison.OrdinalIgnoreCase))
+                name = ReadIdentifier(sql, ref index);
+            return new SqlSavepointCommand(SqlSavepointAction.Release, name.Text);
+        }
+
+        if (!command.Equals("ROLLBACK", StringComparison.OrdinalIgnoreCase))
+            return default;
+
+        var tail = ReadIdentifier(sql, ref index);
+        if (!tail.IsQuoted && tail.Text.Equals("TRANSACTION", StringComparison.OrdinalIgnoreCase))
+        {
+            tail = ReadIdentifier(sql, ref index);
+            if (tail.IsQuoted || !tail.Text.Equals("TO", StringComparison.OrdinalIgnoreCase))
+                tail = ReadIdentifier(sql, ref index);
+        }
+        if (tail.IsQuoted || !tail.Text.Equals("TO", StringComparison.OrdinalIgnoreCase))
+            return default;
+
+        var rollbackName = ReadIdentifier(sql, ref index);
+        if (!rollbackName.IsQuoted
+            && rollbackName.Text.Equals("SAVEPOINT", StringComparison.OrdinalIgnoreCase))
+        {
+            rollbackName = ReadIdentifier(sql, ref index);
+        }
+        return new SqlSavepointCommand(SqlSavepointAction.RollbackTo, rollbackName.Text);
+    }
+
+    private static IdentifierToken ReadIdentifier(string sql, ref int index)
+    {
+        SkipTrivia(sql, ref index);
+        if (index >= sql.Length)
+            return new IdentifierToken(string.Empty, IsQuoted: false);
+
+        var quote = sql[index];
+        var closingQuote = quote switch
+        {
+            '"' or '\'' or '`' => quote,
+            '[' => ']',
+            _ => '\0',
+        };
+        if (closingQuote == '\0')
+            return new IdentifierToken(ReadKeyword(sql, ref index), IsQuoted: false);
+
+        index++;
+        var result = new System.Text.StringBuilder();
+        while (index < sql.Length)
+        {
+            var current = sql[index++];
+            if (current != closingQuote)
+            {
+                result.Append(current);
+                continue;
+            }
+
+            if (index < sql.Length && sql[index] == closingQuote && closingQuote != ']')
+            {
+                result.Append(closingQuote);
+                index++;
+                continue;
+            }
+
+            return new IdentifierToken(result.ToString(), IsQuoted: true);
+        }
+
+        return new IdentifierToken(result.ToString(), IsQuoted: true);
+    }
+
+    private readonly record struct IdentifierToken(string Text, bool IsQuoted);
 
     private static string ReadKeyword(string sql, ref int index)
     {

@@ -65,8 +65,8 @@ for the shapes it covers.
 | functions | 24 | 16 | 0 | 6 | 2 | 0 | 41 |
 | storage | 20 | 7 | 9 | 1 | 1 | 2 | 32 |
 | mvcc | 14 | 11 | 2 | 1 | 0 | 0 | 42 |
-| sync | 18 | 11 | 2 | 3 | 2 | 0 | 1 |
-| **total** | **171** | **98** | **25** | **39** | **7** | **2** | **606 distinct lines** |
+| sync | 18 | 10 | 3 | 3 | 2 | 0 | 1 |
+| **total** | **171** | **97** | **26** | **39** | **7** | **2** | **606 distinct lines** |
 
 \* Sum of expected-failure lines mapped to each layer's entries. Lines multi-map by design (one symptom can trace to several layers), so column sums exceed 606; the distinct-line total is exactly 606 (100% coverage).
 
@@ -708,7 +708,7 @@ gaps have little sqltest coverage. Ahtola.Data now has a pure-managed,
 pull-capable sync path: raw-page bootstrap/page protocol, MVCC `lml3` logical
 decode and transactional replay, opaque revision/protocol/table-map metadata,
 local-change push journaling, self-origin filtering, and atomic ReplaceBase
-fallback. It does not claim Turso's full native sync engine (partial/lazy
+fallback. It does not claim Turso's full native sync engine (query/lazy
 bootstrap, zstd page sets, remote encryption, or push-side automatic conflict
 resolution). Optional companion dispatch remains an intentional extension
 point and is not shipped by this repository.
@@ -725,10 +725,12 @@ while staged, before either the database or its replica metadata is published.
 
 | Capability / option | Status | Managed behavior |
 | --- | --- | --- |
-| Complete raw 4 KiB page stream, legacy/unspecified or v1 `Pages` protocol | **Qualified** | The bootstrapper requests raw pages, requires every 4 KiB `PageData` chunk exactly once, stages and validates the SQLite image, then atomically publishes it. Incremental raw page sets follow the same staged path. |
+| Complete raw 4 KiB page stream, legacy/unspecified or v1 `Pages` protocol | **Qualified** | The bootstrapper requests raw pages, requires every selected 4 KiB `PageData` chunk exactly once, stages and validates the SQLite header, then atomically publishes it. Incremental raw page sets follow the existing staged path after a partial image is completed. |
 | Remote encryption (`RemoteEncryption`) | **Explicitly rejected** | No encrypted page decoder or encrypted local image support is present in the managed replica. This is distinct from encrypted **remote SQL** connections. |
-| Partial prefix bootstrap, query bootstrap, lazy loading (`PartialBootstrap`) | **Explicitly rejected** | The managed replica has neither the server page selector/query protocol nor lazy page storage. |
-| Chunked bootstrap (`PullBytesThreshold`) | **Explicitly rejected** | A complete initial image is the only bootstrap shape; a multi-request page-selection bootstrap is not implemented. |
+| Partial prefix bootstrap (`PartialBootstrap.Prefix`) | **Supported** | The initial request carries Turso's tag-5 portable RoaringBitmap selector for complete 4 KiB pages in the requested prefix. Missing pages are tracked durably and fetched from the pinned revision before pager reads can observe them. |
+| Query bootstrap (`QueryPages`) | **Explicitly rejected** | Server-side query-selected page sets are not implemented; validation rejects this mode before network or local-state mutation. |
+| Lazy segments (`SegmentSize`, `Prefetch`) | **Supported** | Missing-page faults coalesce across connections. The segment size is persisted with the page state, and optional segment prefetch remains an optimization that cannot turn a failed fetch into zero-filled data. |
+| Chunked bootstrap (`PullBytesThreshold`) | **Explicitly rejected** | Client-controlled chunking of the initial pull is not implemented; prefix bootstrap and later targeted page faults use their own selectors. |
 | zstd/compressed page sets | **Explicitly rejected** | The response must declare raw encoding and each page payload must be exactly 4 KiB. |
 | MVCC logical streams / `MvccLogical` protocol | **Qualified (pull-only)** | After raw bootstrap, the client requests `mvcc_logical_log`, validates the complete `lml3` body and CRC chain, replays header/schema/row operations in one transaction, filters this client's transactions, and advances metadata only after durable publication. Pending deletes use v4 journal before-images to rebase by declared primary key. Pending additive `ALTER TABLE ... ADD COLUMN` is rebased across remote refresh/row ops; legacy journals without a before-image and destructive schema changes fail closed until pushed. |
 | Protocol-2 page fallback | **Qualified for validated full replacement** | `Pages + ReplaceBase` checkpoints/removes safe sidecars and atomically installs every page, then replays still-unpushed journal SQL onto the snapshot before metadata publication. Incremental page fallback still requires a provably unchanged page base and rejects pending local changes or WAL divergence. |
@@ -747,22 +749,48 @@ qualified subset in the matrix above.
 | --- | --- | --- | --- | ---: | ---: | --- |
 | `sync-no-cdc-capture-pragma` | divergent | s2-capability | L | 0 | 0 | Ahtola implements the public pinned-Turso `capture_data_changes_conn` V1/V2 table surface, but its managed replica intentionally continues to capture committed local changes in the private `<db>.ahtola-replica-journal`. Public CDC is not yet consumed by replica push/pull or logical replay. |
 | `sync-checkpoint-mode-mismatch-vs-managed-storage` | divergent | s2-capability | M | 0 | 0 | Turso's sync checkpoint explicitly composes Passive (checkpoint only the already-synced WAL prefix, tracked by a watermark) followed by Truncate (once fully synced) to ke… |
-| `sync-conflict-error-surfaced-not-handled` | missing | s2-capability | M | 0 | 0 | Turso's push path distinguishes a specific 'conflict' HTTP status from the remote wal_push endpoint and surfaces a typed DatabaseSyncEngineConflict error that callers can… |
+| `sync-conflict-error-surfaced-not-handled` | partial | s2-capability | M | 0 | 0 | `AhtolaReplicaPushFailure.Classify` now maps every push failure to a stable `AhtolaReplicaPushFailureKind` (Conflict/TransientTransport/InvalidLocalState) at the push response boundary, mirroring Turso's conflict-vs-transient split; automatic rebase-before-retry and revert-WAL rollback remain unported. |
 | `sync-connection-pooling-no-replica-awareness` | partial | s3-perf | M | 0 | 0 | Turso's engine has a wait_changes_from_remote long-poll loop that lets a replica connection block until the server reports new changes, enabling push-driven refresh inste… |
 | `sync-ef-core-provider-no-sync-surface` | closed | s3-perf | M | 0 | 0 | `UseAhtola` accepts direct Turso/Hrana and `Replica Path` connection strings. EF queries, CRUD, migrations, creator operations, and transactions route through the remote/replica-capable SQLite facade; explicit sync remains on the underlying `SqliteConnection`. |
 | `sync-http-pipeline-v2-only-no-v3-websocket` | partial | s2-capability | M | 0 | 0 | Ahtola's remote client is hard-coded to the '/v2/pipeline' HTTP endpoint with a JSON baton-session pipeline; there is no WebSocket transport and no wal_push/pull_updates… |
 | `sync-native-provider-companion-intentional` | extension | s4-intentional | S | 0 | 0 | AhtolaNativeProvider's dynamic-load-by-name pattern for an optional 'Turso.Data.Native' companion (used for Local Provider=Native) exists purely as an extension point for… |
-| `sync-no-embedded-sync-engine-port` | partial | s2-capability | L | 0 | 0 | The managed provider now implements raw bootstrap/page pulls, pull-only MVCC logical replay, durable local push journaling, protocol metadata, and atomic publication. Partial/lazy sync, zstd, remote encryption, and Turso's complete conflict/checkpoint policy remain outside the managed subset. |
+| `sync-no-embedded-sync-engine-port` | partial | s2-capability | L | 0 | 0 | The managed provider now implements raw bootstrap/page pulls, partial prefix selection with durable lazy page faults, pull-only MVCC logical replay, durable local push journaling, protocol metadata, and atomic publication. Query-selected bootstrap, zstd, remote encryption, and Turso's complete conflict/checkpoint policy remain outside the managed subset. |
 | `sync-no-mvcc-logical-log-replay` | closed | s2-capability | L | 0 | 0 | The managed pull path decodes Turso v0.7.2 portable `lml3` transactions, validates range/frame CRCs and bounds, replays header/schema/row changes atomically, persists protocol/table maps, filters client echoes, and compensates post-commit metadata failures. |
-| `sync-no-page-protocol-pull-decode` | partial | s2-capability | M | 0 | 0 | Raw 4-KiB page bootstrap/incremental streams and protocol-2 full ReplaceBase fallback are decoded and atomically published. zstd and partial page-selection streams remain explicitly rejected. |
-| `sync-no-partial-sync-lazy-page-storage` | missing | s2-capability | L | 0 | 0 | Ahtola already defines a rich C# surface for partial bootstrap (prefix-length or server-side-query page selection, lazy segment size, prefetch flag), matching the shape o… |
-| `sync-no-revert-db-checkpoint-safety` | missing | s1-correctness | L | 0 | 0 | Turso's checkpoint keeps a shadow 'revert' WAL (`<db>-wal-revert`) so a passive checkpoint of synced frames can be rolled back if the corresponding push to remote later r… |
+| `sync-no-page-protocol-pull-decode` | partial | s2-capability | M | 0 | 0 | Raw 4-KiB page bootstrap/incremental streams and protocol-2 full ReplaceBase fallback are decoded and atomically published. Prefix and targeted missing-page selectors use Turso's portable RoaringBitmap page-selector protocol; zstd remains explicitly rejected. |
+| `sync-no-partial-sync-lazy-page-storage` | closed | s2-capability | L | 0 | 0 | Incomplete prefix images publish only after their bootstrap marker, metadata, and integrity-protected page-state sidecar are durable. Pager reads coalesce targeted pulls pinned to the bootstrap revision, validate page identity and size before durable publication, support optional segment prefetch, persist across reopen, and use write-ahead mutation intents plus process-exclusive physical ownership. Tracked local changes are pushed before the pinned image is completed for ordinary revision-advancing sync. |
+| `sync-no-revert-db-checkpoint-safety` | partial | s1-correctness | L | 0 | 0 | Managed ReplaceBase checkpointing now durably publishes an integrity-checked `<db>-wal-revert` plus source-WAL watermark metadata before overwriting or truncating rollback-relevant frames. The sidecar contains both the exact pre-checkpoint bytes and the committed checkpoint image: interrupted publication resumes from the committed image, while only a typed push conflict restores the pre-checkpoint bytes. Missing/corrupt recovery state fails closed and pending journal entries remain durable. Turso's reusable passive-prefix/history checkpoint policy remains tracked by `sync-checkpoint-mode-mismatch-vs-managed-storage`. |
 | `sync-partial-encryption-mutual-exclusion-unenforced` | divergent | s1-correctness | S | 0 | 0 | Turso hard-errors when partial-sync + remote-encryption + MVCC-logical-pull are combined incompatibly. Ahtola's AhtolaReplicaOptions.Validate() checks PartialBootstrap/Bo… |
 | `sync-remote-encryption-header-not-wired-for-remote-client` | missing | s2-capability | S | 0 | 0 | AhtolaRemoteEncryptionOptions models the cipher/base64 key surface used to compute reserved-bytes for encrypted Turso Cloud databases (consumed by the not-yet-existing re… |
 | `sync-remote-execute-stream-only-two-request-kinds` | divergent | s4-intentional | S | 0 | 0 | Turso's own vendored server_proto.rs already restricts the Hrana-like pipeline to Execute and Batch stream kinds (no cursor/describe/sequence/store_sql variants seen in f… |
 | `sync-remote-hrana-batch-cond-unsupported` | closed | s2-capability | M | 0 | 0 | Remote batches serialize nested `ok`/`error`/`not`/`and`/`or`/`is_autocommit` conditions. Multi-statement commands and explicit batches chain `ok(previous)` so later destructive steps do not run after a failure. |
 | `sync-remote-no-replication-index-tracking` | closed | s3-perf | S | 0 | 0 | The managed Hrana client tracks the highest valid batch or statement `replication_index`, sends it with subsequent batches, and accepts both string and legacy numeric encodings. `RemoteReplicationIndexTests` covers request propagation and validation. |
 | `sync-sdk-kit-native-companion-intentional` | extension | s4-intentional | S | 0 | 0 | sdk-kit is Turso's native C-ABI/FFI surface for embedding the sync engine into other languages (capi.rs, bindings.rs). Ahtola deliberately has no native companion and no… |
+
+### 9.2 Post-#24 managed replica closure roadmap
+
+PR #24 closed declared-primary-key delete replay, additive-column rebase, and
+pending-statement replay over protocol-2 `ReplaceBase`. The next managed
+replica work is split into the following independently testable slices. Broad
+inventory entries remain the source-of-truth IDs; this table records the
+implementation order within those entries.
+
+| Order | Slice | Inventory coverage | Depends on | Acceptance boundary |
+| ---: | --- | --- | --- | --- |
+| 1 | Request raw page encoding explicitly | `sync-no-page-protocol-pull-decode` | — | Initial and incremental pulls negotiate raw pages; an unexpected zstd response still fails before publication. |
+| 2 | Wire remote-encrypted bootstrap | `sync-remote-encryption-header-not-wired-for-remote-client`, `sync-partial-encryption-mutual-exclusion-unenforced` | — | Reserved-byte/header semantics match the remote cipher and incompatible logical/partial combinations fail before creating replica state. |
+| 3 | Add eager chunked bootstrap | `sync-no-partial-sync-lazy-page-storage` | — | A byte threshold produces bounded page-range requests whose final staged image is byte-identical to one-shot bootstrap. |
+| 4 | Implement eager prefix bootstrap | `sync-no-partial-sync-lazy-page-storage` | — | Prefix selection changes the requested page range; unsupported query selection is rejected rather than silently expanded to a full pull. |
+| 5 | Fault missing pages on demand | `sync-no-partial-sync-lazy-page-storage` | Prefix bootstrap | A materialization map drives one targeted pull per missing page/segment and never exposes an uninitialized page to the pager. |
+| 6 | Type push conflicts | `sync-conflict-error-surfaced-not-handled` | — | Remote divergence is distinguishable from retryable transport failure without acknowledging or dropping pending journal entries. |
+| 7 | Capture and restore a revert WAL | `sync-no-revert-db-checkpoint-safety`, `sync-checkpoint-mode-mismatch-vs-managed-storage` | Typed push conflicts | Pre-checkpoint page images and a durable watermark restore exactly after a confirmed conflict; missing or corrupt recovery state fails closed. |
+| 8 | Project the replica journal through CDC | `sync-no-cdc-capture-pragma` | — | Public CDC can read the same ordered pending before/after images used for push without dual-writing or treating external CDC rows as trusted push input. |
+| 9 | Add rollback-journal OS locks | storage pager lock-state gap, `sync-checkpoint-mode-mismatch-vs-managed-storage` | — | DELETE mode exposes SQLite-compatible SHARED/RESERVED/PENDING/EXCLUSIVE main-file locks across processes on Windows and Unix. |
+| 10 | Hold locks across replica file replacement | `sync-checkpoint-mode-mismatch-vs-managed-storage` | Rollback-journal OS locks | Sidecar validation, checkpoint, main-file swap, and metadata publication execute under one exclusive lock with no check-then-act writer race. |
+
+zstd decompression is intentionally not a separate parity item at the pinned
+Turso v0.7.2 baseline: `database_sync_operations.rs::decode_page` also rejects
+zstd page sets. Explicit raw negotiation closes the interoperability hazard
+without introducing a compression dependency into the shipped managed closure.
 
 
 ## 10. Top-impact ranking and suggested closure order
