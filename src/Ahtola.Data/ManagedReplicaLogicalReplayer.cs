@@ -334,7 +334,13 @@ internal static class ManagedReplicaLogicalReplayer
         return SqliteRecordCodec.Decode(change.BeforeRecord);
     }
 
-    private static IReadOnlyList<SqlValue>? TryCaptureCurrentRowValues(
+    /// <summary>
+    /// Reads a table's current row values by rowid, or <see langword="null"/> when the row is
+    /// not currently present (including tables with no accessible rowid). Shared with
+    /// <see cref="ManagedReplicaChangeCaptureProjector"/>, which uses the same live-read
+    /// technique to reconstruct an "after" image for the public change-data-capture bridge.
+    /// </summary>
+    internal static IReadOnlyList<SqlValue>? TryCaptureCurrentRowValues(
         IManagedConnectionAdapter connection,
         string tableName,
         long rowId)
