@@ -1094,18 +1094,18 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         if (_nativeDatabase is not null || _managedReplicaHost is not null || _managedDatabase is not null || _remoteClient is not null)
             throw new InvalidOperationException("The connection is already open.");
         ValidateAutomaticSyncPolicy();
-                if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
-                {
-                    if (_connectionOptions.IsRemote
-                        || _connectionOptions.LocalProvider != AhtolaLocalProvider.Managed)
-                    {
-                        throw new NotSupportedException(
-                            "Password requires Local Provider=Managed for file-backed Ahtola AES-GCM databases.");
-                    }
-                }
-
-                ValidatePoolingOptions();
+        if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
+        {
+            if (_connectionOptions.IsRemote
+                || _connectionOptions.LocalProvider != AhtolaLocalProvider.Managed)
+            {
+                throw new NotSupportedException(
+                    "Password requires Local Provider=Managed for file-backed Ahtola AES-GCM databases.");
             }
+        }
+
+        ValidatePoolingOptions();
+    }
 
     private void ValidateCanBeginTransaction()
     {
@@ -1130,11 +1130,11 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             && !_connectionOptions.GetEncryptionCipher().HasValue
                         && string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"])
                         && string.IsNullOrWhiteSpace(_connectionOptions["Password"]);
-                    if (!eligibleManagedFile)
-                    {
-                        throw new NotSupportedException(
-                            "Pooling=True is supported only for unencrypted managed local file databases.");
-                    }
+        if (!eligibleManagedFile)
+        {
+            throw new NotSupportedException(
+                "Pooling=True is supported only for unencrypted managed local file databases.");
+        }
     }
 
     private void ValidateAutomaticSyncPolicy()

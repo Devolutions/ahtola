@@ -875,7 +875,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         lock (_changeGate)
         {
             if (!_localTransactionActive)
-               return;
+                return;
         }
 
         throw new AhtolaReplicaChangeCaptureException(
@@ -894,9 +894,9 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         {
             if (!_localTransactionActive)
             {
-               _localTransactionActive = true;
-               _transactionOpenedBySavepoint = true;
-               _sqlTransactionBeginPending = false;
+                _localTransactionActive = true;
+                _transactionOpenedBySavepoint = true;
+                _sqlTransactionBeginPending = false;
             }
 
             _savepoints.Add(new SavepointFrame(name, _transactionChanges.Count));
@@ -913,13 +913,13 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             var retainedChanges = _savepoints[index].ChangeCount;
             if (_transactionChanges.Count > retainedChanges)
             {
-               _transactionChanges.RemoveRange(
-                   retainedChanges,
-                   _transactionChanges.Count - retainedChanges);
+                _transactionChanges.RemoveRange(
+                    retainedChanges,
+                    _transactionChanges.Count - retainedChanges);
             }
 
             if (_savepoints.Count > index + 1)
-               _savepoints.RemoveRange(index + 1, _savepoints.Count - index - 1);
+                _savepoints.RemoveRange(index + 1, _savepoints.Count - index - 1);
             return;
         }
 
