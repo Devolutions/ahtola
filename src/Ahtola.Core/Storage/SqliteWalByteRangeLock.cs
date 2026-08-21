@@ -991,10 +991,15 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
             {
                 var error = Marshal.GetLastPInvokeError();
                 handle.Dispose();
+                if (error is 2 or 3)
+                {
+                    throw new DirectoryNotFoundException(
+                        $"CreateFile failed because directory '{directoryPath}' does not exist.",
+                        new Win32Exception(error));
+                }
                 ThrowNativeIOException("CreateFile", error);
             }
             return handle;
-        }
         }
     }
 }

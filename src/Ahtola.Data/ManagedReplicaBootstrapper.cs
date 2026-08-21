@@ -31,9 +31,12 @@ internal static class ManagedReplicaBootstrapper
     /// </summary>
     internal static void DeleteBootstrappedReplicaFiles(string path)
     {
-        DeleteIfExists(path);
         DeleteIfExists(path + MetadataSuffix);
         DeleteStagingSidecars(path);
+        // Keep the main file present until every sidecar is gone. Apply-lock aliases resolve an
+        // existing target by physical identity; deleting it first would let a missing-path key
+        // race the remainder of this cleanup while the original lease was still held.
+        DeleteIfExists(path);
     }
 
     public static async Task BootstrapAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
