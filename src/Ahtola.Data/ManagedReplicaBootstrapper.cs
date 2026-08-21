@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
@@ -894,23 +895,97 @@ internal static class ManagedReplicaBootstrapper
         string stagingPath,
         CancellationToken cancellationToken)
     {
-        using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
-        var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
         using var scope = options.EnterApplicationHttpScope();
         using var client = options.HttpPolicy.MessageHandler is { } handler
             ? new HttpClient(handler, disposeHandler: false)
             : new HttpClient();
         client.Timeout = Timeout.InfiniteTimeSpan;
+        var authToken = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
+        var chunkPages = options.PullBytesThreshold is { } threshold
+            ? Math.Min(checked((ulong)((threshold - 1) / PageSize + 1)), uint.MaxValue)
+            : (ulong?)null;
+
+        await using (var staging = new FileStream(
+            stagingPath,
+            FileMode.CreateNew,
+            FileAccess.ReadWrite,
+            FileShare.None,
+            bufferSize: PageSize,
+            FileOptions.Asynchronous | FileOptions.WriteThrough))
+        {
+            var firstSelector = chunkPages is { } firstChunkPages
+                ? CreatePageRangeSelector(0, checked((uint)firstChunkPages))
+                : [];
+            var header = await PullBootstrapChunkAsync(
+                    client,
+                    options,
+                    authToken,
+                    staging,
+                    CreateBootstrapPullRequest(
+                        serverRevision: null,
+                        options.LongPollTimeout,
+                        firstSelector),
+                    expectedHeader: null,
+                    requestedStart: 0,
+                    requestedEnd: chunkPages,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (chunkPages is { } pagesPerChunk)
+            {
+                if (header.DatabasePages > uint.MaxValue)
+                    throw new InvalidDataException("The remote database is too large for chunked page selection.");
+
+                var start = pagesPerChunk;
+                while (start < header.DatabasePages)
+                {
+                    var end = Math.Min(start + pagesPerChunk, header.DatabasePages);
+                    var selector = CreatePageRangeSelector(checked((uint)start), checked((uint)end));
+                    _ = await PullBootstrapChunkAsync(
+                            client,
+                            options,
+                            authToken,
+                            staging,
+                            CreateBootstrapPullRequest(
+                                header.Revision,
+                                longPollTimeout: null,
+                                selector),
+                            header,
+                            start,
+                            end,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    start = end;
+                }
+            }
+
+            await staging.FlushAsync(cancellationToken).ConfigureAwait(false);
+            staging.Flush(flushToDisk: true);
+            return (header.Revision, header.Protocol);
+        }
+    }
+
+    private static async Task<PullHeader> PullBootstrapChunkAsync(
+        HttpClient client,
+        AhtolaReplicaOptions options,
+        string? authToken,
+        FileStream staging,
+        byte[] requestPayload,
+        PullHeader? expectedHeader,
+        ulong requestedStart,
+        ulong? requestedEnd,
+        CancellationToken cancellationToken)
+    {
         using var request = new HttpRequestMessage(HttpMethod.Post, CreatePullUpdatesUri(options.RemoteUri));
-        request.Content = new ByteArrayContent(CreateInitialPullRequest(options.LongPollTimeout));
+        request.Content = new ByteArrayContent(requestPayload);
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
         request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
-
-        var authToken = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
         ValidateAuthTokenTransport(request.RequestUri!, authToken);
         if (authToken is not null)
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
 
+        using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
+        var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
         using var response = await client.SendAsync(
             request,
             HttpCompletionOption.ResponseHeadersRead,
@@ -928,37 +1003,108 @@ internal static class ManagedReplicaBootstrapper
                 "Managed embedded replica bootstrap requires a raw page stream; the server returned an MVCC logical-log stream.");
         }
 
-        var databaseLength = checked((long)header.DatabasePages * PageSize);
-        var receivedPages = new HashSet<ulong>();
-        await using (var staging = new FileStream(
-            stagingPath,
-            FileMode.CreateNew,
-            FileAccess.ReadWrite,
-            FileShare.None,
-            bufferSize: PageSize,
-            FileOptions.Asynchronous | FileOptions.WriteThrough))
+        if (expectedHeader is { } expected
+            && (header.Revision != expected.Revision
+                || header.DatabasePages != expected.DatabasePages
+                || header.ApplyMode != expected.ApplyMode
+                || header.Protocol != expected.Protocol))
         {
-            staging.SetLength(databaseLength);
-            while (await reader.ReadAsync(MaxPageMessageLength, effectiveCancellationToken).ConfigureAwait(false) is { } pagePayload)
-            {
-                var page = ParsePage(pagePayload);
-                if (page.PageId >= header.DatabasePages)
-                    throw new InvalidDataException("The pull-updates response contains a page outside the declared database size.");
-                if (!receivedPages.Add(page.PageId))
-                    throw new InvalidDataException("The pull-updates response contains a duplicate page.");
-
-                staging.Position = checked((long)page.PageId * PageSize);
-                await staging.WriteAsync(page.Data, effectiveCancellationToken).ConfigureAwait(false);
-            }
-
-            if ((ulong)receivedPages.Count != header.DatabasePages)
-                throw new InvalidDataException("The pull-updates response did not contain every database page exactly once.");
-
-            await staging.FlushAsync(effectiveCancellationToken).ConfigureAwait(false);
-            staging.Flush(flushToDisk: true);
+            throw new InvalidDataException(
+                "A chunked bootstrap response did not match the initial database revision and shape.");
         }
 
-        return (header.Revision, header.Protocol);
+        if (expectedHeader is null)
+            staging.SetLength(checked((long)header.DatabasePages * PageSize));
+
+        var expectedEnd = Math.Min(requestedEnd ?? header.DatabasePages, header.DatabasePages);
+        var receivedPages = new HashSet<ulong>();
+        while (await reader.ReadAsync(MaxPageMessageLength, effectiveCancellationToken).ConfigureAwait(false) is { } pagePayload)
+        {
+            var page = ParsePage(pagePayload);
+            if (page.PageId < requestedStart || page.PageId >= expectedEnd)
+                throw new InvalidDataException("The pull-updates response contains a page outside the requested bootstrap range.");
+            if (!receivedPages.Add(page.PageId))
+                throw new InvalidDataException("The pull-updates response contains a duplicate page.");
+
+            staging.Position = checked((long)page.PageId * PageSize);
+            await staging.WriteAsync(page.Data, effectiveCancellationToken).ConfigureAwait(false);
+        }
+
+        if ((ulong)receivedPages.Count != expectedEnd - requestedStart)
+        {
+            throw new InvalidDataException(
+                "The pull-updates response did not contain every requested database page exactly once.");
+        }
+
+        return header;
+    }
+
+    private static byte[] CreatePageRangeSelector(uint startInclusive, uint endExclusive)
+    {
+        if (startInclusive >= endExclusive)
+            throw new ArgumentOutOfRangeException(nameof(endExclusive), endExclusive, "The page range must not be empty.");
+
+        const uint serialCookie = 12347;
+        var firstKey = startInclusive >> 16;
+        var lastKey = (endExclusive - 1) >> 16;
+        var containerCount = checked((int)(lastKey - firstKey + 1));
+        var runBitmapLength = (containerCount + 7) / 8;
+        var hasOffsets = containerCount >= 4;
+        var headerLength = checked(
+            sizeof(uint)
+            + runBitmapLength
+            + containerCount * (sizeof(ushort) * 2)
+            + (hasOffsets ? containerCount * sizeof(uint) : 0));
+        var result = new byte[checked(headerLength + containerCount * (sizeof(ushort) * 3))];
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            result,
+            serialCookie | checked((uint)(containerCount - 1) << 16));
+
+        for (var index = 0; index < containerCount; index++)
+            result[sizeof(uint) + index / 8] |= checked((byte)(1 << (index % 8)));
+
+        var descriptionsOffset = sizeof(uint) + runBitmapLength;
+        for (var index = 0; index < containerCount; index++)
+        {
+            var key = checked((ushort)(firstKey + (uint)index));
+            var runStart = index == 0 ? checked((ushort)(startInclusive & ushort.MaxValue)) : (ushort)0;
+            var runEnd = index == containerCount - 1
+                ? checked((ushort)((endExclusive - 1) & ushort.MaxValue))
+                : ushort.MaxValue;
+            var descriptionOffset = descriptionsOffset + index * (sizeof(ushort) * 2);
+            BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(descriptionOffset), key);
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                result.AsSpan(descriptionOffset + sizeof(ushort)),
+                checked((ushort)(runEnd - runStart)));
+        }
+
+        var containersOffset = headerLength;
+        if (hasOffsets)
+        {
+            var offsetsOffset = descriptionsOffset + containerCount * (sizeof(ushort) * 2);
+            for (var index = 0; index < containerCount; index++)
+            {
+                BinaryPrimitives.WriteUInt32LittleEndian(
+                    result.AsSpan(offsetsOffset + index * sizeof(uint)),
+                    checked((uint)(containersOffset + index * (sizeof(ushort) * 3))));
+            }
+        }
+
+        for (var index = 0; index < containerCount; index++)
+        {
+            var runStart = index == 0 ? checked((ushort)(startInclusive & ushort.MaxValue)) : (ushort)0;
+            var runEnd = index == containerCount - 1
+                ? checked((ushort)((endExclusive - 1) & ushort.MaxValue))
+                : ushort.MaxValue;
+            var containerOffset = containersOffset + index * (sizeof(ushort) * 3);
+            BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(containerOffset), 1);
+            BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(containerOffset + sizeof(ushort)), runStart);
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                result.AsSpan(containerOffset + sizeof(ushort) * 2),
+                checked((ushort)(runEnd - runStart)));
+        }
+
+        return result;
     }
 
 
@@ -1239,7 +1385,23 @@ internal static class ManagedReplicaBootstrapper
     }
 
     private static byte[] CreateInitialPullRequest(TimeSpan? longPollTimeout)
-        => CreatePullRequest(clientRevision: null, longPollTimeout, requestLogicalProtocol: false);
+        => CreatePullRequest(
+            serverRevision: null,
+            clientRevision: null,
+            longPollTimeout,
+            requestLogicalProtocol: false,
+            serverPagesSelector: []);
+
+    private static byte[] CreateBootstrapPullRequest(
+        string? serverRevision,
+        TimeSpan? longPollTimeout,
+        byte[] serverPagesSelector)
+        => CreatePullRequest(
+            serverRevision,
+            clientRevision: null,
+            longPollTimeout,
+            requestLogicalProtocol: false,
+            serverPagesSelector);
 
     /// <summary>
     /// Builds a <c>PullUpdatesReqProtoBody</c> request. Tag 1 (<c>encoding</c>) is explicitly
@@ -1253,9 +1415,35 @@ internal static class ManagedReplicaBootstrapper
     /// </summary>
     private static byte[] CreatePullRequest(string? clientRevision, TimeSpan? longPollTimeout, bool requestLogicalProtocol)
     {
-        var request = new List<byte>(clientRevision is null ? 8 : clientRevision.Length + 14);
+        return CreatePullRequest(
+            serverRevision: null,
+            clientRevision,
+            longPollTimeout,
+            requestLogicalProtocol,
+            serverPagesSelector: []);
+    }
+
+    private static byte[] CreatePullRequest(
+        string? serverRevision,
+        string? clientRevision,
+        TimeSpan? longPollTimeout,
+        bool requestLogicalProtocol,
+        byte[] serverPagesSelector)
+    {
+        var request = new List<byte>(
+            (serverRevision?.Length ?? 0)
+            + (clientRevision?.Length ?? 0)
+            + serverPagesSelector.Length
+            + 18);
         WriteVarint(request, 1u << 3);
         WriteVarint(request, 0); // PageUpdatesEncodingReq::Raw
+        if (!string.IsNullOrEmpty(serverRevision))
+        {
+            var revision = StrictUtf8.GetBytes(serverRevision);
+            WriteVarint(request, 2u << 3 | 2);
+            WriteVarint(request, checked((ulong)revision.Length));
+            request.AddRange(revision);
+        }
         if (!string.IsNullOrEmpty(clientRevision))
         {
             var revision = StrictUtf8.GetBytes(clientRevision);
@@ -1267,6 +1455,12 @@ internal static class ManagedReplicaBootstrapper
         {
             WriteVarint(request, 4u << 3);
             WriteVarint(request, checked((ulong)timeout.TotalMilliseconds));
+        }
+        if (serverPagesSelector.Length != 0)
+        {
+            WriteVarint(request, 5u << 3 | 2);
+            WriteVarint(request, checked((ulong)serverPagesSelector.Length));
+            request.AddRange(serverPagesSelector);
         }
         if (requestLogicalProtocol)
         {

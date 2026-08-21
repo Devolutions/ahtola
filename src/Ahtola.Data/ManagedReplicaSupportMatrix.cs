@@ -15,12 +15,6 @@ internal static class ManagedReplicaSupportMatrix
                 "Managed embedded replicas support only a complete raw 4 KiB page bootstrap; partial, query, and lazy bootstrap are not supported.");
         }
 
-        if (options.PullBytesThreshold is not null)
-        {
-            throw new NotSupportedException(
-                "Managed embedded replicas support only a single complete raw 4 KiB page bootstrap; chunked bootstrap is not supported.");
-        }
-
         if (options.RemoteEncryption is not null)
         {
             throw new NotSupportedException(
