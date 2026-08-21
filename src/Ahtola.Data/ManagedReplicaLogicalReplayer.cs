@@ -360,13 +360,18 @@ internal static class ManagedReplicaLogicalReplayer
         bool includeGeneratedColumns = false)
     {
         var info = GetTableColumnsInfo(connection, tableName);
-        if (info.ColumnNames.Count == 0 || info.IsWithoutRowId || info.RowidReferenceName is not { } rowidReference)
+        if (info.ColumnNames.Count == 0 || info.IsWithoutRowId)
             return null;
 
         var columnNames = includeGeneratedColumns
             ? GetFullTableColumnNamesForChangeCapture(connection, tableName)
             : info.ColumnNames;
         if (columnNames.Count == 0)
+            return null;
+        var rowidReference = includeGeneratedColumns
+            ? ResolveRowidReferenceName(columnNames)
+            : info.RowidReferenceName;
+        if (rowidReference is null)
             return null;
 
         var columnList = string.Join(", ", columnNames.Select(QuoteIdentifier));

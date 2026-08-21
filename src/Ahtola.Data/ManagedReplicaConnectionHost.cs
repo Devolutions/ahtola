@@ -19,8 +19,10 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     private readonly object _changeGate = new();
     private readonly List<ReplicaLocalChange> _statementChanges = [];
     private readonly List<ReplicaLocalChange> _transactionChanges = [];
+    private readonly List<SavepointFrame> _savepoints = [];
     private AhtolaConnection? _connection;
     private bool _localTransactionActive;
+    private bool _transactionOpenedBySavepoint;
     private IDisposable? _sqlTransactionOperation;
     private bool _sqlTransactionBeginPending;
     private bool _sqlTransactionCompletionPending;
@@ -117,6 +119,8 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     /// </exception>
     public AhtolaReplicaChangeCaptureBatch PeekPendingChangeCapture()
     {
+        ThrowIfChangeCaptureTransactionIsActive();
+
         // Held for the whole call so a concurrent publish's quiesce-and-close cannot interleave
         // with it: EnterLocalOperation blocks that cycle from proceeding past its own "wait for
         // zero active local operations" step until this lease is released, which is exactly what
@@ -124,19 +128,10 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         // swap) from running underneath this projection and mixing generations.
         using var operation = EnterLocalOperation(CancellationToken.None);
 
-        lock (_changeGate)
-        {
-            if (_localTransactionActive)
-            {
-                throw new AhtolaReplicaChangeCaptureException(
-                    "Cannot peek pending change-data-capture while a local transaction is open "
-                    + "on this connection. Projecting an \"after\" image while a transaction is "
-                    + "in progress could observe not-yet-committed writes, or writes the "
-                    + "transaction later rolls back, and silently bake them into the projected "
-                    + "row as if they were committed. Commit or roll back the open transaction "
-                    + "before peeking pending change-data-capture.");
-            }
-        }
+        // Recheck after entering: a transaction can start between the precheck and lease
+        // acquisition. The precheck prevents publication from deadlocking behind a transaction
+        // lease while this thread waits to enter another local operation.
+        ThrowIfChangeCaptureTransactionIsActive();
 
         // Stable locals captured while the lease above is held, so both come from the same
         // database/journal generation for the whole call: Database and _changeJournal are only
@@ -179,8 +174,17 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             if (keyword is not null && keyword.Equals("BEGIN", StringComparison.OrdinalIgnoreCase))
             {
                 _statementChanges.Clear();
+                _savepoints.Clear();
                 _localTransactionActive = true;
+                _transactionOpenedBySavepoint = false;
                 _sqlTransactionBeginPending = false;
+                return;
+            }
+
+            var savepoint = SqlTransactionControl.GetSavepointCommand(sql);
+            if (savepoint.Action != SqlSavepointAction.None)
+            {
+                CompleteSavepointStatement(savepoint);
                 return;
             }
 
@@ -189,7 +193,9 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             {
                 _statementChanges.Clear();
                 _transactionChanges.Clear();
+                _savepoints.Clear();
                 _localTransactionActive = false;
+                _transactionOpenedBySavepoint = false;
                 _sqlTransactionCompletionPending = true;
                 return;
             }
@@ -200,7 +206,9 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                 _statementChanges.Clear();
                 _changeJournal.AppendCommitted(_transactionChanges);
                 _transactionChanges.Clear();
+                _savepoints.Clear();
                 _localTransactionActive = false;
+                _transactionOpenedBySavepoint = false;
                 _sqlTransactionCompletionPending = true;
                 return;
             }
@@ -645,7 +653,9 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             {
                 _statementChanges.Clear();
                 _transactionChanges.Clear();
+                _savepoints.Clear();
                 _localTransactionActive = false;
+                _transactionOpenedBySavepoint = false;
                 if (_sqlTransactionOperation is not null)
                 {
                     _sqlTransactionBeginPending = false;
@@ -662,6 +672,72 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                || keyword.Equals("DROP", StringComparison.OrdinalIgnoreCase)
                || keyword.Equals("REINDEX", StringComparison.OrdinalIgnoreCase)
                || keyword.Equals("VACUUM", StringComparison.OrdinalIgnoreCase));
+
+    private void ThrowIfChangeCaptureTransactionIsActive()
+    {
+        lock (_changeGate)
+        {
+            if (!_localTransactionActive)
+               return;
+        }
+
+        throw new AhtolaReplicaChangeCaptureException(
+            "Cannot peek pending change-data-capture while a local transaction is open "
+            + "on this connection. Commit or roll back the transaction before peeking.");
+    }
+
+    private void CompleteSavepointStatement(SqlSavepointCommand command)
+    {
+        _statementChanges.Clear();
+        var name = command.Name;
+        if (string.IsNullOrEmpty(name))
+            return;
+
+        if (command.Action == SqlSavepointAction.Savepoint)
+        {
+            if (!_localTransactionActive)
+            {
+               _localTransactionActive = true;
+               _transactionOpenedBySavepoint = true;
+               _sqlTransactionBeginPending = false;
+            }
+
+            _savepoints.Add(new SavepointFrame(name, _transactionChanges.Count));
+            return;
+        }
+
+        var index = _savepoints.FindLastIndex(
+            frame => frame.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (index < 0)
+            return;
+
+        if (command.Action == SqlSavepointAction.RollbackTo)
+        {
+            var retainedChanges = _savepoints[index].ChangeCount;
+            if (_transactionChanges.Count > retainedChanges)
+            {
+               _transactionChanges.RemoveRange(
+                   retainedChanges,
+                   _transactionChanges.Count - retainedChanges);
+            }
+
+            if (_savepoints.Count > index + 1)
+               _savepoints.RemoveRange(index + 1, _savepoints.Count - index - 1);
+            return;
+        }
+
+        _savepoints.RemoveRange(index, _savepoints.Count - index);
+        if (!_transactionOpenedBySavepoint || _savepoints.Count != 0)
+            return;
+
+        _changeJournal.AppendCommitted(_transactionChanges);
+        _transactionChanges.Clear();
+        _localTransactionActive = false;
+        _transactionOpenedBySavepoint = false;
+        _sqlTransactionCompletionPending = true;
+    }
+
+    private readonly record struct SavepointFrame(string Name, int ChangeCount);
 
     private void ReleaseSqlTransactionOperation()
     {

@@ -360,6 +360,50 @@ public sealed class ManagedReplicaChangeCaptureBridgeTests
     }
 
     [Test]
+    public void BareSavepointRetainsAndRollsBackPendingChangesUntilTheOutermostCompletion()
+    {
+        var path = NewReplicaPath("cdc-bridge-bare-savepoint");
+        try
+        {
+            using (var setup = new AhtolaConnection($"Data Source={path};Local Provider=Managed"))
+            {
+                setup.Open();
+                setup.ExecuteNonQuery("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)");
+            }
+
+            using var replica = AhtolaConnection.CreateReplica(
+                new AhtolaReplicaOptions(path, new Uri("https://example.test"), authToken: null));
+            replica.Open();
+
+            replica.ExecuteNonQuery("SAVEPOINT outer_tx;");
+            replica.ExecuteNonQuery("INSERT INTO t VALUES (1, 'rolled back');");
+            Action peekDuringSavepoint = () => replica.PeekPendingChangeCapture();
+            peekDuringSavepoint.Should().Throw<AhtolaReplicaChangeCaptureException>();
+            replica.ExecuteNonQuery("ROLLBACK;");
+            replica.PeekPendingChangeCapture().Rows.Should().BeEmpty();
+
+            replica.ExecuteNonQuery("SAVEPOINT outer_tx;");
+            replica.ExecuteNonQuery("INSERT INTO t VALUES (2, 'kept');");
+            replica.ExecuteNonQuery("SAVEPOINT inner_tx;");
+            replica.ExecuteNonQuery("INSERT INTO t VALUES (3, 'discarded');");
+            replica.ExecuteNonQuery("ROLLBACK TO inner_tx;");
+            replica.ExecuteNonQuery("RELEASE inner_tx;");
+            replica.ExecuteNonQuery("RELEASE outer_tx;");
+
+            var rows = replica.PeekPendingChangeCapture().Rows;
+            rows.Should().ContainSingle();
+            rows[0].RowId.Should().Be(2);
+            SqliteRecordCodec.Decode(rows[0].After!).Should().Equal(
+                SqlValue.Integer(2),
+                SqlValue.Text("kept"));
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public async Task PeekPendingChangeCaptureNeverRacesWithAConcurrentPublish()
     {
         var path = NewReplicaPath("cdc-bridge-peek-publish-race");
@@ -472,7 +516,8 @@ public sealed class ManagedReplicaChangeCaptureBridgeTests
             + "id INTEGER PRIMARY KEY, "
             + "a INT, "
             + "b INT, "
-            + "total INT GENERATED ALWAYS AS (a + b) VIRTUAL)");
+            + "total INT GENERATED ALWAYS AS (a + b) VIRTUAL, "
+            + "rowid INT GENERATED ALWAYS AS (a + 100) VIRTUAL)");
         Exec(connection, "PRAGMA capture_data_changes_conn('full')");
 
         Exec(connection, "INSERT INTO t (id, a, b) VALUES (1, 3, 4)");
@@ -498,7 +543,8 @@ public sealed class ManagedReplicaChangeCaptureBridgeTests
             SqlValue.Integer(1),
             SqlValue.Integer(3),
             SqlValue.Integer(4),
-            SqlValue.Integer(7));
+            SqlValue.Integer(7),
+            SqlValue.Integer(103));
     }
 
     // --- helpers ---

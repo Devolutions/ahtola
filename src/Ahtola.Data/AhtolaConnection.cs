@@ -538,7 +538,9 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     internal bool BeginManagedReplicaSqlTransaction(string sql, CancellationToken cancellationToken)
     {
-        if (SqlTransactionControl.GetFirstKeyword(sql)?.Equals("BEGIN", StringComparison.OrdinalIgnoreCase) != true
+        var keyword = SqlTransactionControl.GetFirstKeyword(sql);
+        if ((keyword?.Equals("BEGIN", StringComparison.OrdinalIgnoreCase) != true
+             && keyword?.Equals("SAVEPOINT", StringComparison.OrdinalIgnoreCase) != true)
             || _managedReplicaHost is not { } host)
         {
             return false;
