@@ -34,6 +34,25 @@ public sealed record SqliteCheckpointResult(
     int InstalledPageCount,
     long RetainedCommittedFrameCount);
 
+/// <summary>One exact main-database page image preserved before a WAL checkpoint.</summary>
+internal sealed record SqliteCheckpointRevertPage(
+    uint PageNumber,
+    ReadOnlyMemory<byte> PageData);
+
+/// <summary>
+/// The main-database preimages and authenticated WAL boundary required to undo
+/// one destructive checkpoint.
+/// </summary>
+internal sealed record SqliteCheckpointRevertCapture(
+    int PageSize,
+    uint OriginalDatabaseSizeInPages,
+    uint CommittedDatabaseSizeInPages,
+    SqliteWalHeader SourceWalHeader,
+    long SourceWalWatermark,
+    SqliteWalFrameHeader SourceWatermarkFrame,
+    Func<uint, ReadOnlyMemory<byte>> ReadOriginalPage,
+    Func<uint, ReadOnlyMemory<byte>> ReadCommittedPage);
+
 /// <summary>
 /// A single-writer SQLite page cache and WAL overlay. It makes only frames up
 /// to the last durable commit marker visible and retains WAL bytes during
@@ -1674,6 +1693,21 @@ public sealed class SqlitePager : IDisposable
         => CheckpointToMainStoreCore(busyTimeout, resetCommittedWal: true);
 
     /// <summary>
+    /// Persists caller-owned checkpoint rollback state while the authenticated
+    /// WAL boundary is locked, before any main-file page is overwritten.
+    /// </summary>
+    internal SqliteCheckpointResult CheckpointToMainStoreAndResetWal(
+        Action<SqliteCheckpointRevertCapture> persistRevertCapture,
+        TimeSpan? busyTimeout = null)
+    {
+        ArgumentNullException.ThrowIfNull(persistRevertCapture);
+        return CheckpointToMainStoreCore(
+            busyTimeout,
+            resetCommittedWal: true,
+            persistRevertCapture);
+    }
+
+    /// <summary>
     /// Changes between WAL and DELETE mode only after the current committed view
     /// is durable in the main file. The header transition itself is protected by
     /// a rollback journal, so interruption preserves either complete format.
@@ -1960,11 +1994,18 @@ public sealed class SqlitePager : IDisposable
 
     private SqliteCheckpointResult CheckpointToMainStoreCore(
         TimeSpan? busyTimeout,
-        bool resetCommittedWal)
+        bool resetCommittedWal,
+        Action<SqliteCheckpointRevertCapture>? persistRevertCapture = null)
     {
         var timeout = ResolveBusyTimeout(busyTimeout);
         if (UsesWalIndexCheckpointProtocol())
-            return CheckpointWithWalIndexProtocol(timeout, resetCommittedWal, writerLockAlreadyHeld: false);
+        {
+            return CheckpointWithWalIndexProtocol(
+                timeout,
+                resetCommittedWal,
+                writerLockAlreadyHeld: false,
+                persistRevertCapture: persistRevertCapture);
+        }
 
         var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
         using var checkpointLock = _lockManager.EnterCheckpoint(timeout);
@@ -1973,7 +2014,11 @@ public sealed class SqlitePager : IDisposable
                 SqlitePagerLockOperation.Checkpoint,
                 SqlitePagerLockManager.RemainingFileLockTimeout(timeout, stopwatch))
             : null;
-        return CheckpointToMainStoreUnderLock(checkpointLock, resetCommittedWal, mainFileLock);
+        return CheckpointToMainStoreUnderLock(
+            checkpointLock,
+            resetCommittedWal,
+            mainFileLock,
+            persistRevertCapture);
     }
 
     private bool UsesWalIndexCheckpointProtocol()
@@ -1992,7 +2037,8 @@ public sealed class SqlitePager : IDisposable
     private SqliteCheckpointResult CheckpointToMainStoreUnderLock(
         SqlitePagerLockLease checkpointLock,
         bool resetCommittedWal,
-        SqliteMainFileLockLease? mainFileLock = null)
+        SqliteMainFileLockLease? mainFileLock = null,
+        Action<SqliteCheckpointRevertCapture>? persistRevertCapture = null)
     {
         lock (_gate)
         {
@@ -2016,6 +2062,8 @@ public sealed class SqlitePager : IDisposable
             try
             {
                 ValidateWalHasNotChanged();
+                if (persistRevertCapture is not null && _committedFrameCount > 0)
+                    persistRevertCapture(CreateCheckpointRevertCapture(_committedFrameCount));
                 // Retain page 1 before overlay clear so post-checkpoint local reads
                 // (e.g. CaptureCommittedViewToken) publish from commit metadata without
                 // a main-file Read — required after exclusive rewrite SetLength.
@@ -2075,7 +2123,8 @@ public sealed class SqlitePager : IDisposable
         TimeSpan timeout,
         bool resetCommittedWal,
         bool writerLockAlreadyHeld,
-        bool checkpointLockAlreadyHeld = false)
+        bool checkpointLockAlreadyHeld = false,
+        Action<SqliteCheckpointRevertCapture>? persistRevertCapture = null)
     {
         const long writeLockOffset = SqliteWalIndexCheckpointInfo.LockOffset;
         const long checkpointLockOffset = SqliteWalIndexCheckpointInfo.LockOffset + 1;
@@ -2203,6 +2252,21 @@ public sealed class SqlitePager : IDisposable
                                     region = confirmedRegion;
                                     if (safeFrame > region.Header.MaximumFrame)
                                         safeFrame = region.Header.MaximumFrame;
+                                    if (persistRevertCapture is not null && safeFrame > 0)
+                                    {
+                                        if (!resetCommittedWal || safeFrame != region.Header.MaximumFrame)
+                                        {
+                                            throw new InvalidOperationException(
+                                                "A checkpoint revert capture requires the complete committed WAL boundary.");
+                                        }
+                                        if (region.CheckpointInfo.BackfilledFrameCount != 0)
+                                        {
+                                            throw new InvalidOperationException(
+                                                "Cannot capture checkpoint revert pages after WAL frames were already backfilled.");
+                                        }
+
+                                        persistRevertCapture(CreateCheckpointRevertCapture(safeFrame));
+                                    }
 
                                     var attempted = region.CheckpointInfo.BackfillAttemptedFrameCount;
                                     if (safeFrame > attempted)
@@ -2436,6 +2500,42 @@ public sealed class SqlitePager : IDisposable
         }
 
         return installedPageCount;
+    }
+
+    private SqliteCheckpointRevertCapture CreateCheckpointRevertCapture(long sourceWalWatermark)
+    {
+        if (sourceWalWatermark <= 0 || sourceWalWatermark != _committedFrameCount)
+        {
+            throw new InvalidOperationException(
+                "A checkpoint revert capture requires the complete committed WAL boundary.");
+        }
+
+        var wal = RequireWal();
+        var watermarkFrame = wal.ReadFrame(sourceWalWatermark).Header;
+        if (!watermarkFrame.IsCommit
+            || watermarkFrame.DatabaseSizeInPages != _committedPageCount)
+        {
+            throw new InvalidDataException(
+                "The checkpoint revert watermark is not the current committed WAL boundary.");
+        }
+
+        var originalDatabaseSizeInPages = _pageStore.PageCount;
+        if (originalDatabaseSizeInPages > int.MaxValue
+            || _committedPageCount > int.MaxValue)
+        {
+            throw new InvalidOperationException(
+                "A checkpoint revert WAL cannot represent more than Int32.MaxValue database pages.");
+        }
+
+        return new SqliteCheckpointRevertCapture(
+            _pageStore.PageSize,
+            originalDatabaseSizeInPages,
+            _committedPageCount,
+            wal.Header,
+            sourceWalWatermark,
+            watermarkFrame,
+            pageNumber => _pageStore.ReadRawPage(pageNumber),
+            pageNumber => GetCommittedPageImage(pageNumber));
     }
 
     private int InstallWalFramesIntoMainStore(uint safeFrame)

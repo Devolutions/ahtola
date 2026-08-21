@@ -247,6 +247,53 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             throw new AhtolaException("Remote replica push did not commit its acknowledgement watermark.", AhtolaReplicaPushFailureKind.InvalidLocalState);
     }
 
+    internal async Task<(long PullGeneration, long ChangeId)?> ReadReplicaPushWatermarkAsync(
+        string clientId,
+        int commandTimeout,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
+        var parameters = new AhtolaParameterCollection();
+        parameters.Add(clientId);
+
+        RemoteStatementResult result;
+        try
+        {
+            result = await ExecuteAsync(
+                    "SELECT pull_gen, change_id FROM turso_sync_last_change_id WHERE client_id = ?",
+                    parameters,
+                    wantRows: true,
+                    commandTimeout,
+                    closeAfter: true,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (AhtolaRemoteSqlException exception) when (
+            exception.RemoteErrorMessage?.Contains("no such table", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            return null;
+        }
+
+        if (result.Rows.Count == 0)
+            return null;
+        if (result.Rows.Count != 1 || result.Rows[0].Count != 2)
+        {
+            throw new AhtolaException(
+                "Remote replica push acknowledgement returned an invalid result shape.",
+                AhtolaReplicaPushFailureKind.InvalidLocalState);
+        }
+
+        var pullGeneration = result.Rows[0][0].GetInt64();
+        var changeId = result.Rows[0][1].GetInt64();
+        if (pullGeneration < 0 || changeId < 0)
+        {
+            throw new AhtolaException(
+                "Remote replica push acknowledgement returned an invalid watermark.",
+                AhtolaReplicaPushFailureKind.InvalidLocalState);
+        }
+        return (pullGeneration, changeId);
+    }
+
     public async Task CloseAsync(int commandTimeout, CancellationToken cancellationToken)
     {
         if (_baton is null)

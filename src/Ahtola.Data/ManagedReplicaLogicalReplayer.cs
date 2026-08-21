@@ -222,6 +222,29 @@ internal static class ManagedReplicaLogicalReplayer
         }
     }
 
+    public static void ReplayPendingLocalSchemaChanges(
+        IManagedConnectionAdapter connection,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(pendingLocalChanges);
+
+        var addColumns = CollectPendingAddColumns(pendingLocalChanges);
+        foreach (var change in pendingLocalChanges)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (change.Kind != ReplicaLocalChangeKind.Schema)
+                continue;
+            if (ManagedReplicaSchemaDdlText.TryParseAlterTableAddColumn(change.Sql) is not null)
+                continue;
+
+            ExecuteDdl(connection, ManagedReplicaSchemaDdlText.EnsureCreateTableIfNotExists(change.Sql));
+        }
+
+        ReplayPendingLocalAddColumns(connection, addColumns, cancellationToken);
+    }
+
     /// <summary>
     /// Replays the original SQL of still-unpushed local statements onto a freshly installed
     /// ReplaceBase snapshot. Consecutive journal rows that share one statement (empty or repeated

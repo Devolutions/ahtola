@@ -39,6 +39,21 @@ internal enum ManagedReplicaDurableBoundary
     PageMutationIntentPersisted,
     PageMutationDatabasePersisted,
     PartialImageCompletionStarted,
+    RevertWalStaged,
+    RevertWalPublished,
+    RevertMetadataPublished,
+    RevertCheckpointed,
+    RevertRemoteApplyIntentPublished,
+    RevertCommittedRestoreIntentPublished,
+    RevertCommittedRestoreStagedDatabase,
+    RevertCommittedRestoreDatabasePublished,
+    RevertCommittedReadyMetadataPublished,
+    RevertPushIntentPublished,
+    RevertConflictRestoreIntentPublished,
+    RevertRestoreStagedDatabase,
+    RevertRestoreDatabasePublished,
+    RevertRestoreMetadataPublished,
+    RevertRetired,
 }
 
 /// <summary>
