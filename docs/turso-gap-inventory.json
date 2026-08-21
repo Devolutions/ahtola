@@ -15,7 +15,7 @@
     },
     "conformance_ground_truth": "src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt (606 failure lines at analysis time)",
     "current_conformance_expected_failures": 11,
-    "last_reconciled": "2026-08-10",
+    "last_reconciled": "2026-08-20",
     "entry_count": 211,
     "counts": {
       "by_layer": {
@@ -29,14 +29,14 @@
       },
       "by_kind": {
         "extension": 8,
-        "missing": 77,
-        "partial": 2,
+        "missing": 76,
+        "partial": 3,
         "divergent": 71,
         "parity": 53
       },
       "by_severity": {
-        "s2-capability": 88,
-        "s4-intentional": 54,
+        "s2-capability": 89,
+        "s4-intentional": 53,
         "s1-correctness": 38,
         "s3-perf": 31
       },
@@ -2548,13 +2548,13 @@
     {
       "id": "sync-conflict-error-surfaced-not-handled",
       "layer": "sync",
-      "kind": "missing",
+      "kind": "partial",
       "turso_ref": "turso-src/sync/engine/src/errors.rs::Error::DatabaseSyncEngineConflict, turso-src/sync/engine/src/database_sync_operations.rs (status==\"conflict\" -> DatabaseSyncEngineConflict, wal_push conflict handling)",
-      "ahtola_ref": "none",
-      "severity": "s4-intentional",
+      "ahtola_ref": "src/Ahtola.Data/AhtolaReplicaPushFailureKind.cs (AhtolaReplicaPushFailureKind, AhtolaReplicaPushFailure.Classify), src/Ahtola.Data/AhtolaReplicaConflictException.cs, src/Ahtola.Data/AhtolaRemoteClient.cs (CreateRemoteError/SendPipelineAsync/PushReplicaChangesAsync push response boundary), src/Ahtola.Data/AhtolaConnection.cs (IsTransientAutomaticSyncFailure)",
+      "severity": "s2-capability",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Updated 2026-08-20: this is managed-native work independent of the missing Turso.Data.Sync companion, so it is pulled out of the s4-intentional companion bucket. The managed push boundary now classifies every push failure into a stable public AhtolaReplicaPushFailureKind (Conflict/TransientTransport/InvalidLocalState) via AhtolaReplicaPushFailure.Classify, mirroring Turso's status==\"conflict\" -> DatabaseSyncEngineConflict split from retryable transport failures. AhtolaReplicaConflictException always carries Conflict; non-conflict remote SQL/shape errors and local-invariant violations carry InvalidLocalState; transport-layer failures (timeouts, no HTTP response, 5xx/429) carry TransientTransport. The local push journal/metadata are retained (never acked/dropped) on any classification. Still missing: automatic rebase-before-retry orchestration and any future revert-WAL rollback (tracked separately by sync-no-revert-db-checkpoint-safety) — callers today can react to the classification but Ahtola does not yet resolve the conflict for them.",
       "status": "closed"
     },
     {

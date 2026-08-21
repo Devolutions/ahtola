@@ -1195,17 +1195,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         if (exception is AhtolaReplicaConflictException || cancellationToken.IsCancellationRequested)
             return false;
 
-        return exception switch
-        {
-            AhtolaException ahtolaException => ahtolaException.IsTransientRemoteHttpFailure,
-            HttpRequestException requestException => requestException.StatusCode is null
-                or System.Net.HttpStatusCode.RequestTimeout
-                or System.Net.HttpStatusCode.TooManyRequests
-                || requestException.StatusCode is { } status
-                && (int)status is >= 500 and <= 599,
-            TaskCanceledException => true,
-            _ => false,
-        };
+        return AhtolaReplicaPushFailure.Classify(exception) == AhtolaReplicaPushFailureKind.TransientTransport;
     }
 
     private Exception? StopAutomaticManagedReplicaSync()

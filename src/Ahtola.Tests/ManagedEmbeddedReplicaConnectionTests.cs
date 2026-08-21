@@ -2075,7 +2075,69 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             connection.Open();
             connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
 
-            Assert.ThrowsAsync<AhtolaException>(() => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            var exception = Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.TransientTransport);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.TransientTransport);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            handler.PullCallCount.Should().Be(1);
+            handler.PushCallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task SyncAsyncClassifiesNonConflictRemoteBatchErrorsAsInvalidLocalStateAndRetainsJournal()
+    {
+        var path = NewReplicaPath("managed-replica-push-invalid-local-state");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var handler = new ReplicaPushHandler(
+            [CreatePullResponse("revision-42", image)],
+            _ => ReplicaPushHandler.BatchErrorResponse(5, 2, "malformed statement", "SQLITE_ERROR"));
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+
+            var exception = Assert.ThrowsAsync<AhtolaRemoteSqlException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            handler.PullCallCount.Should().Be(1);
+            handler.PushCallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task SyncAsyncClassifiesNonRetryableHttpPushFailuresAsInvalidLocalStateAndRetainsJournal()
+    {
+        var path = NewReplicaPath("managed-replica-push-http-invalid-local-state");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var handler = new ReplicaPushHandler(
+            [CreatePullResponse("revision-42", image)],
+            _ => new HttpResponseMessage(HttpStatusCode.BadRequest)
+            {
+                Content = new StringContent("malformed pipeline request"),
+            });
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+
+            var exception = Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
             connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
             handler.PullCallCount.Should().Be(1);
             handler.PushCallCount.Should().Be(1);
@@ -2105,6 +2167,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             exception!.RemoteErrorCode.Should().Be("SQLITE_CONSTRAINT");
             exception.ConflictKind.Should().Be(AhtolaReplicaConflictKind.RowWrite);
             exception.LocalChangeSequence.Should().Be(1);
+            exception.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.Conflict);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.Conflict);
             connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
             handler.PullCallCount.Should().Be(1);
             handler.PushCallCount.Should().Be(1);
@@ -2403,6 +2467,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             exception!.RemoteErrorCode.Should().Be("SQLITE_SCHEMA");
             exception.ConflictKind.Should().Be(AhtolaReplicaConflictKind.SchemaChange);
             exception.LocalChangeSequence.Should().Be(1);
+            exception.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.Conflict);
+            AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.Conflict);
             connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle()
                 .Which.Kind.Should().Be(ReplicaLocalChangeKind.Schema);
             handler.PullCallCount.Should().Be(1);
