@@ -106,7 +106,8 @@ public sealed class AhtolaReplicaOptions
     public TimeSpan? LongPollTimeout { get; init; }
 
     /// <summary>
-    /// Gets or initializes partial bootstrap and lazy page loading.
+    /// Gets or initializes partial bootstrap and lazy page loading. The pure-managed provider
+    /// supports eager prefix selection only and requires the prefix to cover the complete database.
     /// </summary>
     public AhtolaPartialBootstrapOptions? PartialBootstrap { get; init; }
 

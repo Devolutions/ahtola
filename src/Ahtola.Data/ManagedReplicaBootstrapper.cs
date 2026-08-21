@@ -902,7 +902,8 @@ internal static class ManagedReplicaBootstrapper
             : new HttpClient();
         client.Timeout = Timeout.InfiniteTimeSpan;
         using var request = new HttpRequestMessage(HttpMethod.Post, CreatePullUpdatesUri(options.RemoteUri));
-        request.Content = new ByteArrayContent(CreateInitialPullRequest(options.LongPollTimeout));
+        var prefixPageCount = GetPrefixPageCount(options.PartialBootstrap);
+        request.Content = new ByteArrayContent(CreateInitialPullRequest(options.LongPollTimeout, prefixPageCount));
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/protobuf");
         request.Headers.TryAddWithoutValidation("Accept-Encoding", "application/protobuf");
 
@@ -926,6 +927,13 @@ internal static class ManagedReplicaBootstrapper
         {
             throw new InvalidDataException(
                 "Managed embedded replica bootstrap requires a raw page stream; the server returned an MVCC logical-log stream.");
+        }
+        if (prefixPageCount is { } selectedPages && selectedPages < header.DatabasePages)
+        {
+            throw new NotSupportedException(
+                $"Managed embedded replica prefix bootstrap selected {selectedPages} of {header.DatabasePages} pages. "
+                + "The managed pager has no lazy page-fault storage, so the replica cannot be opened safely. "
+                + "Increase the prefix to cover the complete database.");
         }
 
         var databaseLength = checked((long)header.DatabasePages * PageSize);
@@ -1238,8 +1246,8 @@ internal static class ManagedReplicaBootstrapper
             throw new InvalidDataException($"The pull-updates response has an unsupported {name} payload.");
     }
 
-    private static byte[] CreateInitialPullRequest(TimeSpan? longPollTimeout)
-        => CreatePullRequest(clientRevision: null, longPollTimeout, requestLogicalProtocol: false);
+    private static byte[] CreateInitialPullRequest(TimeSpan? longPollTimeout, uint? prefixPageCount)
+        => CreatePullRequest(clientRevision: null, longPollTimeout, requestLogicalProtocol: false, prefixPageCount);
 
     /// <summary>
     /// Builds a <c>PullUpdatesReqProtoBody</c> request. <paramref name="clientRevision"/> is
@@ -1248,7 +1256,11 @@ internal static class ManagedReplicaBootstrapper
     /// <paramref name="requestLogicalProtocol"/> encodes tag 8 (<c>stream_kind</c>) as
     /// <c>MvccLogicalLog</c> (1) instead of leaving it at its <c>Pages</c> (0) default.
     /// </summary>
-    private static byte[] CreatePullRequest(string? clientRevision, TimeSpan? longPollTimeout, bool requestLogicalProtocol)
+    private static byte[] CreatePullRequest(
+        string? clientRevision,
+        TimeSpan? longPollTimeout,
+        bool requestLogicalProtocol,
+        uint? prefixPageCount = null)
     {
         var request = new List<byte>(clientRevision is null ? 6 : clientRevision.Length + 12);
         if (!string.IsNullOrEmpty(clientRevision))
@@ -1268,7 +1280,83 @@ internal static class ManagedReplicaBootstrapper
             WriteVarint(request, 8u << 3);
             WriteVarint(request, 1); // PullUpdatesStreamKind::MvccLogicalLog
         }
+        if (prefixPageCount is { } pageCount)
+        {
+            var selector = CreatePageRangeSelector(pageCount);
+            WriteVarint(request, 5u << 3 | 2);
+            WriteVarint(request, checked((ulong)selector.Length));
+            request.AddRange(selector);
+        }
         return request.ToArray();
+    }
+
+    private static uint? GetPrefixPageCount(AhtolaPartialBootstrapOptions? partialBootstrap)
+        => partialBootstrap?.Kind == AhtolaPartialBootstrapKind.Prefix
+            ? checked((uint)(partialBootstrap.PrefixLength / PageSize))
+            : null;
+
+    /// <summary>
+    /// Serializes the zero-based page range <c>[0, endExclusive)</c> using the portable
+    /// RoaringBitmap format consumed by Turso's <c>server_pages_selector</c> field.
+    /// </summary>
+    private static byte[] CreatePageRangeSelector(uint endExclusive)
+    {
+        const uint noRunContainerCookie = 12346;
+        const int arrayContainerMaximumCardinality = 4096;
+        const int bitmapContainerSize = 8192;
+
+        if (endExclusive == 0)
+            throw new ArgumentOutOfRangeException(nameof(endExclusive));
+
+        var containerCount = checked((int)((endExclusive + ushort.MaxValue) / 65536));
+        var cardinalities = new int[containerCount];
+        for (var container = 0; container < containerCount; container++)
+        {
+            var containerStart = checked((uint)container * 65536);
+            cardinalities[container] = checked((int)Math.Min(65536u, endExclusive - containerStart));
+        }
+
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+        writer.Write(noRunContainerCookie);
+        writer.Write(checked((uint)containerCount));
+        for (var container = 0; container < containerCount; container++)
+        {
+            writer.Write(checked((ushort)container));
+            writer.Write(checked((ushort)(cardinalities[container] - 1)));
+        }
+
+        var offset = checked(8 + containerCount * 8);
+        foreach (var cardinality in cardinalities)
+        {
+            writer.Write(checked((uint)offset));
+            offset = checked(offset + (cardinality <= arrayContainerMaximumCardinality
+                ? cardinality * sizeof(ushort)
+                : bitmapContainerSize));
+        }
+
+        foreach (var cardinality in cardinalities)
+        {
+            if (cardinality <= arrayContainerMaximumCardinality)
+            {
+                for (var value = 0; value < cardinality; value++)
+                    writer.Write(checked((ushort)value));
+                continue;
+            }
+
+            for (var word = 0; word < 1024; word++)
+            {
+                var remainingBits = cardinality - word * 64;
+                var value = remainingBits >= 64
+                    ? ulong.MaxValue
+                    : remainingBits <= 0
+                        ? 0
+                        : (1UL << remainingBits) - 1;
+                writer.Write(value);
+            }
+        }
+
+        return stream.ToArray();
     }
 
     private static Uri CreatePullUpdatesUri(Uri endpoint)

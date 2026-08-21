@@ -9,10 +9,31 @@ internal static class ManagedReplicaSupportMatrix
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        if (options.PartialBootstrap is not null)
+        if (options.PartialBootstrap is { } partialBootstrap)
         {
-            throw new NotSupportedException(
-                "Managed embedded replicas support only a complete raw 4 KiB page bootstrap; partial, query, and lazy bootstrap are not supported.");
+            if (partialBootstrap.Kind == AhtolaPartialBootstrapKind.Query)
+            {
+                throw new NotSupportedException(
+                    "Managed embedded replicas do not support query-selected bootstrap pages.");
+            }
+
+            if (partialBootstrap.Kind != AhtolaPartialBootstrapKind.Prefix)
+            {
+                throw new NotSupportedException(
+                    "Managed embedded replicas do not support the selected partial bootstrap mode.");
+            }
+
+            if (partialBootstrap.SegmentSize is not null || partialBootstrap.Prefetch)
+            {
+                throw new NotSupportedException(
+                    "Managed embedded replicas support eager prefix bootstrap only; lazy segment loading and prefetch are not supported.");
+            }
+
+            if (partialBootstrap.PrefixLength < 4096)
+            {
+                throw new NotSupportedException(
+                    "Managed embedded replica prefix bootstrap must select at least one complete 4 KiB page.");
+            }
         }
 
         if (options.PullBytesThreshold is not null)

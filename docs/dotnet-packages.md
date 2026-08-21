@@ -439,6 +439,15 @@ installed atomically. Pending local row changes are preserved across logical
 pulls; unsafe residual deletes or schema changes fail closed until they have
 been pushed. Protocol-1 databases keep the page-incremental path.
 
+The pure-managed provider supports `AhtolaPartialBootstrapOptions.Prefix(...)`
+as an **eager page selector** for the initial pull. It sends Turso's
+`server_pages_selector` range, but publishes and opens the replica only when
+that range covers every page in the server-declared database size. If pages
+would be missing, `Open` throws before a database or metadata file is
+installed because the managed pager has no lazy page-fault storage. Query
+selection, `SegmentSize`, and `Prefetch` are rejected before any network or
+local-state mutation.
+
 Embedded replicas support `DbBatch` through both facades. Enum parameters bind
 as their underlying SQLite integer value. Extra parameters that are not
 referenced by the SQL are ignored; every referenced slot still requires a
