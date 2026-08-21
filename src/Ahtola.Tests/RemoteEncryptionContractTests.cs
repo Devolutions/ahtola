@@ -37,13 +37,34 @@ public sealed class RemoteEncryptionContractTests
     }
 
     [Test]
-    public void RemoteClientSendsEncryptionKeyHeader()
+    public void RemoteClientRejectsEncryptionOverNonLoopbackHttpWithoutAuthToken()
+    {
+        using var handler = new CapturingHandler();
+        using var httpClient = new HttpClient(handler);
+
+        var action = () => new AhtolaRemoteClient(
+            httpClient,
+            new Uri("http://database.example"),
+            authToken: null,
+            remoteEncryption: new AhtolaRemoteEncryptionOptions(
+                "c2VjcmV0",
+                AhtolaRemoteEncryptionCipher.Aes256Gcm));
+
+        action.Should().Throw<InvalidOperationException>()
+            .WithMessage(
+                "Remote encryption requires an HTTPS remote Ahtola URL unless the host is localhost or loopback.");
+        handler.CallCount.Should().Be(0);
+    }
+
+    [TestCase("https://example.com")]
+    [TestCase("http://localhost")]
+    public void RemoteClientAllowsEncryptionOverHttpsOrLoopbackHttp(string endpoint)
     {
         using var handler = new CapturingHandler();
         using var httpClient = new HttpClient(handler);
         using var client = new AhtolaRemoteClient(
             httpClient,
-            new Uri("https://example.com"),
+            new Uri(endpoint),
             authToken: null,
             remoteEncryption: new AhtolaRemoteEncryptionOptions(
                 "c2VjcmV0",
@@ -58,16 +79,20 @@ public sealed class RemoteEncryptionContractTests
             CancellationToken.None));
 
         handler.EncryptionKey.Should().Be("c2VjcmV0");
+        handler.CallCount.Should().Be(1);
     }
 
     private sealed class CapturingHandler : HttpMessageHandler
     {
+        public int CallCount { get; private set; }
+
         public string? EncryptionKey { get; private set; }
 
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
+            CallCount++;
             EncryptionKey = request.Headers.TryGetValues("x-turso-encryption-key", out var values)
                 ? values.Single()
                 : null;

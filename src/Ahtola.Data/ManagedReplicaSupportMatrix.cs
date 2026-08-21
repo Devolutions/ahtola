@@ -8,6 +8,7 @@ internal static class ManagedReplicaSupportMatrix
     public static void ValidateOptions(AhtolaReplicaOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
+        options.Validate();
 
         if (options.PartialBootstrap is { } partialBootstrap)
         {
