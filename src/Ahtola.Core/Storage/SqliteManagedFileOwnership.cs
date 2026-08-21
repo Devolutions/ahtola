@@ -857,21 +857,40 @@ internal static class SqliteManagedFileOwnershipRegistry
         {
             var identityKey = RegistryKey.ForIdentity(
                 SqliteWalSharedMemoryCarrierIdentity.FromPath(canonicalPath));
+            SqliteManagedFileOwnership? registeredOwner = null;
             lock (Gate)
             {
                 if (Owners.TryGetValue(identityKey, out var existing)
                     && !ReferenceEquals(existing, owner))
                 {
-                    throw new InvalidOperationException(
-                        "The SQLite database was opened concurrently through two aliases before its file identity was registered.");
+                    registeredOwner = existing;
+                    foreach (var staleKey in Owners
+                                 .Where(pair => ReferenceEquals(pair.Value, owner))
+                                 .Select(pair => pair.Key)
+                                 .ToArray())
+                    {
+                        Owners.Remove(staleKey);
+                    }
                 }
-
-                Owners[identityKey] = owner;
-                if (Owners.TryGetValue(pathKey, out var pathOwner)
-                    && ReferenceEquals(pathOwner, owner))
+                else
                 {
-                    Owners.Remove(pathKey);
+                    Owners[identityKey] = owner;
+                    if (Owners.TryGetValue(pathKey, out var pathOwner)
+                        && ReferenceEquals(pathOwner, owner))
+                    {
+                        Owners.Remove(pathKey);
+                    }
                 }
+            }
+
+            if (registeredOwner is not null)
+            {
+                client.Dispose();
+                return registeredOwner.AcquireClient(
+                    canonicalPath,
+                    createNew: false,
+                    readOnly,
+                    timeout);
             }
 
             return client;
