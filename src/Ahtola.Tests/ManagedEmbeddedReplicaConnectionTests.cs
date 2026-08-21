@@ -575,7 +575,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         {
             var payload = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
             var selector = ReadLengthDelimitedField(payload, 5);
-            ReadPortableRoaringBitmap(selector).Should().Equal(
+            DecodeRoaringPageSelector(selector).Should().Equal(
                 Enumerable.Range(0, pageCount).Select(static page => checked((uint)page)));
         });
         var options = CreateOptions(
@@ -658,13 +658,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             {
                 var payload = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
                 var selector = ReadLengthDelimitedField(payload, 5);
-                selector.Should().Equal(
-                    0x3a, 0x30, 0x00, 0x00, // portable no-run cookie (12346)
-                    0x01, 0x00, 0x00, 0x00, // one container
-                    0x00, 0x00, 0x00, 0x00, // key 0, cardinality 1
-                    0x10, 0x00, 0x00, 0x00, // container payload offset
-                    0x00, 0x00);             // page 0
-                ReadPortableRoaringBitmap(selector).Should().Equal(0u);
+                DecodeRoaringPageSelector(selector).Should().Equal(0u);
             });
         var options = CreateOptions(
             path,
@@ -4173,51 +4167,6 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
 
         throw new InvalidOperationException($"Protobuf field {requestedField} was not found.");
-    }
-
-    private static IReadOnlyList<uint> ReadPortableRoaringBitmap(byte[] payload)
-    {
-        const uint noRunContainerCookie = 12346;
-        const int arrayContainerMaximumCardinality = 4096;
-
-        using var stream = new MemoryStream(payload);
-        using var reader = new BinaryReader(stream);
-        reader.ReadUInt32().Should().Be(noRunContainerCookie);
-        var containerCount = checked((int)reader.ReadUInt32());
-        var containers = new (ushort Key, int Cardinality)[containerCount];
-        for (var container = 0; container < containerCount; container++)
-            containers[container] = (reader.ReadUInt16(), reader.ReadUInt16() + 1);
-        for (var container = 0; container < containerCount; container++)
-            _ = reader.ReadUInt32();
-
-        var pages = new List<uint>();
-        foreach (var (key, cardinality) in containers)
-        {
-            if (cardinality <= arrayContainerMaximumCardinality)
-            {
-                for (var value = 0; value < cardinality; value++)
-                    pages.Add(((uint)key << 16) | reader.ReadUInt16());
-                continue;
-            }
-
-            var remaining = cardinality;
-            for (var wordIndex = 0; wordIndex < 1024; wordIndex++)
-            {
-                var word = reader.ReadUInt64();
-                for (var bit = 0; bit < 64; bit++)
-                {
-                    if ((word & (1UL << bit)) != 0)
-                    {
-                        pages.Add(((uint)key << 16) | checked((uint)(wordIndex * 64 + bit)));
-                        remaining--;
-                    }
-                }
-            }
-            remaining.Should().Be(0);
-        }
-
-        stream.Position.Should().Be(stream.Length);
-        return pages;
     }
 
     private static ulong ReadVarint(byte[] source, ref int offset)
