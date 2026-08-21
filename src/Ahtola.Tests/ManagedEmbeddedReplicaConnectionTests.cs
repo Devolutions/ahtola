@@ -560,6 +560,38 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public void CreateReplicaPrefixBootstrapSelectsTheRequestedPageRangeAndOpensWhenComplete()
+    {
+        var path = NewReplicaPath("managed-replica-prefix-bootstrap");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        (databaseImage.Length % 4096).Should().Be(0);
+        var pageCount = checked(databaseImage.Length / 4096);
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-prefix", databaseImage), request =>
+        {
+            var payload = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+            var selector = ReadLengthDelimitedField(payload, 5);
+            ReadPortableRoaringBitmap(selector).Should().Equal(
+                Enumerable.Range(0, pageCount).Select(static page => checked((uint)page)));
+        });
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(databaseImage.Length));
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+            ReadBootstrapMarker(connection).Should().Be(42);
+            handler.CallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public void ChunkedBootstrapFailureDoesNotPublishPartialState()
     {
         var sourcePath = NewReplicaPath("managed-replica-chunked-bootstrap-failure-source");
@@ -603,6 +635,49 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         {
             DeleteReplicaFiles(sourcePath);
             DeleteReplicaFiles(replicaPath);
+        }
+    }
+
+    [Test]
+    public void CreateReplicaPrefixBootstrapRejectsMissingPagesBeforeInstallingTheReplica()
+    {
+        var path = NewReplicaPath("managed-replica-incomplete-prefix-bootstrap");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        databaseImage.Length.Should().BeGreaterThan(4096);
+        var handler = new PullUpdatesHandler(
+            CreatePullResponse(
+                "revision-prefix",
+                databaseImage[..4096],
+                declaredPages: checked((ulong)(databaseImage.Length / 4096))),
+            request =>
+            {
+                var payload = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+                var selector = ReadLengthDelimitedField(payload, 5);
+                selector.Should().Equal(
+                    0x3a, 0x30, 0x00, 0x00, // portable no-run cookie (12346)
+                    0x01, 0x00, 0x00, 0x00, // one container
+                    0x00, 0x00, 0x00, 0x00, // key 0, cardinality 1
+                    0x10, 0x00, 0x00, 0x00, // container payload offset
+                    0x00, 0x00);             // page 0
+                ReadPortableRoaringBitmap(selector).Should().Equal(0u);
+            });
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<NotSupportedException>(() => connection.Open())!
+                .Message.Should().Contain("no lazy page-fault storage");
+            handler.CallCount.Should().Be(1);
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
         }
     }
 
@@ -2277,8 +2352,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [TestCase(UnsupportedReplicaMode.RemoteEncryption)]
-    [TestCase(UnsupportedReplicaMode.PartialPrefix)]
     [TestCase(UnsupportedReplicaMode.PartialQuery)]
+    [TestCase(UnsupportedReplicaMode.PartialPrefixLazy)]
     public void CreateReplicaRejectsUnsupportedModesBeforeOpeningOrMutatingLocalState(
         UnsupportedReplicaMode mode)
     {
@@ -2289,7 +2364,11 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         try
         {
             using var connection = AhtolaConnection.CreateReplica(options);
-            Assert.Throws<NotSupportedException>(() => connection.Open());
+            var exception = Assert.Throws<NotSupportedException>(() => connection.Open())!;
+            if (mode == UnsupportedReplicaMode.PartialQuery)
+                exception.Message.Should().Contain("query-selected bootstrap pages");
+            if (mode == UnsupportedReplicaMode.PartialPrefixLazy)
+                exception.Message.Should().Contain("eager prefix bootstrap only");
 
             handler.CallCount.Should().Be(0);
             File.Exists(path).Should().BeFalse();
@@ -3386,12 +3465,14 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         string path,
         HttpMessageHandler handler,
         int syncInterval = 0,
-        long? pushOperationsThreshold = null)
+        long? pushOperationsThreshold = null,
+        AhtolaPartialBootstrapOptions? partialBootstrap = null)
         => new(path, new Uri("https://example.test/cluster"), authToken: "token-42")
         {
             LongPollTimeout = TimeSpan.FromSeconds(3),
             SyncInterval = syncInterval,
             PushOperationsThreshold = pushOperationsThreshold,
+            PartialBootstrap = partialBootstrap,
             HttpPolicy = new AhtolaSyncHttpPolicy(handler),
         };
 
@@ -3413,20 +3494,23 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                     AhtolaRemoteEncryptionCipher.Aes256Gcm),
                 HttpPolicy = options.HttpPolicy,
             },
-            UnsupportedReplicaMode.PartialPrefix => new AhtolaReplicaOptions(
-                path,
-                options.RemoteUri,
-                options.AuthToken)
-            {
-                PartialBootstrap = AhtolaPartialBootstrapOptions.Prefix(4096),
-                HttpPolicy = options.HttpPolicy,
-            },
             UnsupportedReplicaMode.PartialQuery => new AhtolaReplicaOptions(
                 path,
                 options.RemoteUri,
                 options.AuthToken)
             {
                 PartialBootstrap = AhtolaPartialBootstrapOptions.QueryPages("SELECT 1"),
+                HttpPolicy = options.HttpPolicy,
+            },
+            UnsupportedReplicaMode.PartialPrefixLazy => new AhtolaReplicaOptions(
+                path,
+                options.RemoteUri,
+                options.AuthToken)
+            {
+                PartialBootstrap = AhtolaPartialBootstrapOptions.Prefix(
+                    4096,
+                    segmentSize: 8192,
+                    prefetch: true),
                 HttpPolicy = options.HttpPolicy,
             },
             _ => throw new ArgumentOutOfRangeException(nameof(mode)),
@@ -3695,6 +3779,79 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         }
         return fields;
     }
+
+    private static byte[] ReadLengthDelimitedField(byte[] payload, int requestedField)
+    {
+        var offset = 0;
+        while (offset < payload.Length)
+        {
+            var key = ReadVarint(payload, ref offset);
+            var field = checked((int)(key >> 3));
+            var wireType = checked((int)(key & 7));
+            if (wireType == 0)
+            {
+                _ = ReadVarint(payload, ref offset);
+                continue;
+            }
+            if (wireType != 2)
+                throw new InvalidOperationException("Unsupported test protobuf wire type.");
+
+            var length = checked((int)ReadVarint(payload, ref offset));
+            if (length > payload.Length - offset)
+                throw new InvalidOperationException("Invalid test protobuf field length.");
+            if (field == requestedField)
+                return payload.AsSpan(offset, length).ToArray();
+            offset += length;
+        }
+
+        throw new InvalidOperationException($"Protobuf field {requestedField} was not found.");
+    }
+
+    private static IReadOnlyList<uint> ReadPortableRoaringBitmap(byte[] payload)
+    {
+        const uint noRunContainerCookie = 12346;
+        const int arrayContainerMaximumCardinality = 4096;
+
+        using var stream = new MemoryStream(payload);
+        using var reader = new BinaryReader(stream);
+        reader.ReadUInt32().Should().Be(noRunContainerCookie);
+        var containerCount = checked((int)reader.ReadUInt32());
+        var containers = new (ushort Key, int Cardinality)[containerCount];
+        for (var container = 0; container < containerCount; container++)
+            containers[container] = (reader.ReadUInt16(), reader.ReadUInt16() + 1);
+        for (var container = 0; container < containerCount; container++)
+            _ = reader.ReadUInt32();
+
+        var pages = new List<uint>();
+        foreach (var (key, cardinality) in containers)
+        {
+            if (cardinality <= arrayContainerMaximumCardinality)
+            {
+                for (var value = 0; value < cardinality; value++)
+                    pages.Add(((uint)key << 16) | reader.ReadUInt16());
+                continue;
+            }
+
+            var remaining = cardinality;
+            for (var wordIndex = 0; wordIndex < 1024; wordIndex++)
+            {
+                var word = reader.ReadUInt64();
+                for (var bit = 0; bit < 64; bit++)
+                {
+                    if ((word & (1UL << bit)) != 0)
+                    {
+                        pages.Add(((uint)key << 16) | checked((uint)(wordIndex * 64 + bit)));
+                        remaining--;
+                    }
+                }
+            }
+            remaining.Should().Be(0);
+        }
+
+        stream.Position.Should().Be(stream.Length);
+        return pages;
+    }
+
     private static ulong ReadVarint(byte[] source, ref int offset)
     {
         ulong result = 0;
@@ -3748,8 +3905,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     public enum UnsupportedReplicaMode
     {
         RemoteEncryption,
-        PartialPrefix,
         PartialQuery,
+        PartialPrefixLazy,
     }
 
     private readonly record struct BootstrapPullRequest(

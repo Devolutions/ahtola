@@ -904,6 +904,14 @@ internal static class ManagedReplicaBootstrapper
         var chunkPages = options.PullBytesThreshold is { } threshold
             ? Math.Min(checked((ulong)((threshold - 1) / PageSize + 1)), uint.MaxValue)
             : (ulong?)null;
+        var prefixPageCount = GetPrefixPageCount(options.PartialBootstrap);
+        var firstRequestPages = chunkPages;
+        if (prefixPageCount is { } prefixPages)
+        {
+            firstRequestPages = firstRequestPages is { } boundedPages
+                ? Math.Min(boundedPages, prefixPages)
+                : prefixPages;
+        }
 
         await using (var staging = new FileStream(
             stagingPath,
@@ -913,8 +921,8 @@ internal static class ManagedReplicaBootstrapper
             bufferSize: PageSize,
             FileOptions.Asynchronous | FileOptions.WriteThrough))
         {
-            var firstSelector = chunkPages is { } firstChunkPages
-                ? CreatePageRangeSelector(0, checked((uint)firstChunkPages))
+            var firstSelector = firstRequestPages is { } requestedPages
+                ? CreatePageRangeSelector(0, checked((uint)requestedPages))
                 : [];
             var header = await PullBootstrapChunkAsync(
                     client,
@@ -927,9 +935,16 @@ internal static class ManagedReplicaBootstrapper
                         firstSelector),
                     expectedHeader: null,
                     requestedStart: 0,
-                    requestedEnd: chunkPages,
+                    requestedEnd: firstRequestPages,
                     cancellationToken)
                 .ConfigureAwait(false);
+            if (prefixPageCount is { } selectedPages && selectedPages < header.DatabasePages)
+            {
+                throw new NotSupportedException(
+                    $"Managed embedded replica prefix bootstrap selected {selectedPages} of {header.DatabasePages} pages. "
+                    + "The managed pager has no lazy page-fault storage, so the replica cannot be opened safely. "
+                    + "Increase the prefix to cover the complete database.");
+            }
 
             if (chunkPages is { } pagesPerChunk)
             {
@@ -1002,7 +1017,6 @@ internal static class ManagedReplicaBootstrapper
             throw new InvalidDataException(
                 "Managed embedded replica bootstrap requires a raw page stream; the server returned an MVCC logical-log stream.");
         }
-
         if (expectedHeader is { } expected
             && (header.Revision != expected.Revision
                 || header.DatabasePages != expected.DatabasePages
@@ -1384,14 +1398,6 @@ internal static class ManagedReplicaBootstrapper
             throw new InvalidDataException($"The pull-updates response has an unsupported {name} payload.");
     }
 
-    private static byte[] CreateInitialPullRequest(TimeSpan? longPollTimeout)
-        => CreatePullRequest(
-            serverRevision: null,
-            clientRevision: null,
-            longPollTimeout,
-            requestLogicalProtocol: false,
-            serverPagesSelector: []);
-
     private static byte[] CreateBootstrapPullRequest(
         string? serverRevision,
         TimeSpan? longPollTimeout,
@@ -1413,7 +1419,10 @@ internal static class ManagedReplicaBootstrapper
     /// <paramref name="requestLogicalProtocol"/> encodes tag 8 (<c>stream_kind</c>) as
     /// <c>MvccLogicalLog</c> (1) instead of leaving it at its <c>Pages</c> (0) default.
     /// </summary>
-    private static byte[] CreatePullRequest(string? clientRevision, TimeSpan? longPollTimeout, bool requestLogicalProtocol)
+    private static byte[] CreatePullRequest(
+        string? clientRevision,
+        TimeSpan? longPollTimeout,
+        bool requestLogicalProtocol)
     {
         return CreatePullRequest(
             serverRevision: null,
@@ -1469,6 +1478,11 @@ internal static class ManagedReplicaBootstrapper
         }
         return request.ToArray();
     }
+
+    private static uint? GetPrefixPageCount(AhtolaPartialBootstrapOptions? partialBootstrap)
+        => partialBootstrap?.Kind == AhtolaPartialBootstrapKind.Prefix
+            ? checked((uint)(partialBootstrap.PrefixLength / PageSize))
+            : null;
 
     private static Uri CreatePullUpdatesUri(Uri endpoint)
     {
