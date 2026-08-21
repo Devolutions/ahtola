@@ -5,8 +5,11 @@ This document is the **ordered engineering plan** to finish full Turso/SQLite WA
 
 **Hard rules**
 
-1. Main-file lock is Stage 6 SHARED (not exclusive 512-byte). Do not reintroduce exclusive ownership.
-2. Claim stock-SQLite SHARED coexistence only where Stage 6 tests cover it; PENDING/RESERVED DELETE polish may still deepen.
+1. Main-file locking is the Stage 6 SQLite protocol, not exclusive 512-byte
+   ownership: WAL retains SHARED; DELETE uses SHARED, RESERVED, PENDING, and
+   EXCLUSIVE at transaction boundaries.
+2. Keep WAL write/checkpoint serialization on `-shm`; the DELETE main-file
+   protocol must not weaken WAL mode.
 3. Detached foundations already exist; each stage’s job is to **attach** them to `SqlitePager` (and only then refine locks/busy/recovery).
 4. Byte-exact WAL-index layout (`SqliteWalIndex*`) is non-negotiable.
 5. MVCC is out of scope for this roadmap.
@@ -17,17 +20,19 @@ This document is the **ordered engineering plan** to finish full Turso/SQLite WA
 
 | Piece | Status |
 | --- | --- |
-| Stage 0 process-exclusive ownership | **Live** on physical pager |
-| Stage 1 WAL-index mapped + published from pager | **Attached** (under ownership) |
+| Stage 0 process-exclusive ownership | **Retired** |
+| Stage 1 WAL-index mapped + published from pager | **Attached** |
 | Stage 2 read marks via `SqliteWalReadSnapshotCoordinator` | **Attached** for physical WAL readers |
 | Stage 3 writer publish + CKPT_LOCK checkpoint/`nBackfill` | **Attached** |
 | Stage 4 busy taxonomy + SQLite backoff | **Attached** |
-| Stage 5 recovery + `iChange` invalidation | **Attached** (ownership remains; `-shm` unlink deferred) |
+| Stage 5 recovery + `iChange` invalidation | **Attached** (`-shm` unlink deferred) |
 | Stage 6 main-file SHARED (retire exclusive 512-byte ownership) | **Attached** |
 | Live multi-engine WAL (`-shm` DMS + shared readers) | **Attached** (stock SQLite 3.53+ coexistence proven; Turso binary differential optional) |
 | Foreign read-only guest (§1.9) | Live; not full interop |
 
-**Pager gate:** Stage 6 ownership retirement + concurrent SQLite/Turso interop proof. Stages 1–5 attached under Stage 0 ownership.
+**Pager gate:** Stages 1–6 are attached. Remaining WAL lifecycle work is
+last-connection `-shm` unlink/heap fallback plus optional Turso binary
+differential stress.
 
 ---
 
@@ -153,14 +158,27 @@ This document is the **ordered engineering plan** to finish full Turso/SQLite WA
 **Work**
 
 1. Only after Stages 1–5 exit criteria are green.
-2. Replace 512-byte main-file ownership with SQLite `PENDING`/`RESERVED`/`SHARED` (and DELETE-mode journal locks).
-3. Delete `SqliteManagedFileOwnership`.
+2. Replace 512-byte main-file ownership with SQLite
+   `PENDING`/`RESERVED`/`SHARED`/`EXCLUSIVE` locks for DELETE mode.
+3. Repurpose `SqliteManagedFileOwnership` as the canonical-path process broker
+   required to normalize Windows handle-scoped, Linux OFD, and macOS
+   process-scoped lock lifetimes.
 4. Differential stress: SQLite writer ↔ managed reader and reverse; `PRAGMA wal_checkpoint` agreement; Turso open of managed-produced artifacts and reverse.
 5. Update contract status banner from “Stage 0” to “Stage 6 complete”.
 
-**Landed:** main-file lock is SQLite SHARED (one byte) via `SqliteWalByteRangeLock`; path canonicalization follows symlinks; ownership tests flipped to coexistence for DELETE-mode and managed↔managed. WAL write exclusion stays on `-shm`. Live multi-engine WAL with stock SQLite is proven on Windows: shared `-shm` DMS, stock writer under a live managed reader (no `IOERR`), reverse direction, checkpoint agreement, empty/truncated WAL open, and long-lived managed peer-commit visibility via durable view-token refresh + force catalog reopen (`ManagedOwnershipHandoffPoolingTests`).
+**Landed:** path canonicalization follows symlinks and one broker aggregates
+logical locks onto a stable OS handle. WAL pagers retain lifetime SHARED while
+write exclusion stays on `-shm`. DELETE operations acquire SHARED; transactions
+add RESERVED at begin and PENDING + EXCLUSIVE at commit, with correct busy retry,
+downgrade, rollback, and disposal release. Long-lived DELETE pagers rescan the
+main file under their next SHARED lock. Stock-SQLite worker tests prove reader
+coexistence, writer conflict, PENDING exclusion of new readers, release after
+transaction/pager disposal, and peer-commit freshness. Live multi-engine WAL
+remains proven in both directions with checkpoint agreement.
 
-**Known remaining polish:** PENDING/RESERVED DELETE-mode writer upgrades; last-connection `-shm` unlink / heap WAL-index fallback; optional Turso binary differential stress; expanded process-isolation harness on Linux CI.
+**Known remaining polish:** last-connection `-shm` unlink / heap WAL-index
+fallback; optional Turso binary differential stress; expanded
+process-isolation harness on Linux CI.
 
 **Exit criteria**
 
@@ -168,7 +186,8 @@ This document is the **ordered engineering plan** to finish full Turso/SQLite WA
 - [x] No silent downgrade on unsupported platforms (still fail closed off Windows/Linux/macOS).
 - [x] Characterization suite rewritten for SHARED coexistence.
 - [x] Live WAL multi-engine `-shm` interop (stock SQLite + managed both WAL; reader/writer both directions + checkpoint).
-- [ ] PENDING/RESERVED DELETE polish + optional Turso differential stress.
+- [x] DELETE SHARED/RESERVED/PENDING/EXCLUSIVE protocol and release paths.
+- [ ] Optional Turso differential stress.
 
 ---
 

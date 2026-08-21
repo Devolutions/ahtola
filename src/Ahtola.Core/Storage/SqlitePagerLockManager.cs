@@ -139,6 +139,7 @@ public sealed class SqlitePagerLockManager
     private int _readerCount;
     private int _checkpointWaiterCount;
     private bool _writerActive;
+    private bool _writerExclusivePending;
     private bool _checkpointActive;
     private long _generation;
     private long _journalModeGeneration;
@@ -233,15 +234,47 @@ public sealed class SqlitePagerLockManager
     /// demand like a native read-write connection; a read-only pager must not.
     /// </summary>
     internal SqlitePagerLockLease EnterReader(TimeSpan? busyTimeout, bool pagerReadOnly)
-        => Enter(SqlitePagerLockOperation.Reader, NormalizeTimeout(busyTimeout), pagerReadOnly);
+        => Enter(
+            SqlitePagerLockOperation.Reader,
+            NormalizeTimeout(busyTimeout),
+            pagerReadOnly,
+            useExternalCoordinator: true);
+
+    internal SqlitePagerLockLease EnterReader(
+        TimeSpan? busyTimeout,
+        bool pagerReadOnly,
+        bool useExternalCoordinator)
+        => Enter(
+            SqlitePagerLockOperation.Reader,
+            NormalizeTimeout(busyTimeout),
+            pagerReadOnly,
+            useExternalCoordinator);
 
     /// <summary>Acquires the single WAL writer lock.</summary>
     public SqlitePagerLockLease EnterWriter(TimeSpan? busyTimeout = null)
         => Enter(SqlitePagerLockOperation.Writer, NormalizeTimeout(busyTimeout));
 
+    internal SqlitePagerLockLease EnterWriter(
+        TimeSpan? busyTimeout,
+        bool useExternalCoordinator)
+        => Enter(
+            SqlitePagerLockOperation.Writer,
+            NormalizeTimeout(busyTimeout),
+            pagerReadOnly: false,
+            useExternalCoordinator);
+
     /// <summary>Acquires an exclusive checkpoint lock.</summary>
     public SqlitePagerLockLease EnterCheckpoint(TimeSpan? busyTimeout = null)
         => Enter(SqlitePagerLockOperation.Checkpoint, NormalizeTimeout(busyTimeout));
+
+    internal SqlitePagerLockLease EnterCheckpoint(
+        TimeSpan? busyTimeout,
+        bool useExternalCoordinator)
+        => Enter(
+            SqlitePagerLockOperation.Checkpoint,
+            NormalizeTimeout(busyTimeout),
+            pagerReadOnly: false,
+            useExternalCoordinator);
 
     /// <summary>
     /// Acquires SQLite's WAL recovery lock for writable open and recovery.
@@ -280,7 +313,8 @@ public sealed class SqlitePagerLockManager
     private SqlitePagerLockLease Enter(
         SqlitePagerLockOperation operation,
         TimeSpan timeout,
-        bool pagerReadOnly = true)
+        bool pagerReadOnly = true,
+        bool useExternalCoordinator = true)
     {
         var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
         lock (_gate)
@@ -319,7 +353,7 @@ public sealed class SqlitePagerLockManager
         var leaseHandedOff = false;
         try
         {
-            if (_coordinator is not null)
+            if (_coordinator is not null && useExternalCoordinator)
             {
                 var coordinatorTimeout = RemainingFileLockTimeout(timeout, stopwatch);
                 if (coordinatorTimeout == TimeSpan.Zero && timeout != TimeSpan.Zero)
@@ -375,6 +409,25 @@ public sealed class SqlitePagerLockManager
         }
     }
 
+    internal void UpgradeWriterToExclusive(TimeSpan timeout)
+    {
+        var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
+        lock (_gate)
+        {
+            if (!_writerActive)
+                throw new InvalidOperationException("The SQLite writer lease is no longer active.");
+
+            _writerExclusivePending = true;
+            while (_readerCount != 0)
+            {
+                var remaining = RemainingTimeout(timeout, stopwatch);
+                if (remaining == TimeSpan.Zero)
+                    throw new SqlitePagerBusyException(SqlitePagerLockOperation.Writer, timeout);
+                Monitor.Wait(_gate, remaining);
+            }
+        }
+    }
+
     internal long PublishJournalModeChange(SqlitePagerLockOperation operation)
     {
         lock (_gate)
@@ -411,6 +464,7 @@ public sealed class SqlitePagerLockManager
                 case SqlitePagerLockOperation.Writer:
                     if (!_writerActive)
                         throw new InvalidOperationException("SQLite writer lock is not active.");
+                    _writerExclusivePending = false;
                     _writerActive = false;
                     break;
                 case SqlitePagerLockOperation.Checkpoint:
@@ -495,7 +549,10 @@ public sealed class SqlitePagerLockManager
     private bool CanEnter(SqlitePagerLockOperation operation)
         => operation switch
         {
-            SqlitePagerLockOperation.Reader => !_checkpointActive && _checkpointWaiterCount == 0,
+            SqlitePagerLockOperation.Reader =>
+                !_checkpointActive
+                && !_writerExclusivePending
+                && _checkpointWaiterCount == 0,
             SqlitePagerLockOperation.Writer => !_writerActive && !_checkpointActive && _checkpointWaiterCount == 0,
             SqlitePagerLockOperation.Checkpoint => !_writerActive && !_checkpointActive && _readerCount == 0,
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown SQLite lock operation."),
@@ -596,6 +653,15 @@ public sealed class SqlitePagerLockLease : IDisposable
         var manager = Volatile.Read(ref _manager)
             ?? throw new ObjectDisposedException(nameof(SqlitePagerLockLease));
         return manager.PublishJournalModeChange(Operation);
+    }
+
+    internal void UpgradeToExclusive(TimeSpan timeout)
+    {
+        var manager = Volatile.Read(ref _manager)
+            ?? throw new ObjectDisposedException(nameof(SqlitePagerLockLease));
+        if (Operation != SqlitePagerLockOperation.Writer)
+            throw new InvalidOperationException("Only a SQLite writer lease can upgrade to EXCLUSIVE.");
+        manager.UpgradeWriterToExclusive(timeout);
     }
 
     /// <inheritdoc />
