@@ -764,6 +764,32 @@ qualified subset in the matrix above.
 | `sync-remote-no-replication-index-tracking` | closed | s3-perf | S | 0 | 0 | The managed Hrana client tracks the highest valid batch or statement `replication_index`, sends it with subsequent batches, and accepts both string and legacy numeric encodings. `RemoteReplicationIndexTests` covers request propagation and validation. |
 | `sync-sdk-kit-native-companion-intentional` | extension | s4-intentional | S | 0 | 0 | sdk-kit is Turso's native C-ABI/FFI surface for embedding the sync engine into other languages (capi.rs, bindings.rs). Ahtola deliberately has no native companion and no… |
 
+### 9.2 Post-#24 managed replica closure roadmap
+
+PR #24 closed declared-primary-key delete replay, additive-column rebase, and
+pending-statement replay over protocol-2 `ReplaceBase`. The next managed
+replica work is split into the following independently testable slices. Broad
+inventory entries remain the source-of-truth IDs; this table records the
+implementation order within those entries.
+
+| Order | Slice | Inventory coverage | Depends on | Acceptance boundary |
+| ---: | --- | --- | --- | --- |
+| 1 | Request raw page encoding explicitly | `sync-no-page-protocol-pull-decode` | — | Initial and incremental pulls negotiate raw pages; an unexpected zstd response still fails before publication. |
+| 2 | Wire remote-encrypted bootstrap | `sync-remote-encryption-header-not-wired-for-remote-client`, `sync-partial-encryption-mutual-exclusion-unenforced` | — | Reserved-byte/header semantics match the remote cipher and incompatible logical/partial combinations fail before creating replica state. |
+| 3 | Add eager chunked bootstrap | `sync-no-partial-sync-lazy-page-storage` | — | A byte threshold produces bounded page-range requests whose final staged image is byte-identical to one-shot bootstrap. |
+| 4 | Implement eager prefix bootstrap | `sync-no-partial-sync-lazy-page-storage` | — | Prefix selection changes the requested page range; unsupported query selection is rejected rather than silently expanded to a full pull. |
+| 5 | Fault missing pages on demand | `sync-no-partial-sync-lazy-page-storage` | Prefix bootstrap | A materialization map drives one targeted pull per missing page/segment and never exposes an uninitialized page to the pager. |
+| 6 | Type push conflicts | `sync-conflict-error-surfaced-not-handled` | — | Remote divergence is distinguishable from retryable transport failure without acknowledging or dropping pending journal entries. |
+| 7 | Capture and restore a revert WAL | `sync-no-revert-db-checkpoint-safety`, `sync-checkpoint-mode-mismatch-vs-managed-storage` | Typed push conflicts | Pre-checkpoint page images and a durable watermark restore exactly after a confirmed conflict; missing or corrupt recovery state fails closed. |
+| 8 | Project the replica journal through CDC | `sync-no-cdc-capture-pragma` | — | Public CDC can read the same ordered pending before/after images used for push without dual-writing or treating external CDC rows as trusted push input. |
+| 9 | Add rollback-journal OS locks | storage pager lock-state gap, `sync-checkpoint-mode-mismatch-vs-managed-storage` | — | DELETE mode exposes SQLite-compatible SHARED/RESERVED/PENDING/EXCLUSIVE main-file locks across processes on Windows and Unix. |
+| 10 | Hold locks across replica file replacement | `sync-checkpoint-mode-mismatch-vs-managed-storage` | Rollback-journal OS locks | Sidecar validation, checkpoint, main-file swap, and metadata publication execute under one exclusive lock with no check-then-act writer race. |
+
+zstd decompression is intentionally not a separate parity item at the pinned
+Turso v0.7.2 baseline: `database_sync_operations.rs::decode_page` also rejects
+zstd page sets. Explicit raw negotiation closes the interoperability hazard
+without introducing a compression dependency into the shipped managed closure.
+
 
 ## 10. Top-impact ranking and suggested closure order
 
