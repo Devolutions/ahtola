@@ -7,7 +7,7 @@
       "repo": "tursodatabase/turso",
       "tag": "v0.7.2",
       "commit": "046e9cbf6",
-      "submodule": "turso-src/ (read-only)"
+      "submodule": "historical analysis baseline; current read-only submodule is v0.8.0-pre.7 (277ddd050)"
     },
     "ahtola_ref": {
       "branch": "copilot/ahtola-turso-gap-analysis",

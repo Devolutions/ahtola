@@ -5,7 +5,9 @@ Companion to [`wal-interoperability-contract.md`](wal-interoperability-contract.
 
 ## Upstream reference
 
-Pinned submodule: `turso-src/` @ **v0.7.2** (`046e9cbf6`).
+Behavioral baseline: Turso **v0.7.2** (`046e9cbf6`). The read-only submodule
+now pins **v0.8.0-pre.7** (`277ddd050`) for browser-WASM work; retrieve the
+original baseline with `git -C turso-src show v0.7.2:<path>`.
 
 | Turso | Ahtola |
 | --- | --- |
