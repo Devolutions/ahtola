@@ -434,6 +434,141 @@ public sealed class AsyncPagerConcurrencyRegressionTests
         ExecuteAll(owner, "COMMIT;");
     }
 
+    [Test]
+    public async Task DurableWalCommitSurvivesAPostFlushBookkeepingFailure()
+    {
+        var storage = new InMemoryFileSystem();
+        var writerFileSystem = new FlushInterceptingAsyncFileSystem(storage, WalPath);
+        var first = CreatePage(0xF1);
+        var second = CreatePage(0xF2);
+
+        await using (var writer = await AsyncSqlitePager.CreateAsync(
+                         writerFileSystem,
+                         DatabasePath,
+                         WalPath,
+                         CreateWalHeader()))
+        {
+            await CommitPageAsync(writer, first);
+
+            // The commit frame reaches durable storage and only the bookkeeping that
+            // records it fails, so the transaction is committed and must stay so.
+            writerFileSystem.PostFlushReadFailure =
+                new IOException("injected post-flush SQLite WAL read failure");
+            await using var failing = await writer.BeginTransactionAsync(2);
+            await failing.WritePageAsync(2, second);
+            Func<Task> commit = async () => await failing.CommitAsync();
+            await commit.Should().ThrowAsync<IOException>();
+        }
+
+        await AssertDurableCommitSurvivesAsync(storage, second, expectedFrameCount: 2);
+    }
+
+    [Test]
+    public async Task DurableWalCommitSurvivesCancellationRaisedAfterItsFlush()
+    {
+        var storage = new InMemoryFileSystem();
+        var writerFileSystem = new FlushInterceptingAsyncFileSystem(storage, WalPath);
+        var first = CreatePage(0xF3);
+        var second = CreatePage(0xF4);
+
+        await using (var writer = await AsyncSqlitePager.CreateAsync(
+                         writerFileSystem,
+                         DatabasePath,
+                         WalPath,
+                         CreateWalHeader()))
+        {
+            await CommitPageAsync(writer, first);
+
+            using var cancellation = new CancellationTokenSource();
+            writerFileSystem.AfterFlush = () =>
+            {
+                cancellation.Cancel();
+                return ValueTask.CompletedTask;
+            };
+
+            await using var committing = await writer.BeginTransactionAsync(2);
+            await committing.WritePageAsync(2, second);
+
+            // Cancelling cannot un-commit a durable transaction, so the commit runs
+            // to completion rather than abandoning the record of it.
+            await committing.CommitAsync(cancellation.Token);
+            committing.State.Should().Be(SqlitePagerTransactionState.Committed);
+            writer.CommittedFrameCount.Should().Be(2);
+        }
+
+        await AssertDurableCommitSurvivesAsync(storage, second, expectedFrameCount: 2);
+    }
+
+    [Test]
+    public async Task FailedCreateKeepsAnAbandonedWalTailHidden()
+    {
+        var storage = new InMemoryFileSystem();
+        var writerFileSystem = new FlushInterceptingAsyncFileSystem(storage, WalPath);
+        var committed = CreatePage(0xC7);
+        var abandoned = CreatePage(0xC8);
+
+        await using var writer = await AsyncSqlitePager.CreateAsync(
+            writerFileSystem,
+            DatabasePath,
+            WalPath,
+            CreateWalHeader());
+        await CommitPageAsync(writer, committed);
+
+        await using var readerPager = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(storage),
+            DatabasePath,
+            WalPath);
+        (await readerPager.ReadPageAsync(2)).Should().Equal(committed);
+
+        // Both the flush and the rollback truncation fail, so the abandoned tail is
+        // still physically present and only the boundary is hiding it.
+        writerFileSystem.FlushFailure = new IOException("injected SQLite WAL flush failure");
+        writerFileSystem.SetLengthFailure = new IOException("injected SQLite WAL truncation failure");
+        await using (var failing = await writer.BeginTransactionAsync(2))
+        {
+            await failing.WritePageAsync(2, abandoned);
+            Func<Task> commit = async () => await failing.CommitAsync();
+            await commit.Should().ThrowAsync<IOException>();
+        }
+
+        (await readerPager.ReadPageAsync(2)).Should().Equal(committed);
+
+        // Creating over the existing database fails, and a create that never
+        // produced fresh storage must not publish the tail it was hiding.
+        Func<Task> create = async () => await AsyncSqlitePager.CreateAsync(
+            AsyncFileSystemAdapter.Create(storage),
+            DatabasePath,
+            WalPath,
+            CreateWalHeader());
+        await create.Should().ThrowAsync<IOException>();
+
+        (await readerPager.ReadPageAsync(2)).Should().Equal(committed);
+        readerPager.CommittedFrameCount.Should().Be(1);
+    }
+
+    private static async Task AssertDurableCommitSurvivesAsync(
+        IFileSystem storage,
+        byte[] expectedPage,
+        long expectedFrameCount)
+    {
+        // A writable reopen repairs whatever the boundary still hides, so a commit
+        // wrongly left hidden would be truncated away here rather than retained.
+        await using (var reopened = await AsyncSqlitePager.OpenAsync(
+                         AsyncFileSystemAdapter.Create(storage),
+                         DatabasePath,
+                         WalPath))
+        {
+            (await reopened.ReadPageAsync(2)).Should().Equal(expectedPage);
+            reopened.CommittedFrameCount.Should().Be(expectedFrameCount);
+        }
+
+        await using var rawWal = await SqliteWalFile.OpenAsync(
+            AsyncFileSystemAdapter.Create(storage),
+            WalPath,
+            readOnly: true);
+        (await rawWal.ScanRecoveryAsync()).LastCommittedFrameNumber.Should().Be(expectedFrameCount);
+    }
+
     private static async Task CommitPageAsync(AsyncSqlitePager pager, byte[] replacement)
     {
         await using var transaction = await pager.BeginTransactionAsync(2);
@@ -523,6 +658,12 @@ internal sealed class FlushInterceptingAsyncFileSystem :
 
     internal Exception? FlushFailure { get; set; }
 
+    internal Exception? SetLengthFailure { get; set; }
+
+    internal Exception? PostFlushReadFailure { get; set; }
+
+    private Exception? ArmedReadFailure { get; set; }
+
     public IFileSystem BackingFileSystem => _backing;
 
     public StringComparer PathComparer => ((IStoragePathResolver)_inner).PathComparer;
@@ -563,7 +704,16 @@ internal sealed class FlushInterceptingAsyncFileSystem :
             long position,
             Memory<byte> destination,
             CancellationToken cancellationToken = default)
-            => inner.ReadAsync(position, destination, cancellationToken);
+        {
+            var armed = owner.ArmedReadFailure;
+            if (armed is not null)
+            {
+                owner.ArmedReadFailure = null;
+                throw armed;
+            }
+
+            return inner.ReadAsync(position, destination, cancellationToken);
+        }
 
         public ValueTask WriteAsync(
             long position,
@@ -572,7 +722,16 @@ internal sealed class FlushInterceptingAsyncFileSystem :
             => inner.WriteAsync(position, source, cancellationToken);
 
         public ValueTask SetLengthAsync(long length, CancellationToken cancellationToken = default)
-            => inner.SetLengthAsync(length, cancellationToken);
+        {
+            var failure = owner.SetLengthFailure;
+            if (failure is not null)
+            {
+                owner.SetLengthFailure = null;
+                throw failure;
+            }
+
+            return inner.SetLengthAsync(length, cancellationToken);
+        }
 
         public async ValueTask FlushToDiskAsync(CancellationToken cancellationToken = default)
         {
@@ -592,6 +751,8 @@ internal sealed class FlushInterceptingAsyncFileSystem :
 
             await inner.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
 
+            owner.ArmedReadFailure = owner.PostFlushReadFailure;
+            owner.PostFlushReadFailure = null;
             var after = owner.AfterFlush;
             if (after is not null)
             {

@@ -233,10 +233,13 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             await pager.InitializeCommittedViewAsync(
                 await wal.ScanRecoveryAsync(cancellationToken).ConfigureAwait(false),
                 cancellationToken).ConfigureAwait(false);
+
+            // Fresh storage replaced whatever the boundary was hiding, so publish it
+            // only now: a create that fails must leave an abandoned tail hidden.
+            manager.PublishAllWalFrames();
             pager._lockGeneration = openingLock.Lease.PublishStorageChange();
             pager._busyTimeout = timeout;
             pager._state = SqlitePagerState.Ready;
-            manager.PublishAllWalFrames();
             return pager;
         }
         catch
@@ -309,10 +312,13 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                 encryption,
                 pageCodec);
             await pager.InitializeRollbackViewAsync(cancellationToken).ConfigureAwait(false);
+
+            // Fresh storage replaced whatever the boundary was hiding, so publish it
+            // only now: a create that fails must leave an abandoned tail hidden.
+            manager.PublishAllWalFrames();
             pager._lockGeneration = openingLock.Lease.PublishStorageChange();
             pager._busyTimeout = timeout;
             pager._state = SqlitePagerState.Ready;
-            manager.PublishAllWalFrames();
             return pager;
         }
         catch
@@ -957,9 +963,12 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                 cancellationToken).ConfigureAwait(false);
             await wal.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-            // Past this point the commit frame is durable, so SQLite considers the
-            // transaction committed even if our own bookkeeping then fails. The
-            // frames must become visible again either way.
+            // Past this point the commit frame is durable, so the transaction is
+            // committed whatever happens next. Finish recording it on
+            // CancellationToken.None: a caller that cancels now cannot un-commit
+            // it, and abandoning the bookkeeping would leave the boundary pinned
+            // over a durable commit that the next writer's tail repair would then
+            // truncate away.
             durable = true;
             transaction.PublishWalFrames();
             var recovery = await wal.ScanRecoveryAsync(CancellationToken.None).ConfigureAwait(false);
@@ -1006,7 +1015,28 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             await TruncateAbandonedWalTailAsync(wal, publishedFrameCount).ConfigureAwait(false);
             throw;
         }
+        catch
+        {
+            // Durable, so this transaction is committed even though recording it
+            // failed. Publish the frames before reporting the failure: leaving the
+            // boundary pinned would hide a committed transaction from every local
+            // reader and invite the next tail repair to truncate it away.
+            PublishDurableCommitIgnoringFailure(transaction);
+            throw;
+        }
 
+    }
+
+    private static void PublishDurableCommitIgnoringFailure(AsyncSqlitePagerTransaction transaction)
+    {
+        try
+        {
+            transaction.PublishWalFrames();
+        }
+        catch
+        {
+            // Never mask the bookkeeping failure that is already propagating.
+        }
     }
 
     private async ValueTask TruncateAbandonedWalTailAsync(
@@ -1254,8 +1284,15 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var boundary = lockManager.WalPublicationBoundary;
-        if (boundary != long.MaxValue && !wal.IsReadOnly)
+        if (boundary != long.MaxValue)
+        {
+            // A handle that cannot write cannot repair, and publishing anyway would
+            // expose exactly the tail the boundary exists to hide.
+            if (wal.IsReadOnly)
+                return;
+
             await wal.TruncateToFrameAsync(boundary, cancellationToken).ConfigureAwait(false);
+        }
 
         lockManager.PublishAllWalFrames();
     }
