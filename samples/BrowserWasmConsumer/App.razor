@@ -44,6 +44,8 @@
             var persistentCore = await RunPersistentCoreAsync();
             var persistentFeatures = await RunPersistentFeaturesAsync();
             var browserMemory = await RunBrowserMemoryAsync();
+            var reservedPathRejected = await RunReservedPathRejectedAsync();
+            var workerIsolation = await RunWorkerIsolationAsync();
             var persistentBlob = await RunPersistentBlobAsync();
             var persistentBackup = await RunPersistentBackupAsync();
             var persistentInboundBackup = await RunPersistentInboundBackupAsync();
@@ -61,6 +63,8 @@
                 + $"persistent-core={persistentCore};"
                 + $"persistent-features={persistentFeatures};"
                 + $"browser-memory={browserMemory};"
+                + $"reserved-path-rejected={reservedPathRejected};"
+                + $"worker-isolation={workerIsolation};"
                 + $"persistent-blob={persistentBlob};"
                 + $"persistent-backup={persistentBackup};"
                 + $"persistent-inbound-backup={persistentInboundBackup};"
@@ -250,6 +254,42 @@
                 await command.ExecuteScalarAsync(),
                 CultureInfo.InvariantCulture);
         }
+    }
+
+    private static async Task<bool> RunReservedPathRejectedAsync()
+    {
+        try
+        {
+            await using var source = new AhtolaBrowserDataSource(
+                "packed-consumer-reserved/.ahtola-replace-user.db",
+                "packed-consumer-reserved");
+            await using var connection = await source.OpenConnectionAsync();
+            return false;
+        }
+        catch (ArgumentException exception) when (
+            exception.Message.Contains(".ahtola-replace-", StringComparison.Ordinal))
+        {
+            return true;
+        }
+    }
+
+    private static async Task<long> RunWorkerIsolationAsync()
+    {
+        // These names collide under the old 32-bit FNV-1a intent-slot hash.
+        await using var firstSource = new AhtolaBrowserDataSource("tenant-97018/main.db");
+        await using var secondSource = new AhtolaBrowserDataSource("tenant-180400/main.db");
+        await using var first = await firstSource.OpenConnectionAsync();
+        await using var second = await secondSource.OpenConnectionAsync();
+        await ExecuteFeatureAsync(
+            first,
+            "CREATE TABLE probe(value INTEGER NOT NULL); INSERT INTO probe VALUES (1);",
+            "first collision-isolation database");
+        await ExecuteFeatureAsync(
+            second,
+            "CREATE TABLE probe(value INTEGER NOT NULL); INSERT INTO probe VALUES (2);",
+            "second collision-isolation database");
+        return await ExecuteScalarFeatureAsync(first, "SELECT value FROM probe", "read first isolated database")
+               + await ExecuteScalarFeatureAsync(second, "SELECT value FROM probe", "read second isolated database");
     }
 
     private static async Task<string> RunPersistentBlobAsync()
