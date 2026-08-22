@@ -209,28 +209,6 @@
             await ExecuteFeatureAsync(connection, "VACUUM", "vacuum");
         }
 
-        private static async Task<long> RunBrowserMemoryAsync()
-        {
-            await using var source = new AhtolaBrowserDataSource(":memory:");
-            await using (var connection = await source.OpenConnectionAsync())
-            {
-                await ExecuteFeatureAsync(
-                    connection,
-                    "CREATE TABLE probe(value INTEGER NOT NULL);"
-                    + "INSERT INTO probe(value) VALUES (504);",
-                    "browser memory setup");
-            }
-
-            await using (var connection = await source.OpenConnectionAsync())
-            {
-                await using var command = connection.CreateCommand();
-                command.CommandText = "SELECT value FROM probe";
-                return Convert.ToInt64(
-                    await command.ExecuteScalarAsync(),
-                    CultureInfo.InvariantCulture);
-            }
-        }
-
         await using (var source = new AhtolaBrowserDataSource(mainPath))
         {
             await using var connection = await source.OpenConnectionAsync();
@@ -247,6 +225,28 @@
                 "SELECT value FROM local_probe",
                 "read local");
             return attached + local;
+        }
+    }
+
+    private static async Task<long> RunBrowserMemoryAsync()
+    {
+        await using var source = new AhtolaBrowserDataSource(":memory:");
+        await using (var connection = await source.OpenConnectionAsync())
+        {
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (504);",
+                "browser memory setup");
+        }
+
+        await using (var connection = await source.OpenConnectionAsync())
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
         }
     }
 
