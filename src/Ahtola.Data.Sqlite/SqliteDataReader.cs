@@ -1274,19 +1274,60 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     public override async Task CloseAsync()
         => await CloseCoreAsync().ConfigureAwait(false);
 
-    void IConnectionOwnedReader.CloseFromConnection()
+    void IConnectionOwnedReader.CloseFromConnection() => CloseFromConnection();
+
+    private void CloseFromConnection()
     {
         if (_isClosed)
             return;
 
-        _delegatedReader?.Dispose();
-        _delegatedReader = null;
-        _statement?.Dispose();
-        _statement = null;
+        Exception? error = null;
+        if (_delegatedReader is not null)
+        {
+            try
+            {
+                _delegatedReader.Dispose();
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+            finally
+            {
+                _delegatedReader = null;
+            }
+        }
+        if (_statement is not null)
+        {
+            try
+            {
+                _statement.Dispose();
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+            finally
+            {
+                _statement = null;
+            }
+        }
+
         _remainingSql.Clear();
         _hasPrefetchedRow = false;
         _hasCurrentRow = false;
-        FinishClose(closeConnection: false);
+        _currentStatementRowsAffectedCounted = false;
+        try
+        {
+            FinishClose(closeConnection: false);
+        }
+        catch (Exception ex)
+        {
+            error = CombineCloseErrors(error, ex);
+        }
+
+        if (error is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
     }
 
     ValueTask IConnectionOwnedReader.CloseFromConnectionAsync()
@@ -1297,27 +1338,53 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (_isClosed)
             return;
 
-        try
+        Exception? error = null;
+        if (_delegatedReader is not null)
         {
-            if (_delegatedReader is not null)
+            try
             {
                 await _delegatedReader.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+            finally
+            {
                 _delegatedReader = null;
             }
-            if (_statement is not null)
+        }
+        if (_statement is not null)
+        {
+            try
             {
                 await _statement.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+            finally
+            {
                 _statement = null;
             }
         }
-        finally
+
+        _remainingSql.Clear();
+        _hasPrefetchedRow = false;
+        _hasCurrentRow = false;
+        _currentStatementRowsAffectedCounted = false;
+        try
         {
-            _remainingSql.Clear();
-            _hasPrefetchedRow = false;
-            _hasCurrentRow = false;
-            _currentStatementRowsAffectedCounted = false;
             await FinishCloseAsync(closeConnection: false).ConfigureAwait(false);
         }
+        catch (Exception ex)
+        {
+            error = CombineCloseErrors(error, ex);
+        }
+
+        if (error is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
     }
 
     private void CloseCore(bool throwOnError = true)
@@ -1325,6 +1392,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (_isClosed)
             return;
 
+        Exception? primaryError = null;
+        Exception? cleanupError = null;
         try
         {
             if (_delegatedReader is not null)
@@ -1333,48 +1402,86 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 _hadRecordsAffectedStatement = true;
                 _delegatedReader.Dispose();
                 _delegatedReader = null;
-                FinishClose();
-                return;
             }
-
-            if (_statement is not null)
+            else
             {
-                while (GetStatement().Read())
+                if (_statement is not null)
                 {
+                    while (GetStatement().Read())
+                    {
+                    }
+
+                    CountCurrentStatementRowsAffected();
+
+                    _statement.Dispose();
+                    _statement = null;
+                    _hasPrefetchedRow = false;
+                    _currentStatementRowsAffectedCounted = false;
                 }
 
-                CountCurrentStatementRowsAffected();
-
-                _statement.Dispose();
-                _statement = null;
-                _hasPrefetchedRow = false;
-                _currentStatementRowsAffectedCounted = false;
+                DrainRemainingStatements();
             }
-
-            DrainRemainingStatements();
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex)
         {
-            _statement?.Dispose();
-            _statement = null;
-            _remainingSql.Clear();
-            FinishClose();
-            if (throwOnError)
-                throw SqliteCommand.ToSqliteException(ex);
-            return;
-        }
-        catch (SqliteException)
-        {
-            _statement?.Dispose();
-            _statement = null;
-            _remainingSql.Clear();
-            FinishClose();
-            if (throwOnError)
-                throw;
-            return;
+            primaryError = ex is AhtolaException or EmbeddedSqlException
+                ? SqliteCommand.ToSqliteException(ex)
+                : ex;
         }
 
-        FinishClose();
+        if (_delegatedReader is not null)
+        {
+            try
+            {
+                _delegatedReader.Dispose();
+            }
+            catch (Exception ex)
+            {
+                cleanupError = CombineCloseErrors(cleanupError, ex);
+            }
+            finally
+            {
+                _delegatedReader = null;
+            }
+        }
+        if (_statement is not null)
+        {
+            try
+            {
+                _statement.Dispose();
+            }
+            catch (Exception ex)
+            {
+                cleanupError = CombineCloseErrors(cleanupError, ex);
+            }
+            finally
+            {
+                _statement = null;
+            }
+        }
+
+        _remainingSql.Clear();
+        _hasPrefetchedRow = false;
+        _hasCurrentRow = false;
+        _currentStatementRowsAffectedCounted = false;
+        try
+        {
+            FinishClose();
+        }
+        catch (Exception ex)
+        {
+            cleanupError = CombineCloseErrors(cleanupError, ex);
+        }
+
+        if (cleanupError is not null)
+        {
+            var combined = primaryError is null
+                ? cleanupError
+                : CombineCloseErrors(primaryError, cleanupError);
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(combined).Throw();
+        }
+        if (primaryError is not null && throwOnError)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primaryError).Throw();
     }
 
     private async ValueTask FinishCloseAsync(bool closeConnection = true)

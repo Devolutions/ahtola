@@ -226,6 +226,71 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
     }
 
     [Test]
+    public async Task ConnectionOwnedAsyncCloseAggregatesDisposalAndCallbackFailures()
+    {
+        var factory = new FaultInjectingManagedDatabaseFactory();
+        await using var connection = new SqliteConnection(
+            "Data Source=:memory:;Local Provider=Managed;Pooling=False",
+            factory);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1";
+        var statement = SqliteStatementAdapter.FromManaged(
+            await connection.ManagedConnection.PrepareAsync(command.CommandText));
+        var callbackFailure = new InvalidOperationException("Simulated async close-callback failure.");
+        var reader = new SqliteDataReader(
+            command,
+            statement,
+            command.CommandText,
+            [],
+            recordsAffected: 0,
+            CommandBehavior.Default,
+            closeCallback: () => throw callbackFailure);
+        var disposalFailure = new SimulatedBrowserDisposalException(
+            "Simulated async connection-owned disposal failure.");
+        factory.PendingStatementDisposeFault = disposalFailure;
+
+        var aggregate = Assert.ThrowsAsync<AggregateException>(
+            async () => await ((IConnectionOwnedReader)reader).CloseFromConnectionAsync());
+
+        aggregate!.Flatten().InnerExceptions.Should().Contain(disposalFailure).And.Contain(callbackFailure);
+        reader.IsClosed.Should().BeTrue();
+        connection.HasOpenReader.Should().BeFalse();
+    }
+
+    [Test]
+    public void SynchronousCloseAggregatesDisposalAndCallbackFailures()
+    {
+        var factory = new FaultInjectingManagedDatabaseFactory();
+        var database = new FaultInjectingDatabaseAdapter(
+            ManagedDatabaseAdapter.Open(":memory:"),
+            factory);
+        using var connection = new SqliteConnection(database);
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1";
+        var statement = SqliteStatementAdapter.FromManaged(
+            connection.ManagedConnection.Prepare(command.CommandText));
+        var callbackFailure = new InvalidOperationException("Simulated sync close-callback failure.");
+        var reader = new SqliteDataReader(
+            command,
+            statement,
+            command.CommandText,
+            [],
+            recordsAffected: 0,
+            CommandBehavior.Default,
+            closeCallback: () => throw callbackFailure);
+        var disposalFailure = new SimulatedBrowserDisposalException(
+            "Simulated synchronous statement disposal failure.");
+        factory.PendingStatementSyncDisposeFault = disposalFailure;
+
+        var aggregate = Assert.Throws<AggregateException>(reader.Close);
+
+        aggregate!.Flatten().InnerExceptions.Should().Contain(disposalFailure).And.Contain(callbackFailure);
+        reader.IsClosed.Should().BeTrue();
+        connection.HasOpenReader.Should().BeFalse();
+    }
+
+    [Test]
     public async Task BrowserReaderDisposalFailure_DisposeAsyncSwallowsOperationFailure_ButStillCleansUp()
     {
         var factory = new FaultInjectingManagedDatabaseFactory();
@@ -478,6 +543,8 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
 
         public Exception? PendingStatementDisposeFault { get; set; }
 
+        public Exception? PendingStatementSyncDisposeFault { get; set; }
+
         public ValueTask<IManagedDatabaseAdapter> OpenDatabaseAsync(
             CancellationToken cancellationToken = default)
         {
@@ -592,7 +659,14 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
 
         public string? GetParameterName(int index) => inner.GetParameterName(index);
 
-        public void Dispose() => inner.Dispose();
+        public void Dispose()
+        {
+            var fault = faults.PendingStatementSyncDisposeFault;
+            faults.PendingStatementSyncDisposeFault = null;
+            inner.Dispose();
+            if (fault is not null)
+                throw fault;
+        }
 
         public ValueTask DisposeAsync()
         {
