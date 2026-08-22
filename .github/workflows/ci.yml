@@ -314,7 +314,7 @@ jobs:
           - firefox
           - webkit
     env:
-      PLAYWRIGHT_VERSION: 1.55.0
+      PLAYWRIGHT_VERSION: 1.62.1
       BROWSER_ENGINE: ${{ matrix.browser }}
       PACKAGE_VERSION: 0.0.0-ci.${{ github.run_number }}
     steps:
