@@ -1396,6 +1396,22 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (_isClosed)
             return;
 
+        // Every failure mode below (OPFS quota/I/O, Web Crypto, cancellation, or an
+        // AggregateException wrapping any of those, in addition to the engine's own
+        // AhtolaException/EmbeddedSqlException/SqliteException) must still release the
+        // statement/delegated reader, drop any remaining batched SQL, and deregister this
+        // reader from the connection. Catching only the engine exception types left every other
+        // failure to skip that cleanup entirely and leak the reader as permanently "open".
+        //
+        // Errors are tracked in two buckets: primaryError is the close/drain operation's own
+        // failure, which throwOnError lets callers (DisposeAsync) tolerate, matching the prior
+        // behavior for the engine exception types. cleanupError covers the best-effort recovery
+        // pass below (re-disposing a statement/delegated reader that never got released, and
+        // FinishCloseAsync deregistering the reader / honoring CommandBehavior.CloseConnection).
+        // A cleanup failure means the reader's bookkeeping with its connection may be
+        // inconsistent, so it is never swallowed, even when throwOnError is false.
+        Exception? primaryError = null;
+        Exception? cleanupError = null;
         try
         {
             if (_delegatedReader is not null)
@@ -1404,51 +1420,108 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 _hadRecordsAffectedStatement = true;
                 await _delegatedReader.DisposeAsync().ConfigureAwait(false);
                 _delegatedReader = null;
-                await FinishCloseAsync(closeConnection).ConfigureAwait(false);
-                return;
             }
-
-            if (_statement is not null)
+            else
             {
-                while (await GetStatement().ReadAsync().ConfigureAwait(false))
+                if (_statement is not null)
                 {
+                    while (await GetStatement().ReadAsync().ConfigureAwait(false))
+                    {
+                    }
+
+                    CountCurrentStatementRowsAffected();
+
+                    await _statement.DisposeAsync().ConfigureAwait(false);
+                    _statement = null;
+                    _hasPrefetchedRow = false;
+                    _currentStatementRowsAffectedCounted = false;
                 }
 
-                CountCurrentStatementRowsAffected();
-
-                await _statement.DisposeAsync().ConfigureAwait(false);
-                _statement = null;
-                _hasPrefetchedRow = false;
-                _currentStatementRowsAffectedCounted = false;
+                await DrainRemainingStatementsAsync().ConfigureAwait(false);
             }
-
-            await DrainRemainingStatementsAsync().ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex)
         {
-            if (_statement is not null)
-                await _statement.DisposeAsync().ConfigureAwait(false);
-            _statement = null;
-            _remainingSql.Clear();
-            await FinishCloseAsync(closeConnection).ConfigureAwait(false);
-            if (throwOnError)
-                throw SqliteCommand.ToSqliteException(ex);
-            return;
-        }
-        catch (SqliteException)
-        {
-            if (_statement is not null)
-                await _statement.DisposeAsync().ConfigureAwait(false);
-            _statement = null;
-            _remainingSql.Clear();
-            await FinishCloseAsync(closeConnection).ConfigureAwait(false);
-            if (throwOnError)
-                throw;
-            return;
+            primaryError = ex is AhtolaException or EmbeddedSqlException
+                ? SqliteCommand.ToSqliteException(ex)
+                : ex;
         }
 
-        await FinishCloseAsync(closeConnection).ConfigureAwait(false);
+        // Best-effort cleanup: whatever failed above, a statement/delegated reader still
+        // referenced here was never disposed (or its own disposal is what failed), so retry it
+        // defensively before dropping the reference. SqliteStatementAdapter.DisposeAsync marks
+        // itself disposed before delegating, so a second attempt after a failed first one is a
+        // safe no-op rather than a duplicate disposal.
+        if (_delegatedReader is not null)
+        {
+            try
+            {
+                await _delegatedReader.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                cleanupError = CombineCloseErrors(cleanupError, ex);
+            }
+            finally
+            {
+                _delegatedReader = null;
+            }
+        }
+
+        if (_statement is not null)
+        {
+            try
+            {
+                await _statement.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                cleanupError = CombineCloseErrors(cleanupError, ex);
+            }
+            finally
+            {
+                _statement = null;
+            }
+        }
+
+        _remainingSql.Clear();
+        _hasPrefetchedRow = false;
+        _hasCurrentRow = false;
+        _currentStatementRowsAffectedCounted = false;
+
+        try
+        {
+            // Deregisters the reader from its connection and, when the behavior requires it,
+            // awaits the connection's own asynchronous close - this must run whether or not the
+            // primary operation above failed, or CommandBehavior.CloseConnection would silently
+            // stop being honored on any non-engine failure.
+            await FinishCloseAsync(closeConnection).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            cleanupError = CombineCloseErrors(cleanupError, ex);
+        }
+
+        // throwOnError only governs the primary operation failure (DisposeAsync tolerates it,
+        // matching prior behavior for the engine exception types); a cleanup failure indicates
+        // the reader's registration/connection-close bookkeeping may be inconsistent and is
+        // always surfaced, aggregated with the primary error when both occurred.
+        if (cleanupError is not null)
+        {
+            var combined = primaryError is null
+                ? cleanupError
+                : CombineCloseErrors(primaryError, cleanupError);
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(combined).Throw();
+        }
+
+        if (primaryError is not null && throwOnError)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primaryError).Throw();
     }
+
+    private static Exception CombineCloseErrors(Exception? existing, Exception next)
+        => existing is null
+            ? next
+            : new AggregateException("Data reader close encountered multiple failures.", existing, next);
 
     private void FinishClose(bool closeConnection = true)
     {
@@ -1510,23 +1583,33 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     {
         if (_command.Connection is { RequiresAsyncExecution: true } browserConnection)
         {
+            // Resolve against _currentSql (the statement the reader is positioned on), not
+            // _command.CommandText (the full, possibly multi-statement batch text). Matching
+            // against the whole batch always anchors on the FIRST statement's column/table, so a
+            // later result set would silently inherit its declared type (e.g. reporting a BLOB
+            // column as Guid because an earlier statement in the batch projected one). Validating
+            // the matched column against GetName(ordinal) further ensures the resolved metadata
+            // actually belongs to the column being asked about.
             var browserMatch = Regex.Match(
-                _command.CommandText,
+                _currentSql,
                 @"^\s*SELECT\s+(?<column>[\w\[\]""`]+)\s+FROM\s+(?<table>[\w\[\]""`.]+)",
                 RegexOptions.IgnoreCase);
             if (browserMatch.Success)
             {
                 var columnName = UnquoteIdentifier(browserMatch.Groups["column"].Value);
-                var tableName = browserMatch.Groups["table"].Value
-                    .Split('.')
-                    .Select(UnquoteIdentifier)
-                    .ToArray();
-                var qualifiedTable = string.Join('.', tableName);
-                var columns = GetManagedTableColumns(
-                    browserConnection.ManagedConnection,
-                    qualifiedTable);
-                if (columns.TryGetValue(columnName, out var schemaColumn))
-                    return StripTypeLength(schemaColumn.TypeName);
+                if (string.Equals(columnName, GetName(ordinal), StringComparison.OrdinalIgnoreCase))
+                {
+                    var tableName = browserMatch.Groups["table"].Value
+                        .Split('.')
+                        .Select(UnquoteIdentifier)
+                        .ToArray();
+                    var qualifiedTable = string.Join('.', tableName);
+                    var columns = GetManagedTableColumns(
+                        browserConnection.ManagedConnection,
+                        qualifiedTable);
+                    if (columns.TryGetValue(columnName, out var schemaColumn))
+                        return StripTypeLength(schemaColumn.TypeName);
+                }
             }
         }
 

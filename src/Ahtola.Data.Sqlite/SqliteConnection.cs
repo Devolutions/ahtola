@@ -1150,8 +1150,8 @@ public partial class SqliteConnection :
     internal IManagedConnectionAdapter ManagedConnection
         => _managedDatabase?.Connection ?? throw new InvalidOperationException("The connection is not open.");
 
-    IManagedConnectionAdapter IManagedSchemaConnection.ManagedSchemaConnection
-        => ManagedConnection;
+    IManagedConnectionAdapter? IManagedSchemaConnection.ManagedSchemaConnection
+        => IsManagedConnection ? ManagedConnection : null;
 
     internal bool IsManagedConnection => _managedDatabase is not null;
 

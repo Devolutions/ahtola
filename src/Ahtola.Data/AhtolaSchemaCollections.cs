@@ -729,8 +729,14 @@ internal static class AhtolaSchemaCollections
 
     private static Dictionary<string, ReaderSchemaColumn> GetTableColumns(DbConnection connection, string tableName)
     {
-        if (connection is IManagedSchemaConnection managed)
-            return GetManagedTableColumns(managed.ManagedSchemaConnection, tableName);
+        // Only dispatch to the managed fast path when the connection is actually backed by a
+        // managed adapter. AhtolaConnection/SqliteConnection implement IManagedSchemaConnection
+        // unconditionally (native local and remote connections included), so checking the
+        // interface alone would route those connections into ManagedSchemaConnection, which has
+        // no adapter to return. Falling through to the PRAGMA-based path below keeps native and
+        // remote connections on their normal provider-neutral schema lookup.
+        if (connection is IManagedSchemaConnection { ManagedSchemaConnection: { } managedConnection })
+            return GetManagedTableColumns(managedConnection, tableName);
 
         var columns = new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
         using (var command = connection.CreateCommand())

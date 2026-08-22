@@ -691,8 +691,8 @@ public class AhtolaConnection :
            ?? _managedDatabase?.Connection
            ?? throw new InvalidOperationException("Ahtola database is closed.");
 
-    IManagedConnectionAdapter IManagedSchemaConnection.ManagedSchemaConnection
-        => ManagedConnection;
+    IManagedConnectionAdapter? IManagedSchemaConnection.ManagedSchemaConnection
+        => IsManaged ? ManagedConnection : null;
 
     internal IDisposable? EnterManagedReplicaOperation(CancellationToken cancellationToken)
     {
