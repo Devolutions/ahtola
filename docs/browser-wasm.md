@@ -57,6 +57,7 @@ web assets publish them at:
 
 ```text
 _content/Devolutions.Ahtola.Data.Sqlite.Browser/ahtola-opfs.mjs
+_content/Devolutions.Ahtola.Data.Sqlite.Browser/ahtola-opfs-capability-probe-worker.mjs
 _content/Devolutions.Ahtola.Data.Sqlite.Browser/ahtola-opfs-worker.mjs
 _content/Devolutions.Ahtola.Data.Sqlite.Browser/ahtola-crypto.mjs
 ```

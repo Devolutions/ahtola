@@ -67,6 +67,7 @@ function Test-BrowserPackageContract(
         'lib/net9.0/Devolutions.Ahtola.Data.Sqlite.Browser.dll',
         'lib/net10.0/Devolutions.Ahtola.Data.Sqlite.Browser.dll',
         'staticwebassets/ahtola-opfs.mjs',
+        'staticwebassets/ahtola-opfs-capability-probe-worker.mjs',
         'staticwebassets/ahtola-opfs-worker.mjs',
         'staticwebassets/ahtola-crypto.mjs'
     )
