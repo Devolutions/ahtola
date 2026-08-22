@@ -46,6 +46,61 @@ function Test-EfCorePackageContract([xml]$Nuspec, [string]$PackageName) {
         }
 }
 
+function Test-BrowserPackageContract(
+    [xml]$Nuspec,
+    [string]$PackageName,
+    [string[]]$EntryNames
+) {
+    $metadata = $Nuspec.SelectSingleNode("//*[local-name()='metadata']")
+    $packageId = $metadata.SelectSingleNode("*[local-name()='id']")
+    if ($null -eq $packageId -or $packageId.InnerText -ne 'Devolutions.Ahtola.Data.Sqlite.Browser') {
+        return
+    }
+
+    $version = $metadata.SelectSingleNode("*[local-name()='version']")
+    if ($null -eq $version -or [string]::IsNullOrWhiteSpace($version.InnerText)) {
+        Fail "browser package '$PackageName' does not declare a version."
+    }
+
+    $requiredEntries = @(
+        'lib/net8.0/Devolutions.Ahtola.Data.Sqlite.Browser.dll',
+        'lib/net9.0/Devolutions.Ahtola.Data.Sqlite.Browser.dll',
+        'lib/net10.0/Devolutions.Ahtola.Data.Sqlite.Browser.dll',
+        'staticwebassets/ahtola-opfs.mjs',
+        'staticwebassets/ahtola-opfs-worker.mjs',
+        'staticwebassets/ahtola-crypto.mjs'
+    )
+    foreach ($requiredEntry in $requiredEntries) {
+        if ($EntryNames -notcontains $requiredEntry) {
+            Fail "browser package '$PackageName' is missing required entry '$requiredEntry'."
+        }
+    }
+
+    $forbiddenBinary = @($EntryNames | Where-Object {
+            $_ -match '(?i)\.(wasm|a|lib|o|obj|so|dylib)$'
+        })
+    if ($forbiddenBinary.Count -ne 0) {
+        Fail "browser package '$PackageName' contains custom native/WASM payload '$($forbiddenBinary[0])'."
+    }
+
+    $dependencyGroups = @($metadata.SelectNodes("*[local-name()='dependencies']/*[local-name()='group']"))
+    foreach ($targetFramework in @('net8.0', 'net9.0', 'net10.0')) {
+        $groups = @($dependencyGroups | Where-Object { $_.targetFramework -eq $targetFramework })
+        if ($groups.Count -ne 1) {
+            Fail "browser package '$PackageName' must declare exactly one dependency group for '$targetFramework'."
+        }
+
+        $dependencies = @($groups[0].SelectNodes("*[local-name()='dependency']"))
+        if ($dependencies.Count -ne 1 -or
+            $dependencies[0].id -ne 'Devolutions.Ahtola.Data.Sqlite') {
+            Fail "browser package '$PackageName' must depend only on Devolutions.Ahtola.Data.Sqlite for '$targetFramework'."
+        }
+        if ($dependencies[0].version -ne $version.InnerText) {
+            Fail "browser package '$PackageName' must use its own version '$($version.InnerText)' as the provider dependency floor for '$targetFramework'."
+        }
+    }
+}
+
 function Test-PackageDirectory([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         Fail "package directory '$Path' does not exist."
@@ -63,6 +118,7 @@ function Test-PackageDirectory([string]$Path) {
         $archive = [System.IO.Compression.ZipFile]::OpenRead($package.FullName)
         try {
             $nuspecContent = $null
+            $entryNames = @($archive.Entries | ForEach-Object { $_.FullName })
             foreach ($entry in $archive.Entries) {
                 if ($entry.FullName -match $nativeArchiveEntryPattern) {
                     Fail "package '$($package.Name)' contains native entry '$($entry.FullName)'."
@@ -93,6 +149,7 @@ function Test-PackageDirectory([string]$Path) {
             }
 
             Test-EfCorePackageContract ([xml]$nuspecContent) $package.Name
+            Test-BrowserPackageContract ([xml]$nuspecContent) $package.Name $entryNames
         }
         finally {
             $archive.Dispose()
