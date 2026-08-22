@@ -48,6 +48,7 @@
             var persistentBackup = await RunPersistentBackupAsync();
             var persistentInboundBackup = await RunPersistentInboundBackupAsync();
             var persistentEncrypted = await RunPersistentEncryptedAsync();
+            var encryptedMaintenance = await RunEncryptedMaintenanceAsync();
             var persistentEncryptedPassword = await RunPersistentEncryptedPasswordAsync();
             var encryptedWrongKeyRejected = await RunEncryptedWrongKeyAsync();
             var encryptedCipherMismatchRejected = await RunEncryptedCipherMismatchAsync();
@@ -64,6 +65,7 @@
                 + $"persistent-backup={persistentBackup};"
                 + $"persistent-inbound-backup={persistentInboundBackup};"
                 + $"persistent-encrypted={persistentEncrypted};"
+                + $"encrypted-maintenance={encryptedMaintenance};"
                 + $"persistent-encrypted-password={persistentEncryptedPassword};"
                 + $"encrypted-wrong-key-rejected={encryptedWrongKeyRejected};"
                 + $"encrypted-cipher-mismatch-rejected={encryptedCipherMismatchRejected}";
@@ -372,6 +374,79 @@
                 await command.ExecuteScalarAsync(),
                 CultureInfo.InvariantCulture);
         }
+    }
+
+    private static async Task<long> RunEncryptedMaintenanceAsync()
+    {
+        const string ownedDirectory = "packed-consumer-encrypted-maintenance";
+        const string path = ownedDirectory + "/main.db";
+        const string vacuumPath = ownedDirectory + "/vacuum.db";
+        const string hexKey = "101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F";
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(
+                   path,
+                   ownedDirectory,
+                   encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (588);"
+                + "PRAGMA journal_mode=DELETE;"
+                + "PRAGMA page_size=8192;"
+                + "VACUUM;",
+                "encrypted page-size migration");
+            await ExecuteFeatureAsync(
+                connection,
+                $"VACUUM INTO '{vacuumPath}';",
+                "encrypted vacuum into");
+        }
+
+        long mainValue;
+        long pageSize;
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(
+                   path,
+                   ownedDirectory,
+                   encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            mainValue = await ExecuteScalarFeatureAsync(
+                connection,
+                "SELECT value FROM probe",
+                "read migrated encrypted database");
+            pageSize = await ExecuteScalarFeatureAsync(
+                connection,
+                "PRAGMA page_size",
+                "read migrated encrypted page size");
+        }
+
+        long vacuumValue;
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(
+                   vacuumPath,
+                   ownedDirectory,
+                   encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            vacuumValue = await ExecuteScalarFeatureAsync(
+                connection,
+                "SELECT value FROM probe",
+                "read encrypted vacuum destination");
+        }
+
+        return mainValue + pageSize + vacuumValue;
     }
 
     private static async Task<long> RunPersistentEncryptedPasswordAsync()
