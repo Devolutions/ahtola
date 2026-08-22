@@ -41,13 +41,15 @@
                 throw new InvalidOperationException("persistent-ef failed", exception);
             }
             var persistentCore = await RunPersistentCoreAsync();
+            var persistentFeatures = await RunPersistentFeaturesAsync();
             status =
                 $"PASS:capabilities={capabilities.IsSupported};"
                 + $"storage={storage.Succeeded};"
                 + $"crypto={crypto.Succeeded};"
                 + $"ado={ado};ef={ef};"
                 + $"persistent-ado={persistentAdo};persistent-ef={persistentEf};"
-                + $"persistent-core={persistentCore}";
+                + $"persistent-core={persistentCore};"
+                + $"persistent-features={persistentFeatures}";
         }
         catch (Exception exception)
         {
@@ -151,6 +153,7 @@
                 create.CommandText = "CREATE TABLE probe(value INTEGER NOT NULL)";
                 await create.ExecuteNonQueryAsync();
             }
+
             await using (var insert = connection.CreateCommand())
             {
                 insert.CommandText = "INSERT INTO probe(value) VALUES (210)";
@@ -167,6 +170,81 @@
             return Convert.ToInt64(
                 await command.ExecuteScalarAsync(),
                 CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<long> RunPersistentFeaturesAsync()
+    {
+        const string mainPath = "packed-consumer-features/main.db";
+        const string attachedPath = "packed-consumer-features/attached.db";
+        await using (var source = new AhtolaBrowserDataSource(mainPath))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(connection, $"ATTACH DATABASE '{attachedPath}' AS aux", "attach");
+            await ExecuteFeatureAsync(connection, "CREATE TABLE aux.probe(value INTEGER NOT NULL)", "create attached");
+            await ExecuteFeatureAsync(connection, "INSERT INTO aux.probe(value) VALUES (252)", "insert attached");
+            await ExecuteFeatureAsync(connection, "CREATE TABLE local_probe(value INTEGER NOT NULL)", "create local");
+            await ExecuteFeatureAsync(connection, "PRAGMA main.journal_mode = mvcc", "main mvcc");
+            await ExecuteFeatureAsync(connection, "PRAGMA aux.journal_mode = mvcc", "attached mvcc");
+            await ExecuteFeatureAsync(connection, "BEGIN CONCURRENT", "begin concurrent");
+            await ExecuteFeatureAsync(connection, "INSERT INTO local_probe(value) VALUES (294)", "insert concurrent");
+            await ExecuteFeatureAsync(connection, "COMMIT", "commit concurrent");
+            await ExecuteFeatureAsync(connection, "VACUUM", "vacuum");
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(mainPath))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                $"ATTACH DATABASE '{attachedPath}' AS aux",
+                "reopen attach");
+            var attached = await ExecuteScalarFeatureAsync(
+                connection,
+                "SELECT value FROM aux.probe",
+                "read attached");
+            var local = await ExecuteScalarFeatureAsync(
+                connection,
+                "SELECT value FROM local_probe",
+                "read local");
+            return attached + local;
+        }
+    }
+
+    private static async Task ExecuteFeatureAsync(
+        SqliteConnection connection,
+        string sql,
+        string phase)
+    {
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException($"persistent feature phase '{phase}' failed", exception);
+        }
+    }
+
+    private static async Task<long> ExecuteScalarFeatureAsync(
+        SqliteConnection connection,
+        string sql,
+        string phase)
+    {
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException($"persistent feature phase '{phase}' failed", exception);
         }
     }
 

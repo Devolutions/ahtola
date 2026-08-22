@@ -777,7 +777,7 @@ internal static class AhtolaSchemaCollections
     {
         var columns = new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
         using (var statement = connection.Prepare(
-                   $"PRAGMA table_info({QuoteIdentifier(tableName)});"))
+                   BuildManagedPragma(tableName, "table_info")))
         {
             while (statement.Step() == StatementStepResult.Row)
             {
@@ -795,7 +795,7 @@ internal static class AhtolaSchemaCollections
             return columns;
 
         using var indexes = connection.Prepare(
-            $"PRAGMA index_list({QuoteIdentifier(tableName)});");
+            BuildManagedPragma(tableName, "index_list"));
         while (indexes.Step() == StatementStepResult.Row)
         {
             if (indexes.GetValue(2).AsInteger() == 0
@@ -806,7 +806,9 @@ internal static class AhtolaSchemaCollections
 
             var indexName = indexes.GetValue(1).AsText();
             using var info = connection.Prepare(
-                $"PRAGMA index_info({QuoteIdentifier(indexName)});");
+                BuildManagedPragma(
+                    QualifyPragmaObject(tableName, indexName),
+                    "index_info"));
             string? indexedColumn = null;
             var indexedColumnCount = 0;
             while (info.Step() == StatementStepResult.Row)
@@ -827,6 +829,23 @@ internal static class AhtolaSchemaCollections
         }
 
         return columns;
+    }
+
+    private static string BuildManagedPragma(string objectName, string pragma)
+    {
+        var separator = objectName.IndexOf('.');
+        return separator < 0
+            ? $"PRAGMA {pragma}({QuoteIdentifier(objectName)});"
+            : $"PRAGMA {QuoteIdentifier(objectName[..separator])}.{pragma}"
+              + $"({QuoteIdentifier(objectName[(separator + 1)..])});";
+    }
+
+    private static string QualifyPragmaObject(string tableName, string objectName)
+    {
+        var separator = tableName.IndexOf('.');
+        return separator < 0
+            ? objectName
+            : tableName[..separator] + "." + objectName;
     }
 
     private static List<string> GetUniqueSingleColumnIndexNames(DbConnection connection, string tableName)

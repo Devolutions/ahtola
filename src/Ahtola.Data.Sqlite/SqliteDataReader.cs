@@ -1447,6 +1447,28 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     private string GetDeclaredTypeName(int ordinal)
     {
+        if (_command.Connection is { RequiresAsyncExecution: true } browserConnection)
+        {
+            var browserMatch = Regex.Match(
+                _command.CommandText,
+                @"^\s*SELECT\s+(?<column>[\w\[\]""`]+)\s+FROM\s+(?<table>[\w\[\]""`.]+)",
+                RegexOptions.IgnoreCase);
+            if (browserMatch.Success)
+            {
+                var columnName = UnquoteIdentifier(browserMatch.Groups["column"].Value);
+                var tableName = browserMatch.Groups["table"].Value
+                    .Split('.')
+                    .Select(UnquoteIdentifier)
+                    .ToArray();
+                var qualifiedTable = string.Join('.', tableName);
+                var columns = GetManagedTableColumns(
+                    browserConnection.ManagedConnection,
+                    qualifiedTable);
+                if (columns.TryGetValue(columnName, out var schemaColumn))
+                    return StripTypeLength(schemaColumn.TypeName);
+            }
+        }
+
         if (TryGetSelectSources(out var sources, out var selections))
         {
             var sourceColumns = GetSelectSourceColumns(sources);
@@ -1768,7 +1790,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     {
         var columns = new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
         using (var statement = connection.Prepare(
-                   $"PRAGMA table_info({QuoteIdentifier(tableName)});"))
+                   BuildManagedPragma(tableName, "table_info")))
         {
             while (statement.Step() == StatementStepResult.Row)
             {
@@ -1783,7 +1805,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
 
         using var indexes = connection.Prepare(
-            $"PRAGMA index_list({QuoteIdentifier(tableName)});");
+            BuildManagedPragma(tableName, "index_list"));
         while (indexes.Step() == StatementStepResult.Row)
         {
             if (indexes.GetValue(2).AsInteger() == 0
@@ -1794,7 +1816,9 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
             var indexName = indexes.GetValue(1).AsText();
             using var info = connection.Prepare(
-                $"PRAGMA index_info({QuoteIdentifier(indexName)});");
+                BuildManagedPragma(
+                    QualifyPragmaObject(tableName, indexName),
+                    "index_info"));
             string? indexedColumn = null;
             var indexedColumnCount = 0;
             while (info.Step() == StatementStepResult.Row)
@@ -1815,6 +1839,23 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
 
         return columns;
+    }
+
+    private static string BuildManagedPragma(string objectName, string pragma)
+    {
+        var separator = objectName.IndexOf('.');
+        return separator < 0
+            ? $"PRAGMA {pragma}({QuoteIdentifier(objectName)});"
+            : $"PRAGMA {QuoteIdentifier(objectName[..separator])}.{pragma}"
+              + $"({QuoteIdentifier(objectName[(separator + 1)..])});";
+    }
+
+    private static string QualifyPragmaObject(string tableName, string objectName)
+    {
+        var separator = tableName.IndexOf('.');
+        return separator < 0
+            ? objectName
+            : tableName[..separator] + "." + objectName;
     }
 
     private static string GetDataTypeNameFromValueType(ReaderValueKind valueType, string selection)
