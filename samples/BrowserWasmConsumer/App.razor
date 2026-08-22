@@ -1,4 +1,5 @@
 @using System.Globalization
+@using Ahtola
 @using Ahtola.Data.Sqlite
 @using Microsoft.EntityFrameworkCore
 
@@ -45,6 +46,10 @@
             var persistentBlob = await RunPersistentBlobAsync();
             var persistentBackup = await RunPersistentBackupAsync();
             var persistentInboundBackup = await RunPersistentInboundBackupAsync();
+            var persistentEncrypted = await RunPersistentEncryptedAsync();
+            var persistentEncryptedPassword = await RunPersistentEncryptedPasswordAsync();
+            var encryptedWrongKeyRejected = await RunEncryptedWrongKeyAsync();
+            var encryptedCipherMismatchRejected = await RunEncryptedCipherMismatchAsync();
             status =
                 $"PASS:capabilities={capabilities.IsSupported};"
                 + $"storage={storage.Succeeded};"
@@ -55,7 +60,11 @@
                 + $"persistent-features={persistentFeatures};"
                 + $"persistent-blob={persistentBlob};"
                 + $"persistent-backup={persistentBackup};"
-                + $"persistent-inbound-backup={persistentInboundBackup}";
+                + $"persistent-inbound-backup={persistentInboundBackup};"
+                + $"persistent-encrypted={persistentEncrypted};"
+                + $"persistent-encrypted-password={persistentEncryptedPassword};"
+                + $"encrypted-wrong-key-rejected={encryptedWrongKeyRejected};"
+                + $"encrypted-cipher-mismatch-rejected={encryptedCipherMismatchRejected}";
         }
         catch (Exception exception)
         {
@@ -304,6 +313,158 @@
         }
     }
 
+    private static async Task<long> RunPersistentEncryptedAsync()
+    {
+        const string path = "packed-consumer-encrypted/main.db";
+        const string hexKey = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            if (options.ConnectionString.Contains(hexKey, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The connection string leaked encryption key material.");
+
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (420);",
+                "encrypted setup");
+        }
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<long> RunPersistentEncryptedPasswordAsync()
+    {
+        const string path = "packed-consumer-encrypted-password/main.db";
+        const string password = "packed-consumer-passphrase";
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromPassword(password))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            if (options.ConnectionString.Contains(password, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The connection string leaked the passphrase.");
+
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (462);",
+                "encrypted password setup");
+        }
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromPassword(password))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<bool> RunEncryptedWrongKeyAsync()
+    {
+        const string path = "packed-consumer-encrypted-wrong-key/main.db";
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromPassword("first-passphrase"))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (504);",
+                "wrong-key setup");
+        }
+
+        using var wrong = AhtolaBrowserEncryptionOptions.FromPassword("second-passphrase");
+        using var wrongOptions = new AhtolaBrowserOptions(path, encryption: wrong);
+        try
+        {
+            await using var source = new AhtolaBrowserDataSource(wrongOptions);
+            await using var connection = await source.OpenConnectionAsync();
+            return false;
+        }
+        catch (Exception exception) when (IsEncryptionRejection(exception))
+        {
+            return true;
+        }
+    }
+
+    private static async Task<bool> RunEncryptedCipherMismatchAsync()
+    {
+        const string path = "packed-consumer-encrypted-cipher/main.db";
+        const string aes256Key = "0F0E0D0C0B0A09080706050403020100F0E0D0C0B0A090807060504030201000";
+        const string aes128Key = "0F0E0D0C0B0A09080706050403020100";
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   aes256Key))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (546);",
+                "cipher mismatch setup");
+        }
+
+        // The AHTLA header records the cipher id, so opening an AES-256 database
+        // with AES-256 key material of the wrong cipher must fail closed instead
+        // of silently falling back.
+        using var mismatched = AhtolaBrowserEncryptionOptions.FromHex(
+            AhtolaEncryptionCipher.Aes128Gcm,
+            aes128Key);
+        using var mismatchedOptions = new AhtolaBrowserOptions(path, encryption: mismatched);
+        try
+        {
+            await using var source = new AhtolaBrowserDataSource(mismatchedOptions);
+            await using var connection = await source.OpenConnectionAsync();
+            return false;
+        }
+        catch (Exception exception) when (IsEncryptionRejection(exception))
+        {
+            return true;
+        }
+    }
+
+    /// Encrypted-open failures surface as InvalidDataException wrapping the
+    /// Web Crypto CryptographicException, so the whole chain must be inspected
+    /// rather than only the innermost JSException.
+    private static bool IsEncryptionRejection(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is InvalidDataException or System.Security.Cryptography.CryptographicException)
+                return true;
+        }
+
+        return false;
+    }
+
     private static async Task ExecuteFeatureAsync(
         SqliteConnection connection,
         string sql,
@@ -353,3 +514,4 @@
         public long Value { get; set; }
     }
 }
+

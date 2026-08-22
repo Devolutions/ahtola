@@ -23,9 +23,9 @@ public enum SqliteJournalMode
 /// </summary>
 internal static class SqliteRollbackJournal
 {
-    private const int HeaderSize = 28;
-    private const int SectorSize = 512;
-    private static ReadOnlySpan<byte> Magic => [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    private const int HeaderSize = SqliteRollbackJournalFormat.HeaderSize;
+    private const int SectorSize = SqliteRollbackJournalFormat.SectorSize;
+    private static ReadOnlySpan<byte> Magic => SqliteRollbackJournalFormat.Magic;
 
     internal static bool IsHot(IFileSystem fileSystem, string journalPath)
     {
@@ -896,12 +896,7 @@ internal static class SqliteRollbackJournal
     }
 
     private static uint ComputeChecksum(ReadOnlySpan<byte> page, uint nonce)
-    {
-        var checksum = nonce;
-        for (var index = page.Length - 200; index >= 0; index -= 200)
-            checksum = unchecked(checksum + page[index]);
-        return checksum;
-    }
+        => SqliteRollbackJournalFormat.ComputeChecksum(page, nonce);
 
     private static void Invalidate(string journalPath, IFileSystem fileSystem)
     {

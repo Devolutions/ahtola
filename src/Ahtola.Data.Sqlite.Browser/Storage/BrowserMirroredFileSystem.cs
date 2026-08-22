@@ -1,41 +1,53 @@
-using System.Runtime.Versioning;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Data.Sqlite.Browser.Storage;
 
 /// <summary>
-/// Presents browser OPFS as synchronous in-memory storage to the managed engine
-/// and replays its exact mutations asynchronously at statement boundaries.
+/// Presents a browser persistent store as synchronous in-memory storage to the
+/// managed engine and replays its exact mutations asynchronously at statement
+/// boundaries, optionally encrypting them on the way out.
 /// </summary>
-[SupportedOSPlatform("browser")]
 internal sealed class BrowserMirroredFileSystem :
     IFileSystem,
     IAtomicFileSystem,
     ITemporaryFileSystem,
     IStoragePathResolver,
     ISnapshotFileIdentity,
+    IPageCodecSource,
     IAsyncDisposable
 {
     private readonly object _gate = new();
     private readonly SemaphoreSlim _flushGate = new(1, 1);
     private readonly InMemoryFileSystem _memory = new();
-    private readonly OpfsAsyncFileSystem _persistent;
+    private readonly IBrowserPersistentStore _persistent;
+    private readonly BrowserEncryptedPersistence? _encryption;
+    private readonly AhtolaBrowserReservedSpaceCodec? _reservedSpaceCodec;
     private readonly string _rootDirectory;
     private readonly bool _ownsPersistent;
     private List<Operation> _pending = [];
     private int _disposed;
 
     private BrowserMirroredFileSystem(
-        OpfsAsyncFileSystem persistent,
+        IBrowserPersistentStore persistent,
         string rootDirectory,
-        bool ownsPersistent)
+        bool ownsPersistent,
+        BrowserEncryptedPersistence? encryption)
     {
         _persistent = persistent;
         _rootDirectory = Normalize(rootDirectory);
         _ownsPersistent = ownsPersistent;
+        _encryption = encryption;
+        _reservedSpaceCodec = encryption is null ? null : new AhtolaBrowserReservedSpaceCodec();
     }
 
     public StringComparer PathComparer => StringComparer.Ordinal;
+
+    /// <summary>
+    /// Forces the managed engine to reserve the bytes AHTLA encryption metadata
+    /// needs while it keeps reading and writing plaintext pages. Encryption itself
+    /// happens asynchronously on the way to OPFS.
+    /// </summary>
+    IPageCodec? IPageCodecSource.PageCodec => _reservedSpaceCodec;
 
     internal bool HasPendingMutations
     {
@@ -47,16 +59,18 @@ internal sealed class BrowserMirroredFileSystem :
     }
 
     internal static async ValueTask<BrowserMirroredFileSystem> CreateAsync(
-        OpfsAsyncFileSystem persistent,
+        IBrowserPersistentStore persistent,
         string rootDirectory,
         bool ownsPersistent = false,
+        BrowserEncryptedPersistence? encryption = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(persistent);
         var fileSystem = new BrowserMirroredFileSystem(
             persistent,
             rootDirectory,
-            ownsPersistent);
+            ownsPersistent,
+            encryption);
         try
         {
             await fileSystem.LoadAsync(cancellationToken).ConfigureAwait(false);
@@ -193,6 +207,7 @@ internal sealed class BrowserMirroredFileSystem :
                                 operation.Path,
                                 cancellationToken).ConfigureAwait(false);
                             await file.SetLengthAsync(0, cancellationToken).ConfigureAwait(false);
+                            _encryption?.NotifyCreated(operation.Path);
                             break;
                         }
                     case OperationKind.Write:
@@ -201,10 +216,25 @@ internal sealed class BrowserMirroredFileSystem :
                                 handles,
                                 operation.Path,
                                 cancellationToken).ConfigureAwait(false);
+                            if (_encryption is null || operation.Capture is null)
+                            {
+                                await file.WriteAsync(
+                                    operation.Position,
+                                    operation.Bytes!,
+                                    cancellationToken).ConfigureAwait(false);
+                                break;
+                            }
+
+                            var prepared = await _encryption
+                                .PrepareAsync(operation.Path, operation.Capture, cancellationToken)
+                                .ConfigureAwait(false);
+                            if (prepared.Bytes.Length == 0)
+                                break;
                             await file.WriteAsync(
-                                operation.Position,
-                                operation.Bytes!,
+                                prepared.Position,
+                                prepared.Bytes,
                                 cancellationToken).ConfigureAwait(false);
+                            _encryption.CommitWrite(prepared);
                             break;
                         }
                     case OperationKind.SetLength:
@@ -216,6 +246,7 @@ internal sealed class BrowserMirroredFileSystem :
                             await file.SetLengthAsync(
                                 operation.Position,
                                 cancellationToken).ConfigureAwait(false);
+                            _encryption?.NotifyLengthSet(operation.Path, operation.Position);
                             break;
                         }
                     case OperationKind.Flush:
@@ -232,6 +263,7 @@ internal sealed class BrowserMirroredFileSystem :
                         await _persistent
                             .DeleteFileAsync(operation.Path, cancellationToken)
                             .ConfigureAwait(false);
+                        _encryption?.NotifyDeleted(operation.Path);
                         break;
                     case OperationKind.Replace:
                         await CloseHandleAsync(handles, operation.Path).ConfigureAwait(false);
@@ -243,6 +275,7 @@ internal sealed class BrowserMirroredFileSystem :
                                 operation.ReplaceEmptyDestination,
                                 cancellationToken)
                             .ConfigureAwait(false);
+                        _encryption?.NotifyReplaced(operation.Path, operation.DestinationPath!);
                         break;
                     default:
                         throw new InvalidOperationException(
@@ -316,33 +349,49 @@ internal sealed class BrowserMirroredFileSystem :
         foreach (var path in paths)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await using var source = await _persistent
-                .OpenFileAsync(
-                    path,
-                    FileOpenMode.OpenExisting,
-                    readOnly: true,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            var length = await source.GetLengthAsync(cancellationToken).ConfigureAwait(false);
-            using var destination = _memory.OpenFile(path, FileOpenMode.CreateNew);
-            destination.SetLength(length);
-            var buffer = new byte[1024 * 1024];
-            var position = 0L;
-            while (position < length)
+            var image = await ReadPersistentImageAsync(path, cancellationToken).ConfigureAwait(false);
+            if (_encryption is not null)
             {
-                var count = checked((int)Math.Min(buffer.Length, length - position));
-                var read = await source
-                    .ReadAsync(position, buffer.AsMemory(0, count), cancellationToken)
+                image = await _encryption
+                    .DecryptImageAsync(path, image, cancellationToken)
                     .ConfigureAwait(false);
-                if (read != count)
-                {
-                    throw new InvalidDataException(
-                        $"OPFS file '{path}' was truncated while loading the managed database.");
-                }
-                destination.Write(position, buffer.AsSpan(0, count));
-                position += count;
             }
+
+            using var destination = _memory.OpenFile(path, FileOpenMode.CreateNew);
+            destination.SetLength(image.LongLength);
+            if (image.Length != 0)
+                destination.Write(0, image);
         }
+    }
+
+    private async ValueTask<byte[]> ReadPersistentImageAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        await using var source = await _persistent
+            .OpenFileAsync(
+                path,
+                FileOpenMode.OpenExisting,
+                readOnly: true,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var length = await source.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+        var image = new byte[checked((int)length)];
+        var position = 0;
+        while (position < image.Length)
+        {
+            var read = await source
+                .ReadAsync(position, image.AsMemory(position), cancellationToken)
+                .ConfigureAwait(false);
+            if (read <= 0)
+            {
+                throw new InvalidDataException(
+                    $"OPFS file '{path}' was truncated while loading the managed database.");
+            }
+            position += read;
+        }
+
+        return image;
     }
 
     private async ValueTask<IAsyncFile> GetWritableFileAsync(
@@ -422,12 +471,16 @@ internal sealed class BrowserMirroredFileSystem :
         long Position = 0,
         byte[]? Bytes = null,
         string? DestinationPath = null,
-        bool ReplaceEmptyDestination = false)
+        bool ReplaceEmptyDestination = false,
+        BrowserPlaintextCapture? Capture = null)
     {
         public static Operation Create(string path) => new(OperationKind.Create, path);
 
         public static Operation Write(string path, long position, ReadOnlySpan<byte> source)
             => new(OperationKind.Write, path, position, source.ToArray());
+
+        public static Operation CapturedWrite(string path, BrowserPlaintextCapture capture)
+            => new(OperationKind.Write, path, capture.Position, Capture: capture);
 
         public static Operation SetLength(string path, long length)
             => new(OperationKind.SetLength, path, length);
@@ -470,8 +523,13 @@ internal sealed class BrowserMirroredFileSystem :
         {
             ThrowIfDisposed();
             inner.Write(position, source);
-            if (persistMutations)
-                owner.Enqueue(Operation.Write(path, position, source));
+            if (!persistMutations)
+                return;
+            owner.Enqueue(owner._encryption is { } encryption
+                ? Operation.CapturedWrite(
+                    path,
+                    encryption.Capture(path, position, source.Length, inner))
+                : Operation.Write(path, position, source));
         }
 
         public void SetLength(long length)
@@ -503,3 +561,4 @@ internal sealed class BrowserMirroredFileSystem :
             => ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 }
+

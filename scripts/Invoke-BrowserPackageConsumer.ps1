@@ -121,7 +121,7 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($BrowserExecutable)) {
             $env:AHTOLA_BROWSER_EXECUTABLE = $BrowserExecutable
         }
-        & node $probeScript $uri 'PASS:capabilities=True;storage=True;crypto=True;ado=42;ef=84;persistent-ado=126;persistent-ef=168;persistent-core=210;persistent-features=546;persistent-blob=01020908;persistent-backup=336;persistent-inbound-backup=378'
+        & node $probeScript $uri 'PASS:capabilities=True;storage=True;crypto=True;ado=42;ef=84;persistent-ado=126;persistent-ef=168;persistent-core=210;persistent-features=546;persistent-blob=01020908;persistent-backup=336;persistent-inbound-backup=378;persistent-encrypted=420;persistent-encrypted-password=462;encrypted-wrong-key-rejected=True;encrypted-cipher-mismatch-rejected=True'
         if ($LASTEXITCODE -ne 0) {
             throw "Browser consumer probe failed with exit code $LASTEXITCODE."
         }

@@ -33,4 +33,20 @@ public static class AhtolaBrowserCryptoParameters
                 cipher,
                 "Browser Web Crypto supports only AHTLA AES-128-GCM and AES-256-GCM."),
         };
+
+    /// <summary>
+    /// Maps the provider-level cipher enum onto the storage cipher whose numeric
+    /// value is written into the AHTLA page 1 header. The two enums do not share
+    /// numeric values, so this must always convert by name.
+    /// </summary>
+    internal static Core.Storage.AhtolaEncryptionCipher ToStorageCipher(AhtolaEncryptionCipher cipher)
+        => cipher switch
+        {
+            AhtolaEncryptionCipher.Aes128Gcm => Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
+            AhtolaEncryptionCipher.Aes256Gcm => Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(cipher),
+                cipher,
+                "Browser Web Crypto supports only AHTLA AES-128-GCM and AES-256-GCM."),
+        };
 }

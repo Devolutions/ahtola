@@ -11,6 +11,7 @@ internal sealed class OpfsAsyncFileSystem :
     IAsyncAtomicFileSystem,
     IAsyncTemporaryFileSystem,
     IStoragePathResolver,
+    IBrowserPersistentStore,
     IAsyncDisposable
 {
     internal const int DefaultSharedBufferSize = 1024 * 1024;
@@ -139,7 +140,7 @@ internal sealed class OpfsAsyncFileSystem :
         }
     }
 
-    internal async ValueTask<IReadOnlyList<string>> ListFilesAsync(
+    public async ValueTask<IReadOnlyList<string>> ListFilesAsync(
         string directoryPath,
         CancellationToken cancellationToken = default)
     {

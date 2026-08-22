@@ -168,6 +168,22 @@ internal interface IFileSystemDecorator
 }
 
 /// <summary>
+/// Lets a file system advertise the page codec every database opened through it
+/// must use, without being wrapped in <see cref="AhtolaPageCodecFileSystem"/>.
+/// </summary>
+/// <remarks>
+/// Wrapping hides optional capabilities such as <see cref="IAtomicFileSystem"/>
+/// and <see cref="ITemporaryFileSystem"/>, which storage adapters that implement
+/// those interfaces themselves cannot afford to lose. Implementations must return
+/// a stable instance so every pager, WAL, and journal opened from the same file
+/// system agrees on the on-disk layout.
+/// </remarks>
+internal interface IPageCodecSource
+{
+    IPageCodec? PageCodec { get; }
+}
+
+/// <summary>
 /// Optional capability for proving that two file-backed databases cannot
 /// alias the same underlying file during a managed snapshot copy.
 /// </summary>

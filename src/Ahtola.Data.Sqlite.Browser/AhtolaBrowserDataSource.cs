@@ -13,6 +13,7 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
 {
     private readonly object _gate = new();
     private readonly AhtolaBrowserOptions _options;
+    private readonly AhtolaBrowserEncryptionOptions? _encryption;
     private Task<StorageState>? _initialization;
     private TaskCompletionSource? _connectionsDrained;
     private int _activeConnections;
@@ -21,22 +22,28 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
     public AhtolaBrowserDataSource(AhtolaBrowserOptions options)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
+
+        // Snapshot the key material so the caller can dispose its options object
+        // immediately without breaking a data source that opens storage lazily.
+        _encryption = options.Encryption?.CreateOwnedCopy();
     }
 
     public AhtolaBrowserDataSource(
         string databasePath,
         string ownedDirectory,
         int sharedBufferSize = AhtolaBrowserOptions.DefaultSharedBufferSize,
-        bool readOnly = false)
-        : this(new AhtolaBrowserOptions(databasePath, ownedDirectory, sharedBufferSize, readOnly))
+        bool readOnly = false,
+        AhtolaBrowserEncryptionOptions? encryption = null)
+        : this(new AhtolaBrowserOptions(databasePath, ownedDirectory, sharedBufferSize, readOnly, encryption))
     {
     }
 
     public AhtolaBrowserDataSource(
         string databasePath,
         int sharedBufferSize = AhtolaBrowserOptions.DefaultSharedBufferSize,
-        bool readOnly = false)
-        : this(new AhtolaBrowserOptions(databasePath, sharedBufferSize, readOnly))
+        bool readOnly = false,
+        AhtolaBrowserEncryptionOptions? encryption = null)
+        : this(new AhtolaBrowserOptions(databasePath, sharedBufferSize, readOnly, encryption))
     {
     }
 
@@ -178,7 +185,10 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         if (drained is not null)
             await drained.ConfigureAwait(false);
         if (initialization is null)
+        {
+            _encryption?.Dispose();
             return;
+        }
 
         StorageState storage;
         try
@@ -187,18 +197,35 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         }
         catch
         {
+            _encryption?.Dispose();
             return;
         }
 
-        await storage.DisposeAsync().ConfigureAwait(false);
+        try
+        {
+            await storage.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _encryption?.Dispose();
+        }
     }
 
     private async Task<StorageState> InitializeAsync()
     {
         OpfsAsyncFileSystem? persistent = null;
         BrowserMirroredFileSystem? mirror = null;
+        BrowserEncryptedPersistence? encryption = null;
         try
         {
+            if (_encryption is { } encryptionOptions)
+            {
+                var cipher = await AhtolaBrowserWebCryptoPageCipher
+                    .CreateAsync(encryptionOptions)
+                    .ConfigureAwait(false);
+                encryption = new BrowserEncryptedPersistence(new AhtolaAsyncPageTransformer(cipher));
+            }
+
             persistent = await OpfsAsyncFileSystem
                 .CreateAsync(
                     _options.OwnedDirectory,
@@ -209,14 +236,17 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
                 .CreateAsync(
                     persistent,
                     _options.OwnedDirectory,
+                    encryption: encryption,
                     cancellationToken: CancellationToken.None)
                 .ConfigureAwait(false);
-            return new StorageState(persistent, mirror);
+            return new StorageState(persistent, mirror, encryption);
         }
         catch
         {
             if (mirror is not null)
                 await mirror.DisposeAsync().ConfigureAwait(false);
+            if (encryption is not null)
+                await encryption.DisposeAsync().ConfigureAwait(false);
             if (persistent is not null)
                 await persistent.DisposeAsync().ConfigureAwait(false);
             throw;
@@ -254,11 +284,17 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
             + "Use the corresponding asynchronous API.");
 
     private sealed class StorageState(
-        OpfsAsyncFileSystem persistent,
-        BrowserMirroredFileSystem mirror) : IAsyncDisposable
+        IBrowserPersistentStore persistent,
+        BrowserMirroredFileSystem mirror,
+        BrowserEncryptedPersistence? encryption) : IAsyncDisposable
     {
         public BrowserMirroredFileSystem Mirror { get; } = mirror;
 
+        /// <summary>
+        /// Drains and persists first, then releases the Web Crypto key, then closes
+        /// OPFS. Releasing the key earlier would fail pending encrypted writes, and
+        /// closing OPFS earlier would drop bytes the mirror still owes.
+        /// </summary>
         public async ValueTask DisposeAsync()
         {
             try
@@ -267,7 +303,15 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
             }
             finally
             {
-                await persistent.DisposeAsync().ConfigureAwait(false);
+                try
+                {
+                    if (encryption is not null)
+                        await encryption.DisposeAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    await persistent.DisposeAsync().ConfigureAwait(false);
+                }
             }
         }
     }

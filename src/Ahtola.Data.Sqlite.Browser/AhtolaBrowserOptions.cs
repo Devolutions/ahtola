@@ -5,12 +5,14 @@ namespace Ahtola.Data.Sqlite.Browser;
 /// <summary>
 /// Configures an Ahtola database stored in an application-owned OPFS directory.
 /// </summary>
-public sealed class AhtolaBrowserOptions
+public sealed class AhtolaBrowserOptions : IDisposable
 {
     /// <summary>
     /// The default shared transfer buffer size used by the OPFS worker.
     /// </summary>
     public const int DefaultSharedBufferSize = 1024 * 1024;
+
+    private AhtolaBrowserEncryptionOptions? _encryption;
 
     /// <summary>
     /// Creates immutable browser database options.
@@ -21,11 +23,16 @@ public sealed class AhtolaBrowserOptions
     /// <param name="ownedDirectory">The relative OPFS directory exclusively owned by this data source.</param>
     /// <param name="sharedBufferSize">The OPFS worker transfer buffer size, in bytes.</param>
     /// <param name="readOnly">Whether connections reject database mutations.</param>
+    /// <param name="encryption">
+    /// Optional AHTLA page-encryption key material. It is copied, never placed in
+    /// <see cref="ConnectionString"/>, and released when these options are disposed.
+    /// </param>
     public AhtolaBrowserOptions(
         string databasePath,
         string ownedDirectory,
         int sharedBufferSize = DefaultSharedBufferSize,
-        bool readOnly = false)
+        bool readOnly = false,
+        AhtolaBrowserEncryptionOptions? encryption = null)
     {
         OwnedDirectory = NormalizePath(ownedDirectory, nameof(ownedDirectory));
         DatabasePath = NormalizePath(databasePath, nameof(databasePath));
@@ -40,7 +47,10 @@ public sealed class AhtolaBrowserOptions
         ArgumentOutOfRangeException.ThrowIfGreaterThan(sharedBufferSize, 64 * 1024 * 1024);
         SharedBufferSize = sharedBufferSize;
         IsReadOnly = readOnly;
+        _encryption = encryption?.CreateOwnedCopy();
 
+        // Key material is deliberately absent here: a connection string is routinely
+        // logged, cached, and compared, so it must never carry a passphrase or key.
         ConnectionString = new SqliteConnectionStringBuilder
         {
             DataSource = DatabasePath,
@@ -56,13 +66,31 @@ public sealed class AhtolaBrowserOptions
     public AhtolaBrowserOptions(
         string databasePath,
         int sharedBufferSize = DefaultSharedBufferSize,
-        bool readOnly = false)
+        bool readOnly = false,
+        AhtolaBrowserEncryptionOptions? encryption = null)
         : this(
             databasePath,
             GetParentDirectory(databasePath),
             sharedBufferSize,
-            readOnly)
+            readOnly,
+            encryption)
     {
+    }
+
+    /// <summary>
+    /// Gets this instance's copy of the AHTLA encryption key material, or
+    /// <see langword="null"/> when the database is stored unencrypted.
+    /// </summary>
+    public AhtolaBrowserEncryptionOptions? Encryption => _encryption;
+
+    /// <summary>Whether OPFS content is encrypted with Ahtola's AHTLA page format.</summary>
+    public bool IsEncrypted => _encryption is not null;
+
+    /// <summary>Zeros this instance's copy of the encryption key material.</summary>
+    public void Dispose()
+    {
+        var encryption = Interlocked.Exchange(ref _encryption, null);
+        encryption?.Dispose();
     }
 
     /// <summary>Gets the normalized database path relative to the OPFS root.</summary>
