@@ -418,38 +418,54 @@ public interface ISqliteWalFrameSource
 }
 
 /// <summary>
-/// A minimal, single-writer SQLite WAL file codec over <see cref="IFileSystem"/>.
+/// A minimal, single-writer SQLite WAL file codec over <see cref="IFileSystem"/>
+/// or <see cref="IAsyncFileSystem"/>.
 /// It validates checksums and salts but intentionally does not provide SQLite
 /// locking, shared-memory coordination, checkpointing, or transaction orchestration.
 /// </summary>
-public sealed class SqliteWalFile : IDisposable
+public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
 {
     // Ahtola's pager uses this durable sequence marker to distinguish an empty WAL
     // produced by a completed checkpoint from a newly-created empty WAL. Ordinary
     // restarts still use SQLite/Turso's incrementing checkpoint sequence.
     private const uint PagerCheckpointedRecoverySequence = 0xA5C3_5A3C;
 
-    private readonly IFile _file;
-        private readonly IPageCodec? _pageCodec;
-        private readonly bool _ownsPageCodec;
-        private SqliteWalHeader _header;
-        private bool _hasCheckpointedRecoveryMarker;
-        private bool _truncatedAfterCheckpoint;
-        private bool _disposed;
+    private readonly IFile? _file;
+    private readonly IAsyncFile? _asyncFile;
+    private readonly IPageCodec? _pageCodec;
+    private readonly bool _ownsPageCodec;
+    private SqliteWalHeader _header;
+    private bool _hasCheckpointedRecoveryMarker;
+    private bool _truncatedAfterCheckpoint;
+    private bool _disposed;
 
-        private SqliteWalFile(
-            IFile file,
-            SqliteWalHeader header,
-            IPageCodec? pageCodec,
-            bool ownsPageCodec,
-            bool hasCheckpointedRecoveryMarker = false)
-        {
-            _file = file;
-            _header = header;
-            _pageCodec = pageCodec;
-            _ownsPageCodec = ownsPageCodec;
-            _hasCheckpointedRecoveryMarker = hasCheckpointedRecoveryMarker;
-        }
+    private SqliteWalFile(
+        IFile file,
+        SqliteWalHeader header,
+        IPageCodec? pageCodec,
+        bool ownsPageCodec,
+        bool hasCheckpointedRecoveryMarker = false)
+    {
+        _file = file;
+        _header = header;
+        _pageCodec = pageCodec;
+        _ownsPageCodec = ownsPageCodec;
+        _hasCheckpointedRecoveryMarker = hasCheckpointedRecoveryMarker;
+    }
+
+    private SqliteWalFile(
+        IAsyncFile file,
+        SqliteWalHeader header,
+        IPageCodec? pageCodec,
+        bool ownsPageCodec,
+        bool hasCheckpointedRecoveryMarker = false)
+    {
+        _asyncFile = file;
+        _header = header;
+        _pageCodec = pageCodec;
+        _ownsPageCodec = ownsPageCodec;
+        _hasCheckpointedRecoveryMarker = hasCheckpointedRecoveryMarker;
+    }
 
     /// <summary>The validated WAL header.</summary>
     public SqliteWalHeader Header
@@ -468,17 +484,46 @@ public sealed class SqliteWalFile : IDisposable
     public SqliteWalHeader ReadDurableHeader()
     {
         ThrowIfDisposed();
-        if (_truncatedAfterCheckpoint && _file.Length == 0)
+        var file = GetSyncFile();
+        if (_truncatedAfterCheckpoint && file.Length == 0)
             return _header;
-        if (_file.Length < SqliteWalHeader.Size)
+        if (file.Length < SqliteWalHeader.Size)
         {
             throw new InvalidDataException(
                 "File is too small to contain a SQLite WAL header.");
         }
 
         Span<byte> headerBytes = stackalloc byte[SqliteWalHeader.Size];
-        if (_file.Read(0, headerBytes) != headerBytes.Length)
+        if (file.Read(0, headerBytes) != headerBytes.Length)
             throw new InvalidDataException("Failed to read the complete SQLite WAL header.");
+        return SqliteWalHeader.Parse(headerBytes);
+    }
+
+    /// <summary>
+    /// Asynchronously reads the on-disk WAL header without mutating this
+    /// instance's cached header.
+    /// </summary>
+    public async ValueTask<SqliteWalHeader> ReadDurableHeaderAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var file = GetAsyncFile();
+        var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+        if (_truncatedAfterCheckpoint && length == 0)
+            return _header;
+        if (length < SqliteWalHeader.Size)
+        {
+            throw new InvalidDataException(
+                "File is too small to contain a SQLite WAL header.");
+        }
+
+        var headerBytes = new byte[SqliteWalHeader.Size];
+        if (await file.ReadAsync(0, headerBytes, cancellationToken).ConfigureAwait(false)
+            != headerBytes.Length)
+        {
+            throw new InvalidDataException("Failed to read the complete SQLite WAL header.");
+        }
+
         return SqliteWalHeader.Parse(headerBytes);
     }
 
@@ -508,12 +553,19 @@ public sealed class SqliteWalFile : IDisposable
         get
         {
             ThrowIfDisposed();
-            return _file.Length;
+            return GetSyncFile().Length;
         }
     }
 
+    /// <summary>The current physical file length, including any incomplete tail.</summary>
+    public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return GetAsyncFile().GetLengthAsync(cancellationToken);
+    }
+
     /// <summary>Whether this WAL was opened read-only.</summary>
-    public bool IsReadOnly => _file.IsReadOnly;
+    public bool IsReadOnly => _file?.IsReadOnly ?? _asyncFile!.IsReadOnly;
 
     internal bool HasCheckpointedRecoveryMarker
     {
@@ -530,53 +582,110 @@ public sealed class SqliteWalFile : IDisposable
         IFileSystem fileSystem,
         string path,
         SqliteWalHeader header,
-            AhtolaEncryptionOptions? encryption = null,
-            IPageCodec? pageCodec = null)
-        {
-            ArgumentNullException.ThrowIfNull(fileSystem);
-            ArgumentException.ThrowIfNullOrEmpty(path);
-            ArgumentNullException.ThrowIfNull(header);
+        AhtolaEncryptionOptions? encryption = null,
+        IPageCodec? pageCodec = null)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        ArgumentNullException.ThrowIfNull(header);
 
-            var boundCodec = PageCodecSupport.Bind(encryption, pageCodec, header.PageSize, out var ownsCodec);
-            var file = fileSystem.OpenFile(path, FileOpenMode.CreateNew);
+        var boundCodec = PageCodecSupport.Bind(encryption, pageCodec, header.PageSize, out var ownsCodec);
+        var file = fileSystem.OpenFile(path, FileOpenMode.CreateNew);
+        try
+        {
+            file.Write(0, header.ToArray());
+            if (file.Length != SqliteWalHeader.Size)
+                throw new InvalidDataException("Writing the SQLite WAL header produced an invalid file length.");
+
+            file.FlushToDisk();
+            return new SqliteWalFile(file, header, boundCodec, ownsCodec);
+        }
+        catch
+        {
             try
             {
-                file.Write(0, header.ToArray());
-                if (file.Length != SqliteWalHeader.Size)
-                    throw new InvalidDataException("Writing the SQLite WAL header produced an invalid file length.");
-
-                file.FlushToDisk();
-                return new SqliteWalFile(file, header, boundCodec, ownsCodec);
+                file.Dispose();
             }
             catch
             {
-                try
-                {
-                    file.Dispose();
-                }
-                catch
-                {
-                }
-
-                try
-                {
-                    PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
-                }
-                catch
-                {
-                }
-
-                try
-                {
-                    fileSystem.DeleteFile(path);
-                }
-                catch
-                {
-                }
-
-                throw;
             }
+
+            try
+            {
+                PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                fileSystem.DeleteFile(path);
+            }
+            catch
+            {
+            }
+
+            throw;
         }
+    }
+
+    /// <summary>Asynchronously creates a new WAL file containing only <paramref name="header"/>.</summary>
+    public static async ValueTask<SqliteWalFile> CreateAsync(
+        IAsyncFileSystem fileSystem,
+        string path,
+        SqliteWalHeader header,
+        AhtolaEncryptionOptions? encryption = null,
+        IPageCodec? pageCodec = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        ArgumentNullException.ThrowIfNull(header);
+
+        var boundCodec = PageCodecSupport.Bind(encryption, pageCodec, header.PageSize, out var ownsCodec);
+        var file = await fileSystem.OpenFileAsync(
+            path,
+            FileOpenMode.CreateNew,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await file.WriteAsync(0, header.ToArray(), cancellationToken).ConfigureAwait(false);
+            if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != SqliteWalHeader.Size)
+                throw new InvalidDataException("Writing the SQLite WAL header produced an invalid file length.");
+
+            await file.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
+            return new SqliteWalFile(file, header, boundCodec, ownsCodec);
+        }
+        catch
+        {
+            try
+            {
+                await file.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                await fileSystem.DeleteFileAsync(path, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+
+            throw;
+        }
+    }
 
     /// <summary>
     /// Opens an existing WAL after validating its header. A partial or corrupt
@@ -587,48 +696,110 @@ public sealed class SqliteWalFile : IDisposable
         string path,
         bool readOnly = false,
         AhtolaEncryptionOptions? encryption = null,
-            SqliteWalHeader? truncatedHeader = null,
-            IPageCodec? pageCodec = null)
+        SqliteWalHeader? truncatedHeader = null,
+        IPageCodec? pageCodec = null)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
+
+        var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly);
+        IPageCodec? boundCodec = null;
+        var ownsCodec = false;
+        try
         {
-            ArgumentNullException.ThrowIfNull(fileSystem);
-            ArgumentException.ThrowIfNullOrEmpty(path);
-            PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
-
-            var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly);
-            IPageCodec? boundCodec = null;
-            var ownsCodec = false;
-            try
+            if (file.Length == 0 && truncatedHeader is not null)
             {
-                if (file.Length == 0 && truncatedHeader is not null)
+                boundCodec = PageCodecSupport.Bind(
+                    encryption,
+                    pageCodec,
+                    truncatedHeader.PageSize,
+                    out ownsCodec);
+                return new SqliteWalFile(file, truncatedHeader, boundCodec, ownsCodec)
                 {
-                    boundCodec = PageCodecSupport.Bind(
-                        encryption,
-                        pageCodec,
-                        truncatedHeader.PageSize,
-                        out ownsCodec);
-                    return new SqliteWalFile(file, truncatedHeader, boundCodec, ownsCodec)
-                    {
-                        _truncatedAfterCheckpoint = true,
-                    };
-                }
-                if (file.Length < SqliteWalHeader.Size)
-                    throw new InvalidDataException("File is too small to contain a SQLite WAL header.");
-
-                Span<byte> headerBytes = stackalloc byte[SqliteWalHeader.Size];
-                if (file.Read(0, headerBytes) != headerBytes.Length)
-                    throw new InvalidDataException("Failed to read the complete SQLite WAL header.");
-
-                var header = SqliteWalHeader.Parse(headerBytes);
-                boundCodec = PageCodecSupport.Bind(encryption, pageCodec, header.PageSize, out ownsCodec);
-                return new SqliteWalFile(file, header, boundCodec, ownsCodec);
+                    _truncatedAfterCheckpoint = true,
+                };
             }
-            catch
-            {
-                file.Dispose();
-                PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
-                throw;
-            }
+            if (file.Length < SqliteWalHeader.Size)
+                throw new InvalidDataException("File is too small to contain a SQLite WAL header.");
+
+            Span<byte> headerBytes = stackalloc byte[SqliteWalHeader.Size];
+            if (file.Read(0, headerBytes) != headerBytes.Length)
+                throw new InvalidDataException("Failed to read the complete SQLite WAL header.");
+
+            var header = SqliteWalHeader.Parse(headerBytes);
+            boundCodec = PageCodecSupport.Bind(encryption, pageCodec, header.PageSize, out ownsCodec);
+            return new SqliteWalFile(file, header, boundCodec, ownsCodec);
         }
+        catch
+        {
+            file.Dispose();
+            PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Asynchronously opens an existing WAL after validating its header. A
+    /// partial or corrupt frame tail is left for <see cref="ScanRecoveryAsync"/>
+    /// to diagnose.
+    /// </summary>
+    public static async ValueTask<SqliteWalFile> OpenAsync(
+        IAsyncFileSystem fileSystem,
+        string path,
+        bool readOnly = false,
+        AhtolaEncryptionOptions? encryption = null,
+        SqliteWalHeader? truncatedHeader = null,
+        IPageCodec? pageCodec = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        PageCodecSupport.RejectCombinedTransforms(encryption, pageCodec);
+
+        var file = await fileSystem.OpenFileAsync(
+            path,
+            FileOpenMode.OpenExisting,
+            readOnly,
+            cancellationToken).ConfigureAwait(false);
+        IPageCodec? boundCodec = null;
+        var ownsCodec = false;
+        try
+        {
+            var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+            if (length == 0 && truncatedHeader is not null)
+            {
+                boundCodec = PageCodecSupport.Bind(
+                    encryption,
+                    pageCodec,
+                    truncatedHeader.PageSize,
+                    out ownsCodec);
+                return new SqliteWalFile(file, truncatedHeader, boundCodec, ownsCodec)
+                {
+                    _truncatedAfterCheckpoint = true,
+                };
+            }
+            if (length < SqliteWalHeader.Size)
+                throw new InvalidDataException("File is too small to contain a SQLite WAL header.");
+
+            var headerBytes = new byte[SqliteWalHeader.Size];
+            if (await file.ReadAsync(0, headerBytes, cancellationToken).ConfigureAwait(false)
+                != headerBytes.Length)
+            {
+                throw new InvalidDataException("Failed to read the complete SQLite WAL header.");
+            }
+
+            var header = SqliteWalHeader.Parse(headerBytes);
+            boundCodec = PageCodecSupport.Bind(encryption, pageCodec, header.PageSize, out ownsCodec);
+            return new SqliteWalFile(file, header, boundCodec, ownsCodec);
+        }
+        catch
+        {
+            await file.DisposeAsync().ConfigureAwait(false);
+            PageCodecSupport.DisposeOwned(boundCodec, ownsCodec);
+            throw;
+        }
+    }
 
     /// <summary>
     /// Appends a checksummed page frame. A non-zero
@@ -657,12 +828,53 @@ public sealed class SqliteWalFile : IDisposable
 
         var frameNumber = checked(scan.Info.LastValidFrameNumber + 1);
         var offset = FrameOffset(frameNumber);
-        if (_file.Length != offset)
+        if (GetSyncFile().Length != offset)
             throw new InvalidDataException("SQLite WAL length changed while preparing an append.");
 
         var frame = new byte[checked((int)FrameSize)];
         EncodeFrame(frame, pageNumber, pageData, databaseSizeInPages, scan.LastChecksum);
         AppendAtEnd(offset, frame);
+        return frameNumber;
+    }
+
+    /// <summary>
+    /// Asynchronously appends a checksummed page frame. A non-zero
+    /// <paramref name="databaseSizeInPages"/> marks this frame as committed.
+    /// </summary>
+    public async ValueTask<long> AppendFrameAsync(
+        uint pageNumber,
+        ReadOnlyMemory<byte> pageData,
+        uint databaseSizeInPages = 0,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+        if (pageNumber == 0)
+            throw new ArgumentOutOfRangeException(nameof(pageNumber), pageNumber, "SQLite WAL page numbers are 1-based.");
+        if (pageData.Length != Header.PageSize)
+        {
+            throw new ArgumentException(
+                $"SQLite WAL page data must be exactly {Header.PageSize} bytes.",
+                nameof(pageData));
+        }
+
+        var file = GetAsyncFile();
+        await MaterializeHeaderAfterCheckpointTruncateAsync(cancellationToken).ConfigureAwait(false);
+        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile)
+        {
+            throw new InvalidDataException(
+                "Cannot append to a SQLite WAL with a partial or invalid frame tail; recover it first.");
+        }
+
+        var frameNumber = checked(scan.Info.LastValidFrameNumber + 1);
+        var offset = FrameOffset(frameNumber);
+        if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != offset)
+            throw new InvalidDataException("SQLite WAL length changed while preparing an append.");
+
+        var frame = new byte[checked((int)FrameSize)];
+        EncodeFrame(frame, pageNumber, pageData.Span, databaseSizeInPages, scan.LastChecksum);
+        await AppendAtEndAsync(offset, frame, cancellationToken).ConfigureAwait(false);
         return frameNumber;
     }
 
@@ -708,7 +920,7 @@ public sealed class SqliteWalFile : IDisposable
 
         var firstFrameNumber = checked(scan.Info.LastValidFrameNumber + 1);
         var baseOffset = FrameOffset(firstFrameNumber);
-        if (_file.Length != baseOffset)
+        if (GetSyncFile().Length != baseOffset)
             throw new InvalidDataException("SQLite WAL length changed while preparing an append.");
 
         var frameSize = checked((int)FrameSize);
@@ -746,8 +958,8 @@ public sealed class SqliteWalFile : IDisposable
                 // One bounded write per frame keeps append granularity identical to
                 // the per-frame path; the win here is the single preceding scan.
                 var expectedLength = checked(writeOffset + frameSize);
-                _file.Write(writeOffset, frame);
-                if (_file.Length != expectedLength)
+                GetSyncFile().Write(writeOffset, frame);
+                if (GetSyncFile().Length != expectedLength)
                     throw new InvalidDataException("Appending a SQLite WAL frame produced an invalid file length.");
 
                 writeOffset = expectedLength;
@@ -761,8 +973,103 @@ public sealed class SqliteWalFile : IDisposable
                 // batch stay as an uncommitted tail: none of them carries the
                 // commit marker, so recovery still discards the whole batch,
                 // and a peer sees exactly the boundary the per-frame path left.
-                if (_file.Length != writeOffset)
-                    _file.SetLength(writeOffset);
+                if (GetSyncFile().Length != writeOffset)
+                    GetSyncFile().SetLength(writeOffset);
+            }
+            catch (Exception rollbackException)
+            {
+                throw new InvalidDataException(
+                    "Appending a SQLite WAL frame batch failed and the original length could not be restored.",
+                    new AggregateException(appendException, rollbackException));
+            }
+
+            throw;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        return checked(firstFrameNumber + count - 1);
+    }
+
+    /// <summary>
+    /// Asynchronously appends an entire transaction's frames in one pass. Only
+    /// the final frame carries the commit marker.
+    /// </summary>
+    public async ValueTask<long> AppendFramesAsync(
+        ISqliteWalFrameSource frames,
+        uint commitDatabaseSizeInPages,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(frames);
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+
+        var count = frames.Count;
+        if (count <= 0)
+            throw new ArgumentException("A SQLite WAL frame batch must contain at least one frame.", nameof(frames));
+
+        var file = GetAsyncFile();
+        await MaterializeHeaderAfterCheckpointTruncateAsync(cancellationToken).ConfigureAwait(false);
+        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile)
+        {
+            throw new InvalidDataException(
+                "Cannot append to a SQLite WAL with a partial or invalid frame tail; recover it first.");
+        }
+
+        var firstFrameNumber = checked(scan.Info.LastValidFrameNumber + 1);
+        var baseOffset = FrameOffset(firstFrameNumber);
+        if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != baseOffset)
+            throw new InvalidDataException("SQLite WAL length changed while preparing an append.");
+
+        var frameSize = checked((int)FrameSize);
+        var buffer = ArrayPool<byte>.Shared.Rent(frameSize);
+        var rolling = scan.LastChecksum;
+        var writeOffset = baseOffset;
+
+        try
+        {
+            for (var index = 0; index < count; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var pageNumber = frames.GetPageNumber(index);
+                if (pageNumber == 0)
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(frames),
+                        pageNumber,
+                        "SQLite WAL page numbers are 1-based.");
+                }
+
+                var databaseSizeInPages = index == count - 1 ? commitDatabaseSizeInPages : 0U;
+                rolling = EncodeFrameFromSource(
+                    buffer,
+                    frameSize,
+                    frames,
+                    index,
+                    pageNumber,
+                    databaseSizeInPages,
+                    rolling);
+
+                var expectedLength = checked(writeOffset + frameSize);
+                await file.WriteAsync(
+                    writeOffset,
+                    buffer.AsMemory(0, frameSize),
+                    cancellationToken).ConfigureAwait(false);
+                if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != expectedLength)
+                    throw new InvalidDataException("Appending a SQLite WAL frame produced an invalid file length.");
+
+                writeOffset = expectedLength;
+            }
+        }
+        catch (Exception appendException)
+        {
+            try
+            {
+                if (await file.GetLengthAsync(CancellationToken.None).ConfigureAwait(false) != writeOffset)
+                    await file.SetLengthAsync(writeOffset, CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception rollbackException)
             {
@@ -827,6 +1134,31 @@ public sealed class SqliteWalFile : IDisposable
         return checksum;
     }
 
+    private (uint First, uint Second) EncodeFrameFromSource(
+        byte[] destination,
+        int frameSize,
+        ISqliteWalFrameSource frames,
+        int index,
+        uint pageNumber,
+        uint databaseSizeInPages,
+        (uint First, uint Second) previousChecksum)
+    {
+        var pageData = frames.GetPageImage(index);
+        if (pageData.Length != Header.PageSize)
+        {
+            throw new ArgumentException(
+                $"SQLite WAL page data must be exactly {Header.PageSize} bytes.",
+                nameof(frames));
+        }
+
+        return EncodeFrame(
+            destination.AsSpan(0, frameSize),
+            pageNumber,
+            pageData,
+            databaseSizeInPages,
+            previousChecksum);
+    }
+
     /// <summary>
     /// Reads one frame after validating every checksum in its chain from the WAL
     /// header through that frame.
@@ -837,7 +1169,7 @@ public sealed class SqliteWalFile : IDisposable
         if (frameNumber < 1)
             throw new ArgumentOutOfRangeException(nameof(frameNumber), frameNumber, "SQLite WAL frame numbers are 1-based.");
 
-        var fullFrameCount = CompleteFrameCount(_file.Length);
+        var fullFrameCount = CompleteFrameCount(GetSyncFile().Length);
         if (frameNumber > fullFrameCount)
         {
             throw new ArgumentOutOfRangeException(
@@ -854,24 +1186,62 @@ public sealed class SqliteWalFile : IDisposable
             if (currentFrameNumber == frameNumber)
             {
                 var onDiskPageData = frame.AsSpan(SqliteWalFrameHeader.Size);
-                                byte[] pageData;
-                                if (_pageCodec is null)
-                                {
-                                    pageData = onDiskPageData.ToArray();
-                                }
-                                else
-                                {
-                                    pageData = new byte[onDiskPageData.Length];
-                                    PageCodecSupport.Decode(
-                                        _pageCodec,
-                                        PageLocation.Wal,
-                                        frameHeader.PageNumber,
-                                        onDiskPageData,
-                                        pageData);
-                                }
+                byte[] pageData;
+                if (_pageCodec is null)
+                {
+                    pageData = onDiskPageData.ToArray();
+                }
+                else
+                {
+                    pageData = new byte[onDiskPageData.Length];
+                    PageCodecSupport.Decode(
+                        _pageCodec,
+                        PageLocation.Wal,
+                        frameHeader.PageNumber,
+                        onDiskPageData,
+                        pageData);
+                }
 
-                                return new SqliteWalFrame(frameHeader, pageData);
+                return new SqliteWalFrame(frameHeader, pageData);
             }
+
+            previousChecksum = checksum;
+        }
+
+        throw new InvalidOperationException("SQLite WAL frame traversal ended unexpectedly.");
+    }
+
+    /// <summary>
+    /// Asynchronously reads one frame after validating every checksum in its
+    /// chain from the WAL header through that frame.
+    /// </summary>
+    public async ValueTask<SqliteWalFrame> ReadFrameAsync(
+        long frameNumber,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (frameNumber < 1)
+            throw new ArgumentOutOfRangeException(nameof(frameNumber), frameNumber, "SQLite WAL frame numbers are 1-based.");
+
+        var fullFrameCount = CompleteFrameCount(
+            await GetAsyncFile().GetLengthAsync(cancellationToken).ConfigureAwait(false));
+        if (frameNumber > fullFrameCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(frameNumber),
+                frameNumber,
+                $"Frame number is out of range for {fullFrameCount} complete SQLite WAL frame(s).");
+        }
+
+        var previousChecksum = (Header.Checksum1, Header.Checksum2);
+        for (var currentFrameNumber = 1L; currentFrameNumber <= frameNumber; currentFrameNumber++)
+        {
+            var frame = await ReadFrameBytesAsync(
+                FrameOffset(currentFrameNumber),
+                cancellationToken).ConfigureAwait(false);
+            var frameHeader = ValidateFrame(frame, previousChecksum, out var checksum);
+            if (currentFrameNumber == frameNumber)
+                return DecodeFrame(frame, frameHeader);
 
             previousChecksum = checksum;
         }
@@ -907,7 +1277,7 @@ public sealed class SqliteWalFile : IDisposable
                 "The last SQLite WAL frame number cannot precede the first.");
         }
 
-        var fullFrameCount = CompleteFrameCount(_file.Length);
+        var fullFrameCount = CompleteFrameCount(GetSyncFile().Length);
         if (lastFrameNumber > fullFrameCount)
         {
             throw new ArgumentOutOfRangeException(
@@ -925,7 +1295,7 @@ public sealed class SqliteWalFile : IDisposable
             var frame = rented.AsSpan(0, frameSize);
             for (var frameNumber = 1L; frameNumber <= lastFrameNumber; frameNumber++)
             {
-                var read = _file.Read(FrameOffset(frameNumber), frame);
+                var read = GetSyncFile().Read(FrameOffset(frameNumber), frame);
                 if (read != frame.Length)
                 {
                     throw new InvalidDataException(
@@ -963,6 +1333,78 @@ public sealed class SqliteWalFile : IDisposable
     }
 
     /// <summary>
+    /// Asynchronously reads a contiguous run of frames, validating the checksum
+    /// chain from the WAL header through <paramref name="lastFrameNumber"/>
+    /// exactly once.
+    /// </summary>
+    public async ValueTask<IReadOnlyList<SqliteWalFrame>> ReadFrameRangeAsync(
+        long firstFrameNumber,
+        long lastFrameNumber,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (firstFrameNumber < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(firstFrameNumber),
+                firstFrameNumber,
+                "SQLite WAL frame numbers are 1-based.");
+        }
+        if (lastFrameNumber < firstFrameNumber)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(lastFrameNumber),
+                lastFrameNumber,
+                "The last SQLite WAL frame number cannot precede the first.");
+        }
+
+        var file = GetAsyncFile();
+        var fullFrameCount = CompleteFrameCount(
+            await file.GetLengthAsync(cancellationToken).ConfigureAwait(false));
+        if (lastFrameNumber > fullFrameCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(lastFrameNumber),
+                lastFrameNumber,
+                $"Frame number is out of range for {fullFrameCount} complete SQLite WAL frame(s).");
+        }
+
+        var frameSize = checked((int)FrameSize);
+        var results = new List<SqliteWalFrame>(checked((int)(lastFrameNumber - firstFrameNumber + 1)));
+        var previousChecksum = (Header.Checksum1, Header.Checksum2);
+        var rented = ArrayPool<byte>.Shared.Rent(frameSize);
+        try
+        {
+            for (var frameNumber = 1L; frameNumber <= lastFrameNumber; frameNumber++)
+            {
+                var read = await file.ReadAsync(
+                    FrameOffset(frameNumber),
+                    rented.AsMemory(0, frameSize),
+                    cancellationToken).ConfigureAwait(false);
+                if (read != frameSize)
+                {
+                    throw new InvalidDataException(
+                        $"Short read on SQLite WAL frame: expected {frameSize} bytes, got {read} bytes.");
+                }
+
+                var frameHeader = ValidateFrame(
+                    rented.AsSpan(0, frameSize),
+                    previousChecksum,
+                    out var checksum);
+                previousChecksum = checksum;
+                if (frameNumber >= firstFrameNumber)
+                    results.Add(DecodeFrame(rented.AsSpan(0, frameSize), frameHeader));
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+
+        return results;
+    }
+
+    /// <summary>
     /// Scans valid frames in order and reports the boundary after the most recent
     /// valid commit. Corrupt or incomplete tails are not treated as committed.
     /// </summary>
@@ -970,6 +1412,17 @@ public sealed class SqliteWalFile : IDisposable
     {
         ThrowIfDisposed();
         return ScanCore().Info;
+    }
+
+    /// <summary>
+    /// Asynchronously scans valid frames in order and reports the boundary after
+    /// the most recent valid commit.
+    /// </summary>
+    public async ValueTask<SqliteWalRecoveryInfo> ScanRecoveryAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return (await ScanCoreAsync(cancellationToken).ConfigureAwait(false)).Info;
     }
 
     /// <summary>
@@ -981,18 +1434,48 @@ public sealed class SqliteWalFile : IDisposable
         ThrowIfDisposed();
         ThrowIfReadOnly();
 
+        var file = GetSyncFile();
         var scan = ScanCore();
-        if (_truncatedAfterCheckpoint && _file.Length == 0)
+        if (_truncatedAfterCheckpoint && file.Length == 0)
             return scan.Info;
 
         var targetLength = scan.Info.LastCommittedByteLength;
-        if (_file.Length != targetLength)
+        if (file.Length != targetLength)
         {
-            _file.SetLength(targetLength);
-            if (_file.Length != targetLength)
+            file.SetLength(targetLength);
+            if (file.Length != targetLength)
                 throw new InvalidDataException("SQLite WAL recovery truncation did not reach its requested boundary.");
 
-            _file.FlushToDisk();
+            file.FlushToDisk();
+        }
+
+        return scan.Info;
+    }
+
+    /// <summary>
+    /// Asynchronously truncates and durably flushes every byte after the last
+    /// valid committed frame.
+    /// </summary>
+    public async ValueTask<SqliteWalRecoveryInfo> RecoverToLastCommittedFrameAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+
+        var file = GetAsyncFile();
+        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+        if (_truncatedAfterCheckpoint && length == 0)
+            return scan.Info;
+
+        var targetLength = scan.Info.LastCommittedByteLength;
+        if (length != targetLength)
+        {
+            await file.SetLengthAsync(targetLength, cancellationToken).ConfigureAwait(false);
+            if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != targetLength)
+                throw new InvalidDataException("SQLite WAL recovery truncation did not reach its requested boundary.");
+
+            await file.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
         }
 
         return scan.Info;
@@ -1003,7 +1486,15 @@ public sealed class SqliteWalFile : IDisposable
     {
         ThrowIfDisposed();
         if (!IsReadOnly)
-            _file.FlushToDisk();
+            GetSyncFile().FlushToDisk();
+    }
+
+    /// <summary>Asynchronously flushes WAL bytes and metadata to durable storage.</summary>
+    public async ValueTask FlushAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (!IsReadOnly)
+            await GetAsyncFile().FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1032,8 +1523,9 @@ public sealed class SqliteWalFile : IDisposable
         if (scan.Info.LastCommittedFrameNumber == 0)
             return;
 
-        _file.SetLength(SqliteWalHeader.Size);
-        if (_file.Length != SqliteWalHeader.Size)
+        var file = GetSyncFile();
+        file.SetLength(SqliteWalHeader.Size);
+        if (file.Length != SqliteWalHeader.Size)
             throw new InvalidDataException("SQLite WAL reset did not reach its header boundary.");
 
         var salt2 = CreateRandomSalt();
@@ -1045,11 +1537,54 @@ public sealed class SqliteWalFile : IDisposable
                 PagerCheckpointedRecoverySequence,
                 _header.ChecksumByteOrder)
             : _header.Restart(salt2);
-        _file.Write(0, replacementHeader.ToArray());
+        file.Write(0, replacementHeader.ToArray());
         _header = replacementHeader;
         _hasCheckpointedRecoveryMarker = publishCheckpointedRecoveryMarker;
 
-        _file.FlushToDisk();
+        file.FlushToDisk();
+    }
+
+    /// <summary>
+    /// Asynchronously reclaims every committed frame after the caller has
+    /// durably installed the same committed view in the main database file.
+    /// </summary>
+    internal async ValueTask ResetAfterDurableCheckpointAsync(
+        bool publishCheckpointedRecoveryMarker,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+
+        var file = GetAsyncFile();
+        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile
+            || scan.Info.LastValidFrameNumber != scan.Info.LastCommittedFrameNumber)
+        {
+            throw new InvalidDataException(
+                "Cannot reset a SQLite WAL with a partial, corrupt, or uncommitted frame tail.");
+        }
+
+        if (scan.Info.LastCommittedFrameNumber == 0)
+            return;
+
+        await file.SetLengthAsync(SqliteWalHeader.Size, cancellationToken).ConfigureAwait(false);
+        if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != SqliteWalHeader.Size)
+            throw new InvalidDataException("SQLite WAL reset did not reach its header boundary.");
+
+        var salt2 = CreateRandomSalt();
+        var replacementHeader = publishCheckpointedRecoveryMarker
+            ? SqliteWalHeader.Create(
+                _header.PageSize,
+                unchecked(_header.Salt1 + 1),
+                salt2,
+                PagerCheckpointedRecoverySequence,
+                _header.ChecksumByteOrder)
+            : _header.Restart(salt2);
+        await file.WriteAsync(0, replacementHeader.ToArray(), cancellationToken).ConfigureAwait(false);
+        _header = replacementHeader;
+        _hasCheckpointedRecoveryMarker = publishCheckpointedRecoveryMarker;
+
+        await file.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1074,11 +1609,39 @@ public sealed class SqliteWalFile : IDisposable
                 "Cannot truncate a SQLite WAL with a partial, corrupt, or uncommitted frame tail.");
         }
 
-        _file.SetLength(0);
-        if (_file.Length != 0)
+        var file = GetSyncFile();
+        file.SetLength(0);
+        if (file.Length != 0)
             throw new InvalidDataException("SQLite WAL truncation did not reach zero bytes.");
 
-        _file.FlushToDisk();
+        file.FlushToDisk();
+        _truncatedAfterCheckpoint = true;
+    }
+
+    /// <summary>
+    /// Asynchronously truncates the WAL to zero bytes after a caller has durably
+    /// checkpointed its complete committed view.
+    /// </summary>
+    internal async ValueTask TruncateAfterDurableCheckpointAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+
+        var file = GetAsyncFile();
+        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile
+            || scan.Info.LastValidFrameNumber != scan.Info.LastCommittedFrameNumber)
+        {
+            throw new InvalidDataException(
+                "Cannot truncate a SQLite WAL with a partial, corrupt, or uncommitted frame tail.");
+        }
+
+        await file.SetLengthAsync(0, cancellationToken).ConfigureAwait(false);
+        if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != 0)
+            throw new InvalidDataException("SQLite WAL truncation did not reach zero bytes.");
+
+        await file.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
         _truncatedAfterCheckpoint = true;
     }
 
@@ -1088,14 +1651,35 @@ public sealed class SqliteWalFile : IDisposable
         if (_disposed)
             return;
 
+        if (_file is null)
+        {
+            throw new InvalidOperationException(
+                "This SQLite WAL uses asynchronous storage and must be disposed with DisposeAsync.");
+        }
+
         _disposed = true;
-        _file.Dispose();
-                PageCodecSupport.DisposeOwned(_pageCodec, _ownsPageCodec);
+        _file!.Dispose();
+        PageCodecSupport.DisposeOwned(_pageCodec, _ownsPageCodec);
+    }
+
+    /// <inheritdoc />
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        if (_asyncFile is not null)
+            await _asyncFile.DisposeAsync().ConfigureAwait(false);
+        else
+            _file!.Dispose();
+        PageCodecSupport.DisposeOwned(_pageCodec, _ownsPageCodec);
     }
 
     private ScanState ScanCore()
     {
-        var length = _file.Length;
+        var file = GetSyncFile();
+        var length = file.Length;
         if (_truncatedAfterCheckpoint && length == 0)
         {
             return CreateScanState(
@@ -1112,7 +1696,7 @@ public sealed class SqliteWalFile : IDisposable
         if (_truncatedAfterCheckpoint && length >= SqliteWalHeader.Size)
         {
             var headerBytes = new byte[SqliteWalHeader.Size];
-            if (_file.Read(0, headerBytes) == headerBytes.Length)
+            if (file.Read(0, headerBytes) == headerBytes.Length)
             {
                 _header = SqliteWalHeader.Parse(headerBytes);
                 _truncatedAfterCheckpoint = false;
@@ -1144,7 +1728,7 @@ public sealed class SqliteWalFile : IDisposable
             var frame = rented.AsSpan(0, frameSize);
             for (var frameNumber = 1L; frameNumber <= fullFrameCount; frameNumber++)
             {
-                if (_file.Read(FrameOffset(frameNumber), frame) != frame.Length)
+                if (file.Read(FrameOffset(frameNumber), frame) != frame.Length)
                 {
                     return CreateScanState(
                         lastValidFrameNumber,
@@ -1159,6 +1743,107 @@ public sealed class SqliteWalFile : IDisposable
                 try
                 {
                     frameHeader = ValidateFrame(frame, previousChecksum, out checksum);
+                }
+                catch (InvalidDataException)
+                {
+                    return CreateScanState(
+                        lastValidFrameNumber,
+                        lastCommittedFrameNumber,
+                        lastCommittedDatabaseSizeInPages,
+                        SqliteWalRecoveryStopReason.InvalidFrame,
+                        previousChecksum);
+                }
+
+                lastValidFrameNumber = frameNumber;
+                previousChecksum = checksum;
+                if (frameHeader.IsCommit)
+                {
+                    lastCommittedFrameNumber = frameNumber;
+                    lastCommittedDatabaseSizeInPages = frameHeader.DatabaseSizeInPages;
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+
+        return CreateScanState(
+            lastValidFrameNumber,
+            lastCommittedFrameNumber,
+            lastCommittedDatabaseSizeInPages,
+            hasPartialFrame ? SqliteWalRecoveryStopReason.PartialFrame : SqliteWalRecoveryStopReason.EndOfFile,
+            previousChecksum);
+    }
+
+    private async ValueTask<ScanState> ScanCoreAsync(CancellationToken cancellationToken)
+    {
+        var file = GetAsyncFile();
+        var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+        if (_truncatedAfterCheckpoint && length == 0)
+        {
+            return CreateScanState(
+                lastValidFrameNumber: 0,
+                lastCommittedFrameNumber: 0,
+                lastCommittedDatabaseSizeInPages: 0,
+                SqliteWalRecoveryStopReason.EndOfFile,
+                (Header.Checksum1, Header.Checksum2));
+        }
+
+        if (_truncatedAfterCheckpoint && length >= SqliteWalHeader.Size)
+        {
+            var headerBytes = new byte[SqliteWalHeader.Size];
+            if (await file.ReadAsync(0, headerBytes, cancellationToken).ConfigureAwait(false)
+                == headerBytes.Length)
+            {
+                _header = SqliteWalHeader.Parse(headerBytes);
+                _truncatedAfterCheckpoint = false;
+            }
+        }
+
+        var fullFrameCount = CompleteFrameCount(length);
+        var hasPartialFrame = (length - SqliteWalHeader.Size) % FrameSize != 0;
+        var previousChecksum = (Header.Checksum1, Header.Checksum2);
+        var lastValidFrameNumber = 0L;
+        var lastCommittedFrameNumber = 0L;
+        var lastCommittedDatabaseSizeInPages = 0U;
+        if (fullFrameCount == 0)
+        {
+            return CreateScanState(
+                lastValidFrameNumber,
+                lastCommittedFrameNumber,
+                lastCommittedDatabaseSizeInPages,
+                hasPartialFrame ? SqliteWalRecoveryStopReason.PartialFrame : SqliteWalRecoveryStopReason.EndOfFile,
+                previousChecksum);
+        }
+
+        var frameSize = checked((int)FrameSize);
+        var rented = ArrayPool<byte>.Shared.Rent(frameSize);
+        try
+        {
+            for (var frameNumber = 1L; frameNumber <= fullFrameCount; frameNumber++)
+            {
+                if (await file.ReadAsync(
+                    FrameOffset(frameNumber),
+                    rented.AsMemory(0, frameSize),
+                    cancellationToken).ConfigureAwait(false) != frameSize)
+                {
+                    return CreateScanState(
+                        lastValidFrameNumber,
+                        lastCommittedFrameNumber,
+                        lastCommittedDatabaseSizeInPages,
+                        SqliteWalRecoveryStopReason.PartialFrame,
+                        previousChecksum);
+                }
+
+                SqliteWalFrameHeader frameHeader;
+                (uint First, uint Second) checksum;
+                try
+                {
+                    frameHeader = ValidateFrame(
+                        rented.AsSpan(0, frameSize),
+                        previousChecksum,
+                        out checksum);
                 }
                 catch (InvalidDataException)
                 {
@@ -1235,21 +1920,73 @@ public sealed class SqliteWalFile : IDisposable
         return frameHeader;
     }
 
+    private SqliteWalFrame DecodeFrame(
+        ReadOnlySpan<byte> frame,
+        SqliteWalFrameHeader frameHeader)
+    {
+        var onDiskPageData = frame[SqliteWalFrameHeader.Size..];
+        var pageData = new byte[onDiskPageData.Length];
+        if (_pageCodec is null)
+            onDiskPageData.CopyTo(pageData);
+        else
+        {
+            PageCodecSupport.Decode(
+                _pageCodec,
+                PageLocation.Wal,
+                frameHeader.PageNumber,
+                onDiskPageData,
+                pageData);
+        }
+
+        return new SqliteWalFrame(frameHeader, pageData);
+    }
+
     private void AppendAtEnd(long offset, ReadOnlySpan<byte> frame)
     {
         var expectedLength = checked(offset + frame.Length);
         try
         {
-            _file.Write(offset, frame);
-            if (_file.Length != expectedLength)
+            GetSyncFile().Write(offset, frame);
+            if (GetSyncFile().Length != expectedLength)
                 throw new InvalidDataException("Appending a SQLite WAL frame produced an invalid file length.");
         }
         catch (Exception appendException)
         {
             try
             {
-                if (_file.Length != offset)
-                    _file.SetLength(offset);
+                if (GetSyncFile().Length != offset)
+                    GetSyncFile().SetLength(offset);
+            }
+            catch (Exception rollbackException)
+            {
+                throw new InvalidDataException(
+                    "Appending a SQLite WAL frame failed and the original length could not be restored.",
+                    new AggregateException(appendException, rollbackException));
+            }
+
+            throw;
+        }
+    }
+
+    private async ValueTask AppendAtEndAsync(
+        long offset,
+        ReadOnlyMemory<byte> frame,
+        CancellationToken cancellationToken)
+    {
+        var file = GetAsyncFile();
+        var expectedLength = checked(offset + frame.Length);
+        try
+        {
+            await file.WriteAsync(offset, frame, cancellationToken).ConfigureAwait(false);
+            if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != expectedLength)
+                throw new InvalidDataException("Appending a SQLite WAL frame produced an invalid file length.");
+        }
+        catch (Exception appendException)
+        {
+            try
+            {
+                if (await file.GetLengthAsync(CancellationToken.None).ConfigureAwait(false) != offset)
+                    await file.SetLengthAsync(offset, CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception rollbackException)
             {
@@ -1266,14 +2003,35 @@ public sealed class SqliteWalFile : IDisposable
     {
         if (!_truncatedAfterCheckpoint)
             return;
-        if (_file.Length != 0)
+        var file = GetSyncFile();
+        if (file.Length != 0)
         {
             throw new InvalidDataException(
                 "SQLite WAL changed after a checkpoint truncate; refusing to overwrite an unexpected artifact.");
         }
 
-        _file.Write(position: 0, Header.ToArray());
-        if (_file.Length != SqliteWalHeader.Size)
+        file.Write(position: 0, Header.ToArray());
+        if (file.Length != SqliteWalHeader.Size)
+            throw new InvalidDataException("Recreating a truncated SQLite WAL header produced an invalid file length.");
+
+        _truncatedAfterCheckpoint = false;
+    }
+
+    private async ValueTask MaterializeHeaderAfterCheckpointTruncateAsync(
+        CancellationToken cancellationToken)
+    {
+        if (!_truncatedAfterCheckpoint)
+            return;
+
+        var file = GetAsyncFile();
+        if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != 0)
+        {
+            throw new InvalidDataException(
+                "SQLite WAL changed after a checkpoint truncate; refusing to overwrite an unexpected artifact.");
+        }
+
+        await file.WriteAsync(0, Header.ToArray(), cancellationToken).ConfigureAwait(false);
+        if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != SqliteWalHeader.Size)
             throw new InvalidDataException("Recreating a truncated SQLite WAL header produced an invalid file length.");
 
         _truncatedAfterCheckpoint = false;
@@ -1282,7 +2040,25 @@ public sealed class SqliteWalFile : IDisposable
     private byte[] ReadFrameBytes(long offset)
     {
         var frame = new byte[checked((int)FrameSize)];
-        var read = _file.Read(offset, frame);
+        var read = GetSyncFile().Read(offset, frame);
+        if (read != frame.Length)
+        {
+            throw new InvalidDataException(
+                $"Short read on SQLite WAL frame: expected {frame.Length} bytes, got {read} bytes.");
+        }
+
+        return frame;
+    }
+
+    private async ValueTask<byte[]> ReadFrameBytesAsync(
+        long offset,
+        CancellationToken cancellationToken)
+    {
+        var frame = new byte[checked((int)FrameSize)];
+        var read = await GetAsyncFile().ReadAsync(
+            offset,
+            frame,
+            cancellationToken).ConfigureAwait(false);
         if (read != frame.Length)
         {
             throw new InvalidDataException(
@@ -1323,6 +2099,16 @@ public sealed class SqliteWalFile : IDisposable
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+
+    private IFile GetSyncFile()
+        => _file
+           ?? throw new InvalidOperationException(
+               "This SQLite WAL uses asynchronous storage; call its asynchronous API.");
+
+    private IAsyncFile GetAsyncFile()
+        => _asyncFile
+           ?? throw new InvalidOperationException(
+               "This SQLite WAL uses synchronous storage; call its synchronous API.");
 
     private static uint CreateRandomSalt()
     {
