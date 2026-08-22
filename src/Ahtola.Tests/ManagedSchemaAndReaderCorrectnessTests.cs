@@ -81,7 +81,8 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
             Action getSchemaTable = () => reader.GetSchemaTable();
             getSchemaTable.Should().NotThrow();
             var schema = reader.GetSchemaTable();
-            schema.Rows.Count.Should().Be(1);
+            schema.Should().NotBeNull();
+            schema!.Rows.Count.Should().Be(1);
             schema.Rows[0][System.Data.Common.SchemaTableColumn.ColumnName].Should().Be("value");
         }
         finally
