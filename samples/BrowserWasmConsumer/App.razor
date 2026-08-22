@@ -1,0 +1,78 @@
+@using System.Globalization
+@using Ahtola.Data.Sqlite
+@using Microsoft.EntityFrameworkCore
+
+<PageTitle>Ahtola browser package consumer</PageTitle>
+
+<h1>Ahtola browser package consumer</h1>
+<p id="browser-test-status">@status</p>
+
+@code {
+    private string status = "pending";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+            return;
+
+        try
+        {
+            var capabilities = await AhtolaBrowserRuntime.GetCapabilitiesAsync();
+            var storage = await AhtolaBrowserStorageDiagnostics.RunAsync();
+            var crypto = await AhtolaBrowserCryptoDiagnostics.RunKnownAnswersAsync();
+            var ado = await RunAdoAsync();
+            var ef = await RunEfAsync();
+            status =
+                $"PASS:capabilities={capabilities.IsSupported};"
+                + $"storage={storage.Succeeded};"
+                + $"crypto={crypto.Succeeded};"
+                + $"ado={ado};ef={ef}";
+        }
+        catch (Exception exception)
+        {
+            status = $"FAIL:{exception.GetType().Name}:{exception.Message}";
+        }
+
+        StateHasChanged();
+    }
+
+    private static async Task<long> RunAdoAsync()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:;Mode=Memory");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TABLE probe(value INTEGER NOT NULL);
+            INSERT INTO probe(value) VALUES (42);
+            SELECT value FROM probe;
+            """;
+        var result = await command.ExecuteScalarAsync();
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture);
+    }
+
+    private static async Task<long> RunEfAsync()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:;Mode=Memory");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<ProbeContext>()
+            .UseAhtola(connection)
+            .Options;
+        await using var context = new ProbeContext(options);
+        await context.Database.EnsureCreatedAsync();
+        context.Rows.Add(new ProbeRow { Value = 84 });
+        await context.SaveChangesAsync();
+        return await context.Rows.Select(static row => row.Value).SingleAsync();
+    }
+
+    private sealed class ProbeContext(DbContextOptions<ProbeContext> options) : DbContext(options)
+    {
+        public DbSet<ProbeRow> Rows => Set<ProbeRow>();
+    }
+
+    private sealed class ProbeRow
+    {
+        public int Id { get; set; }
+
+        public long Value { get; set; }
+    }
+}

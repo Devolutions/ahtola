@@ -12,6 +12,7 @@
     ./build.ps1 test
     ./build.ps1 pack -PackageVersion 0.1.0-preview.1
     ./build.ps1 validate-package
+    ./build.ps1 validate-browser-package
 #>
 [CmdletBinding()]
 param(
@@ -25,6 +26,7 @@ param(
                 'pack-powershell',
                 'test-powershell',
                 'validate-package',
+                'validate-browser-package',
                 'validate-runtime',
                 'cloud-smoke',
                 'validate-project-closure',
@@ -72,6 +74,7 @@ $PowerShellHelpMarkdown = Join-Path $RepoRoot "docs/powershell-help/$PowerShellM
 $PowerShellHelpBuilder = Join-Path $RepoRoot 'scripts/Build-PowerShellHelp.ps1'
 $PowerShellTestRunner = Join-Path $RepoRoot 'scripts/Invoke-PowerShellModuleTests.ps1'
 $ConsumerProject = './samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj'
+$BrowserConsumerRunner = Join-Path $RepoRoot 'scripts/Invoke-BrowserPackageConsumer.ps1'
 $ConsumerNugetConfig = './samples/ManagedPackageConsumer/obj/managed-package-consumer.nuget.config'
 $ClosureValidator = Join-Path $RepoRoot 'scripts/Validate-ManagedPackageClosure.ps1'
 $TestRunner = Join-Path $RepoRoot 'scripts/Invoke-ManagedTestSuite.ps1'
@@ -135,7 +138,8 @@ function Assert-ManagedProjectClosure {
         (Join-Path $RepoRoot 'src/Ahtola.Data.Sqlite.Browser'),
         (Join-Path $RepoRoot 'src/Ahtola.EntityFrameworkCore.Sqlite'),
                 (Join-Path $RepoRoot 'src/Devolutions.Ahtola.PowerShell'),
-                (Join-Path $RepoRoot 'samples/ManagedPackageConsumer')
+                (Join-Path $RepoRoot 'samples/ManagedPackageConsumer'),
+                (Join-Path $RepoRoot 'samples/BrowserWasmConsumer')
             )
     foreach ($root in $projectRoots) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) {
@@ -367,6 +371,23 @@ function Invoke-ValidatePackage {
     }
 }
 
+function Invoke-ValidateBrowserPackage {
+    $localVersion = if ([string]::IsNullOrWhiteSpace($PackageVersion)) {
+        '0.0.0-browser-local'
+    } else {
+        $PackageVersion
+    }
+    Invoke-Pack -Version $localVersion -Output $PackageOutput
+    $arguments = @(
+        '-PackageDirectory', (Get-AbsolutePath $PackageOutput),
+        '-PackageVersion', $localVersion
+    )
+    if ($env:AHTOLA_BROWSER_AOT -eq '1') {
+        $arguments += '-RunAot'
+    }
+    Invoke-PwshScript -Path $BrowserConsumerRunner -Arguments $arguments
+}
+
 function Invoke-ValidateRuntime {
     Invoke-ValidatePackage
 
@@ -480,6 +501,7 @@ switch ($Task) {
         'validate-project-closure' { Assert-ManagedProjectClosure }
         'validate-packed-closure' { Invoke-ValidatePackedClosure }
         'validate-package' { Invoke-ValidatePackage }
+        'validate-browser-package' { Invoke-ValidateBrowserPackage }
         'validate-runtime' { Invoke-ValidateRuntime }
         'cloud-smoke' { Invoke-CloudSmoke }
         'test' { Invoke-Test }
