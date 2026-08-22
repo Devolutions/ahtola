@@ -91,6 +91,21 @@ internal sealed class BrowserWalChainUpdate(
 }
 
 /// <summary>
+/// The encryption roles assigned to a persisted directory, separating the files
+/// that must be loaded from the abandoned engine temporaries that must not be.
+/// </summary>
+internal sealed class BrowserLoadPlan(
+    IReadOnlyList<(string Path, BrowserPersistedFileKind Kind)> files,
+    IReadOnlyList<string> transientArtifacts)
+{
+    /// <summary>Files to load, in an order where every base path precedes its sidecars.</summary>
+    internal IReadOnlyList<(string Path, BrowserPersistedFileKind Kind)> Files { get; } = files;
+
+    /// <summary>Abandoned engine temporaries that are safe to discard.</summary>
+    internal IReadOnlyList<string> TransientArtifacts { get; } = transientArtifacts;
+}
+
+/// <summary>
 /// Converts between the plaintext image the managed engine operates on and the
 /// exact AHTLA-encrypted image stored in OPFS.
 /// </summary>
@@ -112,20 +127,48 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
 {
     private const int WalHeaderSize = SqliteWalHeader.Size;
     private const int WalFrameHeaderSize = SqliteWalFrameHeader.Size;
+    private const int RoleProbeLength = 16;
 
     private readonly Dictionary<string, WalChain> _walChains = new(StringComparer.Ordinal);
+    private readonly BrowserPersistedFileRoles _roles = new();
+    private Func<string, bool>? _basePathExists;
 
-    /// <summary>Classifies a persisted path by SQLite's file naming conventions.</summary>
-    internal static BrowserPersistedFileKind Classify(string path)
+    /// <summary>
+    /// Supplies the predicate that reports whether a base database path currently
+    /// exists, so a sidecar can be recognized even before its database is opened.
+    /// </summary>
+    internal void SetBasePathProbe(Func<string, bool> basePathExists)
+        => _basePathExists = basePathExists;
+
+    /// <summary>Declares a path the caller already knows is a database.</summary>
+    internal void RegisterDatabase(string path) => _roles.RegisterDatabase(path);
+
+    /// <summary>
+    /// Resolves the encryption role of a path that the engine is mutating, probing
+    /// its current bytes so a database whose name resembles a sidecar is not
+    /// demoted (and, for <c>-shm</c>, silently persisted in the clear).
+    /// </summary>
+    private BrowserPersistedFileKind ClassifyForWrite(string path, IFile file)
     {
-        if (path.EndsWith("-wal", StringComparison.Ordinal))
-            return BrowserPersistedFileKind.Wal;
-        if (path.EndsWith("-journal", StringComparison.Ordinal))
-            return BrowserPersistedFileKind.Journal;
-        if (path.EndsWith("-shm", StringComparison.Ordinal))
-            return BrowserPersistedFileKind.Passthrough;
-        return BrowserPersistedFileKind.Database;
+        Span<byte> probe = stackalloc byte[RoleProbeLength];
+        var read = file.Length == 0 ? 0 : file.Read(0, probe);
+        var role = _roles.Resolve(path, probe[..Math.Max(read, 0)], _basePathExists);
+        return MapRole(path, role);
     }
+
+    private static BrowserPersistedFileKind MapRole(string path, BrowserPersistedFileRole role)
+        => role switch
+        {
+            BrowserPersistedFileRole.Database => BrowserPersistedFileKind.Database,
+            BrowserPersistedFileRole.Wal => BrowserPersistedFileKind.Wal,
+            BrowserPersistedFileRole.Journal => BrowserPersistedFileKind.Journal,
+            BrowserPersistedFileRole.SharedMemory => BrowserPersistedFileKind.Passthrough,
+            BrowserPersistedFileRole.MvccLog => throw new NotSupportedException(
+                $"Encrypted browser storage cannot host the MVCC logical log '{path}'. "
+                + "The engine writes that log outside the page codec, so enabling MVCC would place row "
+                + "data in OPFS unencrypted. Use the default journal mode for encrypted browser databases."),
+            _ => throw new InvalidOperationException($"Unknown persisted browser file role {role}."),
+        };
 
     /// <summary>
     /// Expands a just-completed engine write to whole pages, WAL frames, or journal
@@ -133,7 +176,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
     /// </summary>
     internal BrowserPlaintextCapture Capture(string path, long position, int length, IFile file)
     {
-        var kind = Classify(path);
+        var kind = ClassifyForWrite(path, file);
         if (kind == BrowserPersistedFileKind.Passthrough)
             return ReadRegion(kind, file, position, length, pageSize: 0, journalChecksumNonce: 0);
 
@@ -201,7 +244,11 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
     internal void NotifyCreated(string path) => _walChains.Remove(path);
 
     /// <summary>Forgets any cached state for a deleted file.</summary>
-    internal void NotifyDeleted(string path) => _walChains.Remove(path);
+    internal void NotifyDeleted(string path)
+    {
+        _walChains.Remove(path);
+        _roles.Forget(path);
+    }
 
     /// <summary>Moves cached state along with an atomically replaced file.</summary>
     internal void NotifyReplaced(string sourcePath, string destinationPath)
@@ -210,6 +257,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             _walChains[destinationPath] = chain;
         else
             _walChains.Remove(destinationPath);
+        _roles.Rename(sourcePath, destinationPath);
     }
 
     /// <summary>Drops WAL frame checksums that a truncation removed.</summary>
@@ -229,27 +277,109 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
     }
 
     /// <summary>
-    /// Decrypts a complete OPFS image into the plaintext the managed engine reads,
-    /// rebuilding the WAL rolling-checksum chain so later appends stay valid.
+    /// Assigns encryption roles to every persisted path and separates the abandoned
+    /// engine temporaries that must not be loaded or decrypted.
     /// </summary>
-    internal async ValueTask<byte[]> DecryptImageAsync(
-        string path,
-        byte[] encryptedImage,
+    /// <remarks>
+    /// Paths are resolved shortest-first because a sidecar name is always strictly
+    /// longer than the database it belongs to, so every base path is known before
+    /// anything derived from it is classified.
+    /// </remarks>
+    internal BrowserLoadPlan PlanLoad(
+        IReadOnlyList<string> paths,
+        Func<string, byte[]> probeHeader)
+    {
+        var ordered = paths
+            .OrderBy(static path => path.Length)
+            .ThenBy(static path => path, StringComparer.Ordinal)
+            .ToArray();
+
+        var loadable = new List<(string Path, BrowserPersistedFileKind Kind)>();
+        var transient = new List<string>();
+        var present = new HashSet<string>(ordered, StringComparer.Ordinal);
+        foreach (var path in ordered)
+        {
+            if (BrowserPersistedFileRoles.IsTransientArtifact(path))
+            {
+                transient.Add(path);
+                continue;
+            }
+
+            loadable.Add((path, MapRole(path, _roles.Resolve(path, probeHeader(path), present.Contains))));
+        }
+
+        return new BrowserLoadPlan(loadable, transient);
+    }
+
+    /// <summary>
+    /// Turns the loaded encrypted images into the plaintext the engine reads.
+    /// </summary>
+    /// <remarks>
+    /// A crash can leave a torn page in the main database, so recovery has to run
+    /// in the encrypted domain before any page is authenticated. Hot rollback
+    /// journals are replayed onto the encrypted image first, and a page that still
+    /// fails authentication is satisfied from a committed WAL frame when one exists.
+    /// Only when no recovery source can supply the page does the open fail.
+    /// </remarks>
+    internal async ValueTask<Dictionary<string, byte[]>> DecryptLoadedImagesAsync(
+        BrowserLoadPlan plan,
+        Dictionary<string, byte[]> encryptedImages,
         CancellationToken cancellationToken)
     {
-        var kind = Classify(path);
-        _walChains.Remove(path);
-        return kind switch
+        var plaintext = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        var walPages = new Dictionary<string, IReadOnlyDictionary<uint, byte[]>>(StringComparer.Ordinal);
+
+        foreach (var (path, kind) in plan.Files)
         {
-            BrowserPersistedFileKind.Passthrough => encryptedImage,
-            BrowserPersistedFileKind.Database
-                => await DecryptDatabaseImageAsync(encryptedImage, cancellationToken).ConfigureAwait(false),
-            BrowserPersistedFileKind.Wal
-                => await DecryptWalImageAsync(path, encryptedImage, cancellationToken).ConfigureAwait(false),
-            BrowserPersistedFileKind.Journal
-                => await DecryptJournalImageAsync(encryptedImage, cancellationToken).ConfigureAwait(false),
-            _ => encryptedImage,
-        };
+            if (kind is not BrowserPersistedFileKind.Wal)
+                continue;
+
+            _walChains.Remove(path);
+            var (Image, CommittedPages) = await DecryptWalImageAsync(
+                    path,
+                    encryptedImages[path],
+                    cancellationToken)
+                .ConfigureAwait(false);
+            plaintext[path] = Image;
+            walPages[path] = CommittedPages;
+        }
+
+        foreach (var (path, kind) in plan.Files)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            switch (kind)
+            {
+                case BrowserPersistedFileKind.Wal:
+                    break;
+                case BrowserPersistedFileKind.Passthrough:
+                    plaintext[path] = encryptedImages[path];
+                    break;
+                case BrowserPersistedFileKind.Journal:
+                    plaintext[path] = await DecryptJournalImageAsync(
+                            encryptedImages[path],
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+                case BrowserPersistedFileKind.Database:
+                    {
+                        var image = encryptedImages[path];
+                        if (encryptedImages.TryGetValue(path + "-journal", out var journal))
+                            image = ApplyEncryptedJournalRollback(image, journal);
+                        walPages.TryGetValue(path + "-wal", out var recoveryPages);
+                        plaintext[path] = await DecryptDatabaseImageAsync(
+                                image,
+                                recoveryPages,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        break;
+                    }
+
+                default:
+                    throw new InvalidOperationException($"Unknown persisted browser file kind {kind}.");
+            }
+        }
+
+        return plaintext;
     }
 
     /// <inheritdoc />
@@ -559,6 +689,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
 
     private async ValueTask<byte[]> DecryptDatabaseImageAsync(
         byte[] encryptedImage,
+        IReadOnlyDictionary<uint, byte[]>? recoveryPages,
         CancellationToken cancellationToken)
     {
         if (encryptedImage.Length == 0)
@@ -582,22 +713,98 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         {
             cancellationToken.ThrowIfCancellationRequested();
             var pageNumber = checked((uint)(offset / pageSize)) + 1;
-            var page = await pages
-                .DecryptPageAsync(encryptedImage.AsMemory(offset, pageSize), pageNumber, cancellationToken)
-                .ConfigureAwait(false);
+            byte[] page;
+            try
+            {
+                page = await pages
+                    .DecryptPageAsync(encryptedImage.AsMemory(offset, pageSize), pageNumber, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (InvalidDataException) when (
+                recoveryPages is not null
+                && recoveryPages.TryGetValue(pageNumber, out var recovered)
+                && recovered.Length == pageSize)
+            {
+                // A crash during checkpoint can tear a page that a committed WAL
+                // frame still holds. Recovering it here keeps the open alive; the
+                // pager then re-applies the same frame through its own checkpoint.
+                page = recovered;
+            }
+
             page.CopyTo(plaintext.AsSpan(offset));
         }
 
         return plaintext;
     }
 
-    private async ValueTask<byte[]> DecryptWalImageAsync(
+    /// <summary>
+    /// Replays a hot rollback journal's encrypted page images back into the
+    /// encrypted database image, restoring the pre-transaction content before any
+    /// page is authenticated.
+    /// </summary>
+    private static byte[] ApplyEncryptedJournalRollback(byte[] databaseImage, byte[] journalImage)
+    {
+        if (!SqliteRollbackJournalFormat.HasMagic(journalImage))
+            return databaseImage;
+        if (!SqliteRollbackJournalFormat.TryReadLayout(
+                journalImage,
+                out var recordCount,
+                out var checksumNonce,
+                out var pageSize,
+                out var sectorSize))
+        {
+            return databaseImage;
+        }
+
+        var originalPageCount = BinaryPrimitives.ReadUInt32BigEndian(journalImage.AsSpan(16));
+        if (originalPageCount == 0 || databaseImage.Length % pageSize != 0)
+            return databaseImage;
+
+        var recordSize = checked((int)SqliteRollbackJournalFormat.GetRecordSize(pageSize));
+        var restored = databaseImage.AsSpan().ToArray();
+        var applied = 0u;
+        for (var offset = sectorSize; offset + recordSize <= journalImage.Length; offset += recordSize)
+        {
+            if (recordCount != uint.MaxValue && applied >= recordCount)
+                break;
+
+            var pageNumber = BinaryPrimitives.ReadUInt32BigEndian(journalImage.AsSpan(offset));
+            if (pageNumber == 0 || pageNumber > originalPageCount)
+                break;
+
+            var page = journalImage.AsSpan(
+                offset + SqliteRollbackJournalFormat.RecordPageNumberSize,
+                pageSize);
+            var storedChecksum = BinaryPrimitives.ReadUInt32BigEndian(
+                journalImage.AsSpan(offset + SqliteRollbackJournalFormat.RecordPageNumberSize + pageSize));
+            if (SqliteRollbackJournalFormat.ComputeChecksum(page, checksumNonce) != storedChecksum)
+                break;
+
+            var target = checked((int)(pageNumber - 1)) * pageSize;
+            if (target + pageSize > restored.Length)
+                break;
+
+            page.CopyTo(restored.AsSpan(target));
+            applied++;
+        }
+
+        if (applied == 0)
+            return databaseImage;
+
+        var originalLength = checked((int)originalPageCount) * pageSize;
+        if (restored.Length > originalLength)
+            Array.Resize(ref restored, originalLength);
+        return restored;
+    }
+
+    private async ValueTask<(byte[] Image, IReadOnlyDictionary<uint, byte[]> CommittedPages)> DecryptWalImageAsync(
         string path,
         byte[] encryptedImage,
         CancellationToken cancellationToken)
     {
+        var committed = new Dictionary<uint, byte[]>();
         if (encryptedImage.Length < WalHeaderSize)
-            return encryptedImage;
+            return (encryptedImage, committed);
 
         SqliteWalHeader header;
         try
@@ -606,7 +813,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         }
         catch (InvalidDataException)
         {
-            return encryptedImage;
+            return (encryptedImage, committed);
         }
 
         var frameSize = WalFrameHeaderSize + header.PageSize;
@@ -619,6 +826,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             ByteOrder = header.ChecksumByteOrder,
         };
 
+        var pending = new Dictionary<uint, byte[]>();
         var encryptedRunning = chain.Seed;
         var plaintextRunning = chain.Seed;
         for (var offset = WalHeaderSize; offset + frameSize <= encryptedImage.Length; offset += frameSize)
@@ -658,10 +866,20 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                 plaintextRunning);
             encryptedRunning = expected;
             chain.FrameChecksums.Add(encryptedRunning);
+
+            pending[frameHeader.PageNumber] = body;
+            if (!frameHeader.IsCommit)
+                continue;
+
+            // Only frames up to a commit marker may repair the main database,
+            // mirroring exactly what a checkpoint is allowed to write.
+            foreach (var (pageNumber, image) in pending)
+                committed[pageNumber] = image;
+            pending.Clear();
         }
 
         _walChains[path] = chain;
-        return plaintext;
+        return (plaintext, committed);
     }
 
     private async ValueTask<byte[]> DecryptJournalImageAsync(

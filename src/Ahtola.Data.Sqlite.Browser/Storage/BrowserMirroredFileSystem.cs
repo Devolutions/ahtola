@@ -38,6 +38,7 @@ internal sealed class BrowserMirroredFileSystem :
         _ownsPersistent = ownsPersistent;
         _encryption = encryption;
         _reservedSpaceCodec = encryption is null ? null : new AhtolaBrowserReservedSpaceCodec();
+        encryption?.SetBasePathProbe(_memory.FileExists);
     }
 
     public StringComparer PathComparer => StringComparer.Ordinal;
@@ -346,22 +347,75 @@ internal sealed class BrowserMirroredFileSystem :
         var paths = await _persistent
             .ListFilesAsync(_rootDirectory, cancellationToken)
             .ConfigureAwait(false);
+        if (_encryption is null)
+        {
+            foreach (var path in paths)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Materialize(path, await ReadPersistentImageAsync(path, cancellationToken).ConfigureAwait(false));
+            }
+
+            return;
+        }
+
+        // Abandoned VACUUM and page-migration temporaries must never be decrypted:
+        // they can be preallocated or half-written, and failing on one would block
+        // opening an otherwise healthy database.
+        var probes = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         foreach (var path in paths)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var image = await ReadPersistentImageAsync(path, cancellationToken).ConfigureAwait(false);
-            if (_encryption is not null)
-            {
-                image = await _encryption
-                    .DecryptImageAsync(path, image, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-
-            using var destination = _memory.OpenFile(path, FileOpenMode.CreateNew);
-            destination.SetLength(image.LongLength);
-            if (image.Length != 0)
-                destination.Write(0, image);
+            if (BrowserPersistedFileRoles.IsTransientArtifact(path))
+                continue;
+            probes[path] = await ReadPersistentHeaderAsync(path, cancellationToken).ConfigureAwait(false);
         }
+
+        var plan = _encryption.PlanLoad(
+            paths,
+            path => probes.TryGetValue(path, out var probe) ? probe : []);
+        foreach (var artifact in plan.TransientArtifacts)
+        {
+            await _persistent
+                .DeleteFileAsync(artifact, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        var images = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        foreach (var (path, _) in plan.Files)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            images[path] = await ReadPersistentImageAsync(path, cancellationToken).ConfigureAwait(false);
+        }
+
+        var plaintext = await _encryption
+            .DecryptLoadedImagesAsync(plan, images, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var (path, _) in plan.Files)
+            Materialize(path, plaintext[path]);
+    }
+
+    private void Materialize(string path, byte[] image)
+    {
+        using var destination = _memory.OpenFile(path, FileOpenMode.CreateNew);
+        destination.SetLength(image.LongLength);
+        if (image.Length != 0)
+            destination.Write(0, image);
+    }
+
+    private async ValueTask<byte[]> ReadPersistentHeaderAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        await using var source = await _persistent
+            .OpenFileAsync(path, FileOpenMode.OpenExisting, readOnly: true, cancellationToken)
+            .ConfigureAwait(false);
+        var length = await source.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+        if (length == 0)
+            return [];
+
+        var probe = new byte[Math.Min(length, 16)];
+        var read = await source.ReadAsync(0, probe, cancellationToken).ConfigureAwait(false);
+        return read == probe.Length ? probe : probe.AsSpan(0, Math.Max(read, 0)).ToArray();
     }
 
     private async ValueTask<byte[]> ReadPersistentImageAsync(

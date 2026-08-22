@@ -55,10 +55,35 @@ transform. Files are classified by SQLite's naming conventions:
 
 | File | Treatment |
 | --- | --- |
-| database (`x.db`, attached, VACUUM temporaries) | every page encrypted |
+| database (`x.db`, attached, VACUUM targets) | every page encrypted |
 | `x.db-wal` | header plaintext; frame bodies encrypted; rolling checksums recomputed over the **encrypted** bytes |
 | `x.db-journal` | header plaintext; page records encrypted; per-record checksum recomputed over the **encrypted** page |
 | `x.db-shm` | passthrough — the WAL index is derived, rebuildable metadata |
+| `x.db-log` | rejected — see *MVCC* below |
+
+### Roles are tracked, not guessed from the suffix
+
+A filename suffix alone cannot decide this. A perfectly legal database can be
+named `notes-shm`, or attached as `archive-wal`, and treating it as a sidecar
+would corrupt it or — for `-shm` — persist its pages in the clear. A path is a
+sidecar only when:
+
+1. its base database is already known (databases are discovered in open order at
+   run time, and shortest-path-first at load, so a base is always resolved
+   before anything derived from it), or the base file exists; or
+2. the content positively identifies it: a WAL header magic, or a finalized
+   rollback journal magic.
+
+In all cases, content that starts with `AHTLA` or `SQLite format 3` vetoes the
+sidecar role and the file is treated as a database.
+
+### MVCC
+
+The engine writes the MVCC logical log (`x.db-log`) outside the page codec, so
+on desktop it is plaintext. Reproducing that in the browser would put row data
+in OPFS unencrypted, so `PRAGMA journal_mode=mvcc` on an encrypted browser
+database fails with an explicit `NotSupportedException` instead. Encryption is
+never silently weakened.
 
 Page 1 keeps a visible 100-byte header: the `AHTLA` magic, format version 0,
 the cipher id, zeroed reserved bytes, and the SQLite header bytes 16..100
@@ -91,6 +116,28 @@ state is committed only after the transformed bytes reach OPFS. A cancelled or
 failed flush therefore leaves the unreplayed mutations queued and replayable
 instead of advancing state or reporting false success.
 
+## Recovery runs before authentication
+
+An OPFS write is not atomic, so losing the process can leave a torn page that no
+longer authenticates. Authenticating the main database first would turn that
+into a fatal open even when the information needed to repair it is sitting in a
+journal or WAL. Loading therefore runs in recovery order:
+
+1. Decrypt the WAL, stopping at the first frame that fails its chain, and record
+   the page images belonging to committed frames.
+2. Replay a hot rollback journal's **encrypted** page images back into the
+   encrypted database image and truncate to the journal's declared original page
+   count. This is the pre-transaction content, restored before anything is
+   authenticated.
+3. Decrypt the database. A page that still fails authentication is satisfied
+   from a committed WAL frame when one exists — the same content a checkpoint
+   would have written.
+
+A page with no recovery source still fails closed. Abandoned engine temporaries
+(`.vacuum-<guid>.tmp`, `.page-size-<guid>.tmp`, and `.v4-upgrade`, plus their
+sidecars) are recognized by exact shape, never decrypted, and removed, so a
+preallocated leftover cannot block opening a healthy database.
+
 ## Failing closed
 
 There is no plaintext fallback and no cipher inference. Opening encrypted
@@ -121,7 +168,10 @@ using var options = new AhtolaBrowserOptions(
 await using var dataSource = new AhtolaBrowserDataSource(options);
 ```
 
-The data source snapshots the encryption settings during construction, so
-caller-owned `AhtolaBrowserOptions` and `AhtolaBrowserEncryptionOptions`
-instances can be disposed independently. The data source releases its own copy
-after all connections drain and pending encrypted writes finish.
+A data source that builds its own `AhtolaBrowserOptions` (the convenience
+constructors) owns them, keeps a single copy of the key rather than a second
+snapshot, and disposes them with itself. Options supplied by the caller stay the
+caller's to dispose, so the data source takes an independent snapshot instead —
+otherwise disposing the options would break a data source that opens storage
+lazily. Every disposal and failure path releases key material through one code
+path.

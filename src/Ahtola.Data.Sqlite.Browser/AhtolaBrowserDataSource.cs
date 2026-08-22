@@ -13,6 +13,7 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
 {
     private readonly object _gate = new();
     private readonly AhtolaBrowserOptions _options;
+    private readonly bool _ownsOptions;
     private readonly AhtolaBrowserEncryptionOptions? _encryption;
     private readonly string _memoryName = "ahtola-browser-memory-" + Guid.NewGuid().ToString("N");
     private IManagedDatabaseAdapter? _memoryOwner;
@@ -22,12 +23,19 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
     private bool _disposed;
 
     public AhtolaBrowserDataSource(AhtolaBrowserOptions options)
+        : this(options ?? throw new ArgumentNullException(nameof(options)), ownsOptions: false)
     {
-        _options = options ?? throw new ArgumentNullException(nameof(options));
+    }
 
-        // Snapshot the key material so the caller can dispose its options object
-        // immediately without breaking a data source that opens storage lazily.
-        _encryption = options.Encryption?.CreateOwnedCopy();
+    private AhtolaBrowserDataSource(AhtolaBrowserOptions options, bool ownsOptions)
+    {
+        _options = options;
+        _ownsOptions = ownsOptions;
+
+        // Options this instance created are disposed with it, so their single copy
+        // of the key is the one used and zeroed. Caller-owned options may be
+        // disposed at any time, so take an independent snapshot instead.
+        _encryption = ownsOptions ? null : options.Encryption?.CreateOwnedCopy();
     }
 
     public AhtolaBrowserDataSource(
@@ -36,7 +44,9 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         int sharedBufferSize = AhtolaBrowserOptions.DefaultSharedBufferSize,
         bool readOnly = false,
         AhtolaBrowserEncryptionOptions? encryption = null)
-        : this(new AhtolaBrowserOptions(databasePath, ownedDirectory, sharedBufferSize, readOnly, encryption))
+        : this(
+            new AhtolaBrowserOptions(databasePath, ownedDirectory, sharedBufferSize, readOnly, encryption),
+            ownsOptions: true)
     {
     }
 
@@ -45,7 +55,9 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         int sharedBufferSize = AhtolaBrowserOptions.DefaultSharedBufferSize,
         bool readOnly = false,
         AhtolaBrowserEncryptionOptions? encryption = null)
-        : this(new AhtolaBrowserOptions(databasePath, sharedBufferSize, readOnly, encryption))
+        : this(
+            new AhtolaBrowserOptions(databasePath, sharedBufferSize, readOnly, encryption),
+            ownsOptions: true)
     {
     }
 
@@ -210,7 +222,7 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
             }
             finally
             {
-                _encryption?.Dispose();
+                ReleaseKeyMaterial();
             }
             return;
         }
@@ -222,7 +234,7 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         }
         catch
         {
-            _encryption?.Dispose();
+            ReleaseKeyMaterial();
             return;
         }
 
@@ -232,8 +244,21 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         }
         finally
         {
-            _encryption?.Dispose();
+            ReleaseKeyMaterial();
         }
+    }
+
+    private AhtolaBrowserEncryptionOptions? EffectiveEncryption => _encryption ?? _options.Encryption;
+
+    /// <summary>
+    /// Zeros this instance's key material and, when it created the options itself,
+    /// the copy those options hold. Runs on every disposal and failure path.
+    /// </summary>
+    private void ReleaseKeyMaterial()
+    {
+        _encryption?.Dispose();
+        if (_ownsOptions)
+            _options.Dispose();
     }
 
     private async Task<StorageState> InitializeAsync()
@@ -243,12 +268,13 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         BrowserEncryptedPersistence? encryption = null;
         try
         {
-            if (_encryption is { } encryptionOptions)
+            if (EffectiveEncryption is { } encryptionOptions)
             {
                 var cipher = await AhtolaBrowserWebCryptoPageCipher
                     .CreateAsync(encryptionOptions)
                     .ConfigureAwait(false);
                 encryption = new BrowserEncryptedPersistence(new AhtolaAsyncPageTransformer(cipher));
+                encryption.RegisterDatabase(_options.DatabasePath);
             }
 
             persistent = await OpfsAsyncFileSystem
