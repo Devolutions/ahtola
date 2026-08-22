@@ -168,6 +168,40 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
     }
 
     [Test]
+    public async Task ThrowingCloseCallback_StillDeregistersReader_AndConnectionRecovers()
+    {
+        // FinishCloseAsync used to call _closeCallback() (command/batch bookkeeping) before
+        // ReaderClosed/_isClosed, with nothing to catch a callback failure: if it threw, the
+        // reader was never deregistered or marked closed. Constructing the reader directly (with
+        // a throwing callback) reaches FinishCloseAsync without needing a real command-level
+        // failure to trigger it.
+        await using var connection = new SqliteConnection("Data Source=:memory:;Pooling=False");
+        await connection.OpenAsync();
+
+        var command = connection.CreateCommand();
+        var thrown = new InvalidOperationException("Simulated close-callback failure.");
+        var reader = new SqliteDataReader(
+            command,
+            recordsAffected: 0,
+            CommandBehavior.Default,
+            closeCallback: () => throw thrown);
+
+        Func<Task> close = async () => await reader.CloseAsync();
+        (await close.Should().ThrowAsync<InvalidOperationException>()).Which.Should().BeSameAs(thrown);
+
+        reader.IsClosed.Should().BeTrue();
+        connection.HasOpenReader.Should().BeFalse();
+
+        // The connection recovers and can still run further commands after the failed close.
+        await using var verify = connection.CreateCommand();
+        verify.CommandText = "SELECT 1";
+        (await verify.ExecuteScalarAsync()).Should().Be(1L);
+
+        await connection.CloseAsync();
+        connection.State.Should().Be(ConnectionState.Closed);
+    }
+
+    [Test]
     public async Task BrowserReaderDisposalFailure_DisposeAsyncSwallowsOperationFailure_ButStillCleansUp()
     {
         var factory = new FaultInjectingManagedDatabaseFactory();

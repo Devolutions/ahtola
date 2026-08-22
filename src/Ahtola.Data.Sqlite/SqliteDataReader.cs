@@ -1382,11 +1382,46 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (_isClosed)
             return;
 
-        _closeCallback();
-        ((ILocalReaderConnection)_connection).ReaderClosed(this);
+        // _closeCallback (command/batch bookkeeping) and ReaderClosed (connection
+        // deregistration) must not gate each other: if the callback throws, the reader still
+        // has to deregister and be marked closed, or it remains permanently "open" on its
+        // connection - and CommandBehavior.CloseConnection must still be honored asynchronously
+        // afterward. Every failure here is aggregated and rethrown rather than swallowed.
+        Exception? error = null;
+        try
+        {
+            _closeCallback();
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        try
+        {
+            ((ILocalReaderConnection)_connection).ReaderClosed(this);
+        }
+        catch (Exception ex)
+        {
+            error = CombineCloseErrors(error, ex);
+        }
+
         _isClosed = true;
+
         if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-            await _connection.CloseAsync().ConfigureAwait(false);
+        {
+            try
+            {
+                await _connection.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+        }
+
+        if (error is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
     }
 
     private async ValueTask CloseCoreAsync(
