@@ -276,7 +276,14 @@ jobs:
 
       - name: Validate packaged consumer
         shell: pwsh
-        run: ./build.ps1 validate-package
+        run: ./build.ps1 validate-package -PackageVersion 0.0.0-ci.${{ github.run_number }}
+
+      - name: Assert exact CI package version
+        shell: pwsh
+        # Deterministic guard against the packaging steps above silently
+        # producing (or leaving behind) a different package version than the
+        # one this run is supposed to publish and validate end-to-end.
+        run: ./build.ps1 assert-package-version -PackageVersion 0.0.0-ci.${{ github.run_number }}
 
       - name: Validate packed browser consumer
         shell: pwsh
@@ -305,7 +312,6 @@ jobs:
   browser-smoke:
     name: Browser smoke (${{ matrix.browser }})
     needs: package
-    continue-on-error: true
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -345,8 +351,16 @@ jobs:
 
       - name: Run packed browser smoke
         shell: pwsh
+        # Playwright's bundled WebKit build does not implement the Origin
+        # Private File System API at all (verified directly against this
+        # pinned Playwright version), so it cannot pass this smoke test - a
+        # limitation of the test engine, not of Ahtola or real-world Safari/
+        # WebKit. Invoke-BrowserSmokeCheck.ps1 downgrades only that exact,
+        # structured capability gap to a notice; a FAIL for any other
+        # reason, a timeout, an unexpected exception, or a webkit capability
+        # that should be present still fails this step.
         run: |
-          ./scripts/Invoke-BrowserPackageConsumer.ps1 `
+          ./scripts/Invoke-BrowserSmokeCheck.ps1 `
             -PackageDirectory ./artifacts/managed-packages `
             -PackageVersion $env:PACKAGE_VERSION `
             -BrowserEngine $env:BROWSER_ENGINE

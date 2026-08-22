@@ -31,6 +31,7 @@ param(
                 'cloud-smoke',
                 'validate-project-closure',
                 'validate-packed-closure',
+                'assert-package-version',
                 'format-check'
             )]
             [string]$Task = 'build',
@@ -279,6 +280,33 @@ function Invoke-ValidatePackedClosure {
     Invoke-PwshScript -Path $ClosureValidator -Arguments @('-PackageDirectory', $outputAbsolute)
 }
 
+function Assert-ExactPackageVersion {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$ExpectedVersion
+    )
+
+    $directoryAbsolute = Get-AbsolutePath $Directory
+    Write-Step "Asserting every package in $directoryAbsolute is exactly version $ExpectedVersion"
+    if (-not (Test-Path -LiteralPath $directoryAbsolute -PathType Container)) {
+        throw "Package directory '$directoryAbsolute' does not exist."
+    }
+
+    $nupkgs = @(Get-ChildItem -LiteralPath $directoryAbsolute -Filter '*.nupkg' -File)
+    if ($nupkgs.Count -eq 0) {
+        throw "No .nupkg files were found in '$directoryAbsolute'."
+    }
+
+    $suffix = ".$ExpectedVersion.nupkg"
+    $mismatched = @($nupkgs | Where-Object { -not $_.Name.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase) })
+    if ($mismatched.Count -gt 0) {
+        $names = ($mismatched | ForEach-Object { $_.Name }) -join ', '
+        throw "Expected every package in '$directoryAbsolute' to be version '$ExpectedVersion', but found: $names"
+    }
+
+    Write-Host "Verified $($nupkgs.Count) package(s) in '$directoryAbsolute' are exactly version '$ExpectedVersion'." -ForegroundColor Green
+}
+
 function Write-ConsumerNugetConfig {
     param(
         [Parameter(Mandatory)][string]$ConfigPath,
@@ -306,16 +334,43 @@ function Write-ConsumerNugetConfig {
 function Invoke-ValidatePackage {
     Assert-ManagedProjectClosure
 
-    $localVersion = '0.0.0-managed-local'
     $packageOutputAbsolute = Get-AbsolutePath $PackageOutput
+    $existingNupkgCount = if (Test-Path -LiteralPath $packageOutputAbsolute -PathType Container) {
+        @(Get-ChildItem -LiteralPath $packageOutputAbsolute -Filter '*.nupkg' -File -ErrorAction SilentlyContinue).Count
+    } else {
+        0
+    }
+    # When the caller already packed nupkgs at a specific version (as CI does
+    # before calling this task), validate those in place instead of deleting
+    # and repacking them under a throwaway local version: that repack used to
+    # silently orphan the intended CI-versioned artifacts, and any consumer
+    # that still asked for the original version - the browser smoke jobs, the
+    # final uploaded nupkg artifact - got a different package via NuGet's
+    # nearest-version fallback without any error.
+    $reuseExistingPackages = -not [string]::IsNullOrWhiteSpace($PackageVersion) -and $existingNupkgCount -gt 0
+
+    if ($reuseExistingPackages) {
+        Assert-ExactPackageVersion -Directory $packageOutputAbsolute -ExpectedVersion $PackageVersion
+        $localVersion = $PackageVersion
+        Write-Step "Validating existing $localVersion packages in $packageOutputAbsolute without repacking"
+    } else {
+        $localVersion = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { '0.0.0-managed-local' } else { $PackageVersion }
+        Invoke-Pack -Version $localVersion -Output $packageOutputAbsolute
+    }
+
     $consumerOutputRoot = Get-AbsolutePath $PackageConsumerOutput
     $consumerNugetConfigAbsolute = Get-AbsolutePath $ConsumerNugetConfig
     $consumerProjectAbsolute = Get-AbsolutePath $ConsumerProject
     $consumerObj = Join-Path (Split-Path -Parent $consumerProjectAbsolute) 'obj'
     $consumerBin = Join-Path (Split-Path -Parent $consumerProjectAbsolute) 'bin'
     $globalPackages = Join-Path $packageOutputAbsolute '.nuget-packages'
+    # Reusing existing nupkgs (above) means this function no longer always
+    # wipes $packageOutputAbsolute first, so any global-packages cache left
+    # over from an earlier restore into the same folder must be cleared
+    # explicitly - otherwise a stale extracted package could shadow a nupkg
+    # that legitimately changed content under an unchanged version string.
+    Remove-PathIfExists $globalPackages
 
-    Invoke-Pack -Version $localVersion -Output $packageOutputAbsolute
     Invoke-ValidatePackedClosure -Output $packageOutputAbsolute
 
     Write-Step 'Validating packed consumer restore/build/run/publish'
@@ -504,6 +559,12 @@ switch ($Task) {
         'validate-browser-package' { Invoke-ValidateBrowserPackage }
         'validate-runtime' { Invoke-ValidateRuntime }
         'cloud-smoke' { Invoke-CloudSmoke }
+        'assert-package-version' {
+            if ([string]::IsNullOrWhiteSpace($PackageVersion)) {
+                throw "Task 'assert-package-version' requires -PackageVersion."
+            }
+            Assert-ExactPackageVersion -Directory $PackageOutput -ExpectedVersion $PackageVersion
+        }
         'test' { Invoke-Test }
         'format-check' { Invoke-FormatCheck }
         default { throw "Unknown task '$Task'" }
