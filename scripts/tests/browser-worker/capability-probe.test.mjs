@@ -94,3 +94,81 @@ test("real probeSynchronousAccessHandleSupport uses the retry-policy default and
         Object.defineProperty(globalThis, "Worker", { value: originalWorker, configurable: true, writable: true });
     }
 });
+
+// Regression test: the synchronous-access-handle probe must load its worker
+// from a real, packaged, same-origin script URL - exactly like the real
+// storage worker does - and must never construct a Blob or call
+// URL.createObjectURL. A Content-Security-Policy of `worker-src 'self'`
+// (with no `blob:`) blocks blob: workers while still allowing the real,
+// same-origin ahtola-opfs-worker.mjs; a blob-based probe would therefore
+// report the browser as unsupported even though Ahtola OPFS storage itself
+// works fine under that exact policy.
+test("the real capability probe uses a same-origin packaged worker, never Blob/createObjectURL (CSP worker-src 'self' safety)", async () => {
+    const { probeSynchronousAccessHandleSupport } = await import(opfsModuleUrl);
+
+    const originalWorker = globalThis.Worker;
+    const originalBlob = globalThis.Blob;
+    const hadCreateObjectURL = Object.prototype.hasOwnProperty.call(URL, "createObjectURL");
+    const originalCreateObjectURL = URL.createObjectURL;
+
+    let capturedUrl;
+    let capturedOptions;
+    class FakeWorker {
+        constructor(url, options) {
+            capturedUrl = url;
+            capturedOptions = options;
+        }
+
+        addEventListener(type, listener) {
+            if (type === "message")
+                this._onMessage = listener;
+        }
+
+        postMessage() {
+            // Simulate the real probe worker reporting success.
+            queueMicrotask(() => this._onMessage?.({ data: { ok: true } }));
+        }
+
+        terminate() {}
+    }
+
+    Object.defineProperty(globalThis, "Worker", { value: FakeWorker, configurable: true, writable: true });
+    Object.defineProperty(globalThis, "Blob", {
+        value: class {
+            constructor() {
+                throw new Error(
+                    "Blob must never be constructed for the capability probe: a CSP of "
+                    + "worker-src 'self' blocks blob: workers.");
+            }
+        },
+        configurable: true,
+        writable: true,
+    });
+    URL.createObjectURL = () => {
+        throw new Error(
+            "URL.createObjectURL must never be called for the capability probe: a CSP of "
+            + "worker-src 'self' blocks blob: workers.");
+    };
+
+    try {
+        const supported = await probeSynchronousAccessHandleSupport();
+        assert.equal(supported, true);
+        assert.ok(
+            capturedUrl instanceof URL,
+            "the probe worker must be constructed from a real URL, not an inline script string"
+        );
+        assert.notEqual(capturedUrl.protocol, "blob:");
+        assert.ok(
+            capturedUrl.pathname.endsWith("ahtola-opfs-capability-probe-worker.mjs"),
+            `expected the packaged probe worker file, got '${capturedUrl.href}'`
+        );
+        assert.equal(capturedOptions?.type, "module");
+    } finally {
+        Object.defineProperty(globalThis, "Worker", { value: originalWorker, configurable: true, writable: true });
+        Object.defineProperty(globalThis, "Blob", { value: originalBlob, configurable: true, writable: true });
+        if (hadCreateObjectURL)
+            URL.createObjectURL = originalCreateObjectURL;
+        else
+            delete URL.createObjectURL;
+    }
+});

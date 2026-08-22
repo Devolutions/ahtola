@@ -87,32 +87,15 @@ function hasSynchronousAccessHandlePrerequisites() {
 // off-limits on the main thread) that creates, opens, and closes a
 // throwaway OPFS file with a synchronous access handle, reporting whether
 // the browser actually supports it rather than inferring support from
-// unrelated feature checks.
+// unrelated feature checks. Uses the real, packaged
+// ahtola-opfs-capability-probe-worker.mjs script - a same-origin URL, the
+// same way the real storage worker is loaded - rather than a blob: URL, so
+// the probe is not blocked by a Content-Security-Policy that allows the
+// real worker but does not allow blob: workers.
 async function runSynchronousAccessHandleProbeInWorker() {
-    const workerSource = `
-        self.addEventListener("message", async () => {
-            const name = ".ahtola-capability-probe-" + crypto.randomUUID();
-            try {
-                const root = await navigator.storage.getDirectory();
-                const fileHandle = await root.getFileHandle(name, { create: true });
-                try {
-                    const access = await fileHandle.createSyncAccessHandle();
-                    access.close();
-                } finally {
-                    await root.removeEntry(name).catch(() => {});
-                }
-                self.postMessage({ ok: true });
-            } catch (error) {
-                self.postMessage({
-                    ok: false,
-                    name: error?.name ?? "Error",
-                    message: error?.message ?? String(error),
-                });
-            }
-        });
-    `;
-    const workerUrl = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
-    const worker = new Worker(workerUrl, { type: "module" });
+    const worker = new Worker(
+        new URL("./ahtola-opfs-capability-probe-worker.mjs", import.meta.url),
+        { type: "module" });
     try {
         return await new Promise(resolve => {
             worker.addEventListener("message", event => resolve(event.data), { once: true });
@@ -125,7 +108,6 @@ async function runSynchronousAccessHandleProbeInWorker() {
         });
     } finally {
         worker.terminate();
-        URL.revokeObjectURL(workerUrl);
     }
 }
 
