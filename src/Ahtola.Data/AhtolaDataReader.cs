@@ -421,6 +421,12 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing && !_isClosed && _command.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous reader disposal is not supported by the browser database source. Use DisposeAsync.");
+        }
+
         if (disposing)
             CloseCore(closeConnection: true);
 
@@ -429,7 +435,7 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
 
     public override async ValueTask DisposeAsync()
     {
-        if (_managedStatement is null)
+        if (!_command.RequiresAsyncExecution && _managedStatement is null)
         {
             await base.DisposeAsync().ConfigureAwait(false);
             return;
@@ -439,7 +445,28 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         await base.DisposeAsync().ConfigureAwait(false);
     }
 
+    public override async Task CloseAsync()
+    {
+        if (_managedStatement is null)
+        {
+            CloseCore(closeConnection: true);
+            return;
+        }
+
+        await CloseCoreAsync(closeConnection: true).ConfigureAwait(false);
+    }
+
+    public override void Close()
+    {
+        if (!_isClosed)
+            ThrowIfSynchronousBrowserOperation();
+        CloseCore(closeConnection: true);
+    }
+
     void IConnectionOwnedReader.CloseFromConnection() => CloseCore(closeConnection: false);
+
+    ValueTask IConnectionOwnedReader.CloseFromConnectionAsync()
+        => CloseCoreAsync(closeConnection: false);
 
     public override bool Read()
     {
@@ -791,7 +818,7 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
             Interlocked.Exchange(ref _replicaOperation, null)?.Dispose();
             _closeCallback();
             if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-                _connection.Close();
+                await _connection.CloseAsync().ConfigureAwait(false);
         }
     }
 

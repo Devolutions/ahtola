@@ -13,7 +13,8 @@ namespace Ahtola.Data.Sqlite;
 public partial class SqliteConnection :
     DbConnection,
     ILocalReaderConnection,
-    IManagedSchemaConnection
+    IManagedSchemaConnection,
+    IAsyncExecutionConnection
 {
     private const int SQLITE_ERROR = 1;
     private const int SQLITE_CANTOPEN = 14;
@@ -493,6 +494,12 @@ public partial class SqliteConnection :
 
     public override void Close()
     {
+        if (_managedDatabaseFactory is not null && _managedDatabase is not null)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous Close is not supported by the browser database source. Use CloseAsync.");
+        }
+
         if (_ahtolaConnection is not null)
         {
             var remoteCloseOriginalState = State;
@@ -616,7 +623,7 @@ public partial class SqliteConnection :
         }
         try
         {
-            CloseOpenReaders();
+            await CloseOpenReadersAsync().ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -751,6 +758,12 @@ public partial class SqliteConnection :
             throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection(nameof(BeginTransaction)));
         if (Transaction is not null)
             throw new InvalidOperationException(Properties.Resources.ParallelTransactionsNotSupported);
+        if (RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous transaction creation is not supported by the browser database source. "
+                + "Use BeginTransactionAsync.");
+        }
 
         Transaction = new SqliteTransaction(this, isolationLevel, deferred);
         return Transaction;
@@ -1051,6 +1064,15 @@ public partial class SqliteConnection :
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing
+            && !_disposed
+            && _managedDatabaseFactory is not null
+            && State != ConnectionState.Closed)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous disposal is not supported by the browser database source. Use DisposeAsync.");
+        }
+
         if (disposing && !_disposed)
         {
             try
@@ -1122,6 +1144,8 @@ public partial class SqliteConnection :
     internal bool IsManagedConnection => _managedDatabase is not null;
 
     internal bool RequiresAsyncExecution => _managedDatabaseFactory is not null;
+
+    bool IAsyncExecutionConnection.RequiresAsyncExecution => RequiresAsyncExecution;
 
     internal bool UsesManagedDatabase => IsManagedConnection;
 
@@ -1531,6 +1555,26 @@ public partial class SqliteConnection :
             try
             {
                 reader.CloseFromConnection();
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+        ThrowCleanupFailures("One or more readers could not be closed.", failures);
+    }
+
+    private async ValueTask CloseOpenReadersAsync()
+    {
+        IConnectionOwnedReader[] readers;
+        lock (_readerGate)
+            readers = _openReaders.ToArray();
+        List<Exception>? failures = null;
+        foreach (var reader in readers)
+        {
+            try
+            {
+                await reader.CloseFromConnectionAsync().ConfigureAwait(false);
             }
             catch (Exception exception)
             {

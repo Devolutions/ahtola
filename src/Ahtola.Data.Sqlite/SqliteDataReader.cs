@@ -1238,6 +1238,12 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing && !_isClosed && _command.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous reader disposal is not supported by the browser database source. Use DisposeAsync.");
+        }
+
         if (disposing)
             CloseCore(throwOnError: false);
 
@@ -1246,7 +1252,9 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override async ValueTask DisposeAsync()
     {
-        if (_delegatedReader is null && _statement?.UsesManagedResults != true)
+        if (!_command.RequiresAsyncExecution
+            && _delegatedReader is null
+            && _statement?.UsesManagedResults != true)
         {
             await base.DisposeAsync().ConfigureAwait(false);
             return;
@@ -1256,7 +1264,15 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         await base.DisposeAsync().ConfigureAwait(false);
     }
 
-    public override void Close() => CloseCore();
+    public override void Close()
+    {
+        if (!_isClosed)
+            ThrowIfSynchronousBrowserOperation();
+        CloseCore();
+    }
+
+    public override async Task CloseAsync()
+        => await CloseCoreAsync().ConfigureAwait(false);
 
     void IConnectionOwnedReader.CloseFromConnection()
     {
@@ -1271,6 +1287,37 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         _hasPrefetchedRow = false;
         _hasCurrentRow = false;
         FinishClose(closeConnection: false);
+    }
+
+    ValueTask IConnectionOwnedReader.CloseFromConnectionAsync()
+        => CloseFromConnectionAsync();
+
+    private async ValueTask CloseFromConnectionAsync()
+    {
+        if (_isClosed)
+            return;
+
+        try
+        {
+            if (_delegatedReader is not null)
+            {
+                await _delegatedReader.DisposeAsync().ConfigureAwait(false);
+                _delegatedReader = null;
+            }
+            if (_statement is not null)
+            {
+                await _statement.DisposeAsync().ConfigureAwait(false);
+                _statement = null;
+            }
+        }
+        finally
+        {
+            _remainingSql.Clear();
+            _hasPrefetchedRow = false;
+            _hasCurrentRow = false;
+            _currentStatementRowsAffectedCounted = false;
+            await FinishCloseAsync(closeConnection: false).ConfigureAwait(false);
+        }
     }
 
     private void CloseCore(bool throwOnError = true)
@@ -1330,7 +1377,21 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         FinishClose();
     }
 
-    private async ValueTask CloseCoreAsync(bool throwOnError = true)
+    private async ValueTask FinishCloseAsync(bool closeConnection = true)
+    {
+        if (_isClosed)
+            return;
+
+        _closeCallback();
+        ((ILocalReaderConnection)_connection).ReaderClosed(this);
+        _isClosed = true;
+        if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+            await _connection.CloseAsync().ConfigureAwait(false);
+    }
+
+    private async ValueTask CloseCoreAsync(
+        bool throwOnError = true,
+        bool closeConnection = true)
     {
         if (_isClosed)
             return;
@@ -1343,7 +1404,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 _hadRecordsAffectedStatement = true;
                 await _delegatedReader.DisposeAsync().ConfigureAwait(false);
                 _delegatedReader = null;
-                FinishClose();
+                await FinishCloseAsync(closeConnection).ConfigureAwait(false);
                 return;
             }
 
@@ -1369,7 +1430,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 await _statement.DisposeAsync().ConfigureAwait(false);
             _statement = null;
             _remainingSql.Clear();
-            FinishClose();
+            await FinishCloseAsync(closeConnection).ConfigureAwait(false);
             if (throwOnError)
                 throw SqliteCommand.ToSqliteException(ex);
             return;
@@ -1380,13 +1441,13 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 await _statement.DisposeAsync().ConfigureAwait(false);
             _statement = null;
             _remainingSql.Clear();
-            FinishClose();
+            await FinishCloseAsync(closeConnection).ConfigureAwait(false);
             if (throwOnError)
                 throw;
             return;
         }
 
-        FinishClose();
+        await FinishCloseAsync(closeConnection).ConfigureAwait(false);
     }
 
     private void FinishClose(bool closeConnection = true)

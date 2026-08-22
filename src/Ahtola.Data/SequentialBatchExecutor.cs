@@ -7,6 +7,12 @@ namespace Ahtola;
 internal interface IConnectionOwnedReader
 {
     void CloseFromConnection();
+
+    ValueTask CloseFromConnectionAsync()
+    {
+        CloseFromConnection();
+        return ValueTask.CompletedTask;
+    }
 }
 
 internal interface ILocalReaderConnection
@@ -14,6 +20,11 @@ internal interface ILocalReaderConnection
     void ReaderOpened(IConnectionOwnedReader reader);
 
     void ReaderClosed(IConnectionOwnedReader reader);
+}
+
+internal interface IAsyncExecutionConnection
+{
+    bool RequiresAsyncExecution { get; }
 }
 
 internal sealed class BatchExecutionControl : IDisposable
@@ -82,7 +93,7 @@ internal sealed class BatchExecutionControl : IDisposable
     }
 }
 
-internal sealed class SequentialBatchCommand : IDisposable
+internal sealed class SequentialBatchCommand : IDisposable, IAsyncDisposable
 {
     private readonly Action<int> _setRecordsAffected;
     private readonly Func<DbTransaction?> _getTransaction;
@@ -123,6 +134,15 @@ internal sealed class SequentialBatchCommand : IDisposable
 
         _disposed = true;
         Command.Dispose();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        await Command.DisposeAsync().ConfigureAwait(false);
     }
 }
 
@@ -165,6 +185,7 @@ internal static class SequentialBatchExecutor
         BatchExecutionControl execution)
     {
         var total = 0;
+        Exception? failure = null;
         try
         {
             foreach (var entry in commands)
@@ -185,13 +206,16 @@ internal static class SequentialBatchExecutor
                     execution.ClearActiveCommand(entry.Command);
                 }
             }
-
-            return total;
         }
-        finally
+        catch (Exception exception)
         {
-            DisposeCommandsAndExecution(commands, execution);
+            failure = exception;
         }
+
+        failure = await DisposeCommandsAndExecutionAsync(commands, execution, failure)
+            .ConfigureAwait(false);
+        ThrowIfFailure(failure);
+        return total;
     }
 
     internal static DbDataReader ExecuteReader(
@@ -236,19 +260,33 @@ internal static class SequentialBatchExecutor
             reader = await first.Command
                 .ExecuteReaderAsync(WithoutCloseConnection(behavior), execution.Token)
                 .ConfigureAwait(false);
-            return new SequentialBatchDataReader(commands, execution, reader, behavior);
+            var ownedReader = reader;
+            reader = null;
+            return await SequentialBatchDataReader
+                .CreateAsync(commands, execution, ownedReader, behavior)
+                .ConfigureAwait(false);
         }
-        catch
+        catch (Exception operationFailure)
         {
-            try
+            Exception? failure = operationFailure;
+            if (reader is not null)
             {
-                if (reader is not null)
+                try
+                {
                     await reader.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception cleanupFailure)
+                {
+                    failure = CombineFailure(
+                        "Batch execution and reader cleanup both failed.",
+                        failure,
+                        cleanupFailure);
+                }
             }
-            finally
-            {
-                DisposeCommandsAndExecution(commands, execution);
-            }
+
+            failure = await DisposeCommandsAndExecutionAsync(commands, execution, failure)
+                .ConfigureAwait(false);
+            ThrowIfFailure(failure);
             throw;
         }
     }
@@ -283,6 +321,54 @@ internal static class SequentialBatchExecutor
             execution.Dispose();
         }
     }
+
+    private static async ValueTask<Exception?> DisposeCommandsAndExecutionAsync(
+        IReadOnlyList<SequentialBatchCommand> commands,
+        BatchExecutionControl execution,
+        Exception? failure)
+    {
+        foreach (var command in commands)
+        {
+            try
+            {
+                await command.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception cleanupFailure)
+            {
+                failure = CombineFailure(
+                    "Batch execution and command cleanup both failed.",
+                    failure,
+                    cleanupFailure);
+            }
+        }
+        try
+        {
+            execution.Dispose();
+        }
+        catch (Exception cleanupFailure)
+        {
+            failure = CombineFailure(
+                "Batch execution and execution-context cleanup both failed.",
+                failure,
+                cleanupFailure);
+        }
+
+        return failure;
+    }
+
+    internal static Exception CombineFailure(
+        string message,
+        Exception? existing,
+        Exception current)
+        => existing is null
+            ? current
+            : new AggregateException(message, existing, current);
+
+    internal static void ThrowIfFailure(Exception? failure)
+    {
+        if (failure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
 }
 
 internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwnedReader
@@ -302,16 +388,61 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
         IReadOnlyList<SequentialBatchCommand> commands,
         BatchExecutionControl execution,
         DbDataReader reader,
-        CommandBehavior behavior)
+        CommandBehavior behavior,
+        bool completeInitialResult = true)
     {
         _commands = commands;
         _execution = execution;
         _reader = reader;
         _behavior = behavior;
         _connection = commands[0].Command.Connection;
-        CompleteCurrentWithoutResultSet();
+        if (completeInitialResult)
+            CompleteCurrentWithoutResultSet();
         _readerConnection = _connection as ILocalReaderConnection;
         _readerConnection?.ReaderOpened(this);
+    }
+
+    internal static async ValueTask<SequentialBatchDataReader> CreateAsync(
+        IReadOnlyList<SequentialBatchCommand> commands,
+        BatchExecutionControl execution,
+        DbDataReader reader,
+        CommandBehavior behavior)
+    {
+        SequentialBatchDataReader? result = null;
+        try
+        {
+            result = new SequentialBatchDataReader(
+                commands,
+                execution,
+                reader,
+                behavior,
+                completeInitialResult: false);
+            await result
+                .CompleteCurrentWithoutResultSetAsync(execution.Token)
+                .ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception operationFailure)
+        {
+            Exception? failure = operationFailure;
+            try
+            {
+                if (result is null)
+                    await reader.DisposeAsync().ConfigureAwait(false);
+                else
+                    await result.CloseCoreAsync(drain: false, closeConnection: false).ConfigureAwait(false);
+            }
+            catch (Exception cleanupFailure)
+            {
+                failure = SequentialBatchExecutor.CombineFailure(
+                    "Batch initialization and cleanup both failed.",
+                    failure,
+                    cleanupFailure);
+            }
+
+            SequentialBatchExecutor.ThrowIfFailure(failure);
+            throw;
+        }
     }
 
     public override int Depth => _finished ? 0 : Current.Depth;
@@ -463,11 +594,13 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
             CompleteCurrent();
             if (_commandIndex + 1 == _commands.Count)
             {
-                Finish();
+                await FinishAsync().ConfigureAwait(false);
                 return false;
             }
 
-            DisposeCurrent();
+            var cleanupFailure = await DisposeCurrentAsync(closeFromConnection: false)
+                .ConfigureAwait(false);
+            SequentialBatchExecutor.ThrowIfFailure(cleanupFailure);
             _commandIndex++;
             var next = _commands[_commandIndex];
             next.PrepareForExecution();
@@ -476,12 +609,25 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
             _reader = await next.Command
                 .ExecuteReaderAsync(WithoutCloseConnection(_behavior), transitionToken)
                 .ConfigureAwait(false);
-            CompleteCurrentWithoutResultSet();
+            await CompleteCurrentWithoutResultSetAsync(transitionToken).ConfigureAwait(false);
             return true;
         }
-        catch
+        catch (Exception operationFailure)
         {
-            CloseCore(drain: false);
+            Exception? failure = operationFailure;
+            try
+            {
+                await CloseCoreAsync(drain: false).ConfigureAwait(false);
+            }
+            catch (Exception cleanupFailure)
+            {
+                failure = SequentialBatchExecutor.CombineFailure(
+                    "Batch result transition and cleanup both failed.",
+                    failure,
+                    cleanupFailure);
+            }
+
+            SequentialBatchExecutor.ThrowIfFailure(failure);
             throw;
         }
     }
@@ -500,16 +646,35 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
         return Current.GetFieldValueAsync<T>(ordinal, cancellationToken);
     }
 
-    public override void Close() => CloseCore(drain: true);
+    public override void Close()
+    {
+        if (!_isClosed)
+            ThrowIfSynchronousBrowserOperation();
+        CloseCore(drain: true);
+    }
+
+    public override async Task CloseAsync()
+        => await CloseCoreAsync(drain: true).ConfigureAwait(false);
 
     void IConnectionOwnedReader.CloseFromConnection() => CloseCore(drain: false, closeConnection: false);
 
+    ValueTask IConnectionOwnedReader.CloseFromConnectionAsync()
+        => CloseCoreAsync(drain: false, closeConnection: false);
+
     protected override void Dispose(bool disposing)
     {
+        if (disposing && !_isClosed)
+            ThrowIfSynchronousBrowserOperation();
         if (disposing)
             CloseCore(drain: true);
 
         base.Dispose(disposing);
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        await CloseCoreAsync(drain: true).ConfigureAwait(false);
+        await base.DisposeAsync().ConfigureAwait(false);
     }
 
     private DbDataReader Current
@@ -535,6 +700,19 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
         CompleteCurrent();
     }
 
+    private async ValueTask CompleteCurrentWithoutResultSetAsync(
+        CancellationToken cancellationToken)
+    {
+        if (Current.FieldCount != 0)
+            return;
+
+        while (await Current.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+        }
+
+        CompleteCurrent();
+    }
+
     private void CompleteCurrent()
     {
         if (CurrentCommand.IsCompleted)
@@ -552,6 +730,25 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
         _execution.Dispose();
     }
 
+    private async ValueTask FinishAsync()
+    {
+        var failure = await DisposeCurrentAsync(closeFromConnection: false)
+            .ConfigureAwait(false);
+        _finished = true;
+        try
+        {
+            _execution.Dispose();
+        }
+        catch (Exception cleanupFailure)
+        {
+            failure = SequentialBatchExecutor.CombineFailure(
+                "Batch reader and execution-context cleanup both failed.",
+                failure,
+                cleanupFailure);
+        }
+        SequentialBatchExecutor.ThrowIfFailure(failure);
+    }
+
     private void DisposeCurrent()
     {
         var reader = _reader;
@@ -566,6 +763,49 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
             _execution.ClearActiveCommand(command.Command);
             command.Dispose();
         }
+    }
+
+    private async ValueTask<Exception?> DisposeCurrentAsync(
+        bool closeFromConnection,
+        Exception? failure = null)
+    {
+        var reader = _reader;
+        _reader = null;
+        try
+        {
+            if (reader is not null)
+            {
+                if (closeFromConnection && reader is IConnectionOwnedReader ownedReader)
+                    await ownedReader.CloseFromConnectionAsync().ConfigureAwait(false);
+                else
+                    await reader.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        catch (Exception cleanupFailure)
+        {
+            failure = SequentialBatchExecutor.CombineFailure(
+                "Batch reader cleanup failed.",
+                failure,
+                cleanupFailure);
+        }
+        finally
+        {
+            var command = CurrentCommand;
+            _execution.ClearActiveCommand(command.Command);
+            try
+            {
+                await command.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception cleanupFailure)
+            {
+                failure = SequentialBatchExecutor.CombineFailure(
+                    "Batch reader and command cleanup both failed.",
+                    failure,
+                    cleanupFailure);
+            }
+        }
+
+        return failure;
     }
 
     private void CloseCore(bool drain, bool closeConnection = true)
@@ -608,10 +848,106 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
         }
     }
 
+    private async ValueTask CloseCoreAsync(bool drain, bool closeConnection = true)
+    {
+        if (_isClosed)
+            return;
+
+        Exception? failure = null;
+        try
+        {
+            if (drain
+                && !_finished
+                && !_execution.Token.IsCancellationRequested
+                && !IsClosed)
+            {
+                while (await NextResultAsync(CancellationToken.None).ConfigureAwait(false))
+                {
+                }
+            }
+        }
+        catch (Exception operationFailure)
+        {
+            failure = operationFailure;
+        }
+
+        failure = await DisposeCurrentAsync(
+                closeFromConnection: !drain,
+                failure)
+            .ConfigureAwait(false);
+        for (var i = _commandIndex + 1; i < _commands.Count; i++)
+        {
+            try
+            {
+                await _commands[i].DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception cleanupFailure)
+            {
+                failure = SequentialBatchExecutor.CombineFailure(
+                    "Batch reader and command cleanup both failed.",
+                    failure,
+                    cleanupFailure);
+            }
+        }
+
+        _finished = true;
+        _isClosed = true;
+        try
+        {
+            _readerConnection?.ReaderClosed(this);
+        }
+        catch (Exception cleanupFailure)
+        {
+            failure = SequentialBatchExecutor.CombineFailure(
+                "Batch reader cleanup and connection notification both failed.",
+                failure,
+                cleanupFailure);
+        }
+        try
+        {
+            _execution.Dispose();
+        }
+        catch (Exception cleanupFailure)
+        {
+            failure = SequentialBatchExecutor.CombineFailure(
+                "Batch reader and execution-context cleanup both failed.",
+                failure,
+                cleanupFailure);
+        }
+        if (closeConnection
+            && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection
+            && _connection is not null)
+        {
+            try
+            {
+                await _connection.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception cleanupFailure)
+            {
+                failure = SequentialBatchExecutor.CombineFailure(
+                    "Batch reader cleanup and connection close both failed.",
+                    failure,
+                    cleanupFailure);
+            }
+        }
+
+        SequentialBatchExecutor.ThrowIfFailure(failure);
+    }
+
     private void EnsureOpen()
     {
         if (IsClosed)
             throw new InvalidOperationException("The batch data reader is closed.");
+    }
+
+    private void ThrowIfSynchronousBrowserOperation()
+    {
+        if (_connection is IAsyncExecutionConnection { RequiresAsyncExecution: true })
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous batch reader operations are not supported by the browser database source. "
+                + "Use the corresponding asynchronous API.");
+        }
     }
 
     private static CommandBehavior WithoutCloseConnection(CommandBehavior behavior)

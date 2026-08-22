@@ -9,7 +9,8 @@ namespace Ahtola;
 public class AhtolaConnection :
     DbConnection,
     ILocalReaderConnection,
-    IManagedSchemaConnection
+    IManagedSchemaConnection,
+    IAsyncExecutionConnection
 {
     internal const int AutomaticSyncMaximumAttempts = 3;
     // Test-only transport seam. Production callers continue to use the default HttpClient transport.
@@ -219,6 +220,12 @@ public class AhtolaConnection :
 
     public override void Close()
     {
+        if (_managedDatabaseFactory is not null && _managedDatabase is not null)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous Close is not supported by the browser database source. Use CloseAsync.");
+        }
+
         _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: true);
         var automaticSyncError = StopAutomaticManagedReplicaSync();
         if (_remoteClient is not null)
@@ -345,7 +352,7 @@ public class AhtolaConnection :
         }
         try
         {
-            CloseOpenReaders();
+            await CloseOpenReadersAsync().ConfigureAwait(false);
             ResetOpenCommands();
         }
         catch (Exception exception)
@@ -374,6 +381,15 @@ public class AhtolaConnection :
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing
+            && !_disposed
+            && _managedDatabaseFactory is not null
+            && State != ConnectionState.Closed)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous disposal is not supported by the browser database source. Use DisposeAsync.");
+        }
+
         if (!disposing || _disposed)
         {
             _disposed = true;
@@ -459,6 +475,12 @@ public class AhtolaConnection :
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
+        if (RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous transaction creation is not supported by the browser database source. "
+                + "Use BeginTransactionAsync.");
+        }
         ValidateCanBeginTransaction();
 
         return _transaction = new AhtolaTransaction(this, isolationLevel);
@@ -627,6 +649,8 @@ public class AhtolaConnection :
     internal bool IsManaged => _managedReplicaHost is not null || _managedDatabase is not null;
 
     internal bool RequiresAsyncExecution => _managedDatabaseFactory is not null;
+
+    bool IAsyncExecutionConnection.RequiresAsyncExecution => RequiresAsyncExecution;
 
     internal AhtolaTransaction? Transaction => _transaction;
 
@@ -1657,6 +1681,30 @@ public class AhtolaConnection :
             readers = _openReaders.ToArray();
         foreach (var reader in readers)
             reader.CloseFromConnection();
+    }
+
+    private async ValueTask CloseOpenReadersAsync()
+    {
+        IConnectionOwnedReader[] readers;
+        lock (_readerLock)
+            readers = _openReaders.ToArray();
+        List<Exception>? failures = null;
+        foreach (var reader in readers)
+        {
+            try
+            {
+                await reader.CloseFromConnectionAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+
+        if (failures is { Count: 1 })
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        if (failures is not null)
+            throw new AggregateException("One or more readers could not be closed.", failures);
     }
 
     private void ResetOpenCommands()
