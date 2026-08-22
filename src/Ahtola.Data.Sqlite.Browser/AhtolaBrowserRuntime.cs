@@ -102,4 +102,14 @@ internal static partial class BrowserInterop
 
     [JSImport("deleteFile", ModuleName)]
     internal static partial Task DeleteFileAsync(int contextId, string path);
+
+    [JSImport("replaceFileAtomically", ModuleName)]
+    internal static partial Task ReplaceFileAtomicallyAsync(
+        int contextId,
+        string sourcePath,
+        string destinationPath,
+        bool replaceEmptyDestination);
+
+    [JSImport("cancelCurrentOperation", ModuleName)]
+    internal static partial void CancelCurrentOperation(int contextId);
 }

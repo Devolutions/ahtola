@@ -75,9 +75,11 @@ export async function createContext(lockName, sharedBufferSize) {
         type: "module",
     });
     const shared = new SharedArrayBuffer(sharedBufferSize);
+    const control = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
     const value = {
         worker,
         shared,
+        control,
         bytes: new Uint8Array(shared),
         pending: new Map(),
         nextRequestId: 0,
@@ -101,7 +103,12 @@ export async function createContext(lockName, sharedBufferSize) {
     const contextId = ++nextContextId;
     contexts.set(contextId, value);
     try {
-        await request(value, { type: "initialize", lockName, shared });
+        await request(value, {
+            type: "initialize",
+            lockName,
+            shared,
+            control: control.buffer,
+        });
         return contextId;
     } catch (error) {
         contexts.delete(contextId);
@@ -224,4 +231,24 @@ export function closeFile(contextId, handleId) {
 export function deleteFile(contextId, path) {
     const value = context(contextId);
     return enqueue(value, () => request(value, { type: "delete", path }));
+}
+
+export function replaceFileAtomically(
+    contextId,
+    sourcePath,
+    destinationPath,
+    replaceEmptyDestination) {
+    const value = context(contextId);
+    Atomics.store(value.control, 0, 0);
+    return enqueue(value, () => request(value, {
+        type: "replace",
+        sourcePath,
+        destinationPath,
+        replaceEmptyDestination,
+    }));
+}
+
+export function cancelCurrentOperation(contextId) {
+    const value = context(contextId);
+    Atomics.store(value.control, 0, 1);
 }

@@ -101,6 +101,27 @@ internal sealed class OpfsWorkerClient : IAsyncDisposable
     public Task DeleteAsync(string path, CancellationToken cancellationToken)
         => BrowserInterop.DeleteFileAsync(GetContextId(), path).WaitAsync(cancellationToken);
 
+    public async Task ReplaceFileAtomicallyAsync(
+        string sourcePath,
+        string destinationPath,
+        bool replaceEmptyDestination,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var contextId = GetContextId();
+        using var registration = cancellationToken.UnsafeRegister(
+            static state => BrowserInterop.CancelCurrentOperation((int)state!),
+            contextId);
+        await BrowserInterop
+            .ReplaceFileAtomicallyAsync(
+                contextId,
+                sourcePath,
+                destinationPath,
+                replaceEmptyDestination)
+            .WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     public async ValueTask DisposeAsync()
     {
         var contextId = Interlocked.Exchange(ref _contextId, 0);
