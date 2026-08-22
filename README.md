@@ -291,9 +291,10 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   build side). Full System-R DP join reordering and multi-index AND intersection
   are still deferred; OUTER JOIN order stays correctness-preserving. Prefer
   `ORDER BY` when order matters (`GROUP BY` is first-encounter order).
-- **File-backed platforms** — Windows, 64-bit Linux, and macOS. In-memory works
-  everywhere; other platforms (e.g. 32-bit Linux) throw
-  `PlatformNotSupportedException` on physical open. macOS uses POSIX
+- **File-backed platforms** — desktop physical files support Windows, 64-bit
+  Linux, and macOS. Browser WebAssembly uses the separate OPFS package and its
+  async-only data source; in-memory works everywhere. Other platforms (e.g.
+  32-bit Linux) throw `PlatformNotSupportedException` on physical open. macOS uses POSIX
   `fcntl(F_SETLK)` (process-associated locks, not Linux OFD); multi-engine
   claims on macOS need host verification.
 - **Multi-engine files (Stage 6)** — physical opens use SQLite main-file SHARED
