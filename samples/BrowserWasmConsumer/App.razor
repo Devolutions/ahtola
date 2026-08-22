@@ -43,6 +43,7 @@
             }
             var persistentCore = await RunPersistentCoreAsync();
             var persistentFeatures = await RunPersistentFeaturesAsync();
+            var browserMemory = await RunBrowserMemoryAsync();
             var persistentBlob = await RunPersistentBlobAsync();
             var persistentBackup = await RunPersistentBackupAsync();
             var persistentInboundBackup = await RunPersistentInboundBackupAsync();
@@ -58,6 +59,7 @@
                 + $"persistent-ado={persistentAdo};persistent-ef={persistentEf};"
                 + $"persistent-core={persistentCore};"
                 + $"persistent-features={persistentFeatures};"
+                + $"browser-memory={browserMemory};"
                 + $"persistent-blob={persistentBlob};"
                 + $"persistent-backup={persistentBackup};"
                 + $"persistent-inbound-backup={persistentInboundBackup};"
@@ -205,6 +207,28 @@
             await ExecuteFeatureAsync(connection, "INSERT INTO local_probe(value) VALUES (294)", "insert concurrent");
             await ExecuteFeatureAsync(connection, "COMMIT", "commit concurrent");
             await ExecuteFeatureAsync(connection, "VACUUM", "vacuum");
+        }
+
+        private static async Task<long> RunBrowserMemoryAsync()
+        {
+            await using var source = new AhtolaBrowserDataSource(":memory:");
+            await using (var connection = await source.OpenConnectionAsync())
+            {
+                await ExecuteFeatureAsync(
+                    connection,
+                    "CREATE TABLE probe(value INTEGER NOT NULL);"
+                    + "INSERT INTO probe(value) VALUES (504);",
+                    "browser memory setup");
+            }
+
+            await using (var connection = await source.OpenConnectionAsync())
+            {
+                await using var command = connection.CreateCommand();
+                command.CommandText = "SELECT value FROM probe";
+                return Convert.ToInt64(
+                    await command.ExecuteScalarAsync(),
+                    CultureInfo.InvariantCulture);
+            }
         }
 
         await using (var source = new AhtolaBrowserDataSource(mainPath))
@@ -514,4 +538,3 @@
         public long Value { get; set; }
     }
 }
-
