@@ -254,6 +254,77 @@ public sealed class AsyncPagerConcurrencyRegressionTests
     }
 
     [Test]
+    public async Task WalCommitIgnoresCancellationRequestedAfterItsFlushBecomesDurable()
+    {
+        var storage = new InMemoryFileSystem();
+        var writerFileSystem = new FlushInterceptingAsyncFileSystem(storage, WalPath);
+        var committed = CreatePage(0xE3);
+        await using var writer = await AsyncSqlitePager.CreateAsync(
+            writerFileSystem,
+            DatabasePath,
+            WalPath,
+            CreateWalHeader());
+        using var cancellation = new CancellationTokenSource();
+        writerFileSystem.AfterFlush = () =>
+        {
+            cancellation.Cancel();
+            return ValueTask.CompletedTask;
+        };
+
+        await using (var transaction = await writer.BeginTransactionAsync(2))
+        {
+            await transaction.WritePageAsync(2, committed);
+            await transaction.CommitAsync(cancellation.Token);
+        }
+
+        cancellation.IsCancellationRequested.Should().BeTrue();
+        await using var reopened = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(storage),
+            DatabasePath,
+            WalPath,
+            readOnly: true);
+        (await reopened.ReadPageAsync(2)).Should().Equal(committed);
+        reopened.CommittedFrameCount.Should().Be(1);
+    }
+
+    [Test]
+    public async Task FailedCreateDoesNotPublishAnExistingHiddenWalTail()
+    {
+        var storage = new InMemoryFileSystem();
+        var lockManager = new SqlitePagerLockManager();
+        await using (var existing = await AsyncSqlitePager.CreateAsync(
+                         AsyncFileSystemAdapter.Create(storage),
+                         DatabasePath,
+                         WalPath,
+                         CreateWalHeader(),
+                         lockManager: lockManager))
+        {
+            await CommitPageAsync(existing, CreatePage(0xE4));
+        }
+
+        using (var writer = lockManager.EnterWriter(TimeSpan.Zero))
+            writer.BeginWalPublication(lastPublishedFrameNumber: 0);
+        lockManager.WalPublicationBoundary.Should().Be(0);
+
+        Func<Task> create = async () => await AsyncSqlitePager.CreateAsync(
+            AsyncFileSystemAdapter.Create(storage),
+            DatabasePath,
+            WalPath,
+            CreateWalHeader(),
+            lockManager: lockManager);
+        await create.Should().ThrowAsync<IOException>();
+        lockManager.WalPublicationBoundary.Should().Be(0);
+
+        await using var readOnly = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(storage),
+            DatabasePath,
+            WalPath,
+            readOnly: true,
+            lockManager: lockManager);
+        readOnly.CommittedFrameCount.Should().Be(0);
+    }
+
+    [Test]
     public async Task SeparateAsyncAdaptersOverOneBackendShareTheWriterLock()
     {
         var storage = new InMemoryFileSystem();
@@ -448,6 +519,8 @@ internal sealed class FlushInterceptingAsyncFileSystem :
 
     internal Func<ValueTask>? BeforeFlush { get; set; }
 
+    internal Func<ValueTask>? AfterFlush { get; set; }
+
     internal Exception? FlushFailure { get; set; }
 
     public IFileSystem BackingFileSystem => _backing;
@@ -518,6 +591,13 @@ internal sealed class FlushInterceptingAsyncFileSystem :
             }
 
             await inner.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
+
+            var after = owner.AfterFlush;
+            if (after is not null)
+            {
+                owner.AfterFlush = null;
+                await after().ConfigureAwait(false);
+            }
         }
 
         public ValueTask DisposeAsync() => inner.DisposeAsync();

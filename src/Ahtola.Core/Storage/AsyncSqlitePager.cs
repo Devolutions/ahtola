@@ -196,7 +196,6 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             manager,
             timeout,
             cancellationToken).ConfigureAwait(false);
-        manager.PublishAllWalFrames();
 
         AsyncSqlitePageStore? pageStore = null;
         SqliteWalFile? wal = null;
@@ -237,6 +236,7 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             pager._lockGeneration = openingLock.Lease.PublishStorageChange();
             pager._busyTimeout = timeout;
             pager._state = SqlitePagerState.Ready;
+            manager.PublishAllWalFrames();
             return pager;
         }
         catch
@@ -282,7 +282,6 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             manager,
             timeout,
             cancellationToken).ConfigureAwait(false);
-        manager.PublishAllWalFrames();
 
         AsyncSqlitePageStore? pageStore = null;
         var databaseCreated = false;
@@ -313,6 +312,7 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             pager._lockGeneration = openingLock.Lease.PublishStorageChange();
             pager._busyTimeout = timeout;
             pager._state = SqlitePagerState.Ready;
+            manager.PublishAllWalFrames();
             return pager;
         }
         catch
@@ -961,7 +961,8 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             // transaction committed even if our own bookkeeping then fails. The
             // frames must become visible again either way.
             durable = true;
-            var recovery = await wal.ScanRecoveryAsync(cancellationToken).ConfigureAwait(false);
+            transaction.PublishWalFrames();
+            var recovery = await wal.ScanRecoveryAsync(CancellationToken.None).ConfigureAwait(false);
             if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
                 || recovery.LastCommittedFrameNumber != recovery.LastValidFrameNumber
                 || recovery.LastCommittedDatabaseSizeInPages != transaction.TargetDatabaseSizeInPages)
@@ -981,9 +982,9 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
 
             await ValidateVisiblePageSourcesAsync(
                 transaction.TargetDatabaseSizeInPages,
-                await _pageStore.GetPageCountAsync(cancellationToken).ConfigureAwait(false),
+                await _pageStore.GetPageCountAsync(CancellationToken.None).ConfigureAwait(false),
                 committedOverlay,
-                cancellationToken).ConfigureAwait(false);
+                CancellationToken.None).ConfigureAwait(false);
             lock (_stateGate)
             {
                 _walPageOverlay.Clear();
@@ -1006,7 +1007,6 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             throw;
         }
 
-        transaction.PublishWalFrames();
     }
 
     private async ValueTask TruncateAbandonedWalTailAsync(
