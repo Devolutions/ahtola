@@ -60,6 +60,10 @@ jobs:
         shell: pwsh
         run: ./build.ps1 test-browser-js
 
+      - name: Test exact package version assertion
+        shell: pwsh
+        run: ./scripts/tests/Test-AssertExactPackageVersion.ps1
+
   build-test:
     name: Build and test (${{ matrix.os }})
     needs: lint
