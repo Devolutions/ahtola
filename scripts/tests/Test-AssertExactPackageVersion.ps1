@@ -96,3 +96,4 @@ $passed++
 Write-Host 'PASS: missing -PackageVersion fails' -ForegroundColor Green
 
 Write-Host "Test-AssertExactPackageVersion passed ($passed checks)." -ForegroundColor Green
+exit 0
