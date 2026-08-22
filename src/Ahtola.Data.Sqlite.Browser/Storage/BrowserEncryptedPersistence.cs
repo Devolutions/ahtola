@@ -96,13 +96,20 @@ internal sealed class BrowserWalChainUpdate(
 /// </summary>
 internal sealed class BrowserLoadPlan(
     IReadOnlyList<(string Path, BrowserPersistedFileKind Kind)> files,
-    IReadOnlyList<string> transientArtifacts)
+    IReadOnlyList<string> transientArtifacts,
+    IReadOnlyList<string> ignoredPaths)
 {
     /// <summary>Files to load, in an order where every base path precedes its sidecars.</summary>
     internal IReadOnlyList<(string Path, BrowserPersistedFileKind Kind)> Files { get; } = files;
 
     /// <summary>Abandoned engine temporaries that are safe to discard.</summary>
     internal IReadOnlyList<string> TransientArtifacts { get; } = transientArtifacts;
+
+    /// <summary>
+    /// Paths that carry no content the encrypted engine can use and are left
+    /// untouched rather than decrypted or deleted.
+    /// </summary>
+    internal IReadOnlyList<string> IgnoredPaths { get; } = ignoredPaths;
 }
 
 /// <summary>
@@ -296,6 +303,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
 
         var loadable = new List<(string Path, BrowserPersistedFileKind Kind)>();
         var transient = new List<string>();
+        var ignored = new List<string>();
         var present = new HashSet<string>(ordered, StringComparer.Ordinal);
         foreach (var path in ordered)
         {
@@ -305,10 +313,24 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                 continue;
             }
 
-            loadable.Add((path, MapRole(path, _roles.Resolve(path, probeHeader(path), present.Contains))));
+            var role = _roles.Resolve(path, probeHeader(path), present.Contains);
+            if (role == BrowserPersistedFileRole.MvccLog)
+            {
+                // Rejecting MVCC belongs on the write path, where it stops row data
+                // from reaching OPFS in the clear. Throwing here instead would let a
+                // single stray -log file permanently block opening a healthy
+                // database, including the empty one a rejected MVCC enable leaves
+                // behind. Ignore it: a -log beside an encrypted database is always an
+                // orphan, and beside a plaintext one the database itself reports the
+                // real problem.
+                ignored.Add(path);
+                continue;
+            }
+
+            loadable.Add((path, MapRole(path, role)));
         }
 
-        return new BrowserLoadPlan(loadable, transient);
+        return new BrowserLoadPlan(loadable, transient, ignored);
     }
 
     /// <summary>
@@ -406,13 +428,39 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                 + $"which is not covered by whole {pageSize}-byte pages within its {fileLength}-byte image.");
         }
 
-        return ReadRegion(
+        var capture = ReadRegion(
             BrowserPersistedFileKind.Database,
             file,
             start,
             checked((int)(end - start)),
             pageSize,
             journalChecksumNonce: 0);
+        if (start == 0)
+            RejectMvccHeader(path, capture.Bytes);
+        return capture;
+    }
+
+    /// <summary>
+    /// Refuses a header that switches the database into MVCC mode.
+    /// </summary>
+    /// <remarks>
+    /// MVCC has to be rejected here rather than when its logical log is first
+    /// written, because the pager persists the new header first. Failing later
+    /// would leave a database permanently marked MVCC whose log can never be
+    /// written, so every reopen would fail. Refusing the header instead aborts the
+    /// mode switch while the pager can still roll it back.
+    /// </remarks>
+    private static void RejectMvccHeader(string path, ReadOnlySpan<byte> page)
+    {
+        if (page.Length <= 19)
+            return;
+        if (page[18] != (byte)SqliteFileFormatVersion.Mvcc && page[19] != (byte)SqliteFileFormatVersion.Mvcc)
+            return;
+
+        throw new NotSupportedException(
+            $"Encrypted browser storage cannot host MVCC database '{path}'. "
+            + "The engine writes the MVCC logical log outside the page codec, so enabling MVCC would place row "
+            + "data in OPFS unencrypted. Use the default journal mode for encrypted browser databases.");
     }
 
     private BrowserPlaintextCapture CaptureWal(

@@ -358,6 +358,31 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
             store.Read(path).AsSpan().IndexOf(Encoding.UTF8.GetBytes(Secret)).Should().Be(-1);
     }
 
+    [Test]
+    public async Task RejectedMvccEnableDoesNotBlockReopeningTheDatabase()
+    {
+        var store = new FakeBrowserPersistentStore();
+        const string DatabasePath = "app/data/main.db";
+
+        await using (var harness = await BrowserHarness.CreateAsync(store, Aes256Key))
+        {
+            using var database = EmbeddedDatabase.OpenFile(DatabasePath, harness.Mirror);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE notes(body TEXT);");
+            Execute(connection, $"INSERT INTO notes VALUES ('{Secret}');");
+            Record(() => Execute(connection, "PRAGMA journal_mode=mvcc;")).Should().NotBeNull();
+
+            // Disposing flushes the orphaned create the rejected attempt queued, so
+            // an empty '-log' can reach OPFS even though no MVCC data ever did.
+        }
+
+        // That stray file must not brick the database on the next open.
+        await using var reopened = await BrowserHarness.CreateAsync(store, Aes256Key);
+        using var reopenedDatabase = EmbeddedDatabase.OpenFile(DatabasePath, reopened.Mirror);
+        using var reopenedConnection = reopenedDatabase.Connect();
+        ScalarText(reopenedConnection, "SELECT body FROM notes;").Should().Be(Secret);
+    }
+
     private static Exception? Record(Action action)
     {
         try
