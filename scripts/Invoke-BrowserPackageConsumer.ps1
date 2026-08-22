@@ -6,6 +6,8 @@ param(
     [string]$Output = './artifacts/browser-wasm-consumer',
     [int]$Port = 8124,
     [string]$BrowserExecutable,
+    [ValidateSet('chromium', 'firefox', 'webkit')]
+    [string]$BrowserEngine = 'chromium',
     [switch]$RunAot
 )
 
@@ -14,6 +16,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $repoRoot 'samples/BrowserWasmConsumer/BrowserWasmConsumer.csproj'
 $serverScript = Join-Path $repoRoot 'samples/BrowserWasmConsumer/serve.mjs'
 $probeScript = Join-Path $repoRoot 'scripts/Run-BrowserProbe.mjs'
+$playwrightProbeScript = Join-Path $repoRoot 'scripts/Run-PlaywrightBrowserProbe.mjs'
 $validator = Join-Path $repoRoot 'scripts/Validate-ManagedPackageClosure.ps1'
 $packageDirectory = if ([System.IO.Path]::IsPathRooted($PackageDirectory)) {
     [System.IO.Path]::GetFullPath($PackageDirectory)
@@ -121,9 +124,13 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($BrowserExecutable)) {
             $env:AHTOLA_BROWSER_EXECUTABLE = $BrowserExecutable
         }
-        & node $probeScript $uri 'PASS:capabilities=True;storage=True;crypto=True;ado=42;ef=84;persistent-ado=126;persistent-ef=168;persistent-core=210;persistent-features=546;persistent-blob=01020908;persistent-backup=336;persistent-inbound-backup=378;persistent-encrypted=420;persistent-encrypted-password=462;encrypted-wrong-key-rejected=True;encrypted-cipher-mismatch-rejected=True'
+        if ($BrowserEngine -eq 'chromium') {
+            & node $probeScript $uri 'PASS:capabilities=True;storage=True;crypto=True;ado=42;ef=84;persistent-ado=126;persistent-ef=168;persistent-core=210;persistent-features=546;persistent-blob=01020908;persistent-backup=336;persistent-inbound-backup=378;persistent-encrypted=420;persistent-encrypted-password=462;encrypted-wrong-key-rejected=True;encrypted-cipher-mismatch-rejected=True'
+        } else {
+            & node $playwrightProbeScript $BrowserEngine $uri 'PASS:'
+        }
         if ($LASTEXITCODE -ne 0) {
-            throw "Browser consumer probe failed with exit code $LASTEXITCODE."
+            throw "$BrowserEngine browser consumer probe failed with exit code $LASTEXITCODE."
         }
     } finally {
         $env:AHTOLA_BROWSER_EXECUTABLE = $previousBrowser
@@ -135,4 +142,4 @@ try {
     }
 }
 
-Write-Host 'Packed browser consumer passed.' -ForegroundColor Green
+Write-Host "Packed browser consumer passed in $BrowserEngine." -ForegroundColor Green

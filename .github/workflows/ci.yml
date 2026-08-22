@@ -301,3 +301,52 @@ jobs:
           path: artifacts/powershell-modules/Devolutions.Ahtola.Sqlite/**
           if-no-files-found: error
           retention-days: 7
+
+  browser-smoke:
+    name: Browser smoke (${{ matrix.browser }})
+    needs: package
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser:
+          - firefox
+          - webkit
+    env:
+      PLAYWRIGHT_VERSION: 1.55.0
+      BROWSER_ENGINE: ${{ matrix.browser }}
+      PACKAGE_VERSION: 0.0.0-ci.${{ github.run_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download packed packages
+        uses: actions/download-artifact@v8
+        with:
+          name: managed-packages
+          path: artifacts/managed-packages
+
+      - name: Install Playwright browser
+        shell: pwsh
+        run: |
+          npm install --no-save --no-package-lock "playwright@$env:PLAYWRIGHT_VERSION"
+          npx playwright install --with-deps $env:BROWSER_ENGINE
+
+      - name: Run packed browser smoke
+        shell: pwsh
+        run: |
+          ./scripts/Invoke-BrowserPackageConsumer.ps1 `
+            -PackageDirectory ./artifacts/managed-packages `
+            -PackageVersion $env:PACKAGE_VERSION `
+            -BrowserEngine $env:BROWSER_ENGINE

@@ -158,6 +158,46 @@ Use EF Core async APIs (`EnsureCreatedAsync`, `MigrateAsync`,
 does not own a separately supplied connection unless configured to do so;
 dispose objects in context, connection, data-source order.
 
+## Encrypted OPFS databases
+
+Browser storage supports the same AHTLA AES-GCM page format as desktop Ahtola.
+Web Crypto derives/imports a non-extractable key and encrypts database pages,
+WAL frame bodies, and rollback-journal page records at the asynchronous OPFS
+boundary.
+
+```csharp
+using var encryption =
+    AhtolaBrowserEncryptionOptions.FromPassword("correct horse battery staple");
+using var browserOptions = new AhtolaBrowserOptions(
+    databasePath: "secure/main.db",
+    encryption: encryption);
+await using var dataSource = new AhtolaBrowserDataSource(browserOptions);
+
+await using var connection = await dataSource.OpenConnectionAsync();
+await using var command = connection.CreateCommand();
+command.CommandText = "CREATE TABLE IF NOT EXISTS secrets(value TEXT NOT NULL)";
+await command.ExecuteNonQueryAsync();
+```
+
+For exact key material, use `FromKey(AhtolaEncryptionCipher, ReadOnlySpan<byte>)`
+or `FromHex(AhtolaEncryptionCipher, string)`. Password mode is the stable
+`Ahtola.Password.v1` scheme: PBKDF2-HMAC-SHA256 with its fixed domain salt,
+210,000 iterations, and an AES-256-GCM key.
+
+Encryption options are copied by both `AhtolaBrowserOptions` and
+`AhtolaBrowserDataSource`. Dispose caller-owned option objects after constructing
+their owner; key material is never included in `ConnectionString`. A wrong key,
+cipher mismatch, plaintext file, or authentication failure is rejected without
+fallback.
+
+The on-disk bytes are desktop/browser compatible. A browser-written file can be
+opened by the desktop provider with the matching `Password` or
+`Encryption Cipher`/`Encryption Key` settings, and the browser can open a
+desktop-written AHTLA database and retained WAL.
+
+See [Browser encrypted storage](browser-encrypted-storage.md) for byte layout,
+WAL/journal checksum handling, cancellation, retry, and durability details.
+
 ## Ownership and locking
 
 One data source owns one OPFS worker and one Web Lock named for its owned

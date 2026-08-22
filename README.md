@@ -126,8 +126,11 @@ Cross-Origin-Embedder-Policy: require-corp
 ```
 
 The package supplies its worker and JavaScript modules through normal Razor
-static web assets. See [docs/browser-wasm.md](docs/browser-wasm.md) for complete
-deployment, EF Core, locking, lifetime, quota, and troubleshooting guidance.
+static web assets. Browser OPFS files can use the same byte-compatible AHTLA
+AES-GCM format as desktop databases. See
+[docs/browser-wasm.md](docs/browser-wasm.md) for deployment and usage, and
+[docs/browser-encrypted-storage.md](docs/browser-encrypted-storage.md) for the
+encryption/durability design.
 
 Common connection-string keywords: `Data Source`, `Mode`, `Cache`, `Pooling`,
 `Foreign Keys`, `Default Timeout` / `Command Timeout`, `Foreign Read Only`,

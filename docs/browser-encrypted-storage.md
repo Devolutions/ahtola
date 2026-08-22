@@ -109,3 +109,19 @@ copied defensively, zeroed on disposal, and **never placed in a connection
 string**. The Web Crypto key handle is non-extractable and is released during
 disposal, after connections are drained and pending writes are persisted, and
 before the OPFS store is closed.
+
+```csharp
+using var encryption =
+    AhtolaBrowserEncryptionOptions.FromHex(
+        AhtolaEncryptionCipher.Aes256Gcm,
+        hexKey);
+using var options = new AhtolaBrowserOptions(
+    databasePath: "secure/main.db",
+    encryption: encryption);
+await using var dataSource = new AhtolaBrowserDataSource(options);
+```
+
+The data source snapshots the encryption settings during construction, so
+caller-owned `AhtolaBrowserOptions` and `AhtolaBrowserEncryptionOptions`
+instances can be disposed independently. The data source releases its own copy
+after all connections drain and pending encrypted writes finish.
