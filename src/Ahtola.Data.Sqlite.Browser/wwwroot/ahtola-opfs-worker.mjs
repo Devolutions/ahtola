@@ -21,12 +21,11 @@ const textDecoder = new TextDecoder();
 // database's reopen or replay hide or corrupt another database that merely
 // happens to share the reserved prefix.
 const RESERVED_PATH_PREFIX = ".ahtola-replace-";
-// The exact shape of a live journal slot's filename: the reserved prefix, a
-// 64-character SHA-256 hex digest of the owning lock's full identity, and a
-// ".0"/".1" double-buffer suffix (see lockDigest). Only this exact shape is
+// The exact filenames of the two live journal slots (see
+// initializeIntentJournal/INTENT_SLOT_NAMES). Only these exact names are
 // hidden from directory listings, so a reserved-prefixed name that isn't one
 // of the two live slots is never silently swallowed by an over-broad filter.
-const RESERVED_INTENT_SLOT_PATTERN = /^\.ahtola-replace-[0-9a-f]{64}\.[01]$/u;
+const RESERVED_INTENT_SLOT_PATTERN = /^\.ahtola-replace-journal\.[01]$/u;
 
 function errorPayload(error) {
     return {
@@ -120,23 +119,17 @@ function checksum(value) {
     return hash >>> 0;
 }
 
-// A cryptographic digest of the full lock identity, not a 32-bit rolling
-// hash: two distinct lock names (for example two tenants' database paths)
-// must never plausibly collide on the journal slot filename this produces.
-// Every record additionally carries the full lock name (see writeIntent and
-// readIntentSlot), so even an astronomically unlikely digest collision is
-// detected and isolated rather than silently recovering another lock's
-// intent.
-async function lockDigest(value) {
-    const bytes = textEncoder.encode(value);
-    const digest = await crypto.subtle.digest("SHA-256", bytes);
-    return [...new Uint8Array(digest)]
-        .map(byte => byte.toString(16).padStart(2, "0"))
-        .join("");
-}
+// Fixed slot filenames used inside the lock's OWN resolved directory (see
+// initializeIntentJournal). Nesting the journal there - rather than hashing
+// the lock name into a filename shared by every database at the OPFS root -
+// makes two different locks sharing a slot structurally impossible instead
+// of merely unlikely: normalizePath/resolveDirectory resolve distinct lock
+// names to distinct directories, and the exclusive Web Lock already
+// guarantees only one worker touches a given directory's slots at a time.
+const INTENT_SLOT_NAMES = [".ahtola-replace-journal.0", ".ahtola-replace-journal.1"];
 
-async function openIntentSlot(name) {
-    const file = await root.getFileHandle(name, { create: true });
+async function openIntentSlot(directory, name) {
+    const file = await directory.getFileHandle(name, { create: true });
     return file.createSyncAccessHandle();
 }
 
@@ -164,9 +157,10 @@ function readIntentSlot(access, expectedLockName) {
             return { invalid: true };
         }
         // A well-formed record for a different lock identity means this
-        // slot's filename collided with another database's (see
-        // lockDigest). That is not corruption: leave the foreign record
-        // alone for its owner and treat this lock's journal as empty.
+        // slot was somehow shared with another lock. That is not
+        // corruption: leave the foreign record alone for its owner and
+        // treat this lock's journal as empty. Kept as defense in depth on
+        // top of the directory-scoped, per-lock slot location above.
         if (record.lockName !== expectedLockName)
             return { foreign: true };
         return { record };
@@ -200,10 +194,10 @@ function writeIntent(payload) {
 
 async function initializeIntentJournal(lockName) {
     currentLockName = lockName;
-    const prefix = `.ahtola-replace-${await lockDigest(lockName)}`;
+    const directory = await resolveDirectory(lockName, true);
     intentSlots.push(
-        await openIntentSlot(`${prefix}.0`),
-        await openIntentSlot(`${prefix}.1`));
+        await openIntentSlot(directory, INTENT_SLOT_NAMES[0]),
+        await openIntentSlot(directory, INTENT_SLOT_NAMES[1]));
 
     const decoded = intentSlots.map(access => readIntentSlot(access, lockName));
     const valid = decoded

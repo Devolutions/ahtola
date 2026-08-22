@@ -25,6 +25,7 @@ param(
         'pack',
                 'pack-powershell',
                 'test-powershell',
+                'test-browser-js',
                 'validate-package',
                 'validate-browser-package',
                 'validate-runtime',
@@ -51,7 +52,12 @@ param(
 
         # Floor for Pester module tests (test-powershell). Keep in sync with
         # tests/PowerShell/Devolutions.Ahtola.Sqlite/Module.Tests.ps1.
-        [int]$PowerShellMinimumExecutedTests = 34
+        [int]$PowerShellMinimumExecutedTests = 34,
+
+        # Floor for the Node-based browser OPFS worker/capability unit tests
+        # (test-browser-js). Keep in sync with the test() count under
+        # scripts/tests/browser-worker.
+        [int]$BrowserWorkerMinimumExecutedTests = 10
     )
 
 Set-StrictMode -Version Latest
@@ -244,6 +250,45 @@ function Invoke-Build {
                 throw "PowerShell module tests failed with exit code $LASTEXITCODE"
             }
         }
+
+function Invoke-TestBrowserJs {
+    param([int]$MinimumExecuted = $BrowserWorkerMinimumExecutedTests)
+
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        throw 'Browser worker JS tests require Node.js.'
+    }
+
+    $testDirectory = Join-Path $RepoRoot 'scripts/tests/browser-worker'
+    $testFiles = @(Get-ChildItem -LiteralPath $testDirectory -Filter '*.test.mjs' -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName })
+    if ($testFiles.Count -eq 0) {
+        throw "No browser worker JS test files were found under $testDirectory."
+    }
+
+    Write-Step "Running browser worker JS tests ($($testFiles.Count) file(s), min $MinimumExecuted)"
+    $output = @(& node --test @testFiles 2>&1)
+    $output | ForEach-Object { Write-Host $_ }
+    $exitCode = $LASTEXITCODE
+
+    $executed = 0
+    $summaryLine = $output | Where-Object { $_ -match '^\s*#\s*tests\s+(\d+)\s*$' } | Select-Object -Last 1
+    if ($summaryLine -and $summaryLine -match '(\d+)') {
+        $executed = [int]$Matches[1]
+    }
+
+    # dotnet test exits 0 for a run that silently discovered nothing, and
+    # Node's runner has the same failure mode if a test file throws during
+    # module load before registering any test() calls - so an explicit floor
+    # on the executed count is required, not just the process exit code.
+    if ($executed -lt $MinimumExecuted) {
+        throw "Browser worker JS tests executed only $executed test(s); expected at least $MinimumExecuted. A test file may have failed to load or register its tests."
+    }
+    if ($exitCode -ne 0) {
+        throw "Browser worker JS tests failed with exit code $exitCode."
+    }
+
+    Write-Host "Browser worker JS tests passed ($executed executed)." -ForegroundColor Green
+}
 
 function Invoke-Pack {
     param(
@@ -553,6 +598,7 @@ switch ($Task) {
     'pack' { Invoke-Pack }
         'pack-powershell' { Invoke-PackPowerShell }
         'test-powershell' { Invoke-TestPowerShell }
+        'test-browser-js' { Invoke-TestBrowserJs }
         'validate-project-closure' { Assert-ManagedProjectClosure }
         'validate-packed-closure' { Invoke-ValidatePackedClosure }
         'validate-package' { Invoke-ValidatePackage }

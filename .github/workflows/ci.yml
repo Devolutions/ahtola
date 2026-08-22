@@ -36,6 +36,11 @@ jobs:
             9.0.x
             10.0.x
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
       - name: Restore package roots
         shell: pwsh
         run: ./build.ps1 restore
@@ -50,6 +55,10 @@ jobs:
       - name: Validate managed project closure
         shell: pwsh
         run: ./build.ps1 validate-project-closure
+
+      - name: Test browser OPFS worker (Node)
+        shell: pwsh
+        run: ./build.ps1 test-browser-js
 
   build-test:
     name: Build and test (${{ matrix.os }})
