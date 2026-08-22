@@ -3162,26 +3162,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// <paramref name="owner"/>'s next attempt, or the busy deadline expires.
     /// </summary>
     /// <remarks>
-    /// This is the asynchronous half of the busy handler: it uses the same
-    /// transaction-lock and catalog-writer waits the synchronous engine blocks on,
-    /// but suspends the caller instead of parking a thread in
-    /// <see cref="Monitor.Wait(object)"/> or <see cref="Thread.Sleep(int)"/>. A
-    /// browser connection therefore never occupies its only thread while another
-    /// connection holds the write reservation.
+    /// This is the asynchronous half of the busy handler: it waits on the same
+    /// write reservation the synchronous engine blocks on, but suspends the caller
+    /// instead of parking a thread in <see cref="Monitor.Wait(object)"/> or
+    /// <see cref="Thread.Sleep(int)"/>. A browser connection therefore never
+    /// occupies its only thread while another connection holds the reservation.
+    /// It deliberately does not wait for catalog-writer quiescence: under sustained
+    /// write contention a settled instant may never come, and a stale snapshot is
+    /// resolved by adopting the committed catalog rather than by waiting.
     /// </remarks>
-    internal async ValueTask WaitForBusyRetryAsync(
+    internal ValueTask WaitForBusyRetryAsync(
         object owner,
         long deadline,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(owner);
         cancellationToken.ThrowIfCancellationRequested();
-        if (IsFileBacked && _fileSystem is not null)
-            await WaitForCatalogStabilityAsync(deadline, cancellationToken).ConfigureAwait(false);
-
-        await _transactionLock
-            .ThrowIfWriteBlockedAsync(owner, GetRemainingBusyTimeout(deadline), cancellationToken)
-            .ConfigureAwait(false);
+        return _transactionLock.ThrowIfWriteBlockedAsync(
+            owner,
+            GetRemainingBusyTimeout(deadline),
+            cancellationToken);
     }
 
     private static long GetBusyWaitDeadline(TimeSpan busyTimeout)
@@ -41892,14 +41892,19 @@ public sealed partial class EmbeddedConnection : IDisposable
     }
 
     /// <summary>
-    /// Runs the synchronous engine with a zero busy budget so no execution path
-    /// can park the calling thread waiting for a competing connection.
+    /// Fails this connection's lock acquisitions immediately instead of parking the
+    /// calling thread until its busy timeout expires.
     /// </summary>
     /// <remarks>
     /// The asynchronous statement seam pairs this with
-    /// <see cref="WaitForBusyRetryAsync"/>: fail fast, suspend on the managed
-    /// lock's asynchronous signal, then retry. Saving and restoring makes nesting
-    /// safe when a SQL callback steps another statement on this connection.
+    /// <see cref="AcquireAutocommitWriteReservationAsync"/> and
+    /// <see cref="WaitForBusyRetryAsync"/>: drain contention on the managed lock's
+    /// asynchronous signal, then run the statement so no <see cref="Monitor"/> wait
+    /// or <see cref="Thread.Sleep(int)"/> inside it can block. Only this
+    /// connection's budget changes; the owning <see cref="EmbeddedDatabase"/> keeps
+    /// its own, so a peer connection's retry budget is untouched and the engine's
+    /// stale-catalog statement restart still converges. Saving and restoring makes
+    /// nesting safe when a SQL callback steps another statement here.
     /// </remarks>
     internal FailFastBusyScope EnterFailFastBusyScope() => new(this);
 
@@ -41911,17 +41916,64 @@ public sealed partial class EmbeddedConnection : IDisposable
         internal FailFastBusyScope(EmbeddedConnection connection)
         {
             _connection = connection;
-            _restore = connection.BusyTimeout;
+            _restore = connection._busyTimeout;
             if (_restore != TimeSpan.Zero)
-                connection.BusyTimeout = TimeSpan.Zero;
+                connection._busyTimeout = TimeSpan.Zero;
         }
 
         public void Dispose()
         {
             // A PRAGMA busy_timeout executed inside the scope is the caller's new
             // intent; never clobber it with the value this scope displaced.
-            if (_restore != TimeSpan.Zero && _connection.BusyTimeout == TimeSpan.Zero)
-                _connection.BusyTimeout = _restore;
+            if (_restore != TimeSpan.Zero && _connection._busyTimeout == TimeSpan.Zero)
+                _connection._busyTimeout = _restore;
+        }
+    }
+
+    /// <summary>
+    /// Asynchronously takes the write reservation an autocommit mutation would
+    /// otherwise block on, returning <see langword="null"/> when the statement does
+    /// not need one.
+    /// </summary>
+    /// <remarks>
+    /// Draining the contention here rather than retrying the whole statement keeps
+    /// the barging shape SQLite has between autocommit writers — the reservation is
+    /// held across the statement instead of being re-raced on every attempt — while
+    /// the acquisition itself suspends rather than sleeping a thread. The engine's
+    /// own <c>EnterAutocommit</c> then finds the reservation re-entrant and never
+    /// waits. The lease is taken per attempt so a failed attempt cannot pin a
+    /// database another connection needs to make progress.
+    /// </remarks>
+    internal async ValueTask<IDisposable?> AcquireAutocommitWriteReservationAsync(
+        ParsedStatement statement,
+        TimeSpan busyTimeout,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(statement);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_transactionDatabases is not null
+            || _database.IsReadOnly
+            || !EmbeddedDatabase.MayMutate(statement))
+        {
+            return null;
+        }
+
+        await _database.TransactionLock
+            .EnterAutocommitAsync(this, busyTimeout, cancellationToken)
+            .ConfigureAwait(false);
+        return new AutocommitWriteReservation(this, _database);
+    }
+
+    private sealed class AutocommitWriteReservation(
+        EmbeddedConnection owner,
+        EmbeddedDatabase database) : IDisposable
+    {
+        private EmbeddedDatabase? _database = database;
+
+        public void Dispose()
+        {
+            var released = Interlocked.Exchange(ref _database, null);
+            released?.TransactionLock.Exit(owner);
         }
     }
 
@@ -41931,8 +41983,6 @@ public sealed partial class EmbeddedConnection : IDisposable
     /// </summary>
     internal async ValueTask<bool> WaitForBusyRetryAsync(
         long deadline,
-        int attempt,
-        bool staleCatalog,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -41955,25 +42005,13 @@ public sealed partial class EmbeddedConnection : IDisposable
             return false;
         }
 
-        // Running the attempt with a zero busy budget also disables the engine's
-        // own stale-catalog retry, so adopt the committed catalog here instead.
-        // An explicit transaction must keep its snapshot, and fails busy exactly
-        // as a zero-timeout synchronous statement would.
-        if (staleCatalog && _transactionDatabases is null)
-        {
-            foreach (var database in EnumerateReachableDatabases())
-            {
-                if (database.IsFileBacked)
-                    database.ReloadFileCatalogAfterStale();
-            }
-        }
-
-        // A stale catalog version, unlike a held reservation, has no signal to wait
-        // on, so back off on SQLite's own delay schedule instead of spinning.
-        var remaining = EmbeddedDatabase.RemainingBusyBudget(deadline);
-        var delay = SqliteBusyBackoff.DelayForAttempt(attempt, TimeSpan.Zero, remaining);
-        if (delay <= TimeSpan.Zero && remaining != Timeout.InfiniteTimeSpan)
-            return false;
+        // The reservation can be retaken between that signal and this retry, so
+        // yield for SQLite's shortest busy delay rather than spinning — the same
+        // one-millisecond poll the synchronous autocommit contender uses.
+        var delay = SqliteBusyBackoff.DelayForAttempt(
+            attempt: 0,
+            TimeSpan.Zero,
+            EmbeddedDatabase.RemainingBusyBudget(deadline));
         if (delay > TimeSpan.Zero)
             await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
 
@@ -48105,15 +48143,17 @@ public sealed class EmbeddedStatement : IDisposable
     /// contention, honoring <paramref name="cancellationToken"/> exactly.
     /// </summary>
     /// <remarks>
-    /// The engine's execution pipeline is synchronous, and its busy waits park a
+    /// The engine's execution pipeline is synchronous, and its lock waits park a
     /// thread in <see cref="Monitor.Wait(object)"/> or <see cref="Thread.Sleep(int)"/>
     /// for the whole busy timeout — fatal on a browser's single thread and
-    /// unresponsive to cancellation. This runs each attempt with a zero busy budget,
-    /// so the synchronous path fails fast instead of waiting, then suspends on the
-    /// managed transaction lock's asynchronous signal before retrying. The observed
-    /// busy semantics are unchanged: the retries are bounded by the connection's
-    /// <c>busy_timeout</c> and the original failure is what surfaces when it runs
-    /// out. The statement is only advanced by a successful attempt, because
+    /// unresponsive to cancellation. This drains the contention first: an autocommit
+    /// mutation takes its write reservation through the transaction lock's
+    /// asynchronous barging acquisition, so the synchronous attempt finds it
+    /// re-entrant, and the attempt itself runs with this connection's budget zeroed
+    /// so no remaining wait can block. Anything still reported busy suspends on the
+    /// same lock's asynchronous signal and retries, bounded by the connection's
+    /// <c>busy_timeout</c>, and surfaces the original busy failure when the budget
+    /// runs out. The statement is only advanced by a successful attempt, because
     /// execution publishes its result as a single assignment.
     /// </remarks>
     public async ValueTask<StatementStepResult> StepAsync(CancellationToken cancellationToken = default)
@@ -48128,27 +48168,32 @@ public sealed class EmbeddedStatement : IDisposable
             return Step(cancellationToken);
 
         var deadline = EmbeddedDatabase.CreateBusyDeadline(busyTimeout);
-        var attempt = 0;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var reservation = await _connection
+                .AcquireAutocommitWriteReservationAsync(
+                    _statement,
+                    EmbeddedDatabase.RemainingBusyBudget(deadline),
+                    cancellationToken)
+                .ConfigureAwait(false);
             try
             {
                 using (_connection.EnterFailFastBusyScope())
                     return Step(cancellationToken);
             }
-            catch (EmbeddedBusyException busy)
+            catch (EmbeddedBusyException)
             {
                 if (!await _connection
-                        .WaitForBusyRetryAsync(
-                            deadline,
-                            attempt++,
-                            busy is EmbeddedCatalogSnapshotStaleException,
-                            cancellationToken)
+                        .WaitForBusyRetryAsync(deadline, cancellationToken)
                         .ConfigureAwait(false))
                 {
                     throw;
                 }
+            }
+            finally
+            {
+                reservation?.Dispose();
             }
         }
     }

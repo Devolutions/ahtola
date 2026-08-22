@@ -1518,6 +1518,39 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Durably discards every frame after <paramref name="lastRetainedFrameNumber"/>.
+    /// </summary>
+    /// <remarks>
+    /// A commit whose durable flush never succeeded still leaves checksum-valid,
+    /// commit-marked frames in the file, so hiding them in memory would only make
+    /// this process disagree with a peer that reads the same WAL. The writer that
+    /// abandoned the commit removes them instead, which is the durable equivalent
+    /// of the rollback SQLite performs when a WAL write fails. Unlike
+    /// <see cref="RecoverToLastCommittedFrameAsync"/> this trims to an explicit
+    /// boundary rather than to whatever the file currently says was committed.
+    /// </remarks>
+    internal async ValueTask TruncateToFrameAsync(
+        long lastRetainedFrameNumber,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+        ArgumentOutOfRangeException.ThrowIfNegative(lastRetainedFrameNumber);
+
+        var file = GetAsyncFile();
+        var targetLength = LengthForFrameCount(lastRetainedFrameNumber);
+        var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+        if (length <= targetLength)
+            return;
+
+        await file.SetLengthAsync(targetLength, cancellationToken).ConfigureAwait(false);
+        if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != targetLength)
+            throw new InvalidDataException("SQLite WAL rollback truncation did not reach its requested boundary.");
+
+        await file.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Reclaims every committed frame after the caller has durably installed the
     /// same committed view in the main database file.
     /// </summary>

@@ -174,18 +174,83 @@ public sealed class AsyncPagerConcurrencyRegressionTests
             await commit.Should().ThrowAsync<IOException>();
         }
 
-        // The commit-bearing frame is physically present and checksum-valid, so a
-        // reader that trusted the raw WAL would adopt a transaction that failed.
+        // The abandoned commit is rolled out of the WAL durably rather than merely
+        // hidden, so no reader — in this process or another — can adopt it.
         await using (var rawWal = await SqliteWalFile.OpenAsync(
                          AsyncFileSystemAdapter.Create(storage),
                          WalPath,
                          readOnly: true))
         {
-            (await rawWal.ScanRecoveryAsync()).LastCommittedFrameNumber.Should().Be(2);
+            var recovery = await rawWal.ScanRecoveryAsync();
+            recovery.LastCommittedFrameNumber.Should().Be(1);
+            recovery.LastValidFrameNumber.Should().Be(1);
         }
 
         (await readerPager.ReadPageAsync(2)).Should().Equal(committed);
         readerPager.CommittedFrameCount.Should().Be(1);
+    }
+
+    [Test]
+    public async Task WalCommitWhoseFlushFailsStaysInvisibleToLaterOpensAndReadOnlyReaders()
+    {
+        var storage = new InMemoryFileSystem();
+        var writerFileSystem = new FlushInterceptingAsyncFileSystem(storage, WalPath);
+        var committed = CreatePage(0xE1);
+        var abandoned = CreatePage(0xE2);
+
+        await using (var writer = await AsyncSqlitePager.CreateAsync(
+                         writerFileSystem,
+                         DatabasePath,
+                         WalPath,
+                         CreateWalHeader()))
+        {
+            await CommitPageAsync(writer, committed);
+
+            writerFileSystem.FlushFailure = new IOException("injected SQLite WAL flush failure");
+            await using var failing = await writer.BeginTransactionAsync(2);
+            await failing.WritePageAsync(2, abandoned);
+            Func<Task> commit = async () => await failing.CommitAsync();
+            await commit.Should().ThrowAsync<IOException>();
+        }
+
+        // A read-only open cannot repair the WAL, so it must keep honoring the
+        // boundary rather than adopting the abandoned commit.
+        await using (var readOnly = await AsyncSqlitePager.OpenAsync(
+                         AsyncFileSystemAdapter.Create(storage),
+                         DatabasePath,
+                         WalPath,
+                         readOnly: true))
+        {
+            (await readOnly.ReadPageAsync(2)).Should().Equal(committed);
+        }
+
+        // A writable open owns the file, so it durably drops the hidden tail before
+        // republishing; the abandoned commit can never come back afterwards.
+        await using (var reopened = await AsyncSqlitePager.OpenAsync(
+                         AsyncFileSystemAdapter.Create(storage),
+                         DatabasePath,
+                         WalPath))
+        {
+            (await reopened.ReadPageAsync(2)).Should().Equal(committed);
+            reopened.CommittedFrameCount.Should().Be(1);
+        }
+
+        await using (var rawWal = await SqliteWalFile.OpenAsync(
+                         AsyncFileSystemAdapter.Create(storage),
+                         WalPath,
+                         readOnly: true))
+        {
+            var recovery = await rawWal.ScanRecoveryAsync();
+            recovery.LastCommittedFrameNumber.Should().Be(1);
+            recovery.LastValidFrameNumber.Should().Be(1);
+        }
+
+        await using var final = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(storage),
+            DatabasePath,
+            WalPath,
+            readOnly: true);
+        (await final.ReadPageAsync(2)).Should().Equal(committed);
     }
 
     [Test]

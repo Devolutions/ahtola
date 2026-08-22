@@ -410,13 +410,18 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                 pageCodec);
 
             // Opening re-derives visibility from the file itself, which is what a
-            // fresh process would see, so drop any publication boundary a faulted
-            // in-process writer left pinned.
-            if (!readOnly)
-                manager.PublishAllWalFrames();
+            // fresh process would see. A writable open first durably removes any
+            // tail an abandoned commit left hidden, so republishing cannot
+            // resurrect it; a read-only open cannot repair anything and therefore
+            // keeps honoring the boundary instead.
             if (UsesWalStorage(journalMode) && wal is not null)
             {
-                var recovery = await wal.ScanRecoveryAsync(cancellationToken).ConfigureAwait(false);
+                if (!readOnly)
+                    await RepairHiddenWalTailAsync(wal, manager, cancellationToken).ConfigureAwait(false);
+
+                var recovery = await wal
+                    .ScanRecoveryAsync(manager.WalPublicationBoundary, cancellationToken)
+                    .ConfigureAwait(false);
                 try
                 {
                     await pager.InitializeCommittedViewAsync(recovery, cancellationToken).ConfigureAwait(false);
@@ -554,12 +559,12 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                 ThrowIfDisposed();
                 ThrowIfReadOnly();
 
-                // This writer now owns the WAL, so the file is authoritative again:
-                // republish every physical frame, including a previous writer's
-                // durable-but-unconfirmed tail, before deriving the committed view.
-                if (UsesWalStorage(JournalMode))
-                    _lockManager.PublishAllWalFrames();
-                await SynchronizeCommittedViewAsync(cancellationToken).ConfigureAwait(false);
+                // This writer now owns the WAL, so the file becomes authoritative
+                // again — but only after any tail an abandoned commit left hidden is
+                // durably removed, so republishing cannot resurrect it.
+                await SynchronizeCommittedViewAsync(
+                    cancellationToken,
+                    repairHiddenWalTail: UsesWalStorage(JournalMode)).ConfigureAwait(false);
                 if (UsesWalStorage(JournalMode) && HasUncommittedOrInvalidTail(_recoveryInfo))
                     await RecoverWalTailUnderWriterLockAsync(cancellationToken).ConfigureAwait(false);
                 if (_state != SqlitePagerState.Ready)
@@ -672,8 +677,8 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                 throw new InvalidOperationException($"Cannot recover a SQLite WAL while the pager is {_state}.");
             try
             {
-                _lockManager.PublishAllWalFrames();
-                await SynchronizeCommittedViewAsync(cancellationToken).ConfigureAwait(false);
+                await SynchronizeCommittedViewAsync(cancellationToken, repairHiddenWalTail: true)
+                    .ConfigureAwait(false);
                 if (HasUncommittedOrInvalidTail(_recoveryInfo))
                     await RecoverWalTailUnderWriterLockAsync(cancellationToken).ConfigureAwait(false);
                 _lockGeneration = writerLock.PublishStorageChange();
@@ -857,10 +862,11 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             ThrowIfDisposed();
             ThrowIfReadOnly();
 
-            // The checkpoint lease excludes every reader and writer, so the WAL
-            // file is authoritative again for whatever it is about to install.
-            _lockManager.PublishAllWalFrames();
-            await SynchronizeCommittedViewAsync(cancellationToken).ConfigureAwait(false);
+            // The checkpoint lease excludes every reader and writer, so this is the
+            // safest point to durably drop a tail an abandoned commit left hidden.
+            await SynchronizeCommittedViewAsync(
+                cancellationToken,
+                repairHiddenWalTail: UsesWalStorage(JournalMode)).ConfigureAwait(false);
             if (JournalMode == SqliteJournalMode.Delete)
             {
                 if (_state != SqlitePagerState.Ready)
@@ -941,46 +947,83 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         // adopt a commit-bearing frame that has not been made durable yet — or one
         // that never commits at all because the flush fails.
         transaction.BeginWalPublication(_committedFrameCount);
-        await wal.AppendFramesAsync(
-            new AsyncSqlitePagerTransaction.WalFrameSource(transaction),
-            transaction.TargetDatabaseSizeInPages,
-            cancellationToken).ConfigureAwait(false);
-        await wal.FlushAsync(cancellationToken).ConfigureAwait(false);
-        var recovery = await wal.ScanRecoveryAsync(cancellationToken).ConfigureAwait(false);
-        if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
-            || recovery.LastCommittedFrameNumber != recovery.LastValidFrameNumber
-            || recovery.LastCommittedDatabaseSizeInPages != transaction.TargetDatabaseSizeInPages)
+        var publishedFrameCount = _committedFrameCount;
+        var durable = false;
+        try
         {
-            throw new InvalidDataException("SQLite WAL did not preserve the transaction commit boundary.");
-        }
+            await wal.AppendFramesAsync(
+                new AsyncSqlitePagerTransaction.WalFrameSource(transaction),
+                transaction.TargetDatabaseSizeInPages,
+                cancellationToken).ConfigureAwait(false);
+            await wal.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-        var committedOverlay = CloneOverlay(_walPageOverlay);
-        foreach (var pageNumber in transaction.WriteOrder)
-            committedOverlay[pageNumber] = transaction.GetPageImage(pageNumber).ToArray();
-        foreach (var pageNumber in committedOverlay.Keys
-                     .Where(pageNumber => pageNumber > transaction.TargetDatabaseSizeInPages)
-                     .ToArray())
-        {
-            committedOverlay.Remove(pageNumber);
-        }
+            // Past this point the commit frame is durable, so SQLite considers the
+            // transaction committed even if our own bookkeeping then fails. The
+            // frames must become visible again either way.
+            durable = true;
+            var recovery = await wal.ScanRecoveryAsync(cancellationToken).ConfigureAwait(false);
+            if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
+                || recovery.LastCommittedFrameNumber != recovery.LastValidFrameNumber
+                || recovery.LastCommittedDatabaseSizeInPages != transaction.TargetDatabaseSizeInPages)
+            {
+                throw new InvalidDataException("SQLite WAL did not preserve the transaction commit boundary.");
+            }
 
-        await ValidateVisiblePageSourcesAsync(
-            transaction.TargetDatabaseSizeInPages,
-            await _pageStore.GetPageCountAsync(cancellationToken).ConfigureAwait(false),
-            committedOverlay,
-            cancellationToken).ConfigureAwait(false);
-        lock (_stateGate)
+            var committedOverlay = CloneOverlay(_walPageOverlay);
+            foreach (var pageNumber in transaction.WriteOrder)
+                committedOverlay[pageNumber] = transaction.GetPageImage(pageNumber).ToArray();
+            foreach (var pageNumber in committedOverlay.Keys
+                         .Where(pageNumber => pageNumber > transaction.TargetDatabaseSizeInPages)
+                         .ToArray())
+            {
+                committedOverlay.Remove(pageNumber);
+            }
+
+            await ValidateVisiblePageSourcesAsync(
+                transaction.TargetDatabaseSizeInPages,
+                await _pageStore.GetPageCountAsync(cancellationToken).ConfigureAwait(false),
+                committedOverlay,
+                cancellationToken).ConfigureAwait(false);
+            lock (_stateGate)
+            {
+                _walPageOverlay.Clear();
+                foreach (var pair in committedOverlay)
+                    _walPageOverlay[pair.Key] = pair.Value;
+                _committedPageCount = transaction.TargetDatabaseSizeInPages;
+                _committedFrameCount = recovery.LastCommittedFrameNumber;
+                _recoveryInfo = recovery;
+                _visibleRecoveryInfo = recovery;
+            }
+        }
+        catch when (!durable)
         {
-            _walPageOverlay.Clear();
-            foreach (var pair in committedOverlay)
-                _walPageOverlay[pair.Key] = pair.Value;
-            _committedPageCount = transaction.TargetDatabaseSizeInPages;
-            _committedFrameCount = recovery.LastCommittedFrameNumber;
-            _recoveryInfo = recovery;
-            _visibleRecoveryInfo = recovery;
+            // The commit never became durable. Roll the WAL back to the published
+            // boundary so a peer process, or a later open, cannot resurrect a
+            // transaction this process already rejected; the boundary stays pinned
+            // when even that fails, which keeps local readers consistent until a
+            // writer or checkpoint can repair the file.
+            await TruncateAbandonedWalTailAsync(wal, publishedFrameCount).ConfigureAwait(false);
+            throw;
         }
 
         transaction.PublishWalFrames();
+    }
+
+    private async ValueTask TruncateAbandonedWalTailAsync(
+        SqliteWalFile wal,
+        long publishedFrameCount)
+    {
+        try
+        {
+            await wal.TruncateToFrameAsync(publishedFrameCount, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            return;
+        }
+
+        _lockManager.PublishAllWalFrames();
     }
 
     private async ValueTask CommitRollbackTransactionAsync(
@@ -1149,7 +1192,9 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         return installed;
     }
 
-    private async ValueTask SynchronizeCommittedViewAsync(CancellationToken cancellationToken)
+    private async ValueTask SynchronizeCommittedViewAsync(
+        CancellationToken cancellationToken,
+        bool repairHiddenWalTail = false)
     {
         if (JournalMode == SqliteJournalMode.Delete)
         {
@@ -1173,10 +1218,17 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         }
         if (_wal is null)
         {
+            if (repairHiddenWalTail)
+                _lockManager.PublishAllWalFrames();
             await _pageStore.RefreshHeaderAsync(cancellationToken).ConfigureAwait(false);
             await InitializeCleanWalViewAsync(cancellationToken).ConfigureAwait(false);
             _lockGeneration = _lockManager.Generation;
             return;
+        }
+
+        if (repairHiddenWalTail)
+        {
+            await RepairHiddenWalTailAsync(_wal, _lockManager, cancellationToken).ConfigureAwait(false);
         }
 
         var recovery = await _wal
@@ -1189,6 +1241,23 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         }
         await InitializeCommittedViewAsync(recovery, cancellationToken).ConfigureAwait(false);
         _lockGeneration = _lockManager.Generation;
+    }
+
+    /// <summary>
+    /// Durably discards a WAL tail an abandoned commit left hidden, then makes the
+    /// file authoritative again. The caller must hold the writer or checkpoint
+    /// lease, which is what makes trimming the file safe.
+    /// </summary>
+    private static async ValueTask RepairHiddenWalTailAsync(
+        SqliteWalFile wal,
+        SqlitePagerLockManager lockManager,
+        CancellationToken cancellationToken)
+    {
+        var boundary = lockManager.WalPublicationBoundary;
+        if (boundary != long.MaxValue && !wal.IsReadOnly)
+            await wal.TruncateToFrameAsync(boundary, cancellationToken).ConfigureAwait(false);
+
+        lockManager.PublishAllWalFrames();
     }
 
     private async ValueTask RecoverWalTailUnderWriterLockAsync(CancellationToken cancellationToken)
