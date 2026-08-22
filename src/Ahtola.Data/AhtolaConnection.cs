@@ -50,6 +50,11 @@ public class AhtolaConnection :
         get => _connectionOptions.GetConnectionString();
         set
         {
+            if (_managedDatabaseFactory is not null)
+            {
+                throw new InvalidOperationException(
+                    "Connections created by a browser data source cannot replace its connection string.");
+            }
             if (State == ConnectionState.Open)
                 throw new InvalidOperationException("ConnectionString cannot be set while the connection is open.");
 
@@ -86,6 +91,11 @@ public class AhtolaConnection :
         get => _pageCodec;
         set
         {
+            if (_managedDatabaseFactory is not null)
+            {
+                throw new InvalidOperationException(
+                    "Connections created by a browser data source cannot replace its page codec.");
+            }
             if (State == ConnectionState.Open)
                 throw new InvalidOperationException("PageCodec cannot be set while the connection is open.");
             if (value is not null)

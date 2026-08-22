@@ -1,5 +1,6 @@
 using System.Data;
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 using Ahtola.Data.Sqlite;
 using AwesomeAssertions;
 
@@ -156,6 +157,23 @@ public sealed class BrowserAsyncOnlyLifecycleTests
     }
 
     [Test]
+    public void BrowserDataSourceConnectionsCannotOverrideStorageConfiguration()
+    {
+        using var sqlite = CreateSqliteConnection();
+        using var ahtola = CreateAhtolaConnection();
+        var codec = new IdentityPageCodec();
+
+        sqlite.Invoking(static value => value.ConnectionString = "Data Source=other.db")
+            .Should().Throw<InvalidOperationException>();
+        sqlite.Invoking(value => value.PageCodec = codec)
+            .Should().Throw<InvalidOperationException>();
+        ahtola.Invoking(static value => value.ConnectionString = "Data Source=other.db")
+            .Should().Throw<InvalidOperationException>();
+        ahtola.Invoking(value => value.PageCodec = codec)
+            .Should().Throw<InvalidOperationException>();
+    }
+
+    [Test]
     public async Task ConnectionOwnedReaderCloseDoesNotExecuteTrailingSql()
     {
         await using var connection = CreateSqliteConnection();
@@ -274,5 +292,20 @@ public sealed class BrowserAsyncOnlyLifecycleTests
             return ValueTask.FromResult<IManagedDatabaseAdapter>(
                 ManagedDatabaseAdapter.Open(":memory:"));
         }
+    }
+
+    private sealed class IdentityPageCodec : IPageCodec
+    {
+        private static readonly PageCodecId Id = new("browser-config"u8.ToArray().Concat(new byte[2]).ToArray());
+
+        public PageCodecId CodecId => Id;
+
+        public byte RequiredReservedBytes => 0;
+
+        public void EncodePage(PageCodecContext context, ReadOnlySpan<byte> input, Span<byte> output)
+            => input.CopyTo(output);
+
+        public void DecodePage(PageCodecContext context, ReadOnlySpan<byte> input, Span<byte> output)
+            => input.CopyTo(output);
     }
 }

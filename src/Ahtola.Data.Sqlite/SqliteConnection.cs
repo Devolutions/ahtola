@@ -78,6 +78,11 @@ public partial class SqliteConnection :
         get => _connectionOptions.ConnectionString;
         set
         {
+            if (_managedDatabaseFactory is not null)
+            {
+                throw new InvalidOperationException(
+                    "Connections created by a browser data source cannot replace its connection string.");
+            }
             if (State == ConnectionState.Open)
                 throw new InvalidOperationException(Properties.Resources.ConnectionStringRequiresClosedConnection);
 
@@ -126,6 +131,11 @@ public partial class SqliteConnection :
         get => _pageCodec;
         set
         {
+            if (_managedDatabaseFactory is not null)
+            {
+                throw new InvalidOperationException(
+                    "Connections created by a browser data source cannot replace its page codec.");
+            }
             if (State == ConnectionState.Open)
                 throw new InvalidOperationException("PageCodec cannot be set while the connection is open.");
             if (value is not null && IsRemoteDataSource)
