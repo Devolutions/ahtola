@@ -36,6 +36,7 @@
     <ItemGroup>
         <ProjectReference Include="..\Ahtola.Data\Ahtola.Data.csproj" />
         <ProjectReference Include="..\Ahtola.Data.Sqlite\Ahtola.Data.Sqlite.csproj" />
+        <ProjectReference Include="..\Ahtola.Data.Sqlite.Browser\Ahtola.Data.Sqlite.Browser.csproj" />
         <ProjectReference Include="..\Ahtola.EntityFrameworkCore.Sqlite\Ahtola.EntityFrameworkCore.Sqlite.csproj" />
                 <ProjectReference Include="..\Devolutions.Ahtola.PowerShell\Devolutions.Ahtola.PowerShell.csproj" />
                 <ProjectReference Include="..\Ahtola.Core\Ahtola.Core.csproj" />
