@@ -266,6 +266,18 @@ and is only refreshed on pooling reset.
   installation.
 - Any of these failures transitions the pager to `SqlitePagerState.Faulted`. The
   pager never silently re-reads a database that changed underneath it.
+- `SqlitePagerLockManager.WalPublicationBoundary` is a second process-local signal,
+  used only by `AsyncSqlitePager`. A commit-bearing frame reaches the WAL file
+  before its durable flush returns, so the committing writer lowers the boundary to
+  the last published frame before appending and raises it again only after the
+  flush, the post-flush scan, and the committed-view publication have all
+  succeeded. Reader scans stop at the boundary, so a concurrent async reader on the
+  same database never adopts a transaction that is still in flight or that failed
+  to become durable. The boundary constrains visibility only; it never changes WAL
+  bytes, and it resets to unbounded on create, open, checkpoint, WAL tail recovery,
+  and whenever a new writer takes the writer lock, so a peer process — or a
+  reopened pager — still derives visibility from the file exactly as
+  §1.8 describes.
 
 ### 1.8 Recovery and handoff today
 

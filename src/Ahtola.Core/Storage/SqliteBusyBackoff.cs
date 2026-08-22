@@ -84,6 +84,30 @@ public static class SqliteBusyBackoff
     }
 
     /// <summary>
+    /// Asynchronously waits for the next SQLite busy delay or cancellation;
+    /// returns <see langword="false"/> when the timeout has expired.
+    /// </summary>
+    public static async ValueTask<bool> WaitAsync(
+        int attempt,
+        TimeSpan timeout,
+        Stopwatch? stopwatch,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var elapsed = stopwatch?.Elapsed ?? TimeSpan.Zero;
+        var delay = DelayForAttempt(attempt, elapsed, timeout);
+        if (delay <= TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan)
+            return false;
+
+        if (delay > TimeSpan.Zero)
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+
+        return timeout == Timeout.InfiniteTimeSpan
+            || stopwatch is null
+            || stopwatch.Elapsed < timeout;
+    }
+
+    /// <summary>
     /// Convenience overload that estimates the attempt from elapsed time for
     /// simple poll loops. Prefer attempt-indexed overloads at call sites that
     /// already count retries.
@@ -100,6 +124,20 @@ public static class SqliteBusyBackoff
         Stopwatch? stopwatch,
         CancellationToken cancellationToken)
         => Wait(
+            attempt: EstimateAttempt(stopwatch?.Elapsed ?? TimeSpan.Zero),
+            timeout,
+            stopwatch,
+            cancellationToken);
+
+    /// <summary>
+    /// Asynchronous convenience overload pairing with
+    /// <see cref="WaitAsync(int, TimeSpan, Stopwatch?, CancellationToken)"/>.
+    /// </summary>
+    public static ValueTask<bool> WaitAsync(
+        TimeSpan timeout,
+        Stopwatch? stopwatch,
+        CancellationToken cancellationToken = default)
+        => WaitAsync(
             attempt: EstimateAttempt(stopwatch?.Elapsed ?? TimeSpan.Zero),
             timeout,
             stopwatch,

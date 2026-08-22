@@ -276,6 +276,22 @@ public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
         Scalar(destination, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'source_data';").Should().Be(0);
     }
 
+    [Test]
+    public void CoreSnapshotAcceptsFileSystemThatProvesFilesAreDistinct()
+    {
+        var fileSystem = new KnownIdentityFileSystem(new InMemoryFileSystem());
+        using var sourceDatabase = ManagedDatabaseAdapter.OpenFile("source.db", fileSystem);
+        using var destinationDatabase = ManagedDatabaseAdapter.OpenFile("destination.db", fileSystem);
+        using var source = sourceDatabase.Connect();
+        using var destination = destinationDatabase.Connect();
+        PrepareReplacementPair(source, destination);
+
+        source.CopySnapshotTo(destination);
+
+        Scalar(destination, "SELECT COUNT(*) FROM source_data;").Should().Be(1);
+        Scalar(destination, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'preserved';").Should().Be(0);
+    }
+
     private static SqliteConnection OpenManagedConnection()
     {
         var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
@@ -323,5 +339,24 @@ public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
             => inner.OpenFile(path, mode, readOnly);
 
         public void DeleteFile(string path) => inner.DeleteFile(path);
+    }
+
+    private sealed class KnownIdentityFileSystem(IFileSystem inner) :
+        IFileSystem,
+        ISnapshotFileIdentity
+    {
+        public bool FileExists(string path) => inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+            => inner.OpenFile(path, mode, readOnly);
+
+        public void DeleteFile(string path) => inner.DeleteFile(path);
+
+        public bool CanProveDistinctFile(
+            string path,
+            IFileSystem otherFileSystem,
+            string otherPath)
+            => ReferenceEquals(this, otherFileSystem)
+               && !StringComparer.Ordinal.Equals(path, otherPath);
     }
 }

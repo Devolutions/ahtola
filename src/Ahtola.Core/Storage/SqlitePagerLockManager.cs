@@ -119,6 +119,22 @@ public interface ISqlitePagerLockCoordinator
 }
 
 /// <summary>
+/// Optional nonblocking counterpart for pager coordinators that can retry
+/// external ownership without sleeping a worker thread.
+/// </summary>
+public interface IAsyncSqlitePagerLockCoordinator
+{
+    ValueTask<IDisposable> AcquireAsync(
+        SqlitePagerLockOperation operation,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default);
+
+    ValueTask<IDisposable> AcquireRecoveryAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>
 /// Coordinates readers, the single WAL writer, and checkpointing for SQLite
 /// pagers. Readers may coexist with a writer; a checkpoint waits for all
 /// readers and the writer, then excludes every role.
@@ -135,6 +151,7 @@ public sealed class SqlitePagerLockManager
 {
     private static readonly TimeSpan MaximumMonitorTimeout = TimeSpan.FromMilliseconds(int.MaxValue);
     private readonly object _gate = new();
+    private readonly AsyncConditionPulse _stateChanged = new();
     private readonly ISqlitePagerLockCoordinator? _coordinator;
     private int _readerCount;
     private int _checkpointWaiterCount;
@@ -143,6 +160,7 @@ public sealed class SqlitePagerLockManager
     private bool _checkpointActive;
     private long _generation;
     private long _journalModeGeneration;
+    private long _walPublicationBoundary = long.MaxValue;
     private IDisposable? _sharedReaderLock;
 
     /// <summary>Creates a process-local SQLite pager lock manager.</summary>
@@ -228,6 +246,17 @@ public sealed class SqlitePagerLockManager
     public SqlitePagerLockLease EnterReader(TimeSpan? busyTimeout = null)
         => Enter(SqlitePagerLockOperation.Reader, NormalizeTimeout(busyTimeout), pagerReadOnly: true);
 
+    /// <summary>Asynchronously acquires a read-snapshot lock.</summary>
+    public ValueTask<SqlitePagerLockLease> EnterReaderAsync(
+        TimeSpan? busyTimeout = null,
+        CancellationToken cancellationToken = default)
+        => EnterAsync(
+            SqlitePagerLockOperation.Reader,
+            NormalizeTimeout(busyTimeout),
+            pagerReadOnly: true,
+            useExternalCoordinator: true,
+            cancellationToken);
+
     /// <summary>
     /// Acquires a read-snapshot lock for a pager whose read-only state is known.
     /// A read-write pager may recreate a missing shared-memory lock carrier on
@@ -254,6 +283,17 @@ public sealed class SqlitePagerLockManager
     public SqlitePagerLockLease EnterWriter(TimeSpan? busyTimeout = null)
         => Enter(SqlitePagerLockOperation.Writer, NormalizeTimeout(busyTimeout));
 
+    /// <summary>Asynchronously acquires the single WAL writer lock.</summary>
+    public ValueTask<SqlitePagerLockLease> EnterWriterAsync(
+        TimeSpan? busyTimeout = null,
+        CancellationToken cancellationToken = default)
+        => EnterAsync(
+            SqlitePagerLockOperation.Writer,
+            NormalizeTimeout(busyTimeout),
+            pagerReadOnly: false,
+            useExternalCoordinator: true,
+            cancellationToken);
+
     internal SqlitePagerLockLease EnterWriter(
         TimeSpan? busyTimeout,
         bool useExternalCoordinator)
@@ -266,6 +306,17 @@ public sealed class SqlitePagerLockManager
     /// <summary>Acquires an exclusive checkpoint lock.</summary>
     public SqlitePagerLockLease EnterCheckpoint(TimeSpan? busyTimeout = null)
         => Enter(SqlitePagerLockOperation.Checkpoint, NormalizeTimeout(busyTimeout));
+
+    /// <summary>Asynchronously acquires an exclusive checkpoint lock.</summary>
+    public ValueTask<SqlitePagerLockLease> EnterCheckpointAsync(
+        TimeSpan? busyTimeout = null,
+        CancellationToken cancellationToken = default)
+        => EnterAsync(
+            SqlitePagerLockOperation.Checkpoint,
+            NormalizeTimeout(busyTimeout),
+            pagerReadOnly: false,
+            useExternalCoordinator: true,
+            cancellationToken);
 
     internal SqlitePagerLockLease EnterCheckpoint(
         TimeSpan? busyTimeout,
@@ -298,6 +349,45 @@ public sealed class SqlitePagerLockManager
         try
         {
             return _coordinator.AcquireRecovery(timeout)
+                   ?? throw new InvalidOperationException("SQLite pager lock coordinator returned no recovery lease.");
+        }
+        catch (SqlitePagerBusyException exception)
+        {
+            throw new SqlitePagerBusyException(
+                SqlitePagerLockOperation.Writer,
+                SqlitePagerBusyReason.Recovery,
+                configuredTimeout,
+                exception);
+        }
+    }
+
+    internal async ValueTask<IDisposable?> EnterRecoveryLockAsync(
+        TimeSpan timeout,
+        TimeSpan configuredTimeout,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_coordinator is null)
+            return null;
+        if (timeout == TimeSpan.Zero && configuredTimeout != TimeSpan.Zero)
+        {
+            throw new SqlitePagerBusyException(
+                SqlitePagerLockOperation.Writer,
+                SqlitePagerBusyReason.Recovery,
+                configuredTimeout);
+        }
+        if (_coordinator is not IAsyncSqlitePagerLockCoordinator asyncCoordinator)
+        {
+            throw new NotSupportedException(
+                "The SQLite pager lock coordinator does not support asynchronous acquisition.");
+        }
+
+        ReleaseIdleSharedReaderLock();
+        try
+        {
+            return await asyncCoordinator
+                       .AcquireRecoveryAsync(timeout, cancellationToken)
+                       .ConfigureAwait(false)
                    ?? throw new InvalidOperationException("SQLite pager lock coordinator returned no recovery lease.");
         }
         catch (SqlitePagerBusyException exception)
@@ -345,8 +435,10 @@ public sealed class SqlitePagerLockManager
                 {
                     _checkpointWaiterCount--;
                     Monitor.PulseAll(_gate);
+                    _stateChanged.PulseAll();
                 }
             }
+
         }
 
         IDisposable? externalLock = null;
@@ -393,6 +485,127 @@ public sealed class SqlitePagerLockManager
         }
     }
 
+    private async ValueTask<SqlitePagerLockLease> EnterAsync(
+        SqlitePagerLockOperation operation,
+        TimeSpan timeout,
+        bool pagerReadOnly,
+        bool useExternalCoordinator,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
+        var checkpointWaiterRegistered = false;
+        var localAcquired = false;
+        try
+        {
+            while (true)
+            {
+                Task stateChanged;
+                TimeSpan remaining;
+                lock (_gate)
+                {
+                    if (!checkpointWaiterRegistered
+                        && operation == SqlitePagerLockOperation.Checkpoint)
+                    {
+                        _checkpointWaiterCount++;
+                        checkpointWaiterRegistered = true;
+                        _stateChanged.PulseAll();
+                    }
+
+                    if (CanEnter(operation))
+                    {
+                        Acquire(operation);
+                        localAcquired = true;
+                        break;
+                    }
+
+                    remaining = RemainingTimeout(timeout, stopwatch);
+                    if (remaining == TimeSpan.Zero)
+                        throw new SqlitePagerBusyException(operation, timeout);
+                    stateChanged = _stateChanged.Capture();
+                }
+
+                try
+                {
+                    if (remaining == Timeout.InfiniteTimeSpan)
+                        await stateChanged.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    else
+                        await stateChanged.WaitAsync(remaining, cancellationToken).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    throw new SqlitePagerBusyException(operation, timeout);
+                }
+            }
+        }
+        finally
+        {
+            if (checkpointWaiterRegistered)
+            {
+                lock (_gate)
+                {
+                    _checkpointWaiterCount--;
+                    Monitor.PulseAll(_gate);
+                    _stateChanged.PulseAll();
+                }
+            }
+        }
+
+        IDisposable? externalLock = null;
+        var leaseHandedOff = false;
+        try
+        {
+            if (_coordinator is not null && useExternalCoordinator)
+            {
+                var coordinatorTimeout = RemainingFileLockTimeout(timeout, stopwatch);
+                if (coordinatorTimeout == TimeSpan.Zero && timeout != TimeSpan.Zero)
+                    throw new SqlitePagerBusyException(operation, timeout);
+                if (_coordinator is not IAsyncSqlitePagerLockCoordinator asyncCoordinator)
+                {
+                    throw new NotSupportedException(
+                        "The SQLite pager lock coordinator does not support asynchronous acquisition.");
+                }
+
+                if (operation == SqlitePagerLockOperation.Reader)
+                {
+                    await AcquireSharedReaderLockAsync(
+                            asyncCoordinator,
+                            coordinatorTimeout,
+                            pagerReadOnly,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    if (operation != SqlitePagerLockOperation.Writer)
+                        ReleaseIdleSharedReaderLock();
+
+                    externalLock = await asyncCoordinator
+                                           .AcquireAsync(operation, coordinatorTimeout, cancellationToken)
+                                           .ConfigureAwait(false)
+                                       ?? throw new InvalidOperationException(
+                                           "SQLite pager lock coordinator returned no lease.");
+                }
+            }
+
+            var lease = new SqlitePagerLockLease(this, operation, externalLock);
+            leaseHandedOff = true;
+            return lease;
+        }
+        catch (SqlitePagerBusyException exception)
+        {
+            throw new SqlitePagerBusyException(operation, timeout, exception);
+        }
+        finally
+        {
+            if (!leaseHandedOff && localAcquired)
+            {
+                externalLock?.Dispose();
+                ExitLocal(operation);
+            }
+        }
+    }
+
     internal long PublishStorageChange(SqlitePagerLockOperation operation)
     {
         if (operation is not SqlitePagerLockOperation.Writer and not SqlitePagerLockOperation.Checkpoint)
@@ -425,6 +638,128 @@ public sealed class SqlitePagerLockManager
                     throw new SqlitePagerBusyException(SqlitePagerLockOperation.Writer, timeout);
                 Monitor.Wait(_gate, remaining);
             }
+        }
+    }
+
+    /// <summary>
+    /// Asynchronously upgrades the active writer lease to EXCLUSIVE without
+    /// blocking a thread while existing readers drain.
+    /// </summary>
+    /// <remarks>
+    /// New readers are excluded the moment the upgrade is requested, so a steady
+    /// stream of arrivals cannot starve the writer. A failed upgrade drops the
+    /// pending flag again: the caller falls back to RESERVED, which SQLite does
+    /// not let block readers.
+    /// </remarks>
+    internal async ValueTask UpgradeWriterToExclusiveAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
+        var upgraded = false;
+        var pendingRegistered = false;
+        try
+        {
+            while (true)
+            {
+                Task stateChanged;
+                TimeSpan remaining;
+                lock (_gate)
+                {
+                    if (!_writerActive)
+                        throw new InvalidOperationException("The SQLite writer lease is no longer active.");
+
+                    if (!pendingRegistered)
+                    {
+                        _writerExclusivePending = true;
+                        pendingRegistered = true;
+                    }
+
+                    if (_readerCount == 0)
+                    {
+                        upgraded = true;
+                        return;
+                    }
+
+                    remaining = RemainingTimeout(timeout, stopwatch);
+                    if (remaining == TimeSpan.Zero)
+                        throw new SqlitePagerBusyException(SqlitePagerLockOperation.Writer, timeout);
+                    stateChanged = _stateChanged.Capture();
+                }
+
+                try
+                {
+                    if (remaining == Timeout.InfiniteTimeSpan)
+                        await stateChanged.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    else
+                        await stateChanged.WaitAsync(remaining, cancellationToken).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    throw new SqlitePagerBusyException(SqlitePagerLockOperation.Writer, timeout);
+                }
+            }
+        }
+        finally
+        {
+            if (!upgraded && pendingRegistered)
+            {
+                lock (_gate)
+                {
+                    if (_writerActive)
+                        _writerExclusivePending = false;
+                    Monitor.PulseAll(_gate);
+                    _stateChanged.PulseAll();
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// The highest WAL frame this process has published to readers, or
+    /// <see cref="long.MaxValue"/> when the physical WAL is authoritative.
+    /// </summary>
+    /// <remarks>
+    /// A commit-bearing frame reaches the WAL file before its durable flush
+    /// succeeds. Without a boundary, a concurrent reader that rescans the physical
+    /// WAL would adopt a transaction that is still in flight and may yet fail. The
+    /// committing writer lowers this boundary to the last published frame before
+    /// appending and raises it again only once the flush and post-flush validation
+    /// have both succeeded. The boundary is deliberately process-local and resets
+    /// to unbounded on open, checkpoint, and WAL tail recovery, so crash recovery
+    /// across a process or open boundary still derives visibility from the file.
+    /// </remarks>
+    internal long WalPublicationBoundary
+    {
+        get
+        {
+            lock (_gate)
+                return _walPublicationBoundary;
+        }
+    }
+
+    /// <summary>Hides WAL frames past <paramref name="lastPublishedFrameNumber"/> from readers.</summary>
+    internal void BeginWalPublication(long lastPublishedFrameNumber)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(lastPublishedFrameNumber);
+        lock (_gate)
+        {
+            if (!_writerActive)
+                throw new InvalidOperationException("Only an active SQLite writer lease can publish WAL frames.");
+
+            _walPublicationBoundary = lastPublishedFrameNumber;
+        }
+    }
+
+    /// <summary>Republishes the physical WAL after a durable commit or recovery.</summary>
+    internal void PublishAllWalFrames()
+    {
+        lock (_gate)
+        {
+            _walPublicationBoundary = long.MaxValue;
+            Monitor.PulseAll(_gate);
+            _stateChanged.PulseAll();
         }
     }
 
@@ -477,6 +812,7 @@ public sealed class SqlitePagerLockManager
             }
 
             Monitor.PulseAll(_gate);
+            _stateChanged.PulseAll();
         }
     }
 
@@ -497,6 +833,45 @@ public sealed class SqlitePagerLockManager
                 ? sharedMemoryLocks.Acquire(SqlitePagerLockOperation.Reader, timeout, pagerReadOnly)
                 : _coordinator!.Acquire(SqlitePagerLockOperation.Reader, timeout))
             ?? throw new InvalidOperationException("SQLite pager lock coordinator returned no lease.");
+
+        var redundant = false;
+        lock (_gate)
+        {
+            if (_sharedReaderLock is null)
+                _sharedReaderLock = acquired;
+            else
+                redundant = true;
+        }
+
+        if (redundant)
+            acquired.Dispose();
+    }
+
+    private async ValueTask AcquireSharedReaderLockAsync(
+        IAsyncSqlitePagerLockCoordinator asyncCoordinator,
+        TimeSpan timeout,
+        bool pagerReadOnly,
+        CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            if (_sharedReaderLock is not null)
+                return;
+        }
+
+        var acquired = _coordinator is SqliteWalSharedMemoryLocks sharedMemoryLocks
+            ? await sharedMemoryLocks
+                .AcquireAsync(
+                    SqlitePagerLockOperation.Reader,
+                    timeout,
+                    pagerReadOnly,
+                    cancellationToken)
+                .ConfigureAwait(false)
+            : await asyncCoordinator
+                .AcquireAsync(SqlitePagerLockOperation.Reader, timeout, cancellationToken)
+                .ConfigureAwait(false);
+        if (acquired is null)
+            throw new InvalidOperationException("SQLite pager lock coordinator returned no lease.");
 
         var redundant = false;
         lock (_gate)
@@ -662,6 +1037,29 @@ public sealed class SqlitePagerLockLease : IDisposable
         if (Operation != SqlitePagerLockOperation.Writer)
             throw new InvalidOperationException("Only a SQLite writer lease can upgrade to EXCLUSIVE.");
         manager.UpgradeWriterToExclusive(timeout);
+    }
+
+    internal ValueTask UpgradeToExclusiveAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var manager = Volatile.Read(ref _manager)
+            ?? throw new ObjectDisposedException(nameof(SqlitePagerLockLease));
+        if (Operation != SqlitePagerLockOperation.Writer)
+            throw new InvalidOperationException("Only a SQLite writer lease can upgrade to EXCLUSIVE.");
+        return manager.UpgradeWriterToExclusiveAsync(timeout, cancellationToken);
+    }
+
+    internal void BeginWalPublication(long lastPublishedFrameNumber)
+    {
+        var manager = Volatile.Read(ref _manager)
+            ?? throw new ObjectDisposedException(nameof(SqlitePagerLockLease));
+        manager.BeginWalPublication(lastPublishedFrameNumber);
+    }
+
+    internal void PublishWalFrames()
+    {
+        var manager = Volatile.Read(ref _manager)
+            ?? throw new ObjectDisposedException(nameof(SqlitePagerLockLease));
+        manager.PublishAllWalFrames();
     }
 
     /// <inheritdoc />

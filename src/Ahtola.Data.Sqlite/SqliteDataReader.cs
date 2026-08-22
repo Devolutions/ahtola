@@ -414,15 +414,15 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             return ApplyConfiguredDateTimeKind(ParseDateTime(GetDelegatedTextValue(ordinal)));
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-            var dateTime = value.Kind switch
+        var dateTime = value.Kind switch
         {
             ReaderValueKind.Text => ParseDateTime(value.Text),
             ReaderValueKind.Real => DateTime.FromOADate(value.Real - 2415018.5),
             ReaderValueKind.Integer => DateTime.FromOADate(value.Integer - 2415018.5),
             _ => DateTime.Parse(GetString(ordinal), CultureInfo.InvariantCulture)
         };
-            return ApplyConfiguredDateTimeKind(dateTime);
-        }
+        return ApplyConfiguredDateTimeKind(dateTime);
+    }
 
     public virtual DateTimeOffset GetDateTimeOffset(int ordinal)
     {
@@ -902,6 +902,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override bool NextResult()
     {
+        ThrowIfSynchronousBrowserOperation();
         if (_delegatedReader is null)
             return _command.RunOperation(NextResultCore);
 
@@ -993,8 +994,81 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         return false;
     }
 
+    private async ValueTask<bool> NextResultCoreAsync(CancellationToken cancellationToken)
+    {
+        EnsureOpen();
+        if (_statement is null)
+            return false;
+        while (await GetStatement().ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+        }
+
+        CountCurrentStatementRowsAffected();
+
+        _hasCurrentRow = false;
+        _hasPrefetchedRow = false;
+        await _statement.DisposeAsync().ConfigureAwait(false);
+        _statement = null;
+        _currentStatementRowsAffectedCounted = false;
+
+        try
+        {
+            while (_remainingSql.Count > 0)
+            {
+                var sql = _remainingSql[0];
+                _remainingSql.RemoveAt(0);
+                if (_command.TryHandleFacadeStatement(sql, out var rewrittenSql))
+                    continue;
+
+                cancellationToken.ThrowIfCancellationRequested();
+                var statement = await _command
+                    .PrepareSingleStatementAsync(rewrittenSql, cancellationToken)
+                    .ConfigureAwait(false);
+                if (statement.ColumnCount > 0)
+                {
+                    _statement = statement;
+                    _currentSql = rewrittenSql;
+                    _hadResultSet = true;
+                    _currentStatementRowsAffectedCounted = false;
+                    _hasPrefetchedRow = await statement.ReadAsync(cancellationToken).ConfigureAwait(false);
+                    return true;
+                }
+
+                try
+                {
+                    while (await statement.ReadAsync(cancellationToken).ConfigureAwait(false))
+                    {
+                    }
+
+                    if (SqliteCommand.CountsRowsAffected(sql))
+                    {
+                        _hadRecordsAffectedStatement = true;
+                        _recordsAffected += statement.RowsAffected;
+                    }
+                    _command.MarkTransactionCompletedExternally(sql);
+                }
+                finally
+                {
+                    await statement.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        {
+            if (_statement is not null)
+                await _statement.DisposeAsync().ConfigureAwait(false);
+            _statement = null;
+            _hasPrefetchedRow = false;
+            _remainingSql.Clear();
+            throw SqliteCommand.ToSqliteException(ex);
+        }
+
+        return false;
+    }
+
     public override bool Read()
     {
+        ThrowIfSynchronousBrowserOperation();
         if (_delegatedReader is null)
             return _command.RunOperation(ReadCore);
 
@@ -1033,10 +1107,39 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
     }
 
+    private async ValueTask<bool> ReadCoreAsync(CancellationToken cancellationToken)
+    {
+        EnsureOpen();
+        if (_statement is null)
+            return false;
+        if (_hasPrefetchedRow)
+        {
+            _hasPrefetchedRow = false;
+            _hasCurrentRow = true;
+            return true;
+        }
+
+        try
+        {
+            _hasCurrentRow = await GetStatement().ReadAsync(cancellationToken).ConfigureAwait(false);
+            if (!_hasCurrentRow)
+                CountCurrentStatementRowsAffected();
+            return _hasCurrentRow;
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        {
+            throw SqliteCommand.ToSqliteException(ex);
+        }
+    }
+
     public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
         if (_delegatedReader is null)
-            return await _command.RunOperationAsync(ReadCore, cancellationToken).ConfigureAwait(false);
+        {
+            return _statement?.UsesManagedResults == true
+                ? await _command.RunOperationAsync(ReadCoreAsync, cancellationToken).ConfigureAwait(false)
+                : await _command.RunOperationAsync(ReadCore, cancellationToken).ConfigureAwait(false);
+        }
 
         try
         {
@@ -1051,7 +1154,11 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     public override async Task<bool> NextResultAsync(CancellationToken cancellationToken)
     {
         if (_delegatedReader is null)
-            return await _command.RunOperationAsync(NextResultCore, cancellationToken).ConfigureAwait(false);
+        {
+            return _statement?.UsesManagedResults == true
+                ? await _command.RunOperationAsync(NextResultCoreAsync, cancellationToken).ConfigureAwait(false)
+                : await _command.RunOperationAsync(NextResultCore, cancellationToken).ConfigureAwait(false);
+        }
 
         try
         {
@@ -1078,6 +1185,16 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
         => _delegatedReader?.IsDBNullAsync(ordinal, cancellationToken) ?? CompleteAsync(() => IsDBNull(ordinal), cancellationToken);
+
+    private void ThrowIfSynchronousBrowserOperation()
+    {
+        if (_command.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous reader iteration is not supported by the browser database source. "
+                + "Use ReadAsync or NextResultAsync.");
+        }
+    }
 
     public override Task<T> GetFieldValueAsync<T>(int ordinal, CancellationToken cancellationToken)
         => CompleteAsync(() =>
@@ -1121,27 +1238,153 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing && !_isClosed && _command.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous reader disposal is not supported by the browser database source. Use DisposeAsync.");
+        }
+
         if (disposing)
             CloseCore(throwOnError: false);
 
         base.Dispose(disposing);
     }
 
-    public override void Close() => CloseCore();
+    public override async ValueTask DisposeAsync()
+    {
+        if (!_command.RequiresAsyncExecution
+            && _delegatedReader is null
+            && _statement?.UsesManagedResults != true)
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
 
-    void IConnectionOwnedReader.CloseFromConnection()
+        await CloseCoreAsync(throwOnError: false).ConfigureAwait(false);
+        await base.DisposeAsync().ConfigureAwait(false);
+    }
+
+    public override void Close()
+    {
+        if (!_isClosed)
+            ThrowIfSynchronousBrowserOperation();
+        CloseCore();
+    }
+
+    public override async Task CloseAsync()
+        => await CloseCoreAsync().ConfigureAwait(false);
+
+    void IConnectionOwnedReader.CloseFromConnection() => CloseFromConnection();
+
+    private void CloseFromConnection()
     {
         if (_isClosed)
             return;
 
-        _delegatedReader?.Dispose();
-        _delegatedReader = null;
-        _statement?.Dispose();
-        _statement = null;
+        Exception? error = null;
+        if (_delegatedReader is not null)
+        {
+            try
+            {
+                _delegatedReader.Dispose();
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+            finally
+            {
+                _delegatedReader = null;
+            }
+        }
+        if (_statement is not null)
+        {
+            try
+            {
+                _statement.Dispose();
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+            finally
+            {
+                _statement = null;
+            }
+        }
+
         _remainingSql.Clear();
         _hasPrefetchedRow = false;
         _hasCurrentRow = false;
-        FinishClose(closeConnection: false);
+        _currentStatementRowsAffectedCounted = false;
+        try
+        {
+            FinishClose(closeConnection: false);
+        }
+        catch (Exception ex)
+        {
+            error = CombineCloseErrors(error, ex);
+        }
+
+        if (error is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
+    }
+
+    ValueTask IConnectionOwnedReader.CloseFromConnectionAsync()
+        => CloseFromConnectionAsync();
+
+    private async ValueTask CloseFromConnectionAsync()
+    {
+        if (_isClosed)
+            return;
+
+        Exception? error = null;
+        if (_delegatedReader is not null)
+        {
+            try
+            {
+                await _delegatedReader.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+            finally
+            {
+                _delegatedReader = null;
+            }
+        }
+        if (_statement is not null)
+        {
+            try
+            {
+                await _statement.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+            finally
+            {
+                _statement = null;
+            }
+        }
+
+        _remainingSql.Clear();
+        _hasPrefetchedRow = false;
+        _hasCurrentRow = false;
+        _currentStatementRowsAffectedCounted = false;
+        try
+        {
+            await FinishCloseAsync(closeConnection: false).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            error = CombineCloseErrors(error, ex);
+        }
+
+        if (error is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
     }
 
     private void CloseCore(bool throwOnError = true)
@@ -1149,6 +1392,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (_isClosed)
             return;
 
+        Exception? primaryError = null;
+        Exception? cleanupError = null;
         try
         {
             if (_delegatedReader is not null)
@@ -1157,61 +1402,309 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 _hadRecordsAffectedStatement = true;
                 _delegatedReader.Dispose();
                 _delegatedReader = null;
-                FinishClose();
-                return;
             }
-
-            if (_statement is not null)
+            else
             {
-                while (GetStatement().Read())
+                if (_statement is not null)
                 {
+                    while (GetStatement().Read())
+                    {
+                    }
+
+                    CountCurrentStatementRowsAffected();
+
+                    _statement.Dispose();
+                    _statement = null;
+                    _hasPrefetchedRow = false;
+                    _currentStatementRowsAffectedCounted = false;
                 }
 
-                CountCurrentStatementRowsAffected();
-
-                _statement.Dispose();
-                _statement = null;
-                _hasPrefetchedRow = false;
-                _currentStatementRowsAffectedCounted = false;
+                DrainRemainingStatements();
             }
-
-            DrainRemainingStatements();
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex)
         {
-            _statement?.Dispose();
-            _statement = null;
-            _remainingSql.Clear();
-            FinishClose();
-            if (throwOnError)
-                throw SqliteCommand.ToSqliteException(ex);
-            return;
-        }
-        catch (SqliteException)
-        {
-            _statement?.Dispose();
-            _statement = null;
-            _remainingSql.Clear();
-            FinishClose();
-            if (throwOnError)
-                throw;
-            return;
+            primaryError = ex is AhtolaException or EmbeddedSqlException
+                ? SqliteCommand.ToSqliteException(ex)
+                : ex;
         }
 
-        FinishClose();
+        if (_delegatedReader is not null)
+        {
+            try
+            {
+                _delegatedReader.Dispose();
+            }
+            catch (Exception ex)
+            {
+                cleanupError = CombineCloseErrors(cleanupError, ex);
+            }
+            finally
+            {
+                _delegatedReader = null;
+            }
+        }
+        if (_statement is not null)
+        {
+            try
+            {
+                _statement.Dispose();
+            }
+            catch (Exception ex)
+            {
+                cleanupError = CombineCloseErrors(cleanupError, ex);
+            }
+            finally
+            {
+                _statement = null;
+            }
+        }
+
+        _remainingSql.Clear();
+        _hasPrefetchedRow = false;
+        _hasCurrentRow = false;
+        _currentStatementRowsAffectedCounted = false;
+        try
+        {
+            FinishClose();
+        }
+        catch (Exception ex)
+        {
+            cleanupError = CombineCloseErrors(cleanupError, ex);
+        }
+
+        if (cleanupError is not null)
+        {
+            var combined = primaryError is null
+                ? cleanupError
+                : CombineCloseErrors(primaryError, cleanupError);
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(combined).Throw();
+        }
+        if (primaryError is not null && throwOnError)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primaryError).Throw();
     }
+
+    private async ValueTask FinishCloseAsync(bool closeConnection = true)
+    {
+        if (_isClosed)
+            return;
+
+        // _closeCallback (command/batch bookkeeping) and ReaderClosed (connection
+        // deregistration) must not gate each other: if the callback throws, the reader still
+        // has to deregister and be marked closed, or it remains permanently "open" on its
+        // connection - and CommandBehavior.CloseConnection must still be honored asynchronously
+        // afterward. Every failure here is aggregated and rethrown rather than swallowed.
+        Exception? error = null;
+        try
+        {
+            _closeCallback();
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        try
+        {
+            ((ILocalReaderConnection)_connection).ReaderClosed(this);
+        }
+        catch (Exception ex)
+        {
+            error = CombineCloseErrors(error, ex);
+        }
+
+        _isClosed = true;
+
+        if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+        {
+            try
+            {
+                await _connection.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+        }
+
+        if (error is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
+    }
+
+    private async ValueTask CloseCoreAsync(
+        bool throwOnError = true,
+        bool closeConnection = true)
+    {
+        if (_isClosed)
+            return;
+
+        // Every failure mode below (OPFS quota/I/O, Web Crypto, cancellation, or an
+        // AggregateException wrapping any of those, in addition to the engine's own
+        // AhtolaException/EmbeddedSqlException/SqliteException) must still release the
+        // statement/delegated reader, drop any remaining batched SQL, and deregister this
+        // reader from the connection. Catching only the engine exception types left every other
+        // failure to skip that cleanup entirely and leak the reader as permanently "open".
+        //
+        // Errors are tracked in two buckets: primaryError is the close/drain operation's own
+        // failure, which throwOnError lets callers (DisposeAsync) tolerate, matching the prior
+        // behavior for the engine exception types. cleanupError covers the best-effort recovery
+        // pass below (re-disposing a statement/delegated reader that never got released, and
+        // FinishCloseAsync deregistering the reader / honoring CommandBehavior.CloseConnection).
+        // A cleanup failure means the reader's bookkeeping with its connection may be
+        // inconsistent, so it is never swallowed, even when throwOnError is false.
+        Exception? primaryError = null;
+        Exception? cleanupError = null;
+        try
+        {
+            if (_delegatedReader is not null)
+            {
+                _recordsAffected = _delegatedReader.RecordsAffected;
+                _hadRecordsAffectedStatement = true;
+                await _delegatedReader.DisposeAsync().ConfigureAwait(false);
+                _delegatedReader = null;
+            }
+            else
+            {
+                if (_statement is not null)
+                {
+                    while (await GetStatement().ReadAsync().ConfigureAwait(false))
+                    {
+                    }
+
+                    CountCurrentStatementRowsAffected();
+
+                    await _statement.DisposeAsync().ConfigureAwait(false);
+                    _statement = null;
+                    _hasPrefetchedRow = false;
+                    _currentStatementRowsAffectedCounted = false;
+                }
+
+                await DrainRemainingStatementsAsync().ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            primaryError = ex is AhtolaException or EmbeddedSqlException
+                ? SqliteCommand.ToSqliteException(ex)
+                : ex;
+        }
+
+        // Best-effort cleanup: whatever failed above, a statement/delegated reader still
+        // referenced here was never disposed (or its own disposal is what failed), so retry it
+        // defensively before dropping the reference. SqliteStatementAdapter.DisposeAsync marks
+        // itself disposed before delegating, so a second attempt after a failed first one is a
+        // safe no-op rather than a duplicate disposal.
+        if (_delegatedReader is not null)
+        {
+            try
+            {
+                await _delegatedReader.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                cleanupError = CombineCloseErrors(cleanupError, ex);
+            }
+            finally
+            {
+                _delegatedReader = null;
+            }
+        }
+
+        if (_statement is not null)
+        {
+            try
+            {
+                await _statement.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                cleanupError = CombineCloseErrors(cleanupError, ex);
+            }
+            finally
+            {
+                _statement = null;
+            }
+        }
+
+        _remainingSql.Clear();
+        _hasPrefetchedRow = false;
+        _hasCurrentRow = false;
+        _currentStatementRowsAffectedCounted = false;
+
+        try
+        {
+            // Deregisters the reader from its connection and, when the behavior requires it,
+            // awaits the connection's own asynchronous close - this must run whether or not the
+            // primary operation above failed, or CommandBehavior.CloseConnection would silently
+            // stop being honored on any non-engine failure.
+            await FinishCloseAsync(closeConnection).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            cleanupError = CombineCloseErrors(cleanupError, ex);
+        }
+
+        // throwOnError only governs the primary operation failure (DisposeAsync tolerates it,
+        // matching prior behavior for the engine exception types); a cleanup failure indicates
+        // the reader's registration/connection-close bookkeeping may be inconsistent and is
+        // always surfaced, aggregated with the primary error when both occurred.
+        if (cleanupError is not null)
+        {
+            var combined = primaryError is null
+                ? cleanupError
+                : CombineCloseErrors(primaryError, cleanupError);
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(combined).Throw();
+        }
+
+        if (primaryError is not null && throwOnError)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primaryError).Throw();
+    }
+
+    private static Exception CombineCloseErrors(Exception? existing, Exception next)
+        => existing is null
+            ? next
+            : new AggregateException("Data reader close encountered multiple failures.", existing, next);
 
     private void FinishClose(bool closeConnection = true)
     {
         if (_isClosed)
             return;
 
-        _closeCallback();
-        ((ILocalReaderConnection)_connection).ReaderClosed(this);
-        if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-            _connection.Close();
+        Exception? error = null;
+        try
+        {
+            _closeCallback();
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        try
+        {
+            ((ILocalReaderConnection)_connection).ReaderClosed(this);
+        }
+        catch (Exception ex)
+        {
+            error = CombineCloseErrors(error, ex);
+        }
 
         _isClosed = true;
+
+        if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+        {
+            try
+            {
+                _connection.Close();
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+        }
+
+        if (error is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
     }
 
     private void EnsureOpen([CallerMemberName] string operation = "")
@@ -1259,6 +1752,38 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     private string GetDeclaredTypeName(int ordinal)
     {
+        if (_command.Connection is { RequiresAsyncExecution: true } browserConnection)
+        {
+            // Resolve against _currentSql (the statement the reader is positioned on), not
+            // _command.CommandText (the full, possibly multi-statement batch text). Matching
+            // against the whole batch always anchors on the FIRST statement's column/table, so a
+            // later result set would silently inherit its declared type (e.g. reporting a BLOB
+            // column as Guid because an earlier statement in the batch projected one). Validating
+            // the matched column against GetName(ordinal) further ensures the resolved metadata
+            // actually belongs to the column being asked about.
+            var browserMatch = Regex.Match(
+                _currentSql,
+                @"^\s*SELECT\s+(?<column>[\w\[\]""`]+)\s+FROM\s+(?<table>[\w\[\]""`.]+)",
+                RegexOptions.IgnoreCase);
+            if (browserMatch.Success)
+            {
+                var columnName = UnquoteIdentifier(browserMatch.Groups["column"].Value);
+                if (string.Equals(columnName, GetName(ordinal), StringComparison.OrdinalIgnoreCase))
+                {
+                    var tableName = browserMatch.Groups["table"].Value
+                        .Split('.')
+                        .Select(UnquoteIdentifier)
+                        .ToArray();
+                    var qualifiedTable = string.Join('.', tableName);
+                    var columns = GetManagedTableColumns(
+                        browserConnection.ManagedConnection,
+                        qualifiedTable);
+                    if (columns.TryGetValue(columnName, out var schemaColumn))
+                        return StripTypeLength(schemaColumn.TypeName);
+                }
+            }
+        }
+
         if (TryGetSelectSources(out var sources, out var selections))
         {
             var sourceColumns = GetSelectSourceColumns(sources);
@@ -1526,6 +2051,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         var columns = new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
         if (_command.Connection is null)
             return columns;
+        if (_command.Connection.RequiresAsyncExecution)
+            return GetManagedTableColumns(_command.Connection.ManagedConnection, tableName);
 
         using var suspension = _command.Connection.SuspendHooks();
         using (var command = _command.Connection.CreateCommand())
@@ -1570,6 +2097,80 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
 
         return columns;
+    }
+
+    private static Dictionary<string, SchemaColumnInfo> GetManagedTableColumns(
+        IManagedConnectionAdapter connection,
+        string tableName)
+    {
+        var columns = new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
+        using (var statement = connection.Prepare(
+                   BuildManagedPragma(tableName, "table_info")))
+        {
+            while (statement.Step() == StatementStepResult.Row)
+            {
+                var name = statement.GetValue(1).AsText();
+                columns[name] = new SchemaColumnInfo(
+                    name,
+                    statement.GetValue(2).AsText(),
+                    statement.GetValue(3).AsInteger() == 0,
+                    statement.GetValue(5).AsInteger() != 0,
+                    false);
+            }
+        }
+
+        using var indexes = connection.Prepare(
+            BuildManagedPragma(tableName, "index_list"));
+        while (indexes.Step() == StatementStepResult.Row)
+        {
+            if (indexes.GetValue(2).AsInteger() == 0
+                || indexes.GetValue(4).AsInteger() != 0)
+            {
+                continue;
+            }
+
+            var indexName = indexes.GetValue(1).AsText();
+            using var info = connection.Prepare(
+                BuildManagedPragma(
+                    QualifyPragmaObject(tableName, indexName),
+                    "index_info"));
+            string? indexedColumn = null;
+            var indexedColumnCount = 0;
+            while (info.Step() == StatementStepResult.Row)
+            {
+                if (info.GetValue(2).Kind != SqlValueKind.Null)
+                {
+                    indexedColumn = info.GetValue(2).AsText();
+                    indexedColumnCount++;
+                }
+            }
+
+            if (indexedColumnCount == 1
+                && indexedColumn is not null
+                && columns.TryGetValue(indexedColumn, out var column))
+            {
+                columns[indexedColumn] = column with { IsUnique = true };
+            }
+        }
+
+        return columns;
+    }
+
+    private static string BuildManagedPragma(string objectName, string pragma)
+    {
+        var separator = objectName.IndexOf('.');
+        return separator < 0
+            ? $"PRAGMA {pragma}({QuoteIdentifier(objectName)});"
+            : $"PRAGMA {QuoteIdentifier(objectName[..separator])}.{pragma}"
+              + $"({QuoteIdentifier(objectName[(separator + 1)..])});";
+    }
+
+    private static string QualifyPragmaObject(string tableName, string objectName)
+    {
+        var separator = tableName.IndexOf('.');
+        return separator < 0
+            ? objectName
+            : tableName[..separator] + "." + objectName;
     }
 
     private static string GetDataTypeNameFromValueType(ReaderValueKind valueType, string selection)
@@ -1874,6 +2475,42 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                     _recordsAffected += statement.RowsAffected;
                 }
                 _command.MarkTransactionCompletedExternally(sql);
+            }
+        }
+
+        finally
+        {
+            _remainingSql.Clear();
+        }
+    }
+
+    private async ValueTask DrainRemainingStatementsAsync()
+    {
+        try
+        {
+            foreach (var sql in _remainingSql)
+            {
+                if (_command.TryHandleFacadeStatement(sql, out var rewrittenSql))
+                    continue;
+
+                var statement = await _command.PrepareSingleStatementAsync(rewrittenSql).ConfigureAwait(false);
+                try
+                {
+                    while (await statement.ReadAsync().ConfigureAwait(false))
+                    {
+                    }
+
+                    if (SqliteCommand.CountsRowsAffected(rewrittenSql))
+                    {
+                        _hadRecordsAffectedStatement = true;
+                        _recordsAffected += statement.RowsAffected;
+                    }
+                    _command.MarkTransactionCompletedExternally(sql);
+                }
+                finally
+                {
+                    await statement.DisposeAsync().ConfigureAwait(false);
+                }
             }
         }
         finally

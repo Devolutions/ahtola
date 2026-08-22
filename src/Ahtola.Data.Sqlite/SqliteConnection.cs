@@ -10,7 +10,11 @@ using Ahtola.Core.Storage;
 
 namespace Ahtola.Data.Sqlite;
 
-public partial class SqliteConnection : DbConnection, ILocalReaderConnection
+public partial class SqliteConnection :
+    DbConnection,
+    ILocalReaderConnection,
+    IManagedSchemaConnection,
+    IAsyncExecutionConnection
 {
     private const int SQLITE_ERROR = 1;
     private const int SQLITE_CANTOPEN = 14;
@@ -19,6 +23,7 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     private AhtolaNativeDatabase? _database;
     private IManagedDatabaseAdapter? _managedDatabase;
+    private readonly IManagedDatabaseFactory? _managedDatabaseFactory;
     private AhtolaConnection? _ahtolaConnection;
     private bool _ahtolaConnectionWasOpen;
     private ManagedConnectionPoolLease? _managedPoolLease;
@@ -51,12 +56,33 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         ConnectionString = connectionString;
     }
 
+    internal SqliteConnection(IManagedDatabaseAdapter managedDatabase)
+        : this("Data Source=:memory:;Local Provider=Managed")
+    {
+        _managedDatabase = managedDatabase ?? throw new ArgumentNullException(nameof(managedDatabase));
+        _dataSource = ":memory:";
+    }
+
+    internal SqliteConnection(
+        string connectionString,
+        IManagedDatabaseFactory managedDatabaseFactory)
+        : this(connectionString)
+    {
+        _managedDatabaseFactory = managedDatabaseFactory
+            ?? throw new ArgumentNullException(nameof(managedDatabaseFactory));
+    }
+
     [AllowNull]
     public override string ConnectionString
     {
         get => _connectionOptions.ConnectionString;
         set
         {
+            if (_managedDatabaseFactory is not null)
+            {
+                throw new InvalidOperationException(
+                    "Connections created by a browser data source cannot replace its connection string.");
+            }
             if (State == ConnectionState.Open)
                 throw new InvalidOperationException(Properties.Resources.ConnectionStringRequiresClosedConnection);
 
@@ -105,6 +131,11 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         get => _pageCodec;
         set
         {
+            if (_managedDatabaseFactory is not null)
+            {
+                throw new InvalidOperationException(
+                    "Connections created by a browser data source cannot replace its page codec.");
+            }
             if (State == ConnectionState.Open)
                 throw new InvalidOperationException("PageCodec cannot be set while the connection is open.");
             if (value is not null && IsRemoteDataSource)
@@ -182,6 +213,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     public override void Open()
     {
+        if (_managedDatabaseFactory is not null)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous Open is not supported by the browser database source. Use OpenAsync.");
+        }
+
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_database is not null || _managedDatabase is not null || _ahtolaConnection is not null)
             throw new InvalidOperationException("The connection is already open.");
@@ -333,6 +370,9 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
 
+        if (_managedDatabaseFactory is not null)
+            return OpenManagedFactoryAsync(cancellationToken);
+
         if (IsRemoteDataSource)
             return OpenRemoteAsync(cancellationToken);
 
@@ -348,6 +388,51 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
                 cancellationToken.ThrowIfCancellationRequested();
             },
             CancellationToken.None);
+    }
+
+    private async Task OpenManagedFactoryAsync(CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (State != ConnectionState.Closed)
+            throw new InvalidOperationException("The connection is already open.");
+
+        var originalState = State;
+        IManagedDatabaseAdapter? database = null;
+        try
+        {
+            database = await _managedDatabaseFactory!
+                .OpenDatabaseAsync(cancellationToken)
+                .ConfigureAwait(false);
+            _ = await database.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            _managedDatabase = database;
+            _dataSource = _managedDatabaseFactory.DataSource;
+            _readOnly = _managedDatabaseFactory.IsReadOnly;
+            _managedSharedMemory = _managedDatabaseFactory.IsSharedMemory;
+            if (IsManagedReadOnly)
+                await ExecuteNonQueryAsync("PRAGMA query_only = ON;", cancellationToken).ConfigureAwait(false);
+            ApplyExtensionSettings();
+            await ApplyConnectionOptionsAsync(cancellationToken).ConfigureAwait(false);
+            RegisterScalarFunctions();
+            RegisterAggregateFunctions();
+            RegisterCollations();
+            RegisterHooks();
+            LoadPendingExtensions();
+            OnStateChange(new StateChangeEventArgs(originalState, State));
+            database = null;
+        }
+        catch
+        {
+            _managedDatabase = null;
+            _dataSource = null;
+            _readOnly = false;
+            _managedSharedMemory = false;
+            throw;
+        }
+        finally
+        {
+            if (database is not null)
+                await database.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     private async Task OpenRemoteAsync(CancellationToken cancellationToken)
@@ -421,6 +506,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     public override void Close()
     {
+        if (_managedDatabaseFactory is not null && _managedDatabase is not null)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous Close is not supported by the browser database source. Use CloseAsync.");
+        }
+
         if (_ahtolaConnection is not null)
         {
             var remoteCloseOriginalState = State;
@@ -491,6 +582,105 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
             OnStateChange(new StateChangeEventArgs(originalState, State));
         }
+    }
+
+    public override Task CloseAsync()
+        => _managedDatabaseFactory is null
+            ? base.CloseAsync()
+            : CloseManagedFactoryAsync();
+
+    private async Task CloseManagedFactoryAsync()
+    {
+        var database = _managedDatabase;
+        if (database is null)
+            return;
+
+        var originalState = State;
+        Exception? cleanupError = null;
+        if (Transaction is { IsCompleted: false } transaction)
+        {
+            try
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                cleanupError = exception;
+            }
+        }
+        if (Transaction is not null)
+        {
+            try
+            {
+                await Transaction.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                cleanupError = CombineCleanupErrors(
+                    "Browser transaction rollback and disposal both failed.",
+                    cleanupError,
+                    exception);
+            }
+        }
+        try
+        {
+            await CloseOpenManagedBlobsAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupError = CombineCleanupErrors(
+                "Browser transaction and incremental blob cleanup both failed.",
+                cleanupError,
+                exception);
+        }
+        try
+        {
+            await CloseOpenReadersAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupError = CombineCleanupErrors(
+                "Browser connection cleanup failed.",
+                cleanupError,
+                exception);
+        }
+        try
+        {
+            ResetOpenCommands();
+        }
+        catch (Exception exception)
+        {
+            cleanupError = CombineCleanupErrors(
+                "Browser command cleanup failed.",
+                cleanupError,
+                exception);
+        }
+        finally
+        {
+            _managedDatabase = null;
+            Transaction = null;
+            _dataSource = null;
+            _readOnly = false;
+            _recursiveTriggers = false;
+            _readUncommitted = false;
+            _managedSharedMemory = false;
+            try
+            {
+                await database.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                cleanupError = CombineCleanupErrors(
+                    "Browser connection cleanup and durable disposal both failed.",
+                    cleanupError,
+                    exception);
+            }
+
+            OnStateChange(new StateChangeEventArgs(originalState, State));
+        }
+
+        if (cleanupError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupError).Throw();
     }
 
     public override void ChangeDatabase(string databaseName)
@@ -580,6 +770,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection(nameof(BeginTransaction)));
         if (Transaction is not null)
             throw new InvalidOperationException(Properties.Resources.ParallelTransactionsNotSupported);
+        if (RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous transaction creation is not supported by the browser database source. "
+                + "Use BeginTransactionAsync.");
+        }
 
         Transaction = new SqliteTransaction(this, isolationLevel, deferred);
         return Transaction;
@@ -720,6 +916,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         if (State != ConnectionState.Open)
             throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection("BackupDatabase"));
         ArgumentNullException.ThrowIfNull(destination);
+        if (RequiresAsyncExecution || destination.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous backup is not supported by browser-managed databases. "
+                + "Use BackupDatabaseAsync.");
+        }
         if (!Capabilities.SupportsBackup || !destination.Capabilities.SupportsBackup)
             throw new NotSupportedException("Backup is supported only for local database connections.");
         if (IsManagedProvider != destination.IsManagedProvider)
@@ -742,6 +944,102 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         foreach (var tableName in GetUserTableNames())
             CopyTableRows(destination, tableName);
     }
+
+    public virtual Task BackupDatabaseAsync(
+        SqliteConnection destination,
+        CancellationToken cancellationToken = default)
+        => BackupDatabaseAsync(destination, "main", "main", cancellationToken);
+
+    public virtual async Task BackupDatabaseAsync(
+        SqliteConnection destination,
+        string destinationName,
+        string sourceName,
+        CancellationToken cancellationToken = default)
+    {
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection("BackupDatabase"));
+        ArgumentNullException.ThrowIfNull(destination);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Capabilities.SupportsBackup || !destination.Capabilities.SupportsBackup)
+            throw new NotSupportedException("Backup is supported only for local database connections.");
+        if (IsManagedProvider != destination.IsManagedProvider)
+            throw new NotSupportedException(Properties.Resources.ManagedBackupMixedProvidersNotSupported);
+        if (destination.State != ConnectionState.Open)
+            await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
+        if (IsManagedProvider)
+        {
+            await SqliteManagedBackup
+                .CopyAsync(this, destination, destinationName, sourceName, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        BackupDatabase(destination, destinationName, sourceName);
+    }
+
+    public virtual SqliteBlob OpenBlob(
+        string tableName,
+        string columnName,
+        long rowid,
+        bool readOnly = false)
+        => OpenBlob("main", tableName, columnName, rowid, readOnly);
+
+    public virtual SqliteBlob OpenBlob(
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowid,
+        bool readOnly = false)
+    {
+        if (RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous incremental blob opening is not supported by browser-managed databases. "
+                + "Use OpenBlobAsync.");
+        }
+
+        return new SqliteBlob(this, databaseName, tableName, columnName, rowid, readOnly);
+    }
+
+    public virtual ValueTask<SqliteBlob> OpenBlobAsync(
+        string tableName,
+        string columnName,
+        long rowid,
+        CancellationToken cancellationToken)
+        => OpenBlobAsync("main", tableName, columnName, rowid, readOnly: false, cancellationToken);
+
+    public virtual ValueTask<SqliteBlob> OpenBlobAsync(
+        string tableName,
+        string columnName,
+        long rowid,
+        bool readOnly = false,
+        CancellationToken cancellationToken = default)
+        => OpenBlobAsync("main", tableName, columnName, rowid, readOnly, cancellationToken);
+
+    public virtual ValueTask<SqliteBlob> OpenBlobAsync(
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowid,
+        CancellationToken cancellationToken)
+        => OpenBlobAsync(databaseName, tableName, columnName, rowid, readOnly: false, cancellationToken);
+
+    public virtual ValueTask<SqliteBlob> OpenBlobAsync(
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowid,
+        bool readOnly = false,
+        CancellationToken cancellationToken = default)
+        => SqliteBlob.OpenAsync(
+            this,
+            databaseName,
+            tableName,
+            columnName,
+            rowid,
+            readOnly,
+            cancellationToken);
 
     public new virtual SqliteCommand CreateCommand() => new(this) { Transaction = Transaction };
 
@@ -778,6 +1076,15 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing
+            && !_disposed
+            && _managedDatabaseFactory is not null
+            && State != ConnectionState.Closed)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous disposal is not supported by the browser database source. Use DisposeAsync.");
+        }
+
         if (disposing && !_disposed)
         {
             try
@@ -798,10 +1105,44 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         base.Dispose(disposing);
     }
 
-    public override ValueTask DisposeAsync()
+    public override async ValueTask DisposeAsync()
     {
-        Dispose();
-        return ValueTask.CompletedTask;
+        if (_managedDatabaseFactory is null)
+        {
+            Dispose();
+            return;
+        }
+        if (_disposed)
+            return;
+
+        Exception? disposalError = null;
+        try
+        {
+            await CloseAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            disposalError = exception;
+        }
+
+        _disposed = true;
+        _noOpenReaders.Dispose();
+        try
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            disposalError = disposalError is null
+                ? exception
+                : new AggregateException(
+                    "Browser connection close and base disposal both failed.",
+                    disposalError,
+                    exception);
+        }
+
+        if (disposalError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(disposalError).Throw();
     }
 
     internal AhtolaNativeDatabase NativeDatabase => _database ?? throw new InvalidOperationException("The connection is not open.");
@@ -809,7 +1150,14 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     internal IManagedConnectionAdapter ManagedConnection
         => _managedDatabase?.Connection ?? throw new InvalidOperationException("The connection is not open.");
 
+    IManagedConnectionAdapter? IManagedSchemaConnection.ManagedSchemaConnection
+        => IsManagedConnection ? ManagedConnection : null;
+
     internal bool IsManagedConnection => _managedDatabase is not null;
+
+    internal bool RequiresAsyncExecution => _managedDatabaseFactory is not null;
+
+    bool IAsyncExecutionConnection.RequiresAsyncExecution => RequiresAsyncExecution;
 
     internal bool UsesManagedDatabase => IsManagedConnection;
 
@@ -940,6 +1288,14 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         command.ExecuteNonQuery();
     }
 
+    internal async Task ExecuteNonQueryAsync(
+        string sql,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = new SqliteCommand(sql, this);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private List<string> GetSchemaSql()
     {
         var schema = new List<string>();
@@ -994,6 +1350,28 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             ExecuteNonQuery("PRAGMA foreign_keys = " + (_connectionOptions.ForeignKeys.Value ? "1" : "0") + ";");
         else if (IsManagedConnection)
             ExecuteNonQuery("PRAGMA foreign_keys = 1;");
+        if (_connectionOptions.RecursiveTriggers)
+            _recursiveTriggers = true;
+    }
+
+    private async Task ApplyConnectionOptionsAsync(CancellationToken cancellationToken)
+    {
+        if (_connectionOptions.ForeignKeys.HasValue)
+        {
+            await ExecuteNonQueryAsync(
+                    "PRAGMA foreign_keys = "
+                    + (_connectionOptions.ForeignKeys.Value ? "1" : "0")
+                    + ";",
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else if (IsManagedConnection)
+        {
+            await ExecuteNonQueryAsync(
+                    "PRAGMA foreign_keys = 1;",
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
         if (_connectionOptions.RecursiveTriggers)
             _recursiveTriggers = true;
     }
@@ -1183,20 +1561,109 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         IConnectionOwnedReader[] readers;
         lock (_readerGate)
             readers = _openReaders.ToArray();
+        List<Exception>? failures = null;
         foreach (var reader in readers)
-            reader.CloseFromConnection();
+        {
+            try
+            {
+                reader.CloseFromConnection();
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+        ThrowCleanupFailures("One or more readers could not be closed.", failures);
+    }
+
+    private async ValueTask CloseOpenReadersAsync()
+    {
+        IConnectionOwnedReader[] readers;
+        lock (_readerGate)
+            readers = _openReaders.ToArray();
+        List<Exception>? failures = null;
+        foreach (var reader in readers)
+        {
+            try
+            {
+                await reader.CloseFromConnectionAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+        ThrowCleanupFailures("One or more readers could not be closed.", failures);
     }
 
     private void CloseOpenManagedBlobs()
     {
+        List<Exception>? failures = null;
         foreach (var blob in _openManagedBlobs.ToArray())
-            blob.CloseFromConnection();
+        {
+            try
+            {
+                blob.CloseFromConnection();
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+        ThrowCleanupFailures("One or more incremental blobs could not be closed.", failures);
+    }
+
+    private async ValueTask CloseOpenManagedBlobsAsync()
+    {
+        List<Exception>? failures = null;
+        foreach (var blob in _openManagedBlobs.ToArray())
+        {
+            try
+            {
+                await blob.CloseFromConnectionAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+        ThrowCleanupFailures("One or more incremental blobs could not be closed.", failures);
     }
 
     private void ResetOpenCommands()
     {
+        List<Exception>? failures = null;
         foreach (var command in _openCommands.ToArray())
-            command.ResetFromConnection();
+        {
+            try
+            {
+                command.ResetFromConnection();
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+        ThrowCleanupFailures("One or more commands could not be reset.", failures);
+    }
+
+    private static Exception CombineCleanupErrors(
+        string message,
+        Exception? existing,
+        Exception current)
+        => existing is null
+            ? current
+            : new AggregateException(message, existing, current);
+
+    private static void ThrowCleanupFailures(
+        string message,
+        List<Exception>? failures)
+    {
+        if (failures is null)
+            return;
+        if (failures.Count == 1)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        throw new AggregateException(message, failures);
     }
 
     private static string NormalizeDataSource(

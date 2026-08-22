@@ -7,7 +7,7 @@ namespace Ahtola.Data.Sqlite;
 public class SqliteBlob : Stream
 {
     private readonly MemoryStream? _stream;
-    private readonly IManagedIncrementalBlobAdapter? _managedBlob;
+    private IManagedIncrementalBlobAdapter? _managedBlob;
     private readonly SqliteConnection? _connection;
     private readonly string? _databaseName;
     private readonly string? _tableName;
@@ -38,6 +38,12 @@ public class SqliteBlob : Stream
             throw new InvalidOperationException(Properties.Resources.SqlBlobRequiresOpenConnection);
         if (!connection.Capabilities.SupportsIncrementalBlob)
             throw new NotSupportedException("Incremental blob I/O is not supported by this connection.");
+        if (connection.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous incremental blob opening is not supported by browser-managed databases. "
+                + "Use SqliteConnection.OpenBlobAsync.");
+        }
 
         _connection = connection;
         _databaseName = databaseName;
@@ -65,6 +71,25 @@ public class SqliteBlob : Stream
         }
 
         _stream = new MemoryStream(GetBlobValue(connection, databaseName, tableName, columnName, rowid), writable: true);
+    }
+
+    private SqliteBlob(
+        SqliteConnection connection,
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowid,
+        bool readOnly,
+        IManagedIncrementalBlobAdapter managedBlob)
+    {
+        _connection = connection;
+        _databaseName = databaseName;
+        _tableName = tableName;
+        _columnName = columnName;
+        _rowId = rowid;
+        _readOnly = readOnly;
+        _managedBlob = managedBlob;
+        connection.ManagedBlobOpened(this);
     }
 
     internal SqliteBlob(byte[] value)
@@ -115,10 +140,21 @@ public class SqliteBlob : Stream
         if (_managedBlob is not null)
         {
             ThrowIfDisposed();
+            ThrowIfBrowserSyncOperation("flushing");
             return;
         }
 
         Persist();
+    }
+
+    public override Task FlushAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_managedBlob is not null)
+            return Task.CompletedTask;
+
+        return GetStream().FlushAsync(cancellationToken);
     }
 
     public override int Read(byte[] buffer, int offset, int count)
@@ -126,12 +162,51 @@ public class SqliteBlob : Stream
         ValidateBuffer(buffer, offset, count);
         if (_managedBlob is not null)
         {
+            ThrowIfDisposed();
+            ThrowIfBrowserSyncOperation("reading");
             var read = ExecuteManaged(blob => blob.Read(GetManagedPosition(), buffer.AsSpan(offset, count)));
             _position += read;
             return read;
         }
 
         return GetStream().Read(buffer, offset, count);
+    }
+
+    public override async ValueTask<int> ReadAsync(
+        Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_managedBlob is null)
+            return await GetStream().ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            var read = await _managedBlob
+                .ReadAsync(GetManagedPosition(), buffer, cancellationToken)
+                .ConfigureAwait(false);
+            _position += read;
+            return read;
+        }
+        catch (ManagedBlobException exception)
+        {
+            throw ToSqliteException(exception);
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            throw SqliteCommand.ToSqliteException(exception);
+        }
+    }
+
+    public override Task<int> ReadAsync(
+        byte[] buffer,
+        int offset,
+        int count,
+        CancellationToken cancellationToken)
+    {
+        ValidateBuffer(buffer, offset, count);
+        return ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
     }
 
     public override long Seek(long offset, SeekOrigin origin)
@@ -179,6 +254,8 @@ public class SqliteBlob : Stream
             throw new NotSupportedException(Properties.Resources.WriteNotSupported);
 
         ValidateBuffer(buffer, offset, count);
+        if (_managedBlob is not null)
+            ThrowIfBrowserSyncOperation("writing");
         if (count == 0)
             return;
 
@@ -208,10 +285,69 @@ public class SqliteBlob : Stream
         Persist();
     }
 
+    public override async ValueTask WriteAsync(
+        ReadOnlyMemory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_readOnly)
+            throw new NotSupportedException(Properties.Resources.WriteNotSupported);
+        if (buffer.IsEmpty)
+            return;
+
+        if (_managedBlob is not null)
+        {
+            if (_connection?.HasOpenReader == true)
+                throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
+            if (_connection?.IsReadOnly == true)
+                throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
+            if (GetManagedPosition() > Length || buffer.Length > Length - GetManagedPosition())
+                throw new NotSupportedException(Properties.Resources.ResizeNotSupported);
+
+            try
+            {
+                await _managedBlob
+                    .WriteAsync(GetManagedPosition(), buffer, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (ManagedBlobException exception)
+            {
+                throw ToSqliteException(exception);
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                throw SqliteCommand.ToSqliteException(exception);
+            }
+
+            _position += buffer.Length;
+            return;
+        }
+
+        var stream = GetStream();
+        if (stream.Position + buffer.Length > stream.Length)
+            throw new NotSupportedException(Properties.Resources.ResizeNotSupported);
+
+        await stream.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+        Persist();
+    }
+
+    public override Task WriteAsync(
+        byte[] buffer,
+        int offset,
+        int count,
+        CancellationToken cancellationToken)
+    {
+        ValidateBuffer(buffer, offset, count);
+        return WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposing && !_disposed)
         {
+            if (_managedBlob is not null)
+                ThrowIfBrowserSyncOperation("disposal");
             try
             {
                 _managedBlob?.Dispose();
@@ -227,7 +363,88 @@ public class SqliteBlob : Stream
         base.Dispose(disposing);
     }
 
+    public override async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+            return;
+
+        Exception? disposalError = null;
+        try
+        {
+            var managedBlob = Interlocked.Exchange(ref _managedBlob, null);
+            if (managedBlob is not null)
+                await managedBlob.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            disposalError = exception;
+        }
+        finally
+        {
+            Dispose(disposing: true);
+            GC.SuppressFinalize(this);
+        }
+
+        if (disposalError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(disposalError).Throw();
+    }
+
     internal void CloseFromConnection() => Dispose();
+
+    internal ValueTask CloseFromConnectionAsync() => DisposeAsync();
+
+    internal static ValueTask<SqliteBlob> OpenAsync(
+        SqliteConnection connection,
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowid,
+        bool readOnly,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(databaseName);
+        ArgumentNullException.ThrowIfNull(tableName);
+        ArgumentNullException.ThrowIfNull(columnName);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (connection.State != ConnectionState.Open)
+            throw new InvalidOperationException(Properties.Resources.SqlBlobRequiresOpenConnection);
+        if (!connection.Capabilities.SupportsIncrementalBlob)
+            throw new NotSupportedException("Incremental blob I/O is not supported by this connection.");
+
+        if (!connection.IsManagedConnection)
+        {
+            return ValueTask.FromResult(
+                new SqliteBlob(connection, databaseName, tableName, columnName, rowid, readOnly));
+        }
+
+        try
+        {
+            var adapter = connection.ManagedConnection.OpenBlob(
+                databaseName,
+                tableName,
+                columnName,
+                rowid,
+                readOnly);
+            return ValueTask.FromResult(
+                new SqliteBlob(
+                    connection,
+                    databaseName,
+                    tableName,
+                    columnName,
+                    rowid,
+                    readOnly,
+                    adapter));
+        }
+        catch (ManagedBlobException exception)
+        {
+            throw ToSqliteException(exception);
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            throw SqliteCommand.ToSqliteException(exception);
+        }
+    }
 
     private MemoryStream GetStream()
     {
@@ -321,5 +538,15 @@ public class SqliteBlob : Stream
     private void ThrowIfDisposed()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+    }
+
+    private void ThrowIfBrowserSyncOperation(string operation)
+    {
+        if (_connection?.RequiresAsyncExecution == true)
+        {
+            throw new PlatformNotSupportedException(
+                $"Synchronous incremental blob {operation} is not supported by browser-managed databases. "
+                + "Use the corresponding asynchronous Stream API.");
+        }
     }
 }

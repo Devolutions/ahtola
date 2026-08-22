@@ -28,6 +28,12 @@ public enum FileSystemOperation
     AtomicReplace = 4,
     Open = 5,
     Delete = 6,
+    FileExists = 7,
+    GetWriteStamp = 8,
+    GetLength = 9,
+    OpenTemporary = 10,
+    EnsureMaterialized = 11,
+    Dispose = 12,
 }
 
 /// <summary>
@@ -37,6 +43,20 @@ public enum FileSystemOperation
 /// (a checkpoint that rewrites pages in place without touching the header).
 /// </summary>
 public readonly record struct FileWriteStamp(long Length, DateTimeOffset LastWriteTimeUtc);
+
+/// <summary>
+/// Optional capability that gives a storage backend authority over canonical
+/// path identity. Host file systems can return absolute paths while browser or
+/// in-memory stores can retain logical keys.
+/// </summary>
+public interface IStoragePathResolver
+{
+    /// <summary>Returns the stable identity used for <paramref name="path"/>.</summary>
+    string GetCanonicalPath(string path);
+
+    /// <summary>Compares canonical paths produced by this resolver.</summary>
+    StringComparer PathComparer { get; }
+}
 
 /// <summary>
 /// Minimal, correctness-first storage abstraction. Backends provide durable,
@@ -145,4 +165,32 @@ internal interface IPageMaterializingFile
 internal interface IFileSystemDecorator
 {
     IFileSystem InnerFileSystem { get; }
+}
+
+/// <summary>
+/// Lets a file system advertise the page codec every database opened through it
+/// must use, without being wrapped in <see cref="AhtolaPageCodecFileSystem"/>.
+/// </summary>
+/// <remarks>
+/// Wrapping hides optional capabilities such as <see cref="IAtomicFileSystem"/>
+/// and <see cref="ITemporaryFileSystem"/>, which storage adapters that implement
+/// those interfaces themselves cannot afford to lose. Implementations must return
+/// a stable instance so every pager, WAL, and journal opened from the same file
+/// system agrees on the on-disk layout.
+/// </remarks>
+internal interface IPageCodecSource
+{
+    IPageCodec? PageCodec { get; }
+}
+
+/// <summary>
+/// Optional capability for proving that two file-backed databases cannot
+/// alias the same underlying file during a managed snapshot copy.
+/// </summary>
+internal interface ISnapshotFileIdentity
+{
+    bool CanProveDistinctFile(
+        string path,
+        IFileSystem otherFileSystem,
+        string otherPath);
 }

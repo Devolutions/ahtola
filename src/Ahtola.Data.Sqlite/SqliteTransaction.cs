@@ -138,6 +138,7 @@ public class SqliteTransaction : DbTransaction
 
     public override void Commit()
     {
+        ThrowIfSynchronousBrowserOperation("CommitAsync");
         ThrowIfCompleted();
         if (_externalRollback)
             throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
@@ -187,6 +188,7 @@ public class SqliteTransaction : DbTransaction
 
     public override void Rollback()
     {
+        ThrowIfSynchronousBrowserOperation("RollbackAsync");
         ThrowIfCompleted();
         try
         {
@@ -222,6 +224,7 @@ public class SqliteTransaction : DbTransaction
 
     public override void Save(string savepointName)
     {
+        ThrowIfSynchronousBrowserOperation("SaveAsync");
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
         if (_ahtolaTransaction is not null)
@@ -246,6 +249,7 @@ public class SqliteTransaction : DbTransaction
 
     public override void Rollback(string savepointName)
     {
+        ThrowIfSynchronousBrowserOperation("RollbackAsync");
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
         if (_ahtolaTransaction is not null)
@@ -270,6 +274,7 @@ public class SqliteTransaction : DbTransaction
 
     public override void Release(string savepointName)
     {
+        ThrowIfSynchronousBrowserOperation("ReleaseAsync");
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
         if (_ahtolaTransaction is not null)
@@ -294,6 +299,13 @@ public class SqliteTransaction : DbTransaction
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing && !_completed && _connection?.RequiresAsyncExecution == true)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous transaction disposal is not supported by the browser database source. "
+                + "Use DisposeAsync or RollbackAsync.");
+        }
+
         if (disposing && !_completed && _ahtolaTransaction is not null)
             Complete();
         else if (disposing && !_completed && _connection is { State: ConnectionState.Open })
@@ -302,6 +314,25 @@ public class SqliteTransaction : DbTransaction
             _connection.Transaction = null;
 
         base.Dispose(disposing);
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (_connection?.RequiresAsyncExecution != true)
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
+        if (!_completed)
+        {
+            if (_connection is { State: ConnectionState.Open })
+                await RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            else
+                Complete();
+        }
+
+        await base.DisposeAsync().ConfigureAwait(false);
     }
 
     internal void MarkCompletedExternally(bool rolledBack)
@@ -335,6 +366,16 @@ public class SqliteTransaction : DbTransaction
     {
         if (_completed || _connection is null || _connection.State != ConnectionState.Open)
             throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
+    }
+
+    private void ThrowIfSynchronousBrowserOperation(string asyncAlternative)
+    {
+        if (_connection?.RequiresAsyncExecution == true)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous transaction operations are not supported by the browser database source. "
+                + $"Use {asyncAlternative}.");
+        }
     }
 
     private static IsolationLevel NormalizeIsolationLevel(SqliteConnection connection, IsolationLevel isolationLevel, bool deferred)

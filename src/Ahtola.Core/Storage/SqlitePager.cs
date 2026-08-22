@@ -3511,6 +3511,7 @@ public sealed class SqlitePager : IDisposable
         => fileSystem switch
         {
             AhtolaPageCodecFileSystem codec => codec.PageCodec,
+            IPageCodecSource source when source.PageCodec is { } sourceCodec => sourceCodec,
             IFileSystemDecorator decorator => GetFileSystemPageCodec(decorator.InnerFileSystem),
             _ => null,
         };

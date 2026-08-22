@@ -110,16 +110,54 @@ public sealed class ManagedSnapshotException : Exception
     public string? ObjectName { get; }
 }
 
-public interface IManagedDatabaseAdapter : IDisposable
+internal interface IManagedDatabaseFactory
+{
+    string DataSource { get; }
+
+    bool IsReadOnly { get; }
+
+    bool IsSharedMemory => false;
+
+    ValueTask<IManagedDatabaseAdapter> OpenDatabaseAsync(
+        CancellationToken cancellationToken = default);
+}
+
+public interface IManagedDatabaseAdapter : IDisposable, IAsyncDisposable
 {
     IManagedConnectionAdapter Connect();
 
+    ValueTask<IManagedConnectionAdapter> ConnectAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult(Connect());
+    }
+
     IManagedConnectionAdapter Connection { get; }
+
+    ValueTask IAsyncDisposable.DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
 }
 
-public interface IManagedConnectionAdapter : IDisposable
+public interface IManagedConnectionAdapter : IDisposable, IAsyncDisposable
 {
     IManagedStatementAdapter Prepare(string sql);
+
+    ValueTask<IManagedStatementAdapter> PrepareAsync(
+        string sql,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var statement = Prepare(sql);
+        if (!cancellationToken.IsCancellationRequested)
+            return ValueTask.FromResult(statement);
+
+        statement.Dispose();
+        cancellationToken.ThrowIfCancellationRequested();
+        return default;
+    }
 
     bool HasAttachedDatabases => true;
 
@@ -165,14 +203,45 @@ public interface IManagedConnectionAdapter : IDisposable
     void CopySnapshotTo(IManagedConnectionAdapter destination)
         => throw new NotSupportedException("Managed snapshot copying is not supported by this connection adapter.");
 
+    ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter destination,
+        CancellationToken cancellationToken = default)
+        => ManagedConnectionDurability.CopySnapshotToAsync(
+            this,
+            destination,
+            cancellationToken);
+
     void CopySnapshotTo(
         IManagedConnectionAdapter destination,
         string destinationName,
         string sourceName)
         => throw new NotSupportedException("Named managed snapshot copying is not supported by this connection adapter.");
 
+    ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter destination,
+        string destinationName,
+        string sourceName,
+        CancellationToken cancellationToken = default)
+        => ManagedConnectionDurability.CopySnapshotToAsync(
+            this,
+            destination,
+            destinationName,
+            sourceName,
+            cancellationToken);
+
     void ApplySnapshotPragmaHeader(int schemaVersion, int userVersion, int applicationId)
         => throw new NotSupportedException("Managed snapshot PRAGMA metadata is not supported by this connection adapter.");
+
+    ValueTask ApplySnapshotPragmaHeaderAsync(
+        int schemaVersion,
+        int userVersion,
+        int applicationId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ApplySnapshotPragmaHeader(schemaVersion, userVersion, applicationId);
+        return ValueTask.CompletedTask;
+    }
 
     /// <summary>
     /// The update, commit, rollback, authorizer, trace and progress callbacks registered on this
@@ -180,9 +249,81 @@ public interface IManagedConnectionAdapter : IDisposable
     /// </summary>
     ManagedConnectionHooks Hooks
         => throw new NotSupportedException("Managed SQL hooks are not supported by this connection adapter.");
+
+    ValueTask IAsyncDisposable.DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
 }
 
-public interface IManagedStatementAdapter : IDisposable
+internal interface IManagedConnectionAdapterDecorator
+{
+    IManagedConnectionAdapter InnerConnectionAdapter { get; }
+}
+
+internal interface IManagedConnectionDurabilityBoundary
+{
+    ValueTask SynchronizeAsync();
+}
+
+internal static class ManagedConnectionDurability
+{
+    internal static ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter source,
+        IManagedConnectionAdapter destination,
+        CancellationToken cancellationToken)
+        => CopySnapshotToAsync(
+            source,
+            destination,
+            destinationName: null,
+            sourceName: null,
+            cancellationToken);
+
+    internal static async ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter source,
+        IManagedConnectionAdapter destination,
+        string? destinationName,
+        string? sourceName,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Exception? failure = null;
+        try
+        {
+            if (destinationName is null)
+                source.CopySnapshotTo(destination);
+            else
+                source.CopySnapshotTo(destination, destinationName, sourceName!);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        if (destination is IManagedConnectionDurabilityBoundary durability)
+        {
+            try
+            {
+                await durability.SynchronizeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                failure = failure is null
+                    ? exception
+                    : new AggregateException(
+                        "Managed snapshot copying and destination synchronization both failed.",
+                        failure,
+                        exception);
+            }
+        }
+
+        if (failure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+}
+
+public interface IManagedStatementAdapter : IDisposable, IAsyncDisposable
 {
     int ParameterCount { get; }
 
@@ -204,9 +345,20 @@ public interface IManagedStatementAdapter : IDisposable
         return result;
     }
 
+    ValueTask<StatementStepResult> StepAsync(CancellationToken cancellationToken = default)
+        => ValueTask.FromResult(Step(cancellationToken));
+
     bool HasRows();
 
     void Reset();
+
+    ValueTask ResetAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Reset();
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
 
     void ClearBindings();
 
@@ -227,6 +379,12 @@ public interface IManagedStatementAdapter : IDisposable
     ManagedResultMetadata ResultMetadata => new(this);
 
     string? GetParameterName(int index);
+
+    ValueTask IAsyncDisposable.DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
 }
 
 public sealed class ManagedDatabaseAdapter : IManagedDatabaseAdapter
@@ -303,6 +461,12 @@ public sealed class ManagedDatabaseAdapter : IManagedDatabaseAdapter
         }
     }
 
+    public ValueTask<IManagedConnectionAdapter> ConnectAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult(Connect());
+    }
+
     public IManagedConnectionAdapter Connection
     {
         get
@@ -342,6 +506,12 @@ public sealed class ManagedDatabaseAdapter : IManagedDatabaseAdapter
         }
     }
 
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
+
     private void ThrowIfDisposed()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -378,6 +548,20 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
     {
         ArgumentNullException.ThrowIfNull(sql);
         return ManagedStatementAdapter.FromPreparedStatement(this, sql, GetConnection().Prepare(sql));
+    }
+
+    public ValueTask<IManagedStatementAdapter> PrepareAsync(
+        string sql,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var statement = Prepare(sql);
+        if (!cancellationToken.IsCancellationRequested)
+            return ValueTask.FromResult(statement);
+
+        statement.Dispose();
+        cancellationToken.ThrowIfCancellationRequested();
+        return default;
     }
 
     public void ResetForPooling()
@@ -441,6 +625,7 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         ArgumentNullException.ThrowIfNull(destination);
         ArgumentNullException.ThrowIfNull(destinationName);
         ArgumentNullException.ThrowIfNull(sourceName);
+        destination = UnwrapConnectionAdapter(destination);
         if (destination is not ManagedConnectionAdapter managedDestination)
             throw new ArgumentException("Managed snapshots require a managed destination adapter.", nameof(destination));
 
@@ -510,6 +695,12 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         connection?.Dispose();
     }
 
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
+
     internal EmbeddedStatement PrepareEmbeddedStatement(string sql)
     {
         return GetConnection().Prepare(sql);
@@ -536,6 +727,22 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         {
             return _connection ?? throw new ObjectDisposedException(nameof(ManagedConnectionAdapter));
         }
+    }
+
+    private static IManagedConnectionAdapter UnwrapConnectionAdapter(
+        IManagedConnectionAdapter adapter)
+    {
+        HashSet<IManagedConnectionAdapter>? visited = null;
+        while (adapter is IManagedConnectionAdapterDecorator decorator)
+        {
+            visited ??= new HashSet<IManagedConnectionAdapter>(
+                ReferenceEqualityComparer.Instance);
+            if (!visited.Add(adapter))
+                throw new InvalidOperationException("Managed connection adapter decorators cannot form a cycle.");
+            adapter = decorator.InnerConnectionAdapter;
+        }
+
+        return adapter;
     }
 }
 
@@ -605,6 +812,23 @@ public sealed class ManagedStatementAdapter : IManagedStatementAdapter
         }
     }
 
+    public async ValueTask<StatementStepResult> StepAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await GetStatement().StepAsync(cancellationToken).ConfigureAwait(false);
+            lock (_gate)
+                _hasCurrentRow = result == StatementStepResult.Row;
+            return result;
+        }
+        catch
+        {
+            lock (_gate)
+                _hasCurrentRow = false;
+            throw;
+        }
+    }
+
     public bool HasRows()
     {
         return GetStatement().HasRows();
@@ -625,6 +849,14 @@ public sealed class ManagedStatementAdapter : IManagedStatementAdapter
         GetStatement().Reset();
         lock (_gate)
             _hasCurrentRow = false;
+    }
+
+    public ValueTask ResetAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Reset();
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
     }
 
     public void ClearBindings()
@@ -691,6 +923,12 @@ public sealed class ManagedStatementAdapter : IManagedStatementAdapter
         }
 
         statement?.Dispose();
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
     }
 
     private void ReplaceStatementWithoutBindings()

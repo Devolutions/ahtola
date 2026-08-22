@@ -8,9 +8,11 @@ a hard constraint when changing build/package configuration.
 ## Referencing the Turso source
 
 A read-only `turso-src` git submodule pins the upstream Turso Rust core at a
-specific release tag (currently `v0.7.2`, commit `046e9cbf6`) so agents can
-read the original Rust sources while porting or comparing behavior, without
-cloning ad hoc or guessing at API shape.
+specific release tag (currently `v0.8.0-pre.7`, commit `277ddd050`) so agents
+can read the original Rust sources while porting or comparing behavior,
+including the tagged browser WASM binding, without cloning ad hoc or guessing
+at API shape. Historical gap/MVCC contracts that explicitly name `v0.7.2`
+retain that version as their behavioral analysis baseline.
 
 ```powershell
 git submodule update --init --recursive      # first checkout / fresh clone

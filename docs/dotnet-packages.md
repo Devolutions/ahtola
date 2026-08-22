@@ -1,6 +1,6 @@
 # NuGet packages guide
 
-Ahtola ships as three NuGet packages that build directly on top of each
+Ahtola ships as four NuGet packages that build directly on top of each
 other. This guide goes deeper than the [top-level README](../README.md#install):
 which package to install for a given scenario, the full ADO.NET / EF Core API
 surface, connection-string keywords, and end-to-end walkthroughs for a
@@ -27,6 +27,7 @@ replica**.
 | --- | --- | --- |
 | `Devolutions.Ahtola.Core` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Core) | Pure-managed engine (pager, b-tree, WAL, VDBE). Rarely referenced directly — it flows in transitively — unless you need engine-level types such as `IPageCodec`. |
 | `Devolutions.Ahtola.Data.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Data.Sqlite) | ADO.NET provider: the `Microsoft.Data.Sqlite`-compatible facade (`Ahtola.Data.Sqlite.SqliteConnection`, …) plus the native `Ahtola.AhtolaConnection` types (local files, MVCC, Turso Cloud direct/replica). Embeds `Ahtola.Data`. |
+| `Devolutions.Ahtola.Data.Sqlite.Browser` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Data.Sqlite.Browser) | Blazor/.NET WebAssembly data source with durable OPFS storage. See the [browser deployment guide](browser-wasm.md). |
 | `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.EntityFrameworkCore.Sqlite) | EF Core provider (`UseAhtola`) — local databases, direct remote Turso Cloud/Hrana connections, and embedded replicas (see [Entity Framework Core](#entity-framework-core)). |
 
 ```bash
@@ -35,10 +36,13 @@ dotnet add package Devolutions.Ahtola.Data.Sqlite
 
 # + EF Core (9.x on net8.0/net9.0, 10.x on net10.0)
 dotnet add package Devolutions.Ahtola.EntityFrameworkCore.Sqlite
+
+# Blazor/.NET WebAssembly OPFS support
+dotnet add package Devolutions.Ahtola.Data.Sqlite.Browser
 ```
 
 Targets `net8.0`, `net9.0`, `net10.0` — no `net48` / .NET Framework assets, no
-native SQLite binary, and no P/Invoke SDK to restore. All three packages are
+native SQLite binary, and no P/Invoke SDK to restore. The shipped packages are
 `IsAotCompatible`/`IsTrimmable` in `Ahtola.Core`, and the shipped
 provider/EF Core packages publish and trim cleanly on every supported TFM.
 
@@ -60,6 +64,10 @@ Devolutions.Ahtola.Core` yourself. Add it directly only if you're writing an
   `optionsBuilder.UseAhtola(...)` — local files, direct remote Turso Cloud/Hrana
   URLs, and embedded replicas are all supported (see
   [Entity Framework Core](#entity-framework-core)).
+- **Blazor/.NET WebAssembly with durable OPFS storage** → add
+  `Devolutions.Ahtola.Data.Sqlite.Browser`, create an
+  `AhtolaBrowserDataSource`, and use async APIs. See the
+  [browser deployment guide](browser-wasm.md).
 
 ## The SQLite-compatible facade
 

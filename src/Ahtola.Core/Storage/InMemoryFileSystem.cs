@@ -109,7 +109,7 @@ public sealed class DeterministicFaultInjector
 /// the semantics of the engine's in-memory I/O backend. An optional
 /// <see cref="DeterministicFaultInjector"/> makes it usable for error-path tests.
 /// </summary>
-public sealed class InMemoryFileSystem : IFileSystem, IAtomicFileSystem
+public sealed class InMemoryFileSystem : IFileSystem, IAtomicFileSystem, IStoragePathResolver
 {
     private const int BlockSize = 4096;
 
@@ -118,6 +118,14 @@ public sealed class InMemoryFileSystem : IFileSystem, IAtomicFileSystem
     private readonly DeterministicFaultInjector? _faults;
 
     public InMemoryFileSystem(DeterministicFaultInjector? faults = null) => _faults = faults;
+
+    public StringComparer PathComparer => StringComparer.Ordinal;
+
+    public string GetCanonicalPath(string path)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        return path;
+    }
 
     /// <summary>Snapshots every path this file system currently holds.</summary>
     /// <remarks>

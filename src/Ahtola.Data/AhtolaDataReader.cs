@@ -367,7 +367,10 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         || (_managedStatement is null && (_nativeStatement?.IsInvalid ?? true));
 
     public override bool NextResult()
-        => _command.RunOperation(NextResultCore);
+    {
+        ThrowIfSynchronousBrowserOperation();
+        return _command.RunOperation(NextResultCore);
+    }
 
     private bool NextResultCore(CancellationToken cancellationToken)
     {
@@ -391,21 +394,85 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
 
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
     {
-        return _command.RunOperationAsync(NextResultCore, cancellationToken);
+        return _managedStatement is null
+            ? _command.RunOperationAsync(NextResultCore, cancellationToken)
+            : _command.RunOperationAsync(NextResultCoreAsync, cancellationToken);
+    }
+
+    private async ValueTask<bool> NextResultCoreAsync(CancellationToken cancellationToken)
+    {
+        EnsureOpen();
+        try
+        {
+            while (await StepAsync(cancellationToken).ConfigureAwait(false))
+            {
+            }
+
+            _hasCurrentRow = false;
+            NotifyCompletion();
+            return false;
+        }
+        catch
+        {
+            NotifyFailure();
+            throw;
+        }
     }
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing && !_isClosed && _command.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous reader disposal is not supported by the browser database source. Use DisposeAsync.");
+        }
+
         if (disposing)
             CloseCore(closeConnection: true);
 
         base.Dispose(disposing);
     }
 
+    public override async ValueTask DisposeAsync()
+    {
+        if (!_command.RequiresAsyncExecution && _managedStatement is null)
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
+        await CloseCoreAsync(closeConnection: true).ConfigureAwait(false);
+        await base.DisposeAsync().ConfigureAwait(false);
+    }
+
+    public override async Task CloseAsync()
+    {
+        if (_managedStatement is null)
+        {
+            CloseCore(closeConnection: true);
+            return;
+        }
+
+        await CloseCoreAsync(closeConnection: true).ConfigureAwait(false);
+    }
+
+    public override void Close()
+    {
+        if (!_isClosed)
+            ThrowIfSynchronousBrowserOperation();
+        CloseCore(closeConnection: true);
+    }
+
     void IConnectionOwnedReader.CloseFromConnection() => CloseCore(closeConnection: false);
 
+    ValueTask IConnectionOwnedReader.CloseFromConnectionAsync()
+        => CloseCoreAsync(closeConnection: false);
+
     public override bool Read()
-        => _command.RunOperation(ReadCore);
+    {
+        ThrowIfSynchronousBrowserOperation();
+        return _command.RunOperation(ReadCore);
+    }
 
     private bool ReadCore(CancellationToken cancellationToken)
     {
@@ -426,7 +493,26 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
 
     public override Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
-        return _command.RunOperationAsync(ReadCore, cancellationToken);
+        return _managedStatement is null
+            ? _command.RunOperationAsync(ReadCore, cancellationToken)
+            : _command.RunOperationAsync(ReadCoreAsync, cancellationToken);
+    }
+
+    private async ValueTask<bool> ReadCoreAsync(CancellationToken cancellationToken)
+    {
+        EnsureOpen();
+        try
+        {
+            _hasCurrentRow = await StepAsync(cancellationToken).ConfigureAwait(false);
+            if (!_hasCurrentRow)
+                NotifyCompletion();
+            return _hasCurrentRow;
+        }
+        catch
+        {
+            NotifyFailure();
+            throw;
+        }
     }
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
@@ -594,11 +680,29 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
             ? ReadNative(cancellationToken)
             : ExecuteManaged(statement => statement.Step(cancellationToken) == StatementStepResult.Row);
 
+    private ValueTask<bool> StepAsync(CancellationToken cancellationToken)
+        => ExecuteManagedAsync(
+            async statement =>
+                await statement.StepAsync(cancellationToken).ConfigureAwait(false) == StatementStepResult.Row);
+
     private T ExecuteManaged<T>(Func<IManagedStatementAdapter, T> operation)
     {
         try
         {
             return operation(_managedStatement!);
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            throw AhtolaException.FromCore(exception);
+        }
+    }
+
+    private async ValueTask<T> ExecuteManagedAsync<T>(
+        Func<IManagedStatementAdapter, ValueTask<T>> operation)
+    {
+        try
+        {
+            return await operation(_managedStatement!).ConfigureAwait(false);
         }
         catch (EmbeddedSqlException exception)
         {
@@ -618,6 +722,7 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         {
             result = statement.Read();
         }
+
         catch (AhtolaException) when (cancellationToken.IsCancellationRequested)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -625,6 +730,16 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         }
         cancellationToken.ThrowIfCancellationRequested();
         return result;
+    }
+
+    private void ThrowIfSynchronousBrowserOperation()
+    {
+        if (_command.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous reader iteration is not supported by the browser database source. "
+                + "Use ReadAsync or NextResultAsync.");
+        }
     }
 
     private void ValidateOrdinal(int ordinal)
@@ -681,6 +796,29 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
             _closeCallback();
             if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
                 _connection.Close();
+        }
+    }
+
+    private async ValueTask CloseCoreAsync(bool closeConnection)
+    {
+        if (_isClosed)
+            return;
+
+        _command.Cancel();
+        try
+        {
+            NotifyFailure();
+            await _managedStatement!.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _hasCurrentRow = false;
+            _isClosed = true;
+            ((ILocalReaderConnection)_connection).ReaderClosed(this);
+            Interlocked.Exchange(ref _replicaOperation, null)?.Dispose();
+            _closeCallback();
+            if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+                await _connection.CloseAsync().ConfigureAwait(false);
         }
     }
 

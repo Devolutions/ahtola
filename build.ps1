@@ -12,6 +12,7 @@
     ./build.ps1 test
     ./build.ps1 pack -PackageVersion 0.1.0-preview.1
     ./build.ps1 validate-package
+    ./build.ps1 validate-browser-package
 #>
 [CmdletBinding()]
 param(
@@ -24,11 +25,14 @@ param(
         'pack',
                 'pack-powershell',
                 'test-powershell',
+                'test-browser-js',
                 'validate-package',
+                'validate-browser-package',
                 'validate-runtime',
                 'cloud-smoke',
                 'validate-project-closure',
                 'validate-packed-closure',
+                'assert-package-version',
                 'format-check'
             )]
             [string]$Task = 'build',
@@ -48,7 +52,12 @@ param(
 
         # Floor for Pester module tests (test-powershell). Keep in sync with
         # tests/PowerShell/Devolutions.Ahtola.Sqlite/Module.Tests.ps1.
-        [int]$PowerShellMinimumExecutedTests = 34
+        [int]$PowerShellMinimumExecutedTests = 34,
+
+        # Floor for the Node-based browser OPFS worker/capability unit tests
+        # (test-browser-js). Keep in sync with the test() count under
+        # scripts/tests/browser-worker.
+        [int]$BrowserWorkerMinimumExecutedTests = 10
     )
 
 Set-StrictMode -Version Latest
@@ -59,6 +68,7 @@ $RepoRoot = $PSScriptRoot
 Set-Location -LiteralPath $RepoRoot
 
 $DataSqliteProject = './src/Ahtola.Data.Sqlite/Ahtola.Data.Sqlite.csproj'
+$BrowserDataSqliteProject = './src/Ahtola.Data.Sqlite.Browser/Ahtola.Data.Sqlite.Browser.csproj'
 $EfCoreProject = './src/Ahtola.EntityFrameworkCore.Sqlite/Ahtola.EntityFrameworkCore.Sqlite.csproj'
 $PowerShellProject = './src/Devolutions.Ahtola.PowerShell/Devolutions.Ahtola.PowerShell.csproj'
 $CoreProject = './src/Ahtola.Core/Ahtola.Core.csproj'
@@ -71,6 +81,7 @@ $PowerShellHelpMarkdown = Join-Path $RepoRoot "docs/powershell-help/$PowerShellM
 $PowerShellHelpBuilder = Join-Path $RepoRoot 'scripts/Build-PowerShellHelp.ps1'
 $PowerShellTestRunner = Join-Path $RepoRoot 'scripts/Invoke-PowerShellModuleTests.ps1'
 $ConsumerProject = './samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj'
+$BrowserConsumerRunner = Join-Path $RepoRoot 'scripts/Invoke-BrowserPackageConsumer.ps1'
 $ConsumerNugetConfig = './samples/ManagedPackageConsumer/obj/managed-package-consumer.nuget.config'
 $ClosureValidator = Join-Path $RepoRoot 'scripts/Validate-ManagedPackageClosure.ps1'
 $TestRunner = Join-Path $RepoRoot 'scripts/Invoke-ManagedTestSuite.ps1'
@@ -131,9 +142,11 @@ function Assert-ManagedProjectClosure {
         (Join-Path $RepoRoot 'src/Ahtola.Core'),
         (Join-Path $RepoRoot 'src/Ahtola.Data'),
         (Join-Path $RepoRoot 'src/Ahtola.Data.Sqlite'),
+        (Join-Path $RepoRoot 'src/Ahtola.Data.Sqlite.Browser'),
         (Join-Path $RepoRoot 'src/Ahtola.EntityFrameworkCore.Sqlite'),
                 (Join-Path $RepoRoot 'src/Devolutions.Ahtola.PowerShell'),
-                (Join-Path $RepoRoot 'samples/ManagedPackageConsumer')
+                (Join-Path $RepoRoot 'samples/ManagedPackageConsumer'),
+                (Join-Path $RepoRoot 'samples/BrowserWasmConsumer')
             )
     foreach ($root in $projectRoots) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) {
@@ -155,6 +168,7 @@ function Assert-ManagedProjectClosure {
 function Invoke-Restore {
     Write-Step 'Restoring managed packages'
     Invoke-DotNet @('restore', $DataSqliteProject)
+    Invoke-DotNet @('restore', $BrowserDataSqliteProject)
     Invoke-DotNet @('restore', $EfCoreProject)
         Invoke-DotNet @('restore', $PowerShellProject)
 }
@@ -166,6 +180,7 @@ function Invoke-Build {
     Invoke-Restore
     Write-Step "Building managed packages ($BuildConfiguration)"
     Invoke-DotNet @('build', '--no-restore', '-c', $BuildConfiguration, $DataSqliteProject)
+    Invoke-DotNet @('build', '--no-restore', '-c', $BuildConfiguration, $BrowserDataSqliteProject)
     Invoke-DotNet @('build', '--no-restore', '-c', $BuildConfiguration, $EfCoreProject)
         Invoke-DotNet @('build', '--no-restore', '-c', $BuildConfiguration, $PowerShellProject)
 }
@@ -236,6 +251,45 @@ function Invoke-Build {
             }
         }
 
+function Invoke-TestBrowserJs {
+    param([int]$MinimumExecuted = $BrowserWorkerMinimumExecutedTests)
+
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        throw 'Browser worker JS tests require Node.js.'
+    }
+
+    $testDirectory = Join-Path $RepoRoot 'scripts/tests/browser-worker'
+    $testFiles = @(Get-ChildItem -LiteralPath $testDirectory -Filter '*.test.mjs' -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName })
+    if ($testFiles.Count -eq 0) {
+        throw "No browser worker JS test files were found under $testDirectory."
+    }
+
+    Write-Step "Running browser worker JS tests ($($testFiles.Count) file(s), min $MinimumExecuted)"
+    $output = @(& node --test @testFiles 2>&1)
+    $output | ForEach-Object { Write-Host $_ }
+    $exitCode = $LASTEXITCODE
+
+    $executed = 0
+    $summaryLine = $output | Where-Object { $_ -match '^\s*#\s*tests\s+(\d+)\s*$' } | Select-Object -Last 1
+    if ($summaryLine -and $summaryLine -match '(\d+)') {
+        $executed = [int]$Matches[1]
+    }
+
+    # dotnet test exits 0 for a run that silently discovered nothing, and
+    # Node's runner has the same failure mode if a test file throws during
+    # module load before registering any test() calls - so an explicit floor
+    # on the executed count is required, not just the process exit code.
+    if ($executed -lt $MinimumExecuted) {
+        throw "Browser worker JS tests executed only $executed test(s); expected at least $MinimumExecuted. A test file may have failed to load or register its tests."
+    }
+    if ($exitCode -ne 0) {
+        throw "Browser worker JS tests failed with exit code $exitCode."
+    }
+
+    Write-Host "Browser worker JS tests passed ($executed executed)." -ForegroundColor Green
+}
+
 function Invoke-Pack {
     param(
         [string]$Version = $PackageVersion,
@@ -257,6 +311,7 @@ function Invoke-Pack {
 
     Invoke-DotNet ($packArgs + @($CoreProject))
     Invoke-DotNet ($packArgs + @($DataSqliteProject))
+    Invoke-DotNet ($packArgs + @($BrowserDataSqliteProject))
     Invoke-DotNet ($packArgs + @($EfCoreProject))
 
     Invoke-ValidatePackedClosure -Output $outputAbsolute
@@ -268,6 +323,33 @@ function Invoke-ValidatePackedClosure {
     $outputAbsolute = Get-AbsolutePath $Output
     Write-Step "Validating packed nupkg closure in $outputAbsolute"
     Invoke-PwshScript -Path $ClosureValidator -Arguments @('-PackageDirectory', $outputAbsolute)
+}
+
+function Assert-ExactPackageVersion {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$ExpectedVersion
+    )
+
+    $directoryAbsolute = Get-AbsolutePath $Directory
+    Write-Step "Asserting every package in $directoryAbsolute is exactly version $ExpectedVersion"
+    if (-not (Test-Path -LiteralPath $directoryAbsolute -PathType Container)) {
+        throw "Package directory '$directoryAbsolute' does not exist."
+    }
+
+    $nupkgs = @(Get-ChildItem -LiteralPath $directoryAbsolute -Filter '*.nupkg' -File)
+    if ($nupkgs.Count -eq 0) {
+        throw "No .nupkg files were found in '$directoryAbsolute'."
+    }
+
+    $suffix = ".$ExpectedVersion.nupkg"
+    $mismatched = @($nupkgs | Where-Object { -not $_.Name.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase) })
+    if ($mismatched.Count -gt 0) {
+        $names = ($mismatched | ForEach-Object { $_.Name }) -join ', '
+        throw "Expected every package in '$directoryAbsolute' to be version '$ExpectedVersion', but found: $names"
+    }
+
+    Write-Host "Verified $($nupkgs.Count) package(s) in '$directoryAbsolute' are exactly version '$ExpectedVersion'." -ForegroundColor Green
 }
 
 function Write-ConsumerNugetConfig {
@@ -297,16 +379,43 @@ function Write-ConsumerNugetConfig {
 function Invoke-ValidatePackage {
     Assert-ManagedProjectClosure
 
-    $localVersion = '0.0.0-managed-local'
     $packageOutputAbsolute = Get-AbsolutePath $PackageOutput
+    $existingNupkgCount = if (Test-Path -LiteralPath $packageOutputAbsolute -PathType Container) {
+        @(Get-ChildItem -LiteralPath $packageOutputAbsolute -Filter '*.nupkg' -File -ErrorAction SilentlyContinue).Count
+    } else {
+        0
+    }
+    # When the caller already packed nupkgs at a specific version (as CI does
+    # before calling this task), validate those in place instead of deleting
+    # and repacking them under a throwaway local version: that repack used to
+    # silently orphan the intended CI-versioned artifacts, and any consumer
+    # that still asked for the original version - the browser smoke jobs, the
+    # final uploaded nupkg artifact - got a different package via NuGet's
+    # nearest-version fallback without any error.
+    $reuseExistingPackages = -not [string]::IsNullOrWhiteSpace($PackageVersion) -and $existingNupkgCount -gt 0
+
+    if ($reuseExistingPackages) {
+        Assert-ExactPackageVersion -Directory $packageOutputAbsolute -ExpectedVersion $PackageVersion
+        $localVersion = $PackageVersion
+        Write-Step "Validating existing $localVersion packages in $packageOutputAbsolute without repacking"
+    } else {
+        $localVersion = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { '0.0.0-managed-local' } else { $PackageVersion }
+        Invoke-Pack -Version $localVersion -Output $packageOutputAbsolute
+    }
+
     $consumerOutputRoot = Get-AbsolutePath $PackageConsumerOutput
     $consumerNugetConfigAbsolute = Get-AbsolutePath $ConsumerNugetConfig
     $consumerProjectAbsolute = Get-AbsolutePath $ConsumerProject
     $consumerObj = Join-Path (Split-Path -Parent $consumerProjectAbsolute) 'obj'
     $consumerBin = Join-Path (Split-Path -Parent $consumerProjectAbsolute) 'bin'
     $globalPackages = Join-Path $packageOutputAbsolute '.nuget-packages'
+    # Reusing existing nupkgs (above) means this function no longer always
+    # wipes $packageOutputAbsolute first, so any global-packages cache left
+    # over from an earlier restore into the same folder must be cleared
+    # explicitly - otherwise a stale extracted package could shadow a nupkg
+    # that legitimately changed content under an unchanged version string.
+    Remove-PathIfExists $globalPackages
 
-    Invoke-Pack -Version $localVersion -Output $packageOutputAbsolute
     Invoke-ValidatePackedClosure -Output $packageOutputAbsolute
 
     Write-Step 'Validating packed consumer restore/build/run/publish'
@@ -360,6 +469,23 @@ function Invoke-ValidatePackage {
             '-PublishOutput', $consumerOutput
         )
     }
+}
+
+function Invoke-ValidateBrowserPackage {
+    $localVersion = if ([string]::IsNullOrWhiteSpace($PackageVersion)) {
+        '0.0.0-browser-local'
+    } else {
+        $PackageVersion
+    }
+    Invoke-Pack -Version $localVersion -Output $PackageOutput
+    $arguments = @(
+        '-PackageDirectory', (Get-AbsolutePath $PackageOutput),
+        '-PackageVersion', $localVersion
+    )
+    if ($env:AHTOLA_BROWSER_AOT -eq '1') {
+        $arguments += '-RunAot'
+    }
+    Invoke-PwshScript -Path $BrowserConsumerRunner -Arguments $arguments
 }
 
 function Invoke-ValidateRuntime {
@@ -472,11 +598,19 @@ switch ($Task) {
     'pack' { Invoke-Pack }
         'pack-powershell' { Invoke-PackPowerShell }
         'test-powershell' { Invoke-TestPowerShell }
+        'test-browser-js' { Invoke-TestBrowserJs }
         'validate-project-closure' { Assert-ManagedProjectClosure }
         'validate-packed-closure' { Invoke-ValidatePackedClosure }
         'validate-package' { Invoke-ValidatePackage }
+        'validate-browser-package' { Invoke-ValidateBrowserPackage }
         'validate-runtime' { Invoke-ValidateRuntime }
         'cloud-smoke' { Invoke-CloudSmoke }
+        'assert-package-version' {
+            if ([string]::IsNullOrWhiteSpace($PackageVersion)) {
+                throw "Task 'assert-package-version' requires -PackageVersion."
+            }
+            Assert-ExactPackageVersion -Directory $PackageOutput -ExpectedVersion $PackageVersion
+        }
         'test' { Invoke-Test }
         'format-check' { Invoke-FormatCheck }
         default { throw "Unknown task '$Task'" }

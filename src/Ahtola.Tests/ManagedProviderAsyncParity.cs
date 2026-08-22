@@ -125,23 +125,12 @@ public sealed class ManagedProviderAsyncParityTests
     }
 
     [Test]
-    public async Task ManagedSqliteAsyncExecutionObservesMidOperationCancellation()
+    public async Task ManagedSqliteAsyncExecutionDoesNotHopToTheThreadPool()
     {
         using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         connection.Open();
-        using var entered = new ManualResetEventSlim();
-        using var cancellation = new CancellationTokenSource();
-        connection.CreateFunction<long>(
-            "wait_for_cancellation",
-            () =>
-            {
-                entered.Set();
-                cancellation.Token.WaitHandle.WaitOne();
-                return 1;
-            });
 
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT wait_for_cancellation();";
         var callerThread = Environment.CurrentManagedThreadId;
         var executionThread = callerThread;
         connection.CreateFunction<long>(
@@ -151,18 +140,12 @@ public sealed class ManagedProviderAsyncParityTests
                 executionThread = Environment.CurrentManagedThreadId;
                 return 1;
             });
-        command.CommandText = "SELECT execution_thread(), wait_for_cancellation();";
+        command.CommandText = "SELECT execution_thread();";
 
-        var execution = command.ExecuteScalarAsync(cancellation.Token);
-        entered.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue();
-        execution.IsCompleted.Should().BeFalse();
-        executionThread.Should().NotBe(callerThread);
-
-        cancellation.Cancel();
-        await AssertCanceledAsync(execution);
-
-        command.CommandText = "SELECT 2;";
-        (await command.ExecuteScalarAsync()).Should().Be(2L);
+        var execution = command.ExecuteScalarAsync();
+        execution.IsCompletedSuccessfully.Should().BeTrue();
+        (await execution).Should().Be(1L);
+        executionThread.Should().Be(callerThread);
     }
 
     [Test]
@@ -183,12 +166,16 @@ public sealed class ManagedProviderAsyncParityTests
 
         using var command = connection.CreateCommand();
         command.CommandText = "SELECT wait_for_command_cancel();";
+        var cancelThread = new Thread(() =>
+        {
+            entered.Wait();
+            command.Cancel();
+            release.Set();
+        });
+        cancelThread.Start();
         var execution = command.ExecuteScalarAsync();
-        entered.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue();
-
-        command.Cancel();
-        release.Set();
         await AssertCanceledAsync(execution);
+        cancelThread.Join(TimeSpan.FromSeconds(5)).Should().BeTrue();
 
         command.CommandText = "SELECT 3;";
         (await command.ExecuteScalarAsync()).Should().Be(3L);
@@ -226,9 +213,9 @@ public sealed class ManagedProviderAsyncParityTests
 
         using var command = connection.CreateCommand();
         command.CommandText = "UPDATE items SET value = cancel_during_update(value);";
+        cancellation.CancelAfter(TimeSpan.FromMilliseconds(50));
         var execution = command.ExecuteNonQueryAsync(cancellation.Token);
-        entered.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue();
-        cancellation.Cancel();
+        entered.IsSet.Should().BeTrue();
         await AssertCanceledAsync(execution);
 
         command.CommandText = "SELECT group_concat(value, ',') FROM items ORDER BY rowid;";
@@ -254,11 +241,9 @@ public sealed class ManagedProviderAsyncParityTests
         using var cancellation = new CancellationTokenSource();
 
         Task<int>? execution = null;
+        cancellation.CancelAfter(TimeSpan.FromMilliseconds(50));
         Assert.DoesNotThrow(() => execution = writer.ExecuteNonQueryAsync(cancellation.Token));
-        await Task.Delay(50);
-        execution!.IsCompleted.Should().BeFalse();
-        cancellation.Cancel();
-        await AssertCanceledAsync(execution);
+        await AssertCanceledAsync(execution!);
     }
 
     [Test]
@@ -272,11 +257,15 @@ public sealed class ManagedProviderAsyncParityTests
             "SELECT 1 UNION ALL SELECT value + 1 FROM counter WHERE value < 100000000" +
             ") SELECT max(value) FROM counter;";
 
+        var cancelThread = new Thread(() =>
+        {
+            Thread.Sleep(50);
+            command.Cancel();
+        });
+        cancelThread.Start();
         var execution = command.ExecuteScalarAsync();
-        await Task.Delay(50);
-        execution.IsCompleted.Should().BeFalse();
-        command.Cancel();
         await AssertCanceledAsync(execution);
+        cancelThread.Join(TimeSpan.FromSeconds(5)).Should().BeTrue();
 
         command.CommandText = "SELECT 4;";
         (await command.ExecuteScalarAsync()).Should().Be(4L);

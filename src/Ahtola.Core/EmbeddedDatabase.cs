@@ -267,7 +267,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private EmbeddedFileStore? _fileStore;
     private readonly string _databasePath = string.Empty;
     private readonly IFileSystem? _fileSystem;
-    private readonly object? _fileCatalogWriteLock;
+    private readonly AsyncFifoGate? _fileCatalogWriteLock;
     private readonly bool _readOnly;
     private readonly bool _foreignReadOnly;
     private SqlitePagerViewToken _foreignViewToken;
@@ -308,7 +308,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         string databasePath,
         IFileSystem fileSystem,
         FileCatalogVersion fileCatalogVersion,
-        object fileCatalogWriteLock,
+        AsyncFifoGate fileCatalogWriteLock,
         bool readOnly,
         bool foreignReadOnly = false)
     {
@@ -353,7 +353,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new ArgumentException("A foreign open is always read-only.", nameof(foreignReadOnly));
         var effectiveFileSystem = fileSystem ?? PhysicalFileSystem.Instance;
         var fileCatalogWriteLock = GetFileCatalogWriteLock(effectiveFileSystem, path);
-        lock (fileCatalogWriteLock)
+        using (fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
         {
             using var catalogWriteLease = readOnly
                 ? null
@@ -439,7 +439,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
-            lock (_fileCatalogWriteLock)
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
                 // A commit landing mid-reload fails the race check; spin until the
                 // reload observes a settled version. Bounded so a commit storm
@@ -1930,7 +1930,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (_fileCatalogWriteLock is null)
                     throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
-                lock (_fileCatalogWriteLock)
+                using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
                 {
                     if (_foreignReadOnly)
                     {
@@ -2739,7 +2739,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             && _fileSystem is not null
             && _fileCatalogWriteLock is not null)
         {
-            lock (_fileCatalogWriteLock)
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
                 using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
                 EnsureFileCatalogVersionCurrent(busyTimeout);
@@ -2793,7 +2793,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 _mvStore = null;
             }
 
-            lock (fileCatalogWriteLock)
+            using (fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
                 using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(fileSystem, _databasePath);
                 EnsureFileCatalogVersionCurrent(busyTimeout);
@@ -2823,7 +2823,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (_fileSystem is null || _fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
-            lock (_fileCatalogWriteLock)
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
                 using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
                 EnsureFileCatalogVersionCurrent(busyTimeout);
@@ -2865,11 +2865,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             if (string.CompareOrdinal(sourceLockPath, destinationLockPath) < 0)
             {
-                lock (_fileCatalogWriteLock)
+                using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
                 {
                     using var sourceWriteLease =
                         EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
-                    lock (destinationWriteLock)
+                    using (destinationWriteLock.Enter(Timeout.InfiniteTimeSpan))
                     {
                         using var destinationWriteLease =
                             EnterPhysicalFileCatalogWriteLock(_fileSystem, destinationPath);
@@ -2879,11 +2879,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
             else
             {
-                lock (destinationWriteLock)
+                using (destinationWriteLock.Enter(Timeout.InfiniteTimeSpan))
                 {
                     using var destinationWriteLease =
                         EnterPhysicalFileCatalogWriteLock(_fileSystem, destinationPath);
-                    lock (_fileCatalogWriteLock)
+                    using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
                     {
                         using var sourceWriteLease =
                             EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
@@ -2936,7 +2936,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (_fileSystem is null || _fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
-            lock (_fileCatalogWriteLock)
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
                 using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
                 EnsureFileCatalogVersionCurrent(busyTimeout);
@@ -2986,7 +2986,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
             throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
-        lock (_fileCatalogWriteLock)
+        using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
         {
             using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
             EnsureFileCatalogVersionCurrent(busyTimeout);
@@ -3143,6 +3143,47 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    private async ValueTask WaitForCatalogStabilityAsync(
+        long deadline,
+        CancellationToken cancellationToken)
+    {
+        var registry = GetFileCatalogWriterRegistry(_fileSystem!);
+        var registryKey = GetFileCatalogLockPath(_fileSystem!, _databasePath);
+        if (!await registry
+                .WaitUntilIdleAsync(registryKey, deadline, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            ThrowCatalogSnapshotBusy();
+        }
+    }
+
+    /// <summary>
+    /// Asynchronously waits until nothing on this database is blocking
+    /// <paramref name="owner"/>'s next attempt, or the busy deadline expires.
+    /// </summary>
+    /// <remarks>
+    /// This is the asynchronous half of the busy handler: it waits on the same
+    /// write reservation the synchronous engine blocks on, but suspends the caller
+    /// instead of parking a thread in <see cref="Monitor.Wait(object)"/> or
+    /// <see cref="Thread.Sleep(int)"/>. A browser connection therefore never
+    /// occupies its only thread while another connection holds the reservation.
+    /// It deliberately does not wait for catalog-writer quiescence: under sustained
+    /// write contention a settled instant may never come, and a stale snapshot is
+    /// resolved by adopting the committed catalog rather than by waiting.
+    /// </remarks>
+    internal ValueTask WaitForBusyRetryAsync(
+        object owner,
+        long deadline,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(owner);
+        cancellationToken.ThrowIfCancellationRequested();
+        return _transactionLock.ThrowIfWriteBlockedAsync(
+            owner,
+            GetRemainingBusyTimeout(deadline),
+            cancellationToken);
+    }
+
     private static long GetBusyWaitDeadline(TimeSpan busyTimeout)
     {
         if (busyTimeout == Timeout.InfiniteTimeSpan)
@@ -3163,6 +3204,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var remaining = Math.Max(0, deadline - Environment.TickCount64);
         return TimeSpan.FromMilliseconds(remaining);
     }
+
+    internal static long CreateBusyDeadline(TimeSpan busyTimeout)
+        => GetBusyWaitDeadline(busyTimeout);
+
+    internal static bool HasBusyBudgetRemaining(long deadline)
+        => GetRemainingBusyWait(deadline) > 0;
+
+    internal static TimeSpan RemainingBusyBudget(long deadline)
+        => GetRemainingBusyTimeout(deadline);
 
     /// <summary>
     /// A foreign read-only connection holds no ownership and no catalog write
@@ -3220,7 +3270,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             if (_fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
-            lock (_fileCatalogWriteLock)
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
                 RefreshForeignCatalogIfChangedLocked();
         }
     }
@@ -3257,7 +3307,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (_fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
-            lock (_fileCatalogWriteLock)
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
                 var replacement = EmbeddedFileStore.Open(
                     _databasePath,
@@ -3317,7 +3367,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (_fileSystem is null || _fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
-            lock (_fileCatalogWriteLock)
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
                 using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
                 var durableVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
@@ -3437,7 +3487,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             header.TextEncoding);
     }
 
-    private static object GetFileCatalogWriteLock(IFileSystem fileSystem, string path)
+    private static AsyncFifoGate GetFileCatalogWriteLock(IFileSystem fileSystem, string path)
     {
         var unwrappedFileSystem = AhtolaEncryptionFileSystem.Unwrap(fileSystem);
         return FileCatalogWriteLocks
@@ -3522,15 +3572,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private sealed class FileCatalogWriteLockScope
     {
-        private readonly Dictionary<string, object> _locks = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, AsyncFifoGate> _locks = new(StringComparer.OrdinalIgnoreCase);
 
-        public object Get(string path)
+        public AsyncFifoGate Get(string path)
         {
             lock (_locks)
             {
                 if (!_locks.TryGetValue(path, out var fileCatalogWriteLock))
                 {
-                    fileCatalogWriteLock = new object();
+                    fileCatalogWriteLock = new AsyncFifoGate();
                     _locks.Add(path, fileCatalogWriteLock);
                 }
 
@@ -3549,6 +3599,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private sealed class FileCatalogWriterRegistry
     {
         private readonly Dictionary<string, int> _writers = new(StringComparer.OrdinalIgnoreCase);
+        private readonly AsyncConditionPulse _stateChanged = new();
 
         internal object WritersGate => _writers;
 
@@ -3571,6 +3622,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     _writers[path] = count - 1;
 
                 Monitor.PulseAll(_writers);
+                _stateChanged.PulseAll();
             }
         }
 
@@ -3578,6 +3630,44 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             // Caller must hold WritersGate.
             return _writers.ContainsKey(path);
+        }
+
+        public async ValueTask<bool> WaitUntilIdleAsync(
+            string path,
+            long deadline,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            while (true)
+            {
+                Task stateChanged;
+                lock (_writers)
+                {
+                    if (!_writers.ContainsKey(path))
+                        return true;
+                    stateChanged = _stateChanged.Capture();
+                }
+
+                if (deadline == long.MaxValue)
+                {
+                    await stateChanged.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                var remaining = deadline - Environment.TickCount64;
+                if (remaining <= 0)
+                    return false;
+                try
+                {
+                    await stateChanged
+                        .WaitAsync(TimeSpan.FromMilliseconds(remaining), cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    return false;
+                }
+            }
         }
     }
 
@@ -41801,6 +41891,140 @@ public sealed partial class EmbeddedConnection : IDisposable
         }
     }
 
+    /// <summary>
+    /// Fails this connection's lock acquisitions immediately instead of parking the
+    /// calling thread until its busy timeout expires.
+    /// </summary>
+    /// <remarks>
+    /// The asynchronous statement seam pairs this with
+    /// <see cref="AcquireAutocommitWriteReservationAsync"/> and
+    /// <see cref="WaitForBusyRetryAsync"/>: drain contention on the managed lock's
+    /// asynchronous signal, then run the statement so no <see cref="Monitor"/> wait
+    /// or <see cref="Thread.Sleep(int)"/> inside it can block. Only this
+    /// connection's budget changes; the owning <see cref="EmbeddedDatabase"/> keeps
+    /// its own, so a peer connection's retry budget is untouched and the engine's
+    /// stale-catalog statement restart still converges. Saving and restoring makes
+    /// nesting safe when a SQL callback steps another statement here.
+    /// </remarks>
+    internal FailFastBusyScope EnterFailFastBusyScope() => new(this);
+
+    internal readonly struct FailFastBusyScope : IDisposable
+    {
+        private readonly EmbeddedConnection _connection;
+        private readonly TimeSpan _restore;
+
+        internal FailFastBusyScope(EmbeddedConnection connection)
+        {
+            _connection = connection;
+            _restore = connection._busyTimeout;
+            if (_restore != TimeSpan.Zero)
+                connection._busyTimeout = TimeSpan.Zero;
+        }
+
+        public void Dispose()
+        {
+            // A PRAGMA busy_timeout executed inside the scope is the caller's new
+            // intent; never clobber it with the value this scope displaced.
+            if (_restore != TimeSpan.Zero && _connection._busyTimeout == TimeSpan.Zero)
+                _connection._busyTimeout = _restore;
+        }
+    }
+
+    /// <summary>
+    /// Asynchronously takes the write reservation an autocommit mutation would
+    /// otherwise block on, returning <see langword="null"/> when the statement does
+    /// not need one.
+    /// </summary>
+    /// <remarks>
+    /// Draining the contention here rather than retrying the whole statement keeps
+    /// the barging shape SQLite has between autocommit writers — the reservation is
+    /// held across the statement instead of being re-raced on every attempt — while
+    /// the acquisition itself suspends rather than sleeping a thread. The engine's
+    /// own <c>EnterAutocommit</c> then finds the reservation re-entrant and never
+    /// waits. The lease is taken per attempt so a failed attempt cannot pin a
+    /// database another connection needs to make progress.
+    /// </remarks>
+    internal async ValueTask<IDisposable?> AcquireAutocommitWriteReservationAsync(
+        ParsedStatement statement,
+        TimeSpan busyTimeout,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(statement);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_transactionDatabases is not null
+            || _database.IsReadOnly
+            || !EmbeddedDatabase.MayMutate(statement))
+        {
+            return null;
+        }
+
+        await _database.TransactionLock
+            .EnterAutocommitAsync(this, busyTimeout, cancellationToken)
+            .ConfigureAwait(false);
+        return new AutocommitWriteReservation(this, _database);
+    }
+
+    private sealed class AutocommitWriteReservation(
+        EmbeddedConnection owner,
+        EmbeddedDatabase database) : IDisposable
+    {
+        private EmbeddedDatabase? _database = database;
+
+        public void Dispose()
+        {
+            var released = Interlocked.Exchange(ref _database, null);
+            released?.TransactionLock.Exit(owner);
+        }
+    }
+
+    /// <summary>
+    /// Asynchronously waits out whatever made this connection's last attempt busy,
+    /// returning <see langword="false"/> once the busy budget is spent.
+    /// </summary>
+    internal async ValueTask<bool> WaitForBusyRetryAsync(
+        long deadline,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!EmbeddedDatabase.HasBusyBudgetRemaining(deadline))
+            return false;
+
+        try
+        {
+            foreach (var database in EnumerateReachableDatabases())
+            {
+                await database
+                    .WaitForBusyRetryAsync(this, deadline, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (EmbeddedBusyException)
+        {
+            // The wait itself ran out of budget; the caller reports the original
+            // busy failure rather than this one.
+            return false;
+        }
+
+        // The reservation can be retaken between that signal and this retry, so
+        // yield for SQLite's shortest busy delay rather than spinning — the same
+        // one-millisecond poll the synchronous autocommit contender uses.
+        var delay = SqliteBusyBackoff.DelayForAttempt(
+            attempt: 0,
+            TimeSpan.Zero,
+            EmbeddedDatabase.RemainingBusyBudget(deadline));
+        if (delay > TimeSpan.Zero)
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+
+        return EmbeddedDatabase.HasBusyBudgetRemaining(deadline);
+    }
+
+    private IEnumerable<EmbeddedDatabase> EnumerateReachableDatabases()
+    {
+        yield return _database;
+        foreach (var attachment in _attachedDatabases.Values)
+            yield return attachment.Database;
+    }
+
     private VdbeExecutionOptions CreateVdbeExecutionOptions(EmbeddedDatabase database)
     {
         ArgumentNullException.ThrowIfNull(database);
@@ -42693,9 +42917,30 @@ public sealed partial class EmbeddedConnection : IDisposable
 
         var storageKind = GetSnapshotStorageKind(database.FileSystem);
         var otherStorageKind = GetSnapshotStorageKind(otherDatabase.FileSystem);
-        return storageKind == SnapshotStorageKind.Unknown
-               || otherStorageKind == SnapshotStorageKind.Unknown;
+        if (storageKind != SnapshotStorageKind.Unknown
+            && otherStorageKind != SnapshotStorageKind.Unknown)
+        {
+            return false;
+        }
+
+        var fileSystem = AhtolaEncryptionFileSystem.Unwrap(database.FileSystem);
+        var otherFileSystem = AhtolaEncryptionFileSystem.Unwrap(otherDatabase.FileSystem);
+        return !CanProveDistinctSnapshotFiles(
+            fileSystem,
+            database.DatabasePath,
+            otherFileSystem,
+            otherDatabase.DatabasePath);
     }
+
+    private static bool CanProveDistinctSnapshotFiles(
+        IFileSystem fileSystem,
+        string path,
+        IFileSystem otherFileSystem,
+        string otherPath)
+        => fileSystem is ISnapshotFileIdentity identity
+               && identity.CanProveDistinctFile(path, otherFileSystem, otherPath)
+           || otherFileSystem is ISnapshotFileIdentity otherIdentity
+               && otherIdentity.CanProveDistinctFile(otherPath, fileSystem, path);
 
     private static SnapshotStorageKind GetSnapshotStorageKind(IFileSystem fileSystem)
         => AhtolaEncryptionFileSystem.Unwrap(fileSystem) switch
@@ -47891,6 +48136,66 @@ public sealed class EmbeddedStatement : IDisposable
         _currentRow = null;
         ReleaseReaderLease();
         return StatementStepResult.Done;
+    }
+
+    /// <summary>
+    /// Advances the statement without ever blocking the calling thread on lock
+    /// contention, honoring <paramref name="cancellationToken"/> exactly.
+    /// </summary>
+    /// <remarks>
+    /// The engine's execution pipeline is synchronous, and its lock waits park a
+    /// thread in <see cref="Monitor.Wait(object)"/> or <see cref="Thread.Sleep(int)"/>
+    /// for the whole busy timeout — fatal on a browser's single thread and
+    /// unresponsive to cancellation. This drains the contention first: an autocommit
+    /// mutation takes its write reservation through the transaction lock's
+    /// asynchronous barging acquisition, so the synchronous attempt finds it
+    /// re-entrant, and the attempt itself runs with this connection's budget zeroed
+    /// so no remaining wait can block. Anything still reported busy suspends on the
+    /// same lock's asynchronous signal and retries, bounded by the connection's
+    /// <c>busy_timeout</c>, and surfaces the original busy failure when the budget
+    /// runs out. The statement is only advanced by a successful attempt, because
+    /// execution publishes its result as a single assignment.
+    /// </remarks>
+    public async ValueTask<StatementStepResult> StepAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
+        var busyTimeout = _connection.BusyTimeout;
+
+        // A zero budget already fails fast, and a busy_timeout PRAGMA owns the very
+        // knob the fail-fast scope displaces, so both run the statement directly.
+        if (busyTimeout == TimeSpan.Zero || _statement is PragmaBusyTimeoutStatement)
+            return Step(cancellationToken);
+
+        var deadline = EmbeddedDatabase.CreateBusyDeadline(busyTimeout);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var reservation = await _connection
+                .AcquireAutocommitWriteReservationAsync(
+                    _statement,
+                    EmbeddedDatabase.RemainingBusyBudget(deadline),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            try
+            {
+                using (_connection.EnterFailFastBusyScope())
+                    return Step(cancellationToken);
+            }
+            catch (EmbeddedBusyException)
+            {
+                if (!await _connection
+                        .WaitForBusyRetryAsync(deadline, cancellationToken)
+                        .ConfigureAwait(false))
+                {
+                    throw;
+                }
+            }
+            finally
+            {
+                reservation?.Dispose();
+            }
+        }
     }
 
     public SqlValue GetValue(int ordinal)

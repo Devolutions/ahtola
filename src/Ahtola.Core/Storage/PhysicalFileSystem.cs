@@ -13,12 +13,24 @@ public sealed partial class PhysicalFileSystem :
     IFileSystem,
     IAtomicFileSystem,
     ITemporaryFileSystem,
+    IStoragePathResolver,
     ISqliteWalSharedMemoryFileSystem
 {
     private const uint ReplaceFileWriteThrough = 0x00000001;
 
     /// <summary>A shared, stateless instance.</summary>
     public static PhysicalFileSystem Instance { get; } = new();
+
+    public StringComparer PathComparer { get; } =
+        OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+
+    public string GetCanonicalPath(string path)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        return Path.GetFullPath(path);
+    }
 
     public bool FileExists(string path)
     {
@@ -190,8 +202,15 @@ public sealed partial class PhysicalFileSystem :
 /// Gives <see cref="SqlitePager"/> its required shared data handles without
 /// weakening the default sharing policy for direct page-store users.
 /// </summary>
-internal sealed class SqlitePagerPhysicalFileSystem(PhysicalFileSystem fileSystem) : IFileSystem, IAtomicFileSystem
+internal sealed class SqlitePagerPhysicalFileSystem(PhysicalFileSystem fileSystem) :
+    IFileSystem,
+    IAtomicFileSystem,
+    IStoragePathResolver
 {
+    public StringComparer PathComparer => fileSystem.PathComparer;
+
+    public string GetCanonicalPath(string path) => fileSystem.GetCanonicalPath(path);
+
     public bool FileExists(string path) => fileSystem.FileExists(path);
 
     public FileWriteStamp? GetWriteStamp(string path) => fileSystem.GetWriteStamp(path);

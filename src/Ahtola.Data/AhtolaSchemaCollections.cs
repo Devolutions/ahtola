@@ -3,6 +3,7 @@ using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using System.Text.RegularExpressions;
+using Ahtola.Core;
 
 namespace Ahtola;
 
@@ -728,6 +729,15 @@ internal static class AhtolaSchemaCollections
 
     private static Dictionary<string, ReaderSchemaColumn> GetTableColumns(DbConnection connection, string tableName)
     {
+        // Only dispatch to the managed fast path when the connection is actually backed by a
+        // managed adapter. AhtolaConnection/SqliteConnection implement IManagedSchemaConnection
+        // unconditionally (native local and remote connections included), so checking the
+        // interface alone would route those connections into ManagedSchemaConnection, which has
+        // no adapter to return. Falling through to the PRAGMA-based path below keeps native and
+        // remote connections on their normal provider-neutral schema lookup.
+        if (connection is IManagedSchemaConnection { ManagedSchemaConnection: { } managedConnection })
+            return GetManagedTableColumns(managedConnection, tableName);
+
         var columns = new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
         using (var command = connection.CreateCommand())
         {
@@ -765,6 +775,83 @@ internal static class AhtolaSchemaCollections
         }
 
         return columns;
+    }
+
+    private static Dictionary<string, ReaderSchemaColumn> GetManagedTableColumns(
+        IManagedConnectionAdapter connection,
+        string tableName)
+    {
+        var columns = new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
+        using (var statement = connection.Prepare(
+                   BuildManagedPragma(tableName, "table_info")))
+        {
+            while (statement.Step() == StatementStepResult.Row)
+            {
+                var name = statement.GetValue(1).AsText();
+                columns[name] = new ReaderSchemaColumn(
+                    name,
+                    statement.GetValue(2).AsText(),
+                    statement.GetValue(3).AsInteger() == 0,
+                    statement.GetValue(5).AsInteger() != 0,
+                    false);
+            }
+        }
+
+        if (columns.Count == 0)
+            return columns;
+
+        using var indexes = connection.Prepare(
+            BuildManagedPragma(tableName, "index_list"));
+        while (indexes.Step() == StatementStepResult.Row)
+        {
+            if (indexes.GetValue(2).AsInteger() == 0
+                || indexes.GetValue(4).AsInteger() != 0)
+            {
+                continue;
+            }
+
+            var indexName = indexes.GetValue(1).AsText();
+            using var info = connection.Prepare(
+                BuildManagedPragma(
+                    QualifyPragmaObject(tableName, indexName),
+                    "index_info"));
+            string? indexedColumn = null;
+            var indexedColumnCount = 0;
+            while (info.Step() == StatementStepResult.Row)
+            {
+                if (info.GetValue(2).Kind != SqlValueKind.Null)
+                {
+                    indexedColumn = info.GetValue(2).AsText();
+                    indexedColumnCount++;
+                }
+            }
+
+            if (indexedColumnCount == 1
+                && indexedColumn is not null
+                && columns.TryGetValue(indexedColumn, out var column))
+            {
+                columns[indexedColumn] = column with { IsUnique = true };
+            }
+        }
+
+        return columns;
+    }
+
+    private static string BuildManagedPragma(string objectName, string pragma)
+    {
+        var separator = objectName.IndexOf('.');
+        return separator < 0
+            ? $"PRAGMA {pragma}({QuoteIdentifier(objectName)});"
+            : $"PRAGMA {QuoteIdentifier(objectName[..separator])}.{pragma}"
+              + $"({QuoteIdentifier(objectName[(separator + 1)..])});";
+    }
+
+    private static string QualifyPragmaObject(string tableName, string objectName)
+    {
+        var separator = tableName.IndexOf('.');
+        return separator < 0
+            ? objectName
+            : tableName[..separator] + "." + objectName;
     }
 
     private static List<string> GetUniqueSingleColumnIndexNames(DbConnection connection, string tableName)

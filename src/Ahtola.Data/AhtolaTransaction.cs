@@ -28,6 +28,12 @@ public class AhtolaTransaction : DbTransaction
         _isolationLevel = NormalizeIsolationLevel(isolationLevel);
         _supportsSavepoints = connection.Capabilities.SupportsSavepoints;
         _isRemote = connection.IsRemote;
+        if (beginTransaction && connection.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous transaction creation is not supported by the browser database source. "
+                + "Use BeginTransactionAsync.");
+        }
 
         if (_isolationLevel == IsolationLevel.ReadUncommitted)
             connection.ReadUncommitted = true;
@@ -88,6 +94,13 @@ public class AhtolaTransaction : DbTransaction
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing && !_completed && _connection?.RequiresAsyncExecution == true)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous transaction disposal is not supported by the browser database source. "
+                + "Use DisposeAsync or RollbackAsync.");
+        }
+
         if (!_completed)
         {
             if (_rootFailure is not null || _connection is null || _connection.State == System.Data.ConnectionState.Closed)
@@ -106,6 +119,31 @@ public class AhtolaTransaction : DbTransaction
         }
 
         base.Dispose(disposing);
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (_connection?.RequiresAsyncExecution != true)
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
+        if (!_completed)
+        {
+            if (_rootFailure is not null
+                || _connection is null
+                || _connection.State == System.Data.ConnectionState.Closed)
+            {
+                CompleteTransaction();
+            }
+            else
+            {
+                await RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+
+        await base.DisposeAsync().ConfigureAwait(false);
     }
 
     public override IsolationLevel IsolationLevel => _isolationLevel;
@@ -135,6 +173,7 @@ public class AhtolaTransaction : DbTransaction
 
     public override void Commit()
     {
+        ThrowIfSynchronousBrowserOperation("CommitAsync");
         ThrowIfCompleted();
         ThrowRootFailureIfPresent();
         var connection = GetConnection();
@@ -169,6 +208,7 @@ public class AhtolaTransaction : DbTransaction
 
     public override void Rollback()
     {
+        ThrowIfSynchronousBrowserOperation("RollbackAsync");
         ThrowIfCompleted();
         ThrowRootFailureIfPresent();
         var connection = GetConnection();
@@ -263,6 +303,7 @@ public class AhtolaTransaction : DbTransaction
 
     public override void Save(string savepointName)
     {
+        ThrowIfSynchronousBrowserOperation("SaveAsync");
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
         ThrowRootFailureIfPresent(completeTransaction: false);
@@ -281,6 +322,7 @@ public class AhtolaTransaction : DbTransaction
 
     public override void Rollback(string savepointName)
     {
+        ThrowIfSynchronousBrowserOperation("RollbackAsync");
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
         ThrowRootFailureIfPresent(completeTransaction: false);
@@ -299,6 +341,7 @@ public class AhtolaTransaction : DbTransaction
 
     public override void Release(string savepointName)
     {
+        ThrowIfSynchronousBrowserOperation("ReleaseAsync");
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
         ThrowRootFailureIfPresent(completeTransaction: false);
@@ -347,6 +390,16 @@ public class AhtolaTransaction : DbTransaction
 
     private AhtolaConnection GetConnection()
         => _connection ?? throw new InvalidOperationException("This transaction has already completed.");
+
+    private void ThrowIfSynchronousBrowserOperation(string asyncAlternative)
+    {
+        if (_connection?.RequiresAsyncExecution == true)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous transaction operations are not supported by the browser database source. "
+                + $"Use {asyncAlternative}.");
+        }
+    }
 
     private async Task ExecuteNonQueryAsync(string sql, CancellationToken cancellationToken)
     {

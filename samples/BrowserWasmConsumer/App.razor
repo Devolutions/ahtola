@@ -1,0 +1,655 @@
+@using System.Globalization
+@using Ahtola
+@using Ahtola.Data.Sqlite
+@using Microsoft.EntityFrameworkCore
+
+<PageTitle>Ahtola browser package consumer</PageTitle>
+
+<h1>Ahtola browser package consumer</h1>
+<p id="browser-test-status">@status</p>
+
+@code {
+    private string status = "pending";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+            return;
+
+        try
+        {
+            var capabilities = await AhtolaBrowserRuntime.GetCapabilitiesAsync();
+            var storage = await AhtolaBrowserStorageDiagnostics.RunAsync();
+            var crypto = await AhtolaBrowserCryptoDiagnostics.RunKnownAnswersAsync();
+            var ado = await RunAdoAsync();
+            var ef = await RunEfAsync();
+            long persistentAdo;
+            try
+            {
+                persistentAdo = await RunPersistentAdoAsync();
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidOperationException("persistent-ado failed", exception);
+            }
+            long persistentEf;
+            try
+            {
+                persistentEf = await RunPersistentEfAsync();
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidOperationException("persistent-ef failed", exception);
+            }
+            var persistentCore = await RunPersistentCoreAsync();
+            var persistentFeatures = await RunPersistentFeaturesAsync();
+            var browserMemory = await RunBrowserMemoryAsync();
+            var reservedPathRejected = await RunReservedPathRejectedAsync();
+            var workerIsolation = await RunWorkerIsolationAsync();
+            var persistentBlob = await RunPersistentBlobAsync();
+            var persistentBackup = await RunPersistentBackupAsync();
+            var persistentInboundBackup = await RunPersistentInboundBackupAsync();
+            var persistentEncrypted = await RunPersistentEncryptedAsync();
+            var encryptedMaintenance = await RunEncryptedMaintenanceAsync();
+            var persistentEncryptedPassword = await RunPersistentEncryptedPasswordAsync();
+            var encryptedWrongKeyRejected = await RunEncryptedWrongKeyAsync();
+            var encryptedCipherMismatchRejected = await RunEncryptedCipherMismatchAsync();
+            status =
+                $"PASS:capabilities={capabilities.IsSupported};"
+                + $"storage={storage.Succeeded};"
+                + $"crypto={crypto.Succeeded};"
+                + $"ado={ado};ef={ef};"
+                + $"persistent-ado={persistentAdo};persistent-ef={persistentEf};"
+                + $"persistent-core={persistentCore};"
+                + $"persistent-features={persistentFeatures};"
+                + $"browser-memory={browserMemory};"
+                + $"reserved-path-rejected={reservedPathRejected};"
+                + $"worker-isolation={workerIsolation};"
+                + $"persistent-blob={persistentBlob};"
+                + $"persistent-backup={persistentBackup};"
+                + $"persistent-inbound-backup={persistentInboundBackup};"
+                + $"persistent-encrypted={persistentEncrypted};"
+                + $"encrypted-maintenance={encryptedMaintenance};"
+                + $"persistent-encrypted-password={persistentEncryptedPassword};"
+                + $"encrypted-wrong-key-rejected={encryptedWrongKeyRejected};"
+                + $"encrypted-cipher-mismatch-rejected={encryptedCipherMismatchRejected}";
+        }
+        catch (Exception exception)
+        {
+            var root = exception.GetBaseException();
+            status =
+                $"FAIL:{exception.GetType().Name}:{exception.Message}:"
+                + $"{root.GetType().Name}:{root.Message}";
+        }
+
+        StateHasChanged();
+    }
+
+    private static async Task<long> RunAdoAsync()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:;Mode=Memory");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TABLE probe(value INTEGER NOT NULL);
+            INSERT INTO probe(value) VALUES (42);
+            SELECT value FROM probe;
+            """;
+        var result = await command.ExecuteScalarAsync();
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture);
+    }
+
+    private static async Task<long> RunEfAsync()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:;Mode=Memory");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<ProbeContext>()
+            .UseAhtola(connection)
+            .Options;
+        await using var context = new ProbeContext(options);
+        await context.Database.EnsureCreatedAsync();
+        context.Rows.Add(new ProbeRow { Value = 84 });
+        await context.SaveChangesAsync();
+        return await context.Rows.Select(static row => row.Value).SingleAsync();
+    }
+
+    private static async Task<long> RunPersistentAdoAsync()
+    {
+        const string path = "packed-consumer/ado.db";
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                CREATE TABLE probe(value INTEGER NOT NULL);
+                INSERT INTO probe(value) VALUES (126);
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<long> RunPersistentEfAsync()
+    {
+        const string path = "packed-consumer-ef/main.db";
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            var options = new DbContextOptionsBuilder<ProbeContext>()
+                .UseAhtola(connection)
+                .Options;
+            await using var context = new ProbeContext(options);
+            await context.Database.EnsureCreatedAsync();
+            context.Rows.Add(new ProbeRow { Value = 168 });
+            await context.SaveChangesAsync();
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            var options = new DbContextOptionsBuilder<ProbeContext>()
+                .UseAhtola(connection)
+                .Options;
+            await using var context = new ProbeContext(options);
+            return await context.Rows.Select(static row => row.Value).SingleAsync();
+        }
+    }
+
+    private static async Task<long> RunPersistentCoreAsync()
+    {
+        const string path = "packed-consumer-core/main.db";
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = source.CreateAhtolaConnection();
+            await connection.OpenAsync();
+            await using (var create = connection.CreateCommand())
+            {
+                create.CommandText = "CREATE TABLE probe(value INTEGER NOT NULL)";
+                await create.ExecuteNonQueryAsync();
+            }
+
+            await using (var insert = connection.CreateCommand())
+            {
+                insert.CommandText = "INSERT INTO probe(value) VALUES (210)";
+                await insert.ExecuteNonQueryAsync();
+            }
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = source.CreateAhtolaConnection();
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<long> RunPersistentFeaturesAsync()
+    {
+        const string mainPath = "packed-consumer-features/main.db";
+        const string attachedPath = "packed-consumer-features/attached.db";
+        await using (var source = new AhtolaBrowserDataSource(mainPath))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(connection, $"ATTACH DATABASE '{attachedPath}' AS aux", "attach");
+            await ExecuteFeatureAsync(connection, "CREATE TABLE aux.probe(value INTEGER NOT NULL)", "create attached");
+            await ExecuteFeatureAsync(connection, "INSERT INTO aux.probe(value) VALUES (252)", "insert attached");
+            await ExecuteFeatureAsync(connection, "CREATE TABLE local_probe(value INTEGER NOT NULL)", "create local");
+            await ExecuteFeatureAsync(connection, "PRAGMA main.journal_mode = mvcc", "main mvcc");
+            await ExecuteFeatureAsync(connection, "PRAGMA aux.journal_mode = mvcc", "attached mvcc");
+            await ExecuteFeatureAsync(connection, "BEGIN CONCURRENT", "begin concurrent");
+            await ExecuteFeatureAsync(connection, "INSERT INTO local_probe(value) VALUES (294)", "insert concurrent");
+            await ExecuteFeatureAsync(connection, "COMMIT", "commit concurrent");
+            await ExecuteFeatureAsync(connection, "VACUUM", "vacuum");
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(mainPath))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                $"ATTACH DATABASE '{attachedPath}' AS aux",
+                "reopen attach");
+            var attached = await ExecuteScalarFeatureAsync(
+                connection,
+                "SELECT value FROM aux.probe",
+                "read attached");
+            var local = await ExecuteScalarFeatureAsync(
+                connection,
+                "SELECT value FROM local_probe",
+                "read local");
+            return attached + local;
+        }
+    }
+
+    private static async Task<long> RunBrowserMemoryAsync()
+    {
+        await using var source = new AhtolaBrowserDataSource(":memory:");
+        await using (var connection = await source.OpenConnectionAsync())
+        {
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (504);",
+                "browser memory setup");
+        }
+
+        await using (var connection = await source.OpenConnectionAsync())
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<bool> RunReservedPathRejectedAsync()
+    {
+        try
+        {
+            await using var source = new AhtolaBrowserDataSource(
+                "packed-consumer-reserved/.ahtola-replace-user.db",
+                "packed-consumer-reserved");
+            await using var connection = await source.OpenConnectionAsync();
+            return false;
+        }
+        catch (ArgumentException exception) when (
+            exception.Message.Contains(".ahtola-replace-", StringComparison.Ordinal))
+        {
+            return true;
+        }
+    }
+
+    private static async Task<long> RunWorkerIsolationAsync()
+    {
+        // These names collide under the old 32-bit FNV-1a intent-slot hash.
+        await using var firstSource = new AhtolaBrowserDataSource("tenant-97018/main.db");
+        await using var secondSource = new AhtolaBrowserDataSource("tenant-180400/main.db");
+        await using var first = await firstSource.OpenConnectionAsync();
+        await using var second = await secondSource.OpenConnectionAsync();
+        await ExecuteFeatureAsync(
+            first,
+            "CREATE TABLE probe(value INTEGER NOT NULL); INSERT INTO probe VALUES (1);",
+            "first collision-isolation database");
+        await ExecuteFeatureAsync(
+            second,
+            "CREATE TABLE probe(value INTEGER NOT NULL); INSERT INTO probe VALUES (2);",
+            "second collision-isolation database");
+        return await ExecuteScalarFeatureAsync(first, "SELECT value FROM probe", "read first isolated database")
+               + await ExecuteScalarFeatureAsync(second, "SELECT value FROM probe", "read second isolated database");
+    }
+
+    private static async Task<string> RunPersistentBlobAsync()
+    {
+        const string path = "packed-consumer-blob/main.db";
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE blobs(value BLOB);"
+                + "INSERT INTO blobs(rowid, value) VALUES (1, X'01020304');",
+                "blob setup");
+            await using var blob = await connection.OpenBlobAsync("blobs", "value", 1);
+            var prefix = new byte[2];
+            if (await blob.ReadAsync(prefix) != prefix.Length)
+                throw new InvalidOperationException("Blob prefix was truncated.");
+            await blob.WriteAsync(new byte[] { 9, 8 });
+            await blob.FlushAsync();
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT hex(value) FROM blobs WHERE rowid = 1";
+            return Convert.ToString(
+                       await command.ExecuteScalarAsync(),
+                       CultureInfo.InvariantCulture)
+                   ?? string.Empty;
+        }
+    }
+
+    private static async Task<long> RunPersistentBackupAsync()
+    {
+        const string sourcePath = "packed-consumer-backup/source.db";
+        const string destinationPath = "packed-consumer-backup-destination/main.db";
+        await using (var sourceDataSource = new AhtolaBrowserDataSource(sourcePath))
+        await using (var destinationDataSource = new AhtolaBrowserDataSource(destinationPath))
+        {
+            await using var source = await sourceDataSource.OpenConnectionAsync();
+            await using var destination = destinationDataSource.CreateConnection();
+            await ExecuteFeatureAsync(
+                source,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (336);",
+                "backup setup");
+            await source.BackupDatabaseAsync(destination);
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(destinationPath))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<long> RunPersistentInboundBackupAsync()
+    {
+        const string destinationPath = "packed-consumer-inbound-backup/main.db";
+        await using (var source = new SqliteConnection(
+                         "Data Source=:memory:;Local Provider=Managed;Pooling=False"))
+        await using (var destinationDataSource = new AhtolaBrowserDataSource(destinationPath))
+        {
+            await source.OpenAsync();
+            await using var destination = destinationDataSource.CreateConnection();
+            await ExecuteFeatureAsync(
+                source,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (378);",
+                "inbound backup setup");
+            await source.BackupDatabaseAsync(destination);
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(destinationPath))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<long> RunPersistentEncryptedAsync()
+    {
+        const string path = "packed-consumer-encrypted/main.db";
+        const string hexKey = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            if (options.ConnectionString.Contains(hexKey, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The connection string leaked encryption key material.");
+
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (420);",
+                "encrypted setup");
+        }
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<long> RunEncryptedMaintenanceAsync()
+    {
+        const string ownedDirectory = "packed-consumer-encrypted-maintenance";
+        const string path = ownedDirectory + "/main.db";
+        const string vacuumPath = ownedDirectory + "/vacuum.db";
+        const string hexKey = "101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F";
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(
+                   path,
+                   ownedDirectory,
+                   encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (588);"
+                + "PRAGMA journal_mode=DELETE;"
+                + "PRAGMA page_size=8192;"
+                + "VACUUM;",
+                "encrypted page-size migration");
+            await ExecuteFeatureAsync(
+                connection,
+                $"VACUUM INTO '{vacuumPath}';",
+                "encrypted vacuum into");
+        }
+
+        long mainValue;
+        long pageSize;
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(
+                   path,
+                   ownedDirectory,
+                   encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            mainValue = await ExecuteScalarFeatureAsync(
+                connection,
+                "SELECT value FROM probe",
+                "read migrated encrypted database");
+            pageSize = await ExecuteScalarFeatureAsync(
+                connection,
+                "PRAGMA page_size",
+                "read migrated encrypted page size");
+        }
+
+        long vacuumValue;
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   hexKey))
+        using (var options = new AhtolaBrowserOptions(
+                   vacuumPath,
+                   ownedDirectory,
+                   encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            vacuumValue = await ExecuteScalarFeatureAsync(
+                connection,
+                "SELECT value FROM probe",
+                "read encrypted vacuum destination");
+        }
+
+        return mainValue + pageSize + vacuumValue;
+    }
+
+    private static async Task<long> RunPersistentEncryptedPasswordAsync()
+    {
+        const string path = "packed-consumer-encrypted-password/main.db";
+        const string password = "packed-consumer-passphrase";
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromPassword(password))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            if (options.ConnectionString.Contains(password, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The connection string leaked the passphrase.");
+
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (462);",
+                "encrypted password setup");
+        }
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromPassword(password))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<bool> RunEncryptedWrongKeyAsync()
+    {
+        const string path = "packed-consumer-encrypted-wrong-key/main.db";
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromPassword("first-passphrase"))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (504);",
+                "wrong-key setup");
+        }
+
+        using var wrong = AhtolaBrowserEncryptionOptions.FromPassword("second-passphrase");
+        using var wrongOptions = new AhtolaBrowserOptions(path, encryption: wrong);
+        try
+        {
+            await using var source = new AhtolaBrowserDataSource(wrongOptions);
+            await using var connection = await source.OpenConnectionAsync();
+            return false;
+        }
+        catch (Exception exception) when (IsEncryptionRejection(exception))
+        {
+            return true;
+        }
+    }
+
+    private static async Task<bool> RunEncryptedCipherMismatchAsync()
+    {
+        const string path = "packed-consumer-encrypted-cipher/main.db";
+        const string aes256Key = "0F0E0D0C0B0A09080706050403020100F0E0D0C0B0A090807060504030201000";
+        const string aes128Key = "0F0E0D0C0B0A09080706050403020100";
+
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   aes256Key))
+        using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
+        {
+            await using var source = new AhtolaBrowserDataSource(options);
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (546);",
+                "cipher mismatch setup");
+        }
+
+        // The AHTLA header records the cipher id, so opening an AES-256 database
+        // with AES-256 key material of the wrong cipher must fail closed instead
+        // of silently falling back.
+        using var mismatched = AhtolaBrowserEncryptionOptions.FromHex(
+            AhtolaEncryptionCipher.Aes128Gcm,
+            aes128Key);
+        using var mismatchedOptions = new AhtolaBrowserOptions(path, encryption: mismatched);
+        try
+        {
+            await using var source = new AhtolaBrowserDataSource(mismatchedOptions);
+            await using var connection = await source.OpenConnectionAsync();
+            return false;
+        }
+        catch (Exception exception) when (IsEncryptionRejection(exception))
+        {
+            return true;
+        }
+    }
+
+    /// Encrypted-open failures surface as InvalidDataException wrapping the
+    /// Web Crypto CryptographicException, so the whole chain must be inspected
+    /// rather than only the innermost JSException.
+    private static bool IsEncryptionRejection(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is InvalidDataException or System.Security.Cryptography.CryptographicException)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static async Task ExecuteFeatureAsync(
+        SqliteConnection connection,
+        string sql,
+        string phase)
+    {
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException($"persistent feature phase '{phase}' failed", exception);
+        }
+    }
+
+    private static async Task<long> ExecuteScalarFeatureAsync(
+        SqliteConnection connection,
+        string sql,
+        string phase)
+    {
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException($"persistent feature phase '{phase}' failed", exception);
+        }
+    }
+
+    private sealed class ProbeContext(DbContextOptions<ProbeContext> options) : DbContext(options)
+    {
+        public DbSet<ProbeRow> Rows => Set<ProbeRow>();
+    }
+
+    private sealed class ProbeRow
+    {
+        public int Id { get; set; }
+
+        public long Value { get; set; }
+    }
+}

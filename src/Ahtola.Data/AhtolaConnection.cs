@@ -6,7 +6,11 @@ using Ahtola.Core.Storage;
 
 namespace Ahtola;
 
-public class AhtolaConnection : DbConnection, ILocalReaderConnection
+public class AhtolaConnection :
+    DbConnection,
+    ILocalReaderConnection,
+    IManagedSchemaConnection,
+    IAsyncExecutionConnection
 {
     internal const int AutomaticSyncMaximumAttempts = 3;
     // Test-only transport seam. Production callers continue to use the default HttpClient transport.
@@ -16,6 +20,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     private AhtolaReplicaDatabase? _replicaDatabase;
     private ManagedReplicaConnectionHost? _managedReplicaHost;
     private IManagedDatabaseAdapter? _managedDatabase;
+    private readonly IManagedDatabaseFactory? _managedDatabaseFactory;
     private ManagedConnectionPoolLease? _managedPoolLease;
     private ManagedConnectionPoolKey? _managedPoolKey;
     private AhtolaRemoteClient? _remoteClient;
@@ -45,6 +50,11 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         get => _connectionOptions.GetConnectionString();
         set
         {
+            if (_managedDatabaseFactory is not null)
+            {
+                throw new InvalidOperationException(
+                    "Connections created by a browser data source cannot replace its connection string.");
+            }
             if (State == ConnectionState.Open)
                 throw new InvalidOperationException("ConnectionString cannot be set while the connection is open.");
 
@@ -81,6 +91,11 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         get => _pageCodec;
         set
         {
+            if (_managedDatabaseFactory is not null)
+            {
+                throw new InvalidOperationException(
+                    "Connections created by a browser data source cannot replace its page codec.");
+            }
             if (State == ConnectionState.Open)
                 throw new InvalidOperationException("PageCodec cannot be set while the connection is open.");
             if (value is not null)
@@ -106,6 +121,21 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         _remoteClient = remoteClient ?? throw new ArgumentNullException(nameof(remoteClient));
     }
 
+    internal AhtolaConnection(
+        string connectionString,
+        IManagedDatabaseFactory managedDatabaseFactory)
+        : this(connectionString)
+    {
+        _managedDatabaseFactory = managedDatabaseFactory
+            ?? throw new ArgumentNullException(nameof(managedDatabaseFactory));
+    }
+
+    internal AhtolaConnection(IManagedDatabaseAdapter managedDatabase)
+        : this("")
+    {
+        _managedDatabase = managedDatabase ?? throw new ArgumentNullException(nameof(managedDatabase));
+    }
+
     /// <summary>
     /// Creates a connection configured as an embedded replica.
     /// </summary>
@@ -126,6 +156,11 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     public override void Open()
     {
+        if (_managedDatabaseFactory is not null)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous Open is not supported by the browser database source. Use OpenAsync.");
+        }
         ValidateCanOpen();
         OpenCore();
     }
@@ -134,6 +169,12 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     {
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
+
+        if (_managedDatabaseFactory is not null)
+        {
+            ValidateCanOpen();
+            return OpenManagedFactoryAsync(cancellationToken);
+        }
 
         if (_connectionOptions.IsRemote && _connectionOptions.IsReplica)
         {
@@ -155,6 +196,27 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             CancellationToken.None);
     }
 
+    private async Task OpenManagedFactoryAsync(CancellationToken cancellationToken)
+    {
+        IManagedDatabaseAdapter? database = null;
+        try
+        {
+            database = await _managedDatabaseFactory!
+                .OpenDatabaseAsync(cancellationToken)
+                .ConfigureAwait(false);
+            _ = await database.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            _managedDatabase = database;
+            database = null;
+            _managedReadOnly = _managedDatabaseFactory.IsReadOnly;
+            _managedSharedMemory = _managedDatabaseFactory.IsSharedMemory;
+        }
+        finally
+        {
+            if (database is not null)
+                await database.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     public static void ClearAllPools() => ManagedConnectionPool.ClearAll();
 
     public static void ClearPool(AhtolaConnection connection)
@@ -169,6 +231,12 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     public override void Close()
     {
+        if (_managedDatabaseFactory is not null && _managedDatabase is not null)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous Close is not supported by the browser database source. Use CloseAsync.");
+        }
+
         _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: true);
         var automaticSyncError = StopAutomaticManagedReplicaSync();
         if (_remoteClient is not null)
@@ -270,8 +338,69 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cancellationError).Throw();
     }
 
+    public override Task CloseAsync()
+        => _managedDatabaseFactory is null
+            ? base.CloseAsync()
+            : CloseManagedFactoryAsync();
+
+    private async Task CloseManagedFactoryAsync()
+    {
+        var database = _managedDatabase;
+        if (database is null)
+            return;
+
+        Exception? cleanupError = null;
+        try
+        {
+            if (_transaction is { IsCompleted: false } transaction)
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            if (_transaction is not null)
+                await _transaction.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupError = exception;
+        }
+        try
+        {
+            await CloseOpenReadersAsync().ConfigureAwait(false);
+            ResetOpenCommands();
+        }
+        catch (Exception exception)
+        {
+            cleanupError = CombineDisposalErrors(cleanupError, exception);
+        }
+        finally
+        {
+            _managedDatabase = null;
+            _transaction = null;
+            _readUncommitted = false;
+            _managedReadOnly = false;
+            try
+            {
+                await database.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                cleanupError = CombineDisposalErrors(cleanupError, exception);
+            }
+        }
+
+        if (cleanupError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupError).Throw();
+    }
+
     protected override void Dispose(bool disposing)
     {
+        if (disposing
+            && !_disposed
+            && _managedDatabaseFactory is not null
+            && State != ConnectionState.Closed)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous disposal is not supported by the browser database source. Use DisposeAsync.");
+        }
+
         if (!disposing || _disposed)
         {
             _disposed = true;
@@ -316,6 +445,40 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(disposalError).Throw();
     }
 
+    public override async ValueTask DisposeAsync()
+    {
+        if (_managedDatabaseFactory is null)
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+        if (_disposed)
+            return;
+
+        Exception? disposalError = null;
+        try
+        {
+            await CloseAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            disposalError = exception;
+        }
+
+        _disposed = true;
+        try
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            disposalError = CombineDisposalErrors(disposalError, exception);
+        }
+
+        if (disposalError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(disposalError).Throw();
+    }
+
     private static Exception CombineDisposalErrors(Exception? existing, Exception next)
         => existing is null
             ? next
@@ -323,6 +486,12 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
+        if (RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous transaction creation is not supported by the browser database source. "
+                + "Use BeginTransactionAsync.");
+        }
         ValidateCanBeginTransaction();
 
         return _transaction = new AhtolaTransaction(this, isolationLevel);
@@ -490,6 +659,10 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     internal bool IsManaged => _managedReplicaHost is not null || _managedDatabase is not null;
 
+    internal bool RequiresAsyncExecution => _managedDatabaseFactory is not null;
+
+    bool IAsyncExecutionConnection.RequiresAsyncExecution => RequiresAsyncExecution;
+
     internal AhtolaTransaction? Transaction => _transaction;
 
     internal bool ReadUncommitted
@@ -517,6 +690,9 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         => _managedReplicaHost?.Database.Connection
            ?? _managedDatabase?.Connection
            ?? throw new InvalidOperationException("Ahtola database is closed.");
+
+    IManagedConnectionAdapter? IManagedSchemaConnection.ManagedSchemaConnection
+        => IsManaged ? ManagedConnection : null;
 
     internal IDisposable? EnterManagedReplicaOperation(CancellationToken cancellationToken)
     {
@@ -1516,6 +1692,30 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             readers = _openReaders.ToArray();
         foreach (var reader in readers)
             reader.CloseFromConnection();
+    }
+
+    private async ValueTask CloseOpenReadersAsync()
+    {
+        IConnectionOwnedReader[] readers;
+        lock (_readerLock)
+            readers = _openReaders.ToArray();
+        List<Exception>? failures = null;
+        foreach (var reader in readers)
+        {
+            try
+            {
+                await reader.CloseFromConnectionAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+
+        if (failures is { Count: 1 })
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        if (failures is not null)
+            throw new AggregateException("One or more readers could not be closed.", failures);
     }
 
     private void ResetOpenCommands()

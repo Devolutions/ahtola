@@ -1,10 +1,13 @@
 # Ahtola ↔ Turso gap analysis
 
-**Scope.** Exhaustive comparison of the Ahtola managed engine against the pinned
-Turso Rust core — `turso-src/` submodule at tag **v0.7.2** (commit `046e9cbf6`) —
-across all seven layers: **VDBE** (deep-dive priority), compilation/translate,
-parser/dialect, built-in functions, storage/pager/WAL/b-tree, MVCC/transactions,
-and sync/replication.
+**Scope.** Exhaustive comparison of the Ahtola managed engine against its
+historical Turso **v0.7.2** baseline (commit `046e9cbf6`) across all seven
+layers: **VDBE** (deep-dive priority), compilation/translate, parser/dialect,
+built-in functions, storage/pager/WAL/b-tree, MVCC/transactions, and
+sync/replication. The read-only `turso-src/` submodule now pins
+**v0.8.0-pre.7** (`277ddd050`) for browser-WASM work; use
+`git -C turso-src show v0.7.2:<path>` when reproducing citations from this
+historical analysis.
 
 **Companion artifact.** [`turso-gap-inventory.json`](./turso-gap-inventory.json) —
 the machine-readable inventory, with stable IDs for status tracking

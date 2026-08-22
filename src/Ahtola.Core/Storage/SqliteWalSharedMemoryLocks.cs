@@ -18,7 +18,9 @@ namespace Ahtola.Core.Storage;
 /// process can still be using it. See
 /// <c>docs/wal-interoperability-contract.md</c> for the normative lock-byte map.
 /// </remarks>
-internal sealed class SqliteWalSharedMemoryLocks : ISqlitePagerLockCoordinator
+internal sealed class SqliteWalSharedMemoryLocks :
+    ISqlitePagerLockCoordinator,
+    IAsyncSqlitePagerLockCoordinator
 {
     private const long WriteLockOffset = 120;
     private const long RecoveryLockOffset = 122;
@@ -77,6 +79,48 @@ internal sealed class SqliteWalSharedMemoryLocks : ISqlitePagerLockCoordinator
             length: 1,
             timeout,
             allowCreate: true);
+
+    public ValueTask<IDisposable> AcquireAsync(
+        SqlitePagerLockOperation operation,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+        => AcquireAsync(operation, timeout, pagerReadOnly: true, cancellationToken);
+
+    internal ValueTask<IDisposable> AcquireAsync(
+        SqlitePagerLockOperation operation,
+        TimeSpan timeout,
+        bool pagerReadOnly,
+        CancellationToken cancellationToken = default)
+        => operation switch
+        {
+            SqlitePagerLockOperation.Reader => AcquireReaderAsync(timeout, pagerReadOnly, cancellationToken),
+            SqlitePagerLockOperation.Writer => AcquireExclusiveRangeAsync(
+                operation,
+                WriteLockOffset,
+                length: 1,
+                timeout,
+                allowCreate: true,
+                cancellationToken),
+            SqlitePagerLockOperation.Checkpoint => AcquireExclusiveRangeAsync(
+                operation,
+                WriteLockOffset,
+                LockRangeLength,
+                timeout,
+                allowCreate: true,
+                cancellationToken),
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown SQLite WAL lock operation."),
+        };
+
+    public ValueTask<IDisposable> AcquireRecoveryAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+        => AcquireExclusiveRangeAsync(
+            SqlitePagerLockOperation.Writer,
+            RecoveryLockOffset,
+            length: 1,
+            timeout,
+            allowCreate: true,
+            cancellationToken);
 
     private IDisposable AcquireReader(TimeSpan timeout, bool pagerReadOnly)
     {
@@ -141,6 +185,7 @@ internal sealed class SqliteWalSharedMemoryLocks : ISqlitePagerLockCoordinator
                         _activeRangeCount++;
                         return new RangeLease(this, lease);
                     }
+
                 }
                 catch (IOException exception)
                 {
@@ -154,6 +199,100 @@ internal sealed class SqliteWalSharedMemoryLocks : ISqlitePagerLockCoordinator
 
             if (!WaitForRetry(timeout, stopwatch))
                 throw CreateBusyException(operation, timeout, contention as IOException);
+        }
+    }
+
+    private async ValueTask<IDisposable> AcquireReaderAsync(
+        TimeSpan timeout,
+        bool pagerReadOnly,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureCarrierExists(allowCreate: !pagerReadOnly);
+        var stopwatch = StartTimeout(timeout);
+        var attempt = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (_gate)
+            {
+                ThrowIfFailed();
+                if (_readerReferenceCount != 0)
+                {
+                    _readerReferenceCount++;
+                    return new ReaderLease(this);
+                }
+
+                for (var slot = 0; slot < ReaderLockCount; slot++)
+                {
+                    if (_byteRangeLocks.TryAcquireShared(
+                            FirstReaderLockOffset + slot,
+                            length: 1,
+                            out var lease)
+                        && lease is not null)
+                    {
+                        _readerLockOffset = FirstReaderLockOffset + slot;
+                        _readerLease = lease;
+                        _readerReferenceCount = 1;
+                        _activeRangeCount++;
+                        return new ReaderLease(this);
+                    }
+                }
+            }
+
+            if (!await SqliteBusyBackoff
+                    .WaitAsync(attempt++, timeout, stopwatch, cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                throw CreateBusyException(SqlitePagerLockOperation.Reader, timeout, innerException: null);
+            }
+        }
+    }
+
+    private async ValueTask<IDisposable> AcquireExclusiveRangeAsync(
+        SqlitePagerLockOperation operation,
+        long offset,
+        long length,
+        TimeSpan timeout,
+        bool allowCreate,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureCarrierExists(allowCreate);
+        var stopwatch = StartTimeout(timeout);
+        var attempt = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Exception? contention = null;
+            lock (_gate)
+            {
+                ThrowIfFailed();
+                try
+                {
+                    if (_byteRangeLocks.TryAcquireExclusive(offset, length, out var lease)
+                        && lease is not null)
+                    {
+                        _activeRangeCount++;
+                        return new RangeLease(this, lease);
+                    }
+                }
+                catch (IOException exception)
+                {
+                    contention = exception;
+                }
+                catch (UnauthorizedAccessException exception)
+                {
+                    contention = exception;
+                }
+            }
+
+            if (!await SqliteBusyBackoff
+                    .WaitAsync(attempt++, timeout, stopwatch, cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                throw CreateBusyException(operation, timeout, contention as IOException);
+            }
         }
     }
 

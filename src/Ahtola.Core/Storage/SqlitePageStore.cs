@@ -730,7 +730,7 @@ public sealed class SqlitePageStore : IDisposable
     }
 
     private static bool IsAhtolaEncrypted(ReadOnlySpan<byte> header)
-        => header.Length >= 5 && header[..5].SequenceEqual("AHTLA"u8);
+        => AhtolaEncryptedPageFormat.IsAhtolaEncrypted(header);
 
     private static void ValidateFileLayout(
         long length,
