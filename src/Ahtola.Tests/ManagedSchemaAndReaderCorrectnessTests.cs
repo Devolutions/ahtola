@@ -202,6 +202,30 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
     }
 
     [Test]
+    public void ThrowingCloseCallback_SynchronousCloseStillDeregistersReader()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Pooling=False");
+        connection.Open();
+
+        using var command = connection.CreateCommand();
+        var thrown = new InvalidOperationException("Simulated synchronous close-callback failure.");
+        var reader = new SqliteDataReader(
+            command,
+            recordsAffected: 0,
+            CommandBehavior.Default,
+            closeCallback: () => throw thrown);
+
+        Action close = reader.Close;
+        close.Should().Throw<InvalidOperationException>().Which.Should().BeSameAs(thrown);
+        reader.IsClosed.Should().BeTrue();
+        connection.HasOpenReader.Should().BeFalse();
+
+        using var verify = connection.CreateCommand();
+        verify.CommandText = "SELECT 1";
+        verify.ExecuteScalar().Should().Be(1L);
+    }
+
+    [Test]
     public async Task BrowserReaderDisposalFailure_DisposeAsyncSwallowsOperationFailure_ButStillCleansUp()
     {
         var factory = new FaultInjectingManagedDatabaseFactory();

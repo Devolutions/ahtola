@@ -1563,12 +1563,41 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (_isClosed)
             return;
 
-        _closeCallback();
-        ((ILocalReaderConnection)_connection).ReaderClosed(this);
-        if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-            _connection.Close();
+        Exception? error = null;
+        try
+        {
+            _closeCallback();
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        try
+        {
+            ((ILocalReaderConnection)_connection).ReaderClosed(this);
+        }
+        catch (Exception ex)
+        {
+            error = CombineCloseErrors(error, ex);
+        }
 
         _isClosed = true;
+
+        if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+        {
+            try
+            {
+                _connection.Close();
+            }
+            catch (Exception ex)
+            {
+                error = CombineCloseErrors(error, ex);
+            }
+        }
+
+        if (error is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
     }
 
     private void EnsureOpen([CallerMemberName] string operation = "")
