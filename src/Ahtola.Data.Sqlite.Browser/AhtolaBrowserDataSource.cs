@@ -14,6 +14,8 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
     private readonly object _gate = new();
     private readonly AhtolaBrowserOptions _options;
     private readonly AhtolaBrowserEncryptionOptions? _encryption;
+    private readonly string _memoryName = "ahtola-browser-memory-" + Guid.NewGuid().ToString("N");
+    private IManagedDatabaseAdapter? _memoryOwner;
     private Task<StorageState>? _initialization;
     private TaskCompletionSource? _connectionsDrained;
     private int _activeConnections;
@@ -55,6 +57,8 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
 
     bool IManagedDatabaseFactory.IsReadOnly => _options.IsReadOnly;
 
+    bool IManagedDatabaseFactory.IsSharedMemory => _options.IsInMemory;
+
     public new SqliteConnection CreateConnection()
     {
         ThrowIfDisposed();
@@ -95,6 +99,23 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
     async ValueTask<IManagedDatabaseAdapter> IManagedDatabaseFactory.OpenDatabaseAsync(
         CancellationToken cancellationToken)
     {
+        if (_options.IsInMemory)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            EnsureMemoryDatabase();
+            AddConnectionReference();
+            try
+            {
+                var inner = global::Ahtola.ManagedSharedMemoryDatabase.Open(_memoryName);
+                return new BrowserInMemoryManagedDatabaseAdapter(inner, ReleaseConnection);
+            }
+            catch
+            {
+                ReleaseConnection();
+                throw;
+            }
+        }
+
         Task<StorageState> initialization;
         lock (_gate)
         {
@@ -119,14 +140,7 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
             }
             throw;
         }
-        lock (_gate)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            checked
-            {
-                _activeConnections++;
-            }
-        }
+        AddConnectionReference();
 
         try
         {
@@ -167,6 +181,7 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
     {
         Task<StorageState>? initialization;
         Task? drained = null;
+        IManagedDatabaseAdapter? memoryOwner;
         lock (_gate)
         {
             if (_disposed)
@@ -174,6 +189,8 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
 
             _disposed = true;
             initialization = _initialization;
+            memoryOwner = _memoryOwner;
+            _memoryOwner = null;
             if (_activeConnections != 0)
             {
                 _connectionsDrained = new TaskCompletionSource(
@@ -186,7 +203,15 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
             await drained.ConfigureAwait(false);
         if (initialization is null)
         {
-            _encryption?.Dispose();
+            try
+            {
+                if (memoryOwner is not null)
+                    await memoryOwner.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _encryption?.Dispose();
+            }
             return;
         }
 
@@ -270,6 +295,27 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         }
 
         drained?.TrySetResult();
+    }
+
+    private void AddConnectionReference()
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            checked
+            {
+                _activeConnections++;
+            }
+        }
+    }
+
+    private void EnsureMemoryDatabase()
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _memoryOwner ??= global::Ahtola.ManagedSharedMemoryDatabase.Open(_memoryName);
+        }
     }
 
     private void ThrowIfDisposed()

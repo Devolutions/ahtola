@@ -109,6 +109,12 @@ All database, `ATTACH`, WAL, journal, backup, and temporary paths are
 normalized relative paths. Traversal (`..`), absolute paths, and paths outside
 the owned directory are rejected.
 
+For a non-persistent database that still enforces the browser async-only
+contract, use `new AhtolaBrowserDataSource(":memory:")`. Connections from that
+data source share one managed in-memory database until the data source is
+disposed and do not initialize OPFS. Read-only and encryption settings are not
+applicable to `:memory:`.
+
 ## Async-only contract
 
 Connections produced by `AhtolaBrowserDataSource` never block on an incomplete

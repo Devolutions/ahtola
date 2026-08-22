@@ -116,6 +116,8 @@ internal interface IManagedDatabaseFactory
 
     bool IsReadOnly { get; }
 
+    bool IsSharedMemory => false;
+
     ValueTask<IManagedDatabaseAdapter> OpenDatabaseAsync(
         CancellationToken cancellationToken = default);
 }

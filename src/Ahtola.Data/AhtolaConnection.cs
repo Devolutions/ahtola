@@ -198,6 +198,7 @@ public class AhtolaConnection :
             _managedDatabase = database;
             database = null;
             _managedReadOnly = _managedDatabaseFactory.IsReadOnly;
+            _managedSharedMemory = _managedDatabaseFactory.IsSharedMemory;
         }
         finally
         {

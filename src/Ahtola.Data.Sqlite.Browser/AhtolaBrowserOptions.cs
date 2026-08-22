@@ -34,13 +34,33 @@ public sealed class AhtolaBrowserOptions : IDisposable
         bool readOnly = false,
         AhtolaBrowserEncryptionOptions? encryption = null)
     {
-        OwnedDirectory = NormalizePath(ownedDirectory, nameof(ownedDirectory));
-        DatabasePath = NormalizePath(databasePath, nameof(databasePath));
-        if (!DatabasePath.StartsWith(OwnedDirectory + "/", StringComparison.Ordinal))
+        IsInMemory = string.Equals(databasePath, ":memory:", StringComparison.Ordinal);
+        if (IsInMemory)
         {
-            throw new ArgumentException(
-                $"Browser database path '{DatabasePath}' must be below owned OPFS directory '{OwnedDirectory}'.",
-                nameof(databasePath));
+            if (!string.Equals(ownedDirectory, ":memory:", StringComparison.Ordinal))
+            {
+                throw new ArgumentException(
+                    "An in-memory browser data source must use ':memory:' as its owned directory.",
+                    nameof(ownedDirectory));
+            }
+            if (readOnly)
+                throw new ArgumentException("An empty in-memory browser database cannot be opened read-only.", nameof(readOnly));
+            if (encryption is not null)
+                throw new NotSupportedException("Encryption is not applicable to an in-memory browser database.");
+
+            OwnedDirectory = ":memory:";
+            DatabasePath = ":memory:";
+        }
+        else
+        {
+            OwnedDirectory = NormalizePath(ownedDirectory, nameof(ownedDirectory));
+            DatabasePath = NormalizePath(databasePath, nameof(databasePath));
+            if (!DatabasePath.StartsWith(OwnedDirectory + "/", StringComparison.Ordinal))
+            {
+                throw new ArgumentException(
+                    $"Browser database path '{DatabasePath}' must be below owned OPFS directory '{OwnedDirectory}'.",
+                    nameof(databasePath));
+            }
         }
 
         ArgumentOutOfRangeException.ThrowIfLessThan(sharedBufferSize, 64 * 1024);
@@ -54,7 +74,12 @@ public sealed class AhtolaBrowserOptions : IDisposable
         ConnectionString = new SqliteConnectionStringBuilder
         {
             DataSource = DatabasePath,
-            Mode = readOnly ? SqliteOpenMode.ReadOnly : SqliteOpenMode.ReadWriteCreate,
+            Mode = IsInMemory
+                ? SqliteOpenMode.Memory
+                : readOnly
+                    ? SqliteOpenMode.ReadOnly
+                    : SqliteOpenMode.ReadWriteCreate,
+            Cache = IsInMemory ? SqliteCacheMode.Shared : SqliteCacheMode.Default,
             LocalProvider = AhtolaLocalProvider.Managed,
             Pooling = false,
         }.ConnectionString;
@@ -85,6 +110,9 @@ public sealed class AhtolaBrowserOptions : IDisposable
 
     /// <summary>Whether OPFS content is encrypted with Ahtola's AHTLA page format.</summary>
     public bool IsEncrypted => _encryption is not null;
+
+    /// <summary>Whether this data source is process-memory-only and does not initialize OPFS.</summary>
+    public bool IsInMemory { get; }
 
     /// <summary>Zeros this instance's copy of the encryption key material.</summary>
     public void Dispose()
@@ -140,6 +168,9 @@ public sealed class AhtolaBrowserOptions : IDisposable
 
     private static string GetParentDirectory(string databasePath)
     {
+        if (string.Equals(databasePath, ":memory:", StringComparison.Ordinal))
+            return ":memory:";
+
         var normalized = NormalizePath(databasePath, nameof(databasePath));
         var separator = normalized.LastIndexOf('/');
         if (separator <= 0)

@@ -397,6 +397,7 @@ public partial class SqliteConnection :
             _managedDatabase = database;
             _dataSource = _managedDatabaseFactory.DataSource;
             _readOnly = _managedDatabaseFactory.IsReadOnly;
+            _managedSharedMemory = _managedDatabaseFactory.IsSharedMemory;
             if (IsManagedReadOnly)
                 await ExecuteNonQueryAsync("PRAGMA query_only = ON;", cancellationToken).ConfigureAwait(false);
             ApplyExtensionSettings();
@@ -414,6 +415,7 @@ public partial class SqliteConnection :
             _managedDatabase = null;
             _dataSource = null;
             _readOnly = false;
+            _managedSharedMemory = false;
             throw;
         }
         finally
