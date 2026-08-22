@@ -28,6 +28,12 @@ public enum FileSystemOperation
     AtomicReplace = 4,
     Open = 5,
     Delete = 6,
+    FileExists = 7,
+    GetWriteStamp = 8,
+    GetLength = 9,
+    OpenTemporary = 10,
+    EnsureMaterialized = 11,
+    Dispose = 12,
 }
 
 /// <summary>
@@ -37,6 +43,20 @@ public enum FileSystemOperation
 /// (a checkpoint that rewrites pages in place without touching the header).
 /// </summary>
 public readonly record struct FileWriteStamp(long Length, DateTimeOffset LastWriteTimeUtc);
+
+/// <summary>
+/// Optional capability that gives a storage backend authority over canonical
+/// path identity. Host file systems can return absolute paths while browser or
+/// in-memory stores can retain logical keys.
+/// </summary>
+public interface IStoragePathResolver
+{
+    /// <summary>Returns the stable identity used for <paramref name="path"/>.</summary>
+    string GetCanonicalPath(string path);
+
+    /// <summary>Compares canonical paths produced by this resolver.</summary>
+    StringComparer PathComparer { get; }
+}
 
 /// <summary>
 /// Minimal, correctness-first storage abstraction. Backends provide durable,
