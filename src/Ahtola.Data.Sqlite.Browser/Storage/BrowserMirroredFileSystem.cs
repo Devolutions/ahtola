@@ -13,6 +13,7 @@ internal sealed class BrowserMirroredFileSystem :
     IAtomicFileSystem,
     ITemporaryFileSystem,
     IStoragePathResolver,
+    ISnapshotFileIdentity,
     IAsyncDisposable
 {
     private readonly object _gate = new();
@@ -69,6 +70,15 @@ internal sealed class BrowserMirroredFileSystem :
     }
 
     public string GetCanonicalPath(string path) => ValidateOwnedPath(path);
+
+    bool ISnapshotFileIdentity.CanProveDistinctFile(
+        string path,
+        IFileSystem otherFileSystem,
+        string otherPath)
+        => otherFileSystem is BrowserMirroredFileSystem other
+           && !PathComparer.Equals(
+               GetCanonicalPath(path),
+               other.GetCanonicalPath(otherPath));
 
     public bool FileExists(string path)
     {

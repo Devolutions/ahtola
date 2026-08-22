@@ -166,3 +166,15 @@ internal interface IFileSystemDecorator
 {
     IFileSystem InnerFileSystem { get; }
 }
+
+/// <summary>
+/// Optional capability for proving that two file-backed databases cannot
+/// alias the same underlying file during a managed snapshot copy.
+/// </summary>
+internal interface ISnapshotFileIdentity
+{
+    bool CanProveDistinctFile(
+        string path,
+        IFileSystem otherFileSystem,
+        string otherPath);
+}

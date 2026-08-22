@@ -201,14 +201,45 @@ public interface IManagedConnectionAdapter : IDisposable, IAsyncDisposable
     void CopySnapshotTo(IManagedConnectionAdapter destination)
         => throw new NotSupportedException("Managed snapshot copying is not supported by this connection adapter.");
 
+    ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter destination,
+        CancellationToken cancellationToken = default)
+        => ManagedConnectionDurability.CopySnapshotToAsync(
+            this,
+            destination,
+            cancellationToken);
+
     void CopySnapshotTo(
         IManagedConnectionAdapter destination,
         string destinationName,
         string sourceName)
         => throw new NotSupportedException("Named managed snapshot copying is not supported by this connection adapter.");
 
+    ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter destination,
+        string destinationName,
+        string sourceName,
+        CancellationToken cancellationToken = default)
+        => ManagedConnectionDurability.CopySnapshotToAsync(
+            this,
+            destination,
+            destinationName,
+            sourceName,
+            cancellationToken);
+
     void ApplySnapshotPragmaHeader(int schemaVersion, int userVersion, int applicationId)
         => throw new NotSupportedException("Managed snapshot PRAGMA metadata is not supported by this connection adapter.");
+
+    ValueTask ApplySnapshotPragmaHeaderAsync(
+        int schemaVersion,
+        int userVersion,
+        int applicationId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ApplySnapshotPragmaHeader(schemaVersion, userVersion, applicationId);
+        return ValueTask.CompletedTask;
+    }
 
     /// <summary>
     /// The update, commit, rollback, authorizer, trace and progress callbacks registered on this
@@ -221,6 +252,72 @@ public interface IManagedConnectionAdapter : IDisposable, IAsyncDisposable
     {
         Dispose();
         return ValueTask.CompletedTask;
+    }
+}
+
+internal interface IManagedConnectionAdapterDecorator
+{
+    IManagedConnectionAdapter InnerConnectionAdapter { get; }
+}
+
+internal interface IManagedConnectionDurabilityBoundary
+{
+    ValueTask SynchronizeAsync();
+}
+
+internal static class ManagedConnectionDurability
+{
+    internal static ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter source,
+        IManagedConnectionAdapter destination,
+        CancellationToken cancellationToken)
+        => CopySnapshotToAsync(
+            source,
+            destination,
+            destinationName: null,
+            sourceName: null,
+            cancellationToken);
+
+    internal static async ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter source,
+        IManagedConnectionAdapter destination,
+        string? destinationName,
+        string? sourceName,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Exception? failure = null;
+        try
+        {
+            if (destinationName is null)
+                source.CopySnapshotTo(destination);
+            else
+                source.CopySnapshotTo(destination, destinationName, sourceName!);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        if (destination is IManagedConnectionDurabilityBoundary durability)
+        {
+            try
+            {
+                await durability.SynchronizeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                failure = failure is null
+                    ? exception
+                    : new AggregateException(
+                        "Managed snapshot copying and destination synchronization both failed.",
+                        failure,
+                        exception);
+            }
+        }
+
+        if (failure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
 }
 
@@ -526,6 +623,7 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         ArgumentNullException.ThrowIfNull(destination);
         ArgumentNullException.ThrowIfNull(destinationName);
         ArgumentNullException.ThrowIfNull(sourceName);
+        destination = UnwrapConnectionAdapter(destination);
         if (destination is not ManagedConnectionAdapter managedDestination)
             throw new ArgumentException("Managed snapshots require a managed destination adapter.", nameof(destination));
 
@@ -627,6 +725,22 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         {
             return _connection ?? throw new ObjectDisposedException(nameof(ManagedConnectionAdapter));
         }
+    }
+
+    private static IManagedConnectionAdapter UnwrapConnectionAdapter(
+        IManagedConnectionAdapter adapter)
+    {
+        HashSet<IManagedConnectionAdapter>? visited = null;
+        while (adapter is IManagedConnectionAdapterDecorator decorator)
+        {
+            visited ??= new HashSet<IManagedConnectionAdapter>(
+                ReferenceEqualityComparer.Instance);
+            if (!visited.Add(adapter))
+                throw new InvalidOperationException("Managed connection adapter decorators cannot form a cycle.");
+            adapter = decorator.InnerConnectionAdapter;
+        }
+
+        return adapter;
     }
 }
 

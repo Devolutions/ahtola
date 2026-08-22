@@ -2,13 +2,39 @@ using Ahtola.Core.Parsing;
 
 namespace Ahtola.Core;
 
-public interface IManagedIncrementalBlobAdapter : IDisposable
+public interface IManagedIncrementalBlobAdapter : IDisposable, IAsyncDisposable
 {
     long Length { get; }
 
     int Read(long offset, Span<byte> destination);
 
+    ValueTask<int> ReadAsync(
+        long offset,
+        Memory<byte> destination,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = Read(offset, destination.Span);
+        return ValueTask.FromResult(result);
+    }
+
     void Write(long offset, ReadOnlySpan<byte> source);
+
+    ValueTask WriteAsync(
+        long offset,
+        ReadOnlyMemory<byte> source,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Write(offset, source.Span);
+        return ValueTask.CompletedTask;
+    }
+
+    ValueTask IAsyncDisposable.DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
 }
 
 public sealed class ManagedBlobException : Exception
@@ -195,6 +221,12 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             _value = [];
             _mutationLease.Dispose();
         }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
     }
 
     private void EnsureCurrent()

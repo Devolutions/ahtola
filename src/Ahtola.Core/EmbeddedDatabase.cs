@@ -42747,9 +42747,30 @@ public sealed partial class EmbeddedConnection : IDisposable
 
         var storageKind = GetSnapshotStorageKind(database.FileSystem);
         var otherStorageKind = GetSnapshotStorageKind(otherDatabase.FileSystem);
-        return storageKind == SnapshotStorageKind.Unknown
-               || otherStorageKind == SnapshotStorageKind.Unknown;
+        if (storageKind != SnapshotStorageKind.Unknown
+            && otherStorageKind != SnapshotStorageKind.Unknown)
+        {
+            return false;
+        }
+
+        var fileSystem = AhtolaEncryptionFileSystem.Unwrap(database.FileSystem);
+        var otherFileSystem = AhtolaEncryptionFileSystem.Unwrap(otherDatabase.FileSystem);
+        return !CanProveDistinctSnapshotFiles(
+            fileSystem,
+            database.DatabasePath,
+            otherFileSystem,
+            otherDatabase.DatabasePath);
     }
+
+    private static bool CanProveDistinctSnapshotFiles(
+        IFileSystem fileSystem,
+        string path,
+        IFileSystem otherFileSystem,
+        string otherPath)
+        => fileSystem is ISnapshotFileIdentity identity
+               && identity.CanProveDistinctFile(path, otherFileSystem, otherPath)
+           || otherFileSystem is ISnapshotFileIdentity otherIdentity
+               && otherIdentity.CanProveDistinctFile(otherPath, fileSystem, path);
 
     private static SnapshotStorageKind GetSnapshotStorageKind(IFileSystem fileSystem)
         => AhtolaEncryptionFileSystem.Unwrap(fileSystem) switch

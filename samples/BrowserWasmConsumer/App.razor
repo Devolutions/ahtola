@@ -42,6 +42,9 @@
             }
             var persistentCore = await RunPersistentCoreAsync();
             var persistentFeatures = await RunPersistentFeaturesAsync();
+            var persistentBlob = await RunPersistentBlobAsync();
+            var persistentBackup = await RunPersistentBackupAsync();
+            var persistentInboundBackup = await RunPersistentInboundBackupAsync();
             status =
                 $"PASS:capabilities={capabilities.IsSupported};"
                 + $"storage={storage.Succeeded};"
@@ -49,7 +52,10 @@
                 + $"ado={ado};ef={ef};"
                 + $"persistent-ado={persistentAdo};persistent-ef={persistentEf};"
                 + $"persistent-core={persistentCore};"
-                + $"persistent-features={persistentFeatures}";
+                + $"persistent-features={persistentFeatures};"
+                + $"persistent-blob={persistentBlob};"
+                + $"persistent-backup={persistentBackup};"
+                + $"persistent-inbound-backup={persistentInboundBackup}";
         }
         catch (Exception exception)
         {
@@ -208,6 +214,93 @@
                 "SELECT value FROM local_probe",
                 "read local");
             return attached + local;
+        }
+    }
+
+    private static async Task<string> RunPersistentBlobAsync()
+    {
+        const string path = "packed-consumer-blob/main.db";
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE blobs(value BLOB);"
+                + "INSERT INTO blobs(rowid, value) VALUES (1, X'01020304');",
+                "blob setup");
+            await using var blob = await connection.OpenBlobAsync("blobs", "value", 1);
+            var prefix = new byte[2];
+            if (await blob.ReadAsync(prefix) != prefix.Length)
+                throw new InvalidOperationException("Blob prefix was truncated.");
+            await blob.WriteAsync(new byte[] { 9, 8 });
+            await blob.FlushAsync();
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT hex(value) FROM blobs WHERE rowid = 1";
+            return Convert.ToString(
+                       await command.ExecuteScalarAsync(),
+                       CultureInfo.InvariantCulture)
+                   ?? string.Empty;
+        }
+    }
+
+    private static async Task<long> RunPersistentBackupAsync()
+    {
+        const string sourcePath = "packed-consumer-backup/source.db";
+        const string destinationPath = "packed-consumer-backup-destination/main.db";
+        await using (var sourceDataSource = new AhtolaBrowserDataSource(sourcePath))
+        await using (var destinationDataSource = new AhtolaBrowserDataSource(destinationPath))
+        {
+            await using var source = await sourceDataSource.OpenConnectionAsync();
+            await using var destination = destinationDataSource.CreateConnection();
+            await ExecuteFeatureAsync(
+                source,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (336);",
+                "backup setup");
+            await source.BackupDatabaseAsync(destination);
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(destinationPath))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<long> RunPersistentInboundBackupAsync()
+    {
+        const string destinationPath = "packed-consumer-inbound-backup/main.db";
+        await using (var source = new SqliteConnection(
+                         "Data Source=:memory:;Local Provider=Managed;Pooling=False"))
+        await using (var destinationDataSource = new AhtolaBrowserDataSource(destinationPath))
+        {
+            await source.OpenAsync();
+            await using var destination = destinationDataSource.CreateConnection();
+            await ExecuteFeatureAsync(
+                source,
+                "CREATE TABLE probe(value INTEGER NOT NULL);"
+                + "INSERT INTO probe(value) VALUES (378);",
+                "inbound backup setup");
+            await source.BackupDatabaseAsync(destination);
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(destinationPath))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
         }
     }
 

@@ -132,7 +132,10 @@ internal sealed class BrowserManagedDatabaseAdapter(
 [SupportedOSPlatform("browser")]
 internal sealed class BrowserManagedConnectionAdapter(
     IManagedConnectionAdapter inner,
-    BrowserMirroredFileSystem mirror) : IManagedConnectionAdapter
+    BrowserMirroredFileSystem mirror) :
+    IManagedConnectionAdapter,
+    IManagedConnectionAdapterDecorator,
+    IManagedConnectionDurabilityBoundary
 {
     private int _disposed;
 
@@ -213,8 +216,12 @@ internal sealed class BrowserManagedConnectionAdapter(
         string columnName,
         long rowId,
         bool readOnly = false)
-        => throw new PlatformNotSupportedException(
-            "Incremental blob I/O has only a synchronous managed API and is not supported by browser connections.");
+    {
+        ThrowIfDisposed();
+        return new BrowserManagedIncrementalBlobAdapter(
+            inner.OpenBlob(databaseName, tableName, columnName, rowId, readOnly),
+            mirror);
+    }
 
     public void RegisterScalarFunction(
         string name,
@@ -269,8 +276,73 @@ internal sealed class BrowserManagedConnectionAdapter(
         string sourceName)
         => throw BrowserManagedAdapterErrors.BackupNotSupported();
 
+    public ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter destination,
+        CancellationToken cancellationToken = default)
+        => CopySnapshotToAsync(destination, "main", "main", cancellationToken);
+
+    public async ValueTask CopySnapshotToAsync(
+        IManagedConnectionAdapter destination,
+        string destinationName,
+        string sourceName,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        Exception? failure = null;
+        try
+        {
+            await inner
+                .CopySnapshotToAsync(
+                    destination,
+                    destinationName,
+                    sourceName,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        failure = await BrowserManagedAdapterErrors
+            .FlushAndCombineAsync(mirror, failure)
+            .ConfigureAwait(false);
+        if (failure is not null)
+            ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
     public void ApplySnapshotPragmaHeader(int schemaVersion, int userVersion, int applicationId)
         => throw BrowserManagedAdapterErrors.BackupNotSupported();
+
+    public async ValueTask ApplySnapshotPragmaHeaderAsync(
+        int schemaVersion,
+        int userVersion,
+        int applicationId,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        Exception? failure = null;
+        try
+        {
+            await inner
+                .ApplySnapshotPragmaHeaderAsync(
+                    schemaVersion,
+                    userVersion,
+                    applicationId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        failure = await BrowserManagedAdapterErrors
+            .FlushAndCombineAsync(mirror, failure)
+            .ConfigureAwait(false);
+        if (failure is not null)
+            ExceptionDispatchInfo.Capture(failure).Throw();
+    }
 
     public void Dispose()
     {
@@ -298,6 +370,108 @@ internal sealed class BrowserManagedConnectionAdapter(
         }
         if (failure is not null)
             ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        Exception? failure = null;
+        try
+        {
+            await inner.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        failure = await BrowserManagedAdapterErrors
+            .FlushAndCombineAsync(mirror, failure)
+            .ConfigureAwait(false);
+        if (failure is not null)
+            ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    private void ThrowIfDisposed()
+        => ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+    internal IManagedConnectionAdapter Inner => inner;
+
+    IManagedConnectionAdapter IManagedConnectionAdapterDecorator.InnerConnectionAdapter
+        => inner;
+
+    ValueTask IManagedConnectionDurabilityBoundary.SynchronizeAsync()
+        => mirror.FlushPendingAsync(CancellationToken.None);
+
+    internal BrowserMirroredFileSystem Mirror => mirror;
+}
+
+[SupportedOSPlatform("browser")]
+internal sealed class BrowserManagedIncrementalBlobAdapter(
+    IManagedIncrementalBlobAdapter inner,
+    BrowserMirroredFileSystem mirror) : IManagedIncrementalBlobAdapter
+{
+    private int _disposed;
+
+    public long Length
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return inner.Length;
+        }
+    }
+
+    public int Read(long offset, Span<byte> destination)
+    {
+        ThrowIfDisposed();
+        throw BrowserManagedAdapterErrors.SyncNotSupported("incremental blob reads");
+    }
+
+    public void Write(long offset, ReadOnlySpan<byte> source)
+    {
+        ThrowIfDisposed();
+        throw BrowserManagedAdapterErrors.SyncNotSupported("incremental blob writes");
+    }
+
+    public async ValueTask<int> ReadAsync(
+        long offset,
+        Memory<byte> destination,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return await inner.ReadAsync(offset, destination, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask WriteAsync(
+        long offset,
+        ReadOnlyMemory<byte> source,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        Exception? failure = null;
+        try
+        {
+            await inner.WriteAsync(offset, source, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        failure = await BrowserManagedAdapterErrors
+            .FlushAndCombineAsync(mirror, failure)
+            .ConfigureAwait(false);
+        if (failure is not null)
+            ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    public void Dispose()
+    {
+        ThrowIfDisposed();
+        throw BrowserManagedAdapterErrors.SyncNotSupported("incremental blob disposal");
     }
 
     public async ValueTask DisposeAsync()
@@ -544,8 +718,8 @@ internal static class BrowserManagedAdapterErrors
 
     internal static PlatformNotSupportedException BackupNotSupported()
         => new(
-            "Backup and snapshot copying have only synchronous managed APIs and are not "
-            + "supported by browser connections.");
+            "Synchronous backup and snapshot copying are not supported by browser connections. "
+            + "Use the corresponding asynchronous API.");
 
     internal static void ThrowIfPending(BrowserMirroredFileSystem mirror, string operation)
     {
