@@ -17,8 +17,13 @@ function context(contextId) {
 }
 
 function deserializeError(value) {
-    const error = new Error(value?.message ?? "The Ahtola OPFS worker failed.");
-    error.name = value?.name ?? "Error";
+    const name = value?.name ?? "Error";
+    const message = value?.message ?? "The Ahtola OPFS worker failed.";
+    const error = new Error(`${name}: ${message}`);
+    error.name = name;
+    // .NET marshals Error.stack for promise rejections. Normalize it so error
+    // names survive V8, SpiderMonkey, and JavaScriptCore stack differences.
+    error.stack = `${name}: ${message}`;
     error.code = value?.code;
     return error;
 }
@@ -75,7 +80,8 @@ export async function createContext(lockName, sharedBufferSize) {
         type: "module",
     });
     const shared = new SharedArrayBuffer(sharedBufferSize);
-    const control = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+    const control = new Int32Array(
+        new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2));
     const value = {
         worker,
         shared,
@@ -83,6 +89,7 @@ export async function createContext(lockName, sharedBufferSize) {
         bytes: new Uint8Array(shared),
         pending: new Map(),
         nextRequestId: 0,
+        nextOperationId: 0,
         queue: Promise.resolve(),
     };
     worker.addEventListener("message", event => {
@@ -151,64 +158,63 @@ export function getLength(contextId, handleId) {
     return enqueue(value, () => request(value, { type: "length", handleId }));
 }
 
-export async function readFile(contextId, handleId, position, length) {
+export function readFile(contextId, handleId, position, length) {
     const value = context(contextId);
     if (!Number.isSafeInteger(position) || position < 0)
         throw new RangeError("The OPFS read position is invalid.");
     if (!Number.isSafeInteger(length) || length < 0)
         throw new RangeError("The OPFS read length is invalid.");
 
-    return enqueue(value, async () => {
-        const result = new Uint8Array(length);
-        let total = 0;
-        while (total < length) {
-            const count = Math.min(length - total, value.bytes.length);
-            const read = await request(value, {
-                type: "read",
-                handleId,
-                position: position + total,
-                length: count,
-            });
-            if (read === 0)
-                break;
-
-            result.set(value.bytes.subarray(0, read), total);
-            total += read;
-            if (read < count)
-                break;
-        }
-
-        return total === result.length ? result : result.slice(0, total);
-    });
+    if (length > value.bytes.length)
+        throw new RangeError("The OPFS read exceeds the shared buffer size.");
+    return enqueue(value, () => request(value, {
+        type: "read",
+        handleId,
+        position,
+        length,
+    }));
 }
 
-export function unwrapByteArray(value) {
-    return Array.from(value);
+export function copyFromSharedBuffer(contextId, destination, length) {
+    const value = context(contextId);
+    if (!Number.isInteger(length)
+        || length < 0
+        || length > destination.byteLength
+        || length > value.bytes.length) {
+        throw new RangeError("The OPFS shared-buffer read length is invalid.");
+    }
+    try {
+        destination.set(value.bytes.subarray(0, length));
+        return length;
+    } finally {
+        destination.dispose();
+    }
 }
 
-export async function writeFile(contextId, handleId, position, source) {
+export function copyToSharedBuffer(contextId, source) {
+    const value = context(contextId);
+    if (source.byteLength > value.bytes.length)
+        throw new RangeError("The OPFS shared-buffer write exceeds its capacity.");
+    try {
+        source.copyTo(value.bytes);
+        return source.byteLength;
+    } finally {
+        source.dispose();
+    }
+}
+
+export function writeFile(contextId, handleId, position, length) {
     const value = context(contextId);
     if (!Number.isSafeInteger(position) || position < 0)
         throw new RangeError("The OPFS write position is invalid.");
-
-    const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
-    return enqueue(value, async () => {
-        let total = 0;
-        while (total < bytes.length) {
-            const count = Math.min(bytes.length - total, value.bytes.length);
-            value.bytes.set(bytes.subarray(total, total + count), 0);
-            const written = await request(value, {
-                type: "write",
-                handleId,
-                position: position + total,
-                length: count,
-            });
-            if (written !== count)
-                throw new Error(`The OPFS worker wrote ${written} of ${count} requested bytes.`);
-            total += written;
-        }
-        return total;
-    });
+    if (!Number.isInteger(length) || length < 0 || length > value.bytes.length)
+        throw new RangeError("The OPFS write length is invalid.");
+    return enqueue(value, () => request(value, {
+        type: "write",
+        handleId,
+        position,
+        length,
+    }));
 }
 
 export function setLength(contextId, handleId, length) {
@@ -235,20 +241,37 @@ export function deleteFile(contextId, path) {
 
 export function replaceFileAtomically(
     contextId,
+    operationId,
     sourcePath,
     destinationPath,
     replaceEmptyDestination) {
     const value = context(contextId);
-    Atomics.store(value.control, 0, 0);
-    return enqueue(value, () => request(value, {
-        type: "replace",
-        sourcePath,
-        destinationPath,
-        replaceEmptyDestination,
-    }));
+    return enqueue(value, async () => {
+        Atomics.store(value.control, 0, operationId);
+        try {
+            return await request(value, {
+                type: "replace",
+                operationId,
+                sourcePath,
+                destinationPath,
+                replaceEmptyDestination,
+            });
+        } finally {
+            Atomics.compareExchange(value.control, 0, operationId, 0);
+            Atomics.compareExchange(value.control, 1, operationId, 0);
+        }
+    });
 }
 
-export function cancelCurrentOperation(contextId) {
+export function allocateOperationId(contextId) {
     const value = context(contextId);
-    Atomics.store(value.control, 0, 1);
+    value.nextOperationId = value.nextOperationId >= 0x7ffffffe
+        ? 1
+        : value.nextOperationId + 1;
+    return value.nextOperationId;
+}
+
+export function cancelOperation(contextId, operationId) {
+    const value = context(contextId);
+    Atomics.store(value.control, 1, operationId);
 }

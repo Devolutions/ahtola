@@ -1,10 +1,8 @@
-using System.Runtime.InteropServices.JavaScript;
-
 namespace Ahtola.Data.Sqlite.Browser.Storage;
 
 internal static class BrowserStorageExceptionMapper
 {
-    public static Exception Map(JSException exception, string path, string operation)
+    public static Exception Map(Exception exception, string path, string operation)
     {
         if (HasName(exception, "NotFoundError"))
             return new FileNotFoundException($"OPFS could not {operation} '{path}' because it does not exist.", path, exception);
@@ -20,6 +18,6 @@ internal static class BrowserStorageExceptionMapper
         return new IOException($"OPFS failed to {operation} '{path}': {exception.Message}", exception);
     }
 
-    private static bool HasName(JSException exception, string name)
+    private static bool HasName(Exception exception, string name)
         => exception.Message.Contains(name, StringComparison.Ordinal);
 }

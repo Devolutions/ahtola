@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices.JavaScript;
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using Ahtola.Core.Storage;
@@ -154,21 +155,35 @@ public sealed class AhtolaBrowserCryptoService : IDisposable, IAsyncDisposable
         var associatedDataCopy = associatedData.ToArray();
         try
         {
-            using var result = await BrowserCryptoInterop.DecryptAesGcmAsync(
-                    keyHandle,
-                    nonceCopy,
-                    ciphertextCopy,
-                    tagCopy,
-                    associatedDataCopy)
-                .ConfigureAwait(false);
-            var plaintext = BrowserCryptoInterop.ConsumeByteArray(result);
-            if (plaintext.Length != ciphertext.Length)
+            JSObject result;
+            try
             {
-                CryptographicOperations.ZeroMemory(plaintext);
-                throw new CryptographicException("Web Crypto returned an invalid AES-GCM plaintext length.");
+                result = await BrowserCryptoInterop.DecryptAesGcmAsync(
+                        keyHandle,
+                        nonceCopy,
+                        ciphertextCopy,
+                        tagCopy,
+                        associatedDataCopy)
+                    .ConfigureAwait(false);
             }
+            catch (JSException exception) when (
+                exception.Message.Contains("OperationError", StringComparison.Ordinal))
+            {
+                throw new AuthenticationTagMismatchException(
+                    "The AHTLA AES-GCM authentication tag does not match.",
+                    exception);
+            }
+            using (result)
+            {
+                var plaintext = BrowserCryptoInterop.ConsumeByteArray(result);
+                if (plaintext.Length != ciphertext.Length)
+                {
+                    CryptographicOperations.ZeroMemory(plaintext);
+                    throw new CryptographicException("Web Crypto returned an invalid AES-GCM plaintext length.");
+                }
 
-            return plaintext;
+                return plaintext;
+            }
         }
         finally
         {

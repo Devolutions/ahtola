@@ -12,7 +12,7 @@ internal static class AhtolaBrowserCryptoRuntime
     private static readonly object Gate = new();
     private static Task? s_moduleInitialization;
 
-    internal static Task InitializeAsync()
+    internal static async Task InitializeAsync()
     {
         if (!OperatingSystem.IsBrowser())
         {
@@ -20,8 +20,23 @@ internal static class AhtolaBrowserCryptoRuntime
                 "Ahtola browser cryptography is supported only by a .NET browser WebAssembly runtime.");
         }
 
+        Task initialization;
         lock (Gate)
-            return s_moduleInitialization ??= JSHost.ImportAsync(ModuleName, ModuleUrl);
+            initialization = s_moduleInitialization ??= JSHost.ImportAsync(ModuleName, ModuleUrl);
+
+        try
+        {
+            await initialization.ConfigureAwait(false);
+        }
+        catch
+        {
+            lock (Gate)
+            {
+                if (ReferenceEquals(s_moduleInitialization, initialization))
+                    s_moduleInitialization = null;
+            }
+            throw;
+        }
     }
 }
 

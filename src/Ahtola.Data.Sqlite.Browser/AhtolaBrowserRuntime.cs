@@ -14,7 +14,7 @@ public static class AhtolaBrowserRuntime
     private static Task? s_moduleInitialization;
 
     /// <summary>Loads the packaged JavaScript module once for the current browser runtime.</summary>
-    public static Task InitializeAsync()
+    public static async Task InitializeAsync()
     {
         if (!OperatingSystem.IsBrowser())
         {
@@ -22,8 +22,23 @@ public static class AhtolaBrowserRuntime
                 "Ahtola browser storage is supported only by a .NET browser WebAssembly runtime.");
         }
 
+        Task initialization;
         lock (Gate)
-            return s_moduleInitialization ??= JSHost.ImportAsync(ModuleName, ModuleUrl);
+            initialization = s_moduleInitialization ??= JSHost.ImportAsync(ModuleName, ModuleUrl);
+
+        try
+        {
+            await initialization.ConfigureAwait(false);
+        }
+        catch
+        {
+            lock (Gate)
+            {
+                if (ReferenceEquals(s_moduleInitialization, initialization))
+                    s_moduleInitialization = null;
+            }
+            throw;
+        }
     }
 
     /// <summary>Returns the browser features available to the OPFS backend.</summary>
@@ -73,23 +88,29 @@ internal static partial class BrowserInterop
     internal static partial Task<double> GetLengthAsync(int contextId, int handleId);
 
     [JSImport("readFile", ModuleName)]
-    [return: JSMarshalAs<JSType.Promise<JSType.Object>>]
-    internal static partial Task<JSObject> ReadFileAsync(
+    internal static partial Task<int> ReadFileAsync(
         int contextId,
         int handleId,
         double position,
         int length);
 
-    [JSImport("unwrapByteArray", ModuleName)]
-    [return: JSMarshalAs<JSType.Array<JSType.Number>>]
-    internal static partial byte[] UnwrapByteArray(JSObject value);
+    [JSImport("copyFromSharedBuffer", ModuleName)]
+    internal static partial int CopyFromSharedBuffer(
+        int contextId,
+        [JSMarshalAs<JSType.MemoryView>] ArraySegment<byte> destination,
+        int length);
+
+    [JSImport("copyToSharedBuffer", ModuleName)]
+    internal static partial int CopyToSharedBuffer(
+        int contextId,
+        [JSMarshalAs<JSType.MemoryView>] ArraySegment<byte> source);
 
     [JSImport("writeFile", ModuleName)]
     internal static partial Task<int> WriteFileAsync(
         int contextId,
         int handleId,
         double position,
-        byte[] source);
+        int length);
 
     [JSImport("setLength", ModuleName)]
     internal static partial Task SetLengthAsync(int contextId, int handleId, double length);
@@ -106,10 +127,14 @@ internal static partial class BrowserInterop
     [JSImport("replaceFileAtomically", ModuleName)]
     internal static partial Task ReplaceFileAtomicallyAsync(
         int contextId,
+        int operationId,
         string sourcePath,
         string destinationPath,
         bool replaceEmptyDestination);
 
-    [JSImport("cancelCurrentOperation", ModuleName)]
-    internal static partial void CancelCurrentOperation(int contextId);
+    [JSImport("allocateOperationId", ModuleName)]
+    internal static partial int AllocateOperationId(int contextId);
+
+    [JSImport("cancelOperation", ModuleName)]
+    internal static partial void CancelOperation(int contextId, int operationId);
 }

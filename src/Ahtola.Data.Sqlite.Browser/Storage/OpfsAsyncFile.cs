@@ -53,11 +53,9 @@ internal sealed class OpfsAsyncFile : IAsyncFile
 
         try
         {
-            var bytes = await _client
-                .ReadAsync(handleId, position, destination.Length, cancellationToken)
+            return await _client
+                .ReadAsync(handleId, position, destination, cancellationToken)
                 .ConfigureAwait(false);
-            bytes.CopyTo(destination);
-            return bytes.Length;
         }
         catch (JSException exception)
         {
@@ -78,15 +76,9 @@ internal sealed class OpfsAsyncFile : IAsyncFile
         var handleId = GetHandleId();
         try
         {
-            var bytes = source.ToArray();
-            var written = await _client
-                .WriteAsync(handleId, position, bytes, cancellationToken)
+            await _client
+                .WriteAsync(handleId, position, source, cancellationToken)
                 .ConfigureAwait(false);
-            if (written != bytes.Length)
-            {
-                throw new IOException(
-                    $"OPFS wrote {written} of {bytes.Length} requested bytes to '{_path}'.");
-            }
         }
         catch (JSException exception)
         {

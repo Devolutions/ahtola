@@ -89,6 +89,31 @@ public static class AhtolaBrowserCryptoDiagnostics
             var plaintextMatches = CryptographicOperations.FixedTimeEquals(
                 decrypted,
                 vector.Plaintext);
+            var tamperedTag = encrypted.Tag.ToArray();
+            try
+            {
+                tamperedTag[0] ^= 0x80;
+                try
+                {
+                    var unexpected = await service
+                        .DecryptAsync(
+                            encrypted.Ciphertext,
+                            tamperedTag,
+                            vector.Nonce,
+                            vector.AssociatedData)
+                        .ConfigureAwait(false);
+                    CryptographicOperations.ZeroMemory(unexpected);
+                    return false;
+                }
+                catch (AuthenticationTagMismatchException)
+                {
+                }
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(tamperedTag);
+            }
+
             return ciphertextMatches && tagMatches && plaintextMatches;
         }
         finally

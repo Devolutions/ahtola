@@ -250,7 +250,7 @@ function requireUnreferenced(entry) {
     }
 }
 
-async function copyEntry(source, destinationPath) {
+async function copyEntry(source, destinationPath, operationId = 0) {
     requireUnreferenced(source);
     const destination = await getOrOpenEntry(destinationPath, true);
     requireUnreferenced(destination);
@@ -260,7 +260,7 @@ async function copyEntry(source, destinationPath) {
     const buffer = new Uint8Array(Math.min(sharedBytes.length, 1024 * 1024));
     let position = 0;
     while (position < sourceSize) {
-        if (Atomics.load(control, 0) !== 0)
+        if (operationId !== 0 && Atomics.load(control, 1) === operationId)
             throw new DOMException("The OPFS operation was cancelled.", "AbortError");
         const count = Math.min(buffer.length, sourceSize - position);
         const target = buffer.subarray(0, count);
@@ -337,7 +337,8 @@ async function rollbackPreparedReplacement(payload) {
 async function replaceFileAtomically(
     sourcePath,
     destinationPath,
-    replaceEmptyDestination) {
+    replaceEmptyDestination,
+    operationId) {
     const sourceNormalized = normalizePath(sourcePath).join("/");
     const destinationNormalized = normalizePath(destinationPath).join("/");
     if (sourceNormalized === destinationNormalized)
@@ -368,7 +369,7 @@ async function replaceFileAtomically(
     };
     writeIntent(intent);
     try {
-        await copyEntry(source, destinationNormalized);
+        await copyEntry(source, destinationNormalized, operationId);
     } catch (error) {
         await rollbackPreparedReplacement(intent);
         throw error;
@@ -461,7 +462,8 @@ self.addEventListener("message", async event => {
                 await replaceFileAtomically(
                     event.data.sourcePath,
                     event.data.destinationPath,
-                    event.data.replaceEmptyDestination);
+                    event.data.replaceEmptyDestination,
+                    event.data.operationId);
                 result = 0;
                 break;
             case "dispose":

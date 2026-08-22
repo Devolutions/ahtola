@@ -44,6 +44,15 @@ function clearBytes(original, bytes) {
     }
 }
 
+function normalizeError(error) {
+    const name = error?.name ?? "Error";
+    const message = error?.message ?? String(error);
+    const normalized = new Error(`${name}: ${message}`);
+    normalized.name = name;
+    normalized.stack = `${name}: ${message}`;
+    return normalized;
+}
+
 export async function createPasswordKey(password, salt, iterations, keyLengthBits) {
     const subtle = getSubtleCrypto();
     const encoder = new TextEncoder();
@@ -160,16 +169,20 @@ export async function decryptAesGcm(
     combined.set(ciphertextBytes);
     combined.set(tagBytes, ciphertextBytes.byteLength);
     try {
-        const decrypted = await subtle.decrypt(
-            {
-                name: "AES-GCM",
-                iv: nonceBytes,
-                additionalData: associatedDataBytes,
-                tagLength: 128,
-            },
-            getKey(keyHandle),
-            combined);
-        return new Uint8Array(decrypted);
+        try {
+            const decrypted = await subtle.decrypt(
+                {
+                    name: "AES-GCM",
+                    iv: nonceBytes,
+                    additionalData: associatedDataBytes,
+                    tagLength: 128,
+                },
+                getKey(keyHandle),
+                combined);
+            return new Uint8Array(decrypted);
+        } catch (error) {
+            throw normalizeError(error);
+        }
     } finally {
         combined.fill(0);
         clearBytes(nonce, nonceBytes);
