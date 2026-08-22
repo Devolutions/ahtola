@@ -3,7 +3,7 @@ using Ahtola;
 
 namespace Ahtola.Data.Sqlite;
 
-internal sealed class SqliteStatementAdapter : IDisposable
+internal sealed class SqliteStatementAdapter : IDisposable, IAsyncDisposable
 {
     private readonly AhtolaNativeStatement? _nativeStatement;
     private readonly IManagedStatementAdapter? _managedStatement;
@@ -51,6 +51,12 @@ internal sealed class SqliteStatementAdapter : IDisposable
             ? ReadNative(cancellationToken)
             : _managedStatement.Step(cancellationToken) == StatementStepResult.Row;
 
+    public async ValueTask<bool> ReadAsync(CancellationToken cancellationToken = default)
+        => _managedStatement is null
+            ? ReadNative(cancellationToken)
+            : await _managedStatement.StepAsync(cancellationToken).ConfigureAwait(false)
+              == StatementStepResult.Row;
+
     public bool HasRows()
         => _managedStatement?.HasRows() ?? GetNativeStatement().HasRows;
 
@@ -80,6 +86,18 @@ internal sealed class SqliteStatementAdapter : IDisposable
             _nativeStatement?.Dispose();
         else
             _managedStatement.Dispose();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        if (_managedStatement is null)
+            _nativeStatement?.Dispose();
+        else
+            await _managedStatement.DisposeAsync().ConfigureAwait(false);
     }
 
     private AhtolaNativeStatement GetNativeStatement()

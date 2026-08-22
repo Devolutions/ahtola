@@ -41,6 +41,17 @@ internal sealed class CommandCancellationController
         return RunTaskAsync(operation, cancellationToken);
     }
 
+    public Task<T> RunAsync<T>(
+        Func<CancellationToken, ValueTask<T>> operation,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<T>(cancellationToken);
+
+        return RunValueTaskAsync(operation, cancellationToken);
+    }
+
     private async Task<T> RunTaskAsync<T>(
         Func<CancellationToken, Task<T>> operation,
         CancellationToken cancellationToken)
@@ -48,6 +59,23 @@ internal sealed class CommandCancellationController
         using var lease = Begin(cancellationToken);
         lease.Token.ThrowIfCancellationRequested();
         return await operation(lease.Token).ConfigureAwait(false);
+    }
+
+    private async Task<T> RunValueTaskAsync<T>(
+        Func<CancellationToken, ValueTask<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        using var lease = Begin(cancellationToken);
+        lease.Token.ThrowIfCancellationRequested();
+        try
+        {
+            return await operation(lease.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw;
+        }
     }
 
     private async Task<T> RunSyncAsync<T>(

@@ -285,6 +285,12 @@ public class SqliteCommand : DbCommand
         cancellationToken.ThrowIfCancellationRequested();
         if (Connection?.AhtolaConnection is not null)
             return ExecuteAhtolaAsync(behavior, cancellationToken);
+        if (Connection?.IsManagedConnection == true)
+        {
+            return _cancellation.RunAsync<DbDataReader>(
+                token => ExecuteManagedLocalAsync(behavior, token),
+                cancellationToken);
+        }
         return _cancellation.RunAsync<DbDataReader>(
             token => Execute("ExecuteReader", behavior, token),
             cancellationToken);
@@ -439,6 +445,83 @@ public class SqliteCommand : DbCommand
         {
             throw ToSqliteException(ex);
         }
+        _hasOpenReader = true;
+        return new SqliteDataReader(this, recordsAffected, behavior, CloseReader);
+    }
+
+    private async ValueTask<DbDataReader> ExecuteManagedLocalAsync(
+        CommandBehavior behavior,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureExecutable("ExecuteReader");
+        if (Connection?.IsReadOnly == true && IsWriteCommand(CommandText))
+            throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
+        if (IsEmptyCommand(CommandText))
+        {
+            _hasOpenReader = true;
+            return new SqliteDataReader(this, -1, behavior, CloseReader);
+        }
+
+        if (Connection?.HasOpenReader == true && IsReaderBlockingCommand(CommandText))
+        {
+            var timeout = CommandTimeout == 0
+                ? Timeout.InfiniteTimeSpan
+                : TimeSpan.FromSeconds(CommandTimeout);
+            if (!Connection.WaitForNoOpenReader(timeout, cancellationToken))
+                throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
+        }
+
+        var recordsAffected = 0;
+        var hadRecordsAffectedStatement = false;
+        var statements = SplitStatements(CommandText);
+        try
+        {
+            for (var i = 0; i < statements.Count; i++)
+            {
+                if (TryHandleFacadeStatement(statements[i], out var sql))
+                    continue;
+
+                cancellationToken.ThrowIfCancellationRequested();
+                var statement = await PrepareSingleStatementAsync(sql, cancellationToken).ConfigureAwait(false);
+                if (statement.ColumnCount > 0)
+                {
+                    _hasOpenReader = true;
+                    return new SqliteDataReader(
+                        this,
+                        statement,
+                        statements[i],
+                        statements.Skip(i + 1).ToList(),
+                        recordsAffected,
+                        hadRecordsAffectedStatement,
+                        behavior,
+                        CloseReader);
+                }
+
+                try
+                {
+                    while (await statement.ReadAsync(cancellationToken).ConfigureAwait(false))
+                    {
+                    }
+
+                    if (CountsRowsAffected(statements[i]))
+                    {
+                        hadRecordsAffectedStatement = true;
+                        recordsAffected += statement.RowsAffected;
+                    }
+                    MarkTransactionCompletedExternally(statements[i]);
+                }
+                finally
+                {
+                    await statement.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        {
+            throw ToSqliteException(ex);
+        }
+
         _hasOpenReader = true;
         return new SqliteDataReader(this, recordsAffected, behavior, CloseReader);
     }
@@ -744,6 +827,11 @@ public class SqliteCommand : DbCommand
         CancellationToken cancellationToken = default)
         => _cancellation.RunAsync(operation, cancellationToken);
 
+    internal Task<T> RunOperationAsync<T>(
+        Func<CancellationToken, ValueTask<T>> operation,
+        CancellationToken cancellationToken = default)
+        => _cancellation.RunAsync(operation, cancellationToken);
+
     internal void MarkTransactionCompletedExternally(string commandText)
     {
         var completion = SqlTransactionControl.GetCompletion(commandText);
@@ -831,6 +919,42 @@ public class SqliteCommand : DbCommand
         finally
         {
             nativeStatement?.Dispose();
+        }
+    }
+
+    internal async ValueTask<SqliteStatementAdapter> PrepareSingleStatementAsync(
+        string sql,
+        CancellationToken cancellationToken = default)
+    {
+        var connection = Connection!;
+        if (connection.IsManagedReadOnly)
+            ManagedReadOnlySqlGuard.ThrowIfQueryOnlyIsDisabled(sql);
+        sql = RewriteFacadeStatement(sql, connection);
+        if (!connection.IsManagedConnection)
+            return PrepareSingleStatement(sql);
+
+        connection.ManagedConnection.BusyTimeout =
+            CommandTimeout == 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(CommandTimeout);
+        IManagedStatementAdapter? managedStatement = null;
+        try
+        {
+            managedStatement = await connection.ManagedConnection
+                .PrepareAsync(sql, cancellationToken)
+                .ConfigureAwait(false);
+            BindManagedParameters(managedStatement);
+
+            var statement = SqliteStatementAdapter.FromManaged(managedStatement);
+            managedStatement = null;
+            return statement;
+        }
+        catch (EmbeddedSqlException ex)
+        {
+            throw ToSqliteException(ex, sql);
+        }
+        finally
+        {
+            if (managedStatement is not null)
+                await managedStatement.DisposeAsync().ConfigureAwait(false);
         }
     }
 

@@ -51,6 +51,13 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         ConnectionString = connectionString;
     }
 
+    internal SqliteConnection(IManagedDatabaseAdapter managedDatabase)
+        : this("Data Source=:memory:;Local Provider=Managed")
+    {
+        _managedDatabase = managedDatabase ?? throw new ArgumentNullException(nameof(managedDatabase));
+        _dataSource = ":memory:";
+    }
+
     [AllowNull]
     public override string ConnectionString
     {

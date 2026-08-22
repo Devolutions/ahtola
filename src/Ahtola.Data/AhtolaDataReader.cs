@@ -391,7 +391,29 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
 
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
     {
-        return _command.RunOperationAsync(NextResultCore, cancellationToken);
+        return _managedStatement is null
+            ? _command.RunOperationAsync(NextResultCore, cancellationToken)
+            : _command.RunOperationAsync(NextResultCoreAsync, cancellationToken);
+    }
+
+    private async ValueTask<bool> NextResultCoreAsync(CancellationToken cancellationToken)
+    {
+        EnsureOpen();
+        try
+        {
+            while (await StepAsync(cancellationToken).ConfigureAwait(false))
+            {
+            }
+
+            _hasCurrentRow = false;
+            NotifyCompletion();
+            return false;
+        }
+        catch
+        {
+            NotifyFailure();
+            throw;
+        }
     }
 
     protected override void Dispose(bool disposing)
@@ -400,6 +422,18 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
             CloseCore(closeConnection: true);
 
         base.Dispose(disposing);
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (_managedStatement is null)
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
+        await CloseCoreAsync(closeConnection: true).ConfigureAwait(false);
+        await base.DisposeAsync().ConfigureAwait(false);
     }
 
     void IConnectionOwnedReader.CloseFromConnection() => CloseCore(closeConnection: false);
@@ -426,7 +460,26 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
 
     public override Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
-        return _command.RunOperationAsync(ReadCore, cancellationToken);
+        return _managedStatement is null
+            ? _command.RunOperationAsync(ReadCore, cancellationToken)
+            : _command.RunOperationAsync(ReadCoreAsync, cancellationToken);
+    }
+
+    private async ValueTask<bool> ReadCoreAsync(CancellationToken cancellationToken)
+    {
+        EnsureOpen();
+        try
+        {
+            _hasCurrentRow = await StepAsync(cancellationToken).ConfigureAwait(false);
+            if (!_hasCurrentRow)
+                NotifyCompletion();
+            return _hasCurrentRow;
+        }
+        catch
+        {
+            NotifyFailure();
+            throw;
+        }
     }
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
@@ -594,11 +647,29 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
             ? ReadNative(cancellationToken)
             : ExecuteManaged(statement => statement.Step(cancellationToken) == StatementStepResult.Row);
 
+    private ValueTask<bool> StepAsync(CancellationToken cancellationToken)
+        => ExecuteManagedAsync(
+            async statement =>
+                await statement.StepAsync(cancellationToken).ConfigureAwait(false) == StatementStepResult.Row);
+
     private T ExecuteManaged<T>(Func<IManagedStatementAdapter, T> operation)
     {
         try
         {
             return operation(_managedStatement!);
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            throw AhtolaException.FromCore(exception);
+        }
+    }
+
+    private async ValueTask<T> ExecuteManagedAsync<T>(
+        Func<IManagedStatementAdapter, ValueTask<T>> operation)
+    {
+        try
+        {
+            return await operation(_managedStatement!).ConfigureAwait(false);
         }
         catch (EmbeddedSqlException exception)
         {
@@ -671,6 +742,29 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
             NotifyFailure();
             _nativeStatement?.Dispose();
             _managedStatement?.Dispose();
+        }
+        finally
+        {
+            _hasCurrentRow = false;
+            _isClosed = true;
+            ((ILocalReaderConnection)_connection).ReaderClosed(this);
+            Interlocked.Exchange(ref _replicaOperation, null)?.Dispose();
+            _closeCallback();
+            if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+                _connection.Close();
+        }
+    }
+
+    private async ValueTask CloseCoreAsync(bool closeConnection)
+    {
+        if (_isClosed)
+            return;
+
+        _command.Cancel();
+        try
+        {
+            NotifyFailure();
+            await _managedStatement!.DisposeAsync().ConfigureAwait(false);
         }
         finally
         {

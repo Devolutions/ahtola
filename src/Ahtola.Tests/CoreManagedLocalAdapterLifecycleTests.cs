@@ -33,4 +33,26 @@ public class CoreManagedLocalAdapterLifecycleTests
         statement.Step().Should().Be(StatementStepResult.Row);
         statement.GetValue(0).AsInteger().Should().Be(9);
     }
+
+    [Test]
+    public async Task CoreManagedAdapterAsyncDefaultsCompleteInline()
+    {
+        await using var database = ManagedDatabaseAdapter.Open(":memory:");
+        var connect = database.ConnectAsync();
+        connect.IsCompletedSuccessfully.Should().BeTrue();
+        var connection = await connect;
+
+        var prepare = connection.PrepareAsync("SELECT 31;");
+        prepare.IsCompletedSuccessfully.Should().BeTrue();
+        await using var statement = await prepare;
+
+        var step = statement.StepAsync();
+        step.IsCompletedSuccessfully.Should().BeTrue();
+        (await step).Should().Be(StatementStepResult.Row);
+
+        var reset = statement.ResetAsync();
+        reset.IsCompletedSuccessfully.Should().BeTrue();
+        await reset;
+        statement.Step().Should().Be(StatementStepResult.Row);
+    }
 }

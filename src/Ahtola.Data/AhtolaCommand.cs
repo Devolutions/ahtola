@@ -301,6 +301,13 @@ public class AhtolaCommand : DbCommand
                 cancellationToken);
         }
 
+        if (_connection?.IsManaged == true)
+        {
+            return _cancellation.RunAsync<DbDataReader>(
+                token => ExecuteManagedAsync(behavior, token),
+                cancellationToken);
+        }
+
         return _cancellation.RunAsync<DbDataReader>(
             token => Execute(behavior, token),
             cancellationToken);
@@ -434,6 +441,95 @@ public class AhtolaCommand : DbCommand
         }
     }
 
+    private async ValueTask<DbDataReader> ExecuteManagedAsync(
+        CommandBehavior behavior,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_connection is null)
+            throw new InvalidOperationException("Connection must be set before executing a command.");
+
+        IDisposable? replicaOperation = null;
+        var beganManagedReplicaTransaction = false;
+        try
+        {
+            beganManagedReplicaTransaction =
+                _connection.BeginManagedReplicaSqlTransaction(CommandText, cancellationToken);
+            replicaOperation = _connection.EnterManagedReplicaOperation(cancellationToken);
+            await PrepareManagedCoreAsync(cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var managedStatement = _managedStatement
+                ?? throw new InvalidOperationException("Command was not prepared.");
+            _managedStatement = null;
+            var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
+            _connection.ManagedReplicaStatementStarted(CommandText);
+            var reader = new AhtolaDataReader(
+                this,
+                nativeStatement: null,
+                managedStatement,
+                behavior,
+                () =>
+                {
+                    MarkTransactionCompletedExternally(transactionCompletion);
+                    _connection.ManagedReplicaStatementCompleted(CommandText);
+                },
+                _connection.ManagedReplicaStatementFailed,
+                _connection.ManagedReplicaStatementClosed,
+                replicaOperation);
+            replicaOperation = null;
+            return reader;
+        }
+        catch
+        {
+            replicaOperation?.Dispose();
+            if (beganManagedReplicaTransaction)
+                _connection.ManagedReplicaStatementFailed();
+            throw;
+        }
+    }
+
+    private async ValueTask PrepareManagedCoreAsync(CancellationToken cancellationToken)
+    {
+        if (_connection is null)
+            throw new InvalidOperationException("Connection must be set before preparing a command.");
+        if (string.IsNullOrWhiteSpace(CommandText))
+            throw new InvalidOperationException("CommandText must be set before preparing a command.");
+        ValidateTransaction();
+        _connection.ValidateCommandCapabilities(CommandText);
+        if (_connection.IsManagedReadOnly)
+            ManagedReadOnlySqlGuard.ThrowIfQueryOnlyIsDisabled(CommandText);
+
+        IManagedStatementAdapter? managedStatement = null;
+        try
+        {
+            var sql = RewriteFacadePragmas(CommandText, _connection);
+            _connection.ManagedConnection.BusyTimeout = CommandTimeout == 0
+                ? Timeout.InfiniteTimeSpan
+                : TimeSpan.FromSeconds(CommandTimeout);
+            managedStatement = await _connection.ManagedConnection
+                .PrepareAsync(sql, cancellationToken)
+                .ConfigureAwait(false);
+            BindManagedParameters(managedStatement, sql);
+            _ = managedStatement.ResultMetadata.ColumnCount;
+
+            _nativeStatement?.Dispose();
+            _nativeStatement = null;
+            if (_managedStatement is not null)
+                await _managedStatement.DisposeAsync().ConfigureAwait(false);
+            _managedStatement = managedStatement;
+            managedStatement = null;
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            throw AhtolaException.FromCorePreparation(exception);
+        }
+        finally
+        {
+            if (managedStatement is not null)
+                await managedStatement.DisposeAsync().ConfigureAwait(false);
+        }
+    }
     internal T RunOperation<T>(
         Func<CancellationToken, T> operation,
         CancellationToken cancellationToken = default)
@@ -441,6 +537,11 @@ public class AhtolaCommand : DbCommand
 
     internal Task<T> RunOperationAsync<T>(
         Func<CancellationToken, T> operation,
+        CancellationToken cancellationToken = default)
+        => _cancellation.RunAsync(operation, cancellationToken);
+
+    internal Task<T> RunOperationAsync<T>(
+        Func<CancellationToken, ValueTask<T>> operation,
         CancellationToken cancellationToken = default)
         => _cancellation.RunAsync(operation, cancellationToken);
 

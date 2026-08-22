@@ -106,6 +106,12 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         _remoteClient = remoteClient ?? throw new ArgumentNullException(nameof(remoteClient));
     }
 
+    internal AhtolaConnection(IManagedDatabaseAdapter managedDatabase)
+        : this("")
+    {
+        _managedDatabase = managedDatabase ?? throw new ArgumentNullException(nameof(managedDatabase));
+    }
+
     /// <summary>
     /// Creates a connection configured as an embedded replica.
     /// </summary>

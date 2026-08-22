@@ -414,15 +414,15 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             return ApplyConfiguredDateTimeKind(ParseDateTime(GetDelegatedTextValue(ordinal)));
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-            var dateTime = value.Kind switch
+        var dateTime = value.Kind switch
         {
             ReaderValueKind.Text => ParseDateTime(value.Text),
             ReaderValueKind.Real => DateTime.FromOADate(value.Real - 2415018.5),
             ReaderValueKind.Integer => DateTime.FromOADate(value.Integer - 2415018.5),
             _ => DateTime.Parse(GetString(ordinal), CultureInfo.InvariantCulture)
         };
-            return ApplyConfiguredDateTimeKind(dateTime);
-        }
+        return ApplyConfiguredDateTimeKind(dateTime);
+    }
 
     public virtual DateTimeOffset GetDateTimeOffset(int ordinal)
     {
@@ -993,6 +993,78 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         return false;
     }
 
+    private async ValueTask<bool> NextResultCoreAsync(CancellationToken cancellationToken)
+    {
+        EnsureOpen();
+        if (_statement is null)
+            return false;
+        while (await GetStatement().ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+        }
+
+        CountCurrentStatementRowsAffected();
+
+        _hasCurrentRow = false;
+        _hasPrefetchedRow = false;
+        await _statement.DisposeAsync().ConfigureAwait(false);
+        _statement = null;
+        _currentStatementRowsAffectedCounted = false;
+
+        try
+        {
+            while (_remainingSql.Count > 0)
+            {
+                var sql = _remainingSql[0];
+                _remainingSql.RemoveAt(0);
+                if (_command.TryHandleFacadeStatement(sql, out var rewrittenSql))
+                    continue;
+
+                cancellationToken.ThrowIfCancellationRequested();
+                var statement = await _command
+                    .PrepareSingleStatementAsync(rewrittenSql, cancellationToken)
+                    .ConfigureAwait(false);
+                if (statement.ColumnCount > 0)
+                {
+                    _statement = statement;
+                    _currentSql = rewrittenSql;
+                    _hadResultSet = true;
+                    _currentStatementRowsAffectedCounted = false;
+                    _hasPrefetchedRow = await statement.ReadAsync(cancellationToken).ConfigureAwait(false);
+                    return true;
+                }
+
+                try
+                {
+                    while (await statement.ReadAsync(cancellationToken).ConfigureAwait(false))
+                    {
+                    }
+
+                    if (SqliteCommand.CountsRowsAffected(sql))
+                    {
+                        _hadRecordsAffectedStatement = true;
+                        _recordsAffected += statement.RowsAffected;
+                    }
+                    _command.MarkTransactionCompletedExternally(sql);
+                }
+                finally
+                {
+                    await statement.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        {
+            if (_statement is not null)
+                await _statement.DisposeAsync().ConfigureAwait(false);
+            _statement = null;
+            _hasPrefetchedRow = false;
+            _remainingSql.Clear();
+            throw SqliteCommand.ToSqliteException(ex);
+        }
+
+        return false;
+    }
+
     public override bool Read()
     {
         if (_delegatedReader is null)
@@ -1033,10 +1105,39 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
     }
 
+    private async ValueTask<bool> ReadCoreAsync(CancellationToken cancellationToken)
+    {
+        EnsureOpen();
+        if (_statement is null)
+            return false;
+        if (_hasPrefetchedRow)
+        {
+            _hasPrefetchedRow = false;
+            _hasCurrentRow = true;
+            return true;
+        }
+
+        try
+        {
+            _hasCurrentRow = await GetStatement().ReadAsync(cancellationToken).ConfigureAwait(false);
+            if (!_hasCurrentRow)
+                CountCurrentStatementRowsAffected();
+            return _hasCurrentRow;
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        {
+            throw SqliteCommand.ToSqliteException(ex);
+        }
+    }
+
     public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
         if (_delegatedReader is null)
-            return await _command.RunOperationAsync(ReadCore, cancellationToken).ConfigureAwait(false);
+        {
+            return _statement?.UsesManagedResults == true
+                ? await _command.RunOperationAsync(ReadCoreAsync, cancellationToken).ConfigureAwait(false)
+                : await _command.RunOperationAsync(ReadCore, cancellationToken).ConfigureAwait(false);
+        }
 
         try
         {
@@ -1051,7 +1152,11 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     public override async Task<bool> NextResultAsync(CancellationToken cancellationToken)
     {
         if (_delegatedReader is null)
-            return await _command.RunOperationAsync(NextResultCore, cancellationToken).ConfigureAwait(false);
+        {
+            return _statement?.UsesManagedResults == true
+                ? await _command.RunOperationAsync(NextResultCoreAsync, cancellationToken).ConfigureAwait(false)
+                : await _command.RunOperationAsync(NextResultCore, cancellationToken).ConfigureAwait(false);
+        }
 
         try
         {
@@ -1127,6 +1232,18 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         base.Dispose(disposing);
     }
 
+    public override async ValueTask DisposeAsync()
+    {
+        if (_delegatedReader is null && _statement?.UsesManagedResults != true)
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
+        await CloseCoreAsync(throwOnError: false).ConfigureAwait(false);
+        await base.DisposeAsync().ConfigureAwait(false);
+    }
+
     public override void Close() => CloseCore();
 
     void IConnectionOwnedReader.CloseFromConnection()
@@ -1190,6 +1307,65 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         catch (SqliteException)
         {
             _statement?.Dispose();
+            _statement = null;
+            _remainingSql.Clear();
+            FinishClose();
+            if (throwOnError)
+                throw;
+            return;
+        }
+
+        FinishClose();
+    }
+
+    private async ValueTask CloseCoreAsync(bool throwOnError = true)
+    {
+        if (_isClosed)
+            return;
+
+        try
+        {
+            if (_delegatedReader is not null)
+            {
+                _recordsAffected = _delegatedReader.RecordsAffected;
+                _hadRecordsAffectedStatement = true;
+                await _delegatedReader.DisposeAsync().ConfigureAwait(false);
+                _delegatedReader = null;
+                FinishClose();
+                return;
+            }
+
+            if (_statement is not null)
+            {
+                while (await GetStatement().ReadAsync().ConfigureAwait(false))
+                {
+                }
+
+                CountCurrentStatementRowsAffected();
+
+                await _statement.DisposeAsync().ConfigureAwait(false);
+                _statement = null;
+                _hasPrefetchedRow = false;
+                _currentStatementRowsAffectedCounted = false;
+            }
+
+            await DrainRemainingStatementsAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        {
+            if (_statement is not null)
+                await _statement.DisposeAsync().ConfigureAwait(false);
+            _statement = null;
+            _remainingSql.Clear();
+            FinishClose();
+            if (throwOnError)
+                throw SqliteCommand.ToSqliteException(ex);
+            return;
+        }
+        catch (SqliteException)
+        {
+            if (_statement is not null)
+                await _statement.DisposeAsync().ConfigureAwait(false);
             _statement = null;
             _remainingSql.Clear();
             FinishClose();
@@ -1874,6 +2050,42 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                     _recordsAffected += statement.RowsAffected;
                 }
                 _command.MarkTransactionCompletedExternally(sql);
+            }
+        }
+
+        finally
+        {
+            _remainingSql.Clear();
+        }
+    }
+
+    private async ValueTask DrainRemainingStatementsAsync()
+    {
+        try
+        {
+            foreach (var sql in _remainingSql)
+            {
+                if (_command.TryHandleFacadeStatement(sql, out var rewrittenSql))
+                    continue;
+
+                var statement = await _command.PrepareSingleStatementAsync(rewrittenSql).ConfigureAwait(false);
+                try
+                {
+                    while (await statement.ReadAsync().ConfigureAwait(false))
+                    {
+                    }
+
+                    if (SqliteCommand.CountsRowsAffected(rewrittenSql))
+                    {
+                        _hadRecordsAffectedStatement = true;
+                        _recordsAffected += statement.RowsAffected;
+                    }
+                    _command.MarkTransactionCompletedExternally(sql);
+                }
+                finally
+                {
+                    await statement.DisposeAsync().ConfigureAwait(false);
+                }
             }
         }
         finally

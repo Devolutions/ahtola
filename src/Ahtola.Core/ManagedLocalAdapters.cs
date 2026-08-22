@@ -110,16 +110,42 @@ public sealed class ManagedSnapshotException : Exception
     public string? ObjectName { get; }
 }
 
-public interface IManagedDatabaseAdapter : IDisposable
+public interface IManagedDatabaseAdapter : IDisposable, IAsyncDisposable
 {
     IManagedConnectionAdapter Connect();
 
+    ValueTask<IManagedConnectionAdapter> ConnectAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult(Connect());
+    }
+
     IManagedConnectionAdapter Connection { get; }
+
+    ValueTask IAsyncDisposable.DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
 }
 
-public interface IManagedConnectionAdapter : IDisposable
+public interface IManagedConnectionAdapter : IDisposable, IAsyncDisposable
 {
     IManagedStatementAdapter Prepare(string sql);
+
+    ValueTask<IManagedStatementAdapter> PrepareAsync(
+        string sql,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var statement = Prepare(sql);
+        if (!cancellationToken.IsCancellationRequested)
+            return ValueTask.FromResult(statement);
+
+        statement.Dispose();
+        cancellationToken.ThrowIfCancellationRequested();
+        return default;
+    }
 
     bool HasAttachedDatabases => true;
 
@@ -180,9 +206,15 @@ public interface IManagedConnectionAdapter : IDisposable
     /// </summary>
     ManagedConnectionHooks Hooks
         => throw new NotSupportedException("Managed SQL hooks are not supported by this connection adapter.");
+
+    ValueTask IAsyncDisposable.DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
 }
 
-public interface IManagedStatementAdapter : IDisposable
+public interface IManagedStatementAdapter : IDisposable, IAsyncDisposable
 {
     int ParameterCount { get; }
 
@@ -204,9 +236,20 @@ public interface IManagedStatementAdapter : IDisposable
         return result;
     }
 
+    ValueTask<StatementStepResult> StepAsync(CancellationToken cancellationToken = default)
+        => ValueTask.FromResult(Step(cancellationToken));
+
     bool HasRows();
 
     void Reset();
+
+    ValueTask ResetAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Reset();
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
 
     void ClearBindings();
 
@@ -227,6 +270,12 @@ public interface IManagedStatementAdapter : IDisposable
     ManagedResultMetadata ResultMetadata => new(this);
 
     string? GetParameterName(int index);
+
+    ValueTask IAsyncDisposable.DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
 }
 
 public sealed class ManagedDatabaseAdapter : IManagedDatabaseAdapter
@@ -303,6 +352,12 @@ public sealed class ManagedDatabaseAdapter : IManagedDatabaseAdapter
         }
     }
 
+    public ValueTask<IManagedConnectionAdapter> ConnectAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult(Connect());
+    }
+
     public IManagedConnectionAdapter Connection
     {
         get
@@ -342,6 +397,12 @@ public sealed class ManagedDatabaseAdapter : IManagedDatabaseAdapter
         }
     }
 
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
+
     private void ThrowIfDisposed()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -378,6 +439,20 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
     {
         ArgumentNullException.ThrowIfNull(sql);
         return ManagedStatementAdapter.FromPreparedStatement(this, sql, GetConnection().Prepare(sql));
+    }
+
+    public ValueTask<IManagedStatementAdapter> PrepareAsync(
+        string sql,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var statement = Prepare(sql);
+        if (!cancellationToken.IsCancellationRequested)
+            return ValueTask.FromResult(statement);
+
+        statement.Dispose();
+        cancellationToken.ThrowIfCancellationRequested();
+        return default;
     }
 
     public void ResetForPooling()
@@ -510,6 +585,12 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         connection?.Dispose();
     }
 
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
+
     internal EmbeddedStatement PrepareEmbeddedStatement(string sql)
     {
         return GetConnection().Prepare(sql);
@@ -605,6 +686,9 @@ public sealed class ManagedStatementAdapter : IManagedStatementAdapter
         }
     }
 
+    public ValueTask<StatementStepResult> StepAsync(CancellationToken cancellationToken = default)
+        => ValueTask.FromResult(Step(cancellationToken));
+
     public bool HasRows()
     {
         return GetStatement().HasRows();
@@ -625,6 +709,14 @@ public sealed class ManagedStatementAdapter : IManagedStatementAdapter
         GetStatement().Reset();
         lock (_gate)
             _hasCurrentRow = false;
+    }
+
+    public ValueTask ResetAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Reset();
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
     }
 
     public void ClearBindings()
@@ -691,6 +783,12 @@ public sealed class ManagedStatementAdapter : IManagedStatementAdapter
         }
 
         statement?.Dispose();
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
     }
 
     private void ReplaceStatementWithoutBindings()
