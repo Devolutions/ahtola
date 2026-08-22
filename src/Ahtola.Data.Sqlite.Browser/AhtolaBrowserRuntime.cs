@@ -46,11 +46,18 @@ public static class AhtolaBrowserRuntime
     {
         await InitializeAsync().ConfigureAwait(false);
         var mask = BrowserInterop.GetCapabilityMask();
+        var hasOriginPrivateFileSystem = (mask & BrowserInterop.OriginPrivateFileSystem) != 0;
+        // Synchronous access handle support is never inferred from unrelated
+        // feature checks: it is probed for real, inside a worker, because a
+        // browser can expose Worker and OPFS directory access while still
+        // lacking (or throwing from) createSyncAccessHandle itself.
+        var hasSynchronousAccessHandles = hasOriginPrivateFileSystem
+            && await BrowserInterop.ProbeSynchronousAccessHandleSupportAsync().ConfigureAwait(false);
         return new AhtolaBrowserCapabilities(
             IsCrossOriginIsolated: (mask & BrowserInterop.CrossOriginIsolated) != 0,
             HasSharedArrayBuffer: (mask & BrowserInterop.SharedArrayBuffer) != 0,
-            HasOriginPrivateFileSystem: (mask & BrowserInterop.OriginPrivateFileSystem) != 0,
-            HasSynchronousAccessHandles: (mask & BrowserInterop.SynchronousAccessHandle) != 0,
+            HasOriginPrivateFileSystem: hasOriginPrivateFileSystem,
+            HasSynchronousAccessHandles: hasSynchronousAccessHandles,
             HasWebLocks: (mask & BrowserInterop.WebLocks) != 0);
     }
 }
@@ -61,12 +68,14 @@ internal static partial class BrowserInterop
     internal const int CrossOriginIsolated = 1 << 0;
     internal const int SharedArrayBuffer = 1 << 1;
     internal const int OriginPrivateFileSystem = 1 << 2;
-    internal const int SynchronousAccessHandle = 1 << 3;
-    internal const int WebLocks = 1 << 4;
+    internal const int WebLocks = 1 << 3;
     private const string ModuleName = "Devolutions.Ahtola.Data.Sqlite.Browser";
 
     [JSImport("getCapabilityMask", ModuleName)]
     internal static partial int GetCapabilityMask();
+
+    [JSImport("probeSynchronousAccessHandleSupport", ModuleName)]
+    internal static partial Task<bool> ProbeSynchronousAccessHandleSupportAsync();
 
     [JSImport("createContext", ModuleName)]
     internal static partial Task<int> CreateContextAsync(string lockName, int sharedBufferSize);

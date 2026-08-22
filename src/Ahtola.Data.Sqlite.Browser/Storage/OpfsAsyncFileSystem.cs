@@ -36,7 +36,8 @@ internal sealed class OpfsAsyncFileSystem :
         {
             throw new PlatformNotSupportedException(
                 "Ahtola OPFS requires cross-origin isolation, SharedArrayBuffer, "
-                + "Origin Private File System synchronous handles, module workers, and Web Locks.");
+                + "Origin Private File System synchronous handles, module workers, and Web Locks. "
+                + $"Missing in this browser: {string.Join(", ", capabilities.MissingCapabilities)}.");
         }
 
         try
@@ -207,7 +208,15 @@ internal sealed class OpfsAsyncFileSystem :
             await _client.DisposeAsync().ConfigureAwait(false);
     }
 
-    private static string Canonicalize(string path)
+    // Reserved for the OPFS worker's own atomic-replacement intent journal
+    // (see ahtola-opfs-worker.mjs). Rejecting it here, at every public path
+    // boundary (open/exists/delete/list/replace, which also covers ATTACH,
+    // backup, and VACUUM destinations), guarantees no database, WAL,
+    // journal, or backup file can ever be given a name that collides with an
+    // internal journal slot.
+    private const string ReservedPathPrefix = ".ahtola-replace-";
+
+    internal static string Canonicalize(string path)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         var normalized = path.Replace('\\', '/');
@@ -221,6 +230,14 @@ internal sealed class OpfsAsyncFileSystem :
         {
             throw new ArgumentException(
                 "OPFS paths cannot contain empty, current, or parent segments.",
+                nameof(path));
+        }
+
+        if (segments.Any(static segment =>
+                segment.StartsWith(ReservedPathPrefix, StringComparison.Ordinal)))
+        {
+            throw new ArgumentException(
+                $"OPFS path segments cannot start with the reserved prefix '{ReservedPathPrefix}'.",
                 nameof(path));
         }
 

@@ -5,12 +5,28 @@ let lockRelease;
 let lockRequest;
 let nextHandleId = 0;
 let intentGeneration = 0;
+let currentLockName;
 
 const entriesByPath = new Map();
 const viewsByHandle = new Map();
 const intentSlots = [];
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+
+// Filenames using this prefix are reserved for the worker's own atomic-
+// replacement intent journal (see initializeIntentJournal). No public path
+// operation may create, open, delete, or list a path whose last segment
+// starts with it, so a real database, WAL, journal, or backup destination
+// can never collide with an internal journal slot - which would let one
+// database's reopen or replay hide or corrupt another database that merely
+// happens to share the reserved prefix.
+const RESERVED_PATH_PREFIX = ".ahtola-replace-";
+// The exact shape of a live journal slot's filename: the reserved prefix, a
+// 64-character SHA-256 hex digest of the owning lock's full identity, and a
+// ".0"/".1" double-buffer suffix (see lockDigest). Only this exact shape is
+// hidden from directory listings, so a reserved-prefixed name that isn't one
+// of the two live slots is never silently swallowed by an over-broad filter.
+const RESERVED_INTENT_SLOT_PATTERN = /^\.ahtola-replace-[0-9a-f]{64}\.[01]$/u;
 
 function errorPayload(error) {
     return {
@@ -35,6 +51,11 @@ function normalizePath(value) {
         || segment === ".."
         || /[\0\r\n]/u.test(segment)))
         throw new TypeError("OPFS paths cannot contain empty, current, or parent segments.");
+    if (segments.some(segment => segment.startsWith(RESERVED_PATH_PREFIX))) {
+        throw new DOMException(
+            `OPFS path segments cannot start with the reserved prefix '${RESERVED_PATH_PREFIX}'.`,
+            "NotAllowedError");
+    }
     return segments;
 }
 
@@ -80,7 +101,7 @@ async function listFiles(path) {
             const relative = `${prefix}/${name}`;
             if (handle.kind === "directory")
                 await visit(handle, relative);
-            else if (!name.startsWith(".ahtola-replace-"))
+            else if (!RESERVED_INTENT_SLOT_PATTERN.test(name))
                 files.push(relative);
         }
     }
@@ -99,8 +120,19 @@ function checksum(value) {
     return hash >>> 0;
 }
 
-function lockHash(value) {
-    return checksum(value).toString(16).padStart(8, "0");
+// A cryptographic digest of the full lock identity, not a 32-bit rolling
+// hash: two distinct lock names (for example two tenants' database paths)
+// must never plausibly collide on the journal slot filename this produces.
+// Every record additionally carries the full lock name (see writeIntent and
+// readIntentSlot), so even an astronomically unlikely digest collision is
+// detected and isolated rather than silently recovering another lock's
+// intent.
+async function lockDigest(value) {
+    const bytes = textEncoder.encode(value);
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    return [...new Uint8Array(digest)]
+        .map(byte => byte.toString(16).padStart(2, "0"))
+        .join("");
 }
 
 async function openIntentSlot(name) {
@@ -108,7 +140,7 @@ async function openIntentSlot(name) {
     return file.createSyncAccessHandle();
 }
 
-function readIntentSlot(access) {
+function readIntentSlot(access, expectedLockName) {
     const size = access.getSize();
     if (size === 0)
         return { empty: true };
@@ -125,11 +157,18 @@ function readIntentSlot(access) {
         }
 
         const record = JSON.parse(envelope.body);
-        if (record?.version !== 1
+        if (record?.version !== 2
             || !Number.isSafeInteger(record.generation)
-            || record.generation < 1) {
+            || record.generation < 1
+            || typeof record.lockName !== "string") {
             return { invalid: true };
         }
+        // A well-formed record for a different lock identity means this
+        // slot's filename collided with another database's (see
+        // lockDigest). That is not corruption: leave the foreign record
+        // alone for its owner and treat this lock's journal as empty.
+        if (record.lockName !== expectedLockName)
+            return { foreign: true };
         return { record };
     } catch {
         return { invalid: true };
@@ -138,7 +177,12 @@ function readIntentSlot(access) {
 
 function writeIntent(payload) {
     const generation = intentGeneration + 1;
-    const body = JSON.stringify({ version: 1, generation, payload });
+    const body = JSON.stringify({
+        version: 2,
+        generation,
+        lockName: currentLockName,
+        payload,
+    });
     const bytes = textEncoder.encode(JSON.stringify({
         body,
         checksum: checksum(body),
@@ -155,12 +199,13 @@ function writeIntent(payload) {
 }
 
 async function initializeIntentJournal(lockName) {
-    const prefix = `.ahtola-replace-${lockHash(lockName)}`;
+    currentLockName = lockName;
+    const prefix = `.ahtola-replace-${await lockDigest(lockName)}`;
     intentSlots.push(
         await openIntentSlot(`${prefix}.0`),
         await openIntentSlot(`${prefix}.1`));
 
-    const decoded = intentSlots.map(readIntentSlot);
+    const decoded = intentSlots.map(access => readIntentSlot(access, lockName));
     const valid = decoded
         .filter(value => value.record)
         .map(value => value.record)

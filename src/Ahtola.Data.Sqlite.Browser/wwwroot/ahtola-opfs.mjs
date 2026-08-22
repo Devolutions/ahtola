@@ -1,6 +1,16 @@
 const contexts = new Map();
 let nextContextId = 0;
 
+// Transient failures a fresh probe file can still legitimately hit (for
+// example another tab racing to clean up its own probe run); worth a couple
+// of retries before concluding the browser truly lacks support.
+const TRANSIENT_ACCESS_HANDLE_ERRORS = new Set([
+    "NoModificationAllowedError",
+    "InvalidStateError",
+]);
+const SYNCHRONOUS_ACCESS_HANDLE_PROBE_ATTEMPTS = 3;
+const SYNCHRONOUS_ACCESS_HANDLE_PROBE_RETRY_DELAY_MS = 20;
+
 function requiredFeatures() {
     return globalThis.crossOriginIsolated
         && typeof SharedArrayBuffer !== "undefined"
@@ -48,6 +58,10 @@ function failContext(value, error) {
     value.pending.clear();
 }
 
+function delay(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
 export function getCapabilityMask() {
     let mask = 0;
     if (globalThis.crossOriginIsolated)
@@ -56,15 +70,88 @@ export function getCapabilityMask() {
         mask |= 1 << 1;
     if (typeof navigator.storage?.getDirectory === "function")
         mask |= 1 << 2;
-    // The synchronous handle method is worker-only and some browsers don't
-    // expose FileSystemFileHandle's constructor on the window global.
-    if (typeof Worker !== "undefined"
-        && typeof navigator.storage?.getDirectory === "function") {
-        mask |= 1 << 3;
-    }
     if (typeof navigator.locks?.request === "function")
-        mask |= 1 << 4;
+        mask |= 1 << 3;
     return mask;
+}
+
+function hasSynchronousAccessHandlePrerequisites() {
+    // The synchronous handle method is worker-only and some browsers don't
+    // expose FileSystemFileHandle's constructor on the window global, so
+    // there is no point spinning up a probe worker without these first.
+    return typeof Worker !== "undefined"
+        && typeof navigator.storage?.getDirectory === "function";
+}
+
+// Spins up a short-lived dedicated worker (createSyncAccessHandle is
+// off-limits on the main thread) that creates, opens, and closes a
+// throwaway OPFS file with a synchronous access handle, reporting whether
+// the browser actually supports it rather than inferring support from
+// unrelated feature checks.
+async function runSynchronousAccessHandleProbeInWorker() {
+    const workerSource = `
+        self.addEventListener("message", async () => {
+            const name = ".ahtola-capability-probe-" + crypto.randomUUID();
+            try {
+                const root = await navigator.storage.getDirectory();
+                const fileHandle = await root.getFileHandle(name, { create: true });
+                try {
+                    const access = await fileHandle.createSyncAccessHandle();
+                    access.close();
+                } finally {
+                    await root.removeEntry(name).catch(() => {});
+                }
+                self.postMessage({ ok: true });
+            } catch (error) {
+                self.postMessage({
+                    ok: false,
+                    name: error?.name ?? "Error",
+                    message: error?.message ?? String(error),
+                });
+            }
+        });
+    `;
+    const workerUrl = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
+    const worker = new Worker(workerUrl, { type: "module" });
+    try {
+        return await new Promise(resolve => {
+            worker.addEventListener("message", event => resolve(event.data), { once: true });
+            worker.addEventListener("error", event => resolve({
+                ok: false,
+                name: "WorkerError",
+                message: event?.message || "The OPFS capability probe worker failed to start.",
+            }), { once: true });
+            worker.postMessage("probe");
+        });
+    } finally {
+        worker.terminate();
+        URL.revokeObjectURL(workerUrl);
+    }
+}
+
+// Applies the probe/retry policy on top of an injectable single-attempt
+// prober so the retry and error-classification logic can be unit tested
+// without a real Worker/OPFS-capable host.
+export async function evaluateSynchronousAccessHandleSupport(
+    runProbeOnce = runSynchronousAccessHandleProbeInWorker,
+    attempts = SYNCHRONOUS_ACCESS_HANDLE_PROBE_ATTEMPTS,
+    retryDelayMs = SYNCHRONOUS_ACCESS_HANDLE_PROBE_RETRY_DELAY_MS) {
+    if (!hasSynchronousAccessHandlePrerequisites())
+        return false;
+
+    let outcome;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        outcome = await runProbeOnce();
+        if (outcome.ok || !TRANSIENT_ACCESS_HANDLE_ERRORS.has(outcome.name))
+            break;
+        if (attempt < attempts - 1)
+            await delay(retryDelayMs * (attempt + 1));
+    }
+    return Boolean(outcome?.ok);
+}
+
+export function probeSynchronousAccessHandleSupport() {
+    return evaluateSynchronousAccessHandleSupport();
 }
 
 export async function createContext(lockName, sharedBufferSize) {
