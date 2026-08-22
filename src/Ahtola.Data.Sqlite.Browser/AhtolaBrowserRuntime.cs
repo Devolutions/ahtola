@@ -124,6 +124,9 @@ internal static partial class BrowserInterop
     [JSImport("deleteFile", ModuleName)]
     internal static partial Task DeleteFileAsync(int contextId, string path);
 
+    [JSImport("listFiles", ModuleName)]
+    internal static partial Task<string> ListFilesAsync(int contextId, string directoryPath);
+
     [JSImport("replaceFileAtomically", ModuleName)]
     internal static partial Task ReplaceFileAtomicallyAsync(
         int contextId,

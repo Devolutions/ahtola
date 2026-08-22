@@ -32,6 +32,7 @@ public sealed class AhtolaBrowserStorageContractTests
                 CompetingContextRejected: true,
                 PositionalIoMatches: true,
                 AtomicReplaceMatches: true,
+                ManagedPersistenceMatches: true,
                 Details: "passed")
             .Succeeded.Should().BeTrue();
 
@@ -39,6 +40,7 @@ public sealed class AhtolaBrowserStorageContractTests
                 CompetingContextRejected: true,
                 PositionalIoMatches: false,
                 AtomicReplaceMatches: true,
+                ManagedPersistenceMatches: true,
                 Details: "failed")
             .Succeeded.Should().BeFalse();
     }

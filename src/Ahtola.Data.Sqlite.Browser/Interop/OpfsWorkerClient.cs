@@ -169,6 +169,19 @@ internal sealed class OpfsWorkerClient : IAsyncDisposable
         await BrowserInterop.DeleteFileAsync(GetContextId(), path).ConfigureAwait(false);
     }
 
+    public async Task<IReadOnlyList<string>> ListFilesAsync(
+        string directoryPath,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = await BrowserInterop
+            .ListFilesAsync(GetContextId(), directoryPath)
+            .ConfigureAwait(false);
+        return string.IsNullOrEmpty(result)
+            ? []
+            : result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    }
+
     public async Task ReplaceFileAtomicallyAsync(
         string sourcePath,
         string destinationPath,

@@ -29,7 +29,11 @@ function normalizePath(value) {
         throw new TypeError("OPFS paths must be relative to the origin-private root.");
 
     const segments = normalized.split("/");
-    if (segments.some(segment => segment === "" || segment === "." || segment === ".."))
+    if (segments.some(segment =>
+        segment === ""
+        || segment === "."
+        || segment === ".."
+        || /[\0\r\n]/u.test(segment)))
         throw new TypeError("OPFS paths cannot contain empty, current, or parent segments.");
     return segments;
 }
@@ -58,6 +62,31 @@ async function tryGetFile(path) {
             return undefined;
         throw error;
     }
+}
+
+async function resolveDirectory(path, create = false) {
+    const segments = normalizePath(path);
+    let directory = root;
+    for (const segment of segments)
+        directory = await directory.getDirectoryHandle(segment, { create });
+    return directory;
+}
+
+async function listFiles(path) {
+    const directory = await resolveDirectory(path, true);
+    const files = [];
+    async function visit(current, prefix) {
+        for await (const [name, handle] of current.entries()) {
+            const relative = `${prefix}/${name}`;
+            if (handle.kind === "directory")
+                await visit(handle, relative);
+            else if (!name.startsWith(".ahtola-replace-"))
+                files.push(relative);
+        }
+    }
+    await visit(directory, path);
+    files.sort();
+    return files.join("\n");
 }
 
 function checksum(value) {
@@ -457,6 +486,9 @@ self.addEventListener("message", async event => {
             case "delete":
                 await deleteFile(event.data.path);
                 result = 0;
+                break;
+            case "list":
+                result = await listFiles(event.data.directoryPath);
                 break;
             case "replace":
                 await replaceFileAtomically(

@@ -239,6 +239,14 @@ export function deleteFile(contextId, path) {
     return enqueue(value, () => request(value, { type: "delete", path }));
 }
 
+export function listFiles(contextId, directoryPath) {
+    const value = context(contextId);
+    return enqueue(value, () => request(value, {
+        type: "list",
+        directoryPath,
+    }));
+}
+
 export function replaceFileAtomically(
     contextId,
     operationId,

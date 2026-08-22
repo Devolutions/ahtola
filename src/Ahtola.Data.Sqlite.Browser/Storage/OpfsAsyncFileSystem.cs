@@ -139,6 +139,24 @@ internal sealed class OpfsAsyncFileSystem :
         }
     }
 
+    internal async ValueTask<IReadOnlyList<string>> ListFilesAsync(
+        string directoryPath,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var canonicalPath = Canonicalize(directoryPath);
+        try
+        {
+            return await _client
+                .ListFilesAsync(canonicalPath, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (JSException exception)
+        {
+            throw BrowserStorageExceptionMapper.Map(exception, canonicalPath, "enumerate");
+        }
+    }
+
     public async ValueTask ReplaceFileAtomicallyAsync(
         string sourcePath,
         string destinationPath,
@@ -196,7 +214,9 @@ internal sealed class OpfsAsyncFileSystem :
             throw new ArgumentException("OPFS paths must be relative to the origin-private root.", nameof(path));
 
         var segments = normalized.Split('/');
-        if (segments.Any(static segment => segment is "" or "." or ".."))
+        if (segments.Any(static segment =>
+                segment is "" or "." or ".."
+                || segment.IndexOfAny(['\0', '\r', '\n']) >= 0))
         {
             throw new ArgumentException(
                 "OPFS paths cannot contain empty, current, or parent segments.",

@@ -1,4 +1,5 @@
 using System.Runtime.Versioning;
+using Ahtola.Core;
 using Ahtola.Core.Storage;
 using Ahtola.Data.Sqlite.Browser.Storage;
 
@@ -28,6 +29,7 @@ public static class AhtolaBrowserStorageDiagnostics
         var lockRejected = false;
         var positionalIoMatches = false;
         var atomicReplaceMatches = false;
+        var managedPersistenceMatches = false;
         var details = string.Empty;
         await using var fileSystem = await OpfsAsyncFileSystem
             .CreateAsync(lockName, sharedBufferSize, cancellationToken)
@@ -129,11 +131,76 @@ public static class AhtolaBrowserStorageDiagnostics
             await fileSystem.DeleteFileAsync(destinationPath, CancellationToken.None).ConfigureAwait(false);
         }
 
+        var managedRoot = $"managed-{id}";
+        var managedPath = $"{managedRoot}/main.db";
+        await using (var persistent = await OpfsAsyncFileSystem
+                         .CreateAsync($"{lockName}-managed", sharedBufferSize, cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            await using var mirror = await BrowserMirroredFileSystem
+                .CreateAsync(
+                    persistent,
+                    managedRoot,
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            using var database = ManagedDatabaseAdapter.OpenFile(managedPath, mirror);
+            var connection = await database.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            await ExecuteToCompletionAsync(
+                connection,
+                "CREATE TABLE probe(value INTEGER NOT NULL)",
+                cancellationToken).ConfigureAwait(false);
+            await ExecuteToCompletionAsync(
+                connection,
+                "INSERT INTO probe(value) VALUES (42)",
+                cancellationToken).ConfigureAwait(false);
+            await mirror.FlushPendingAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await using (var persistent = await OpfsAsyncFileSystem
+                         .CreateAsync($"{lockName}-managed", sharedBufferSize, cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            await using var mirror = await BrowserMirroredFileSystem
+                .CreateAsync(
+                    persistent,
+                    managedRoot,
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            using var database = ManagedDatabaseAdapter.OpenFile(managedPath, mirror);
+            var connection = await database.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            await using var statement = await connection
+                .PrepareAsync("SELECT value FROM probe", cancellationToken)
+                .ConfigureAwait(false);
+            managedPersistenceMatches =
+                await statement.StepAsync(cancellationToken).ConfigureAwait(false)
+                    == StatementStepResult.Row
+                && statement.GetValue(0).AsInteger() == 42
+                && await statement.StepAsync(cancellationToken).ConfigureAwait(false)
+                    == StatementStepResult.Done;
+            database.Dispose();
+            await mirror.DeleteAllPersistentFilesAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+
         return new AhtolaBrowserStorageDiagnosticResult(
             lockRejected,
             positionalIoMatches,
             atomicReplaceMatches,
+            managedPersistenceMatches,
             details);
+    }
+
+    private static async ValueTask ExecuteToCompletionAsync(
+        IManagedConnectionAdapter connection,
+        string sql,
+        CancellationToken cancellationToken)
+    {
+        await using var statement = await connection
+            .PrepareAsync(sql, cancellationToken)
+            .ConfigureAwait(false);
+        while (await statement.StepAsync(cancellationToken).ConfigureAwait(false)
+               == StatementStepResult.Row)
+        {
+        }
     }
 
     private static int FindFirstMismatch(ReadOnlySpan<byte> expected, ReadOnlySpan<byte> actual)
@@ -153,11 +220,13 @@ public readonly record struct AhtolaBrowserStorageDiagnosticResult(
     bool CompetingContextRejected,
     bool PositionalIoMatches,
     bool AtomicReplaceMatches,
+    bool ManagedPersistenceMatches,
     string Details)
 {
     /// <summary>Whether every OPFS diagnostic check passed.</summary>
     public bool Succeeded =>
         CompetingContextRejected
         && PositionalIoMatches
-        && AtomicReplaceMatches;
+        && AtomicReplaceMatches
+        && ManagedPersistenceMatches;
 }
