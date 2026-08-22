@@ -37,6 +37,17 @@ public interface IAsyncFileSystem
 }
 
 /// <summary>
+/// Identifies an asynchronous file system that merely adapts a synchronous
+/// backend. Pager locking keys on the adapted backend rather than on wrapper
+/// identity so two adapters over one storage still share a single writer lock.
+/// </summary>
+internal interface IAsyncFileSystemBacking
+{
+    /// <summary>The synchronous storage this asynchronous facade forwards to.</summary>
+    IFileSystem BackingFileSystem { get; }
+}
+
+/// <summary>
 /// Optional capability for asynchronously publishing a fully written sibling
 /// file without exposing a partial destination image.
 /// </summary>

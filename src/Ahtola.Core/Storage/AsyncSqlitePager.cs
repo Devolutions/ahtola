@@ -14,7 +14,9 @@ namespace Ahtola.Core.Storage;
 /// </remarks>
 public sealed class AsyncSqlitePager : IAsyncDisposable
 {
-    private static readonly ConditionalWeakTable<IAsyncFileSystem, AsyncLockScope> LockScopes = new();
+    private static readonly ConditionalWeakTable<IAsyncFileSystem, AsyncLockScope> AsyncLockScopes = new();
+    private static readonly ConditionalWeakTable<IFileSystem, AsyncLockScope> BackingLockScopes = new();
+    private static readonly AsyncLockScope PhysicalLockScope = new(PhysicalFileSystem.Instance);
 
     private readonly object _stateGate = new();
     private readonly SemaphoreSlim _ioGate = new(1, 1);
@@ -194,6 +196,7 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             manager,
             timeout,
             cancellationToken).ConfigureAwait(false);
+        manager.PublishAllWalFrames();
 
         AsyncSqlitePageStore? pageStore = null;
         SqliteWalFile? wal = null;
@@ -279,6 +282,7 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             manager,
             timeout,
             cancellationToken).ConfigureAwait(false);
+        manager.PublishAllWalFrames();
 
         AsyncSqlitePageStore? pageStore = null;
         var databaseCreated = false;
@@ -404,6 +408,12 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                 manager,
                 encryption,
                 pageCodec);
+
+            // Opening re-derives visibility from the file itself, which is what a
+            // fresh process would see, so drop any publication boundary a faulted
+            // in-process writer left pinned.
+            if (!readOnly)
+                manager.PublishAllWalFrames();
             if (UsesWalStorage(journalMode) && wal is not null)
             {
                 var recovery = await wal.ScanRecoveryAsync(cancellationToken).ConfigureAwait(false);
@@ -543,6 +553,12 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             {
                 ThrowIfDisposed();
                 ThrowIfReadOnly();
+
+                // This writer now owns the WAL, so the file is authoritative again:
+                // republish every physical frame, including a previous writer's
+                // durable-but-unconfirmed tail, before deriving the committed view.
+                if (UsesWalStorage(JournalMode))
+                    _lockManager.PublishAllWalFrames();
                 await SynchronizeCommittedViewAsync(cancellationToken).ConfigureAwait(false);
                 if (UsesWalStorage(JournalMode) && HasUncommittedOrInvalidTail(_recoveryInfo))
                     await RecoverWalTailUnderWriterLockAsync(cancellationToken).ConfigureAwait(false);
@@ -557,7 +573,8 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                     writerLock,
                     targetDatabaseSizeInPages,
                     _committedPageCount,
-                    CloneOverlay(_walPageOverlay));
+                    CloneOverlay(_walPageOverlay),
+                    timeout);
                 lock (_stateGate)
                 {
                     _activeTransaction = transaction;
@@ -655,6 +672,7 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                 throw new InvalidOperationException($"Cannot recover a SQLite WAL while the pager is {_state}.");
             try
             {
+                _lockManager.PublishAllWalFrames();
                 await SynchronizeCommittedViewAsync(cancellationToken).ConfigureAwait(false);
                 if (HasUncommittedOrInvalidTail(_recoveryInfo))
                     await RecoverWalTailUnderWriterLockAsync(cancellationToken).ConfigureAwait(false);
@@ -759,6 +777,14 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         AsyncSqlitePagerTransaction transaction,
         CancellationToken cancellationToken)
     {
+        // A DELETE-mode commit rewrites the main database file in place, which
+        // every read snapshot on this database reads through directly. Take the
+        // same EXCLUSIVE upgrade the synchronous pager takes so no reader can
+        // observe a half-applied rollback-journal commit. This happens before the
+        // I/O gate so a draining reader can still finish its own page reads.
+        if (JournalMode == SqliteJournalMode.Delete)
+            await transaction.UpgradeToExclusiveCommitAsync(cancellationToken).ConfigureAwait(false);
+
         await _ioGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -830,6 +856,10 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         {
             ThrowIfDisposed();
             ThrowIfReadOnly();
+
+            // The checkpoint lease excludes every reader and writer, so the WAL
+            // file is authoritative again for whatever it is about to install.
+            _lockManager.PublishAllWalFrames();
             await SynchronizeCommittedViewAsync(cancellationToken).ConfigureAwait(false);
             if (JournalMode == SqliteJournalMode.Delete)
             {
@@ -904,6 +934,13 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
     {
         await ValidateWalHasNotChangedAsync(cancellationToken).ConfigureAwait(false);
         var wal = RequireWal();
+
+        // Hide everything this commit is about to append until its durable flush
+        // and post-flush validation both succeed. Readers on other pagers over the
+        // same WAL rescan the physical file, so without this boundary they could
+        // adopt a commit-bearing frame that has not been made durable yet — or one
+        // that never commits at all because the flush fails.
+        transaction.BeginWalPublication(_committedFrameCount);
         await wal.AppendFramesAsync(
             new AsyncSqlitePagerTransaction.WalFrameSource(transaction),
             transaction.TargetDatabaseSizeInPages,
@@ -942,6 +979,8 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             _recoveryInfo = recovery;
             _visibleRecoveryInfo = recovery;
         }
+
+        transaction.PublishWalFrames();
     }
 
     private async ValueTask CommitRollbackTransactionAsync(
@@ -1140,7 +1179,9 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             return;
         }
 
-        var recovery = await _wal.ScanRecoveryAsync(cancellationToken).ConfigureAwait(false);
+        var recovery = await _wal
+            .ScanRecoveryAsync(_lockManager.WalPublicationBoundary, cancellationToken)
+            .ConfigureAwait(false);
         if (recovery.LastCommittedFrameNumber == 0
             && recovery.StopReason == SqliteWalRecoveryStopReason.EndOfFile)
         {
@@ -1638,17 +1679,55 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         string databasePath,
         string walPath)
     {
-        var scope = LockScopes.GetValue(fileSystem, static _ => new AsyncLockScope());
-        var key = CreateLockKey(fileSystem, databasePath, walPath);
-        return scope.GetOrAdd(key);
+        var (scope, resolver) = GetLockScope(fileSystem);
+        return scope.GetOrAdd(CreateLockKey(resolver, databasePath, walPath));
+    }
+
+    /// <summary>
+    /// Resolves the lock scope that owns every pager over one physical storage.
+    /// </summary>
+    /// <remarks>
+    /// Two <see cref="AsyncFileSystemAdapter"/> wrappers over the same backend are
+    /// distinct objects, so keying the scope on the asynchronous facade would hand
+    /// each of them an independent writer lock over one database file. Unwrap to
+    /// the backing <see cref="IFileSystem"/> (through encryption, page-codec, and
+    /// decorator layers) first, and give every <see cref="PhysicalFileSystem"/> a
+    /// single process-wide scope because those instances are interchangeable.
+    /// </remarks>
+    private static (AsyncLockScope Scope, IStoragePathResolver? Resolver) GetLockScope(
+        IAsyncFileSystem fileSystem)
+    {
+        var resolver = ResolvePathResolver(fileSystem);
+        if (fileSystem is IAsyncFileSystemBacking backing)
+        {
+            var inner = AhtolaEncryptionFileSystem.Unwrap(backing.BackingFileSystem);
+            resolver ??= inner as IStoragePathResolver;
+            return inner is PhysicalFileSystem
+                ? (PhysicalLockScope, resolver)
+                : (BackingLockScopes.GetValue(inner, _ => new AsyncLockScope(resolver)), resolver);
+        }
+
+        var capturedResolver = resolver;
+        return (
+            AsyncLockScopes.GetValue(fileSystem, _ => new AsyncLockScope(capturedResolver)),
+            resolver);
+    }
+
+    private static IStoragePathResolver? ResolvePathResolver(IAsyncFileSystem fileSystem)
+    {
+        if (fileSystem is IStoragePathResolver asyncResolver)
+            return asyncResolver;
+        return fileSystem is IAsyncFileSystemBacking backing
+            ? AhtolaEncryptionFileSystem.Unwrap(backing.BackingFileSystem) as IStoragePathResolver
+            : null;
     }
 
     private static string CreateLockKey(
-        IAsyncFileSystem fileSystem,
+        IStoragePathResolver? resolver,
         string databasePath,
         string walPath)
     {
-        if (fileSystem is IStoragePathResolver resolver)
+        if (resolver is not null)
         {
             databasePath = resolver.GetCanonicalPath(databasePath);
             walPath = resolver.GetCanonicalPath(walPath);
@@ -1680,10 +1759,14 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         }
     }
 
-    private sealed class AsyncLockScope
+    private sealed class AsyncLockScope(IStoragePathResolver? resolver)
     {
         private readonly object _gate = new();
-        private readonly Dictionary<string, SqlitePagerLockManager> _locks = new(StringComparer.Ordinal);
+
+        // Canonical paths are only unique under the resolver's own comparison, so
+        // two spellings of one Windows path must land on a single lock manager.
+        private readonly Dictionary<string, SqlitePagerLockManager> _locks =
+            new(resolver?.PathComparer ?? StringComparer.Ordinal);
 
         internal SqlitePagerLockManager GetOrAdd(string key)
         {
@@ -1805,6 +1888,7 @@ public sealed class AsyncSqlitePagerTransaction : IAsyncDisposable
     private readonly IReadOnlyDictionary<uint, byte[]> _sourceOverlay;
     private readonly Dictionary<uint, byte[]> _pageImages = [];
     private readonly List<uint> _writeOrder = [];
+    private readonly TimeSpan _busyTimeout;
     private SqlitePagerLockLease? _writerLock;
     private SqlitePagerTransactionState _state = SqlitePagerTransactionState.Active;
 
@@ -1813,13 +1897,15 @@ public sealed class AsyncSqlitePagerTransaction : IAsyncDisposable
         SqlitePagerLockLease writerLock,
         uint targetDatabaseSizeInPages,
         uint sourcePageCount,
-        IReadOnlyDictionary<uint, byte[]> sourceOverlay)
+        IReadOnlyDictionary<uint, byte[]> sourceOverlay,
+        TimeSpan busyTimeout)
     {
         _pager = pager;
         _writerLock = writerLock;
         TargetDatabaseSizeInPages = targetDatabaseSizeInPages;
         _sourcePageCount = sourcePageCount;
         _sourceOverlay = sourceOverlay;
+        _busyTimeout = busyTimeout;
     }
 
     /// <summary>The database size written into this transaction's commit boundary.</summary>
@@ -1958,6 +2044,24 @@ public sealed class AsyncSqlitePagerTransaction : IAsyncDisposable
         => (_writerLock
             ?? throw new InvalidOperationException("SQLite pager transaction no longer owns its writer lock."))
             .PublishStorageChange();
+
+    /// <summary>
+    /// Excludes readers before a rollback-journal commit rewrites the main file.
+    /// </summary>
+    internal ValueTask UpgradeToExclusiveCommitAsync(CancellationToken cancellationToken)
+        => RequireWriterLock().UpgradeToExclusiveAsync(_busyTimeout, cancellationToken);
+
+    /// <summary>Hides WAL frames past <paramref name="lastPublishedFrameNumber"/> from readers.</summary>
+    internal void BeginWalPublication(long lastPublishedFrameNumber)
+        => RequireWriterLock().BeginWalPublication(lastPublishedFrameNumber);
+
+    /// <summary>Republishes the physical WAL once this commit is durable.</summary>
+    internal void PublishWalFrames()
+        => RequireWriterLock().PublishWalFrames();
+
+    private SqlitePagerLockLease RequireWriterLock()
+        => _writerLock
+           ?? throw new InvalidOperationException("SQLite pager transaction no longer owns its writer lock.");
 
     internal void ReleaseWriterLock()
     {

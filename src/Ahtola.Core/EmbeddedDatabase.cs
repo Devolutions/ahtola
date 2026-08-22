@@ -3157,6 +3157,33 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// Asynchronously waits until nothing on this database is blocking
+    /// <paramref name="owner"/>'s next attempt, or the busy deadline expires.
+    /// </summary>
+    /// <remarks>
+    /// This is the asynchronous half of the busy handler: it uses the same
+    /// transaction-lock and catalog-writer waits the synchronous engine blocks on,
+    /// but suspends the caller instead of parking a thread in
+    /// <see cref="Monitor.Wait(object)"/> or <see cref="Thread.Sleep(int)"/>. A
+    /// browser connection therefore never occupies its only thread while another
+    /// connection holds the write reservation.
+    /// </remarks>
+    internal async ValueTask WaitForBusyRetryAsync(
+        object owner,
+        long deadline,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(owner);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (IsFileBacked && _fileSystem is not null)
+            await WaitForCatalogStabilityAsync(deadline, cancellationToken).ConfigureAwait(false);
+
+        await _transactionLock
+            .ThrowIfWriteBlockedAsync(owner, GetRemainingBusyTimeout(deadline), cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     private static long GetBusyWaitDeadline(TimeSpan busyTimeout)
     {
         if (busyTimeout == Timeout.InfiniteTimeSpan)
@@ -3177,6 +3204,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var remaining = Math.Max(0, deadline - Environment.TickCount64);
         return TimeSpan.FromMilliseconds(remaining);
     }
+
+    internal static long CreateBusyDeadline(TimeSpan busyTimeout)
+        => GetBusyWaitDeadline(busyTimeout);
+
+    internal static bool HasBusyBudgetRemaining(long deadline)
+        => GetRemainingBusyWait(deadline) > 0;
+
+    internal static TimeSpan RemainingBusyBudget(long deadline)
+        => GetRemainingBusyTimeout(deadline);
 
     /// <summary>
     /// A foreign read-only connection holds no ownership and no catalog write
@@ -41855,6 +41891,102 @@ public sealed partial class EmbeddedConnection : IDisposable
         }
     }
 
+    /// <summary>
+    /// Runs the synchronous engine with a zero busy budget so no execution path
+    /// can park the calling thread waiting for a competing connection.
+    /// </summary>
+    /// <remarks>
+    /// The asynchronous statement seam pairs this with
+    /// <see cref="WaitForBusyRetryAsync"/>: fail fast, suspend on the managed
+    /// lock's asynchronous signal, then retry. Saving and restoring makes nesting
+    /// safe when a SQL callback steps another statement on this connection.
+    /// </remarks>
+    internal FailFastBusyScope EnterFailFastBusyScope() => new(this);
+
+    internal readonly struct FailFastBusyScope : IDisposable
+    {
+        private readonly EmbeddedConnection _connection;
+        private readonly TimeSpan _restore;
+
+        internal FailFastBusyScope(EmbeddedConnection connection)
+        {
+            _connection = connection;
+            _restore = connection.BusyTimeout;
+            if (_restore != TimeSpan.Zero)
+                connection.BusyTimeout = TimeSpan.Zero;
+        }
+
+        public void Dispose()
+        {
+            // A PRAGMA busy_timeout executed inside the scope is the caller's new
+            // intent; never clobber it with the value this scope displaced.
+            if (_restore != TimeSpan.Zero && _connection.BusyTimeout == TimeSpan.Zero)
+                _connection.BusyTimeout = _restore;
+        }
+    }
+
+    /// <summary>
+    /// Asynchronously waits out whatever made this connection's last attempt busy,
+    /// returning <see langword="false"/> once the busy budget is spent.
+    /// </summary>
+    internal async ValueTask<bool> WaitForBusyRetryAsync(
+        long deadline,
+        int attempt,
+        bool staleCatalog,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!EmbeddedDatabase.HasBusyBudgetRemaining(deadline))
+            return false;
+
+        try
+        {
+            foreach (var database in EnumerateReachableDatabases())
+            {
+                await database
+                    .WaitForBusyRetryAsync(this, deadline, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (EmbeddedBusyException)
+        {
+            // The wait itself ran out of budget; the caller reports the original
+            // busy failure rather than this one.
+            return false;
+        }
+
+        // Running the attempt with a zero busy budget also disables the engine's
+        // own stale-catalog retry, so adopt the committed catalog here instead.
+        // An explicit transaction must keep its snapshot, and fails busy exactly
+        // as a zero-timeout synchronous statement would.
+        if (staleCatalog && _transactionDatabases is null)
+        {
+            foreach (var database in EnumerateReachableDatabases())
+            {
+                if (database.IsFileBacked)
+                    database.ReloadFileCatalogAfterStale();
+            }
+        }
+
+        // A stale catalog version, unlike a held reservation, has no signal to wait
+        // on, so back off on SQLite's own delay schedule instead of spinning.
+        var remaining = EmbeddedDatabase.RemainingBusyBudget(deadline);
+        var delay = SqliteBusyBackoff.DelayForAttempt(attempt, TimeSpan.Zero, remaining);
+        if (delay <= TimeSpan.Zero && remaining != Timeout.InfiniteTimeSpan)
+            return false;
+        if (delay > TimeSpan.Zero)
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+
+        return EmbeddedDatabase.HasBusyBudgetRemaining(deadline);
+    }
+
+    private IEnumerable<EmbeddedDatabase> EnumerateReachableDatabases()
+    {
+        yield return _database;
+        foreach (var attachment in _attachedDatabases.Values)
+            yield return attachment.Database;
+    }
+
     private VdbeExecutionOptions CreateVdbeExecutionOptions(EmbeddedDatabase database)
     {
         ArgumentNullException.ThrowIfNull(database);
@@ -47966,6 +48098,59 @@ public sealed class EmbeddedStatement : IDisposable
         _currentRow = null;
         ReleaseReaderLease();
         return StatementStepResult.Done;
+    }
+
+    /// <summary>
+    /// Advances the statement without ever blocking the calling thread on lock
+    /// contention, honoring <paramref name="cancellationToken"/> exactly.
+    /// </summary>
+    /// <remarks>
+    /// The engine's execution pipeline is synchronous, and its busy waits park a
+    /// thread in <see cref="Monitor.Wait(object)"/> or <see cref="Thread.Sleep(int)"/>
+    /// for the whole busy timeout — fatal on a browser's single thread and
+    /// unresponsive to cancellation. This runs each attempt with a zero busy budget,
+    /// so the synchronous path fails fast instead of waiting, then suspends on the
+    /// managed transaction lock's asynchronous signal before retrying. The observed
+    /// busy semantics are unchanged: the retries are bounded by the connection's
+    /// <c>busy_timeout</c> and the original failure is what surfaces when it runs
+    /// out. The statement is only advanced by a successful attempt, because
+    /// execution publishes its result as a single assignment.
+    /// </remarks>
+    public async ValueTask<StatementStepResult> StepAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
+        var busyTimeout = _connection.BusyTimeout;
+
+        // A zero budget already fails fast, and a busy_timeout PRAGMA owns the very
+        // knob the fail-fast scope displaces, so both run the statement directly.
+        if (busyTimeout == TimeSpan.Zero || _statement is PragmaBusyTimeoutStatement)
+            return Step(cancellationToken);
+
+        var deadline = EmbeddedDatabase.CreateBusyDeadline(busyTimeout);
+        var attempt = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                using (_connection.EnterFailFastBusyScope())
+                    return Step(cancellationToken);
+            }
+            catch (EmbeddedBusyException busy)
+            {
+                if (!await _connection
+                        .WaitForBusyRetryAsync(
+                            deadline,
+                            attempt++,
+                            busy is EmbeddedCatalogSnapshotStaleException,
+                            cancellationToken)
+                        .ConfigureAwait(false))
+                {
+                    throw;
+                }
+            }
+        }
     }
 
     public SqlValue GetValue(int ordinal)

@@ -741,8 +741,8 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Asynchronously opens an existing WAL after validating its header. A
-    /// partial or corrupt frame tail is left for <see cref="ScanRecoveryAsync"/>
-    /// to diagnose.
+    /// partial or corrupt frame tail is left for
+    /// <see cref="ScanRecoveryAsync(CancellationToken)"/> to diagnose.
     /// </summary>
     public static async ValueTask<SqliteWalFile> OpenAsync(
         IAsyncFileSystem fileSystem,
@@ -860,7 +860,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
 
         var file = GetAsyncFile();
         await MaterializeHeaderAfterCheckpointTruncateAsync(cancellationToken).ConfigureAwait(false);
-        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        var scan = await ScanCoreAsync(long.MaxValue, cancellationToken).ConfigureAwait(false);
         if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile)
         {
             throw new InvalidDataException(
@@ -1012,7 +1012,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
 
         var file = GetAsyncFile();
         await MaterializeHeaderAfterCheckpointTruncateAsync(cancellationToken).ConfigureAwait(false);
-        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        var scan = await ScanCoreAsync(long.MaxValue, cancellationToken).ConfigureAwait(false);
         if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile)
         {
             throw new InvalidDataException(
@@ -1422,7 +1422,27 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        return (await ScanCoreAsync(cancellationToken).ConfigureAwait(false)).Info;
+        return (await ScanCoreAsync(long.MaxValue, cancellationToken).ConfigureAwait(false)).Info;
+    }
+
+    /// <summary>
+    /// Asynchronously scans frames up to and including
+    /// <paramref name="maxVisibleFrameNumber"/>, ignoring anything past it.
+    /// </summary>
+    /// <remarks>
+    /// Frames beyond the boundary belong to a commit that is still being made
+    /// durable by another pager on this database, so a reader must not adopt them.
+    /// Because the boundary always lands on a published commit, the truncated scan
+    /// reports <see cref="SqliteWalRecoveryStopReason.EndOfFile"/> and never asks
+    /// its caller to repair a tail it simply cannot see yet.
+    /// </remarks>
+    public async ValueTask<SqliteWalRecoveryInfo> ScanRecoveryAsync(
+        long maxVisibleFrameNumber,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ArgumentOutOfRangeException.ThrowIfNegative(maxVisibleFrameNumber);
+        return (await ScanCoreAsync(maxVisibleFrameNumber, cancellationToken).ConfigureAwait(false)).Info;
     }
 
     /// <summary>
@@ -1463,7 +1483,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         ThrowIfReadOnly();
 
         var file = GetAsyncFile();
-        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        var scan = await ScanCoreAsync(long.MaxValue, cancellationToken).ConfigureAwait(false);
         var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
         if (_truncatedAfterCheckpoint && length == 0)
             return scan.Info;
@@ -1556,7 +1576,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         ThrowIfReadOnly();
 
         var file = GetAsyncFile();
-        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        var scan = await ScanCoreAsync(long.MaxValue, cancellationToken).ConfigureAwait(false);
         if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile
             || scan.Info.LastValidFrameNumber != scan.Info.LastCommittedFrameNumber)
         {
@@ -1629,7 +1649,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         ThrowIfReadOnly();
 
         var file = GetAsyncFile();
-        var scan = await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        var scan = await ScanCoreAsync(long.MaxValue, cancellationToken).ConfigureAwait(false);
         if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile
             || scan.Info.LastValidFrameNumber != scan.Info.LastCommittedFrameNumber)
         {
@@ -1776,7 +1796,9 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
             previousChecksum);
     }
 
-    private async ValueTask<ScanState> ScanCoreAsync(CancellationToken cancellationToken)
+    private async ValueTask<ScanState> ScanCoreAsync(
+        long maxVisibleFrameNumber,
+        CancellationToken cancellationToken)
     {
         var file = GetAsyncFile();
         var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
@@ -1801,8 +1823,10 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
             }
         }
 
-        var fullFrameCount = CompleteFrameCount(length);
-        var hasPartialFrame = (length - SqliteWalHeader.Size) % FrameSize != 0;
+        var physicalFrameCount = CompleteFrameCount(length);
+        var fullFrameCount = Math.Min(physicalFrameCount, maxVisibleFrameNumber);
+        var truncatedByBoundary = fullFrameCount < physicalFrameCount;
+        var hasPartialFrame = !truncatedByBoundary && (length - SqliteWalHeader.Size) % FrameSize != 0;
         var previousChecksum = (Header.Checksum1, Header.Checksum2);
         var lastValidFrameNumber = 0L;
         var lastCommittedFrameNumber = 0L;

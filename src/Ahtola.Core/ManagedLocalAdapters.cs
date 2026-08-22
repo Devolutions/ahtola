@@ -812,8 +812,22 @@ public sealed class ManagedStatementAdapter : IManagedStatementAdapter
         }
     }
 
-    public ValueTask<StatementStepResult> StepAsync(CancellationToken cancellationToken = default)
-        => ValueTask.FromResult(Step(cancellationToken));
+    public async ValueTask<StatementStepResult> StepAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await GetStatement().StepAsync(cancellationToken).ConfigureAwait(false);
+            lock (_gate)
+                _hasCurrentRow = result == StatementStepResult.Row;
+            return result;
+        }
+        catch
+        {
+            lock (_gate)
+                _hasCurrentRow = false;
+            throw;
+        }
+    }
 
     public bool HasRows()
     {

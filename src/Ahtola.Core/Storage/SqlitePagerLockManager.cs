@@ -160,6 +160,7 @@ public sealed class SqlitePagerLockManager
     private bool _checkpointActive;
     private long _generation;
     private long _journalModeGeneration;
+    private long _walPublicationBoundary = long.MaxValue;
     private IDisposable? _sharedReaderLock;
 
     /// <summary>Creates a process-local SQLite pager lock manager.</summary>
@@ -640,6 +641,128 @@ public sealed class SqlitePagerLockManager
         }
     }
 
+    /// <summary>
+    /// Asynchronously upgrades the active writer lease to EXCLUSIVE without
+    /// blocking a thread while existing readers drain.
+    /// </summary>
+    /// <remarks>
+    /// New readers are excluded the moment the upgrade is requested, so a steady
+    /// stream of arrivals cannot starve the writer. A failed upgrade drops the
+    /// pending flag again: the caller falls back to RESERVED, which SQLite does
+    /// not let block readers.
+    /// </remarks>
+    internal async ValueTask UpgradeWriterToExclusiveAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
+        var upgraded = false;
+        var pendingRegistered = false;
+        try
+        {
+            while (true)
+            {
+                Task stateChanged;
+                TimeSpan remaining;
+                lock (_gate)
+                {
+                    if (!_writerActive)
+                        throw new InvalidOperationException("The SQLite writer lease is no longer active.");
+
+                    if (!pendingRegistered)
+                    {
+                        _writerExclusivePending = true;
+                        pendingRegistered = true;
+                    }
+
+                    if (_readerCount == 0)
+                    {
+                        upgraded = true;
+                        return;
+                    }
+
+                    remaining = RemainingTimeout(timeout, stopwatch);
+                    if (remaining == TimeSpan.Zero)
+                        throw new SqlitePagerBusyException(SqlitePagerLockOperation.Writer, timeout);
+                    stateChanged = _stateChanged.Capture();
+                }
+
+                try
+                {
+                    if (remaining == Timeout.InfiniteTimeSpan)
+                        await stateChanged.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    else
+                        await stateChanged.WaitAsync(remaining, cancellationToken).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    throw new SqlitePagerBusyException(SqlitePagerLockOperation.Writer, timeout);
+                }
+            }
+        }
+        finally
+        {
+            if (!upgraded && pendingRegistered)
+            {
+                lock (_gate)
+                {
+                    if (_writerActive)
+                        _writerExclusivePending = false;
+                    Monitor.PulseAll(_gate);
+                    _stateChanged.PulseAll();
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// The highest WAL frame this process has published to readers, or
+    /// <see cref="long.MaxValue"/> when the physical WAL is authoritative.
+    /// </summary>
+    /// <remarks>
+    /// A commit-bearing frame reaches the WAL file before its durable flush
+    /// succeeds. Without a boundary, a concurrent reader that rescans the physical
+    /// WAL would adopt a transaction that is still in flight and may yet fail. The
+    /// committing writer lowers this boundary to the last published frame before
+    /// appending and raises it again only once the flush and post-flush validation
+    /// have both succeeded. The boundary is deliberately process-local and resets
+    /// to unbounded on open, checkpoint, and WAL tail recovery, so crash recovery
+    /// across a process or open boundary still derives visibility from the file.
+    /// </remarks>
+    internal long WalPublicationBoundary
+    {
+        get
+        {
+            lock (_gate)
+                return _walPublicationBoundary;
+        }
+    }
+
+    /// <summary>Hides WAL frames past <paramref name="lastPublishedFrameNumber"/> from readers.</summary>
+    internal void BeginWalPublication(long lastPublishedFrameNumber)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(lastPublishedFrameNumber);
+        lock (_gate)
+        {
+            if (!_writerActive)
+                throw new InvalidOperationException("Only an active SQLite writer lease can publish WAL frames.");
+
+            _walPublicationBoundary = lastPublishedFrameNumber;
+        }
+    }
+
+    /// <summary>Republishes the physical WAL after a durable commit or recovery.</summary>
+    internal void PublishAllWalFrames()
+    {
+        lock (_gate)
+        {
+            _walPublicationBoundary = long.MaxValue;
+            Monitor.PulseAll(_gate);
+            _stateChanged.PulseAll();
+        }
+    }
+
     internal long PublishJournalModeChange(SqlitePagerLockOperation operation)
     {
         lock (_gate)
@@ -914,6 +1037,29 @@ public sealed class SqlitePagerLockLease : IDisposable
         if (Operation != SqlitePagerLockOperation.Writer)
             throw new InvalidOperationException("Only a SQLite writer lease can upgrade to EXCLUSIVE.");
         manager.UpgradeWriterToExclusive(timeout);
+    }
+
+    internal ValueTask UpgradeToExclusiveAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var manager = Volatile.Read(ref _manager)
+            ?? throw new ObjectDisposedException(nameof(SqlitePagerLockLease));
+        if (Operation != SqlitePagerLockOperation.Writer)
+            throw new InvalidOperationException("Only a SQLite writer lease can upgrade to EXCLUSIVE.");
+        return manager.UpgradeWriterToExclusiveAsync(timeout, cancellationToken);
+    }
+
+    internal void BeginWalPublication(long lastPublishedFrameNumber)
+    {
+        var manager = Volatile.Read(ref _manager)
+            ?? throw new ObjectDisposedException(nameof(SqlitePagerLockLease));
+        manager.BeginWalPublication(lastPublishedFrameNumber);
+    }
+
+    internal void PublishWalFrames()
+    {
+        var manager = Volatile.Read(ref _manager)
+            ?? throw new ObjectDisposedException(nameof(SqlitePagerLockLease));
+        manager.PublishAllWalFrames();
     }
 
     /// <inheritdoc />

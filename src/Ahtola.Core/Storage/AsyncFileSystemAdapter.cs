@@ -30,9 +30,11 @@ public static class AsyncFileSystemAdapter
         };
     }
 
-    private class FileSystemAdapter(IFileSystem inner) : IAsyncFileSystem
+    private class FileSystemAdapter(IFileSystem inner) : IAsyncFileSystem, IAsyncFileSystemBacking
     {
         protected IFileSystem Inner { get; } = inner;
+
+        public IFileSystem BackingFileSystem => Inner;
 
         public StringComparer PathComparer
             => ((IStoragePathResolver)Inner).PathComparer;
