@@ -16,6 +16,7 @@ or run.
 
 - [Install](#install) ([full guide](docs/dotnet-packages.md))
 - [Quick start](#quick-start)
+- [Browser WebAssembly](#browser-webassembly) ([deployment guide](docs/browser-wasm.md))
 - [PowerShell module](#powershell-module) ([full guide](docs/powershell-module.md))
 - [What this is good for](#what-this-is-good-for)
 - [Important limits](#important-limits)
@@ -27,6 +28,8 @@ or run.
 dotnet add package Devolutions.Ahtola.Data.Sqlite
 # optional EF Core provider (9.x on net8/net9, 10.x on net10):
 dotnet add package Devolutions.Ahtola.EntityFrameworkCore.Sqlite
+# optional Blazor/browser OPFS support:
+dotnet add package Devolutions.Ahtola.Data.Sqlite.Browser
 ```
 
 Targets: `net8.0`, `net9.0`, `net10.0`. No `net48` / .NET Framework assets.
@@ -35,6 +38,7 @@ Targets: `net8.0`, `net9.0`, `net10.0`. No `net48` / .NET Framework assets.
 | --- | --- | --- |
 | `Devolutions.Ahtola.Core` | Managed engine | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Core) |
 | `Devolutions.Ahtola.Data.Sqlite` | ADO.NET provider + `Microsoft.Data.Sqlite`-compatible facade; embeds `Ahtola.Data` | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Data.Sqlite) |
+| `Devolutions.Ahtola.Data.Sqlite.Browser` | Blazor/.NET WebAssembly data source with durable OPFS storage | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.Data.Sqlite.Browser) |
 | `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | EF Core provider (`UseAhtola`) | [nuget.org](https://www.nuget.org/packages/Devolutions.Ahtola.EntityFrameworkCore.Sqlite) |
 
 `Devolutions.Ahtola.Core` flows in transitively via `Devolutions.Ahtola.Data.Sqlite`
@@ -90,6 +94,40 @@ options.UseAhtola("Data Source=app.db");
 // Direct Turso/Hrana:
 options.UseAhtola("Data Source=turso://my-db.turso.io;Auth Token=" + authToken);
 ```
+
+## Browser WebAssembly
+
+`Devolutions.Ahtola.Data.Sqlite.Browser` stores local databases in the browser's
+Origin Private File System (OPFS). A dedicated module worker owns synchronous
+OPFS handles while .NET awaits its operations, so the browser event loop is
+never blocked on storage I/O.
+
+```csharp
+using Ahtola.Data.Sqlite.Browser;
+
+await using var dataSource = new AhtolaBrowserDataSource("my-app/main.db");
+await using var connection = await dataSource.OpenConnectionAsync();
+await using var command = connection.CreateCommand();
+command.CommandText = "CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, name TEXT)";
+await command.ExecuteNonQueryAsync();
+```
+
+Browser-created connections are async-only. Use `OpenAsync`,
+`ExecuteReaderAsync`, `ReadAsync`, transaction async methods, `OpenBlobAsync`,
+`BackupDatabaseAsync`, `CloseAsync`, and `DisposeAsync`. The corresponding
+synchronous operations fail rather than blocking WebAssembly on an incomplete
+browser promise.
+
+The host must be a secure context and cross-origin isolated:
+
+```text
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+The package supplies its worker and JavaScript modules through normal Razor
+static web assets. See [docs/browser-wasm.md](docs/browser-wasm.md) for complete
+deployment, EF Core, locking, lifetime, quota, and troubleshooting guidance.
 
 Common connection-string keywords: `Data Source`, `Mode`, `Cache`, `Pooling`,
 `Foreign Keys`, `Default Timeout` / `Command Timeout`, `Foreign Read Only`,
