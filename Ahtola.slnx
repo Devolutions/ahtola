@@ -2,6 +2,7 @@
   <Project Path="src/Ahtola.Core/Ahtola.Core.csproj" />
   <Project Path="src/Ahtola.Data/Ahtola.Data.csproj" />
   <Project Path="src/Ahtola.Data.Sqlite/Ahtola.Data.Sqlite.csproj" />
+  <Project Path="src/Ahtola.Data.Sqlite.Browser/Ahtola.Data.Sqlite.Browser.csproj" />
   <Project Path="src/Ahtola.EntityFrameworkCore.Sqlite/Ahtola.EntityFrameworkCore.Sqlite.csproj" />
     <Project Path="src/Devolutions.Ahtola.PowerShell/Devolutions.Ahtola.PowerShell.csproj" />
       <Project Path="src/Ahtola.Tests/Ahtola.Tests.csproj" />

@@ -59,6 +59,7 @@ $RepoRoot = $PSScriptRoot
 Set-Location -LiteralPath $RepoRoot
 
 $DataSqliteProject = './src/Ahtola.Data.Sqlite/Ahtola.Data.Sqlite.csproj'
+$BrowserDataSqliteProject = './src/Ahtola.Data.Sqlite.Browser/Ahtola.Data.Sqlite.Browser.csproj'
 $EfCoreProject = './src/Ahtola.EntityFrameworkCore.Sqlite/Ahtola.EntityFrameworkCore.Sqlite.csproj'
 $PowerShellProject = './src/Devolutions.Ahtola.PowerShell/Devolutions.Ahtola.PowerShell.csproj'
 $CoreProject = './src/Ahtola.Core/Ahtola.Core.csproj'
@@ -131,6 +132,7 @@ function Assert-ManagedProjectClosure {
         (Join-Path $RepoRoot 'src/Ahtola.Core'),
         (Join-Path $RepoRoot 'src/Ahtola.Data'),
         (Join-Path $RepoRoot 'src/Ahtola.Data.Sqlite'),
+        (Join-Path $RepoRoot 'src/Ahtola.Data.Sqlite.Browser'),
         (Join-Path $RepoRoot 'src/Ahtola.EntityFrameworkCore.Sqlite'),
                 (Join-Path $RepoRoot 'src/Devolutions.Ahtola.PowerShell'),
                 (Join-Path $RepoRoot 'samples/ManagedPackageConsumer')
@@ -155,6 +157,7 @@ function Assert-ManagedProjectClosure {
 function Invoke-Restore {
     Write-Step 'Restoring managed packages'
     Invoke-DotNet @('restore', $DataSqliteProject)
+    Invoke-DotNet @('restore', $BrowserDataSqliteProject)
     Invoke-DotNet @('restore', $EfCoreProject)
         Invoke-DotNet @('restore', $PowerShellProject)
 }
@@ -166,6 +169,7 @@ function Invoke-Build {
     Invoke-Restore
     Write-Step "Building managed packages ($BuildConfiguration)"
     Invoke-DotNet @('build', '--no-restore', '-c', $BuildConfiguration, $DataSqliteProject)
+    Invoke-DotNet @('build', '--no-restore', '-c', $BuildConfiguration, $BrowserDataSqliteProject)
     Invoke-DotNet @('build', '--no-restore', '-c', $BuildConfiguration, $EfCoreProject)
         Invoke-DotNet @('build', '--no-restore', '-c', $BuildConfiguration, $PowerShellProject)
 }
@@ -257,6 +261,7 @@ function Invoke-Pack {
 
     Invoke-DotNet ($packArgs + @($CoreProject))
     Invoke-DotNet ($packArgs + @($DataSqliteProject))
+    Invoke-DotNet ($packArgs + @($BrowserDataSqliteProject))
     Invoke-DotNet ($packArgs + @($EfCoreProject))
 
     Invoke-ValidatePackedClosure -Output $outputAbsolute

@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+  <PropertyGroup>
+    <TargetFrameworks>$(AhtolaTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Ahtola.Data.Sqlite.Browser</RootNamespace>
+    <AssemblyName>Devolutions.Ahtola.Data.Sqlite.Browser</AssemblyName>
+
+    <PackageId>Devolutions.Ahtola.Data.Sqlite.Browser</PackageId>
+    <Title>Ahtola SQLite-compatible provider for browser WebAssembly</Title>
+    <Description>Browser WebAssembly support for the pure-managed Ahtola ADO.NET provider, with OPFS persistence through a dedicated Web Worker.</Description>
+    <Authors>Devolutions</Authors>
+    <PackageTags>ahtola;sqlite;database;ado.net;browser;webassembly;wasm;opfs;blazor;devolutions</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Devolutions/ahtola</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Devolutions/ahtola</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <IsAotCompatible>true</IsAotCompatible>
+    <IsTrimmable>true</IsTrimmable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ahtola.Data.Sqlite\Ahtola.Data.Sqlite.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+</Project>
