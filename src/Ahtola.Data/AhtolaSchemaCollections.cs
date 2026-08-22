@@ -3,6 +3,7 @@ using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using System.Text.RegularExpressions;
+using Ahtola.Core;
 
 namespace Ahtola;
 
@@ -728,6 +729,9 @@ internal static class AhtolaSchemaCollections
 
     private static Dictionary<string, ReaderSchemaColumn> GetTableColumns(DbConnection connection, string tableName)
     {
+        if (connection is IManagedSchemaConnection managed)
+            return GetManagedTableColumns(managed.ManagedSchemaConnection, tableName);
+
         var columns = new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
         using (var command = connection.CreateCommand())
         {
@@ -762,6 +766,64 @@ internal static class AhtolaSchemaCollections
 
             if (indexedColumns.Count == 1 && columns.TryGetValue(indexedColumns[0], out var column))
                 columns[indexedColumns[0]] = column with { IsUnique = true };
+        }
+
+        return columns;
+    }
+
+    private static Dictionary<string, ReaderSchemaColumn> GetManagedTableColumns(
+        IManagedConnectionAdapter connection,
+        string tableName)
+    {
+        var columns = new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
+        using (var statement = connection.Prepare(
+                   $"PRAGMA table_info({QuoteIdentifier(tableName)});"))
+        {
+            while (statement.Step() == StatementStepResult.Row)
+            {
+                var name = statement.GetValue(1).AsText();
+                columns[name] = new ReaderSchemaColumn(
+                    name,
+                    statement.GetValue(2).AsText(),
+                    statement.GetValue(3).AsInteger() == 0,
+                    statement.GetValue(5).AsInteger() != 0,
+                    false);
+            }
+        }
+
+        if (columns.Count == 0)
+            return columns;
+
+        using var indexes = connection.Prepare(
+            $"PRAGMA index_list({QuoteIdentifier(tableName)});");
+        while (indexes.Step() == StatementStepResult.Row)
+        {
+            if (indexes.GetValue(2).AsInteger() == 0
+                || indexes.GetValue(4).AsInteger() != 0)
+            {
+                continue;
+            }
+
+            var indexName = indexes.GetValue(1).AsText();
+            using var info = connection.Prepare(
+                $"PRAGMA index_info({QuoteIdentifier(indexName)});");
+            string? indexedColumn = null;
+            var indexedColumnCount = 0;
+            while (info.Step() == StatementStepResult.Row)
+            {
+                if (info.GetValue(2).Kind != SqlValueKind.Null)
+                {
+                    indexedColumn = info.GetValue(2).AsText();
+                    indexedColumnCount++;
+                }
+            }
+
+            if (indexedColumnCount == 1
+                && indexedColumn is not null
+                && columns.TryGetValue(indexedColumn, out var column))
+            {
+                columns[indexedColumn] = column with { IsUnique = true };
+            }
         }
 
         return columns;

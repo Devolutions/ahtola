@@ -110,6 +110,16 @@ public sealed class ManagedSnapshotException : Exception
     public string? ObjectName { get; }
 }
 
+internal interface IManagedDatabaseFactory
+{
+    string DataSource { get; }
+
+    bool IsReadOnly { get; }
+
+    ValueTask<IManagedDatabaseAdapter> OpenDatabaseAsync(
+        CancellationToken cancellationToken = default);
+}
+
 public interface IManagedDatabaseAdapter : IDisposable, IAsyncDisposable
 {
     IManagedConnectionAdapter Connect();

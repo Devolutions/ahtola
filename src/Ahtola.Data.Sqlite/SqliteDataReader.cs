@@ -902,6 +902,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override bool NextResult()
     {
+        ThrowIfSynchronousBrowserOperation();
         if (_delegatedReader is null)
             return _command.RunOperation(NextResultCore);
 
@@ -1067,6 +1068,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override bool Read()
     {
+        ThrowIfSynchronousBrowserOperation();
         if (_delegatedReader is null)
             return _command.RunOperation(ReadCore);
 
@@ -1183,6 +1185,16 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
         => _delegatedReader?.IsDBNullAsync(ordinal, cancellationToken) ?? CompleteAsync(() => IsDBNull(ordinal), cancellationToken);
+
+    private void ThrowIfSynchronousBrowserOperation()
+    {
+        if (_command.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous reader iteration is not supported by the browser database source. "
+                + "Use ReadAsync or NextResultAsync.");
+        }
+    }
 
     public override Task<T> GetFieldValueAsync<T>(int ordinal, CancellationToken cancellationToken)
         => CompleteAsync(() =>
@@ -1702,6 +1714,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         var columns = new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
         if (_command.Connection is null)
             return columns;
+        if (_command.Connection.RequiresAsyncExecution)
+            return GetManagedTableColumns(_command.Connection.ManagedConnection, tableName);
 
         using var suspension = _command.Connection.SuspendHooks();
         using (var command = _command.Connection.CreateCommand())
@@ -1742,6 +1756,61 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
                 if (indexedColumns.Count == 1 && columns.TryGetValue(indexedColumns[0], out var column))
                     columns[indexedColumns[0]] = column with { IsUnique = true };
+            }
+        }
+
+        return columns;
+    }
+
+    private static Dictionary<string, SchemaColumnInfo> GetManagedTableColumns(
+        IManagedConnectionAdapter connection,
+        string tableName)
+    {
+        var columns = new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
+        using (var statement = connection.Prepare(
+                   $"PRAGMA table_info({QuoteIdentifier(tableName)});"))
+        {
+            while (statement.Step() == StatementStepResult.Row)
+            {
+                var name = statement.GetValue(1).AsText();
+                columns[name] = new SchemaColumnInfo(
+                    name,
+                    statement.GetValue(2).AsText(),
+                    statement.GetValue(3).AsInteger() == 0,
+                    statement.GetValue(5).AsInteger() != 0,
+                    false);
+            }
+        }
+
+        using var indexes = connection.Prepare(
+            $"PRAGMA index_list({QuoteIdentifier(tableName)});");
+        while (indexes.Step() == StatementStepResult.Row)
+        {
+            if (indexes.GetValue(2).AsInteger() == 0
+                || indexes.GetValue(4).AsInteger() != 0)
+            {
+                continue;
+            }
+
+            var indexName = indexes.GetValue(1).AsText();
+            using var info = connection.Prepare(
+                $"PRAGMA index_info({QuoteIdentifier(indexName)});");
+            string? indexedColumn = null;
+            var indexedColumnCount = 0;
+            while (info.Step() == StatementStepResult.Row)
+            {
+                if (info.GetValue(2).Kind != SqlValueKind.Null)
+                {
+                    indexedColumn = info.GetValue(2).AsText();
+                    indexedColumnCount++;
+                }
+            }
+
+            if (indexedColumnCount == 1
+                && indexedColumn is not null
+                && columns.TryGetValue(indexedColumn, out var column))
+            {
+                columns[indexedColumn] = column with { IsUnique = true };
             }
         }
 

@@ -139,6 +139,7 @@ public class AhtolaCommand : DbCommand
 
     public override int ExecuteNonQuery()
     {
+        ThrowIfSynchronousBrowserOperation("ExecuteNonQueryAsync");
         if (_connection?.IsRemote == true)
         {
             return _cancellation
@@ -174,6 +175,7 @@ public class AhtolaCommand : DbCommand
 
     public override object? ExecuteScalar()
     {
+        ThrowIfSynchronousBrowserOperation("ExecuteScalarAsync");
         using var reader = _cancellation.Run(token => Execute(CommandBehavior.Default, token));
         var result = reader.Read()
             ? reader.GetValue(0)
@@ -192,8 +194,22 @@ public class AhtolaCommand : DbCommand
 
     public override void Prepare()
     {
+        ThrowIfSynchronousBrowserOperation("PrepareAsync");
         using var replicaOperation = _connection?.EnterManagedReplicaOperation(CancellationToken.None);
         PrepareCore();
+    }
+
+    internal bool RequiresAsyncExecution
+        => _connection?.RequiresAsyncExecution == true;
+
+    private void ThrowIfSynchronousBrowserOperation(string asyncAlternative)
+    {
+        if (RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                $"Synchronous command execution is not supported by the browser database source. "
+                + $"Use {asyncAlternative}.");
+        }
     }
 
     private void PrepareCore()
@@ -289,6 +305,7 @@ public class AhtolaCommand : DbCommand
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
     {
+        ThrowIfSynchronousBrowserOperation("ExecuteReaderAsync");
         return _cancellation.Run(token => Execute(behavior, token));
     }
 

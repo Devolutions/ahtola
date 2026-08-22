@@ -36,6 +36,15 @@ internal sealed class BrowserMirroredFileSystem :
 
     public StringComparer PathComparer => StringComparer.Ordinal;
 
+    internal bool HasPendingMutations
+    {
+        get
+        {
+            lock (_gate)
+                return _pending.Count != 0;
+        }
+    }
+
     internal static async ValueTask<BrowserMirroredFileSystem> CreateAsync(
         OpfsAsyncFileSystem persistent,
         string rootDirectory,
@@ -168,46 +177,46 @@ internal sealed class BrowserMirroredFileSystem :
                 switch (operation.Kind)
                 {
                     case OperationKind.Create:
-                    {
-                        var file = await GetWritableFileAsync(
-                            handles,
-                            operation.Path,
-                            cancellationToken).ConfigureAwait(false);
-                        await file.SetLengthAsync(0, cancellationToken).ConfigureAwait(false);
-                        break;
-                    }
+                        {
+                            var file = await GetWritableFileAsync(
+                                handles,
+                                operation.Path,
+                                cancellationToken).ConfigureAwait(false);
+                            await file.SetLengthAsync(0, cancellationToken).ConfigureAwait(false);
+                            break;
+                        }
                     case OperationKind.Write:
-                    {
-                        var file = await GetWritableFileAsync(
-                            handles,
-                            operation.Path,
-                            cancellationToken).ConfigureAwait(false);
-                        await file.WriteAsync(
-                            operation.Position,
-                            operation.Bytes!,
-                            cancellationToken).ConfigureAwait(false);
-                        break;
-                    }
+                        {
+                            var file = await GetWritableFileAsync(
+                                handles,
+                                operation.Path,
+                                cancellationToken).ConfigureAwait(false);
+                            await file.WriteAsync(
+                                operation.Position,
+                                operation.Bytes!,
+                                cancellationToken).ConfigureAwait(false);
+                            break;
+                        }
                     case OperationKind.SetLength:
-                    {
-                        var file = await GetWritableFileAsync(
-                            handles,
-                            operation.Path,
-                            cancellationToken).ConfigureAwait(false);
-                        await file.SetLengthAsync(
-                            operation.Position,
-                            cancellationToken).ConfigureAwait(false);
-                        break;
-                    }
+                        {
+                            var file = await GetWritableFileAsync(
+                                handles,
+                                operation.Path,
+                                cancellationToken).ConfigureAwait(false);
+                            await file.SetLengthAsync(
+                                operation.Position,
+                                cancellationToken).ConfigureAwait(false);
+                            break;
+                        }
                     case OperationKind.Flush:
-                    {
-                        var file = await GetWritableFileAsync(
-                            handles,
-                            operation.Path,
-                            cancellationToken).ConfigureAwait(false);
-                        await file.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
-                        break;
-                    }
+                        {
+                            var file = await GetWritableFileAsync(
+                                handles,
+                                operation.Path,
+                                cancellationToken).ConfigureAwait(false);
+                            await file.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
+                            break;
+                        }
                     case OperationKind.Delete:
                         await CloseHandleAsync(handles, operation.Path).ConfigureAwait(false);
                         await _persistent

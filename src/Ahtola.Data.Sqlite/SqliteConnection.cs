@@ -10,7 +10,10 @@ using Ahtola.Core.Storage;
 
 namespace Ahtola.Data.Sqlite;
 
-public partial class SqliteConnection : DbConnection, ILocalReaderConnection
+public partial class SqliteConnection :
+    DbConnection,
+    ILocalReaderConnection,
+    IManagedSchemaConnection
 {
     private const int SQLITE_ERROR = 1;
     private const int SQLITE_CANTOPEN = 14;
@@ -19,6 +22,7 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     private AhtolaNativeDatabase? _database;
     private IManagedDatabaseAdapter? _managedDatabase;
+    private readonly IManagedDatabaseFactory? _managedDatabaseFactory;
     private AhtolaConnection? _ahtolaConnection;
     private bool _ahtolaConnectionWasOpen;
     private ManagedConnectionPoolLease? _managedPoolLease;
@@ -56,6 +60,15 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     {
         _managedDatabase = managedDatabase ?? throw new ArgumentNullException(nameof(managedDatabase));
         _dataSource = ":memory:";
+    }
+
+    internal SqliteConnection(
+        string connectionString,
+        IManagedDatabaseFactory managedDatabaseFactory)
+        : this(connectionString)
+    {
+        _managedDatabaseFactory = managedDatabaseFactory
+            ?? throw new ArgumentNullException(nameof(managedDatabaseFactory));
     }
 
     [AllowNull]
@@ -189,6 +202,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     public override void Open()
     {
+        if (_managedDatabaseFactory is not null)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous Open is not supported by the browser database source. Use OpenAsync.");
+        }
+
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_database is not null || _managedDatabase is not null || _ahtolaConnection is not null)
             throw new InvalidOperationException("The connection is already open.");
@@ -340,6 +359,9 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
 
+        if (_managedDatabaseFactory is not null)
+            return OpenManagedFactoryAsync(cancellationToken);
+
         if (IsRemoteDataSource)
             return OpenRemoteAsync(cancellationToken);
 
@@ -355,6 +377,49 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
                 cancellationToken.ThrowIfCancellationRequested();
             },
             CancellationToken.None);
+    }
+
+    private async Task OpenManagedFactoryAsync(CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (State != ConnectionState.Closed)
+            throw new InvalidOperationException("The connection is already open.");
+
+        var originalState = State;
+        IManagedDatabaseAdapter? database = null;
+        try
+        {
+            database = await _managedDatabaseFactory!
+                .OpenDatabaseAsync(cancellationToken)
+                .ConfigureAwait(false);
+            _ = await database.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            _managedDatabase = database;
+            _dataSource = _managedDatabaseFactory.DataSource;
+            _readOnly = _managedDatabaseFactory.IsReadOnly;
+            if (IsManagedReadOnly)
+                await ExecuteNonQueryAsync("PRAGMA query_only = ON;", cancellationToken).ConfigureAwait(false);
+            ApplyExtensionSettings();
+            await ApplyConnectionOptionsAsync(cancellationToken).ConfigureAwait(false);
+            RegisterScalarFunctions();
+            RegisterAggregateFunctions();
+            RegisterCollations();
+            RegisterHooks();
+            LoadPendingExtensions();
+            OnStateChange(new StateChangeEventArgs(originalState, State));
+            database = null;
+        }
+        catch
+        {
+            _managedDatabase = null;
+            _dataSource = null;
+            _readOnly = false;
+            throw;
+        }
+        finally
+        {
+            if (database is not null)
+                await database.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     private async Task OpenRemoteAsync(CancellationToken cancellationToken)
@@ -498,6 +563,75 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
             OnStateChange(new StateChangeEventArgs(originalState, State));
         }
+    }
+
+    public override Task CloseAsync()
+        => _managedDatabaseFactory is null
+            ? base.CloseAsync()
+            : CloseManagedFactoryAsync();
+
+    private async Task CloseManagedFactoryAsync()
+    {
+        var database = _managedDatabase;
+        if (database is null)
+            return;
+
+        var originalState = State;
+        Exception? cleanupError = null;
+        try
+        {
+            if (Transaction is { IsCompleted: false } transaction)
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            if (Transaction is not null)
+                await Transaction.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupError = exception;
+        }
+        try
+        {
+            CloseOpenManagedBlobs();
+            CloseOpenReaders();
+            ResetOpenCommands();
+        }
+        catch (Exception exception)
+        {
+            cleanupError = cleanupError is null
+                ? exception
+                : new AggregateException(
+                    "Browser transaction rollback and connection cleanup both failed.",
+                    cleanupError,
+                    exception);
+        }
+        finally
+        {
+            _managedDatabase = null;
+            Transaction = null;
+            _dataSource = null;
+            _readOnly = false;
+            _recursiveTriggers = false;
+            _readUncommitted = false;
+            _managedSharedMemory = false;
+            try
+            {
+                await database.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                cleanupError = cleanupError is null
+                    ? exception
+                    : new AggregateException(
+                        "Browser connection cleanup and durable disposal both failed.",
+                        cleanupError,
+                        exception);
+            }
+
+            OnStateChange(new StateChangeEventArgs(originalState, State));
+        }
+
+        if (cleanupError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupError).Throw();
     }
 
     public override void ChangeDatabase(string databaseName)
@@ -805,10 +939,44 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         base.Dispose(disposing);
     }
 
-    public override ValueTask DisposeAsync()
+    public override async ValueTask DisposeAsync()
     {
-        Dispose();
-        return ValueTask.CompletedTask;
+        if (_managedDatabaseFactory is null)
+        {
+            Dispose();
+            return;
+        }
+        if (_disposed)
+            return;
+
+        Exception? disposalError = null;
+        try
+        {
+            await CloseAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            disposalError = exception;
+        }
+
+        _disposed = true;
+        _noOpenReaders.Dispose();
+        try
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            disposalError = disposalError is null
+                ? exception
+                : new AggregateException(
+                    "Browser connection close and base disposal both failed.",
+                    disposalError,
+                    exception);
+        }
+
+        if (disposalError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(disposalError).Throw();
     }
 
     internal AhtolaNativeDatabase NativeDatabase => _database ?? throw new InvalidOperationException("The connection is not open.");
@@ -816,7 +984,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     internal IManagedConnectionAdapter ManagedConnection
         => _managedDatabase?.Connection ?? throw new InvalidOperationException("The connection is not open.");
 
+    IManagedConnectionAdapter IManagedSchemaConnection.ManagedSchemaConnection
+        => ManagedConnection;
+
     internal bool IsManagedConnection => _managedDatabase is not null;
+
+    internal bool RequiresAsyncExecution => _managedDatabaseFactory is not null;
 
     internal bool UsesManagedDatabase => IsManagedConnection;
 
@@ -947,6 +1120,14 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         command.ExecuteNonQuery();
     }
 
+    internal async Task ExecuteNonQueryAsync(
+        string sql,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = new SqliteCommand(sql, this);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private List<string> GetSchemaSql()
     {
         var schema = new List<string>();
@@ -1001,6 +1182,28 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             ExecuteNonQuery("PRAGMA foreign_keys = " + (_connectionOptions.ForeignKeys.Value ? "1" : "0") + ";");
         else if (IsManagedConnection)
             ExecuteNonQuery("PRAGMA foreign_keys = 1;");
+        if (_connectionOptions.RecursiveTriggers)
+            _recursiveTriggers = true;
+    }
+
+    private async Task ApplyConnectionOptionsAsync(CancellationToken cancellationToken)
+    {
+        if (_connectionOptions.ForeignKeys.HasValue)
+        {
+            await ExecuteNonQueryAsync(
+                    "PRAGMA foreign_keys = "
+                    + (_connectionOptions.ForeignKeys.Value ? "1" : "0")
+                    + ";",
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else if (IsManagedConnection)
+        {
+            await ExecuteNonQueryAsync(
+                    "PRAGMA foreign_keys = 1;",
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
         if (_connectionOptions.RecursiveTriggers)
             _recursiveTriggers = true;
     }

@@ -6,7 +6,10 @@ using Ahtola.Core.Storage;
 
 namespace Ahtola;
 
-public class AhtolaConnection : DbConnection, ILocalReaderConnection
+public class AhtolaConnection :
+    DbConnection,
+    ILocalReaderConnection,
+    IManagedSchemaConnection
 {
     internal const int AutomaticSyncMaximumAttempts = 3;
     // Test-only transport seam. Production callers continue to use the default HttpClient transport.
@@ -16,6 +19,7 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     private AhtolaReplicaDatabase? _replicaDatabase;
     private ManagedReplicaConnectionHost? _managedReplicaHost;
     private IManagedDatabaseAdapter? _managedDatabase;
+    private readonly IManagedDatabaseFactory? _managedDatabaseFactory;
     private ManagedConnectionPoolLease? _managedPoolLease;
     private ManagedConnectionPoolKey? _managedPoolKey;
     private AhtolaRemoteClient? _remoteClient;
@@ -106,6 +110,15 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         _remoteClient = remoteClient ?? throw new ArgumentNullException(nameof(remoteClient));
     }
 
+    internal AhtolaConnection(
+        string connectionString,
+        IManagedDatabaseFactory managedDatabaseFactory)
+        : this(connectionString)
+    {
+        _managedDatabaseFactory = managedDatabaseFactory
+            ?? throw new ArgumentNullException(nameof(managedDatabaseFactory));
+    }
+
     internal AhtolaConnection(IManagedDatabaseAdapter managedDatabase)
         : this("")
     {
@@ -132,6 +145,11 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     public override void Open()
     {
+        if (_managedDatabaseFactory is not null)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous Open is not supported by the browser database source. Use OpenAsync.");
+        }
         ValidateCanOpen();
         OpenCore();
     }
@@ -140,6 +158,12 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
     {
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
+
+        if (_managedDatabaseFactory is not null)
+        {
+            ValidateCanOpen();
+            return OpenManagedFactoryAsync(cancellationToken);
+        }
 
         if (_connectionOptions.IsRemote && _connectionOptions.IsReplica)
         {
@@ -159,6 +183,26 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
                 cancellationToken.ThrowIfCancellationRequested();
             },
             CancellationToken.None);
+    }
+
+    private async Task OpenManagedFactoryAsync(CancellationToken cancellationToken)
+    {
+        IManagedDatabaseAdapter? database = null;
+        try
+        {
+            database = await _managedDatabaseFactory!
+                .OpenDatabaseAsync(cancellationToken)
+                .ConfigureAwait(false);
+            _ = await database.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            _managedDatabase = database;
+            database = null;
+            _managedReadOnly = _managedDatabaseFactory.IsReadOnly;
+        }
+        finally
+        {
+            if (database is not null)
+                await database.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     public static void ClearAllPools() => ManagedConnectionPool.ClearAll();
@@ -276,6 +320,58 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cancellationError).Throw();
     }
 
+    public override Task CloseAsync()
+        => _managedDatabaseFactory is null
+            ? base.CloseAsync()
+            : CloseManagedFactoryAsync();
+
+    private async Task CloseManagedFactoryAsync()
+    {
+        var database = _managedDatabase;
+        if (database is null)
+            return;
+
+        Exception? cleanupError = null;
+        try
+        {
+            if (_transaction is { IsCompleted: false } transaction)
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            if (_transaction is not null)
+                await _transaction.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupError = exception;
+        }
+        try
+        {
+            CloseOpenReaders();
+            ResetOpenCommands();
+        }
+        catch (Exception exception)
+        {
+            cleanupError = CombineDisposalErrors(cleanupError, exception);
+        }
+        finally
+        {
+            _managedDatabase = null;
+            _transaction = null;
+            _readUncommitted = false;
+            _managedReadOnly = false;
+            try
+            {
+                await database.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                cleanupError = CombineDisposalErrors(cleanupError, exception);
+            }
+        }
+
+        if (cleanupError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupError).Throw();
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (!disposing || _disposed)
@@ -312,6 +408,40 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         try
         {
             base.Dispose(disposing);
+        }
+        catch (Exception exception)
+        {
+            disposalError = CombineDisposalErrors(disposalError, exception);
+        }
+
+        if (disposalError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(disposalError).Throw();
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (_managedDatabaseFactory is null)
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+        if (_disposed)
+            return;
+
+        Exception? disposalError = null;
+        try
+        {
+            await CloseAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            disposalError = exception;
+        }
+
+        _disposed = true;
+        try
+        {
+            await base.DisposeAsync().ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -496,6 +626,8 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
 
     internal bool IsManaged => _managedReplicaHost is not null || _managedDatabase is not null;
 
+    internal bool RequiresAsyncExecution => _managedDatabaseFactory is not null;
+
     internal AhtolaTransaction? Transaction => _transaction;
 
     internal bool ReadUncommitted
@@ -523,6 +655,9 @@ public class AhtolaConnection : DbConnection, ILocalReaderConnection
         => _managedReplicaHost?.Database.Connection
            ?? _managedDatabase?.Connection
            ?? throw new InvalidOperationException("Ahtola database is closed.");
+
+    IManagedConnectionAdapter IManagedSchemaConnection.ManagedSchemaConnection
+        => ManagedConnection;
 
     internal IDisposable? EnterManagedReplicaOperation(CancellationToken cancellationToken)
     {

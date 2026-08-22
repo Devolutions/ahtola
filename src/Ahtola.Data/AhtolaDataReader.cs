@@ -367,7 +367,10 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         || (_managedStatement is null && (_nativeStatement?.IsInvalid ?? true));
 
     public override bool NextResult()
-        => _command.RunOperation(NextResultCore);
+    {
+        ThrowIfSynchronousBrowserOperation();
+        return _command.RunOperation(NextResultCore);
+    }
 
     private bool NextResultCore(CancellationToken cancellationToken)
     {
@@ -439,7 +442,10 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
     void IConnectionOwnedReader.CloseFromConnection() => CloseCore(closeConnection: false);
 
     public override bool Read()
-        => _command.RunOperation(ReadCore);
+    {
+        ThrowIfSynchronousBrowserOperation();
+        return _command.RunOperation(ReadCore);
+    }
 
     private bool ReadCore(CancellationToken cancellationToken)
     {
@@ -689,6 +695,7 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         {
             result = statement.Read();
         }
+
         catch (AhtolaException) when (cancellationToken.IsCancellationRequested)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -696,6 +703,16 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         }
         cancellationToken.ThrowIfCancellationRequested();
         return result;
+    }
+
+    private void ThrowIfSynchronousBrowserOperation()
+    {
+        if (_command.RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                "Synchronous reader iteration is not supported by the browser database source. "
+                + "Use ReadAsync or NextResultAsync.");
+        }
     }
 
     private void ValidateOrdinal(int ordinal)

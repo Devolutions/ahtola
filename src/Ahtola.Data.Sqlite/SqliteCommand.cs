@@ -149,6 +149,7 @@ public class SqliteCommand : DbCommand
 
     public override int ExecuteNonQuery()
     {
+        ThrowIfSynchronousBrowserOperation("ExecuteNonQueryAsync");
         using var reader = _cancellation.Run(
             token => Execute("ExecuteNonQuery", CommandBehavior.Default, token));
         while (reader.Read())
@@ -163,6 +164,7 @@ public class SqliteCommand : DbCommand
 
     public override object? ExecuteScalar()
     {
+        ThrowIfSynchronousBrowserOperation("ExecuteScalarAsync");
         using var reader = _cancellation.Run(
             token => Execute("ExecuteScalar", CommandBehavior.Default, token));
         var result = reader.Read() ? reader.GetValue(0) : null;
@@ -173,6 +175,7 @@ public class SqliteCommand : DbCommand
 
     public override void Prepare()
     {
+        ThrowIfSynchronousBrowserOperation("PrepareAsync");
         EnsureExecutable("Prepare");
         if (Connection?.AhtolaConnection is { } ahtolaConnection)
         {
@@ -222,13 +225,22 @@ public class SqliteCommand : DbCommand
     protected override DbParameter CreateDbParameter() => new SqliteParameter();
 
     public new SqliteDataReader ExecuteReader()
-        => _cancellation.Run(token => Execute("ExecuteReader", CommandBehavior.Default, token));
+    {
+        ThrowIfSynchronousBrowserOperation("ExecuteReaderAsync");
+        return _cancellation.Run(token => Execute("ExecuteReader", CommandBehavior.Default, token));
+    }
 
     public new SqliteDataReader ExecuteReader(CommandBehavior behavior)
-        => _cancellation.Run(token => Execute("ExecuteReader", behavior, token));
+    {
+        ThrowIfSynchronousBrowserOperation("ExecuteReaderAsync");
+        return _cancellation.Run(token => Execute("ExecuteReader", behavior, token));
+    }
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
-        => _cancellation.Run<DbDataReader>(token => Execute("ExecuteReader", behavior, token));
+    {
+        ThrowIfSynchronousBrowserOperation("ExecuteReaderAsync");
+        return _cancellation.Run<DbDataReader>(token => Execute("ExecuteReader", behavior, token));
+    }
 
     public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
         => cancellationToken.IsCancellationRequested
@@ -447,6 +459,19 @@ public class SqliteCommand : DbCommand
         }
         _hasOpenReader = true;
         return new SqliteDataReader(this, recordsAffected, behavior, CloseReader);
+    }
+
+    internal bool RequiresAsyncExecution
+        => Connection?.RequiresAsyncExecution == true;
+
+    private void ThrowIfSynchronousBrowserOperation(string asyncAlternative)
+    {
+        if (RequiresAsyncExecution)
+        {
+            throw new PlatformNotSupportedException(
+                $"Synchronous command execution is not supported by the browser database source. "
+                + $"Use {asyncAlternative}.");
+        }
     }
 
     private async ValueTask<DbDataReader> ExecuteManagedLocalAsync(

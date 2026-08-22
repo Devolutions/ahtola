@@ -29,6 +29,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Ahtola.Data.Sqlite\Ahtola.Data.Sqlite.csproj" />
+    <ProjectReference Include="..\Ahtola.Data\Ahtola.Data.csproj" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>

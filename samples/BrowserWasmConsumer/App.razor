@@ -22,15 +22,39 @@
             var crypto = await AhtolaBrowserCryptoDiagnostics.RunKnownAnswersAsync();
             var ado = await RunAdoAsync();
             var ef = await RunEfAsync();
+            long persistentAdo;
+            try
+            {
+                persistentAdo = await RunPersistentAdoAsync();
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidOperationException("persistent-ado failed", exception);
+            }
+            long persistentEf;
+            try
+            {
+                persistentEf = await RunPersistentEfAsync();
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidOperationException("persistent-ef failed", exception);
+            }
+            var persistentCore = await RunPersistentCoreAsync();
             status =
                 $"PASS:capabilities={capabilities.IsSupported};"
                 + $"storage={storage.Succeeded};"
                 + $"crypto={crypto.Succeeded};"
-                + $"ado={ado};ef={ef}";
+                + $"ado={ado};ef={ef};"
+                + $"persistent-ado={persistentAdo};persistent-ef={persistentEf};"
+                + $"persistent-core={persistentCore}";
         }
         catch (Exception exception)
         {
-            status = $"FAIL:{exception.GetType().Name}:{exception.Message}";
+            var root = exception.GetBaseException();
+            status =
+                $"FAIL:{exception.GetType().Name}:{exception.Message}:"
+                + $"{root.GetType().Name}:{root.Message}";
         }
 
         StateHasChanged();
@@ -62,6 +86,88 @@
         context.Rows.Add(new ProbeRow { Value = 84 });
         await context.SaveChangesAsync();
         return await context.Rows.Select(static row => row.Value).SingleAsync();
+    }
+
+    private static async Task<long> RunPersistentAdoAsync()
+    {
+        const string path = "packed-consumer/ado.db";
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                CREATE TABLE probe(value INTEGER NOT NULL);
+                INSERT INTO probe(value) VALUES (126);
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static async Task<long> RunPersistentEfAsync()
+    {
+        const string path = "packed-consumer-ef/main.db";
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            var options = new DbContextOptionsBuilder<ProbeContext>()
+                .UseAhtola(connection)
+                .Options;
+            await using var context = new ProbeContext(options);
+            await context.Database.EnsureCreatedAsync();
+            context.Rows.Add(new ProbeRow { Value = 168 });
+            await context.SaveChangesAsync();
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            var options = new DbContextOptionsBuilder<ProbeContext>()
+                .UseAhtola(connection)
+                .Options;
+            await using var context = new ProbeContext(options);
+            return await context.Rows.Select(static row => row.Value).SingleAsync();
+        }
+    }
+
+    private static async Task<long> RunPersistentCoreAsync()
+    {
+        const string path = "packed-consumer-core/main.db";
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = source.CreateAhtolaConnection();
+            await connection.OpenAsync();
+            await using (var create = connection.CreateCommand())
+            {
+                create.CommandText = "CREATE TABLE probe(value INTEGER NOT NULL)";
+                await create.ExecuteNonQueryAsync();
+            }
+            await using (var insert = connection.CreateCommand())
+            {
+                insert.CommandText = "INSERT INTO probe(value) VALUES (210)";
+                await insert.ExecuteNonQueryAsync();
+            }
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = source.CreateAhtolaConnection();
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT value FROM probe";
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(),
+                CultureInfo.InvariantCulture);
+        }
     }
 
     private sealed class ProbeContext(DbContextOptions<ProbeContext> options) : DbContext(options)
