@@ -126,6 +126,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     // its page delta from memory instead of re-reading the database.
     private IReadOnlyDictionary<string, EmbeddedTable>? _committedTables;
     private Exception? _postCommitMaintenanceFailure;
+    private SqliteSynchronousMode _synchronousMode = SqliteSynchronousMode.Full;
     private bool _disposed;
 
     private EmbeddedFileStore(IFileSystem fileSystem, string databasePath, string walPath, SqlitePager pager, SqliteDatabaseHeader header)
@@ -254,6 +255,12 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// connections to detect owner commits between statements.
     /// </summary>
     internal SqlitePagerViewToken CaptureCommittedViewToken() => _pager.CaptureCommittedViewToken();
+
+    internal void SetSynchronousMode(SqliteSynchronousMode synchronousMode)
+    {
+        synchronousMode.Validate(nameof(synchronousMode));
+        _synchronousMode = synchronousMode;
+    }
 
     /// <summary>
     /// The shared per-file storage generation (see <see cref="SqlitePager.CommittedViewGeneration"/>).
@@ -1469,7 +1476,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         using (var transaction = _pager.BeginTransaction(_pager.CommittedPageCount))
         {
             transaction.WritePage(SchemaRootPage, pageOne);
-            transaction.Commit();
+            transaction.Commit(_synchronousMode);
         }
 
         _header = updated;
@@ -1484,7 +1491,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
-        return _pager.CheckpointToMainStore(busyTimeout);
+        return _pager.CheckpointToMainStore(busyTimeout, _synchronousMode);
     }
 
     /// <summary>
@@ -1495,14 +1502,16 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
-        return _pager.CheckpointToMainStoreAndResetWal(busyTimeout);
+        return _pager.CheckpointToMainStoreAndResetWal(busyTimeout, _synchronousMode);
     }
 
     internal SqliteJournalMode SwitchJournalMode(SqliteJournalMode journalMode)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
-        var result = _pager.SwitchJournalMode(journalMode);
+        var result = _pager.SwitchJournalMode(
+            journalMode,
+            synchronousMode: _synchronousMode);
         _header = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
         return result;
     }
@@ -1701,7 +1710,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         migrated.WriteTo(pageOne);
         using var transaction = _pager.BeginTransaction(_pager.CommittedPageCount);
         transaction.WritePage(SchemaRootPage, pageOne);
-        transaction.Commit();
+        transaction.Commit(_synchronousMode);
         _header = migrated;
     }
 
@@ -1955,7 +1964,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             // Page one carries the authoritative size and catalog routing, so it
             // must be the final frame that makes every replacement page visible.
             transaction.WritePage(SchemaRootPage, schemaTree.RootPage);
-            transaction.Commit();
+            transaction.Commit(_synchronousMode);
         }
 
         // A full catalog rewrite rewrites every managed page. Once its exclusive
@@ -2179,7 +2188,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             // Page one publishes the new database size, so it must be the frame
             // that makes every page this mutation allocated reachable.
             transaction.WritePage(SchemaRootPage, pageOne);
-            transaction.Commit();
+            transaction.Commit(_synchronousMode);
         }
 
         _header = newHeader;
@@ -2823,7 +2832,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             foreach (var (pageNumber, _, replacementIndexPage) in indexReplacementPages)
                 transaction.WritePage(pageNumber, replacementIndexPage);
             transaction.WritePage(SchemaRootPage, schemaPage);
-            transaction.Commit();
+            transaction.Commit(_synchronousMode);
         }
 
         _header = newHeader;
@@ -7945,7 +7954,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         try
         {
-            _pager.CheckpointToMainStoreAndResetWal();
+            _pager.CheckpointToMainStoreAndResetWal(synchronousMode: _synchronousMode);
         }
         catch (IOException exception) when (!reclaimTrailingPages)
         {

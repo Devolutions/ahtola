@@ -82,9 +82,13 @@ internal sealed class MvccLogicalLog : IDisposable
         return databasePath + "-log";
     }
 
-    internal static MvccLogicalLog CreateOrOpen(IFileSystem fileSystem, string databasePath)
+    internal static MvccLogicalLog CreateOrOpen(
+        IFileSystem fileSystem,
+        string databasePath,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
+        synchronousMode.Validate(nameof(synchronousMode));
         var encryption = CreateEncryption(fileSystem);
         var path = LogPathForDatabase(databasePath);
         try
@@ -98,7 +102,7 @@ internal sealed class MvccLogicalLog : IDisposable
                     {
                         existing.Dispose();
                         fileSystem.DeleteFile(path);
-                        return CreateNew(fileSystem, path, encryption);
+                        return CreateNew(fileSystem, path, encryption, synchronousMode);
                     }
 
                     Span<byte> header = stackalloc byte[LogHeaderSize];
@@ -123,7 +127,7 @@ internal sealed class MvccLogicalLog : IDisposable
                         // catalog permanently unopenable.
                         existing.Dispose();
                         fileSystem.DeleteFile(path);
-                        return CreateNew(fileSystem, path, encryption);
+                        return CreateNew(fileSystem, path, encryption, synchronousMode);
                     }
                 }
                 catch
@@ -133,7 +137,7 @@ internal sealed class MvccLogicalLog : IDisposable
                 }
             }
 
-            return CreateNew(fileSystem, path, encryption);
+            return CreateNew(fileSystem, path, encryption, synchronousMode);
         }
         catch
         {
@@ -145,7 +149,8 @@ internal sealed class MvccLogicalLog : IDisposable
     private static MvccLogicalLog CreateNew(
         IFileSystem fileSystem,
         string path,
-        LogicalLogEncryption? encryption)
+        LogicalLogEncryption? encryption,
+        SqliteSynchronousMode synchronousMode)
     {
         var file = fileSystem.OpenFile(path, FileOpenMode.CreateNew, readOnly: false);
         try
@@ -154,7 +159,8 @@ internal sealed class MvccLogicalLog : IDisposable
             Span<byte> header = stackalloc byte[LogHeaderSize];
             WriteHeader(header, salt, CurrentLogVersion);
             file.Write(0, header);
-            file.FlushToDisk();
+            if (synchronousMode.SyncsCheckpoint())
+                file.FlushToDisk();
             return new MvccLogicalLog(
                 fileSystem,
                 path,
@@ -171,10 +177,14 @@ internal sealed class MvccLogicalLog : IDisposable
         }
     }
 
-    /// <summary>Append one committed transaction frame and flush.</summary>
-    internal void AppendCommit(ulong commitTs, IReadOnlyList<MvccLogOp> ops)
+    /// <summary>Appends one committed transaction frame and applies the requested barrier.</summary>
+    internal void AppendCommit(
+        ulong commitTs,
+        IReadOnlyList<MvccLogOp> ops,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentNullException.ThrowIfNull(ops);
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             ThrowIfDisposed();
@@ -208,7 +218,8 @@ internal sealed class MvccLogicalLog : IDisposable
             try
             {
                 file.Write(_offset, frame);
-                file.FlushToDisk();
+                if (synchronousMode.SyncsWalCommit())
+                    file.FlushToDisk();
             }
             catch (Exception exception)
             {
@@ -312,8 +323,10 @@ internal sealed class MvccLogicalLog : IDisposable
     }
 
     /// <summary>Truncate log after checkpoint (keep header only).</summary>
-    internal void TruncateAfterCheckpoint()
+    internal void TruncateAfterCheckpoint(
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             ThrowIfDisposed();
@@ -323,7 +336,8 @@ internal sealed class MvccLogicalLog : IDisposable
             WriteHeader(header, freshSalt, _version);
             file.SetLength(0);
             file.Write(0, header);
-            file.FlushToDisk();
+            if (synchronousMode.SyncsCheckpoint())
+                file.FlushToDisk();
             _salt = freshSalt;
             _offset = LogHeaderSize;
         }
@@ -334,8 +348,10 @@ internal sealed class MvccLogicalLog : IDisposable
     /// SQLite catalog. This is intentionally forbidden while a frame remains,
     /// avoiding a mixed V3/V4 log after interruption.
     /// </summary>
-    internal void UpgradeToVersion4AfterCheckpoint()
+    internal void UpgradeToVersion4AfterCheckpoint(
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             ThrowIfDisposed();
@@ -360,7 +376,8 @@ internal sealed class MvccLogicalLog : IDisposable
                            readOnly: false))
                 {
                     replacement.Write(0, header);
-                    replacement.FlushToDisk();
+                    if (synchronousMode.SyncsCheckpoint())
+                        replacement.FlushToDisk();
                 }
 
                 var current = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
@@ -369,7 +386,8 @@ internal sealed class MvccLogicalLog : IDisposable
                 // IAtomicFileSystem the same safe replacement contract: if the
                 // process stops here, reopen recreates a harmless empty V4 log.
                 current.SetLength(0);
-                current.FlushToDisk();
+                if (synchronousMode.SyncsCheckpoint())
+                    current.FlushToDisk();
                 current.Dispose();
                 _file = null;
                 try
@@ -394,9 +412,11 @@ internal sealed class MvccLogicalLog : IDisposable
                 // empty log, so an interruption here cannot strand catalog data.
                 var file = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
                 file.SetLength(0);
-                file.FlushToDisk();
+                if (synchronousMode.SyncsCheckpoint())
+                    file.FlushToDisk();
                 file.Write(0, header);
-                file.FlushToDisk();
+                if (synchronousMode.SyncsCheckpoint())
+                    file.FlushToDisk();
             }
 
             _version = CurrentLogVersion;

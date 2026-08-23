@@ -132,6 +132,25 @@ Additional current behavior:
 6. **Remaining WAL lifecycle gap.** Last-connection `-shm` unlink and the
    exclusive-locking-mode heap WAL-index fallback are not yet implemented.
 
+#### 1.3.1 `PRAGMA synchronous` durability
+
+The connection-local synchronous mode is passed into every managed commit and
+checkpoint rather than being pager-global. This keeps pooled connections with
+different settings independent while preserving the SQLite default of `FULL`.
+
+| Mode | WAL commit | WAL checkpoint | DELETE journal |
+| --- | --- | --- | --- |
+| `OFF` | No WAL flush | Backfill may update the main file, but no WAL/main-file flush is issued and the recovery WAL is retained rather than reset | No journal, database, or invalidation flush |
+| `NORMAL` | Commit frames are not flushed | Flush WAL before backfill, flush the main file, then durably reset the WAL | Flush the completed hot journal once before database writes, then flush the database |
+| `FULL` | Flush WAL before reporting commit | Same checkpoint barriers as `NORMAL` | Flush journal payload before publishing its hot header, flush the completed header, flush the database, then flush journal invalidation |
+| `EXTRA` | Same as `FULL` | Same as `FULL` | Same ordered barriers as `FULL`; the journal is durably invalidated before deletion, so recovery never depends on directory-entry persistence |
+
+Checkpoint barrier failures propagate before backfill publication or WAL reset.
+Commit barrier failures fault the pager and are never returned as successful
+commits. Browser OPFS uses the same policy: `BrowserMirroredFileSystem` records
+only the requested flush operations and replays them in order at the asynchronous
+statement boundary.
+
 ### 1.4 MVCC mode (Phase 2)
 
 `PRAGMA journal_mode=mvcc` enables Turso-aligned main-memory MVCC on the
@@ -170,7 +189,7 @@ Phase 2 scope and limits:
   restores the object-id mapping. V3 rowid-only logs are upgraded only by an
   exclusive materializing checkpoint; a cold V3 log whose table identities
   cannot be proven fails closed instead of losing frames.
-- A logical-log write/flush failure after frame construction is an
+- A logical-log write or requested durability-barrier failure after frame construction is an
   indeterminate commit. The live MVCC store rejects further transactions and
   callers must dispose and reopen; recovery then accepts a fully framed commit
   or discards a torn tail before a later append.

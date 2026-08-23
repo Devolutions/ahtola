@@ -1383,7 +1383,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         Func<string?, string?, ExecutionResult>? executeTableList = null,
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
         ChangeDataCaptureSession? changeDataCapture = null,
-        VdbeExecutionOptions? vdbeExecutionOptions = null)
+        VdbeExecutionOptions? vdbeExecutionOptions = null,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         var result = ExecuteCore(
             statement,
@@ -1401,7 +1402,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             executeTableList,
             externalTables,
             changeDataCapture,
-            vdbeExecutionOptions);
+            vdbeExecutionOptions,
+            synchronousMode);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -1436,8 +1438,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         Func<string?, string?, ExecutionResult>? executeTableList = null,
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
         ChangeDataCaptureSession? changeDataCapture = null,
-        VdbeExecutionOptions? vdbeExecutionOptions = null)
+        VdbeExecutionOptions? vdbeExecutionOptions = null,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
                 statement,
@@ -1460,7 +1464,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 executeTableList,
                 externalTables,
                 changeDataCapture,
-                vdbeExecutionOptions));
+                vdbeExecutionOptions,
+                synchronousMode));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -1480,6 +1485,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 lock (_gate)
                 {
+                    _fileStore?.SetSynchronousMode(synchronousMode);
                     // A commit hook can veto the implicit commit of an autocommit mutation, so the
                     // statement has to run against a working clone that can be discarded. The in-memory
                     // fast path below mutates the live catalog in place and cannot be rolled back, so an
@@ -2188,8 +2194,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool forceFullRewrite = false,
         TimeSpan busyTimeout = default,
         bool concurrent = false,
-        bool containsSchemaChanges = false)
+        bool containsSchemaChanges = false,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             if (_readOnly)
@@ -2220,6 +2228,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return;
             }
 
+            _fileStore.SetSynchronousMode(synchronousMode);
             PersistFileCatalog(publishCatalog, pragmaHeader, forceFullRewrite, busyTimeout);
         }
     }
@@ -2506,10 +2515,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// <c>journal_mode=mvcc</c>. File-backed databases keep WAL page I/O and
     /// persist header version <c>255</c> plus a durable <c>db-log</c>.
     /// </summary>
-    internal SqliteJournalMode EnableMvccMode()
+    internal SqliteJournalMode EnableMvccMode(
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
-            return EnableMvccModeLocked(BusyTimeout);
+            return EnableMvccModeLocked(BusyTimeout, synchronousMode);
     }
 
     /// <summary>
@@ -2558,11 +2569,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    private static MvStore CreateOrGetSharedMvStore(IFileSystem fileSystem, string databasePath)
+    private static MvStore CreateOrGetSharedMvStore(
+        IFileSystem fileSystem,
+        string databasePath,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         return EmbeddedMvStoreRegistry.GetOrCreate(fileSystem, databasePath, () =>
         {
-            var logicalLog = MvccLogicalLog.CreateOrOpen(fileSystem, databasePath);
+            var logicalLog = MvccLogicalLog.CreateOrOpen(
+                fileSystem,
+                databasePath,
+                synchronousMode);
             try
             {
                 var store = new MvStore(logicalLog: logicalLog);
@@ -2583,8 +2600,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// transaction enters the store, so the checkpoint can take its required
     /// exclusive boundary without invalidating an active MVCC snapshot.
     /// </summary>
-    internal void EnsureMvccLogVersion4()
+    internal void EnsureMvccLogVersion4(
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             if (_mvStore?.LogicalLog is not { RequiresVersion4Upgrade: true })
@@ -2595,7 +2614,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     "cannot safely migrate a legacy MVCC logical log with unresolved table identities; restore it with a version that can materialize its catalog first.");
             }
 
-            var result = RunMvccCheckpoint("TRUNCATE", BusyTimeout);
+            var result = RunMvccCheckpoint(
+                "TRUNCATE",
+                BusyTimeout,
+                synchronousMode);
             if (result.Busy)
                 throw new EmbeddedBusyException();
         }
@@ -2606,10 +2628,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// first become durable in the WAL, then the main file; only then may the
     /// logical log retire its frames and the WAL be reset.
     /// </summary>
-    internal MvccCheckpointResult RunMvccCheckpoint(string? mode, TimeSpan busyTimeout = default)
+    internal MvccCheckpointResult RunMvccCheckpoint(
+        string? mode,
+        TimeSpan busyTimeout = default,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
+            _fileStore?.SetSynchronousMode(synchronousMode);
             var store = _mvStore;
             if (store is null)
             {
@@ -2683,9 +2710,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if ((wantTruncate || requiresLogUpgrade) && log is not null)
             {
                 phase = MvccCheckpointPhase.TruncateLogicalLog;
-                log.TruncateAfterCheckpoint();
+                log.TruncateAfterCheckpoint(synchronousMode);
                 if (requiresLogUpgrade)
-                    log.UpgradeToVersion4AfterCheckpoint();
+                    log.UpgradeToVersion4AfterCheckpoint(synchronousMode);
                 if (wantTruncate)
                     checkpointed = logBefore;
             }
@@ -2721,7 +2748,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    private SqliteJournalMode EnableMvccModeLocked(TimeSpan busyTimeout)
+    private SqliteJournalMode EnableMvccModeLocked(
+        TimeSpan busyTimeout,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         if (_readOnly)
             throw new EmbeddedSqlException("attempt to write a readonly database");
@@ -2751,7 +2780,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         if (_fileStore is not null && _fileSystem is not null && !string.IsNullOrEmpty(_databasePath))
-            _mvStore = CreateOrGetSharedMvStore(_fileSystem, _databasePath);
+            _mvStore = CreateOrGetSharedMvStore(
+                _fileSystem,
+                _databasePath,
+                synchronousMode);
         else
             _mvStore = new MvStore();
 
@@ -2759,12 +2791,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return SqliteJournalMode.Mvcc;
     }
 
-    internal SqliteJournalMode SwitchJournalMode(SqliteJournalMode journalMode, TimeSpan busyTimeout = default)
+    internal SqliteJournalMode SwitchJournalMode(
+        SqliteJournalMode journalMode,
+        TimeSpan busyTimeout = default,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
+            _fileStore?.SetSynchronousMode(synchronousMode);
             if (journalMode == SqliteJournalMode.Mvcc)
-                return EnableMvccModeLocked(busyTimeout);
+                return EnableMvccModeLocked(busyTimeout, synchronousMode);
 
             if (_fileStore is null)
                 throw new EmbeddedSqlException("In-memory databases support only MEMORY journal mode.");
@@ -2806,8 +2843,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    internal void MigratePageSize(int pageSize, TimeSpan busyTimeout = default)
+    internal void MigratePageSize(
+        int pageSize,
+        TimeSpan busyTimeout = default,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             if (_fileStore is null)
@@ -2822,6 +2863,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 throw new EmbeddedSqlException("cannot VACUUM while a blob handle is active");
             if (_fileSystem is null || _fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+            _fileStore.SetSynchronousMode(synchronousMode);
 
             using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
@@ -2839,9 +2881,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    internal void VacuumInto(string destinationPath, int pageSize, TimeSpan busyTimeout = default)
+    internal void VacuumInto(
+        string destinationPath,
+        int pageSize,
+        TimeSpan busyTimeout = default,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             if (_fileStore is null)
@@ -2856,6 +2903,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 throw new EmbeddedSqlException("cannot VACUUM while a blob handle is active");
             if (_fileSystem is null || _fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+            _fileStore.SetSynchronousMode(synchronousMode);
 
             var destinationWriteLock = GetFileCatalogWriteLock(_fileSystem, destinationPath);
             var sourceLockPath = GetFileCatalogLockPath(_fileSystem, _databasePath);
@@ -2910,8 +2958,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         PragmaHeaderIntegerKind kind,
         int value,
         TimeSpan busyTimeout = default,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
@@ -2935,6 +2985,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
             if (_fileSystem is null || _fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+            _fileStore.SetSynchronousMode(synchronousMode);
 
             using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
@@ -41856,7 +41907,7 @@ public sealed partial class EmbeddedConnection : IDisposable
     private readonly Dictionary<EmbeddedDatabase, bool> _cacheSpills = [];
     private int _tempStore;
     private bool _ignoreCheckConstraints;
-    private readonly Dictionary<EmbeddedDatabase, int> _synchronousModes = [];
+    private readonly Dictionary<EmbeddedDatabase, SqliteSynchronousMode> _synchronousModes = [];
     private readonly Dictionary<EmbeddedDatabase, string> _lockingModes = [];
     private bool _dataSyncRetry;
     private bool _fullColumnNames;
@@ -43586,7 +43637,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     executeTableList: ExecutePragmaTableList,
                                     externalTables: routed.ExternalTables,
                                     changeDataCapture: changeDataCapture,
-                                    vdbeExecutionOptions: vdbeExecutionOptions);
+                                    vdbeExecutionOptions: vdbeExecutionOptions,
+                                    synchronousMode: GetSynchronousMode(routed.Database));
                             }
                             catch (Exception failure)
                                 when (failure is not EmbeddedConflictFailException
@@ -44194,7 +44246,10 @@ public sealed partial class EmbeddedConnection : IDisposable
         var statement = new PragmaTableListStatement(schema, filter);
         var transactionState = GetTransactionState(database);
         var result = transactionState is null
-            ? database.Execute(statement, new SqlValue[1])
+            ? database.Execute(
+                statement,
+                new SqlValue[1],
+                synchronousMode: GetSynchronousMode(database))
             : database.Execute(statement, new SqlValue[1], transactionState.Catalog);
         foreach (var row in result.Rows)
             rows.Add(row);
@@ -44538,7 +44593,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                         _recursiveTriggers,
                         _deferForeignKeys,
                         inTransaction: false,
-                        cancellationToken);
+                        cancellationToken,
+                        synchronousMode: GetSynchronousMode(database));
                 }
                 else
                 {
@@ -46476,7 +46532,7 @@ Func<string, ParsedStatement> rewrite)
                     "Concurrent transaction mode is only supported when MVCC is enabled");
             }
 
-            _database.EnsureMvccLogVersion4();
+            _database.EnsureMvccLogVersion4(GetSynchronousMode(_database));
         }
 
         var databases = _attachedDatabases.Values
@@ -46856,7 +46912,7 @@ Func<string, ParsedStatement> rewrite)
                         pendingSchemaPublications.Add((database, txId, publish));
                     }
                     var hasPendingWrites = store.HasPendingWrites(txId);
-                    store.Commit(txId);
+                    store.Commit(txId, GetSynchronousMode(database));
                     mvccWriteWasPublished |= hasPendingWrites;
                 }
                 _mvccTransactions.Remove(database);
@@ -46892,14 +46948,15 @@ Func<string, ParsedStatement> rewrite)
                     state.ForceFullCatalogRewrite,
                     busyTimeout: BusyTimeout,
                     concurrent: _transactionIsConcurrent,
-                    containsSchemaChanges: state.HasSchemaChanges);
+                    containsSchemaChanges: state.HasSchemaChanges,
+                    synchronousMode: GetSynchronousMode(database));
             }
 
             foreach (var (database, txId, publish) in pendingSchemaPublications)
             {
                 if (publish)
                 {
-                    database.MvStore?.CompleteSchemaCheckpoint();
+                    database.MvStore?.CompleteSchemaCheckpoint(GetSynchronousMode(database));
                     database.MvStore?.PublishSchemaChange(txId);
                 }
                 else
@@ -47076,7 +47133,8 @@ Func<string, ParsedStatement> rewrite)
                 statement.Kind,
                 statement.Value.Value,
                 busyTimeout: BusyTimeout,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken,
+                synchronousMode: GetSynchronousMode(database));
             if (ReferenceEquals(database, _tempDatabase))
                 _tempInitialized = true;
             return ExecutionResult.Empty;
@@ -47144,11 +47202,19 @@ Func<string, ParsedStatement> rewrite)
         {
             if (requested != SqliteJournalMode.Mvcc)
                 return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
-            var memoryResult = database.EnableMvccMode().ToString().ToLowerInvariant();
+            var memoryResult = database
+                .EnableMvccMode(GetSynchronousMode(database))
+                .ToString()
+                .ToLowerInvariant();
             return new ExecutionResult(["journal_mode"], [[SqlValue.Text(memoryResult)]], 0);
         }
 
-        var result = database.SwitchJournalMode(requested, busyTimeout: BusyTimeout).ToString().ToLowerInvariant();
+        var result = database.SwitchJournalMode(
+                requested,
+                busyTimeout: BusyTimeout,
+                synchronousMode: GetSynchronousMode(database))
+            .ToString()
+            .ToLowerInvariant();
         return new ExecutionResult(["journal_mode"], [[SqlValue.Text(result)]], 0);
     }
 
@@ -47345,7 +47411,10 @@ Func<string, ParsedStatement> rewrite)
         {
             // Managed MVCC checkpoint: materialize WAL pages -> backfill/flush
             // main storage -> retire the logical log -> reset the WAL last.
-            var result = database.RunMvccCheckpoint(statement.Mode, BusyTimeout);
+            var result = database.RunMvccCheckpoint(
+                statement.Mode,
+                BusyTimeout,
+                GetSynchronousMode(database));
             return new ExecutionResult(
                 columns,
                 [[
@@ -47381,21 +47450,24 @@ Func<string, ParsedStatement> rewrite)
         {
             return new ExecutionResult(
                 ["synchronous"],
-                [[SqlValue.Integer(_synchronousModes.GetValueOrDefault(database, 2))]],
+                [[SqlValue.Integer((int)GetSynchronousMode(database))]],
                 0);
         }
 
-        var current = _synchronousModes.GetValueOrDefault(database, 2);
+        var current = GetSynchronousMode(database);
         _synchronousModes[database] = statement.Value.ToUpperInvariant() switch
         {
-            "OFF" or "0" => 0,
-            "NORMAL" or "1" => 1,
-            "FULL" or "2" => 2,
-            "EXTRA" or "3" => 3,
+            "OFF" or "0" => SqliteSynchronousMode.Off,
+            "NORMAL" or "1" => SqliteSynchronousMode.Normal,
+            "FULL" or "2" => SqliteSynchronousMode.Full,
+            "EXTRA" or "3" => SqliteSynchronousMode.Extra,
             _ => current,
         };
         return ExecutionResult.Empty;
     }
+
+    private SqliteSynchronousMode GetSynchronousMode(EmbeddedDatabase database)
+        => _synchronousModes.GetValueOrDefault(database, SqliteSynchronousMode.Full);
 
     private ExecutionResult ExecutePragmaLockingMode(PragmaLockingModeStatement statement)
     {
@@ -47635,7 +47707,10 @@ Func<string, ParsedStatement> rewrite)
                 : pendingPageSize ?? currentPageSize;
         if (statement.Into is null)
         {
-            database.MigratePageSize(targetPageSize, busyTimeout: BusyTimeout);
+            database.MigratePageSize(
+                targetPageSize,
+                busyTimeout: BusyTimeout,
+                synchronousMode: GetSynchronousMode(database));
         }
         else
         {
@@ -47665,7 +47740,11 @@ Func<string, ParsedStatement> rewrite)
                 throw new EmbeddedSqlException("output file already exists");
             }
 
-            database.VacuumInto(destinationPath, targetPageSize, busyTimeout: BusyTimeout);
+            database.VacuumInto(
+                destinationPath,
+                targetPageSize,
+                busyTimeout: BusyTimeout,
+                synchronousMode: GetSynchronousMode(database));
         }
 
         if (statement.Into is null)
