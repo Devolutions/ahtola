@@ -493,6 +493,61 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
         CountPlaintextMvccFrames(reopened.Mirror, logPath).Should().Be(2);
     }
 
+    [Test]
+    public async Task LegacyHeaderOnlyMvccLogUpgradesBeforeEncryptedTypedKeyWrite()
+    {
+        var store = new FakeBrowserPersistentStore();
+        const string DatabasePath = "app/data/main.db";
+        const string LogPath = DatabasePath + "-log";
+        Dictionary<string, byte[]> durableImages;
+        await using (var harness = await BrowserHarness.CreateAsync(store, Aes256Key))
+        {
+            using var database = EmbeddedDatabase.OpenFile(DatabasePath, harness.Mirror);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE notes(k TEXT PRIMARY KEY, body TEXT) WITHOUT ROWID;");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            await harness.Mirror.FlushPendingAsync();
+            durableImages = store.Paths.ToDictionary(path => path, store.Read, StringComparer.Ordinal);
+        }
+
+        foreach (var (path, image) in durableImages)
+            store.Seed(path, image);
+        var legacyLog = store.Read(LogPath);
+        legacyLog.Length.Should().Be(MvccLogicalLogFormat.LogHeaderSize);
+        legacyLog[4] = 3;
+        legacyLog.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart).Clear();
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
+            legacyLog.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart),
+            Crc32C.Compute(legacyLog));
+        store.Seed(LogPath, legacyLog);
+
+        Dictionary<string, byte[]> upgradedImages;
+        await using (var upgraded = await BrowserHarness.CreateAsync(store, Aes256Key))
+        {
+            using var database = EmbeddedDatabase.OpenFile(DatabasePath, upgraded.Mirror);
+            database.MvStore!.LogicalLog!.RequiresVersion4Upgrade.Should().BeTrue();
+            database.RunMvccCheckpoint("PASSIVE").Busy.Should().BeFalse();
+            database.MvStore.LogicalLog!.RequiresVersion4Upgrade.Should().BeFalse();
+
+            using var connection = database.Connect();
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, $"INSERT INTO notes VALUES ('tenant', '{Secret}');");
+            Execute(connection, "COMMIT;");
+            await upgraded.Mirror.FlushPendingAsync();
+            upgradedImages = store.Paths.ToDictionary(path => path, store.Read, StringComparer.Ordinal);
+        }
+
+        foreach (var (path, image) in upgradedImages)
+            store.Seed(path, image);
+        store.Contains(LogPath + ".v4-upgrade").Should().BeFalse();
+        store.Read(LogPath).AsSpan().IndexOf(Encoding.UTF8.GetBytes(Secret)).Should().Be(-1);
+
+        await using var reopened = await BrowserHarness.CreateAsync(store, Aes256Key);
+        using var reopenedDatabase = EmbeddedDatabase.OpenFile(DatabasePath, reopened.Mirror);
+        using var reopenedConnection = reopenedDatabase.Connect();
+        ScalarText(reopenedConnection, "SELECT body FROM notes WHERE k = 'tenant';").Should().Be(Secret);
+    }
+
     private static int CountPlaintextMvccFrames(IFileSystem fileSystem, string path)
     {
         using var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly: true);
