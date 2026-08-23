@@ -147,6 +147,28 @@ public sealed class RemoteStreamRecoveryTests
     }
 
     [Test]
+    public void ExpiredSchemaProbeFaultsActiveTransactionBeforeCursorStarts()
+    {
+        using var handler = new ScriptedPipelineHandler(
+            ExecuteSuccess("transaction", 0),
+            StreamExpired("schema probe stream expired"));
+        using var connection = CreateConnection(handler);
+        using var transaction = connection.BeginTransaction();
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT value FROM widgets";
+
+        var rootFailure = Assert.Throws<AhtolaRemoteSqlException>(() => command.ExecuteReader())!;
+
+        rootFailure.RemoteErrorCode.Should().Be("STREAM_EXPIRED");
+        handler.Requests.Should().HaveCount(2);
+        handler.GetSql(1).Should().StartWith("PRAGMA table_info");
+        Assert.Throws<AhtolaRemoteSqlException>(() => transaction.Rollback())
+            .Should().BeSameAs(rootFailure);
+        handler.Requests.Should().HaveCount(2);
+    }
+
+    [Test]
     public void FaultedTransactionDisposalDoesNotMaskAnExceptionAlreadyUnwinding()
     {
         using var handler = new ScriptedPipelineHandler(

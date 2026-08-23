@@ -159,6 +159,15 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
     }
 
     [Test]
+    public void RemoteCursorSchemaCacheRejectsJoinQueries()
+    {
+        AhtolaSchemaCollections.TryGetReaderSchemaTableName(
+                "SELECT b.id, b.value FROM a JOIN b ON b.id = a.id",
+                out _)
+            .Should().BeFalse();
+    }
+
+    [Test]
     public async Task BrowserReaderDisposalFailure_StillClosesReader_AndConnectionRecovers()
     {
         var factory = new FaultInjectingManagedDatabaseFactory();

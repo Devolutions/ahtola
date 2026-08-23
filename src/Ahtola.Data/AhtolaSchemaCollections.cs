@@ -648,6 +648,15 @@ internal static class AhtolaSchemaCollections
         if (!match.Success)
             return false;
 
+        var remainder = commandText[match.Length..];
+        if (Regex.IsMatch(
+                remainder,
+                @"(?:,|\b(?:JOIN|CROSS|INNER|LEFT|RIGHT|FULL|NATURAL)\b)",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
         tableName = UnquoteIdentifier(match.Groups["table"].Value);
         return true;
     }

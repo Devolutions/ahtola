@@ -1001,6 +1001,17 @@ public class AhtolaConnection :
 
             return AhtolaSchemaCollections.CreateReaderSchemaSource(tableName, columns);
         }
+        catch (AhtolaRemoteSqlException exception) when (exception.IsStreamExpired)
+        {
+            if (_remoteTransactionActive)
+            {
+                RecordRemoteTransactionFailure(exception);
+                throw;
+            }
+
+            ResetRemoteSession();
+            return null;
+        }
         catch (AhtolaException) when (!cancellationToken.IsCancellationRequested)
         {
             return null;
