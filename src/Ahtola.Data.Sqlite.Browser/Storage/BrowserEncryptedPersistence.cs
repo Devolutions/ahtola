@@ -40,7 +40,8 @@ internal sealed class BrowserPlaintextCapture(
     byte[] bytes,
     int pageSize,
     uint journalChecksumNonce,
-    ulong mvccSalt = 0)
+    ulong mvccSalt = 0,
+    byte mvccVersion = 0)
 {
     internal BrowserPersistedFileKind Kind { get; } = kind;
 
@@ -56,6 +57,9 @@ internal sealed class BrowserPlaintextCapture(
 
     /// <summary>The authenticated logical-log salt, valid only for MVCC captures.</summary>
     internal ulong MvccSalt { get; } = mvccSalt;
+
+    /// <summary>The authenticated logical-log format version, valid only for MVCC captures.</summary>
+    internal byte MvccVersion { get; } = mvccVersion;
 }
 
 /// <summary>
@@ -465,17 +469,18 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         {
             var header = new byte[length];
             ReadExact(file, 0, header, path);
-            var headerSalt = fileLength >= MvccLogicalLogFormat.LogHeaderSize
+            var headerInfo = fileLength >= MvccLogicalLogFormat.LogHeaderSize
                 ? MvccLogicalLogFormat.ValidateHeader(
-                    ReadFileRegion(file, 0, MvccLogicalLogFormat.LogHeaderSize, path)).Salt
-                : 0;
+                    ReadFileRegion(file, 0, MvccLogicalLogFormat.LogHeaderSize, path))
+                : (Salt: 0UL, Version: (byte)0);
             return new BrowserPlaintextCapture(
                 BrowserPersistedFileKind.MvccLog,
                 0,
                 header,
                 pageSize: 0,
                 journalChecksumNonce: 0,
-                headerSalt);
+                headerInfo.Salt,
+                headerInfo.Version);
         }
 
         if (position < MvccLogicalLogFormat.LogHeaderSize)
@@ -485,7 +490,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         }
 
         var logHeader = ReadFileRegion(file, 0, MvccLogicalLogFormat.LogHeaderSize, path);
-        var (salt, _) = MvccLogicalLogFormat.ValidateHeader(logHeader);
+        var (salt, version) = MvccLogicalLogFormat.ValidateHeader(logHeader);
         var persistedPosition = GetMvccPersistedLength(path, file, position);
         var frame = ReadFileRegion(file, position, length, path);
         ValidatePlaintextMvccFrame(frame, path);
@@ -495,7 +500,8 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             frame,
             pageSize: 0,
             journalChecksumNonce: 0,
-            salt);
+            salt,
+            version);
     }
 
     private static long GetMvccPersistedLength(string path, IFile file, long logicalLength)
@@ -875,7 +881,8 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                 payloadSize,
                 opCount,
                 commitTs,
-                chunkIndex);
+                chunkIndex,
+                capture.MvccVersion);
             var result = await pages
                 .EncryptLogicalLogChunkAsync(
                     capture.Bytes.AsMemory(plaintextOffset, plaintextLength),
@@ -921,7 +928,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         if (encryptedImage.Length < MvccLogicalLogFormat.LogHeaderSize)
             return encryptedImage;
 
-        var (salt, _) = MvccLogicalLogFormat.ValidateHeader(encryptedImage);
+        var (salt, version) = MvccLogicalLogFormat.ValidateHeader(encryptedImage);
         using var plaintext = new MemoryStream(encryptedImage.Length);
         plaintext.Write(encryptedImage, 0, MvccLogicalLogFormat.LogHeaderSize);
         var position = MvccLogicalLogFormat.LogHeaderSize;
@@ -991,7 +998,8 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                         payloadSize,
                         opCount,
                         commitTs,
-                        chunkIndex);
+                        chunkIndex,
+                        version);
                     var chunk = await pages
                         .DecryptLogicalLogChunkAsync(
                             encryptedImage.AsMemory(encryptedOffset, plaintextLength),

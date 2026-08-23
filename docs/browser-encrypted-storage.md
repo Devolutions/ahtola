@@ -83,8 +83,10 @@ The MVCC logical log (`x.db-log`) uses Turso's encrypted logical-log layout.
 Its 56-byte log header, 24-byte transaction headers, and 8-byte trailers remain
 visible for recovery framing. Each transaction payload is split into 32-KiB
 chunks and encrypted with AES-GCM. Associated data binds the log salt, final
-plaintext payload length, operation count, commit timestamp, and chunk index.
-The trailer CRC covers the encrypted bytes.
+plaintext payload length, operation count, commit timestamp, chunk index, and
+logical-log version. The trailer CRC covers the encrypted bytes. Recovery also
+requires the decoded operation count to consume the authenticated payload
+exactly; trailing bytes are corruption rather than forward-compatible padding.
 
 Desktop storage performs that transform synchronously in `MvccLogicalLog`.
 The browser mirror captures each complete plaintext frame, maps its logical
@@ -101,6 +103,12 @@ it with the original plaintext configuration first. Wrong keys, authenticated
 metadata changes, and complete-frame tampering fail closed. A short final
 encrypted frame is treated as a torn append and recovery retains only the
 authenticated prefix.
+
+Encrypted MVCC payloads written by the short-lived format that did not bind the
+log version in associated data are deliberately not accepted: their tags do not
+validate under the hardened format. They must be checkpointed by the exact
+writer that created them before upgrading. There is no unauthenticated fallback
+or automatic reinterpretation as a different log version.
 
 Page 1 keeps a visible 100-byte header: the `AHTLA` magic, format version 0,
 the cipher id, zeroed reserved bytes, and the SQLite header bytes 16..100

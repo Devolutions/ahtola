@@ -20,7 +20,7 @@ internal static class MvccLogicalLogFormat
     internal const int EncryptionTagSize = 16;
     internal const int EncryptionNonceSize = 12;
     internal const int EncryptionOverhead = EncryptionTagSize + EncryptionNonceSize;
-    internal const int EncryptedChunkAssociatedDataSize = 32;
+    internal const int EncryptedChunkAssociatedDataSize = 33;
 
     internal static int GetEncryptedPayloadSize(int plaintextSize)
     {
@@ -55,7 +55,8 @@ internal static class MvccLogicalLogFormat
         int plaintextSize,
         uint opCount,
         ulong commitTs,
-        int chunkIndex)
+        int chunkIndex,
+        byte logVersion)
     {
         var chunkCount = GetEncryptedChunkCount(plaintextSize);
         if ((uint)chunkIndex >= (uint)chunkCount)
@@ -68,6 +69,7 @@ internal static class MvccLogicalLogFormat
         BinaryPrimitives.WriteUInt32LittleEndian(associatedData.AsSpan(16), opCount);
         BinaryPrimitives.WriteUInt64LittleEndian(associatedData.AsSpan(20), commitTs);
         BinaryPrimitives.WriteUInt32LittleEndian(associatedData.AsSpan(28), checked((uint)chunkIndex));
+        associatedData[32] = logVersion;
         return associatedData;
     }
 

@@ -398,6 +398,41 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
             .Which.Message.Should().Contain("authentication failed");
     }
 
+    [Test]
+    public async Task MvccLogicalLogVersionTamperingFailsAuthenticationOnLoad()
+    {
+        var store = new FakeBrowserPersistentStore();
+        const string DatabasePath = "app/data/main.db";
+        Dictionary<string, byte[]> durableImages;
+        await using (var harness = await BrowserHarness.CreateAsync(store, Aes256Key))
+        {
+            using var database = EmbeddedDatabase.OpenFile(DatabasePath, harness.Mirror);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE notes(body TEXT);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, $"INSERT INTO notes VALUES ('{Secret}');");
+            Execute(connection, "COMMIT;");
+            await harness.Mirror.FlushPendingAsync();
+            durableImages = store.Paths.ToDictionary(path => path, store.Read, StringComparer.Ordinal);
+        }
+
+        foreach (var (path, image) in durableImages)
+            store.Seed(path, image);
+        var logPath = DatabasePath + "-log";
+        var log = store.Read(logPath);
+        log[4] = 3;
+        log.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart, sizeof(uint)).Clear();
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
+            log.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart),
+            Crc32C.Compute(log.AsSpan(0, MvccLogicalLogFormat.LogHeaderSize)));
+        store.Seed(logPath, log);
+
+        var failure = await Capture(() => BrowserHarness.CreateAsync(store, Aes256Key));
+        failure.Should().BeOfType<InvalidDataException>()
+            .Which.Message.Should().Contain("authentication failed");
+    }
+
     [TestCase(-1L)]
     [TestCase(1L)]
     public async Task MvccLogicalLogPayloadLengthTamperingFailsWithoutTruncation(long delta)

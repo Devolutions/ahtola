@@ -184,7 +184,9 @@ Phase 2 scope and limits:
   opens a durable logical log (`<db>-log`, Turso LML2/MVTX framing). For an
   encrypted database, transaction payloads use Turso's chunked AES-GCM logical-
   log layout; salt, payload length, operation count, commit timestamp, and chunk
-  index are authenticated while framing metadata remains visible. New logs
+  index are authenticated while framing metadata remains visible. Ahtola also
+  binds the logical-log version and rejects trailing decoded payload bytes, so a
+  recomputed unkeyed header CRC cannot reinterpret V4 row bytes as V3. New logs
   use V4 typed-key frames and include their logical object name so recovery
   restores the object-id mapping. V3 rowid-only logs are upgraded only by an
   exclusive materializing checkpoint; a cold V3 log whose table identities

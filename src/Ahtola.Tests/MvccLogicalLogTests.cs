@@ -344,6 +344,45 @@ public sealed class MvccLogicalLogTests
             .WithMessage("*authentication failed*");
     }
 
+    [Test]
+    public void EncryptedCommitFrameAuthenticatesLogVersion()
+    {
+        var storage = new InMemoryFileSystem();
+        var key = Enumerable.Repeat((byte)0x26, 16).ToArray();
+        const string dbPath = "encrypted-mvcc-version.db";
+        var logPath = MvccLogicalLog.LogPathForDatabase(dbPath);
+        using (var options = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key))
+        using (var fileSystem = new AhtolaEncryptionFileSystem(storage, options))
+        using (var log = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("secret")]);
+            store.Commit(tx.Id);
+        }
+
+        using (var file = storage.OpenFile(logPath, FileOpenMode.OpenExisting))
+        {
+            var image = new byte[checked((int)file.Length)];
+            file.Read(0, image).Should().Be(image.Length);
+            image[4] = 3;
+            image.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart, sizeof(uint)).Clear();
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                image.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart),
+                Crc32C.Compute(image.AsSpan(0, MvccLogicalLogFormat.LogHeaderSize)));
+            file.Write(0, image);
+            file.FlushToDisk();
+        }
+
+        using var reopenOptions = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key);
+        using var reopenedFileSystem = new AhtolaEncryptionFileSystem(storage, reopenOptions);
+        using var reopened = MvccLogicalLog.CreateOrOpen(reopenedFileSystem, dbPath);
+        var replay = () => reopened.ReplayInto(new MvStore());
+        replay.Should().Throw<InvalidDataException>()
+            .WithMessage("*authentication failed*");
+    }
+
     [TestCase(-1L)]
     [TestCase(1L)]
     public void EncryptedCommitFrameRejectsPayloadLengthTampering(long delta)
@@ -411,6 +450,58 @@ public sealed class MvccLogicalLogTests
         var replay = () => reopened.ReplayInto(new MvStore());
         replay.Should().Throw<InvalidDataException>()
             .WithMessage("*plaintext logical-log frame*");
+    }
+
+    [Test]
+    public void ReplayRejectsTrailingPayloadBytes()
+    {
+        var storage = new InMemoryFileSystem();
+        const string dbPath = "mvcc-trailing-payload.db";
+        var logPath = MvccLogicalLog.LogPathForDatabase(dbPath);
+        using (var log = MvccLogicalLog.CreateOrOpen(storage, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("value")]);
+            store.Commit(tx.Id);
+        }
+
+        var original = ReadAll(storage, logPath);
+        var frameOffset = MvccLogicalLogFormat.LogHeaderSize;
+        var originalPayloadSize = checked((int)BinaryPrimitives.ReadUInt64LittleEndian(
+            original.AsSpan(frameOffset + 4)));
+        var enlargedPayloadSize = originalPayloadSize + 1;
+        var rewritten = new byte[original.Length + 1];
+        original.AsSpan(0, frameOffset + MvccLogicalLogFormat.TxHeaderSize).CopyTo(rewritten);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            rewritten.AsSpan(frameOffset + 4),
+            checked((ulong)enlargedPayloadSize));
+        original.AsSpan(
+                frameOffset + MvccLogicalLogFormat.TxHeaderSize,
+                originalPayloadSize)
+            .CopyTo(rewritten.AsSpan(frameOffset + MvccLogicalLogFormat.TxHeaderSize));
+        rewritten[frameOffset + MvccLogicalLogFormat.TxHeaderSize + originalPayloadSize] = 0xA5;
+        var trailerOffset = frameOffset + MvccLogicalLogFormat.TxHeaderSize + enlargedPayloadSize;
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            rewritten.AsSpan(trailerOffset),
+            Crc32C.Compute(rewritten.AsSpan(
+                frameOffset,
+                MvccLogicalLogFormat.TxHeaderSize + enlargedPayloadSize)));
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            rewritten.AsSpan(trailerOffset + sizeof(uint)),
+            MvccLogicalLogFormat.EndMagic);
+        using (var file = storage.OpenFile(logPath, FileOpenMode.OpenExisting))
+        {
+            file.SetLength(rewritten.Length);
+            file.Write(0, rewritten);
+            file.FlushToDisk();
+        }
+
+        using var reopened = MvccLogicalLog.CreateOrOpen(storage, dbPath);
+        var replay = () => reopened.ReplayInto(new MvStore());
+        replay.Should().Throw<InvalidDataException>()
+            .WithMessage("*trailing byte*");
     }
 
     [Test]

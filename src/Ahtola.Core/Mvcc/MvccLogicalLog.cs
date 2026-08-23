@@ -199,7 +199,12 @@ internal sealed class MvccLogicalLog : IDisposable
             var plaintextPayload = EncodeOps(ops, _version);
             var payload = _encryption is null
                 ? plaintextPayload
-                : _encryption.EncryptPayload(plaintextPayload, _salt, checked((uint)ops.Count), commitTs);
+                : _encryption.EncryptPayload(
+                    plaintextPayload,
+                    _salt,
+                    checked((uint)ops.Count),
+                    commitTs,
+                    _version);
             var frameSize = checked(TxHeaderSize + payload.Length + TxTrailerSize);
             var frame = new byte[frameSize];
             BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(0, 4), MvccLogicalLogFormat.FrameMagic);
@@ -299,7 +304,13 @@ internal sealed class MvccLogicalLog : IDisposable
                 var payload = frame.AsSpan(TxHeaderSize, storedPayloadSize);
                 var plaintext = _encryption is null
                     ? payload.ToArray()
-                    : _encryption.DecryptPayload(payload, payloadSize, _salt, opCount, commitTs);
+                    : _encryption.DecryptPayload(
+                        payload,
+                        payloadSize,
+                        _salt,
+                        opCount,
+                        commitTs,
+                        _version);
                 var ops = DecodeOps(
                     plaintext,
                     (int)opCount,
@@ -611,6 +622,12 @@ internal sealed class MvccLogicalLog : IDisposable
             ops.Add(MvccLogOp.Upsert(new MvccRowId(tableId, key), cells, objectName));
         }
 
+        if (offset != payload.Length)
+        {
+            throw new InvalidDataException(
+                $"MVCC log payload has {payload.Length - offset} trailing byte(s) after {opCount} operation(s).");
+        }
+
         return ops;
     }
 
@@ -785,7 +802,8 @@ internal sealed class MvccLogicalLog : IDisposable
             ReadOnlySpan<byte> plaintext,
             ulong salt,
             uint opCount,
-            ulong commitTs)
+            ulong commitTs,
+            byte logVersion)
         {
             var encrypted = new byte[MvccLogicalLogFormat.GetEncryptedPayloadSize(plaintext.Length)];
             var chunkCount = MvccLogicalLogFormat.GetEncryptedChunkCount(plaintext.Length);
@@ -809,7 +827,8 @@ internal sealed class MvccLogicalLog : IDisposable
                     plaintext.Length,
                     opCount,
                     commitTs,
-                    chunkIndex);
+                    chunkIndex,
+                    logVersion);
                 using var cipher = _options.CreateAesGcm();
                 cipher.Encrypt(
                     nonce,
@@ -829,7 +848,8 @@ internal sealed class MvccLogicalLog : IDisposable
             int plaintextSize,
             ulong salt,
             uint opCount,
-            ulong commitTs)
+            ulong commitTs,
+            byte logVersion)
         {
             if (encrypted.Length != MvccLogicalLogFormat.GetEncryptedPayloadSize(plaintextSize))
                 throw new InvalidDataException("MVCC encrypted payload size does not match its frame header.");
@@ -857,7 +877,8 @@ internal sealed class MvccLogicalLog : IDisposable
                         plaintextSize,
                         opCount,
                         commitTs,
-                        chunkIndex);
+                        chunkIndex,
+                        logVersion);
                     using var cipher = _options.CreateAesGcm();
                     cipher.Decrypt(
                         nonce,
