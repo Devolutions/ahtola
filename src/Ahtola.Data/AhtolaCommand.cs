@@ -611,7 +611,7 @@ public class AhtolaCommand : DbCommand
             .ExecuteRemoteReaderAsync(sql, _parameterCollection, CommandTimeout, cancellationToken)
             .ConfigureAwait(false);
         return execution.Cursor is { } cursor
-            ? new AhtolaRemoteDataReader(this, cursor, behavior)
+            ? new AhtolaRemoteDataReader(this, cursor, execution.SchemaSource, behavior)
             : new AhtolaRemoteDataReader(
                 this,
                 execution.BufferedResult

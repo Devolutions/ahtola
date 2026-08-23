@@ -333,6 +333,13 @@ internal sealed class ScriptedHranaHandler : HttpMessageHandler
 
     private (JsonObject? Result, JsonObject? Error) RespondTo(string sql)
     {
+        if (sql.StartsWith("PRAGMA table_info", StringComparison.OrdinalIgnoreCase)
+            || sql.StartsWith("PRAGMA index_list", StringComparison.OrdinalIgnoreCase)
+            || sql.StartsWith("PRAGMA index_info", StringComparison.OrdinalIgnoreCase))
+        {
+            return (Ok(affectedRowCount: 0), null);
+        }
+
         var index = _statementIndex++;
         _sqlLog.Add(sql);
         UpdateAutocommitState(sql);

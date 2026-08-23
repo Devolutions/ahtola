@@ -15,6 +15,7 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
     private readonly int _recordsAffected;
     private readonly string? _commandText;
     private readonly AhtolaRemoteClient.RemoteCursor? _cursor;
+    private readonly AhtolaSchemaCollections.ReaderSchemaSource? _schemaSource;
     private readonly AhtolaCommand? _command;
     private readonly ILocalReaderConnection? _readerConnection;
     private List<RemoteResponseValue>? _currentStreamingRow;
@@ -24,13 +25,14 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
     private bool _isClosed;
 
     public AhtolaRemoteDataReader(AhtolaCommand command, RemoteStatementResult result, CommandBehavior behavior)
-        : this(command.Connection as AhtolaConnection, [result], behavior, command.CommandText, cursor: null, command: null)
+        : this(command.Connection as AhtolaConnection, [result], behavior, command.CommandText, cursor: null, schemaSource: null, command: null)
     {
     }
 
     public AhtolaRemoteDataReader(
         AhtolaCommand command,
         AhtolaRemoteClient.RemoteCursor cursor,
+        AhtolaSchemaCollections.ReaderSchemaSource? schemaSource,
         CommandBehavior behavior)
         : this(
             command.Connection as AhtolaConnection,
@@ -38,12 +40,13 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
             behavior,
             command.CommandText,
             cursor,
+            schemaSource,
             command)
     {
     }
 
     public AhtolaRemoteDataReader(AhtolaConnection? connection, IReadOnlyList<RemoteStatementResult> results, CommandBehavior behavior)
-        : this(connection, results, behavior, null, cursor: null, command: null)
+        : this(connection, results, behavior, null, cursor: null, schemaSource: null, command: null)
     {
     }
 
@@ -53,6 +56,7 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
         CommandBehavior behavior,
         string? commandText,
         AhtolaRemoteClient.RemoteCursor? cursor,
+        AhtolaSchemaCollections.ReaderSchemaSource? schemaSource,
         AhtolaCommand? command)
     {
         ArgumentNullException.ThrowIfNull(results);
@@ -62,6 +66,7 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
         _behavior = behavior;
         _commandText = commandText;
         _cursor = cursor;
+        _schemaSource = schemaSource;
         _command = command;
         foreach (var result in results)
             _recordsAffected = checked(_recordsAffected + (int)result.AffectedRowCount);
@@ -286,6 +291,7 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
     {
         return AhtolaSchemaCollections.BuildReaderSchemaTable(
             _cursor is null ? _connection : null,
+            _schemaSource,
             _commandText,
             FieldCount,
             GetName,

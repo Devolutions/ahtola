@@ -84,6 +84,9 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
             schema.Should().NotBeNull();
             schema!.Rows.Count.Should().Be(1);
             schema.Rows[0][System.Data.Common.SchemaTableColumn.ColumnName].Should().Be("value");
+            schema.Rows[0][System.Data.Common.SchemaTableColumn.BaseTableName].Should().Be("widgets");
+            schema.Rows[0][System.Data.Common.SchemaTableColumn.BaseColumnName].Should().Be("value");
+            schema.Rows[0][System.Data.Common.SchemaTableColumn.IsKey].Should().Be(true);
         }
         finally
         {
@@ -118,6 +121,32 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
         finally
         {
             SqliteConnection.RemoteMessageHandlerFactory = priorFactory;
+        }
+    }
+
+    [Test]
+    public void RemoteAhtolaCommandBuilderUsesCachedCursorSchemaMetadata()
+    {
+        using var handler = new MinimalRemoteSchemaHandler();
+        var priorFactory = global::Ahtola.AhtolaConnection.RemoteMessageHandlerFactory;
+        global::Ahtola.AhtolaConnection.RemoteMessageHandlerFactory = () => handler;
+        try
+        {
+            using var connection = new global::Ahtola.AhtolaConnection(
+                "Data Source=https://example.test/db;Auth Token=token");
+            connection.Open();
+            using var adapter = new global::Ahtola.AhtolaDataAdapter(
+                "SELECT value FROM widgets",
+                connection);
+            using var builder = new global::Ahtola.AhtolaCommandBuilder(adapter);
+
+            using var update = builder.GetUpdateCommand();
+
+            update.CommandText.Should().Contain("UPDATE").And.Contain("widgets").And.Contain("value");
+        }
+        finally
+        {
+            global::Ahtola.AhtolaConnection.RemoteMessageHandlerFactory = priorFactory;
         }
     }
 
@@ -534,9 +563,16 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
                 };
             }
 
-            var response = sql!.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
-                ? """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"value","decltype":"INTEGER"}],"rows":[[{"type":"integer","value":"42"}]],"affected_row_count":0}}}]}"""
-                : """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}}]}""";
+            var response = sql switch
+            {
+                not null when sql.StartsWith("PRAGMA table_info", StringComparison.OrdinalIgnoreCase)
+                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"cid"},{"name":"name"},{"name":"type"},{"name":"notnull"},{"name":"dflt_value"},{"name":"pk"}],"rows":[[{"type":"integer","value":"0"},{"type":"text","value":"value"},{"type":"text","value":"INTEGER"},{"type":"integer","value":"1"},{"type":"null"},{"type":"integer","value":"1"}]],"affected_row_count":0}}}]}""",
+                not null when sql.StartsWith("PRAGMA index_list", StringComparison.OrdinalIgnoreCase)
+                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}}]}""",
+                not null when sql.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"value","decltype":"INTEGER"}],"rows":[[{"type":"integer","value":"42"}]],"affected_row_count":0}}}]}""",
+                _ => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}}]}""",
+            };
 
             return new HttpResponseMessage(HttpStatusCode.OK)
             {

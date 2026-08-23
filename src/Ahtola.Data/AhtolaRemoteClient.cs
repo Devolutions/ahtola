@@ -1634,21 +1634,28 @@ internal sealed class RemoteReaderExecution
 {
     private RemoteReaderExecution(
         RemoteStatementResult? bufferedResult,
-        AhtolaRemoteClient.RemoteCursor? cursor)
+        AhtolaRemoteClient.RemoteCursor? cursor,
+        AhtolaSchemaCollections.ReaderSchemaSource? schemaSource = null)
     {
         BufferedResult = bufferedResult;
         Cursor = cursor;
+        SchemaSource = schemaSource;
     }
 
     public RemoteStatementResult? BufferedResult { get; }
 
     public AhtolaRemoteClient.RemoteCursor? Cursor { get; }
 
+    public AhtolaSchemaCollections.ReaderSchemaSource? SchemaSource { get; }
+
     public static RemoteReaderExecution FromBuffered(RemoteStatementResult result)
         => new(result, null);
 
     public static RemoteReaderExecution FromCursor(AhtolaRemoteClient.RemoteCursor cursor)
         => new(null, cursor);
+
+    public RemoteReaderExecution WithSchemaSource(AhtolaSchemaCollections.ReaderSchemaSource? schemaSource)
+        => new(BufferedResult, Cursor, schemaSource);
 }
 
 internal sealed class RemoteCursorHeader

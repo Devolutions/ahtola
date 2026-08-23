@@ -84,8 +84,8 @@ public sealed class HranaV3StreamingTests
         var read = async () => await reader.ReadAsync(cancellation.Token);
 
         await read.Should().ThrowAsync<OperationCanceledException>();
-        handler.Paths.Should().Equal("/v3/cursor", "/v3/pipeline");
-        AssertCloseRequest(handler.Bodies[1], "cursor-baton");
+        handler.Paths.Should().Equal("/v3/pipeline", "/v3/cursor", "/v3/pipeline");
+        AssertCloseRequest(handler.Bodies[2], "cursor-baton");
     }
 
     [Test]
@@ -179,8 +179,8 @@ public sealed class HranaV3StreamingTests
 
         await read.Should().ThrowAsync<AhtolaException>()
             .WithMessage("Unable to parse remote cursor response:*");
-        handler.Paths.Should().Equal("/v3/cursor", "/v3/pipeline");
-        AssertCloseRequest(handler.Bodies[1], "cursor-baton");
+        handler.Paths.Should().Equal("/v3/pipeline", "/v3/cursor", "/v3/pipeline");
+        AssertCloseRequest(handler.Bodies[2], "cursor-baton");
     }
 
     [Test]

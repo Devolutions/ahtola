@@ -559,6 +559,7 @@ internal static class AhtolaSchemaCollections
     /// </summary>
     internal static DataTable BuildReaderSchemaTable(
         DbConnection? connection,
+        ReaderSchemaSource? cachedSource,
         string? commandText,
         int fieldCount,
         Func<int, string> getName,
@@ -566,9 +567,18 @@ internal static class AhtolaSchemaCollections
     {
         var schema = CreateReaderSchemaTable();
         var hasSource = TryGetSelectSource(commandText, fieldCount, getName, out var tableName, out var selections);
-        var tableColumns = hasSource && connection is not null
-            ? GetTableColumns(connection, tableName)
-            : new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, ReaderSchemaColumn> tableColumns;
+        if (hasSource && cachedSource is not null
+            && cachedSource.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
+        {
+            tableColumns = cachedSource.Columns;
+        }
+        else
+        {
+            tableColumns = hasSource && connection is not null
+                ? GetTableColumns(connection, tableName)
+                : new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
+        }
 
         for (var i = 0; i < fieldCount; i++)
         {
@@ -616,6 +626,38 @@ internal static class AhtolaSchemaCollections
 
         return schema;
     }
+
+    internal static DataTable BuildReaderSchemaTable(
+        DbConnection? connection,
+        string? commandText,
+        int fieldCount,
+        Func<int, string> getName,
+        Func<int, Type> getFieldType)
+        => BuildReaderSchemaTable(connection, null, commandText, fieldCount, getName, getFieldType);
+
+    internal static bool TryGetReaderSchemaTableName(string? commandText, out string tableName)
+    {
+        tableName = string.Empty;
+        if (string.IsNullOrWhiteSpace(commandText))
+            return false;
+
+        var match = Regex.Match(
+            commandText,
+            @"^\s*SELECT\s+.*?\s+FROM\s+(?<table>""(?:[^""]|"""")+""|\[[^\]]+\]|`[^`]+`|[\w]+)",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!match.Success)
+            return false;
+
+        tableName = UnquoteIdentifier(match.Groups["table"].Value);
+        return true;
+    }
+
+    internal static ReaderSchemaSource CreateReaderSchemaSource(
+        string tableName,
+        IEnumerable<ReaderSchemaColumn> columns)
+        => new(
+            tableName,
+            columns.ToDictionary(static column => column.Name, StringComparer.OrdinalIgnoreCase));
 
     /// <summary>
     /// Resolves the declared SQLite type of every projected column, or <c>null</c> for a column
@@ -955,7 +997,11 @@ internal static class AhtolaSchemaCollections
         return 3;
     }
 
-    private sealed record ReaderSchemaColumn(
+    internal sealed record ReaderSchemaSource(
+        string TableName,
+        Dictionary<string, ReaderSchemaColumn> Columns);
+
+    internal sealed record ReaderSchemaColumn(
         string Name,
         string TypeName,
         bool AllowNull,
