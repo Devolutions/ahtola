@@ -332,7 +332,7 @@ public sealed class HranaV3StreamingTests
             path == "/v3/cursor" ? Ndjson(stream) : PipelineClose());
         using var connection = CreateConnection(handler, readYourWrites: true);
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT value FROM malformed_query";
+        command.CommandText = "SELECT 42";
 
         var execute = async () => await command.ExecuteReaderAsync();
 
