@@ -171,6 +171,39 @@ public sealed class ManagedIncrementalIndexBtreeBalanceTests
     }
 
     [Test]
+    public void SmallerPredecessorBalancesModifiedNonRootInteriorAndReopensWithIntegrity()
+    {
+        var comparer = new SqliteIndexRecordComparer(SqliteTextEncoding.Utf8);
+        var fixture = BuildNonRootInteriorReplacementFixture(comparer);
+        var io = new SqliteStagedBtreePageIo(
+            pageNumber => (byte[])fixture.Pages[checked((int)pageNumber) - 1].Clone(),
+            committedPageCount: checked((uint)fixture.Pages.Count),
+            pageSize: PageSize,
+            usableSpace: PageSize);
+
+        new SqliteIncrementalIndexBtree(io, comparer, SqliteTextEncoding.Utf8)
+            .Delete(RootPage, fixture.DeletedSeparator);
+
+        io.StagedPages.Keys.Should().Contain([3u, 4u, 5u]);
+        var reopenedPages = Enumerable.Range(1, checked((int)io.PageCount))
+            .Select(pageNumber => io.ReadPage(checked((uint)pageNumber)))
+            .ToArray();
+        var reopened = new SqliteStagedBtreePageIo(
+            pageNumber => (byte[])reopenedPages[checked((int)pageNumber) - 1].Clone(),
+            committedPageCount: io.PageCount,
+            pageSize: PageSize,
+            usableSpace: PageSize,
+            io.FirstFreelistTrunkPage,
+            io.FreelistPageCount);
+        var rowIds = ReadTree(reopened, comparer)
+            .Select(record => SqliteRecordCodec.Decode(record, SqliteTextEncoding.Utf8)[0].AsInteger())
+            .ToArray();
+        rowIds.Should().BeInAscendingOrder();
+        rowIds.Should().OnlyHaveUniqueItems();
+        rowIds.Should().Equal(fixture.ExpectedRowIds);
+    }
+
+    [Test]
     public void SeparatorDeleteReopensAndPassesExternalSqliteIntegrityCheck()
     {
         var path = Path.Combine(
@@ -251,6 +284,114 @@ public sealed class ManagedIncrementalIndexBtreeBalanceTests
             .Select(id => $"({id}, 'value-{id:D4}-{new string('x', 48)}')");
         Execute(connection, $"INSERT INTO target VALUES {string.Join(", ", rows)};");
         Execute(connection, "CREATE INDEX target_value ON target(value);");
+    }
+
+    private static NonRootInteriorFixture BuildNonRootInteriorReplacementFixture(
+        SqliteIndexRecordComparer comparer)
+    {
+        var records = new Dictionary<long, byte[]>();
+        byte[] Record(long rowId, int textLength = 4)
+        {
+            var record = SqliteRecordCodec.Encode(
+                [SqlValue.Integer(rowId), SqlValue.Text(new string('x', textLength))],
+                SqliteTextEncoding.Utf8);
+            records.Add(rowId, record);
+            return record;
+        }
+
+        var leafRecords = new Dictionary<uint, byte[][]>
+        {
+            [6] = [Record(5), Record(10), Record(15), Record(20), Record(25)],
+            [7] = [Record(35), Record(40)],
+            [8] = [Record(50), Record(55)],
+            [9] = [Record(65), Record(70)],
+            [10] = [Record(80), Record(85), Record(90), Record(95)],
+            [11] = [Record(105, 40), Record(110, 40), Record(115, 40), Record(120, 40), Record(125, 40)],
+            [12] = [Record(135), Record(140)],
+            [13] = [Record(150), Record(155)],
+            [14] = [Record(165), Record(170)],
+            [15] = [Record(180), Record(185)],
+            [16] = [Record(205), Record(210), Record(215), Record(220), Record(225)],
+            [17] = [Record(235), Record(240)],
+            [18] = [Record(250), Record(255)],
+            [19] = [Record(265), Record(270)],
+            [20] = [Record(280), Record(285), Record(290), Record(295)],
+            [21] = [Record(195)],
+        };
+        var deletedSeparator = Record(130, 90);
+        var pages = Enumerable.Range(0, 21).Select(_ => new byte[PageSize]).ToArray();
+        foreach (var (pageNumber, entries) in leafRecords)
+            pages[checked((int)pageNumber) - 1] = BuildIndexLeaf(entries, comparer);
+
+        pages[2] = BuildIndexInterior(
+            [6, 7, 8, 9, 10],
+            [Record(30), Record(45), Record(60), Record(75)],
+            comparer);
+        pages[3] = BuildIndexInterior(
+            [11, 12, 13, 14, 15, 21],
+            [deletedSeparator, Record(145), Record(160), Record(175), Record(190, 20)],
+            comparer);
+        pages[4] = BuildIndexInterior(
+            [16, 17, 18, 19, 20],
+            [Record(230), Record(245), Record(260), Record(275)],
+            comparer);
+        pages[1] = BuildIndexInterior(
+            [3, 4, 5],
+            [Record(100), Record(200)],
+            comparer);
+
+        var middle = SqliteIndexInteriorPageView.Parse(
+            pages[3],
+            PageSize,
+            SqliteTextEncoding.Utf8,
+            recordComparer: comparer);
+        var currentUsed = middle.Cells.Sum(
+            cell => SqliteIndexInteriorCell.ChildPointerLength
+                + cell.Cell.Key.EncodedLength
+                + sizeof(ushort));
+        var predecessorLength = SqliteIndexLeafCell.Create(records[125], PageSize).EncodedLength;
+        var usedAfterReplacement = currentUsed
+            - middle.Cells[0].Cell.Key.EncodedLength
+            + predecessorLength;
+        (currentUsed * 3).Should().BeGreaterThanOrEqualTo(
+            PageSize - SqliteBtreePageHeader.InteriorHeaderSize);
+        (usedAfterReplacement * 3).Should().BeLessThan(
+            PageSize - SqliteBtreePageHeader.InteriorHeaderSize);
+
+        return new NonRootInteriorFixture(
+            pages,
+            deletedSeparator,
+            records.Keys.Where(rowId => rowId != 130).Order().ToArray());
+    }
+
+    private static byte[] BuildIndexLeaf(
+        IEnumerable<byte[]> records,
+        SqliteIndexRecordComparer comparer)
+    {
+        var builder = new SqliteIndexLeafPageBuilder(PageSize, PageSize, comparer);
+        foreach (var record in records)
+            builder.Append(SqliteIndexLeafCell.Create(record, PageSize), record);
+        return builder.Build();
+    }
+
+    private static byte[] BuildIndexInterior(
+        IReadOnlyList<uint> children,
+        IReadOnlyList<byte[]> separators,
+        SqliteIndexRecordComparer comparer)
+    {
+        children.Count.Should().Be(separators.Count + 1);
+        var builder = new SqliteIndexInteriorPageBuilder(
+            PageSize,
+            PageSize,
+            children[^1],
+            comparer);
+        for (var index = 0; index < separators.Count; index++)
+        {
+            builder.Append(
+                SqliteIndexInteriorCell.Create(children[index], separators[index], PageSize),
+                separators[index]);
+        }
+        return builder.Build();
     }
 
     private static long ReadRootSeparatorRowId(SqlitePager pager)
@@ -360,4 +501,9 @@ public sealed class ManagedIncrementalIndexBtreeBalanceTests
         statement.Step().Should().Be(StatementStepResult.Row);
         return statement.GetValue(0).AsInteger();
     }
+
+    private sealed record NonRootInteriorFixture(
+        IReadOnlyList<byte[]> Pages,
+        byte[] DeletedSeparator,
+        IReadOnlyList<long> ExpectedRowIds);
 }

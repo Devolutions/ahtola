@@ -150,7 +150,11 @@ public sealed class SqliteIncrementalIndexBtree
 
         _io.WritePage(separatorEntry.PageNumber, BuildInteriorImage(links));
         _io.WritePage(pageNumber, BuildLeafImage(entries));
-        BalanceAfterDelete(predecessorPath, predecessorPath.Count - 1);
+        var predecessorLevel = predecessorPath.Count - 1;
+        var predecessorUnderflows = IsUnderfull(pageNumber);
+        BalanceAfterDelete(predecessorPath, predecessorLevel);
+        if (!predecessorUnderflows)
+            BalanceAfterDelete(predecessorPath, separatorLevel);
     }
 
     private void BalanceAfterDelete(List<PathEntry> path, int level)
