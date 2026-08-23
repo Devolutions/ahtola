@@ -18,9 +18,9 @@ namespace Ahtola.Core.Storage;
 /// <see cref="ISqliteBtreePageIo.FreePage"/>. Empty non-root leaves are freed and
 /// unlinked (with single-child interior collapse into the parent/root). Under-full
 /// non-empty leaves merge into a left or right sibling when both cell sets fit
-/// on one page, and two-way sibling redistribution rebalances when merge does
-/// not fit. Three-way multi-sibling balance and index-tree shrink remain out of
-/// scope (callers fall back to a complete rewrite). Leaf/interior images are
+/// on one page. When a pair cannot be balanced safely, up to three adjacent
+/// siblings are repacked together and surplus pages are returned to the
+/// freelist. Leaf/interior images are
 /// always packed compactly on write, so freeblock-style in-page defragmentation
 /// is not required.
 /// </para>
@@ -132,13 +132,12 @@ public sealed class SqliteIncrementalTableBtree
                 /// <summary>
                                 /// Merges an under-full non-root leaf into a neighboring sibling when both
                                 /// sets of cells fit on one page. When merge does not fit and this leaf is
-                                /// below half full, redistributes cells evenly with one sibling (two-way).
+                                /// below half full, redistributes cells with up to three siblings.
                                 /// Empty-leaf reclaim still collapses single-child interiors via
                                 /// <see cref="CollapseSingleChildInterior"/>. Underfull (non-empty) merge is
                                 /// deferred when the parent has only two children under a deep tree so a
-                                /// separator-only delete keeps parent topology byte-stable (full-rewrite /
-                                /// empty-leaf paths handle true shrink). Three-way multi-sibling balance and
-                                /// index-tree shrink remain out of scope.
+                                /// separator-only delete keeps parent topology byte-stable (empty-leaf paths
+                                /// handle true shrink).
                                 /// </summary>
                                 private void TryMergeUnderfullLeaf(List<PathEntry> path, List<SqliteTableLeafCell> cells)
                                 {
@@ -231,18 +230,22 @@ public sealed class SqliteIncrementalTableBtree
                             return;
                         }
 
-                        if (allowRedistribute)
-                        {
-                            TryRedistributeLeafPair(
+                        if (allowRedistribute
+                            && TryRedistributeLeafPair(
                                 path,
                                 parentLinks,
                                 leftIndex: childIndex,
                                 leafPage,
                                 cells,
                                 rightPage,
-                                rightCells);
+                                rightCells))
+                        {
+                            return;
                         }
                     }
+
+                    if (allowRedistribute)
+                        TryBalanceLeafSiblingRun(path, parentLinks, childIndex);
                 }
 
                 /// <summary>
@@ -308,6 +311,57 @@ public sealed class SqliteIncrementalTableBtree
                         MaximumRowId = newLeft[^1].RowId,
                     };
                     WriteOrCollapseParent(path, path.Count - 2, parentLinks);
+                    return true;
+                }
+
+                private bool TryBalanceLeafSiblingRun(
+                    List<PathEntry> path,
+                    List<ChildLink> parentLinks,
+                    int childIndex)
+                {
+                    if (parentLinks.Count < 3)
+                        return false;
+
+                    var first = childIndex == 0
+                        ? 0
+                        : childIndex == parentLinks.Count - 1
+                            ? parentLinks.Count - 3
+                            : childIndex - 1;
+                    const int siblingCount = 3;
+                    var pages = new uint[siblingCount];
+                    var combined = new List<SqliteTableLeafCell>();
+                    for (var index = 0; index < siblingCount; index++)
+                    {
+                        var pageNumber = parentLinks[first + index].PageNumber;
+                        if (ParseHeaderType(pageNumber) != SqliteBtreePageType.TableLeaf)
+                            return false;
+
+                        pages[index] = pageNumber;
+                        combined.AddRange(ParseLeaf(pageNumber).Cells.Select(cell => cell.Cell));
+                    }
+
+                    var assignedPages = pages.Order().ToList();
+                    var groups = PartitionLeafCells(assignedPages[0], combined, appendedAtEnd: false);
+                    if (groups.Count > siblingCount || groups.Any(group => group.Count == 0))
+                        return false;
+
+                    var inheritedUpperBound = parentLinks[first + siblingCount - 1].MaximumRowId;
+                    var replacement = new List<ChildLink>(groups.Count);
+                    for (var index = 0; index < groups.Count; index++)
+                    {
+                        var group = groups[index];
+                        var pageNumber = assignedPages[index];
+                        WriteSinglePage(pageNumber, BuildLeafImage(pageNumber, group));
+                        replacement.Add(new ChildLink(
+                            pageNumber,
+                            index + 1 == groups.Count ? inheritedUpperBound : group[^1].RowId));
+                    }
+
+                    parentLinks.RemoveRange(first, siblingCount);
+                    parentLinks.InsertRange(first, replacement);
+                    WriteOrCollapseParent(path, path.Count - 2, parentLinks);
+                    for (var index = groups.Count; index < assignedPages.Count; index++)
+                        _io.FreePage(assignedPages[index]);
                     return true;
                 }
 
@@ -418,8 +472,82 @@ public sealed class SqliteIncrementalTableBtree
                 }
             }
 
+            if (TryRedistributeSingleChildInterior(
+                    path,
+                    level,
+                    grandLinks,
+                    parentIndex,
+                    soleChildPage))
+            {
+                return;
+            }
+
             throw new SqliteBtreeMaintenanceRequiredException(
                 $"SQLite table-interior page {entry.PageNumber} would collapse to a single child under non-root parent {grandEntry.PageNumber}; no sibling interior can absorb the survivor.");
+        }
+
+        private bool TryRedistributeSingleChildInterior(
+            List<PathEntry> path,
+            int level,
+            List<ChildLink> grandLinks,
+            int parentIndex,
+            uint soleChildPage)
+        {
+            if (grandLinks.Count < 2)
+                return false;
+
+            var siblingCount = Math.Min(3, grandLinks.Count);
+            var first = parentIndex == 0
+                ? 0
+                : parentIndex == grandLinks.Count - 1
+                    ? grandLinks.Count - siblingCount
+                    : Math.Min(parentIndex - 1, grandLinks.Count - siblingCount);
+            var pages = new uint[siblingCount];
+            var combined = new List<ChildLink>();
+            for (var offset = 0; offset < siblingCount; offset++)
+            {
+                var index = first + offset;
+                var pageNumber = grandLinks[index].PageNumber;
+                pages[offset] = pageNumber;
+                List<ChildLink> links;
+                if (index == parentIndex)
+                {
+                    links = [new ChildLink(soleChildPage, long.MaxValue)];
+                }
+                else
+                {
+                    if (ParseHeaderType(pageNumber) != SqliteBtreePageType.TableInterior)
+                        return false;
+                    links = ReadChildLinks(ParseInterior(pageNumber));
+                }
+
+                links[^1] = links[^1] with { MaximumRowId = grandLinks[index].MaximumRowId };
+                combined.AddRange(links);
+            }
+
+            var assignedPages = pages.Order().ToList();
+            var groups = PartitionInteriorChildren(assignedPages[0], combined);
+            if (groups.Count > siblingCount || groups.Any(group => group.Count < 2))
+                return false;
+
+            var inheritedUpperBound = grandLinks[first + siblingCount - 1].MaximumRowId;
+            var replacement = new List<ChildLink>(groups.Count);
+            for (var index = 0; index < groups.Count; index++)
+            {
+                var group = groups[index];
+                var pageNumber = assignedPages[index];
+                WriteSinglePage(pageNumber, BuildInteriorImage(pageNumber, group));
+                replacement.Add(new ChildLink(
+                    pageNumber,
+                    index + 1 == groups.Count ? inheritedUpperBound : group[^1].MaximumRowId));
+            }
+
+            grandLinks.RemoveRange(first, siblingCount);
+            grandLinks.InsertRange(first, replacement);
+            WriteOrCollapseParent(path, level - 1, grandLinks);
+            for (var index = groups.Count; index < assignedPages.Count; index++)
+                _io.FreePage(assignedPages[index]);
+            return true;
         }
 
         private bool InteriorLinksFit(uint pageNumber, List<ChildLink> links)

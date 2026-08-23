@@ -2079,11 +2079,11 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// frames.
     /// </para>
     /// <para>
-    /// It refuses anything that would need the b-tree maintenance the incremental
-    /// writers deliberately omit — page merging, rebalancing, defragmentation,
-    /// freelist reuse — and anything whose committed contents it cannot prove it
-    /// knows. Every refusal falls through to the complete catalog rewrite, which
-    /// can always represent the mutation.
+    /// It performs ordinary b-tree split, sibling redistribution, merge,
+    /// root-collapse, overflow cleanup, and freelist reuse. It refuses page shapes
+    /// outside those bounded operations and anything whose committed contents it
+    /// cannot prove it knows. Every refusal falls through to the complete catalog
+    /// rewrite, which can always represent the mutation.
     /// </para>
     /// </remarks>
     private bool TryPersistIncrementalRowMutation(
