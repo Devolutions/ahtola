@@ -168,6 +168,16 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
     }
 
     [Test]
+    public void RemoteCursorSchemaCacheAcceptsSingleTableOrderByLists()
+    {
+        AhtolaSchemaCollections.TryGetReaderSchemaTableName(
+                "SELECT value FROM widgets ORDER BY value, value",
+                out var tableName)
+            .Should().BeTrue();
+        tableName.Should().Be("widgets");
+    }
+
+    [Test]
     public async Task BrowserReaderDisposalFailure_StillClosesReader_AndConnectionRecovers()
     {
         var factory = new FaultInjectingManagedDatabaseFactory();

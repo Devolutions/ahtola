@@ -887,6 +887,7 @@ internal static class SqliteVectorFunctions
 
     private static byte[] Serialize(VectorValue vector)
     {
+        EnsureManagedDimensions(vector.Dimensions);
         switch (vector.Type)
         {
             case VectorType.Float32Dense:

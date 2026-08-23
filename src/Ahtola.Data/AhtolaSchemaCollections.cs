@@ -649,8 +649,12 @@ internal static class AhtolaSchemaCollections
             return false;
 
         var remainder = commandText[match.Length..];
+        var sourceTail = Regex.Split(
+            remainder,
+            @"\b(?:WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|OFFSET|WINDOW|UNION|EXCEPT|INTERSECT)\b|;",
+            RegexOptions.IgnoreCase)[0];
         if (Regex.IsMatch(
-                remainder,
+                sourceTail,
                 @"(?:,|\b(?:JOIN|CROSS|INNER|LEFT|RIGHT|FULL|NATURAL)\b)",
                 RegexOptions.IgnoreCase))
         {

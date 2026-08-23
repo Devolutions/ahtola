@@ -277,6 +277,20 @@ public sealed class ManagedVectorFunctionTests
     }
 
     [Test]
+    public void SparseOperationsCannotSerializeDimensionsBeyondManagedLimit()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        var concatenate = () => ReadValue(
+            connection,
+            "SELECT vector_concat(X'0000100009', X'0100000009');");
+
+        concatenate.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*dimensions exceed managed limit*");
+    }
+
+    [Test]
     public void EmptyDenseVectorCannotConvertToOneBit()
     {
         using var database = new EmbeddedDatabase();
