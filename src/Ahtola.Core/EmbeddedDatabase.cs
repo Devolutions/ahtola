@@ -47466,6 +47466,9 @@ Func<string, ParsedStatement> rewrite)
                 0);
         }
 
+        if (HasActiveTransaction)
+            throw new EmbeddedSqlException("Safety level may not be changed inside a transaction");
+
         var current = GetSynchronousMode(database);
         _synchronousModes[database] = statement.Value.ToUpperInvariant() switch
         {

@@ -212,6 +212,86 @@ public sealed class SqliteSynchronousDurabilityTests
     }
 
     [Test]
+    public void PragmaSynchronousCannotChangeInsideTransactionOrSavepoint()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Execute(connection, "BEGIN;");
+        AssertSynchronousChangeRejected(connection);
+        ReadValue(connection, "PRAGMA synchronous;").Should().Be(SqlValue.Integer(2));
+        Execute(connection, "ROLLBACK;");
+
+        Execute(connection, "SAVEPOINT durability;");
+        AssertSynchronousChangeRejected(connection);
+        ReadValue(connection, "PRAGMA synchronous;").Should().Be(SqlValue.Integer(2));
+        Execute(connection, "RELEASE durability;");
+
+        Execute(connection, "PRAGMA synchronous=OFF;");
+        ReadValue(connection, "PRAGMA synchronous;").Should().Be(SqlValue.Integer(0));
+    }
+
+    [Test]
+    public void WalToDeleteForcesDurableFoldEvenWhenSynchronousIsOff()
+    {
+        var fileSystem = new RecordingFileSystem();
+        using var pager = CreateWalPager(fileSystem);
+        var page2 = CreatePage(pager.PageSize, 0x48);
+        using (var transaction = pager.BeginTransaction(2))
+        {
+            transaction.WritePage(2, page2);
+            transaction.Commit(SqliteSynchronousMode.Off);
+        }
+        fileSystem.ClearEvents();
+
+        pager.SwitchJournalMode(
+            SqliteJournalMode.Delete,
+            synchronousMode: SqliteSynchronousMode.Off);
+
+        pager.JournalMode.Should().Be(SqliteJournalMode.Delete);
+        fileSystem.FileExists(WalPath).Should().BeFalse();
+        fileSystem.FlushPaths.Should().Equal(
+            WalPath,
+            DatabasePath,
+            WalPath,
+            DatabasePath + "-journal",
+            DatabasePath + "-journal",
+            DatabasePath,
+            DatabasePath + "-journal");
+        pager.ReadCommittedPage(2).Should().Equal(page2);
+    }
+
+    [Test]
+    public void FailedWalToDeleteFoldRetainsRecoveryWalAndReopensCommittedView()
+    {
+        var fileSystem = new RecordingFileSystem();
+        var page2 = CreatePage(SqlitePageSize.Default, 0x49);
+        using (var pager = CreateWalPager(fileSystem))
+        {
+            using (var transaction = pager.BeginTransaction(2))
+            {
+                transaction.WritePage(2, page2);
+                transaction.Commit(SqliteSynchronousMode.Off);
+            }
+            fileSystem.ClearEvents();
+            fileSystem.FailNextFlush(DatabasePath);
+
+            Assert.Throws<IOException>(
+                () => pager.SwitchJournalMode(
+                    SqliteJournalMode.Delete,
+                    synchronousMode: SqliteSynchronousMode.Off));
+
+            pager.JournalMode.Should().Be(SqliteJournalMode.Wal);
+            fileSystem.FileExists(WalPath).Should().BeTrue();
+            fileSystem.FlushPaths.Should().Equal(WalPath, DatabasePath);
+        }
+
+        using var reopened = SqlitePager.Open(fileSystem, DatabasePath, WalPath);
+        reopened.JournalMode.Should().Be(SqliteJournalMode.Wal);
+        reopened.ReadCommittedPage(2).Should().Equal(page2);
+    }
+
+    [Test]
     public async Task BrowserMirrorReplaysOnlyBarriersRequestedByPager()
     {
         var persistent = new FakeBrowserPersistentStore();
@@ -245,6 +325,22 @@ public sealed class SqliteSynchronousDurabilityTests
     {
         using var statement = connection.Prepare(sql);
         statement.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    private static SqlValue ReadValue(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        var value = statement.GetValue(0);
+        statement.Step().Should().Be(StatementStepResult.Done);
+        return value;
+    }
+
+    private static void AssertSynchronousChangeRejected(EmbeddedConnection connection)
+    {
+        using var statement = connection.Prepare("PRAGMA synchronous=OFF;");
+        Assert.Throws<EmbeddedSqlException>(() => statement.Step())!
+            .Message.Should().Be("Safety level may not be changed inside a transaction");
     }
 
     private static SqlitePager CreateWalPager(IFileSystem fileSystem)

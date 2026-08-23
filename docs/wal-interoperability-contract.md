@@ -151,6 +151,13 @@ commits. Browser OPFS uses the same policy: `BrowserMirroredFileSystem` records
 only the requested flush operations and replays them in order at the asynchronous
 statement boundary.
 
+The mode cannot change while a transaction or savepoint transaction is active;
+the commit therefore cannot be weakened after its writes have begun. A
+WAL/MVCC-to-DELETE journal transition is also always folded with FULL barriers,
+even when the connection is configured OFF: the WAL remains recovery authority
+until its frames, the main database, and the legacy header are durable, and any
+barrier failure retains the WAL instead of deleting recovery evidence.
+
 ### 1.4 MVCC mode (Phase 2)
 
 `PRAGMA journal_mode=mvcc` enables Turso-aligned main-memory MVCC on the

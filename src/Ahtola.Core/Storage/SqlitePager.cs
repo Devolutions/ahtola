@@ -1736,6 +1736,11 @@ public sealed class SqlitePager : IDisposable
         if (JournalMode == journalMode)
             return journalMode;
 
+        var forceDurableWalFold = journalMode == SqliteJournalMode.Delete
+            && UsesWalStorage(JournalMode);
+        var transitionSynchronousMode = forceDurableWalFold
+            ? SqliteSynchronousMode.Full
+            : synchronousMode;
         var timeout = ResolveBusyTimeout(busyTimeout);
         var lockStopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
         using var checkpointLock = _lockManager.EnterCheckpoint(timeout);
@@ -1748,14 +1753,14 @@ public sealed class SqlitePager : IDisposable
                     resetCommittedWal: true,
                     writerLockAlreadyHeld: true,
                     checkpointLockAlreadyHeld: true,
-                    synchronousMode: synchronousMode);
+                    synchronousMode: transitionSynchronousMode);
             }
             else
             {
                 CheckpointToMainStoreUnderLock(
                     checkpointLock,
                     resetCommittedWal: true,
-                    synchronousMode: synchronousMode);
+                    synchronousMode: transitionSynchronousMode);
             }
         }
 
@@ -1830,7 +1835,7 @@ public sealed class SqlitePager : IDisposable
                                 unchecked((uint)Random.Shared.NextInt64())),
                             GetFileSystemEncryption(_fileSystem),
                             GetFileSystemPageCodec(_fileSystem),
-                            synchronousMode);
+                            transitionSynchronousMode);
                     }
 
                     SqliteRollbackJournal.Commit(
@@ -1841,10 +1846,10 @@ public sealed class SqlitePager : IDisposable
                         () =>
                         {
                             _pageStore.WritePage(1, pageOne);
-                            if (synchronousMode.SyncsCheckpoint())
+                            if (transitionSynchronousMode.SyncsCheckpoint())
                                 _pageStore.Flush();
                         },
-                        synchronousMode);
+                        transitionSynchronousMode);
 
                     _journalMode = journalMode;
                     if (UsesWalStorage(journalMode))
