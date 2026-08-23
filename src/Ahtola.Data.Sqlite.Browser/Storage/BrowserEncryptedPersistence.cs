@@ -948,6 +948,13 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                         $"Encrypted browser storage contains a plaintext MVCC logical-log frame in '{path}'. "
                         + "Automatic migration is not safe.");
                 }
+                if (MvccLogicalLogFormat.ContainsCompleteFrameBoundary(
+                        encryptedImage.AsSpan(position)))
+                {
+                    throw new InvalidDataException(
+                        $"MVCC logical-log payload length does not match its complete frame boundary in '{path}'. "
+                        + "The authenticated frame metadata was tampered with.");
+                }
 
                 break;
             }

@@ -264,6 +264,12 @@ internal sealed class MvccLogicalLog : IDisposable
                             "Encrypted MVCC storage contains a plaintext logical-log frame. "
                             + "Automatic migration is not safe; checkpoint the log without encryption first.");
                     }
+                    if (ContainsCompleteStoredFrame(file, position))
+                    {
+                        throw new InvalidDataException(
+                            "MVCC logical-log payload length does not match its complete frame boundary. "
+                            + "The authenticated frame metadata was tampered with.");
+                    }
                     break; // torn tail — stop (fail-closed leave partial unrecovered)
                 }
 
@@ -461,6 +467,22 @@ internal sealed class MvccLogicalLog : IDisposable
                    == MvccLogicalLogFormat.EndMagic
                && BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(trailerOffset))
                    == Crc32C.Compute(frame.AsSpan(0, trailerOffset));
+    }
+
+    private static bool ContainsCompleteStoredFrame(IFile file, long position)
+    {
+        var remaining = file.Length - position;
+        if (remaining <= 0)
+            return false;
+        if (remaining > int.MaxValue)
+        {
+            throw new InvalidDataException(
+                "MVCC logical-log tail is too large to prove that an oversized payload length is a torn append.");
+        }
+
+        var bytes = new byte[(int)remaining];
+        ReadExact(file, position, bytes);
+        return MvccLogicalLogFormat.ContainsCompleteFrameBoundary(bytes);
     }
 
     private static bool RequiresVersion4(IReadOnlyList<MvccLogOp> ops)
@@ -896,15 +918,21 @@ internal readonly struct MvccLogOp
 /// <summary>CRC-32C (Castagnoli) used by Turso logical log framing.</summary>
 internal static class Crc32C
 {
+    internal const uint InitialState = 0xFFFFFFFFu;
     private static readonly uint[] Table = CreateTable();
 
     internal static uint Compute(ReadOnlySpan<byte> data)
     {
-        var crc = 0xFFFFFFFFu;
+        var crc = InitialState;
         foreach (var b in data)
-            crc = Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
-        return crc ^ 0xFFFFFFFFu;
+            crc = Update(crc, b);
+        return Complete(crc);
     }
+
+    internal static uint Update(uint crc, byte value)
+        => Table[(crc ^ value) & 0xFF] ^ (crc >> 8);
+
+    internal static uint Complete(uint crc) => crc ^ 0xFFFFFFFFu;
 
     private static uint[] CreateTable()
     {

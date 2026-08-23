@@ -344,6 +344,51 @@ public sealed class MvccLogicalLogTests
             .WithMessage("*authentication failed*");
     }
 
+    [TestCase(-1L)]
+    [TestCase(1L)]
+    public void EncryptedCommitFrameRejectsPayloadLengthTampering(long delta)
+    {
+        var storage = new InMemoryFileSystem();
+        var key = Enumerable.Repeat((byte)0x25, 16).ToArray();
+        const string dbPath = "encrypted-mvcc-length.db";
+        var logPath = MvccLogicalLog.LogPathForDatabase(dbPath);
+        using (var options = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key))
+        using (var fileSystem = new AhtolaEncryptionFileSystem(storage, options))
+        using (var log = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("secret")]);
+            store.Commit(tx.Id);
+        }
+
+        using (var file = storage.OpenFile(logPath, FileOpenMode.OpenExisting))
+        {
+            var frame = new byte[checked((int)(file.Length - MvccLogicalLogFormat.LogHeaderSize))];
+            file.Read(MvccLogicalLogFormat.LogHeaderSize, frame).Should().Be(frame.Length);
+            var originalSize = checked((long)BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(4)));
+            var originalTrailerOffset = MvccLogicalLogFormat.TxHeaderSize
+                                        + MvccLogicalLogFormat.GetEncryptedPayloadSize(
+                                            checked((int)originalSize));
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                frame.AsSpan(4),
+                checked((ulong)(originalSize + delta)));
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                frame.AsSpan(originalTrailerOffset),
+                Crc32C.Compute(frame.AsSpan(0, originalTrailerOffset)));
+            file.Write(MvccLogicalLogFormat.LogHeaderSize, frame);
+            file.FlushToDisk();
+        }
+
+        using var reopenOptions = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key);
+        using var reopenedFileSystem = new AhtolaEncryptionFileSystem(storage, reopenOptions);
+        using var reopened = MvccLogicalLog.CreateOrOpen(reopenedFileSystem, dbPath);
+        var replay = () => reopened.ReplayInto(new MvStore());
+        replay.Should().Throw<InvalidDataException>();
+        ReadAll(storage, logPath).Length.Should().BeGreaterThan(MvccLogicalLogFormat.LogHeaderSize);
+    }
+
     [Test]
     public void EncryptedOpenRejectsExistingPlaintextFrames()
     {

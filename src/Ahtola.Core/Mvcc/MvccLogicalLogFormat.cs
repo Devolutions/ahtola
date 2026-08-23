@@ -112,4 +112,36 @@ internal static class MvccLogicalLogFormat
             BinaryPrimitives.ReadUInt32LittleEndian(header[12..]),
             BinaryPrimitives.ReadUInt64LittleEndian(header[16..]));
     }
+
+    /// <summary>
+    /// Determines whether bytes beginning at a frame header contain any complete
+    /// CRC-valid frame boundary. This does not trust the unauthenticated payload
+    /// length, so an enlarged length cannot masquerade as a torn append.
+    /// </summary>
+    internal static bool ContainsCompleteFrameBoundary(ReadOnlySpan<byte> frameBytes)
+    {
+        if (frameBytes.Length < TxHeaderSize + TxTrailerSize)
+            return false;
+
+        var crc = Crc32C.InitialState;
+        for (var index = 0; index < TxHeaderSize; index++)
+            crc = Crc32C.Update(crc, frameBytes[index]);
+
+        for (var trailerOffset = TxHeaderSize;
+             trailerOffset + TxTrailerSize <= frameBytes.Length;
+             trailerOffset++)
+        {
+            if (BinaryPrimitives.ReadUInt32LittleEndian(frameBytes[(trailerOffset + sizeof(uint))..])
+                    == EndMagic
+                && BinaryPrimitives.ReadUInt32LittleEndian(frameBytes[trailerOffset..])
+                    == Crc32C.Complete(crc))
+            {
+                return true;
+            }
+
+            crc = Crc32C.Update(crc, frameBytes[trailerOffset]);
+        }
+
+        return false;
+    }
 }

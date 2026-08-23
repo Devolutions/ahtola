@@ -398,6 +398,131 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
             .Which.Message.Should().Contain("authentication failed");
     }
 
+    [TestCase(-1L)]
+    [TestCase(1L)]
+    public async Task MvccLogicalLogPayloadLengthTamperingFailsWithoutTruncation(long delta)
+    {
+        var store = new FakeBrowserPersistentStore();
+        const string DatabasePath = "app/data/main.db";
+        Dictionary<string, byte[]> durableImages;
+        await using (var harness = await BrowserHarness.CreateAsync(store, Aes256Key))
+        {
+            using var database = EmbeddedDatabase.OpenFile(DatabasePath, harness.Mirror);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE notes(body TEXT);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, $"INSERT INTO notes VALUES ('{Secret}');");
+            Execute(connection, "COMMIT;");
+            await harness.Mirror.FlushPendingAsync();
+            durableImages = store.Paths.ToDictionary(path => path, store.Read, StringComparer.Ordinal);
+        }
+
+        foreach (var (path, image) in durableImages)
+            store.Seed(path, image);
+        var logPath = DatabasePath + "-log";
+        var log = store.Read(logPath);
+        var frameOffset = MvccLogicalLogFormat.LogHeaderSize;
+        var originalSize = checked((long)System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(
+            log.AsSpan(frameOffset + 4)));
+        var originalTrailerOffset = frameOffset
+                                    + MvccLogicalLogFormat.TxHeaderSize
+                                    + MvccLogicalLogFormat.GetEncryptedPayloadSize(
+                                        checked((int)originalSize));
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(
+            log.AsSpan(frameOffset + 4),
+            checked((ulong)(originalSize + delta)));
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
+            log.AsSpan(originalTrailerOffset),
+            Crc32C.Compute(log.AsSpan(
+                frameOffset,
+                originalTrailerOffset - frameOffset)));
+        store.Seed(logPath, log);
+
+        var failure = await Capture(() => BrowserHarness.CreateAsync(store, Aes256Key));
+        failure.Should().BeOfType<InvalidDataException>();
+        store.Read(logPath).Should().Equal(log);
+    }
+
+    [Test]
+    public async Task MvccLogicalLogGenuineTornTailKeepsPrefixAndAcceptsANewCommit()
+    {
+        var store = new FakeBrowserPersistentStore();
+        const string DatabasePath = "app/data/main.db";
+        Dictionary<string, byte[]> durableImages;
+        await using (var harness = await BrowserHarness.CreateAsync(store, Aes256Key))
+        {
+            using var database = EmbeddedDatabase.OpenFile(DatabasePath, harness.Mirror);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, $"INSERT INTO notes VALUES (1, '{Secret}-first');");
+            Execute(connection, "COMMIT;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, $"INSERT INTO notes VALUES (2, '{Secret}-torn');");
+            Execute(connection, "COMMIT;");
+            await harness.Mirror.FlushPendingAsync();
+            durableImages = store.Paths.ToDictionary(path => path, store.Read, StringComparer.Ordinal);
+        }
+
+        foreach (var (path, image) in durableImages)
+            store.Seed(path, image);
+        var logPath = DatabasePath + "-log";
+        var tornLog = store.Read(logPath);
+        Array.Resize(ref tornLog, tornLog.Length - 3);
+        store.Seed(logPath, tornLog);
+
+        Dictionary<string, byte[]> recoveredImages;
+        await using (var recovered = await BrowserHarness.CreateAsync(store, Aes256Key))
+        {
+            CountPlaintextMvccFrames(recovered.Mirror, logPath).Should().Be(1);
+            using var database = EmbeddedDatabase.OpenFile(DatabasePath, recovered.Mirror);
+            using var connection = database.Connect();
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, $"INSERT INTO notes VALUES (3, '{Secret}-third');");
+            Execute(connection, "COMMIT;");
+            await recovered.Mirror.FlushPendingAsync();
+            CountPlaintextMvccFrames(recovered.Mirror, logPath).Should().Be(2);
+            recoveredImages = store.Paths.ToDictionary(path => path, store.Read, StringComparer.Ordinal);
+        }
+
+        foreach (var (path, image) in recoveredImages)
+            store.Seed(path, image);
+        await using var reopened = await BrowserHarness.CreateAsync(store, Aes256Key);
+        CountPlaintextMvccFrames(reopened.Mirror, logPath).Should().Be(2);
+    }
+
+    private static int CountPlaintextMvccFrames(IFileSystem fileSystem, string path)
+    {
+        using var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly: true);
+        var image = new byte[checked((int)file.Length)];
+        file.Read(0, image).Should().Be(image.Length);
+        _ = MvccLogicalLogFormat.ValidateHeader(image);
+        var position = MvccLogicalLogFormat.LogHeaderSize;
+        var count = 0;
+        while (position < image.Length)
+        {
+            var (payloadSize, _, _) = MvccLogicalLogFormat.ReadFrameHeader(
+                image.AsSpan(position, MvccLogicalLogFormat.TxHeaderSize));
+            var trailerOffset = position + MvccLogicalLogFormat.TxHeaderSize + payloadSize;
+            System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                    image.AsSpan(trailerOffset + sizeof(uint)))
+                .Should()
+                .Be(MvccLogicalLogFormat.EndMagic);
+            System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(image.AsSpan(trailerOffset))
+                .Should()
+                .Be(Crc32C.Compute(image.AsSpan(
+                    position,
+                    MvccLogicalLogFormat.TxHeaderSize + payloadSize)));
+            position = trailerOffset + MvccLogicalLogFormat.TxTrailerSize;
+            count++;
+        }
+
+        position.Should().Be(image.Length);
+        return count;
+    }
+
     private static Exception? Record(Action action)
     {
         try
