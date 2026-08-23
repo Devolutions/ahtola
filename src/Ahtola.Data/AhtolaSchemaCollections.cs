@@ -648,21 +648,95 @@ internal static class AhtolaSchemaCollections
         if (!match.Success)
             return false;
 
-        var remainder = commandText[match.Length..];
-        var sourceTail = Regex.Split(
-            remainder,
-            @"\b(?:WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|OFFSET|WINDOW|UNION|EXCEPT|INTERSECT)\b|;",
-            RegexOptions.IgnoreCase)[0];
-        if (Regex.IsMatch(
-                sourceTail,
-                @"(?:,|\b(?:JOIN|CROSS|INNER|LEFT|RIGHT|FULL|NATURAL)\b)",
-                RegexOptions.IgnoreCase))
-        {
+        if (HasAdditionalTopLevelSource(commandText.AsSpan(match.Length)))
             return false;
-        }
 
         tableName = UnquoteIdentifier(match.Groups["table"].Value);
         return true;
+    }
+
+    private static bool HasAdditionalTopLevelSource(ReadOnlySpan<char> sql)
+    {
+        for (var index = 0; index < sql.Length;)
+        {
+            var current = sql[index];
+            if (current == '-' && index + 1 < sql.Length && sql[index + 1] == '-')
+            {
+                index += 2;
+                while (index < sql.Length && sql[index] is not '\r' and not '\n')
+                    index++;
+                continue;
+            }
+            if (current == '/' && index + 1 < sql.Length && sql[index + 1] == '*')
+            {
+                index += 2;
+                while (index + 1 < sql.Length && (sql[index] != '*' || sql[index + 1] != '/'))
+                    index++;
+                index = Math.Min(sql.Length, index + 2);
+                continue;
+            }
+            if (current is '\'' or '"' or '`' or '[')
+            {
+                var closing = current == '[' ? ']' : current;
+                index++;
+                while (index < sql.Length)
+                {
+                    if (sql[index] != closing)
+                    {
+                        index++;
+                        continue;
+                    }
+                    if (closing != ']' && index + 1 < sql.Length && sql[index + 1] == closing)
+                    {
+                        index += 2;
+                        continue;
+                    }
+                    index++;
+                    break;
+                }
+                continue;
+            }
+            if (current == ',')
+                return true;
+            if (current == ';')
+                return false;
+            if (!char.IsLetter(current) && current != '_')
+            {
+                index++;
+                continue;
+            }
+
+            var start = index++;
+            while (index < sql.Length && (char.IsLetterOrDigit(sql[index]) || sql[index] == '_'))
+                index++;
+            var token = sql[start..index];
+            if (token.Equals("JOIN", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("CROSS", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("INNER", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("LEFT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("RIGHT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("FULL", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("NATURAL", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            if (token.Equals("WHERE", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("GROUP", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("HAVING", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("ORDER", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("LIMIT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("OFFSET", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("WINDOW", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("UNION", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("EXCEPT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("INTERSECT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("RETURNING", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return false;
     }
 
     internal static ReaderSchemaSource CreateReaderSchemaSource(

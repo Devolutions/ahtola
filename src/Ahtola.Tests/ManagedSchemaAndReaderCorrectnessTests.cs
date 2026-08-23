@@ -165,6 +165,10 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
                 "SELECT b.id, b.value FROM a JOIN b ON b.id = a.id",
                 out _)
             .Should().BeFalse();
+        AhtolaSchemaCollections.TryGetReaderSchemaTableName(
+                "SELECT b.id FROM a -- where related rows\nJOIN b ON b.id = a.id",
+                out _)
+            .Should().BeFalse();
     }
 
     [Test]
@@ -173,6 +177,11 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
         AhtolaSchemaCollections.TryGetReaderSchemaTableName(
                 "SELECT value FROM widgets ORDER BY value, value",
                 out var tableName)
+            .Should().BeTrue();
+        tableName.Should().Be("widgets");
+        AhtolaSchemaCollections.TryGetReaderSchemaTableName(
+                "SELECT value FROM widgets -- joins are documented elsewhere\nORDER BY value, value",
+                out tableName)
             .Should().BeTrue();
         tableName.Should().Be("widgets");
     }
