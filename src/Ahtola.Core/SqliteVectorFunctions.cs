@@ -13,6 +13,8 @@ namespace Ahtola.Core;
 /// </remarks>
 internal static class SqliteVectorFunctions
 {
+    private const int MaximumManagedDimensions = 1_048_576;
+
     private enum VectorType
     {
         Float32Dense,
@@ -532,7 +534,7 @@ internal static class SqliteVectorFunctions
                 if (data.Length == 0 || data.Length % 4 != 0 || (data.Length - 4) % 8 != 0)
                     throw new EmbeddedSqlException($"f32 sparse vector unexpected data length: {data.Length}");
                 var dimensions = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(data.Length - 4));
-                if (dimensions > int.MaxValue)
+                if (dimensions > MaximumManagedDimensions)
                     throw new EmbeddedSqlException($"f32 sparse vector dimensions exceed managed limit: {dimensions}");
                 var entries = (data.Length - 4) / 8;
                 uint previousIndex = 0;
@@ -673,6 +675,7 @@ internal static class SqliteVectorFunctions
 
     private static float[] ToFloat32(VectorValue vector)
     {
+        EnsureManagedDimensions(vector.Dimensions);
         var values = new float[vector.Dimensions];
         switch (vector.Type)
         {
@@ -706,6 +709,7 @@ internal static class SqliteVectorFunctions
 
     private static double[] ToFloat64(VectorValue vector)
     {
+        EnsureManagedDimensions(vector.Dimensions);
         var values = new double[vector.Dimensions];
         switch (vector.Type)
         {
@@ -805,6 +809,8 @@ internal static class SqliteVectorFunctions
 
     private static VectorValue Create1Bit(float[] values)
     {
+        if (values.Length == 0)
+            throw new EmbeddedSqlException("empty vector not supported for this type");
         var data = new byte[(values.Length + 7) / 8];
         for (var index = 0; index < values.Length; index++)
         {
@@ -817,6 +823,8 @@ internal static class SqliteVectorFunctions
 
     private static VectorValue Create1Bit(double[] values)
     {
+        if (values.Length == 0)
+            throw new EmbeddedSqlException("empty vector not supported for this type");
         var data = new byte[(values.Length + 7) / 8];
         for (var index = 0; index < values.Length; index++)
         {
@@ -825,6 +833,12 @@ internal static class SqliteVectorFunctions
         }
 
         return new VectorValue(VectorType.Float1Bit, values.Length, data);
+    }
+
+    private static void EnsureManagedDimensions(int dimensions)
+    {
+        if (dimensions > MaximumManagedDimensions)
+            throw new EmbeddedSqlException($"vector dimensions exceed managed limit: {dimensions}");
     }
 
     private static VectorValue CreateFloat8(float[] values)

@@ -1,4 +1,5 @@
 using System.Data;
+using System.Data.Common;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -135,6 +136,13 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
             using var connection = new global::Ahtola.AhtolaConnection(
                 "Data Source=https://example.test/db;Auth Token=token");
             connection.Open();
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "SELECT value FROM widgets";
+                using var reader = command.ExecuteReader();
+                var schema = reader.GetSchemaTable()!;
+                schema.Rows[0][SchemaTableColumn.IsUnique].Should().Be(false);
+            }
             using var adapter = new global::Ahtola.AhtolaDataAdapter(
                 "SELECT value FROM widgets",
                 connection);
@@ -568,7 +576,9 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
                 not null when sql.StartsWith("PRAGMA table_info", StringComparison.OrdinalIgnoreCase)
                     => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"cid"},{"name":"name"},{"name":"type"},{"name":"notnull"},{"name":"dflt_value"},{"name":"pk"}],"rows":[[{"type":"integer","value":"0"},{"type":"text","value":"value"},{"type":"text","value":"INTEGER"},{"type":"integer","value":"1"},{"type":"null"},{"type":"integer","value":"1"}]],"affected_row_count":0}}}]}""",
                 not null when sql.StartsWith("PRAGMA index_list", StringComparison.OrdinalIgnoreCase)
-                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}}]}""",
+                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"seq"},{"name":"name"},{"name":"unique"},{"name":"origin"},{"name":"partial"}],"rows":[[{"type":"integer","value":"0"},{"type":"text","value":"ux_widgets_value"},{"type":"integer","value":"1"},{"type":"text","value":"c"},{"type":"integer","value":"1"}]],"affected_row_count":0}}}]}""",
+                not null when sql.StartsWith("PRAGMA index_info", StringComparison.OrdinalIgnoreCase)
+                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"seqno"},{"name":"cid"},{"name":"name"}],"rows":[[{"type":"integer","value":"0"},{"type":"integer","value":"0"},{"type":"text","value":"value"}]],"affected_row_count":0}}}]}""",
                 not null when sql.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
                     => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"value","decltype":"INTEGER"}],"rows":[[{"type":"integer","value":"42"}]],"affected_row_count":0}}}]}""",
                 _ => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}}]}""",

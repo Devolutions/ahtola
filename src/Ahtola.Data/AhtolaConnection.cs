@@ -975,7 +975,9 @@ public class AhtolaConnection :
                 .ConfigureAwait(false);
             foreach (var indexRow in indexList.Rows)
             {
-                if (indexRow.Count < 3 || indexRow[2].GetInt64() == 0)
+                if (indexRow.Count < 5
+                    || indexRow[2].GetInt64() == 0
+                    || indexRow[4].GetInt64() != 0)
                     continue;
 
                 var indexName = indexRow[1].ToClrValue() as string;

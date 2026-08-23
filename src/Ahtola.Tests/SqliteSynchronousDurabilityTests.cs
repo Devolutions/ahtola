@@ -212,6 +212,30 @@ public sealed class SqliteSynchronousDurabilityTests
     }
 
     [Test]
+    public void TempTriggerForeignWriteUsesCurrentSynchronousMode()
+    {
+        var fileSystem = new RecordingFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("trigger.db", fileSystem);
+        using var connection = database.Connect();
+
+        Execute(connection, "PRAGMA synchronous=OFF;");
+        Execute(connection, "CREATE TABLE log(value INTEGER);");
+        Execute(connection, "CREATE TEMP TABLE driver(value INTEGER);");
+        Execute(
+            connection,
+            "CREATE TEMP TRIGGER write_main AFTER INSERT ON driver "
+            + "BEGIN INSERT INTO log VALUES (NEW.value); END;");
+        Execute(connection, "PRAGMA synchronous=FULL;");
+        fileSystem.ClearEvents();
+
+        Execute(connection, "INSERT INTO driver VALUES (42);");
+
+        fileSystem.FlushPaths.Should().Contain("trigger.db-wal");
+        fileSystem.FlushPaths.Should().Contain("trigger.db");
+        ReadValue(connection, "SELECT value FROM log;").Should().Be(SqlValue.Integer(42));
+    }
+
+    [Test]
     public void PragmaSynchronousCannotChangeInsideTransactionOrSavepoint()
     {
         using var database = new EmbeddedDatabase();

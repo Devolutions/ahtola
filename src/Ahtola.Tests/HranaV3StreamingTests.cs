@@ -237,6 +237,29 @@ public sealed class HranaV3StreamingTests
     }
 
     [Test]
+    public async Task CursorAcceptsCleanEofAfterStepEnd()
+    {
+        var stream = new ControlledReadStream();
+        stream.Add(CursorHeader());
+        stream.Add(StepBegin());
+        stream.Add(Row(7));
+        stream.Add(StepEnd());
+        stream.Complete();
+        using var handler = new CannedHranaHandler((path, _, _) =>
+            path == "/v3/cursor" ? Ndjson(stream) : PipelineClose());
+        using var connection = CreateConnection(handler, readYourWrites: true);
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 7";
+
+        await using var reader = await command.ExecuteReaderAsync();
+
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetInt64(0).Should().Be(7);
+        (await reader.ReadAsync()).Should().BeFalse();
+        handler.Paths.Should().Equal("/v3/cursor");
+    }
+
+    [Test]
     public async Task CleanupCloseFailureDoesNotChangeASuccessfulCursorResult()
     {
         var stream = new ControlledReadStream();

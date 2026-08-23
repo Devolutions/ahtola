@@ -1451,7 +1451,15 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             {
                 while (true)
                 {
-                    var entry = await ReadEntryAsync(effectiveCancellationToken).ConfigureAwait(false);
+                    var entry = _stepOpen
+                        ? await ReadEntryAsync(effectiveCancellationToken).ConfigureAwait(false)
+                        : await ReadOptionalEntryAsync(effectiveCancellationToken).ConfigureAwait(false);
+                    if (entry is null)
+                    {
+                        _terminated = true;
+                        await FinishOwnerAsync(successful: true).ConfigureAwait(false);
+                        return null;
+                    }
                     switch (entry.Type)
                     {
                         case "row":
@@ -1545,6 +1553,21 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         private async Task<RemoteCursorEntry> ReadEntryAsync(CancellationToken cancellationToken)
         {
             var line = await ReadRequiredLineAsync(cancellationToken).ConfigureAwait(false);
+            return DeserializeEntry(line);
+        }
+
+        private async Task<RemoteCursorEntry?> ReadOptionalEntryAsync(CancellationToken cancellationToken)
+        {
+            var line = await _reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+            if (line is null)
+                return null;
+            if (string.IsNullOrWhiteSpace(line))
+                throw Malformed("response contained an empty frame");
+            return DeserializeEntry(line);
+        }
+
+        private static RemoteCursorEntry DeserializeEntry(string line)
+        {
             try
             {
                 var entry = JsonSerializer.Deserialize(

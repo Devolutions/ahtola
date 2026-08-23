@@ -1789,8 +1789,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// once the statement that fired the trigger succeeded, so a failed statement discards the
     /// working copy exactly like a failed local statement does.
     /// </summary>
-    internal void PublishTriggerBodyCatalog(SchemaCatalog catalog, bool forceFullRewrite)
+    internal void PublishTriggerBodyCatalog(
+        SchemaCatalog catalog,
+        bool forceFullRewrite,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             _inMemoryPragmaHeader = _inMemoryPragmaHeader with
@@ -1800,7 +1804,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (_fileStore is null)
                 PublishCatalog(catalog);
             else
+            {
+                _fileStore.SetSynchronousMode(synchronousMode);
                 PersistFileCatalog(catalog, forceFullRewrite: forceFullRewrite);
+            }
         }
     }
 
@@ -42205,7 +42212,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 {
                     pair.Key.PublishTriggerBodyCatalog(
                         pair.Value.Catalog,
-                        pair.Value.ForceFullCatalogRewrite);
+                        pair.Value.ForceFullCatalogRewrite,
+                        connection.GetSynchronousMode(pair.Key));
                 }
                 if (ReferenceEquals(pair.Key, connection._tempDatabase))
                     connection._tempInitialized = true;

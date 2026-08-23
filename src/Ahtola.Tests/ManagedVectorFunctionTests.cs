@@ -263,6 +263,32 @@ public sealed class ManagedVectorFunctionTests
     }
 
     [Test]
+    public void SparseConversionRejectsDimensionsThatExceedManagedAllocationLimit()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        var convert = () => ReadValue(
+            connection,
+            "SELECT vector32(X'0000803F00000000FFFFFF7F09');");
+
+        convert.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*dimensions exceed managed limit*");
+    }
+
+    [Test]
+    public void EmptyDenseVectorCannotConvertToOneBit()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        var convert = () => ReadValue(connection, "SELECT vector1bit(vector32('[]'));");
+
+        convert.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*empty vector not supported*");
+    }
+
+    [Test]
     public void SparseBoundaryIndicesRemainValidAcrossConsumers()
     {
         using var database = new EmbeddedDatabase();
