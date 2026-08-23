@@ -95,6 +95,12 @@ public sealed class AhtolaEncryptionOptions : IDisposable
         return new AhtolaEncryptionOptions(Cipher, key);
     }
 
+    internal AesGcm CreateAesGcm()
+    {
+        var key = _key ?? throw new ObjectDisposedException(nameof(AhtolaEncryptionOptions));
+        return new AesGcm(key, AhtolaEncryptedPageFormat.TagSize);
+    }
+
     internal static int GetRequiredKeyLength(AhtolaEncryptionCipher cipher)
         => cipher switch
         {

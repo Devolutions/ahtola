@@ -162,7 +162,10 @@ Phase 2 scope and limits:
   object bindings.
 - File-backed MVCC keeps a WAL open underneath for page durability (matching
   Turso). Enabling MVCC persists SQLite header read/write version **255** and
-  opens a durable logical log (`<db>-log`, Turso LML2/MVTX framing). New logs
+  opens a durable logical log (`<db>-log`, Turso LML2/MVTX framing). For an
+  encrypted database, transaction payloads use Turso's chunked AES-GCM logical-
+  log layout; salt, payload length, operation count, commit timestamp, and chunk
+  index are authenticated while framing metadata remains visible. New logs
   use V4 typed-key frames and include their logical object name so recovery
   restores the object-id mapping. V3 rowid-only logs are upgraded only by an
   exclusive materializing checkpoint; a cold V3 log whose table identities

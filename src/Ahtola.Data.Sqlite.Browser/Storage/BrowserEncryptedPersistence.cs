@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
+using Ahtola.Core.Mvcc;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Data.Sqlite.Browser.Storage;
@@ -14,6 +16,9 @@ internal enum BrowserPersistedFileKind
 
     /// <summary>A DELETE-mode rollback journal whose page records are encrypted.</summary>
     Journal,
+
+    /// <summary>An MVCC logical log whose transaction payloads are encrypted.</summary>
+    MvccLog,
 
     /// <summary>Content that is never encrypted, such as the rebuildable WAL index.</summary>
     Passthrough,
@@ -34,7 +39,8 @@ internal sealed class BrowserPlaintextCapture(
     long position,
     byte[] bytes,
     int pageSize,
-    uint journalChecksumNonce)
+    uint journalChecksumNonce,
+    ulong mvccSalt = 0)
 {
     internal BrowserPersistedFileKind Kind { get; } = kind;
 
@@ -47,6 +53,9 @@ internal sealed class BrowserPlaintextCapture(
 
     /// <summary>The rollback journal checksum nonce, valid only for journal records.</summary>
     internal uint JournalChecksumNonce { get; } = journalChecksumNonce;
+
+    /// <summary>The authenticated logical-log salt, valid only for MVCC captures.</summary>
+    internal ulong MvccSalt { get; } = mvccSalt;
 }
 
 /// <summary>
@@ -57,7 +66,8 @@ internal sealed class BrowserPersistedWrite(
     long position,
     byte[] bytes,
     string path,
-    BrowserWalChainUpdate? walUpdate)
+    BrowserWalChainUpdate? walUpdate,
+    long? persistedLength = null)
 {
     internal long Position { get; } = position;
 
@@ -66,6 +76,9 @@ internal sealed class BrowserPersistedWrite(
     internal string Path { get; } = path;
 
     internal BrowserWalChainUpdate? WalUpdate { get; } = walUpdate;
+
+    /// <summary>A transformed file length to publish after this write succeeds.</summary>
+    internal long? PersistedLength { get; } = persistedLength;
 }
 
 /// <summary>The WAL rolling-checksum state produced by transforming one WAL region.</summary>
@@ -170,10 +183,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             BrowserPersistedFileRole.Wal => BrowserPersistedFileKind.Wal,
             BrowserPersistedFileRole.Journal => BrowserPersistedFileKind.Journal,
             BrowserPersistedFileRole.SharedMemory => BrowserPersistedFileKind.Passthrough,
-            BrowserPersistedFileRole.MvccLog => throw new NotSupportedException(
-                $"Encrypted browser storage cannot host the MVCC logical log '{path}'. "
-                + "The engine writes that log outside the page codec, so enabling MVCC would place row "
-                + "data in OPFS unencrypted. Use the default journal mode for encrypted browser databases."),
+            BrowserPersistedFileRole.MvccLog => BrowserPersistedFileKind.MvccLog,
             _ => throw new InvalidOperationException($"Unknown persisted browser file role {role}."),
         };
 
@@ -193,8 +203,18 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             BrowserPersistedFileKind.Database => CaptureDatabase(path, position, length, file, fileLength),
             BrowserPersistedFileKind.Wal => CaptureWal(path, position, length, file, fileLength),
             BrowserPersistedFileKind.Journal => CaptureJournal(path, position, length, file, fileLength),
+            BrowserPersistedFileKind.MvccLog => CaptureMvccLog(path, position, length, file, fileLength),
             _ => ReadRegion(kind, file, position, length, pageSize: 0, journalChecksumNonce: 0),
         };
+    }
+
+    /// <summary>Maps a plaintext mirror length to its encrypted persisted length.</summary>
+    internal long MapPersistedLength(string path, long logicalLength, IFile file)
+    {
+        var kind = ClassifyForWrite(path, file);
+        return kind == BrowserPersistedFileKind.MvccLog
+            ? GetMvccPersistedLength(path, file, logicalLength)
+            : logicalLength;
     }
 
     /// <summary>
@@ -215,6 +235,8 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                 => await PrepareWalAsync(path, capture, cancellationToken).ConfigureAwait(false),
             BrowserPersistedFileKind.Journal
                 => await PrepareJournalAsync(path, capture, cancellationToken).ConfigureAwait(false),
+            BrowserPersistedFileKind.MvccLog
+                => await PrepareMvccLogAsync(path, capture, cancellationToken).ConfigureAwait(false),
             _ => throw new InvalidOperationException($"Unknown persisted browser file kind {capture.Kind}."),
         };
 
@@ -314,19 +336,6 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             }
 
             var role = _roles.Resolve(path, probeHeader(path), present.Contains);
-            if (role == BrowserPersistedFileRole.MvccLog)
-            {
-                // Rejecting MVCC belongs on the write path, where it stops row data
-                // from reaching OPFS in the clear. Throwing here instead would let a
-                // single stray -log file permanently block opening a healthy
-                // database, including the empty one a rejected MVCC enable leaves
-                // behind. Ignore it: a -log beside an encrypted database is always an
-                // orphan, and beside a plaintext one the database itself reports the
-                // real problem.
-                ignored.Add(path);
-                continue;
-            }
-
             loadable.Add((path, MapRole(path, role)));
         }
 
@@ -378,6 +387,13 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                     break;
                 case BrowserPersistedFileKind.Journal:
                     plaintext[path] = await DecryptJournalImageAsync(
+                            encryptedImages[path],
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+                case BrowserPersistedFileKind.MvccLog:
+                    plaintext[path] = await DecryptMvccLogImageAsync(
+                            path,
                             encryptedImages[path],
                             cancellationToken)
                         .ConfigureAwait(false);
@@ -435,32 +451,116 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             checked((int)(end - start)),
             pageSize,
             journalChecksumNonce: 0);
-        if (start == 0)
-            RejectMvccHeader(path, capture.Bytes);
         return capture;
     }
 
-    /// <summary>
-    /// Refuses a header that switches the database into MVCC mode.
-    /// </summary>
-    /// <remarks>
-    /// MVCC has to be rejected here rather than when its logical log is first
-    /// written, because the pager persists the new header first. Failing later
-    /// would leave a database permanently marked MVCC whose log can never be
-    /// written, so every reopen would fail. Refusing the header instead aborts the
-    /// mode switch while the pager can still roll it back.
-    /// </remarks>
-    private static void RejectMvccHeader(string path, ReadOnlySpan<byte> page)
+    private static BrowserPlaintextCapture CaptureMvccLog(
+        string path,
+        long position,
+        int length,
+        IFile file,
+        long fileLength)
     {
-        if (page.Length <= 19)
-            return;
-        if (page[18] != (byte)SqliteFileFormatVersion.Mvcc && page[19] != (byte)SqliteFileFormatVersion.Mvcc)
-            return;
+        if (position == 0)
+        {
+            var header = new byte[length];
+            ReadExact(file, 0, header, path);
+            var headerSalt = fileLength >= MvccLogicalLogFormat.LogHeaderSize
+                ? MvccLogicalLogFormat.ValidateHeader(
+                    ReadFileRegion(file, 0, MvccLogicalLogFormat.LogHeaderSize, path)).Salt
+                : 0;
+            return new BrowserPlaintextCapture(
+                BrowserPersistedFileKind.MvccLog,
+                0,
+                header,
+                pageSize: 0,
+                journalChecksumNonce: 0,
+                headerSalt);
+        }
 
-        throw new NotSupportedException(
-            $"Encrypted browser storage cannot host MVCC database '{path}'. "
-            + "The engine writes the MVCC logical log outside the page codec, so enabling MVCC would place row "
-            + "data in OPFS unencrypted. Use the default journal mode for encrypted browser databases.");
+        if (position < MvccLogicalLogFormat.LogHeaderSize)
+        {
+            throw new InvalidDataException(
+                $"Encrypted browser MVCC log '{path}' received a write inside its fixed header.");
+        }
+
+        var logHeader = ReadFileRegion(file, 0, MvccLogicalLogFormat.LogHeaderSize, path);
+        var (salt, _) = MvccLogicalLogFormat.ValidateHeader(logHeader);
+        var persistedPosition = GetMvccPersistedLength(path, file, position);
+        var frame = ReadFileRegion(file, position, length, path);
+        ValidatePlaintextMvccFrame(frame, path);
+        return new BrowserPlaintextCapture(
+            BrowserPersistedFileKind.MvccLog,
+            persistedPosition,
+            frame,
+            pageSize: 0,
+            journalChecksumNonce: 0,
+            salt);
+    }
+
+    private static long GetMvccPersistedLength(string path, IFile file, long logicalLength)
+    {
+        if (logicalLength is 0)
+            return 0;
+        if (logicalLength < MvccLogicalLogFormat.LogHeaderSize)
+            return logicalLength;
+        if (logicalLength > file.Length)
+            throw new InvalidDataException($"MVCC logical length exceeds the mirror image for '{path}'.");
+
+        var logHeader = ReadFileRegion(file, 0, MvccLogicalLogFormat.LogHeaderSize, path);
+        _ = MvccLogicalLogFormat.ValidateHeader(logHeader);
+        long logicalPosition = MvccLogicalLogFormat.LogHeaderSize;
+        long persistedPosition = MvccLogicalLogFormat.LogHeaderSize;
+        while (logicalPosition < logicalLength)
+        {
+            if (logicalPosition + MvccLogicalLogFormat.TxHeaderSize > logicalLength)
+                throw new InvalidDataException($"MVCC logical length cuts through a frame header in '{path}'.");
+
+            var frameHeader = ReadFileRegion(
+                file,
+                logicalPosition,
+                MvccLogicalLogFormat.TxHeaderSize,
+                path);
+            var (payloadSize, _, _) = MvccLogicalLogFormat.ReadFrameHeader(frameHeader);
+            var logicalFrameSize = checked(
+                MvccLogicalLogFormat.TxHeaderSize
+                + payloadSize
+                + MvccLogicalLogFormat.TxTrailerSize);
+            if (logicalPosition + logicalFrameSize > logicalLength)
+                throw new InvalidDataException($"MVCC logical length cuts through a transaction frame in '{path}'.");
+
+            var frame = ReadFileRegion(file, logicalPosition, logicalFrameSize, path);
+            ValidatePlaintextMvccFrame(frame, path);
+            logicalPosition += logicalFrameSize;
+            persistedPosition += checked(
+                MvccLogicalLogFormat.TxHeaderSize
+                + MvccLogicalLogFormat.GetEncryptedPayloadSize(payloadSize)
+                + MvccLogicalLogFormat.TxTrailerSize);
+        }
+
+        return persistedPosition;
+    }
+
+    private static void ValidatePlaintextMvccFrame(ReadOnlySpan<byte> frame, string path)
+    {
+        var (payloadSize, _, _) = MvccLogicalLogFormat.ReadFrameHeader(frame);
+        var expectedLength = checked(
+            MvccLogicalLogFormat.TxHeaderSize
+            + payloadSize
+            + MvccLogicalLogFormat.TxTrailerSize);
+        if (frame.Length != expectedLength)
+            throw new InvalidDataException($"Encrypted browser MVCC log '{path}' received a partial frame write.");
+
+        var trailerOffset = MvccLogicalLogFormat.TxHeaderSize + payloadSize;
+        if (BinaryPrimitives.ReadUInt32LittleEndian(frame[(trailerOffset + 4)..])
+            != MvccLogicalLogFormat.EndMagic)
+        {
+            throw new InvalidDataException($"MVCC logical-log frame end magic is invalid in '{path}'.");
+        }
+
+        var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(frame[trailerOffset..]);
+        if (expectedCrc != Crc32C.Compute(frame[..trailerOffset]))
+            throw new InvalidDataException($"MVCC logical-log frame CRC is invalid in '{path}'.");
     }
 
     private BrowserPlaintextCapture CaptureWal(
@@ -733,6 +833,234 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         }
 
         return new BrowserPersistedWrite(capture.Position, encrypted, path, walUpdate: null);
+    }
+
+    private async ValueTask<BrowserPersistedWrite> PrepareMvccLogAsync(
+        string path,
+        BrowserPlaintextCapture capture,
+        CancellationToken cancellationToken)
+    {
+        if (capture.Position == 0)
+        {
+            if (capture.Bytes.Length >= MvccLogicalLogFormat.LogHeaderSize)
+                _ = MvccLogicalLogFormat.ValidateHeader(capture.Bytes);
+            return new BrowserPersistedWrite(
+                0,
+                capture.Bytes,
+                path,
+                walUpdate: null,
+                persistedLength: capture.Bytes.LongLength);
+        }
+
+        ValidatePlaintextMvccFrame(capture.Bytes, path);
+        var (payloadSize, opCount, commitTs) = MvccLogicalLogFormat.ReadFrameHeader(capture.Bytes);
+        var encryptedPayloadSize = MvccLogicalLogFormat.GetEncryptedPayloadSize(payloadSize);
+        var encryptedFrame = new byte[checked(
+            MvccLogicalLogFormat.TxHeaderSize
+            + encryptedPayloadSize
+            + MvccLogicalLogFormat.TxTrailerSize)];
+        capture.Bytes.AsSpan(0, MvccLogicalLogFormat.TxHeaderSize).CopyTo(encryptedFrame);
+
+        var plaintextOffset = MvccLogicalLogFormat.TxHeaderSize;
+        var encryptedOffset = MvccLogicalLogFormat.TxHeaderSize;
+        var chunkCount = MvccLogicalLogFormat.GetEncryptedChunkCount(payloadSize);
+        for (var chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var plaintextLength = MvccLogicalLogFormat.GetPlaintextChunkLength(payloadSize, chunkIndex);
+            var nonce = new byte[MvccLogicalLogFormat.EncryptionNonceSize];
+            RandomNumberGenerator.Fill(nonce);
+            var associatedData = MvccLogicalLogFormat.BuildEncryptedChunkAssociatedData(
+                capture.MvccSalt,
+                payloadSize,
+                opCount,
+                commitTs,
+                chunkIndex);
+            var result = await pages
+                .EncryptLogicalLogChunkAsync(
+                    capture.Bytes.AsMemory(plaintextOffset, plaintextLength),
+                    nonce,
+                    associatedData,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (result.Ciphertext.Length != plaintextLength
+                || result.Tag.Length != MvccLogicalLogFormat.EncryptionTagSize)
+            {
+                throw new CryptographicException(
+                    "The asynchronous AES-GCM provider returned an invalid MVCC logical-log chunk.");
+            }
+
+            result.Ciphertext.CopyTo(encryptedFrame.AsSpan(encryptedOffset));
+            result.Tag.CopyTo(encryptedFrame.AsSpan(encryptedOffset + plaintextLength));
+            nonce.CopyTo(encryptedFrame.AsSpan(
+                encryptedOffset + plaintextLength + MvccLogicalLogFormat.EncryptionTagSize));
+            plaintextOffset += plaintextLength;
+            encryptedOffset += plaintextLength + MvccLogicalLogFormat.EncryptionOverhead;
+        }
+
+        var trailerOffset = MvccLogicalLogFormat.TxHeaderSize + encryptedPayloadSize;
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            encryptedFrame.AsSpan(trailerOffset),
+            Crc32C.Compute(encryptedFrame.AsSpan(0, trailerOffset)));
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            encryptedFrame.AsSpan(trailerOffset + sizeof(uint)),
+            MvccLogicalLogFormat.EndMagic);
+        return new BrowserPersistedWrite(
+            capture.Position,
+            encryptedFrame,
+            path,
+            walUpdate: null,
+            persistedLength: checked(capture.Position + encryptedFrame.LongLength));
+    }
+
+    private async ValueTask<byte[]> DecryptMvccLogImageAsync(
+        string path,
+        byte[] encryptedImage,
+        CancellationToken cancellationToken)
+    {
+        if (encryptedImage.Length < MvccLogicalLogFormat.LogHeaderSize)
+            return encryptedImage;
+
+        var (salt, _) = MvccLogicalLogFormat.ValidateHeader(encryptedImage);
+        using var plaintext = new MemoryStream(encryptedImage.Length);
+        plaintext.Write(encryptedImage, 0, MvccLogicalLogFormat.LogHeaderSize);
+        var position = MvccLogicalLogFormat.LogHeaderSize;
+        while (position < encryptedImage.Length)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (position + MvccLogicalLogFormat.TxHeaderSize > encryptedImage.Length)
+                break;
+
+            var frameHeader = encryptedImage
+                .AsSpan(position, MvccLogicalLogFormat.TxHeaderSize)
+                .ToArray();
+            var (payloadSize, opCount, commitTs) = MvccLogicalLogFormat.ReadFrameHeader(frameHeader);
+            var encryptedPayloadSize = MvccLogicalLogFormat.GetEncryptedPayloadSize(payloadSize);
+            var encryptedFrameSize = checked(
+                MvccLogicalLogFormat.TxHeaderSize
+                + encryptedPayloadSize
+                + MvccLogicalLogFormat.TxTrailerSize);
+            if (position + encryptedFrameSize > encryptedImage.Length)
+            {
+                if (IsCompletePlaintextMvccFrame(encryptedImage, position, payloadSize))
+                {
+                    throw new InvalidDataException(
+                        $"Encrypted browser storage contains a plaintext MVCC logical-log frame in '{path}'. "
+                        + "Automatic migration is not safe.");
+                }
+
+                break;
+            }
+
+            var trailerOffset = position + MvccLogicalLogFormat.TxHeaderSize + encryptedPayloadSize;
+            if (BinaryPrimitives.ReadUInt32LittleEndian(encryptedImage.AsSpan(trailerOffset + sizeof(uint)))
+                != MvccLogicalLogFormat.EndMagic)
+            {
+                throw new InvalidDataException($"MVCC logical-log frame end magic is invalid in '{path}'.");
+            }
+
+            var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(
+                encryptedImage.AsSpan(trailerOffset));
+            var actualCrc = Crc32C.Compute(
+                encryptedImage.AsSpan(
+                    position,
+                    MvccLogicalLogFormat.TxHeaderSize + encryptedPayloadSize));
+            if (expectedCrc != actualCrc)
+                throw new InvalidDataException($"MVCC logical-log frame CRC is invalid in '{path}'.");
+
+            var payload = new byte[payloadSize];
+            var plaintextOffset = 0;
+            var encryptedOffset = position + MvccLogicalLogFormat.TxHeaderSize;
+            try
+            {
+                var chunkCount = MvccLogicalLogFormat.GetEncryptedChunkCount(payloadSize);
+                for (var chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
+                {
+                    var plaintextLength = MvccLogicalLogFormat.GetPlaintextChunkLength(
+                        payloadSize,
+                        chunkIndex);
+                    var associatedData = MvccLogicalLogFormat.BuildEncryptedChunkAssociatedData(
+                        salt,
+                        payloadSize,
+                        opCount,
+                        commitTs,
+                        chunkIndex);
+                    var chunk = await pages
+                        .DecryptLogicalLogChunkAsync(
+                            encryptedImage.AsMemory(encryptedOffset, plaintextLength),
+                            encryptedImage.AsMemory(
+                                encryptedOffset + plaintextLength,
+                                MvccLogicalLogFormat.EncryptionTagSize),
+                            encryptedImage.AsMemory(
+                                encryptedOffset
+                                + plaintextLength
+                                + MvccLogicalLogFormat.EncryptionTagSize,
+                                MvccLogicalLogFormat.EncryptionNonceSize),
+                            associatedData,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    try
+                    {
+                        if (chunk.Length != plaintextLength)
+                            throw new CryptographicException("Decrypted MVCC logical-log chunk has an invalid length.");
+                        chunk.CopyTo(payload.AsSpan(plaintextOffset));
+                    }
+                    finally
+                    {
+                        CryptographicOperations.ZeroMemory(chunk);
+                    }
+
+                    plaintextOffset += plaintextLength;
+                    encryptedOffset += plaintextLength + MvccLogicalLogFormat.EncryptionOverhead;
+                }
+            }
+            catch (CryptographicException exception)
+            {
+                CryptographicOperations.ZeroMemory(payload);
+                throw new InvalidDataException(
+                    $"MVCC logical-log payload authentication failed in '{path}'. "
+                    + "The key is wrong or the log was tampered with.",
+                    exception);
+            }
+
+            plaintext.Write(frameHeader);
+            plaintext.Write(payload);
+            var plaintextFrameCrc = Crc32C.Compute(
+                plaintext.GetBuffer().AsSpan(
+                    checked((int)plaintext.Position - payload.Length - MvccLogicalLogFormat.TxHeaderSize),
+                    MvccLogicalLogFormat.TxHeaderSize + payload.Length));
+            var trailer = new byte[MvccLogicalLogFormat.TxTrailerSize];
+            BinaryPrimitives.WriteUInt32LittleEndian(trailer, plaintextFrameCrc);
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                trailer.AsSpan(sizeof(uint)),
+                MvccLogicalLogFormat.EndMagic);
+            plaintext.Write(trailer);
+            CryptographicOperations.ZeroMemory(payload);
+            position += encryptedFrameSize;
+        }
+
+        return plaintext.ToArray();
+    }
+
+    private static bool IsCompletePlaintextMvccFrame(
+        ReadOnlySpan<byte> image,
+        int position,
+        int payloadSize)
+    {
+        var frameSize = checked(
+            MvccLogicalLogFormat.TxHeaderSize
+            + payloadSize
+            + MvccLogicalLogFormat.TxTrailerSize);
+        if (position + frameSize > image.Length)
+            return false;
+
+        var trailerOffset = position + MvccLogicalLogFormat.TxHeaderSize + payloadSize;
+        return BinaryPrimitives.ReadUInt32LittleEndian(image[(trailerOffset + sizeof(uint))..])
+                   == MvccLogicalLogFormat.EndMagic
+               && BinaryPrimitives.ReadUInt32LittleEndian(image[trailerOffset..])
+                   == Crc32C.Compute(image.Slice(
+                       position,
+                       MvccLogicalLogFormat.TxHeaderSize + payloadSize));
     }
 
     private async ValueTask<byte[]> DecryptDatabaseImageAsync(
@@ -1056,6 +1384,14 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         if (length != 0)
             ReadExact(file, position, bytes, kind.ToString());
         return new BrowserPlaintextCapture(kind, position, bytes, pageSize, journalChecksumNonce);
+    }
+
+    private static byte[] ReadFileRegion(IFile file, long position, int length, string path)
+    {
+        var bytes = new byte[length];
+        if (length != 0)
+            ReadExact(file, position, bytes, path);
+        return bytes;
     }
 
     private static void ReadExact(IFile file, long position, Span<byte> destination, string path)

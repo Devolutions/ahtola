@@ -235,6 +235,12 @@ internal sealed class BrowserMirroredFileSystem :
                                 prepared.Position,
                                 prepared.Bytes,
                                 cancellationToken).ConfigureAwait(false);
+                            if (prepared.PersistedLength is { } persistedLength)
+                            {
+                                await file.SetLengthAsync(
+                                    persistedLength,
+                                    cancellationToken).ConfigureAwait(false);
+                            }
                             _encryption.CommitWrite(prepared);
                             break;
                         }
@@ -591,7 +597,12 @@ internal sealed class BrowserMirroredFileSystem :
             ThrowIfDisposed();
             inner.SetLength(length);
             if (persistMutations)
-                owner.Enqueue(Operation.SetLength(path, length));
+            {
+                var persistedLength = owner._encryption is { } encryption
+                    ? encryption.MapPersistedLength(path, length, inner)
+                    : length;
+                owner.Enqueue(Operation.SetLength(path, persistedLength));
+            }
         }
 
         public void FlushToDisk()
@@ -615,4 +626,3 @@ internal sealed class BrowserMirroredFileSystem :
             => ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 }
-

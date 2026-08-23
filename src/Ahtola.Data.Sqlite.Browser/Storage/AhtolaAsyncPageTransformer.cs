@@ -80,6 +80,21 @@ internal sealed class AhtolaAsyncPageTransformer(IAhtolaAsyncPageCipher cipher) 
     /// <summary>The AHTLA cipher id recorded in encrypted page 1 headers.</summary>
     internal Core.Storage.AhtolaEncryptionCipher Cipher => cipher.Cipher;
 
+    internal ValueTask<AhtolaBrowserAesGcmResult> EncryptLogicalLogChunkAsync(
+        ReadOnlyMemory<byte> plaintext,
+        ReadOnlyMemory<byte> nonce,
+        ReadOnlyMemory<byte> associatedData,
+        CancellationToken cancellationToken)
+        => cipher.EncryptAsync(plaintext, nonce, associatedData, cancellationToken);
+
+    internal ValueTask<byte[]> DecryptLogicalLogChunkAsync(
+        ReadOnlyMemory<byte> ciphertext,
+        ReadOnlyMemory<byte> tag,
+        ReadOnlyMemory<byte> nonce,
+        ReadOnlyMemory<byte> associatedData,
+        CancellationToken cancellationToken)
+        => cipher.DecryptAsync(ciphertext, tag, nonce, associatedData, cancellationToken);
+
     /// <summary>Encrypts one whole plaintext page.</summary>
     internal async ValueTask<byte[]> EncryptPageAsync(
         ReadOnlyMemory<byte> page,

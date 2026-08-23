@@ -1,6 +1,7 @@
 using System.Text;
 using AwesomeAssertions;
 using Ahtola.Core;
+using Ahtola.Core.Mvcc;
 using Ahtola.Core.Storage;
 using Ahtola.Data.Sqlite.Browser;
 using Ahtola.Data.Sqlite.Browser.Storage;
@@ -322,65 +323,79 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
     }
 
     [Test]
-    public async Task MvccJournalModeFailsClosedInsteadOfWritingPlaintextRowData()
+    public async Task MvccJournalModeEncryptsLogicalLogAndSurvivesReopen()
     {
         var store = new FakeBrowserPersistentStore();
         const string DatabasePath = "app/data/main.db";
-        await using var harness = await BrowserHarness.CreateAsync(store, Aes256Key);
-        using var database = EmbeddedDatabase.OpenFile(DatabasePath, harness.Mirror);
-        using var connection = database.Connect();
-        Execute(connection, "CREATE TABLE notes(body TEXT);");
-
-        // The engine writes the MVCC logical log outside the page codec, so it
-        // would land in OPFS unencrypted. That must fail loudly, not silently.
-        var failure = Record(() =>
-        {
-            Execute(connection, "PRAGMA journal_mode=mvcc;");
-            Execute(connection, $"INSERT INTO notes VALUES ('{Secret}');");
-        });
-
-        var chain = failure;
-        var mentionsMvcc = false;
-        while (chain is not null)
-        {
-            if (chain is NotSupportedException && chain.Message.Contains("MVCC logical log", StringComparison.Ordinal))
-            {
-                mentionsMvcc = true;
-                break;
-            }
-
-            chain = chain.InnerException;
-        }
-
-        mentionsMvcc.Should().BeTrue(
-            $"encrypted browser storage must reject the MVCC logical log explicitly, but saw: {failure}");
-        foreach (var path in store.Paths)
-            store.Read(path).AsSpan().IndexOf(Encoding.UTF8.GetBytes(Secret)).Should().Be(-1);
-    }
-
-    [Test]
-    public async Task RejectedMvccEnableDoesNotBlockReopeningTheDatabase()
-    {
-        var store = new FakeBrowserPersistentStore();
-        const string DatabasePath = "app/data/main.db";
-
+        Dictionary<string, byte[]> durableImages;
         await using (var harness = await BrowserHarness.CreateAsync(store, Aes256Key))
         {
             using var database = EmbeddedDatabase.OpenFile(DatabasePath, harness.Mirror);
             using var connection = database.Connect();
             Execute(connection, "CREATE TABLE notes(body TEXT);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
             Execute(connection, $"INSERT INTO notes VALUES ('{Secret}');");
-            Record(() => Execute(connection, "PRAGMA journal_mode=mvcc;")).Should().NotBeNull();
-
-            // Disposing flushes the orphaned create the rejected attempt queued, so
-            // an empty '-log' can reach OPFS even though no MVCC data ever did.
+            Execute(connection, "COMMIT;");
+            await harness.Mirror.FlushPendingAsync();
+            durableImages = store.Paths.ToDictionary(path => path, store.Read, StringComparer.Ordinal);
         }
 
-        // That stray file must not brick the database on the next open.
+        foreach (var (path, image) in durableImages)
+            store.Seed(path, image);
+        var logPath = DatabasePath + "-log";
+        store.Contains(logPath).Should().BeTrue();
+        store.Read(logPath).Length.Should().BeGreaterThan(MvccLogicalLogFormat.LogHeaderSize);
+        store.Read(logPath).AsSpan().IndexOf(Encoding.UTF8.GetBytes(Secret)).Should().Be(-1);
+        foreach (var path in store.Paths)
+            store.Read(path).AsSpan().IndexOf(Encoding.UTF8.GetBytes(Secret)).Should().Be(-1);
+
         await using var reopened = await BrowserHarness.CreateAsync(store, Aes256Key);
         using var reopenedDatabase = EmbeddedDatabase.OpenFile(DatabasePath, reopened.Mirror);
         using var reopenedConnection = reopenedDatabase.Connect();
         ScalarText(reopenedConnection, "SELECT body FROM notes;").Should().Be(Secret);
+    }
+
+    [Test]
+    public async Task MvccLogicalLogMetadataTamperingFailsAuthenticationOnLoad()
+    {
+        var store = new FakeBrowserPersistentStore();
+        const string DatabasePath = "app/data/main.db";
+        Dictionary<string, byte[]> durableImages;
+        await using (var harness = await BrowserHarness.CreateAsync(store, Aes256Key))
+        {
+            using var database = EmbeddedDatabase.OpenFile(DatabasePath, harness.Mirror);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE notes(body TEXT);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, $"INSERT INTO notes VALUES ('{Secret}');");
+            Execute(connection, "COMMIT;");
+            await harness.Mirror.FlushPendingAsync();
+            durableImages = store.Paths.ToDictionary(path => path, store.Read, StringComparer.Ordinal);
+        }
+
+        foreach (var (path, image) in durableImages)
+            store.Seed(path, image);
+        var logPath = DatabasePath + "-log";
+        var log = store.Read(logPath);
+        var frameOffset = MvccLogicalLogFormat.LogHeaderSize;
+        log[frameOffset + 16] ^= 0x01;
+        var plaintextSize = checked((int)System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(
+            log.AsSpan(frameOffset + 4)));
+        var trailerOffset = frameOffset
+                            + MvccLogicalLogFormat.TxHeaderSize
+                            + MvccLogicalLogFormat.GetEncryptedPayloadSize(plaintextSize);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
+            log.AsSpan(trailerOffset),
+            Crc32C.Compute(log.AsSpan(
+                frameOffset,
+                trailerOffset - frameOffset)));
+        store.Seed(logPath, log);
+
+        var failure = await Capture(() => BrowserHarness.CreateAsync(store, Aes256Key));
+        failure.Should().BeOfType<InvalidDataException>()
+            .Which.Message.Should().Contain("authentication failed");
     }
 
     private static Exception? Record(Action action)
