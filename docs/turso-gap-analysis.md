@@ -630,7 +630,7 @@ than absent subsystems.
 | `func-struct-union-experimental` | missing | s4-intentional | L | 0 | 0 | Experimental typed STRUCT/UNION column support in Turso (struct_pack/struct_extract/union_value/union_tag/union_extract), unrelated to SQLite's dynamic typing model. No c… |
 | `func-test-nondet-counter-missing` | missing | s3-perf | S | 0 | 2 | test_nondet_counter() is a Turso test-only helper (feature-gated) used by the vendored sqltest corpus to probe nondeterministic-function dedup/caching behavior in window… |
 | `func-unistr-family-missing` | missing | s2-capability | M | 0 | 0 | unistr()/unistr_quote() (Postgres-style Unicode escape decoding/encoding) are absent from SqliteBuiltinFunctions.Names and EmbeddedDatabase.StringFunctions.cs; the only '… |
-| `func-vector-family` | missing | s2-capability | L | 0 | 0 | Entire vector/embedding scalar function family (vector(), vector32(), vector_distance_cos/l2/jaccard/dot, vector_concat, vector_slice, vector_extract) has no counterpart… |
+| `func-vector-family` | parity | s2-capability | L | 0 | 0 | Pure-managed scalar parity now covers Turso's dense float32/float64, sparse float32, 1-bit, and 8-bit encodings plus vector construction/extraction, concat/slice, and cosine/L2/Jaccard/dot distance. Vector indexes and custom index methods remain intentionally out of scope. |
 
 ## 7. Storage / pager / WAL / b-tree layer
 20 entries, 32 mapped lines, and the **only layer with closed parity entries**

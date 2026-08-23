@@ -7,7 +7,7 @@ namespace Ahtola.Tests;
 public sealed class ManagedAdvancedFeatureBoundaryTests
 {
     [Test]
-    public void ManagedEngineEnablesMvccOnMemoryDatabasesAndStillRejectsVectorFunctions()
+    public void ManagedEngineEnablesMvccOnMemoryDatabasesAndVectorFunctions()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -16,9 +16,8 @@ public sealed class ManagedAdvancedFeatureBoundaryTests
         ReadValue(connection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("mvcc"));
         database.IsMvccEnabled.Should().BeTrue();
 
-        var vector = () => ReadValue(connection, "SELECT vector32('[1.0, 2.0]');");
-        vector.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("no such function: vector32");
+        ReadValue(connection, "SELECT vector_extract(vector32('[1.0, 2.0]'));")
+            .Should().Be(SqlValue.Text("[1,2]"));
     }
 
     [Test]

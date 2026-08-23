@@ -33873,6 +33873,18 @@ out bool hasReturning)
             "BOOLEAN_TO_INT" => EvaluateBooleanToInt(arguments),
             "INT_TO_BOOLEAN" => EvaluateIntToBoolean(arguments),
             "VALIDATE_IPADDR" => EvaluateValidateIpAddress(arguments),
+            "VECTOR" or "VECTOR32" => SqliteVectorFunctions.Vector32(arguments),
+            "VECTOR32_SPARSE" => SqliteVectorFunctions.Vector32Sparse(arguments),
+            "VECTOR64" => SqliteVectorFunctions.Vector64(arguments),
+            "VECTOR8" => SqliteVectorFunctions.Vector8(arguments),
+            "VECTOR1BIT" => SqliteVectorFunctions.Vector1Bit(arguments),
+            "VECTOR_EXTRACT" => SqliteVectorFunctions.Extract(arguments),
+            "VECTOR_DISTANCE_COS" => SqliteVectorFunctions.DistanceCos(arguments),
+            "VECTOR_DISTANCE_L2" => SqliteVectorFunctions.DistanceL2(arguments),
+            "VECTOR_DISTANCE_JACCARD" => SqliteVectorFunctions.DistanceJaccard(arguments),
+            "VECTOR_DISTANCE_DOT" => SqliteVectorFunctions.DistanceDot(arguments),
+            "VECTOR_CONCAT" => SqliteVectorFunctions.Concat(arguments),
+            "VECTOR_SLICE" => SqliteVectorFunctions.Slice(arguments),
             _ => throw new EmbeddedSqlException($"no such function: {function.Name}"),
         };
     }

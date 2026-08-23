@@ -40,6 +40,9 @@ internal static class SqliteBuiltinFunctions
         "UUID4_STR", "GEN_RANDOM_UUID", "UUID4", "UUID7_STR", "UUID7", "UUID7_TIMESTAMP_MS",
         "UUID_STR", "UUID_BLOB",
         "BOOLEAN_TO_INT", "INT_TO_BOOLEAN", "VALIDATE_IPADDR",
+        "VECTOR", "VECTOR32", "VECTOR32_SPARSE", "VECTOR64", "VECTOR8", "VECTOR1BIT",
+        "VECTOR_EXTRACT", "VECTOR_DISTANCE_COS", "VECTOR_DISTANCE_L2",
+        "VECTOR_DISTANCE_JACCARD", "VECTOR_DISTANCE_DOT", "VECTOR_CONCAT", "VECTOR_SLICE",
     };
 
     private static readonly HashSet<string> WindowOnlyNames = new(StringComparer.Ordinal)
@@ -142,12 +145,14 @@ internal static class SqliteBuiltinFunctions
             or "PERCENTILE" or "PERCENTILE_CONT" or "PERCENTILE_DISC" or "NTH_VALUE"
             or "ATAN2" or "POW" or "POWER" or "GCD" or "LCM" or "MOD" or "REPEAT"
             or "GLOB" or "INSTR" or "NULLIF" or "IFNULL" or "LIKELIHOOD" or "TIMEDIFF"
-            or "UUID_STR" or "UUID_BLOB" or "JSON_PATCH" or "JSONB_PATCH")
+            or "UUID_STR" or "UUID_BLOB" or "JSON_PATCH" or "JSONB_PATCH"
+            or "VECTOR_DISTANCE_COS" or "VECTOR_DISTANCE_L2" or "VECTOR_DISTANCE_JACCARD"
+            or "VECTOR_DISTANCE_DOT")
         {
             return [2];
         }
 
-        if (normalized is "REPLACE" or "IIF" or "IF")
+        if (normalized is "REPLACE" or "IIF" or "IF" or "VECTOR_SLICE")
             return [3];
 
         if (normalized is "COALESCE" or "CHAR" or "CONCAT" or "CONCAT_WS" or "FORMAT"
@@ -155,7 +160,8 @@ internal static class SqliteBuiltinFunctions
             or "UNIXEPOCH" or "MIN" or "MAX" or "JSON_ARRAY" or "JSONB_ARRAY"
             or "JSON_OBJECT" or "JSONB_OBJECT" or "JSON_EXTRACT" or "JSONB_EXTRACT"
             or "JSON_INSERT" or "JSONB_INSERT" or "JSON_REMOVE" or "JSONB_REMOVE"
-            or "JSON_REPLACE" or "JSONB_REPLACE" or "JSON_SET" or "JSONB_SET")
+            or "JSON_REPLACE" or "JSONB_REPLACE" or "JSON_SET" or "JSONB_SET"
+            or "VECTOR_CONCAT")
         {
             return [-1];
         }
