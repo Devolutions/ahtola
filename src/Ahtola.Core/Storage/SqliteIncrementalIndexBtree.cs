@@ -11,11 +11,11 @@ namespace Ahtola.Core.Storage;
 /// </para>
 /// <para>
 /// SQLite stores a real index entry in every interior separator cell, so a
-/// split promotes one cell out of a page rather than duplicating a key. A
-/// deletion whose key lives in an interior page, or that would empty a leaf,
-/// requires separator pull-down / page-merge rules this writer deliberately
-/// omits (unlike table trees, index separators are live keys) and raises
-/// <see cref="SqliteBtreeMaintenanceRequiredException"/> instead.
+/// split promotes one cell out of a page rather than duplicating a key.
+/// Deletion rotates the predecessor into an interior separator, then balances
+/// up to three neighboring pages. Parent separators are pulled down into the
+/// redistributed children, surplus pages are returned to the freelist, and a
+/// root with one child absorbs that child without changing its catalog page.
 /// </para>
 /// </remarks>
 public sealed class SqliteIncrementalIndexBtree
@@ -72,8 +72,8 @@ public sealed class SqliteIncrementalIndexBtree
         var path = Descend(rootPage, record, out var separatorMatch);
         if (separatorMatch)
         {
-            throw new SqliteBtreeMaintenanceRequiredException(
-                "Removing an index key stored in an interior separator requires page merging.");
+            DeleteInteriorSeparator(path, path.Count - 1);
+            return;
         }
 
         var leafPage = path[^1].PageNumber;
@@ -86,16 +86,303 @@ public sealed class SqliteIncrementalIndexBtree
         }
 
         var entries = ReadLeafEntries(view);
-                FreeOverflowIfPresent(entries[search.Index].Cell);
-                entries.RemoveAt(search.Index);
-                if (entries.Count == 0 && path.Count > 1)
+        FreeOverflowIfPresent(entries[search.Index].Cell);
+        entries.RemoveAt(search.Index);
+        _io.WritePage(leafPage, BuildLeafImage(entries));
+        BalanceAfterDelete(path, path.Count - 1);
+    }
+
+    private void DeleteInteriorSeparator(List<PathEntry> path, int separatorLevel)
+    {
+        var separatorEntry = path[separatorLevel];
+        var links = ReadChildLinks(ParseInterior(separatorEntry.PageNumber));
+        if (separatorEntry.ChildIndex < 0
+            || separatorEntry.ChildIndex >= links.Count - 1
+            || links[separatorEntry.ChildIndex].Separator is not { } deletedSeparator)
+        {
+            throw new InvalidDataException(
+                $"SQLite index-interior page {separatorEntry.PageNumber} has no separator at {separatorEntry.ChildIndex}.");
+        }
+
+        var predecessorPath = new List<PathEntry>(path);
+        var pageNumber = links[separatorEntry.ChildIndex].PageNumber;
+        while (true)
+        {
+            var header = SqliteBtreePageHeader.Parse(_io.ReadPage(pageNumber));
+            if (header.PageType == SqliteBtreePageType.IndexLeaf)
+            {
+                predecessorPath.Add(new PathEntry(pageNumber, -1));
+                break;
+            }
+
+            if (header.PageType != SqliteBtreePageType.IndexInterior)
+            {
+                throw new InvalidDataException(
+                    $"SQLite page {pageNumber} is not part of the predecessor subtree for index separator deletion.");
+            }
+
+            var interior = ParseInterior(pageNumber);
+            predecessorPath.Add(new PathEntry(pageNumber, interior.Cells.Count));
+            pageNumber = interior.Header.RightMostChildPage;
+        }
+
+        var predecessorLeaf = ParseLeaf(pageNumber);
+        var entries = ReadLeafEntries(predecessorLeaf);
+        if (entries.Count == 0)
+        {
+            throw new InvalidDataException(
+                $"SQLite index-leaf page {pageNumber} is empty while replacing an interior separator.");
+        }
+
+        var predecessor = entries[^1];
+        entries.RemoveAt(entries.Count - 1);
+        FreeOverflowIfPresent(deletedSeparator.Cell);
+        links[separatorEntry.ChildIndex] = links[separatorEntry.ChildIndex] with
+        {
+            Separator = predecessor,
+        };
+
+        if (!InteriorLinksFit(links))
+        {
+            throw new SqliteBtreeMaintenanceRequiredException(
+                $"Replacing separator {separatorEntry.ChildIndex} on SQLite index-interior page {separatorEntry.PageNumber} would overflow the page.");
+        }
+
+        _io.WritePage(separatorEntry.PageNumber, BuildInteriorImage(links));
+        _io.WritePage(pageNumber, BuildLeafImage(entries));
+        var predecessorLevel = predecessorPath.Count - 1;
+        var predecessorUnderflows = IsUnderfull(pageNumber);
+        BalanceAfterDelete(predecessorPath, predecessorLevel);
+        if (!predecessorUnderflows)
+            BalanceAfterDelete(predecessorPath, separatorLevel);
+    }
+
+    private void BalanceAfterDelete(List<PathEntry> path, int level)
+    {
+        if (level == 0)
+        {
+            CollapseIndexRoot(path[0].PageNumber);
+            return;
+        }
+
+        var pageNumber = path[level].PageNumber;
+        if (!IsUnderfull(pageNumber))
+            return;
+
+        BalanceSiblingRun(path, level);
+    }
+
+    private void BalanceSiblingRun(List<PathEntry> path, int level)
+    {
+        var parentLevel = level - 1;
+        var parentPage = path[parentLevel].PageNumber;
+        var parentLinks = ReadChildLinks(ParseInterior(parentPage));
+        var pageNumber = path[level].PageNumber;
+        var childIndex = parentLinks.FindIndex(link => link.PageNumber == pageNumber);
+        if (childIndex < 0)
+        {
+            throw new InvalidDataException(
+                $"SQLite index page {pageNumber} is not a child of page {parentPage} during balancing.");
+        }
+
+        var siblingCount = Math.Min(3, parentLinks.Count);
+        var first = childIndex == 0
+            ? 0
+            : childIndex == parentLinks.Count - 1
+                ? parentLinks.Count - siblingCount
+                : Math.Min(childIndex - 1, parentLinks.Count - siblingCount);
+        var oldPages = parentLinks
+            .Skip(first)
+            .Take(siblingCount)
+            .Select(link => link.PageNumber)
+            .ToArray();
+        var pageType = SqliteBtreePageHeader.Parse(_io.ReadPage(oldPages[0])).PageType;
+        if (oldPages.Any(page => SqliteBtreePageHeader.Parse(_io.ReadPage(page)).PageType != pageType))
+        {
+            throw new InvalidDataException(
+                $"SQLite index siblings under page {parentPage} do not have a uniform page type.");
+        }
+
+        var inheritedSeparator = parentLinks[first + siblingCount - 1].Separator;
+        List<ChildLink> replacement;
+        List<uint> assignedPages;
+        switch (pageType)
+        {
+            case SqliteBtreePageType.IndexLeaf:
                 {
-                    throw new SqliteBtreeMaintenanceRequiredException(
-                        $"Removing an index key would empty child page {leafPage}, which requires page merging.");
+                    var combined = new List<IndexEntry>();
+                    for (var offset = 0; offset < siblingCount; offset++)
+                    {
+                        combined.AddRange(ReadLeafEntries(ParseLeaf(oldPages[offset])));
+                        if (offset + 1 < siblingCount)
+                        {
+                            combined.Add(parentLinks[first + offset].Separator
+                                ?? throw new InvalidDataException(
+                                    $"SQLite index parent {parentPage} is missing divider {first + offset}."));
+                        }
+                    }
+
+                    var split = PartitionLeafEntries(combined);
+                    assignedPages = AssignSiblingPages(oldPages, split.Groups.Count);
+                    for (var index = 0; index < split.Groups.Count; index++)
+                        _io.WritePage(assignedPages[index], BuildLeafImage(split.Groups[index]));
+
+                    replacement = new List<ChildLink>(split.Groups.Count);
+                    for (var index = 0; index < split.Groups.Count; index++)
+                    {
+                        replacement.Add(new ChildLink(
+                            assignedPages[index],
+                            index < split.Separators.Count
+                                ? split.Separators[index]
+                                : inheritedSeparator));
+                    }
+                    break;
                 }
 
-                _io.WritePage(leafPage, BuildLeafImage(entries));
+            case SqliteBtreePageType.IndexInterior:
+                {
+                    var combined = new List<ChildLink>();
+                    for (var offset = 0; offset < siblingCount; offset++)
+                    {
+                        var childLinks = ReadChildLinks(ParseInterior(oldPages[offset]));
+                        if (offset + 1 < siblingCount)
+                        {
+                            childLinks[^1] = childLinks[^1] with
+                            {
+                                Separator = parentLinks[first + offset].Separator
+                                    ?? throw new InvalidDataException(
+                                        $"SQLite index parent {parentPage} is missing divider {first + offset}."),
+                            };
+                        }
+                        combined.AddRange(childLinks);
+                    }
+
+                    var split = PartitionInteriorLinks(combined);
+                    assignedPages = AssignSiblingPages(oldPages, split.Groups.Count);
+                    for (var index = 0; index < split.Groups.Count; index++)
+                        _io.WritePage(assignedPages[index], BuildInteriorImage(split.Groups[index]));
+
+                    replacement = new List<ChildLink>(split.Groups.Count);
+                    for (var index = 0; index < split.Groups.Count; index++)
+                    {
+                        replacement.Add(new ChildLink(
+                            assignedPages[index],
+                            index < split.Separators.Count
+                                ? split.Separators[index]
+                                : inheritedSeparator));
+                    }
+                    break;
+                }
+
+            default:
+                throw new InvalidDataException(
+                    $"SQLite page {oldPages[0]} is not an index b-tree page during balancing.");
+        }
+
+        parentLinks.RemoveRange(first, siblingCount);
+        parentLinks.InsertRange(first, replacement);
+        if (parentLevel == 0 && parentLinks.Count == 1)
+        {
+            AbsorbIndexChild(parentPage, parentLinks[0].PageNumber);
+        }
+        else
+        {
+            if (!InteriorLinksFit(parentLinks))
+            {
+                throw new SqliteBtreeMaintenanceRequiredException(
+                    $"Balancing SQLite index children would overflow parent page {parentPage}.");
             }
+            _io.WritePage(parentPage, BuildInteriorImage(parentLinks));
+        }
+
+        var assigned = assignedPages.ToHashSet();
+        foreach (var oldPage in oldPages)
+        {
+            if (!assigned.Contains(oldPage))
+                _io.FreePage(oldPage);
+        }
+
+        if (parentLevel > 0 && IsUnderfull(parentPage))
+            BalanceSiblingRun(path, parentLevel);
+        else if (parentLevel == 0)
+            CollapseIndexRoot(parentPage);
+    }
+
+    private List<uint> AssignSiblingPages(uint[] oldPages, int requiredCount)
+    {
+        var pages = oldPages.Order().Take(requiredCount).ToList();
+        while (pages.Count < requiredCount)
+            pages.Add(_io.AllocatePage());
+        return pages;
+    }
+
+    private bool IsUnderfull(uint pageNumber)
+    {
+        var header = SqliteBtreePageHeader.Parse(_io.ReadPage(pageNumber));
+        var capacity = _io.UsableSpace - (header.PageType == SqliteBtreePageType.IndexLeaf
+            ? SqliteBtreePageHeader.LeafHeaderSize
+            : SqliteBtreePageHeader.InteriorHeaderSize);
+        var used = header.PageType switch
+        {
+            SqliteBtreePageType.IndexLeaf => ReadLeafEntries(ParseLeaf(pageNumber))
+                .Sum(entry => entry.Cell.EncodedLength + sizeof(ushort)),
+            SqliteBtreePageType.IndexInterior => ReadChildLinks(ParseInterior(pageNumber))
+                .Where(link => link.Separator is not null)
+                .Sum(link => SqliteIndexInteriorCell.ChildPointerLength
+                    + link.Separator!.Cell.EncodedLength
+                    + sizeof(ushort)),
+            _ => throw new InvalidDataException(
+                $"SQLite page {pageNumber} is not an index b-tree page during underflow detection."),
+        };
+        return used * 3 < capacity;
+    }
+
+    private bool InteriorLinksFit(List<ChildLink> links)
+    {
+        var used = 0;
+        foreach (var link in links)
+        {
+            if (link.Separator is null)
+                continue;
+            used += SqliteIndexInteriorCell.ChildPointerLength
+                + link.Separator.Cell.EncodedLength
+                + sizeof(ushort);
+        }
+        return used <= _io.UsableSpace - SqliteBtreePageHeader.InteriorHeaderSize;
+    }
+
+    private void CollapseIndexRoot(uint rootPage)
+    {
+        var header = SqliteBtreePageHeader.Parse(_io.ReadPage(rootPage));
+        if (header.PageType != SqliteBtreePageType.IndexInterior)
+            return;
+
+        var links = ReadChildLinks(ParseInterior(rootPage));
+        if (links.Count == 1)
+            AbsorbIndexChild(rootPage, links[0].PageNumber);
+    }
+
+    private void AbsorbIndexChild(uint rootPage, uint childPage)
+    {
+        if (rootPage == childPage)
+            return;
+
+        var header = SqliteBtreePageHeader.Parse(_io.ReadPage(childPage));
+        switch (header.PageType)
+        {
+            case SqliteBtreePageType.IndexLeaf:
+                _io.WritePage(rootPage, BuildLeafImage(ReadLeafEntries(ParseLeaf(childPage))));
+                break;
+            case SqliteBtreePageType.IndexInterior:
+                _io.WritePage(rootPage, BuildInteriorImage(ReadChildLinks(ParseInterior(childPage))));
+                break;
+            default:
+                throw new InvalidDataException(
+                    $"SQLite page {childPage} cannot be absorbed into index root {rootPage}.");
+        }
+
+        _io.FreePage(childPage);
+    }
 
     private void FreeOverflowIfPresent(SqliteIndexLeafCell cell)
     {

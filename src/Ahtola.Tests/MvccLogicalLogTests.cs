@@ -2,6 +2,8 @@ using AwesomeAssertions;
 using Ahtola.Core;
 using Ahtola.Core.Mvcc;
 using Ahtola.Core.Storage;
+using System.Buffers.Binary;
+using System.Text;
 
 namespace Ahtola.Tests;
 
@@ -237,5 +239,326 @@ public sealed class MvccLogicalLogTests
         reopenedLog.ReplayInto(reopened);
         var reader = reopened.BeginTransaction();
         reopened.IsBaseRowInvalidated(reader.Id, new MvccRowId(table, 1)).Should().BeTrue();
+    }
+
+    [Test]
+    public void EncryptedCommitFramesHideRowsAndSurviveReopen()
+    {
+        var storage = new InMemoryFileSystem();
+        var key = Enumerable.Range(1, 32).Select(static value => (byte)value).ToArray();
+        const string dbPath = "encrypted-mvcc-log.db";
+        const string secret = "logical-log-secret";
+        long table;
+
+        using (var options = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes256Gcm, key))
+        using (var fileSystem = new AhtolaEncryptionFileSystem(storage, options))
+        using (var log = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text(secret)]);
+            store.Commit(tx.Id);
+        }
+
+        var persisted = ReadAll(storage, MvccLogicalLog.LogPathForDatabase(dbPath));
+        persisted.AsSpan().IndexOf(Encoding.UTF8.GetBytes(secret)).Should().Be(-1);
+        BinaryPrimitives.ReadUInt32LittleEndian(persisted).Should().Be(MvccLogicalLogFormat.LogMagic);
+
+        using var reopenOptions = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes256Gcm, key);
+        using var reopenedFileSystem = new AhtolaEncryptionFileSystem(storage, reopenOptions);
+        using var reopenedLog = MvccLogicalLog.CreateOrOpen(reopenedFileSystem, dbPath);
+        var recovered = new MvStore();
+        reopenedLog.ReplayInto(recovered);
+        var reader = recovered.BeginTransaction();
+        recovered.TryRead(reader.Id, new MvccRowId(table, 1), out var cells).Should().BeTrue();
+        cells!.Should().Equal(SqlValue.Text(secret));
+    }
+
+    [Test]
+    public void EncryptedCommitFrameRejectsWrongKey()
+    {
+        var storage = new InMemoryFileSystem();
+        const string dbPath = "encrypted-mvcc-wrong-key.db";
+        using (var options = new AhtolaEncryptionOptions(
+                   AhtolaEncryptionCipher.Aes128Gcm,
+                   Enumerable.Repeat((byte)0x42, 16).ToArray()))
+        using (var fileSystem = new AhtolaEncryptionFileSystem(storage, options))
+        using (var log = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("secret")]);
+            store.Commit(tx.Id);
+        }
+
+        using var wrongOptions = new AhtolaEncryptionOptions(
+            AhtolaEncryptionCipher.Aes128Gcm,
+            Enumerable.Repeat((byte)0xFF, 16).ToArray());
+        using var wrongFileSystem = new AhtolaEncryptionFileSystem(storage, wrongOptions);
+        using var reopened = MvccLogicalLog.CreateOrOpen(wrongFileSystem, dbPath);
+        var replay = () => reopened.ReplayInto(new MvStore());
+        replay.Should().Throw<InvalidDataException>()
+            .WithMessage("*authentication failed*");
+    }
+
+    [Test]
+    public void EncryptedCommitFrameAuthenticatesTransactionMetadata()
+    {
+        var storage = new InMemoryFileSystem();
+        var key = Enumerable.Repeat((byte)0x24, 16).ToArray();
+        const string dbPath = "encrypted-mvcc-metadata.db";
+        var logPath = MvccLogicalLog.LogPathForDatabase(dbPath);
+        using (var options = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key))
+        using (var fileSystem = new AhtolaEncryptionFileSystem(storage, options))
+        using (var log = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("secret")]);
+            store.Commit(tx.Id);
+        }
+
+        using (var file = storage.OpenFile(logPath, FileOpenMode.OpenExisting))
+        {
+            var frame = new byte[checked((int)(file.Length - MvccLogicalLogFormat.LogHeaderSize))];
+            file.Read(MvccLogicalLogFormat.LogHeaderSize, frame).Should().Be(frame.Length);
+            frame[16] ^= 0x01; // commit_ts is authenticated associated data.
+            var plaintextSize = checked((int)BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(4)));
+            var trailerOffset = MvccLogicalLogFormat.TxHeaderSize
+                                + MvccLogicalLogFormat.GetEncryptedPayloadSize(plaintextSize);
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                frame.AsSpan(trailerOffset),
+                Crc32C.Compute(frame.AsSpan(0, trailerOffset)));
+            file.Write(MvccLogicalLogFormat.LogHeaderSize, frame);
+            file.FlushToDisk();
+        }
+
+        using var reopenOptions = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key);
+        using var reopenedFileSystem = new AhtolaEncryptionFileSystem(storage, reopenOptions);
+        using var reopened = MvccLogicalLog.CreateOrOpen(reopenedFileSystem, dbPath);
+        var replay = () => reopened.ReplayInto(new MvStore());
+        replay.Should().Throw<InvalidDataException>()
+            .WithMessage("*authentication failed*");
+    }
+
+    [Test]
+    public void EncryptedCommitFrameAuthenticatesLogVersion()
+    {
+        var storage = new InMemoryFileSystem();
+        var key = Enumerable.Repeat((byte)0x26, 16).ToArray();
+        const string dbPath = "encrypted-mvcc-version.db";
+        var logPath = MvccLogicalLog.LogPathForDatabase(dbPath);
+        using (var options = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key))
+        using (var fileSystem = new AhtolaEncryptionFileSystem(storage, options))
+        using (var log = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("secret")]);
+            store.Commit(tx.Id);
+        }
+
+        using (var file = storage.OpenFile(logPath, FileOpenMode.OpenExisting))
+        {
+            var image = new byte[checked((int)file.Length)];
+            file.Read(0, image).Should().Be(image.Length);
+            image[4] = 3;
+            image.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart, sizeof(uint)).Clear();
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                image.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart),
+                Crc32C.Compute(image.AsSpan(0, MvccLogicalLogFormat.LogHeaderSize)));
+            file.Write(0, image);
+            file.FlushToDisk();
+        }
+
+        using var reopenOptions = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key);
+        using var reopenedFileSystem = new AhtolaEncryptionFileSystem(storage, reopenOptions);
+        using var reopened = MvccLogicalLog.CreateOrOpen(reopenedFileSystem, dbPath);
+        var replay = () => reopened.ReplayInto(new MvStore());
+        replay.Should().Throw<InvalidDataException>()
+            .WithMessage("*authentication failed*");
+    }
+
+    [TestCase(-1L)]
+    [TestCase(1L)]
+    public void EncryptedCommitFrameRejectsPayloadLengthTampering(long delta)
+    {
+        var storage = new InMemoryFileSystem();
+        var key = Enumerable.Repeat((byte)0x25, 16).ToArray();
+        const string dbPath = "encrypted-mvcc-length.db";
+        var logPath = MvccLogicalLog.LogPathForDatabase(dbPath);
+        using (var options = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key))
+        using (var fileSystem = new AhtolaEncryptionFileSystem(storage, options))
+        using (var log = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("secret")]);
+            store.Commit(tx.Id);
+        }
+
+        using (var file = storage.OpenFile(logPath, FileOpenMode.OpenExisting))
+        {
+            var frame = new byte[checked((int)(file.Length - MvccLogicalLogFormat.LogHeaderSize))];
+            file.Read(MvccLogicalLogFormat.LogHeaderSize, frame).Should().Be(frame.Length);
+            var originalSize = checked((long)BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(4)));
+            var originalTrailerOffset = MvccLogicalLogFormat.TxHeaderSize
+                                        + MvccLogicalLogFormat.GetEncryptedPayloadSize(
+                                            checked((int)originalSize));
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                frame.AsSpan(4),
+                checked((ulong)(originalSize + delta)));
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                frame.AsSpan(originalTrailerOffset),
+                Crc32C.Compute(frame.AsSpan(0, originalTrailerOffset)));
+            file.Write(MvccLogicalLogFormat.LogHeaderSize, frame);
+            file.FlushToDisk();
+        }
+
+        using var reopenOptions = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes128Gcm, key);
+        using var reopenedFileSystem = new AhtolaEncryptionFileSystem(storage, reopenOptions);
+        using var reopened = MvccLogicalLog.CreateOrOpen(reopenedFileSystem, dbPath);
+        var replay = () => reopened.ReplayInto(new MvStore());
+        replay.Should().Throw<InvalidDataException>();
+        ReadAll(storage, logPath).Length.Should().BeGreaterThan(MvccLogicalLogFormat.LogHeaderSize);
+    }
+
+    [Test]
+    public void EncryptedOpenRejectsExistingPlaintextFrames()
+    {
+        var storage = new InMemoryFileSystem();
+        const string dbPath = "plaintext-to-encrypted-mvcc.db";
+        using (var log = MvccLogicalLog.CreateOrOpen(storage, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("plaintext")]);
+            store.Commit(tx.Id);
+        }
+
+        using var options = new AhtolaEncryptionOptions(
+            AhtolaEncryptionCipher.Aes128Gcm,
+            Enumerable.Repeat((byte)0x42, 16).ToArray());
+        using var fileSystem = new AhtolaEncryptionFileSystem(storage, options);
+        using var reopened = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath);
+        var replay = () => reopened.ReplayInto(new MvStore());
+        replay.Should().Throw<InvalidDataException>()
+            .WithMessage("*plaintext logical-log frame*");
+    }
+
+    [Test]
+    public void ReplayRejectsTrailingPayloadBytes()
+    {
+        var storage = new InMemoryFileSystem();
+        const string dbPath = "mvcc-trailing-payload.db";
+        var logPath = MvccLogicalLog.LogPathForDatabase(dbPath);
+        using (var log = MvccLogicalLog.CreateOrOpen(storage, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("value")]);
+            store.Commit(tx.Id);
+        }
+
+        var original = ReadAll(storage, logPath);
+        var frameOffset = MvccLogicalLogFormat.LogHeaderSize;
+        var originalPayloadSize = checked((int)BinaryPrimitives.ReadUInt64LittleEndian(
+            original.AsSpan(frameOffset + 4)));
+        var enlargedPayloadSize = originalPayloadSize + 1;
+        var rewritten = new byte[original.Length + 1];
+        original.AsSpan(0, frameOffset + MvccLogicalLogFormat.TxHeaderSize).CopyTo(rewritten);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            rewritten.AsSpan(frameOffset + 4),
+            checked((ulong)enlargedPayloadSize));
+        original.AsSpan(
+                frameOffset + MvccLogicalLogFormat.TxHeaderSize,
+                originalPayloadSize)
+            .CopyTo(rewritten.AsSpan(frameOffset + MvccLogicalLogFormat.TxHeaderSize));
+        rewritten[frameOffset + MvccLogicalLogFormat.TxHeaderSize + originalPayloadSize] = 0xA5;
+        var trailerOffset = frameOffset + MvccLogicalLogFormat.TxHeaderSize + enlargedPayloadSize;
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            rewritten.AsSpan(trailerOffset),
+            Crc32C.Compute(rewritten.AsSpan(
+                frameOffset,
+                MvccLogicalLogFormat.TxHeaderSize + enlargedPayloadSize)));
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            rewritten.AsSpan(trailerOffset + sizeof(uint)),
+            MvccLogicalLogFormat.EndMagic);
+        using (var file = storage.OpenFile(logPath, FileOpenMode.OpenExisting))
+        {
+            file.SetLength(rewritten.Length);
+            file.Write(0, rewritten);
+            file.FlushToDisk();
+        }
+
+        using var reopened = MvccLogicalLog.CreateOrOpen(storage, dbPath);
+        var replay = () => reopened.ReplayInto(new MvStore());
+        replay.Should().Throw<InvalidDataException>()
+            .WithMessage("*trailing byte*");
+    }
+
+    [Test]
+    public void EncryptedRecoveryTruncatesATornTailBeforeTheNextCommit()
+    {
+        var storage = new InMemoryFileSystem();
+        var key = Enumerable.Repeat((byte)0x31, 32).ToArray();
+        const string dbPath = "encrypted-mvcc-torn-tail.db";
+        long table;
+
+        using (var options = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes256Gcm, key))
+        using (var fileSystem = new AhtolaEncryptionFileSystem(storage, options))
+        using (var log = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            table = store.GetOrCreateTableId("notes");
+            var tx = store.BeginTransaction();
+            store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Text("first")]);
+            store.Commit(tx.Id);
+        }
+
+        using (var file = storage.OpenFile(
+                   MvccLogicalLog.LogPathForDatabase(dbPath),
+                   FileOpenMode.OpenExisting))
+        {
+            file.Write(file.Length, [0x4D, 0x56, 0x54]);
+            file.FlushToDisk();
+        }
+
+        using (var options = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes256Gcm, key))
+        using (var fileSystem = new AhtolaEncryptionFileSystem(storage, options))
+        using (var log = MvccLogicalLog.CreateOrOpen(fileSystem, dbPath))
+        {
+            var recovered = new MvStore(logicalLog: log);
+            log.ReplayInto(recovered);
+            var tx = recovered.BeginTransaction();
+            recovered.Insert(tx.Id, new MvccRowId(table, 2), [SqlValue.Text("second")]);
+            recovered.Commit(tx.Id);
+        }
+
+        using var reopenOptions = new AhtolaEncryptionOptions(AhtolaEncryptionCipher.Aes256Gcm, key);
+        using var reopenedFileSystem = new AhtolaEncryptionFileSystem(storage, reopenOptions);
+        using var reopenedLog = MvccLogicalLog.CreateOrOpen(reopenedFileSystem, dbPath);
+        var reopened = new MvStore();
+        reopenedLog.ReplayInto(reopened);
+        var reader = reopened.BeginTransaction();
+        reopened.ScanVisible(reader.Id)
+            .Select(static row => row.Cells[0].AsText())
+            .Should()
+            .BeEquivalentTo(["first", "second"]);
+    }
+
+    private static byte[] ReadAll(IFileSystem fileSystem, string path)
+    {
+        using var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly: true);
+        var bytes = new byte[checked((int)file.Length)];
+        file.Read(0, bytes).Should().Be(bytes.Length);
+        return bytes;
     }
 }

@@ -169,6 +169,16 @@ internal sealed class BrowserPersistedFileRoles
         ReadOnlySpan<byte> probeHeader,
         Func<string, bool>? basePathExists)
     {
+        if (path.EndsWith(MvccUpgradeSuffix, StringComparison.Ordinal))
+        {
+            var sourcePath = path[..^MvccUpgradeSuffix.Length];
+            if (_roles.TryGetValue(sourcePath, out var sourceRole)
+                && sourceRole == BrowserPersistedFileRole.MvccLog)
+            {
+                return BrowserPersistedFileRole.MvccLog;
+            }
+        }
+
         foreach (var (suffix, role) in SidecarSuffixes)
         {
             if (!path.EndsWith(suffix, StringComparison.Ordinal))

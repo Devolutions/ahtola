@@ -3105,7 +3105,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             request =>
             {
                 request.Method.Should().Be(HttpMethod.Post);
-                request.RequestUri!.AbsolutePath.Should().Be("/cluster/v2/pipeline");
+                request.RequestUri!.AbsolutePath.Should().Be("/cluster/v3/pipeline");
                 request.Headers.Authorization.Should().Be(new AuthenticationHeaderValue("Bearer", "token-42"));
                 push = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
                 return ReplicaPushHandler.SuccessfulBatchResponse(5);

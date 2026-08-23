@@ -624,7 +624,9 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
     }
 
     /// <summary>Commits the active transaction.</summary>
-    public ValueTask CommitAsync(CancellationToken cancellationToken = default)
+    public ValueTask CommitAsync(
+        CancellationToken cancellationToken = default,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         AsyncSqlitePagerTransaction transaction;
         lock (_stateGate)
@@ -634,7 +636,7 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                 ?? throw new InvalidOperationException("The SQLite pager has no active write transaction.");
         }
 
-        return transaction.CommitAsync(cancellationToken);
+        return transaction.CommitAsync(cancellationToken, synchronousMode);
     }
 
     /// <summary>Rolls back the active transaction without writing storage.</summary>
@@ -654,14 +656,24 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
     /// <summary>Installs committed WAL pages into the main database and retains the WAL.</summary>
     public ValueTask<SqliteCheckpointResult> CheckpointToMainStoreAsync(
         TimeSpan? busyTimeout = null,
-        CancellationToken cancellationToken = default)
-        => CheckpointAsync(resetCommittedWal: false, busyTimeout, cancellationToken);
+        CancellationToken cancellationToken = default,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+        => CheckpointAsync(
+            resetCommittedWal: false,
+            busyTimeout,
+            cancellationToken,
+            synchronousMode);
 
     /// <summary>Installs committed WAL pages, then durably resets the WAL.</summary>
     public ValueTask<SqliteCheckpointResult> CheckpointToMainStoreAndResetWalAsync(
         TimeSpan? busyTimeout = null,
-        CancellationToken cancellationToken = default)
-        => CheckpointAsync(resetCommittedWal: true, busyTimeout, cancellationToken);
+        CancellationToken cancellationToken = default,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+        => CheckpointAsync(
+            resetCommittedWal: true,
+            busyTimeout,
+            cancellationToken,
+            synchronousMode);
 
     /// <summary>Repairs an uncommitted, partial, or invalid WAL tail.</summary>
     public async ValueTask RecoverUncommittedWalTailAsync(
@@ -786,8 +798,10 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
 
     internal async ValueTask CommitTransactionAsync(
         AsyncSqlitePagerTransaction transaction,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        SqliteSynchronousMode synchronousMode)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         // A DELETE-mode commit rewrites the main database file in place, which
         // every read snapshot on this database reads through directly. Take the
         // same EXCLUSIVE upgrade the synchronous pager takes so no reader can
@@ -810,9 +824,11 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             try
             {
                 if (JournalMode == SqliteJournalMode.Delete)
-                    await CommitRollbackTransactionAsync(transaction, cancellationToken).ConfigureAwait(false);
+                    await CommitRollbackTransactionAsync(transaction, cancellationToken, synchronousMode)
+                        .ConfigureAwait(false);
                 else
-                    await CommitWalTransactionAsync(transaction, cancellationToken).ConfigureAwait(false);
+                    await CommitWalTransactionAsync(transaction, cancellationToken, synchronousMode)
+                        .ConfigureAwait(false);
 
                 lock (_stateGate)
                 {
@@ -857,8 +873,10 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
     private async ValueTask<SqliteCheckpointResult> CheckpointAsync(
         bool resetCommittedWal,
         TimeSpan? busyTimeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        SqliteSynchronousMode synchronousMode)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         var timeout = ResolveBusyTimeout(busyTimeout);
         using var checkpointLock = await _lockManager.EnterCheckpointAsync(timeout, cancellationToken)
             .ConfigureAwait(false);
@@ -892,11 +910,14 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             try
             {
                 await ValidateWalHasNotChangedAsync(cancellationToken).ConfigureAwait(false);
-                await RequireWal().FlushAsync(cancellationToken).ConfigureAwait(false);
-                var installed = await InstallCommittedOverlayIntoMainStoreAsync(cancellationToken)
+                if (_committedFrameCount > 0 && synchronousMode.SyncsCheckpoint())
+                    await RequireWal().FlushAsync(cancellationToken).ConfigureAwait(false);
+                var installed = await InstallCommittedOverlayIntoMainStoreAsync(
+                        cancellationToken,
+                        synchronousMode)
                     .ConfigureAwait(false);
                 var retainedFrames = _committedFrameCount;
-                if (resetCommittedWal)
+                if (resetCommittedWal && synchronousMode.SyncsCheckpoint())
                 {
                     if (await _pageStore.GetPageCountAsync(cancellationToken).ConfigureAwait(false)
                         != _committedPageCount)
@@ -942,7 +963,8 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
 
     private async ValueTask CommitWalTransactionAsync(
         AsyncSqlitePagerTransaction transaction,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        SqliteSynchronousMode synchronousMode)
     {
         await ValidateWalHasNotChangedAsync(cancellationToken).ConfigureAwait(false);
         var wal = RequireWal();
@@ -961,9 +983,11 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
                 new AsyncSqlitePagerTransaction.WalFrameSource(transaction),
                 transaction.TargetDatabaseSizeInPages,
                 cancellationToken).ConfigureAwait(false);
-            await wal.FlushAsync(cancellationToken).ConfigureAwait(false);
+            if (synchronousMode.SyncsWalCommit())
+                await wal.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-            // Past this point the commit frame is durable, so the transaction is
+            // Past this point the complete commit frame has been accepted under
+            // the requested synchronous policy, so the transaction is logically
             // committed whatever happens next. Finish recording it on
             // CancellationToken.None: a caller that cancels now cannot un-commit
             // it, and abandoning the bookkeeping would leave the boundary pinned
@@ -1058,7 +1082,8 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
 
     private async ValueTask CommitRollbackTransactionAsync(
         AsyncSqlitePagerTransaction transaction,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        SqliteSynchronousMode synchronousMode)
     {
         var originalPageCount = _committedPageCount;
         var pagesToJournal = new HashSet<uint>(
@@ -1094,6 +1119,7 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             unchecked((uint)Random.Shared.NextInt64()),
             originalPageCount,
             PageSize,
+            synchronousMode,
             cancellationToken).ConfigureAwait(false);
         try
         {
@@ -1142,15 +1168,21 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             }
         }
 
-        await _pageStore.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (synchronousMode.SyncsCheckpoint())
+            await _pageStore.FlushAsync(cancellationToken).ConfigureAwait(false);
         if (transaction.TargetDatabaseSizeInPages < originalPageCount)
         {
             await _pageStore.TruncateToPageCountAsync(
                 transaction.TargetDatabaseSizeInPages,
                 cancellationToken).ConfigureAwait(false);
-            await _pageStore.FlushAsync(cancellationToken).ConfigureAwait(false);
+            if (synchronousMode.SyncsCheckpoint())
+                await _pageStore.FlushAsync(cancellationToken).ConfigureAwait(false);
         }
-        await SqliteRollbackJournal.DeleteAsync(_fileSystem, _journalPath, cancellationToken)
+        await SqliteRollbackJournal.DeleteAsync(
+                _fileSystem,
+                _journalPath,
+                synchronousMode,
+                cancellationToken)
             .ConfigureAwait(false);
 
         var emptyRecovery = CreateEmptyRecoveryInfo();
@@ -1165,7 +1197,8 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
     }
 
     private async ValueTask<int> InstallCommittedOverlayIntoMainStoreAsync(
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        SqliteSynchronousMode synchronousMode)
     {
         var originalPageCount = await _pageStore.GetPageCountAsync(cancellationToken).ConfigureAwait(false);
         var installed = 0;
@@ -1212,12 +1245,14 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
             installed++;
         }
 
-        await _pageStore.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (synchronousMode.SyncsCheckpoint())
+            await _pageStore.FlushAsync(cancellationToken).ConfigureAwait(false);
         if (_committedPageCount < originalPageCount)
         {
             await _pageStore.TruncateToPageCountAsync(_committedPageCount, cancellationToken)
                 .ConfigureAwait(false);
-            await _pageStore.FlushAsync(cancellationToken).ConfigureAwait(false);
+            if (synchronousMode.SyncsCheckpoint())
+                await _pageStore.FlushAsync(cancellationToken).ConfigureAwait(false);
         }
         return installed;
     }
@@ -2075,16 +2110,25 @@ public sealed class AsyncSqlitePagerTransaction : IAsyncDisposable
         }
     }
 
-    /// <summary>Durably commits all staged pages.</summary>
-    public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
+    /// <summary>Commits all staged pages using the configured durability barriers.</summary>
+    public ValueTask CommitAsync(CancellationToken cancellationToken = default)
+        => CommitAsync(cancellationToken, SqliteSynchronousMode.Full);
+
+    /// <summary>Commits all staged pages using <paramref name="synchronousMode"/>.</summary>
+    public async ValueTask CommitAsync(
+        CancellationToken cancellationToken,
+        SqliteSynchronousMode synchronousMode)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ThrowIfNotActive();
             try
             {
-                await _pager.CommitTransactionAsync(this, cancellationToken).ConfigureAwait(false);
+                await _pager
+                    .CommitTransactionAsync(this, cancellationToken, synchronousMode)
+                    .ConfigureAwait(false);
                 _state = SqlitePagerTransactionState.Committed;
             }
             catch

@@ -176,6 +176,12 @@ public class AhtolaCommand : DbCommand
     public override object? ExecuteScalar()
     {
         ThrowIfSynchronousBrowserOperation("ExecuteScalarAsync");
+        if (_connection?.IsRemote == true)
+        {
+            return _cancellation
+                .Run(token => ExecuteRemoteScalarAsync(token).GetAwaiter().GetResult());
+        }
+
         using var reader = _cancellation.Run(token => Execute(CommandBehavior.Default, token));
         var result = reader.Read()
             ? reader.GetValue(0)
@@ -185,6 +191,13 @@ public class AhtolaCommand : DbCommand
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
+        if (_connection?.IsRemote == true)
+        {
+            return await _cancellation
+                .RunAsync(ExecuteRemoteScalarAsync, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
         await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
         var result = await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
             ? reader.GetValue(0)
@@ -585,11 +598,25 @@ public class AhtolaCommand : DbCommand
 
         var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
         var sql = RewriteFacadePragmas(CommandText, _connection);
-        var result = await _connection
-            .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: true, CommandTimeout, cancellationToken)
+        if (transactionCompletion != SqlTransactionCompletion.None)
+        {
+            var buffered = await _connection
+                .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: true, CommandTimeout, cancellationToken)
+                .ConfigureAwait(false);
+            MarkTransactionCompletedExternally(transactionCompletion);
+            return new AhtolaRemoteDataReader(this, buffered, behavior);
+        }
+
+        var execution = await _connection
+            .ExecuteRemoteReaderAsync(sql, _parameterCollection, CommandTimeout, cancellationToken)
             .ConfigureAwait(false);
-        MarkTransactionCompletedExternally(transactionCompletion);
-        return new AhtolaRemoteDataReader(this, result, behavior);
+        return execution.Cursor is { } cursor
+            ? new AhtolaRemoteDataReader(this, cursor, execution.SchemaSource, behavior)
+            : new AhtolaRemoteDataReader(
+                this,
+                execution.BufferedResult
+                ?? throw new AhtolaException("Remote reader execution returned no result."),
+                behavior);
     }
 
     private async Task<int> ExecuteRemoteNonQueryAsync(CancellationToken cancellationToken)
@@ -610,6 +637,28 @@ public class AhtolaCommand : DbCommand
             .ConfigureAwait(false);
         MarkTransactionCompletedExternally(transactionCompletion);
         return checked((int)result.AffectedRowCount);
+    }
+
+    private async Task<object?> ExecuteRemoteScalarAsync(CancellationToken cancellationToken)
+    {
+        if (_connection is null)
+            throw new InvalidOperationException("Connection must be set before executing a command.");
+        if (string.IsNullOrWhiteSpace(CommandText))
+            throw new InvalidOperationException("CommandText must be set before executing a command.");
+        ValidateTransaction();
+        _connection.ValidateCommandCapabilities(CommandText);
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
+        var sql = RewriteFacadePragmas(CommandText, _connection);
+        var result = await _connection
+            .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: true, CommandTimeout, cancellationToken)
+            .ConfigureAwait(false);
+        MarkTransactionCompletedExternally(transactionCompletion);
+        return result.Rows.Count > 0 && result.Rows[0].Count > 0
+            ? result.Rows[0][0].ToClrValue()
+            : null;
     }
 
     private void MarkTransactionCompletedExternally(SqlTransactionCompletion completion)

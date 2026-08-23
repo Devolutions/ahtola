@@ -76,6 +76,8 @@ internal sealed class FakeBrowserPersistentStore : IBrowserPersistentStore
 
     public IReadOnlyCollection<string> Paths => _files.Keys;
 
+    public List<string> FlushPaths { get; } = [];
+
     public byte[] Read(string path) => _files[path].AsSpan().ToArray();
 
     public bool Contains(string path) => _files.ContainsKey(path);
@@ -177,7 +179,11 @@ internal sealed class FakeBrowserPersistentStore : IBrowserPersistentStore
         }
 
         public ValueTask FlushToDiskAsync(CancellationToken cancellationToken = default)
-            => ValueTask.CompletedTask;
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            owner.FlushPaths.Add(path);
+            return ValueTask.CompletedTask;
+        }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }

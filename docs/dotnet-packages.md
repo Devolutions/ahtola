@@ -398,6 +398,22 @@ commands. An active transaction is never replayed: it becomes unusable and
 commit/rollback preserves the original stream failure instead of masking it
 with a local "database is closed" error.
 
+Direct remote connections use Hrana HTTP v3. Pipeline operations are sent to
+`/v3/pipeline`, while `ExecuteReader`/`ExecuteReaderAsync` use `/v3/cursor` and
+parse the newline-delimited cursor response incrementally; rows are available
+to the `DbDataReader` without buffering the complete response. The cursor's
+baton follows the same transaction and `Read Your Writes` lifetime as pipeline
+requests, and stateless cursors are closed explicitly after their terminating
+frame.
+
+For an unversioned database URL, a `404 Not Found` from the first stateless v3
+request selects Hrana v2 for that connection and retries through
+`/v2/pipeline`; readers are buffered on that compatibility path because v2 has
+no cursor endpoint. A URL that explicitly ends in `/v2/pipeline` or a v3
+endpoint is pinned to that version and is never downgraded. No fallback is
+attempted after a baton has been issued, so an expired or invalid live session
+cannot be mistaken for protocol negotiation.
+
 ## Turso Cloud: managed embedded replica
 
 Add `Replica Path=<file>` to get a **managed embedded replica**: a local

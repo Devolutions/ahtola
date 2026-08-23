@@ -1650,9 +1650,12 @@ public sealed class SqlitePager : IDisposable
     /// Commits a complete table-leaf mutation through this pager's WAL overlay.
     /// Its source page count must match the currently committed view.
     /// </summary>
-    public void CommitMutation(SqliteTableLeafMutation mutation)
+    public void CommitMutation(
+        SqliteTableLeafMutation mutation,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentNullException.ThrowIfNull(mutation);
+        synchronousMode.Validate(nameof(synchronousMode));
         using var transaction = BeginTransaction(mutation.TargetDatabaseSizeInPages);
         lock (_gate)
         {
@@ -1668,7 +1671,7 @@ public sealed class SqlitePager : IDisposable
         foreach (var overflowPage in mutation.OverflowPages)
             transaction.WritePage(overflowPage.PageNumber, overflowPage.Page.Span);
         transaction.WritePage(mutation.TableLeafPageNumber, mutation.TableLeafPage.Span);
-        transaction.Commit();
+        transaction.Commit(synchronousMode);
     }
 
     /// <summary>
@@ -1676,8 +1679,13 @@ public sealed class SqlitePager : IDisposable
     /// retaining the WAL. The operation is allowed only when every page it needs
     /// is recoverable from the still-retained WAL and no transaction is active.
     /// </summary>
-    public SqliteCheckpointResult CheckpointToMainStore(TimeSpan? busyTimeout = null)
-        => CheckpointToMainStoreCore(busyTimeout, resetCommittedWal: false);
+    public SqliteCheckpointResult CheckpointToMainStore(
+        TimeSpan? busyTimeout = null,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+        => CheckpointToMainStoreCore(
+            busyTimeout,
+            resetCommittedWal: false,
+            synchronousMode: synchronousMode);
 
     /// <summary>
     /// Exclusively installs the committed WAL view into the durable main database
@@ -1689,8 +1697,13 @@ public sealed class SqlitePager : IDisposable
     /// external change occurred while checkpointing. Any failure leaves the pager
     /// faulted and does not intentionally discard WAL recovery evidence.
     /// </remarks>
-    public SqliteCheckpointResult CheckpointToMainStoreAndResetWal(TimeSpan? busyTimeout = null)
-        => CheckpointToMainStoreCore(busyTimeout, resetCommittedWal: true);
+    public SqliteCheckpointResult CheckpointToMainStoreAndResetWal(
+        TimeSpan? busyTimeout = null,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+        => CheckpointToMainStoreCore(
+            busyTimeout,
+            resetCommittedWal: true,
+            synchronousMode: synchronousMode);
 
     /// <summary>
     /// Persists caller-owned checkpoint rollback state while the authenticated
@@ -1698,13 +1711,15 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     internal SqliteCheckpointResult CheckpointToMainStoreAndResetWal(
         Action<SqliteCheckpointRevertCapture> persistRevertCapture,
-        TimeSpan? busyTimeout = null)
+        TimeSpan? busyTimeout = null,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentNullException.ThrowIfNull(persistRevertCapture);
         return CheckpointToMainStoreCore(
             busyTimeout,
             resetCommittedWal: true,
-            persistRevertCapture);
+            synchronousMode: synchronousMode,
+            persistRevertCapture: persistRevertCapture);
     }
 
     /// <summary>
@@ -1714,11 +1729,18 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     public SqliteJournalMode SwitchJournalMode(
         SqliteJournalMode journalMode,
-        TimeSpan? busyTimeout = null)
+        TimeSpan? busyTimeout = null,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         if (JournalMode == journalMode)
             return journalMode;
 
+        var forceDurableWalFold = journalMode == SqliteJournalMode.Delete
+            && UsesWalStorage(JournalMode);
+        var transitionSynchronousMode = forceDurableWalFold
+            ? SqliteSynchronousMode.Full
+            : synchronousMode;
         var timeout = ResolveBusyTimeout(busyTimeout);
         var lockStopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
         using var checkpointLock = _lockManager.EnterCheckpoint(timeout);
@@ -1730,11 +1752,15 @@ public sealed class SqlitePager : IDisposable
                     SqlitePagerLockManager.RemainingFileLockTimeout(timeout, lockStopwatch),
                     resetCommittedWal: true,
                     writerLockAlreadyHeld: true,
-                    checkpointLockAlreadyHeld: true);
+                    checkpointLockAlreadyHeld: true,
+                    synchronousMode: transitionSynchronousMode);
             }
             else
             {
-                CheckpointToMainStoreUnderLock(checkpointLock, resetCommittedWal: true);
+                CheckpointToMainStoreUnderLock(
+                    checkpointLock,
+                    resetCommittedWal: true,
+                    synchronousMode: transitionSynchronousMode);
             }
         }
 
@@ -1807,8 +1833,9 @@ public sealed class SqlitePager : IDisposable
                                 _pageStore.PageSize,
                                 unchecked((uint)Random.Shared.NextInt64()),
                                 unchecked((uint)Random.Shared.NextInt64())),
-                                                GetFileSystemEncryption(_fileSystem),
-                                                GetFileSystemPageCodec(_fileSystem));
+                            GetFileSystemEncryption(_fileSystem),
+                            GetFileSystemPageCodec(_fileSystem),
+                            transitionSynchronousMode);
                     }
 
                     SqliteRollbackJournal.Commit(
@@ -1819,8 +1846,10 @@ public sealed class SqlitePager : IDisposable
                         () =>
                         {
                             _pageStore.WritePage(1, pageOne);
-                            _pageStore.Flush();
-                        });
+                            if (transitionSynchronousMode.SyncsCheckpoint())
+                                _pageStore.Flush();
+                        },
+                        transitionSynchronousMode);
 
                     _journalMode = journalMode;
                     if (UsesWalStorage(journalMode))
@@ -1995,8 +2024,10 @@ public sealed class SqlitePager : IDisposable
     private SqliteCheckpointResult CheckpointToMainStoreCore(
         TimeSpan? busyTimeout,
         bool resetCommittedWal,
+        SqliteSynchronousMode synchronousMode,
         Action<SqliteCheckpointRevertCapture>? persistRevertCapture = null)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         var timeout = ResolveBusyTimeout(busyTimeout);
         if (UsesWalIndexCheckpointProtocol())
         {
@@ -2004,6 +2035,7 @@ public sealed class SqlitePager : IDisposable
                 timeout,
                 resetCommittedWal,
                 writerLockAlreadyHeld: false,
+                synchronousMode: synchronousMode,
                 persistRevertCapture: persistRevertCapture);
         }
 
@@ -2018,6 +2050,7 @@ public sealed class SqlitePager : IDisposable
             checkpointLock,
             resetCommittedWal,
             mainFileLock,
+            synchronousMode,
             persistRevertCapture);
     }
 
@@ -2038,6 +2071,7 @@ public sealed class SqlitePager : IDisposable
         SqlitePagerLockLease checkpointLock,
         bool resetCommittedWal,
         SqliteMainFileLockLease? mainFileLock = null,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         Action<SqliteCheckpointRevertCapture>? persistRevertCapture = null)
     {
         lock (_gate)
@@ -2068,9 +2102,11 @@ public sealed class SqlitePager : IDisposable
                 // (e.g. CaptureCommittedViewToken) publish from commit metadata without
                 // a main-file Read — required after exclusive rewrite SetLength.
                 _walPageOverlay.TryGetValue(1, out var committedPageOne);
-                var installedPageCount = InstallCommittedOverlayIntoMainStore();
+                if (_committedFrameCount > 0 && synchronousMode.SyncsCheckpoint())
+                    RequireWal().Flush();
+                var installedPageCount = InstallCommittedOverlayIntoMainStore(synchronousMode);
                 var retainedCommittedFrameCount = _committedFrameCount;
-                if (resetCommittedWal)
+                if (resetCommittedWal && synchronousMode.SyncsCheckpoint())
                 {
                     if (_pageStore.PageCount != _committedPageCount)
                     {
@@ -2124,8 +2160,10 @@ public sealed class SqlitePager : IDisposable
         bool resetCommittedWal,
         bool writerLockAlreadyHeld,
         bool checkpointLockAlreadyHeld = false,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         Action<SqliteCheckpointRevertCapture>? persistRevertCapture = null)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         const long writeLockOffset = SqliteWalIndexCheckpointInfo.LockOffset;
         const long checkpointLockOffset = SqliteWalIndexCheckpointInfo.LockOffset + 1;
         const long firstReadMarkLockOffset = SqliteWalIndexCheckpointInfo.LockOffset + 3;
@@ -2307,16 +2345,20 @@ public sealed class SqlitePager : IDisposable
 
                                         try
                                         {
-                                            RequireWal().Flush();
+                                            if (synchronousMode.SyncsCheckpoint())
+                                                RequireWal().Flush();
                                             _walPageOverlay.TryGetValue(1, out committedPageOne);
                                             installedPageCount = safeFrame == (uint)_committedFrameCount
-                                                ? InstallCommittedOverlayIntoMainStore()
-                                                : InstallWalFramesIntoMainStore(safeFrame);
-                                            _walIndex.PublishBackfilledFrameCount(
-                                                region.Header,
-                                                safeFrame,
-                                                _wal);
-                                            backfilled = safeFrame;
+                                                ? InstallCommittedOverlayIntoMainStore(synchronousMode)
+                                                : InstallWalFramesIntoMainStore(safeFrame, synchronousMode);
+                                            if (synchronousMode.SyncsCheckpoint())
+                                            {
+                                                _walIndex.PublishBackfilledFrameCount(
+                                                    region.Header,
+                                                    safeFrame,
+                                                    _wal);
+                                                backfilled = safeFrame;
+                                            }
                                         }
                                         catch (SqliteWalIncarnationChangedException)
                                         {
@@ -2325,7 +2367,7 @@ public sealed class SqlitePager : IDisposable
                                     }
 
                                     var retainedCommittedFrameCount = _committedFrameCount;
-                                    if (resetCommittedWal)
+                                    if (resetCommittedWal && synchronousMode.SyncsCheckpoint())
                                     {
                                         if (!allExclusive || backfilled != region.Header.MaximumFrame)
                                         {
@@ -2450,7 +2492,7 @@ public sealed class SqlitePager : IDisposable
             RetainedCommittedFrameCount: _committedFrameCount);
     }
 
-    private int InstallCommittedOverlayIntoMainStore()
+    private int InstallCommittedOverlayIntoMainStore(SqliteSynchronousMode synchronousMode)
     {
         var originalStorePageCount = _pageStore.PageCount;
         var installedPageCount = 0;
@@ -2492,11 +2534,13 @@ public sealed class SqlitePager : IDisposable
             installedPageCount++;
         }
 
-        _pageStore.Flush();
+        if (synchronousMode.SyncsCheckpoint())
+            _pageStore.Flush();
         if (_committedPageCount < originalStorePageCount)
         {
             _pageStore.TruncateToPageCount(_committedPageCount);
-            _pageStore.Flush();
+            if (synchronousMode.SyncsCheckpoint())
+                _pageStore.Flush();
         }
 
         return installedPageCount;
@@ -2538,7 +2582,9 @@ public sealed class SqlitePager : IDisposable
             pageNumber => GetCommittedPageImage(pageNumber));
     }
 
-    private int InstallWalFramesIntoMainStore(uint safeFrame)
+    private int InstallWalFramesIntoMainStore(
+        uint safeFrame,
+        SqliteSynchronousMode synchronousMode)
     {
         var wal = RequireWal();
         var finalFrame = wal.ReadFrame(safeFrame);
@@ -2588,9 +2634,11 @@ public sealed class SqlitePager : IDisposable
 
             _pageStore.WriteShrinkCheckpointPageOne(pageOne);
             installedPageCount++;
-            _pageStore.Flush();
+            if (synchronousMode.SyncsCheckpoint())
+                _pageStore.Flush();
             _pageStore.TruncateToPageCount(targetPageCount);
-            _pageStore.Flush();
+            if (synchronousMode.SyncsCheckpoint())
+                _pageStore.Flush();
             return installedPageCount;
         }
 
@@ -2600,7 +2648,8 @@ public sealed class SqlitePager : IDisposable
             installedPageCount++;
         }
 
-        _pageStore.Flush();
+        if (synchronousMode.SyncsCheckpoint())
+            _pageStore.Flush();
         return installedPageCount;
     }
 
@@ -2663,9 +2712,12 @@ public sealed class SqlitePager : IDisposable
         }
     }
 
-    internal void CommitTransaction(SqlitePagerTransaction transaction)
+    internal void CommitTransaction(
+        SqlitePagerTransaction transaction,
+        SqliteSynchronousMode synchronousMode)
     {
         ArgumentNullException.ThrowIfNull(transaction);
+        synchronousMode.Validate(nameof(synchronousMode));
         if (transaction.RequiresExclusiveCommit)
             transaction.UpgradeToExclusiveCommit();
 
@@ -2681,7 +2733,7 @@ public sealed class SqlitePager : IDisposable
             {
                 if (_journalMode == SqliteJournalMode.Delete)
                 {
-                    CommitRollbackTransaction(transaction);
+                    CommitRollbackTransaction(transaction, synchronousMode);
                     _lockGeneration = transaction.PublishStorageChange();
                     _activeTransaction = null;
                     _state = SqlitePagerState.Ready;
@@ -2703,7 +2755,8 @@ public sealed class SqlitePager : IDisposable
                         transaction.TargetDatabaseSizeInPages);
                 }
 
-                wal.Flush();
+                if (synchronousMode.SyncsWalCommit())
+                    wal.Flush();
                 var recovery = wal.ScanRecovery();
                 if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
                     || recovery.LastCommittedFrameNumber != recovery.LastValidFrameNumber
@@ -2734,13 +2787,15 @@ public sealed class SqlitePager : IDisposable
                             TimeSpan.Zero,
                             resetCommittedWal: true,
                             writerLockAlreadyHeld: true,
-                            checkpointLockAlreadyHeld: true);
+                            checkpointLockAlreadyHeld: true,
+                            synchronousMode: synchronousMode);
                     }
                     else
                     {
                         _ = CheckpointToMainStoreUnderLock(
                             transaction.TransactionLock,
-                            resetCommittedWal: true);
+                            resetCommittedWal: true,
+                            synchronousMode: synchronousMode);
                     }
                 }
                 transaction.ReleaseWriterLock();
@@ -2755,7 +2810,9 @@ public sealed class SqlitePager : IDisposable
         }
     }
 
-    private void CommitRollbackTransaction(SqlitePagerTransaction transaction)
+    private void CommitRollbackTransaction(
+        SqlitePagerTransaction transaction,
+        SqliteSynchronousMode synchronousMode)
     {
         var originalPageCount = _committedPageCount;
         var pagesToJournal = new HashSet<uint>(
@@ -2803,13 +2860,16 @@ public sealed class SqlitePager : IDisposable
                         _pageStore.WritePage(1, pageOne);
                 }
 
-                _pageStore.Flush();
+                if (synchronousMode.SyncsCheckpoint())
+                    _pageStore.Flush();
                 if (transaction.TargetDatabaseSizeInPages < originalPageCount)
                 {
                     _pageStore.TruncateToPageCount(transaction.TargetDatabaseSizeInPages);
-                    _pageStore.Flush();
+                    if (synchronousMode.SyncsCheckpoint())
+                        _pageStore.Flush();
                 }
-            });
+            },
+            synchronousMode);
 
         _committedPageCount = transaction.TargetDatabaseSizeInPages;
         _committedFrameCount = 0;
@@ -4507,17 +4567,21 @@ public sealed class SqlitePagerTransaction : IDisposable
     }
 
     /// <summary>
-    /// Appends all staged images and makes them visible only after the WAL commit
-    /// frame and WAL flush both complete.
+    /// Appends all staged images and makes them visible after the configured
+    /// durability barrier completes.
     /// </summary>
-    public void Commit()
+    public void Commit() => Commit(SqliteSynchronousMode.Full);
+
+    /// <summary>Commits all staged images using <paramref name="synchronousMode"/>.</summary>
+    public void Commit(SqliteSynchronousMode synchronousMode)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             ThrowIfNotActive();
             try
             {
-                _pager.CommitTransaction(this);
+                _pager.CommitTransaction(this, synchronousMode);
                 _state = SqlitePagerTransactionState.Committed;
             }
             catch

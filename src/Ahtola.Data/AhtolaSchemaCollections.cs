@@ -559,6 +559,7 @@ internal static class AhtolaSchemaCollections
     /// </summary>
     internal static DataTable BuildReaderSchemaTable(
         DbConnection? connection,
+        ReaderSchemaSource? cachedSource,
         string? commandText,
         int fieldCount,
         Func<int, string> getName,
@@ -566,9 +567,18 @@ internal static class AhtolaSchemaCollections
     {
         var schema = CreateReaderSchemaTable();
         var hasSource = TryGetSelectSource(commandText, fieldCount, getName, out var tableName, out var selections);
-        var tableColumns = hasSource && connection is not null
-            ? GetTableColumns(connection, tableName)
-            : new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, ReaderSchemaColumn> tableColumns;
+        if (hasSource && cachedSource is not null
+            && cachedSource.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
+        {
+            tableColumns = cachedSource.Columns;
+        }
+        else
+        {
+            tableColumns = hasSource && connection is not null
+                ? GetTableColumns(connection, tableName)
+                : new Dictionary<string, ReaderSchemaColumn>(StringComparer.OrdinalIgnoreCase);
+        }
 
         for (var i = 0; i < fieldCount; i++)
         {
@@ -616,6 +626,125 @@ internal static class AhtolaSchemaCollections
 
         return schema;
     }
+
+    internal static DataTable BuildReaderSchemaTable(
+        DbConnection? connection,
+        string? commandText,
+        int fieldCount,
+        Func<int, string> getName,
+        Func<int, Type> getFieldType)
+        => BuildReaderSchemaTable(connection, null, commandText, fieldCount, getName, getFieldType);
+
+    internal static bool TryGetReaderSchemaTableName(string? commandText, out string tableName)
+    {
+        tableName = string.Empty;
+        if (string.IsNullOrWhiteSpace(commandText))
+            return false;
+
+        var match = Regex.Match(
+            commandText,
+            @"^\s*SELECT\s+.*?\s+FROM\s+(?<table>""(?:[^""]|"""")+""|\[[^\]]+\]|`[^`]+`|[\w]+)",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!match.Success)
+            return false;
+
+        if (HasAdditionalTopLevelSource(commandText.AsSpan(match.Length)))
+            return false;
+
+        tableName = UnquoteIdentifier(match.Groups["table"].Value);
+        return true;
+    }
+
+    private static bool HasAdditionalTopLevelSource(ReadOnlySpan<char> sql)
+    {
+        for (var index = 0; index < sql.Length;)
+        {
+            var current = sql[index];
+            if (current == '-' && index + 1 < sql.Length && sql[index + 1] == '-')
+            {
+                index += 2;
+                while (index < sql.Length && sql[index] is not '\r' and not '\n')
+                    index++;
+                continue;
+            }
+            if (current == '/' && index + 1 < sql.Length && sql[index + 1] == '*')
+            {
+                index += 2;
+                while (index + 1 < sql.Length && (sql[index] != '*' || sql[index + 1] != '/'))
+                    index++;
+                index = Math.Min(sql.Length, index + 2);
+                continue;
+            }
+            if (current is '\'' or '"' or '`' or '[')
+            {
+                var closing = current == '[' ? ']' : current;
+                index++;
+                while (index < sql.Length)
+                {
+                    if (sql[index] != closing)
+                    {
+                        index++;
+                        continue;
+                    }
+                    if (closing != ']' && index + 1 < sql.Length && sql[index + 1] == closing)
+                    {
+                        index += 2;
+                        continue;
+                    }
+                    index++;
+                    break;
+                }
+                continue;
+            }
+            if (current == ',')
+                return true;
+            if (current == ';')
+                return false;
+            if (!char.IsLetter(current) && current != '_')
+            {
+                index++;
+                continue;
+            }
+
+            var start = index++;
+            while (index < sql.Length && (char.IsLetterOrDigit(sql[index]) || sql[index] == '_'))
+                index++;
+            var token = sql[start..index];
+            if (token.Equals("JOIN", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("CROSS", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("INNER", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("LEFT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("RIGHT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("FULL", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("NATURAL", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            if (token.Equals("WHERE", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("GROUP", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("HAVING", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("ORDER", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("LIMIT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("OFFSET", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("WINDOW", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("UNION", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("EXCEPT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("INTERSECT", StringComparison.OrdinalIgnoreCase)
+                || token.Equals("RETURNING", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    internal static ReaderSchemaSource CreateReaderSchemaSource(
+        string tableName,
+        IEnumerable<ReaderSchemaColumn> columns)
+        => new(
+            tableName,
+            columns.ToDictionary(static column => column.Name, StringComparer.OrdinalIgnoreCase));
 
     /// <summary>
     /// Resolves the declared SQLite type of every projected column, or <c>null</c> for a column
@@ -955,7 +1084,11 @@ internal static class AhtolaSchemaCollections
         return 3;
     }
 
-    private sealed record ReaderSchemaColumn(
+    internal sealed record ReaderSchemaSource(
+        string TableName,
+        Dictionary<string, ReaderSchemaColumn> Columns);
+
+    internal sealed record ReaderSchemaColumn(
         string Name,
         string TypeName,
         bool AllowNull,

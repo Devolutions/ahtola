@@ -331,7 +331,11 @@ internal static class SqliteRollbackJournal
 
             await journal.DisposeAsync().ConfigureAwait(false);
             journal = null;
-            await DeleteAsync(fileSystem, journalPath, cancellationToken).ConfigureAwait(false);
+            await DeleteAsync(
+                    fileSystem,
+                    journalPath,
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -500,13 +504,15 @@ internal static class SqliteRollbackJournal
         string journalPath,
         SqlitePageStore pageStore,
         IReadOnlyCollection<uint> pageNumbers,
-        Action applyDatabaseChanges)
+        Action applyDatabaseChanges,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
         ArgumentException.ThrowIfNullOrEmpty(journalPath);
         ArgumentNullException.ThrowIfNull(pageStore);
         ArgumentNullException.ThrowIfNull(pageNumbers);
         ArgumentNullException.ThrowIfNull(applyDatabaseChanges);
+        synchronousMode.Validate(nameof(synchronousMode));
 
         var originalPageCount = pageStore.PageCount;
         var pages = pageNumbers
@@ -552,7 +558,8 @@ internal static class SqliteRollbackJournal
                 }
 
                 journal.SetLength(recordOffset);
-                journal.FlushToDisk();
+                if (synchronousMode.UsesFullRollbackBarriers())
+                    journal.FlushToDisk();
 
                 Span<byte> durableHeader = stackalloc byte[HeaderSize];
                 WriteHeader(
@@ -563,11 +570,12 @@ internal static class SqliteRollbackJournal
                     pageStore.PageSize,
                     includeMagic: true);
                 journal.Write(0, durableHeader);
-                journal.FlushToDisk();
+                if (synchronousMode.SyncsCheckpoint())
+                    journal.FlushToDisk();
             }
 
             applyDatabaseChanges();
-            Invalidate(journalPath, fileSystem);
+            Invalidate(journalPath, fileSystem, synchronousMode);
         }
         catch
         {
@@ -584,6 +592,7 @@ internal static class SqliteRollbackJournal
         uint checksumNonce,
         uint initialDatabasePageCount,
         int pageSize,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
@@ -591,6 +600,7 @@ internal static class SqliteRollbackJournal
         if (recordCount < 0)
             throw new ArgumentOutOfRangeException(nameof(recordCount));
         ValidateHeaderFields(initialDatabasePageCount, pageSize);
+        synchronousMode.Validate(nameof(synchronousMode));
 
         var journal = await fileSystem
             .OpenFileAsync(
@@ -614,7 +624,8 @@ internal static class SqliteRollbackJournal
                 recordCount,
                 checksumNonce,
                 initialDatabasePageCount,
-                pageSize);
+                pageSize,
+                synchronousMode);
         }
         catch
         {
@@ -633,10 +644,12 @@ internal static class SqliteRollbackJournal
     internal static async ValueTask DeleteAsync(
         IAsyncFileSystem fileSystem,
         string journalPath,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
         ArgumentException.ThrowIfNullOrEmpty(journalPath);
+        synchronousMode.Validate(nameof(synchronousMode));
 
         var journal = await fileSystem
             .OpenFileAsync(
@@ -649,7 +662,8 @@ internal static class SqliteRollbackJournal
             await journal
                 .WriteAsync(0, new byte[Magic.Length], cancellationToken)
                 .ConfigureAwait(false);
-            await journal.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
+            if (synchronousMode.UsesFullRollbackBarriers())
+                await journal.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -666,6 +680,7 @@ internal static class SqliteRollbackJournal
         private readonly uint _checksumNonce;
         private readonly uint _initialDatabasePageCount;
         private readonly int _pageSize;
+        private readonly SqliteSynchronousMode _synchronousMode;
         private readonly SemaphoreSlim _gate = new(1, 1);
         private readonly HashSet<uint> _writtenPages = [];
         private int _writtenRecordCount;
@@ -678,13 +693,15 @@ internal static class SqliteRollbackJournal
             int recordCount,
             uint checksumNonce,
             uint initialDatabasePageCount,
-            int pageSize)
+            int pageSize,
+            SqliteSynchronousMode synchronousMode)
         {
             _journal = journal;
             _recordCount = recordCount;
             _checksumNonce = checksumNonce;
             _initialDatabasePageCount = initialDatabasePageCount;
             _pageSize = pageSize;
+            _synchronousMode = synchronousMode;
         }
 
         internal async ValueTask WritePageRecordAsync(
@@ -762,7 +779,8 @@ internal static class SqliteRollbackJournal
                 }
 
                 await _journal.SetLengthAsync(_recordOffset, cancellationToken).ConfigureAwait(false);
-                await _journal.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
+                if (_synchronousMode.UsesFullRollbackBarriers())
+                    await _journal.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
 
                 var durableHeader = new byte[HeaderSize];
                 WriteHeader(
@@ -773,7 +791,8 @@ internal static class SqliteRollbackJournal
                     _pageSize,
                     includeMagic: true);
                 await _journal.WriteAsync(0, durableHeader, cancellationToken).ConfigureAwait(false);
-                await _journal.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
+                if (_synchronousMode.SyncsCheckpoint())
+                    await _journal.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
                 _finalized = true;
             }
             finally
@@ -898,12 +917,16 @@ internal static class SqliteRollbackJournal
     private static uint ComputeChecksum(ReadOnlySpan<byte> page, uint nonce)
         => SqliteRollbackJournalFormat.ComputeChecksum(page, nonce);
 
-    private static void Invalidate(string journalPath, IFileSystem fileSystem)
+    private static void Invalidate(
+        string journalPath,
+        IFileSystem fileSystem,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         using (var journal = fileSystem.OpenFile(journalPath, FileOpenMode.OpenExisting))
         {
             journal.Write(0, new byte[Magic.Length]);
-            journal.FlushToDisk();
+            if (synchronousMode.UsesFullRollbackBarriers())
+                journal.FlushToDisk();
         }
 
         TryDelete(fileSystem, journalPath);

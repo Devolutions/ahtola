@@ -1,4 +1,5 @@
 using System.Data;
+using System.Data.Common;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -84,6 +85,9 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
             schema.Should().NotBeNull();
             schema!.Rows.Count.Should().Be(1);
             schema.Rows[0][System.Data.Common.SchemaTableColumn.ColumnName].Should().Be("value");
+            schema.Rows[0][System.Data.Common.SchemaTableColumn.BaseTableName].Should().Be("widgets");
+            schema.Rows[0][System.Data.Common.SchemaTableColumn.BaseColumnName].Should().Be("value");
+            schema.Rows[0][System.Data.Common.SchemaTableColumn.IsKey].Should().Be(true);
         }
         finally
         {
@@ -119,6 +123,67 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
         {
             SqliteConnection.RemoteMessageHandlerFactory = priorFactory;
         }
+    }
+
+    [Test]
+    public void RemoteAhtolaCommandBuilderUsesCachedCursorSchemaMetadata()
+    {
+        using var handler = new MinimalRemoteSchemaHandler();
+        var priorFactory = global::Ahtola.AhtolaConnection.RemoteMessageHandlerFactory;
+        global::Ahtola.AhtolaConnection.RemoteMessageHandlerFactory = () => handler;
+        try
+        {
+            using var connection = new global::Ahtola.AhtolaConnection(
+                "Data Source=https://example.test/db;Auth Token=token");
+            connection.Open();
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "SELECT value FROM widgets";
+                using var reader = command.ExecuteReader();
+                var schema = reader.GetSchemaTable()!;
+                schema.Rows[0][SchemaTableColumn.IsUnique].Should().Be(false);
+            }
+            using var adapter = new global::Ahtola.AhtolaDataAdapter(
+                "SELECT value FROM widgets",
+                connection);
+            using var builder = new global::Ahtola.AhtolaCommandBuilder(adapter);
+
+            using var update = builder.GetUpdateCommand();
+
+            update.CommandText.Should().Contain("UPDATE").And.Contain("widgets").And.Contain("value");
+        }
+        finally
+        {
+            global::Ahtola.AhtolaConnection.RemoteMessageHandlerFactory = priorFactory;
+        }
+    }
+
+    [Test]
+    public void RemoteCursorSchemaCacheRejectsJoinQueries()
+    {
+        AhtolaSchemaCollections.TryGetReaderSchemaTableName(
+                "SELECT b.id, b.value FROM a JOIN b ON b.id = a.id",
+                out _)
+            .Should().BeFalse();
+        AhtolaSchemaCollections.TryGetReaderSchemaTableName(
+                "SELECT b.id FROM a -- where related rows\nJOIN b ON b.id = a.id",
+                out _)
+            .Should().BeFalse();
+    }
+
+    [Test]
+    public void RemoteCursorSchemaCacheAcceptsSingleTableOrderByLists()
+    {
+        AhtolaSchemaCollections.TryGetReaderSchemaTableName(
+                "SELECT value FROM widgets ORDER BY value, value",
+                out var tableName)
+            .Should().BeTrue();
+        tableName.Should().Be("widgets");
+        AhtolaSchemaCollections.TryGetReaderSchemaTableName(
+                "SELECT value FROM widgets -- joins are documented elsewhere\nORDER BY value, value",
+                out tableName)
+            .Should().BeTrue();
+        tableName.Should().Be("widgets");
     }
 
     [Test]
@@ -494,15 +559,58 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
         {
             using var document = JsonDocument.Parse(
                 await request.Content!.ReadAsStringAsync(cancellationToken));
-            var sql = document.RootElement
-                .GetProperty("requests")[0]
-                .GetProperty("stmt")
-                .GetProperty("sql")
-                .GetString();
+            var cursor = request.RequestUri!.AbsolutePath.EndsWith("/v3/cursor", StringComparison.Ordinal);
+            var root = document.RootElement;
+            if (!cursor
+                && root.GetProperty("requests")[0].GetProperty("type").GetString() == "close")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """{"baton":null,"results":[{"type":"ok","response":{"type":"close"}}]}""",
+                        Encoding.UTF8,
+                        "application/json"),
+                };
+            }
 
-            var response = sql!.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
-                ? """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"value","decltype":"INTEGER"}],"rows":[[{"type":"integer","value":"42"}]],"affected_row_count":0}}}]}"""
-                : """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}}]}""";
+            var statement = cursor
+                ? root.GetProperty("batch").GetProperty("steps")[0].GetProperty("stmt")
+                : root.GetProperty("requests")[0].GetProperty("stmt");
+            var sql = statement.GetProperty("sql").GetString();
+            if (cursor)
+            {
+                var cursorResponse = sql!.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+                    ? """
+                      {"baton":"schema-cursor","base_url":null}
+                      {"type":"step_begin","step":0,"cols":[{"name":"value","decltype":"INTEGER"}]}
+                      {"type":"row","row":[{"type":"integer","value":"42"}]}
+                      {"type":"step_end","affected_row_count":0,"last_insert_rowid":null}
+                      {"type":"replication_index","replication_index":null}
+                      """
+                    : """
+                      {"baton":"schema-cursor","base_url":null}
+                      {"type":"step_begin","step":0,"cols":[]}
+                      {"type":"step_end","affected_row_count":0,"last_insert_rowid":null}
+                      {"type":"replication_index","replication_index":null}
+                      """;
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(cursorResponse + "\n", Encoding.UTF8, "application/x-ndjson"),
+                };
+            }
+
+            var response = sql switch
+            {
+                not null when sql.StartsWith("PRAGMA table_info", StringComparison.OrdinalIgnoreCase)
+                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"cid"},{"name":"name"},{"name":"type"},{"name":"notnull"},{"name":"dflt_value"},{"name":"pk"}],"rows":[[{"type":"integer","value":"0"},{"type":"text","value":"value"},{"type":"text","value":"INTEGER"},{"type":"integer","value":"1"},{"type":"null"},{"type":"integer","value":"1"}]],"affected_row_count":0}}}]}""",
+                not null when sql.StartsWith("PRAGMA index_list", StringComparison.OrdinalIgnoreCase)
+                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"seq"},{"name":"name"},{"name":"unique"},{"name":"origin"},{"name":"partial"}],"rows":[[{"type":"integer","value":"0"},{"type":"text","value":"ux_widgets_value"},{"type":"integer","value":"1"},{"type":"text","value":"c"},{"type":"integer","value":"1"}]],"affected_row_count":0}}}]}""",
+                not null when sql.StartsWith("PRAGMA index_info", StringComparison.OrdinalIgnoreCase)
+                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"seqno"},{"name":"cid"},{"name":"name"}],"rows":[[{"type":"integer","value":"0"},{"type":"integer","value":"0"},{"type":"text","value":"value"}]],"affected_row_count":0}}}]}""",
+                not null when sql.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+                    => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"value","decltype":"INTEGER"}],"rows":[[{"type":"integer","value":"42"}]],"affected_row_count":0}}}]}""",
+                _ => """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}}]}""",
+            };
 
             return new HttpResponseMessage(HttpStatusCode.OK)
             {

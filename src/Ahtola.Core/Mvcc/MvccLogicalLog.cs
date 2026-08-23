@@ -1,26 +1,23 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Core.Mvcc;
 
 /// <summary>
 /// Durable MVCC logical log (Turso <c>db-log</c> framing constants).
-/// Phase 2 stores commit frames with upsert/delete ops so an <see cref="MvStore"/>
-/// can recover after reopen. Full Turso CRC-chain / encryption parity is iterative.
+/// Stores commit frames with upsert/delete ops so an <see cref="MvStore"/>
+/// can recover after reopen. Encrypted stores use Turso's authenticated,
+/// chunked logical-log payload layout while preserving visible recovery framing.
 /// </summary>
 internal sealed class MvccLogicalLog : IDisposable
 {
     // Turso logical_log.rs constants.
-    private const uint LogMagic = 0x4C4D4C32; // "LML2"
     private const byte LegacyLogVersion = 3;
     private const byte CurrentLogVersion = 4;
-    private const int LogHeaderSize = 56;
-    private const int LogHeaderSaltStart = 8;
-    private const int LogHeaderCrcStart = 52;
-    private const uint FrameMagic = 0x5854564D; // "MVTX"
-    private const uint EndMagic = 0x4554564D; // "MVTE"
-    private const int TxHeaderSize = 24; // magic(4)+payload(8)+op_count(4)+commit_ts(8)
-    private const int TxTrailerSize = 8; // crc(4)+end_magic(4)
+    private const int LogHeaderSize = MvccLogicalLogFormat.LogHeaderSize;
+    private const int TxHeaderSize = MvccLogicalLogFormat.TxHeaderSize;
+    private const int TxTrailerSize = MvccLogicalLogFormat.TxTrailerSize;
     private const byte OpUpsertTable = 0;
     private const byte OpDeleteTable = 1;
     private const byte OpBaseTombstone = 0x80;
@@ -28,6 +25,7 @@ internal sealed class MvccLogicalLog : IDisposable
     private readonly IFileSystem _fileSystem;
     private readonly string _path;
     private readonly object _gate = new();
+    private readonly LogicalLogEncryption? _encryption;
     private IFile? _file;
     private long _offset;
     private ulong _salt;
@@ -40,7 +38,8 @@ internal sealed class MvccLogicalLog : IDisposable
         IFile file,
         long offset,
         ulong salt,
-        byte version)
+        byte version,
+        LogicalLogEncryption? encryption)
     {
         _fileSystem = fileSystem;
         _path = path;
@@ -48,6 +47,7 @@ internal sealed class MvccLogicalLog : IDisposable
         _offset = offset;
         _salt = salt;
         _version = version;
+        _encryption = encryption;
     }
 
     internal string Path => _path;
@@ -82,67 +82,93 @@ internal sealed class MvccLogicalLog : IDisposable
         return databasePath + "-log";
     }
 
-    internal static MvccLogicalLog CreateOrOpen(IFileSystem fileSystem, string databasePath)
+    internal static MvccLogicalLog CreateOrOpen(
+        IFileSystem fileSystem,
+        string databasePath,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
+        synchronousMode.Validate(nameof(synchronousMode));
+        var encryption = CreateEncryption(fileSystem);
         var path = LogPathForDatabase(databasePath);
-        if (fileSystem.FileExists(path))
+        try
         {
-            var existing = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly: false);
-            try
+            if (fileSystem.FileExists(path))
             {
-                if (existing.Length < LogHeaderSize)
-                {
-                    existing.Dispose();
-                    fileSystem.DeleteFile(path);
-                    return CreateNew(fileSystem, path);
-                }
-
-                Span<byte> header = stackalloc byte[LogHeaderSize];
-                ReadExact(existing, 0, header);
+                var existing = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly: false);
                 try
                 {
-                    var (salt, version) = ValidateHeader(header);
-                    return new MvccLogicalLog(fileSystem, path, existing, existing.Length, salt, version);
-                }
-                catch (InvalidDataException) when (existing.Length == LogHeaderSize)
-                {
-                    // A header-only log has no committed frame to lose. This is
-                    // the recoverable interruption point of a non-atomic V3→V4
-                    // header rewrite, so recreate it instead of making a valid
-                    // catalog permanently unopenable.
-                    existing.Dispose();
-                    fileSystem.DeleteFile(path);
-                    return CreateNew(fileSystem, path);
-                }
-            }
-            catch
-            {
-                existing.Dispose();
-                throw;
-            }
-        }
+                    if (existing.Length < LogHeaderSize)
+                    {
+                        existing.Dispose();
+                        fileSystem.DeleteFile(path);
+                        return CreateNew(fileSystem, path, encryption, synchronousMode);
+                    }
 
-        return CreateNew(fileSystem, path);
+                    Span<byte> header = stackalloc byte[LogHeaderSize];
+                    ReadExact(existing, 0, header);
+                    try
+                    {
+                        var (salt, version) = MvccLogicalLogFormat.ValidateHeader(header);
+                        return new MvccLogicalLog(
+                            fileSystem,
+                            path,
+                            existing,
+                            existing.Length,
+                            salt,
+                            version,
+                            encryption);
+                    }
+                    catch (InvalidDataException) when (existing.Length == LogHeaderSize)
+                    {
+                        // A header-only log has no committed frame to lose. This is
+                        // the recoverable interruption point of a non-atomic V3→V4
+                        // header rewrite, so recreate it instead of making a valid
+                        // catalog permanently unopenable.
+                        existing.Dispose();
+                        fileSystem.DeleteFile(path);
+                        return CreateNew(fileSystem, path, encryption, synchronousMode);
+                    }
+                }
+                catch
+                {
+                    existing.Dispose();
+                    throw;
+                }
+            }
+
+            return CreateNew(fileSystem, path, encryption, synchronousMode);
+        }
+        catch
+        {
+            encryption?.Dispose();
+            throw;
+        }
     }
 
-    private static MvccLogicalLog CreateNew(IFileSystem fileSystem, string path)
+    private static MvccLogicalLog CreateNew(
+        IFileSystem fileSystem,
+        string path,
+        LogicalLogEncryption? encryption,
+        SqliteSynchronousMode synchronousMode)
     {
         var file = fileSystem.OpenFile(path, FileOpenMode.CreateNew, readOnly: false);
         try
         {
-            var salt = unchecked((ulong)Random.Shared.NextInt64());
+            var salt = CreateSalt();
             Span<byte> header = stackalloc byte[LogHeaderSize];
             WriteHeader(header, salt, CurrentLogVersion);
             file.Write(0, header);
-            file.FlushToDisk();
+            if (synchronousMode.SyncsCheckpoint())
+                file.FlushToDisk();
             return new MvccLogicalLog(
                 fileSystem,
                 path,
                 file,
                 LogHeaderSize,
                 salt,
-                CurrentLogVersion);
+                CurrentLogVersion,
+                encryption);
         }
         catch
         {
@@ -151,10 +177,14 @@ internal sealed class MvccLogicalLog : IDisposable
         }
     }
 
-    /// <summary>Append one committed transaction frame and flush.</summary>
-    internal void AppendCommit(ulong commitTs, IReadOnlyList<MvccLogOp> ops)
+    /// <summary>Appends one committed transaction frame and applies the requested barrier.</summary>
+    internal void AppendCommit(
+        ulong commitTs,
+        IReadOnlyList<MvccLogOp> ops,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentNullException.ThrowIfNull(ops);
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             ThrowIfDisposed();
@@ -166,11 +196,19 @@ internal sealed class MvccLogicalLog : IDisposable
                     "MVCC typed keys require an exclusive checkpoint before upgrading the logical log to version 4.");
             }
 
-            var payload = EncodeOps(ops, _version);
-            var frameSize = TxHeaderSize + payload.Length + TxTrailerSize;
+            var plaintextPayload = EncodeOps(ops, _version);
+            var payload = _encryption is null
+                ? plaintextPayload
+                : _encryption.EncryptPayload(
+                    plaintextPayload,
+                    _salt,
+                    checked((uint)ops.Count),
+                    commitTs,
+                    _version);
+            var frameSize = checked(TxHeaderSize + payload.Length + TxTrailerSize);
             var frame = new byte[frameSize];
-            BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(0, 4), FrameMagic);
-            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(4, 8), (ulong)payload.Length);
+            BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(0, 4), MvccLogicalLogFormat.FrameMagic);
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(4, 8), checked((ulong)plaintextPayload.Length));
             BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(12, 4), (uint)ops.Count);
             BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(16, 8), commitTs);
             payload.CopyTo(frame.AsSpan(TxHeaderSize));
@@ -180,12 +218,13 @@ internal sealed class MvccLogicalLog : IDisposable
                 crc);
             BinaryPrimitives.WriteUInt32LittleEndian(
                 frame.AsSpan(TxHeaderSize + payload.Length + 4, 4),
-                EndMagic);
+                MvccLogicalLogFormat.EndMagic);
 
             try
             {
                 file.Write(_offset, frame);
-                file.FlushToDisk();
+                if (synchronousMode.SyncsWalCommit())
+                    file.FlushToDisk();
             }
             catch (Exception exception)
             {
@@ -214,34 +253,66 @@ internal sealed class MvccLogicalLog : IDisposable
             while (position + TxHeaderSize + TxTrailerSize <= file.Length)
             {
                 ReadExact(file, position, header);
-                var magic = BinaryPrimitives.ReadUInt32LittleEndian(header);
-                if (magic != FrameMagic)
-                    throw new InvalidDataException($"Invalid MVCC log frame magic at offset {position}.");
+                int payloadSize;
+                uint opCount;
+                ulong commitTs;
+                try
+                {
+                    (payloadSize, opCount, commitTs) = MvccLogicalLogFormat.ReadFrameHeader(header);
+                }
+                catch (InvalidDataException exception)
+                {
+                    throw new InvalidDataException(
+                        $"Invalid MVCC log frame at offset {position}: {exception.Message}",
+                        exception);
+                }
 
-                var payloadSize = BinaryPrimitives.ReadUInt64LittleEndian(header[4..]);
-                var opCount = BinaryPrimitives.ReadUInt32LittleEndian(header[12..]);
-                var commitTs = BinaryPrimitives.ReadUInt64LittleEndian(header[16..]);
-                if (payloadSize > int.MaxValue)
-                    throw new InvalidDataException("MVCC log frame payload too large.");
-
-                var frameLen = TxHeaderSize + (int)payloadSize + TxTrailerSize;
+                var storedPayloadSize = _encryption is null
+                    ? payloadSize
+                    : MvccLogicalLogFormat.GetEncryptedPayloadSize(payloadSize);
+                var frameLen = checked(TxHeaderSize + storedPayloadSize + TxTrailerSize);
                 if (position + frameLen > file.Length)
+                {
+                    if (_encryption is not null
+                        && IsCompletePlaintextFrame(file, position, payloadSize))
+                    {
+                        throw new InvalidDataException(
+                            "Encrypted MVCC storage contains a plaintext logical-log frame. "
+                            + "Automatic migration is not safe; checkpoint the log without encryption first.");
+                    }
+                    if (ContainsCompleteStoredFrame(file, position))
+                    {
+                        throw new InvalidDataException(
+                            "MVCC logical-log payload length does not match its complete frame boundary. "
+                            + "The authenticated frame metadata was tampered with.");
+                    }
                     break; // torn tail — stop (fail-closed leave partial unrecovered)
+                }
 
                 var frame = new byte[frameLen];
                 ReadExact(file, position, frame);
                 var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(
-                    frame.AsSpan(TxHeaderSize + (int)payloadSize, 4));
+                    frame.AsSpan(TxHeaderSize + storedPayloadSize, 4));
                 var end = BinaryPrimitives.ReadUInt32LittleEndian(
-                    frame.AsSpan(TxHeaderSize + (int)payloadSize + 4, 4));
-                if (end != EndMagic)
+                    frame.AsSpan(TxHeaderSize + storedPayloadSize + 4, 4));
+                if (end != MvccLogicalLogFormat.EndMagic)
                     throw new InvalidDataException("MVCC log frame end magic mismatch.");
-                var actualCrc = Crc32C.Compute(frame.AsSpan(0, TxHeaderSize + (int)payloadSize));
+                var actualCrc = Crc32C.Compute(frame.AsSpan(0, TxHeaderSize + storedPayloadSize));
                 if (actualCrc != expectedCrc)
                     throw new InvalidDataException("MVCC log frame CRC mismatch.");
 
+                var payload = frame.AsSpan(TxHeaderSize, storedPayloadSize);
+                var plaintext = _encryption is null
+                    ? payload.ToArray()
+                    : _encryption.DecryptPayload(
+                        payload,
+                        payloadSize,
+                        _salt,
+                        opCount,
+                        commitTs,
+                        _version);
                 var ops = DecodeOps(
-                    frame.AsSpan(TxHeaderSize, (int)payloadSize),
+                    plaintext,
                     (int)opCount,
                     _version);
                 store.ApplyRecoveredCommit(commitTs, ops);
@@ -263,17 +334,22 @@ internal sealed class MvccLogicalLog : IDisposable
     }
 
     /// <summary>Truncate log after checkpoint (keep header only).</summary>
-    internal void TruncateAfterCheckpoint()
+    internal void TruncateAfterCheckpoint(
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             ThrowIfDisposed();
             var file = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
+            var freshSalt = CreateSalt();
             Span<byte> header = stackalloc byte[LogHeaderSize];
-            WriteHeader(header, _salt, _version);
+            WriteHeader(header, freshSalt, _version);
             file.SetLength(0);
             file.Write(0, header);
-            file.FlushToDisk();
+            if (synchronousMode.SyncsCheckpoint())
+                file.FlushToDisk();
+            _salt = freshSalt;
             _offset = LogHeaderSize;
         }
     }
@@ -283,8 +359,10 @@ internal sealed class MvccLogicalLog : IDisposable
     /// SQLite catalog. This is intentionally forbidden while a frame remains,
     /// avoiding a mixed V3/V4 log after interruption.
     /// </summary>
-    internal void UpgradeToVersion4AfterCheckpoint()
+    internal void UpgradeToVersion4AfterCheckpoint(
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             ThrowIfDisposed();
@@ -309,7 +387,8 @@ internal sealed class MvccLogicalLog : IDisposable
                            readOnly: false))
                 {
                     replacement.Write(0, header);
-                    replacement.FlushToDisk();
+                    if (synchronousMode.SyncsCheckpoint())
+                        replacement.FlushToDisk();
                 }
 
                 var current = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
@@ -318,7 +397,8 @@ internal sealed class MvccLogicalLog : IDisposable
                 // IAtomicFileSystem the same safe replacement contract: if the
                 // process stops here, reopen recreates a harmless empty V4 log.
                 current.SetLength(0);
-                current.FlushToDisk();
+                if (synchronousMode.SyncsCheckpoint())
+                    current.FlushToDisk();
                 current.Dispose();
                 _file = null;
                 try
@@ -343,9 +423,11 @@ internal sealed class MvccLogicalLog : IDisposable
                 // empty log, so an interruption here cannot strand catalog data.
                 var file = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
                 file.SetLength(0);
-                file.FlushToDisk();
+                if (synchronousMode.SyncsCheckpoint())
+                    file.FlushToDisk();
                 file.Write(0, header);
-                file.FlushToDisk();
+                if (synchronousMode.SyncsCheckpoint())
+                    file.FlushToDisk();
             }
 
             _version = CurrentLogVersion;
@@ -361,6 +443,7 @@ internal sealed class MvccLogicalLog : IDisposable
             _disposed = true;
             _file?.Dispose();
             _file = null;
+            _encryption?.Dispose();
         }
     }
 
@@ -372,36 +455,65 @@ internal sealed class MvccLogicalLog : IDisposable
     private static void WriteHeader(Span<byte> header, ulong salt, byte version)
     {
         header.Clear();
-        BinaryPrimitives.WriteUInt32LittleEndian(header, LogMagic);
+        BinaryPrimitives.WriteUInt32LittleEndian(header, MvccLogicalLogFormat.LogMagic);
         header[4] = version;
         header[5] = 0;
         BinaryPrimitives.WriteUInt16LittleEndian(header[6..], (ushort)LogHeaderSize);
-        BinaryPrimitives.WriteUInt64LittleEndian(header[LogHeaderSaltStart..], salt);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[MvccLogicalLogFormat.LogHeaderSaltStart..], salt);
         var crc = Crc32C.Compute(header);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[LogHeaderCrcStart..], crc);
+        BinaryPrimitives.WriteUInt32LittleEndian(header[MvccLogicalLogFormat.LogHeaderCrcStart..], crc);
     }
 
-    private static (ulong Salt, byte Version) ValidateHeader(ReadOnlySpan<byte> header)
+    private static LogicalLogEncryption? CreateEncryption(IFileSystem fileSystem)
     {
-        var magic = BinaryPrimitives.ReadUInt32LittleEndian(header);
-        if (magic != LogMagic)
-            throw new InvalidDataException("Invalid MVCC logical log magic.");
-        var version = header[4];
-        if (version is not (2 or LegacyLogVersion or CurrentLogVersion))
-            throw new InvalidDataException($"Unsupported MVCC logical log version {version}.");
-        var hdrLen = BinaryPrimitives.ReadUInt16LittleEndian(header[6..]);
-        if (hdrLen != LogHeaderSize)
-            throw new InvalidDataException("Invalid MVCC logical log header length.");
+        var options = GetEncryptionOptions(fileSystem);
+        return options is null ? null : new LogicalLogEncryption(options);
+    }
 
-        Span<byte> crcBuf = stackalloc byte[LogHeaderSize];
-        header[..LogHeaderSize].CopyTo(crcBuf);
-        crcBuf[LogHeaderCrcStart..].Clear();
-        var expected = Crc32C.Compute(crcBuf);
-        var actual = BinaryPrimitives.ReadUInt32LittleEndian(header[LogHeaderCrcStart..]);
-        if (expected != actual)
-            throw new InvalidDataException("MVCC logical log header CRC mismatch.");
+    private static AhtolaEncryptionOptions? GetEncryptionOptions(IFileSystem fileSystem)
+        => fileSystem switch
+        {
+            AhtolaEncryptionFileSystem encrypted => encrypted.Encryption,
+            IFileSystemDecorator decorator => GetEncryptionOptions(decorator.InnerFileSystem),
+            _ => null,
+        };
 
-        return (BinaryPrimitives.ReadUInt64LittleEndian(header[LogHeaderSaltStart..]), version);
+    private static ulong CreateSalt()
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        RandomNumberGenerator.Fill(bytes);
+        return BinaryPrimitives.ReadUInt64LittleEndian(bytes);
+    }
+
+    private static bool IsCompletePlaintextFrame(IFile file, long position, int payloadSize)
+    {
+        var frameLength = checked(TxHeaderSize + payloadSize + TxTrailerSize);
+        if (position + frameLength > file.Length)
+            return false;
+
+        var frame = new byte[frameLength];
+        ReadExact(file, position, frame);
+        var trailerOffset = TxHeaderSize + payloadSize;
+        return BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(trailerOffset + 4))
+                   == MvccLogicalLogFormat.EndMagic
+               && BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(trailerOffset))
+                   == Crc32C.Compute(frame.AsSpan(0, trailerOffset));
+    }
+
+    private static bool ContainsCompleteStoredFrame(IFile file, long position)
+    {
+        var remaining = file.Length - position;
+        if (remaining <= 0)
+            return false;
+        if (remaining > int.MaxValue)
+        {
+            throw new InvalidDataException(
+                "MVCC logical-log tail is too large to prove that an oversized payload length is a torn append.");
+        }
+
+        var bytes = new byte[(int)remaining];
+        ReadExact(file, position, bytes);
+        return MvccLogicalLogFormat.ContainsCompleteFrameBoundary(bytes);
     }
 
     private static bool RequiresVersion4(IReadOnlyList<MvccLogOp> ops)
@@ -508,6 +620,12 @@ internal sealed class MvccLogicalLog : IDisposable
             for (var c = 0; c < cellCount; c++)
                 cells[c] = ReadCell(payload, ref offset);
             ops.Add(MvccLogOp.Upsert(new MvccRowId(tableId, key), cells, objectName));
+        }
+
+        if (offset != payload.Length)
+        {
+            throw new InvalidDataException(
+                $"MVCC log payload has {payload.Length - offset} trailing byte(s) after {opCount} operation(s).");
         }
 
         return ops;
@@ -670,6 +788,121 @@ internal sealed class MvccLogicalLog : IDisposable
             total += read;
         }
     }
+
+    private sealed class LogicalLogEncryption : IDisposable
+    {
+        private readonly AhtolaEncryptionOptions _options;
+
+        internal LogicalLogEncryption(AhtolaEncryptionOptions options)
+        {
+            _options = options.CreateOwnedCopy();
+        }
+
+        internal byte[] EncryptPayload(
+            ReadOnlySpan<byte> plaintext,
+            ulong salt,
+            uint opCount,
+            ulong commitTs,
+            byte logVersion)
+        {
+            var encrypted = new byte[MvccLogicalLogFormat.GetEncryptedPayloadSize(plaintext.Length)];
+            var chunkCount = MvccLogicalLogFormat.GetEncryptedChunkCount(plaintext.Length);
+            var plaintextOffset = 0;
+            var encryptedOffset = 0;
+            for (var chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
+            {
+                var plaintextLength = MvccLogicalLogFormat.GetPlaintextChunkLength(
+                    plaintext.Length,
+                    chunkIndex);
+                var ciphertext = encrypted.AsSpan(encryptedOffset, plaintextLength);
+                var tag = encrypted.AsSpan(
+                    encryptedOffset + plaintextLength,
+                    MvccLogicalLogFormat.EncryptionTagSize);
+                var nonce = encrypted.AsSpan(
+                    encryptedOffset + plaintextLength + MvccLogicalLogFormat.EncryptionTagSize,
+                    MvccLogicalLogFormat.EncryptionNonceSize);
+                RandomNumberGenerator.Fill(nonce);
+                var associatedData = MvccLogicalLogFormat.BuildEncryptedChunkAssociatedData(
+                    salt,
+                    plaintext.Length,
+                    opCount,
+                    commitTs,
+                    chunkIndex,
+                    logVersion);
+                using var cipher = _options.CreateAesGcm();
+                cipher.Encrypt(
+                    nonce,
+                    plaintext.Slice(plaintextOffset, plaintextLength),
+                    ciphertext,
+                    tag,
+                    associatedData);
+                plaintextOffset += plaintextLength;
+                encryptedOffset += plaintextLength + MvccLogicalLogFormat.EncryptionOverhead;
+            }
+
+            return encrypted;
+        }
+
+        internal byte[] DecryptPayload(
+            ReadOnlySpan<byte> encrypted,
+            int plaintextSize,
+            ulong salt,
+            uint opCount,
+            ulong commitTs,
+            byte logVersion)
+        {
+            if (encrypted.Length != MvccLogicalLogFormat.GetEncryptedPayloadSize(plaintextSize))
+                throw new InvalidDataException("MVCC encrypted payload size does not match its frame header.");
+
+            var plaintext = new byte[plaintextSize];
+            var chunkCount = MvccLogicalLogFormat.GetEncryptedChunkCount(plaintextSize);
+            var plaintextOffset = 0;
+            var encryptedOffset = 0;
+            try
+            {
+                for (var chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
+                {
+                    var plaintextLength = MvccLogicalLogFormat.GetPlaintextChunkLength(
+                        plaintextSize,
+                        chunkIndex);
+                    var ciphertext = encrypted.Slice(encryptedOffset, plaintextLength);
+                    var tag = encrypted.Slice(
+                        encryptedOffset + plaintextLength,
+                        MvccLogicalLogFormat.EncryptionTagSize);
+                    var nonce = encrypted.Slice(
+                        encryptedOffset + plaintextLength + MvccLogicalLogFormat.EncryptionTagSize,
+                        MvccLogicalLogFormat.EncryptionNonceSize);
+                    var associatedData = MvccLogicalLogFormat.BuildEncryptedChunkAssociatedData(
+                        salt,
+                        plaintextSize,
+                        opCount,
+                        commitTs,
+                        chunkIndex,
+                        logVersion);
+                    using var cipher = _options.CreateAesGcm();
+                    cipher.Decrypt(
+                        nonce,
+                        ciphertext,
+                        tag,
+                        plaintext.AsSpan(plaintextOffset, plaintextLength),
+                        associatedData);
+                    plaintextOffset += plaintextLength;
+                    encryptedOffset += plaintextLength + MvccLogicalLogFormat.EncryptionOverhead;
+                }
+
+                return plaintext;
+            }
+            catch (CryptographicException exception)
+            {
+                CryptographicOperations.ZeroMemory(plaintext);
+                throw new InvalidDataException(
+                    "MVCC logical-log payload authentication failed. The key is wrong or the log was tampered with.",
+                    exception);
+            }
+        }
+
+        public void Dispose() => _options.Dispose();
+    }
 }
 
 internal sealed class MvccLogicalLogUpgradeRequiredException : EmbeddedSqlException
@@ -726,15 +959,21 @@ internal readonly struct MvccLogOp
 /// <summary>CRC-32C (Castagnoli) used by Turso logical log framing.</summary>
 internal static class Crc32C
 {
+    internal const uint InitialState = 0xFFFFFFFFu;
     private static readonly uint[] Table = CreateTable();
 
     internal static uint Compute(ReadOnlySpan<byte> data)
     {
-        var crc = 0xFFFFFFFFu;
+        var crc = InitialState;
         foreach (var b in data)
-            crc = Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
-        return crc ^ 0xFFFFFFFFu;
+            crc = Update(crc, b);
+        return Complete(crc);
     }
+
+    internal static uint Update(uint crc, byte value)
+        => Table[(crc ^ value) & 0xFF] ^ (crc >> 8);
+
+    internal static uint Complete(uint crc) => crc ^ 0xFFFFFFFFu;
 
     private static uint[] CreateTable()
     {

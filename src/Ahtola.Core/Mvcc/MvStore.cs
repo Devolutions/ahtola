@@ -1,3 +1,5 @@
+using Ahtola.Core.Storage;
+
 namespace Ahtola.Core.Mvcc;
 
 /// <summary>Opaque MVCC transaction identifier (Turso <c>TxID</c>).</summary>
@@ -606,8 +608,10 @@ internal sealed class MvStore
     /// retire the old object identities and their log prefix before a table name
     /// can be reused by CREATE/RENAME.
     /// </summary>
-    internal void CompleteSchemaCheckpoint()
+    internal void CompleteSchemaCheckpoint(
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
         {
             if (HasActiveTransactionsLocked())
@@ -621,9 +625,9 @@ internal sealed class MvStore
             _tableNames.Clear();
             _nextRowIds.Clear();
             _nextTableId = -2;
-            _logicalLog?.TruncateAfterCheckpoint();
+            _logicalLog?.TruncateAfterCheckpoint(synchronousMode);
             if (_logicalLog is { RequiresVersion4Upgrade: true })
-                _logicalLog.UpgradeToVersion4AfterCheckpoint();
+                _logicalLog.UpgradeToVersion4AfterCheckpoint(synchronousMode);
         }
     }
     /// <summary>Insert a new live version created by <paramref name="txId"/>.</summary>
@@ -927,8 +931,11 @@ internal sealed class MvStore
     /// Commit with first-committer-wins WW detection. Rewrites in-flight TxID
     /// stamps on version chains to the commit timestamp (Turso rewrite step).
     /// </summary>
-    internal void Commit(MvccTxId id)
+    internal void Commit(
+        MvccTxId id,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        synchronousMode.Validate(nameof(synchronousMode));
         MvccTransaction tx;
         HashSet<MvccRowId> writes;
         lock (_gate)
@@ -983,7 +990,7 @@ internal sealed class MvStore
             try
             {
                 if (logOps.Count != 0)
-                    _logicalLog?.AppendCommit(commitTs, logOps);
+                    _logicalLog?.AppendCommit(commitTs, logOps, synchronousMode);
             }
             catch (MvccLogicalLogCommitIndeterminateException exception)
             {

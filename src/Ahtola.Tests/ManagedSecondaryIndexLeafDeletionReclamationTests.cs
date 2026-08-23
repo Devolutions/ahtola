@@ -32,6 +32,7 @@ public sealed class ManagedSecondaryIndexLeafDeletionReclamationTests
 
             var after = ReadTopology(PhysicalFileSystem.Instance, path);
             AssertReclaimedLeaf(before, after, target);
+            var reclaimedPage = ReclaimedPage(before, after);
             using (var pager = SqlitePager.Open(
                        PhysicalFileSystem.Instance,
                        path,
@@ -42,13 +43,13 @@ public sealed class ManagedSecondaryIndexLeafDeletionReclamationTests
                     after.Header,
                     pager.CommittedPageCount,
                     pager.ReadCommittedPage);
-                freelist.PageNumbers.Should().Equal([target.PageNumber]);
-                freelist.TrunkPageNumbers.Should().Equal([target.PageNumber]);
-                BinaryPrimitives.ReadUInt32BigEndian(pager.ReadCommittedPage(target.PageNumber))
+                freelist.PageNumbers.Should().Equal([reclaimedPage]);
+                freelist.TrunkPageNumbers.Should().Equal([reclaimedPage]);
+                BinaryPrimitives.ReadUInt32BigEndian(pager.ReadCommittedPage(reclaimedPage))
                     .Should()
                     .Be(0);
                 BinaryPrimitives.ReadUInt32BigEndian(
-                        pager.ReadCommittedPage(target.PageNumber).AsSpan(sizeof(uint)))
+                        pager.ReadCommittedPage(reclaimedPage).AsSpan(sizeof(uint)))
                     .Should()
                     .Be(0);
             }
@@ -631,11 +632,20 @@ public sealed class ManagedSecondaryIndexLeafDeletionReclamationTests
         after.Header.ChangeCounter.Should().Be(before.Header.ChangeCounter + 1);
         after.Header.VersionValidFor.Should().Be(after.Header.ChangeCounter);
         after.Header.SchemaCookie.Should().Be(before.Header.SchemaCookie);
-        after.Header.FirstFreelistTrunkPage.Should().Be(target.PageNumber);
+        var reclaimedPage = ReclaimedPage(before, after);
+        after.Header.FirstFreelistTrunkPage.Should().Be(reclaimedPage);
         after.Header.FreelistPageCount.Should().Be(1);
         after.Children.Should().HaveCount(before.Children.Count - 1);
-        after.Children.Select(child => child.PageNumber).Should().NotContain(target.PageNumber);
+        after.Children.Select(child => child.PageNumber).Should().NotContain(reclaimedPage);
     }
+
+    private static uint ReclaimedPage(IndexTopology before, IndexTopology after)
+        => before.Children
+            .Select(child => child.PageNumber)
+            .Except(after.Children.Select(child => child.PageNumber))
+            .Should()
+            .ContainSingle()
+            .Which;
 
     private static void CreateMinimumPageDatabase(IFileSystem fileSystem, string path)
     {

@@ -583,11 +583,13 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         string path,
         SqliteWalHeader header,
         AhtolaEncryptionOptions? encryption = null,
-        IPageCodec? pageCodec = null)
+        IPageCodec? pageCodec = null,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
         ArgumentException.ThrowIfNullOrEmpty(path);
         ArgumentNullException.ThrowIfNull(header);
+        synchronousMode.Validate(nameof(synchronousMode));
 
         var boundCodec = PageCodecSupport.Bind(encryption, pageCodec, header.PageSize, out var ownsCodec);
         var file = fileSystem.OpenFile(path, FileOpenMode.CreateNew);
@@ -597,7 +599,8 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
             if (file.Length != SqliteWalHeader.Size)
                 throw new InvalidDataException("Writing the SQLite WAL header produced an invalid file length.");
 
-            file.FlushToDisk();
+            if (synchronousMode.SyncsCheckpoint())
+                file.FlushToDisk();
             return new SqliteWalFile(file, header, boundCodec, ownsCodec);
         }
         catch
@@ -637,11 +640,13 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         SqliteWalHeader header,
         AhtolaEncryptionOptions? encryption = null,
         IPageCodec? pageCodec = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
         ArgumentException.ThrowIfNullOrEmpty(path);
         ArgumentNullException.ThrowIfNull(header);
+        synchronousMode.Validate(nameof(synchronousMode));
 
         var boundCodec = PageCodecSupport.Bind(encryption, pageCodec, header.PageSize, out var ownsCodec);
         var file = await fileSystem.OpenFileAsync(
@@ -654,7 +659,8 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
             if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != SqliteWalHeader.Size)
                 throw new InvalidDataException("Writing the SQLite WAL header produced an invalid file length.");
 
-            await file.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
+            if (synchronousMode.SyncsCheckpoint())
+                await file.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
             return new SqliteWalFile(file, header, boundCodec, ownsCodec);
         }
         catch

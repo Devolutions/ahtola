@@ -59,7 +59,7 @@ transform. Files are classified by SQLite's naming conventions:
 | `x.db-wal` | header plaintext; frame bodies encrypted; rolling checksums recomputed over the **encrypted** bytes |
 | `x.db-journal` | header plaintext; page records encrypted; per-record checksum recomputed over the **encrypted** page |
 | `x.db-shm` | passthrough — the WAL index is derived, rebuildable metadata |
-| `x.db-log` | rejected — see *MVCC* below |
+| `x.db-log` | header/frame metadata plaintext; transaction payloads encrypted in authenticated chunks |
 
 ### Roles are tracked, not guessed from the suffix
 
@@ -79,11 +79,36 @@ sidecar role and the file is treated as a database.
 
 ### MVCC
 
-The engine writes the MVCC logical log (`x.db-log`) outside the page codec, so
-on desktop it is plaintext. Reproducing that in the browser would put row data
-in OPFS unencrypted, so `PRAGMA journal_mode=mvcc` on an encrypted browser
-database fails with an explicit `NotSupportedException` instead. Encryption is
-never silently weakened.
+The MVCC logical log (`x.db-log`) uses Turso's encrypted logical-log layout.
+Its 56-byte log header, 24-byte transaction headers, and 8-byte trailers remain
+visible for recovery framing. Each transaction payload is split into 32-KiB
+chunks and encrypted with AES-GCM. Associated data binds the log salt, final
+plaintext payload length, operation count, commit timestamp, chunk index, and
+logical-log version. The trailer CRC covers the encrypted bytes. Recovery also
+requires the decoded operation count to consume the authenticated payload
+exactly; trailing bytes are corruption rather than forward-compatible padding.
+
+Desktop storage performs that transform synchronously in `MvccLogicalLog`.
+The browser mirror captures each complete plaintext frame, maps its logical
+offset to the expanded encrypted offset, and encrypts it asynchronously with
+the same non-extractable Web Crypto key used for pages. On load it authenticates
+and decrypts complete frames before the managed engine replays them. This makes
+`PRAGMA journal_mode=mvcc` and `BEGIN CONCURRENT` available without exposing key
+material or persisting row data in plaintext.
+
+A header-only plaintext log can safely begin receiving encrypted frames because
+it contains no row data. A populated plaintext log presented to encrypted
+storage is rejected instead of being guessed or migrated in place; checkpoint
+it with the original plaintext configuration first. Wrong keys, authenticated
+metadata changes, and complete-frame tampering fail closed. A short final
+encrypted frame is treated as a torn append and recovery retains only the
+authenticated prefix.
+
+Encrypted MVCC payloads written by the short-lived format that did not bind the
+log version in associated data are deliberately not accepted: their tags do not
+validate under the hardened format. They must be checkpointed by the exact
+writer that created them before upgrading. There is no unauthenticated fallback
+or automatic reinterpretation as a different log version.
 
 Page 1 keeps a visible 100-byte header: the `AHTLA` magic, format version 0,
 the cipher id, zeroed reserved bytes, and the SQLite header bytes 16..100
@@ -123,13 +148,15 @@ longer authenticates. Authenticating the main database first would turn that
 into a fatal open even when the information needed to repair it is sitting in a
 journal or WAL. Loading therefore runs in recovery order:
 
-1. Decrypt the WAL, stopping at the first frame that fails its chain, and record
+1. Authenticate and decrypt the MVCC logical log, retaining the complete frame
+   prefix when the final append is torn.
+2. Decrypt the WAL, stopping at the first frame that fails its chain, and record
    the page images belonging to committed frames.
-2. Replay a hot rollback journal's **encrypted** page images back into the
+3. Replay a hot rollback journal's **encrypted** page images back into the
    encrypted database image and truncate to the journal's declared original page
    count. This is the pre-transaction content, restored before anything is
    authenticated.
-3. Decrypt the database. A page that still fails authentication is satisfied
+4. Decrypt the database. A page that still fails authentication is satisfied
    from a committed WAL frame when one exists — the same content a checkpoint
    would have written.
 

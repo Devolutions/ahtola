@@ -7,11 +7,10 @@ namespace Ahtola.Core.Storage;
 /// rebalancing, or defragmentation beyond freelist allocate/free.
 /// </summary>
 /// <remarks>
-/// The incremental writer implements the growth half of SQLite's balancing
-/// rules plus freelist-backed page allocate/free and empty non-root leaf
-/// reclaim (unlink + free, with single-child interior collapse). Sibling
-/// redistribution for under-full non-empty pages is still out of scope;
-/// those cases raise this exception so the caller can fall back to a full rewrite.
+/// Incremental writers implement ordinary SQLite split, sibling redistribution,
+/// merge, and root-collapse maintenance. This exception is reserved for a page
+/// shape that cannot be represented safely by those bounded operations, so the
+/// caller can fall back to a full rewrite.
 /// </remarks>
 public sealed class SqliteBtreeMaintenanceRequiredException : Exception
 {
