@@ -535,6 +535,7 @@ internal static class SqliteVectorFunctions
                 if (dimensions > int.MaxValue)
                     throw new EmbeddedSqlException($"f32 sparse vector dimensions exceed managed limit: {dimensions}");
                 var entries = (data.Length - 4) / 8;
+                uint previousIndex = 0;
                 for (var entry = 0; entry < entries; entry++)
                 {
                     var index = BinaryPrimitives.ReadUInt32LittleEndian(
@@ -544,6 +545,14 @@ internal static class SqliteVectorFunctions
                         throw new EmbeddedSqlException(
                             $"f32 sparse vector index {index} out of range for {dimensions} dims");
                     }
+
+                    if (entry != 0 && index <= previousIndex)
+                    {
+                        throw new EmbeddedSqlException(
+                            $"f32 sparse vector indices must be strictly increasing: {previousIndex} then {index}");
+                    }
+
+                    previousIndex = index;
                 }
 
                 Array.Resize(ref data, data.Length - 4);

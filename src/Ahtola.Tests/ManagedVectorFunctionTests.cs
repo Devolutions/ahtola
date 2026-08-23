@@ -142,6 +142,8 @@ public sealed class ManagedVectorFunctionTests
     [TestCase("SELECT vector_extract(X'00');", "unknown vector type: 0")]
     [TestCase("SELECT vector_extract(X'0000');", "f32 dense vector unexpected data length: 2")]
     [TestCase("SELECT vector_extract(X'0000803F020000000200000009');", "index 2 out of range")]
+    [TestCase("SELECT vector_extract(X'0000803F0000004000000000000000000200000009');", "indices must be strictly increasing: 0 then 0")]
+    [TestCase("SELECT vector_extract(X'0000803F0000004001000000000000000200000009');", "indices must be strictly increasing: 1 then 0")]
     [TestCase("SELECT vector_extract(X'00FF03');", "trailing bits 255 exceed blob capacity")]
     [TestCase("SELECT vector_extract(X'000004');", "too short")]
     public void MalformedVectorBlobsFailClosed(string sql, string expected)
@@ -230,6 +232,57 @@ public sealed class ManagedVectorFunctionTests
             "SELECT vector_distance_l2(X'FF0F03', X'010F03');");
         l2.Should().Throw<EmbeddedSqlException>()
             .WithMessage("*L2 distance is not supported for float1bit vectors*");
+    }
+
+    [Test]
+    public void SparseConsumersRejectNonIncreasingOrDuplicateBlobIndices()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        const string duplicate = "X'0000803F0000004000000000000000000200000009'";
+        const string descending = "X'0000803F0000004001000000000000000200000009'";
+        var queries = new[]
+        {
+            $"SELECT vector_extract({duplicate});",
+            $"SELECT vector_extract({descending});",
+            $"SELECT vector_distance_cos({duplicate}, vector32_sparse('[1,2]'));",
+            $"SELECT vector_distance_l2({duplicate}, vector32_sparse('[1,2]'));",
+            $"SELECT vector_distance_jaccard({duplicate}, vector32_sparse('[1,2]'));",
+            $"SELECT vector_distance_dot({duplicate}, vector32_sparse('[1,2]'));",
+            $"SELECT vector_concat({duplicate}, vector32_sparse('[1,2]'));",
+            $"SELECT vector_concat(vector32_sparse('[1,2]'), {descending});",
+        };
+
+        foreach (var query in queries)
+        {
+            var action = () => ReadValue(connection, query);
+            action.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("*indices must be strictly increasing*");
+        }
+    }
+
+    [Test]
+    public void SparseBoundaryIndicesRemainValidAcrossConsumers()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        const string boundary = "X'0000803F0000004000000000020000000300000009'";
+        ReadValue(connection, $"SELECT vector_extract({boundary});")
+            .Should().Be(SqlValue.Text("[1,0,2]"));
+        ReadReal(connection, $"SELECT vector_distance_cos({boundary}, {boundary});")
+            .Should().BeApproximately(0.0, 1e-6);
+        ReadReal(connection, $"SELECT vector_distance_l2({boundary}, {boundary});")
+            .Should().BeApproximately(0.0, 1e-6);
+        ReadReal(connection, $"SELECT vector_distance_jaccard({boundary}, {boundary});")
+            .Should().BeApproximately(0.0, 1e-6);
+        ReadReal(connection, $"SELECT vector_distance_dot({boundary}, {boundary});")
+            .Should().BeApproximately(-5.0, 1e-6);
+        ReadValue(
+                connection,
+                $"SELECT vector_extract(vector_concat({boundary}, vector32_sparse('[3]')));")
+            .Should().Be(SqlValue.Text("[1,0,2,3]"));
     }
 
     [Test]
