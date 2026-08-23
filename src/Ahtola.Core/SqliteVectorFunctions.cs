@@ -104,7 +104,14 @@ internal static class SqliteVectorFunctions
                 left.Data.AsSpan(0, leftEntries * 4).CopyTo(data);
                 right.Data.AsSpan(0, rightEntries * 4).CopyTo(data.AsSpan(leftEntries * 4));
                 left.Data.AsSpan(leftEntries * 4).CopyTo(data.AsSpan((leftEntries + rightEntries) * 4));
-                right.Data.AsSpan(rightEntries * 4).CopyTo(data.AsSpan((leftEntries * 2 + rightEntries) * 4));
+                var rightIndexOffset = (leftEntries * 2 + rightEntries) * 4;
+                for (var entry = 0; entry < rightEntries; entry++)
+                {
+                    var index = checked(ReadSparseIndex(right, entry) + (uint)left.Dimensions);
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        data.AsSpan(rightIndexOffset + entry * 4, 4),
+                        index);
+                }
                 break;
 
             case VectorType.Float1Bit:
@@ -339,6 +346,12 @@ internal static class SqliteVectorFunctions
         {
             var a = left.Data[index];
             var b = right.Data[index];
+            if (index == left.Data.Length - 1 && left.Dimensions % 8 != 0)
+            {
+                var semanticBits = (byte)((1 << (left.Dimensions % 8)) - 1);
+                a &= semanticBits;
+                b &= semanticBits;
+            }
             hamming += PopCount((byte)(a ^ b));
             intersection += PopCount((byte)(a & b));
             union += PopCount((byte)(a | b));

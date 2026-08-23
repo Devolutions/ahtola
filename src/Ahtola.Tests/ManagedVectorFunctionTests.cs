@@ -50,6 +50,26 @@ public sealed class ManagedVectorFunctionTests
             .Should().Be(SqlValue.Text("[1,2,3,4]"));
         ReadValue(
                 connection,
+                "SELECT vector_extract(vector_concat(vector32_sparse('[1,0]'), vector32_sparse('[2,0]')));")
+            .Should().Be(SqlValue.Text("[1,0,2,0]"));
+        ReadValue(
+                connection,
+                "SELECT vector_extract(vector_concat(vector32_sparse('[0,1]'), vector32_sparse('[0,2]')));")
+            .Should().Be(SqlValue.Text("[0,1,0,2]"));
+        ReadValue(
+                connection,
+                "SELECT vector_extract(vector_concat(vector32_sparse('[]'), vector32_sparse('[2,0]')));")
+            .Should().Be(SqlValue.Text("[2,0]"));
+        ReadValue(
+                connection,
+                "SELECT vector_extract(vector_concat(vector32_sparse('[1,0]'), vector32_sparse('[]')));")
+            .Should().Be(SqlValue.Text("[1,0]"));
+        ReadValue(
+                connection,
+                "SELECT vector_extract(vector_concat(vector32_sparse('[]'), vector32_sparse('[]')));")
+            .Should().Be(SqlValue.Text("[]"));
+        ReadValue(
+                connection,
                 "SELECT vector_extract(vector_slice(vector64('[1,2,3,4]'), 1, 3));")
             .Should().Be(SqlValue.Text("[2,3]"));
         ReadValue(
@@ -186,6 +206,30 @@ public sealed class ManagedVectorFunctionTests
                 connection,
                 "SELECT vector_distance_dot(X'00000000000000000000807F000304', X'00000000000000000000807F000304');")
             .Should().Be(SqlValue.Null);
+    }
+
+    [Test]
+    public void Float1BitDistancesIgnoreUnusedHighStorageBits()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        ReadValue(connection, "SELECT vector_extract(X'FF0F03');")
+            .Should().Be(SqlValue.Text("[1]"));
+        ReadValue(connection, "SELECT vector_extract(X'010F03');")
+            .Should().Be(SqlValue.Text("[1]"));
+        ReadReal(connection, "SELECT vector_distance_cos(X'FF0F03', X'010F03');")
+            .Should().Be(0.0);
+        ReadReal(connection, "SELECT vector_distance_dot(X'FF0F03', X'010F03');")
+            .Should().Be(-1.0);
+        ReadReal(connection, "SELECT vector_distance_jaccard(X'FF0F03', X'010F03');")
+            .Should().Be(0.0);
+
+        var l2 = () => ReadValue(
+            connection,
+            "SELECT vector_distance_l2(X'FF0F03', X'010F03');");
+        l2.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*L2 distance is not supported for float1bit vectors*");
     }
 
     [Test]
