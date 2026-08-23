@@ -291,6 +291,57 @@ public sealed class HranaV3StreamingTests
         (await reader.ReadAsync()).Should().BeFalse();
     }
 
+    [Test]
+    public async Task CursorFieldTypeUsesBoundedLookaheadForAllNullResults()
+    {
+        const int rowCount = 20_000;
+        var body = new StringBuilder(CursorHeader())
+            .Append(StepBeginWithoutDeclaredType());
+        for (var i = 0; i < rowCount; i++)
+            body.Append(NullRow());
+        body.Append(StepEnd()).Append(Terminator());
+
+        var payload = body.ToString();
+        var stream = new ControlledReadStream();
+        stream.Add(payload);
+        stream.Complete();
+        using var handler = new CannedHranaHandler((path, _, _) =>
+            path == "/v3/cursor" ? Ndjson(stream) : PipelineClose());
+        using var connection = CreateConnection(handler, readYourWrites: true);
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT nullable_expression";
+        await using var reader = await command.ExecuteReaderAsync();
+
+        reader.GetFieldType(0).Should().Be(typeof(object));
+        stream.TotalBytesRead.Should().BeLessThan(Encoding.UTF8.GetByteCount(payload));
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.IsDBNull(0).Should().BeTrue();
+    }
+
+    [Test]
+    public async Task CursorRejectsRowsBeforeStepBegin()
+    {
+        var stream = new ControlledReadStream();
+        stream.Add(CursorHeader());
+        stream.Add(Row(42));
+        stream.Add(StepBegin());
+        stream.Add(StepEnd());
+        stream.Add(Terminator());
+        stream.Complete();
+        using var handler = new CannedHranaHandler((path, _, _) =>
+            path == "/v3/cursor" ? Ndjson(stream) : PipelineClose());
+        using var connection = CreateConnection(handler, readYourWrites: true);
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT value FROM malformed_query";
+
+        var execute = async () => await command.ExecuteReaderAsync();
+
+        await execute.Should().ThrowAsync<AhtolaException>()
+            .WithMessage("Unable to parse remote cursor response: row was received before step_begin*");
+        handler.Paths.Should().Equal("/v3/cursor", "/v3/pipeline");
+        AssertCloseRequest(handler.Bodies[1], "cursor-baton");
+    }
+
     private static AhtolaConnection CreateConnection(HttpMessageHandler handler, bool readYourWrites)
     {
         var client = new AhtolaRemoteClient(

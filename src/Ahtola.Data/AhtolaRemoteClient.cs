@@ -1268,6 +1268,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
 
     internal sealed class RemoteCursor : IAsyncDisposable
     {
+        private const int MaximumTypeInferenceLookaheadRows = 64;
+
         private readonly AhtolaRemoteClient _owner;
         private readonly HttpResponseMessage _response;
         private readonly StreamReader _reader;
@@ -1275,6 +1277,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         private readonly bool _closeAfter;
         private readonly Action<Exception>? _failureCallback;
         private readonly Queue<List<RemoteResponseValue>> _bufferedRows = new();
+        private readonly HashSet<int> _exhaustedTypeInferenceOrdinals = [];
         private List<RemoteResponseValue>? _pendingRow;
         private bool _stepOpen;
         private bool _terminated;
@@ -1328,15 +1331,22 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                         return row[ordinal];
                 }
 
-                while (!_terminated)
+                if (_exhaustedTypeInferenceOrdinals.Contains(ordinal))
+                    return null;
+
+                var rowsRead = 0;
+                while (!_terminated && rowsRead < MaximumTypeInferenceLookaheadRows)
                 {
                     var row = ReadRowAsync(cancellationToken).AsTask().GetAwaiter().GetResult();
                     if (row is null)
                         break;
                     collected.Add(row);
+                    rowsRead++;
                     if (ordinal < row.Count && row[ordinal].Type != "null")
                         return row[ordinal];
                 }
+                if (!_terminated && rowsRead == MaximumTypeInferenceLookaheadRows)
+                    _exhaustedTypeInferenceOrdinals.Add(ordinal);
                 return null;
             }
             finally
@@ -1388,6 +1398,10 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
 
                         case "replication_index":
                             throw Malformed("cursor completed before step_begin");
+
+                        case "row":
+                        case "step_end":
+                            throw Malformed($"{entry.Type} was received before step_begin");
 
                         default:
                             break;
