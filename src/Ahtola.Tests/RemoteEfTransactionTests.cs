@@ -117,7 +117,8 @@ public sealed class RemoteEfTransactionTests
         var query = () => context.Widgets.Select(w => w.Id).ToList();
 
         query.Should().Throw<Exception>();
-        handler.RequestCount.Should().Be(1, "no automatic retry is performed for direct remote connections");
+        handler.SqlLog.Should().ContainSingle(
+            "the cursor request executes once; a second HTTP request may only close its issued baton");
     }
 
     [Test]

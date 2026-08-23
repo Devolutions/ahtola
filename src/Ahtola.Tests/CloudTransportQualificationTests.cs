@@ -136,7 +136,7 @@ public sealed class CloudTransportQualificationTests
             closeAfter: true,
             CancellationToken.None);
 
-        handler.Paths.Should().Equal("/cluster/v2/pipeline", "/redirected/v2/pipeline");
+        handler.Paths.Should().Equal("/cluster/v3/pipeline", "/redirected/v3/pipeline");
     }
 
     [Test]

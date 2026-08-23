@@ -871,6 +871,62 @@ public class AhtolaConnection :
         }
     }
 
+    internal async Task<RemoteReaderExecution> ExecuteRemoteReaderAsync(
+        string sql,
+        AhtolaParameterCollection parameters,
+        int commandTimeout,
+        CancellationToken cancellationToken)
+    {
+        AhtolaRemoteClient.ValidateParameters(sql, parameters);
+        for (var attempt = 0; ; attempt++)
+        {
+            var remoteClient = _remoteClient ?? throw new InvalidOperationException("Ahtola database is closed.");
+            var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
+            try
+            {
+                return await remoteClient.ExecuteCursorAsync(
+                        sql,
+                        parameters,
+                        commandTimeout,
+                        closeAfter,
+                        cancellationToken,
+                        exception =>
+                        {
+                            RecordRemoteTransactionFailure(exception);
+                            if (exception is not AhtolaRemoteSqlException)
+                                InvalidateRemoteSession();
+                        })
+                    .ConfigureAwait(false);
+            }
+            catch (AhtolaRemoteSqlException exception) when (exception.IsStreamExpired)
+            {
+                if (_remoteTransactionActive)
+                {
+                    RecordRemoteTransactionFailure(exception);
+                    throw;
+                }
+
+                ResetRemoteSession();
+                if (attempt != 0)
+                    throw;
+            }
+            catch (AhtolaRemoteSqlException)
+            {
+                throw;
+            }
+            catch (AhtolaParameterException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                RecordRemoteTransactionFailure(exception);
+                InvalidateRemoteSession();
+                throw;
+            }
+        }
+    }
+
     internal async Task<IReadOnlyList<RemoteStatementResult>> ExecuteRemoteBatchAsync(
         IReadOnlyList<AhtolaBatchCommand> batchCommands,
         int commandTimeout,
@@ -932,6 +988,7 @@ public class AhtolaConnection :
         _remoteTransactionActive = true;
         try
         {
+            CloseOpenReaders();
             remoteClient
                 .ExecuteAsync(GetRemoteBeginSql(isolationLevel), new AhtolaParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
                 .GetAwaiter()
@@ -963,6 +1020,7 @@ public class AhtolaConnection :
         _remoteTransactionActive = true;
         try
         {
+            await CloseOpenReadersAsync().ConfigureAwait(false);
             await remoteClient
                 .ExecuteAsync(
                     GetRemoteBeginSql(isolationLevel),
@@ -996,6 +1054,7 @@ public class AhtolaConnection :
 
         try
         {
+            CloseOpenReaders();
             remoteClient
                 .ExecuteAsync("COMMIT", new AhtolaParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
                 .GetAwaiter()
@@ -1025,6 +1084,7 @@ public class AhtolaConnection :
 
         try
         {
+            await CloseOpenReadersAsync().ConfigureAwait(false);
             await remoteClient
                 .ExecuteAsync(
                     "COMMIT",
@@ -1059,6 +1119,7 @@ public class AhtolaConnection :
 
         try
         {
+            CloseOpenReaders();
             remoteClient
                 .ExecuteAsync("ROLLBACK", new AhtolaParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
                 .GetAwaiter()
@@ -1087,6 +1148,7 @@ public class AhtolaConnection :
 
         try
         {
+            await CloseOpenReadersAsync().ConfigureAwait(false);
             await remoteClient
                 .ExecuteAsync(
                     "ROLLBACK",

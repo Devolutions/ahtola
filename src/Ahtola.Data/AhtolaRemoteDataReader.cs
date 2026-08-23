@@ -7,24 +7,43 @@ using System.Text;
 
 namespace Ahtola;
 
-internal sealed class AhtolaRemoteDataReader : DbDataReader
+internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedReader
 {
     private readonly AhtolaConnection? _connection;
     private readonly IReadOnlyList<RemoteStatementResult> _results;
     private readonly CommandBehavior _behavior;
     private readonly int _recordsAffected;
     private readonly string? _commandText;
+    private readonly AhtolaRemoteClient.RemoteCursor? _cursor;
+    private readonly AhtolaCommand? _command;
+    private readonly ILocalReaderConnection? _readerConnection;
+    private List<RemoteResponseValue>? _currentStreamingRow;
+    private bool _streamHasRows;
     private int _resultIndex;
     private int _rowIndex = -1;
     private bool _isClosed;
 
     public AhtolaRemoteDataReader(AhtolaCommand command, RemoteStatementResult result, CommandBehavior behavior)
-        : this(command.Connection as AhtolaConnection, [result], behavior, command.CommandText)
+        : this(command.Connection as AhtolaConnection, [result], behavior, command.CommandText, cursor: null, command: null)
+    {
+    }
+
+    public AhtolaRemoteDataReader(
+        AhtolaCommand command,
+        AhtolaRemoteClient.RemoteCursor cursor,
+        CommandBehavior behavior)
+        : this(
+            command.Connection as AhtolaConnection,
+            [new RemoteStatementResult { Columns = cursor.Columns }],
+            behavior,
+            command.CommandText,
+            cursor,
+            command)
     {
     }
 
     public AhtolaRemoteDataReader(AhtolaConnection? connection, IReadOnlyList<RemoteStatementResult> results, CommandBehavior behavior)
-        : this(connection, results, behavior, null)
+        : this(connection, results, behavior, null, cursor: null, command: null)
     {
     }
 
@@ -32,7 +51,9 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
         AhtolaConnection? connection,
         IReadOnlyList<RemoteStatementResult> results,
         CommandBehavior behavior,
-        string? commandText)
+        string? commandText,
+        AhtolaRemoteClient.RemoteCursor? cursor,
+        AhtolaCommand? command)
     {
         ArgumentNullException.ThrowIfNull(results);
 
@@ -40,8 +61,15 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
         _results = results;
         _behavior = behavior;
         _commandText = commandText;
+        _cursor = cursor;
+        _command = command;
         foreach (var result in results)
             _recordsAffected = checked(_recordsAffected + (int)result.AffectedRowCount);
+        if (cursor is not null)
+        {
+            _readerConnection = connection as ILocalReaderConnection;
+            _readerConnection?.ReaderOpened(this);
+        }
     }
 
     public override bool GetBoolean(int ordinal)
@@ -121,7 +149,18 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
 
         // No declared type (expression or aggregate): use the data, skipping NULLs. DataTable rejects DBNull as a
         // column type.
-        if (HasCurrentRow)
+        if (_currentStreamingRow is not null)
+        {
+            var currentType = GetClrType(_currentStreamingRow[ordinal].Type);
+            if (currentType != typeof(DBNull))
+                return currentType;
+        }
+        else if (_cursor is not null
+                 && FindFirstStreamingNonNullValue(ordinal) is { } streamingValue)
+        {
+            return GetClrType(streamingValue.Type);
+        }
+        else if (HasCurrentRow)
         {
             var currentType = GetClrType(CurrentResult.Rows[_rowIndex][ordinal].Type);
             if (currentType != typeof(DBNull))
@@ -244,26 +283,38 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
             : 0;
 
     public override DataTable GetSchemaTable()
-        => AhtolaSchemaCollections.BuildReaderSchemaTable(
-            _connection,
+    {
+        return AhtolaSchemaCollections.BuildReaderSchemaTable(
+            _cursor is null ? _connection : null,
             _commandText,
             FieldCount,
             GetName,
             GetFieldType);
+    }
 
     public override object this[int ordinal] => GetValue(ordinal);
 
     public override object this[string name] => GetValue(GetOrdinal(name));
 
-    public override int RecordsAffected => _recordsAffected;
+    public override int RecordsAffected => _cursor?.RecordsAffected ?? _recordsAffected;
 
-    public override bool HasRows => CurrentResult.Rows.Count > 0;
+    public override bool HasRows
+        => _cursor is null
+            ? CurrentResult.Rows.Count > 0
+            : _streamHasRows || EnsureCursorHasRows();
 
     public override bool IsClosed => _isClosed;
 
     public override bool NextResult()
     {
         EnsureOpen();
+        if (_cursor is not null)
+        {
+            while (Read())
+            {
+            }
+            return false;
+        }
         if (_resultIndex + 1 >= _results.Count)
         {
             _rowIndex = CurrentResult.Rows.Count;
@@ -275,25 +326,52 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
         return true;
     }
 
-    public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
+    public override async Task<bool> NextResultAsync(CancellationToken cancellationToken)
     {
-        return cancellationToken.IsCancellationRequested
-            ? Task.FromCanceled<bool>(cancellationToken)
-            : Task.FromResult(NextResult());
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_cursor is not null)
+        {
+            while (await ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+            }
+            return false;
+        }
+        return NextResult();
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing && !_isClosed && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-            _connection?.Close();
-
-        _isClosed = true;
+        if (disposing)
+            CloseCoreAsync(closeConnection: true).AsTask().GetAwaiter().GetResult();
         base.Dispose(disposing);
     }
+
+    public override async ValueTask DisposeAsync()
+    {
+        await CloseCoreAsync(closeConnection: true).ConfigureAwait(false);
+        GC.SuppressFinalize(this);
+    }
+
+    public override Task CloseAsync()
+        => CloseCoreAsync(closeConnection: true).AsTask();
+
+    void IConnectionOwnedReader.CloseFromConnection()
+        => CloseCoreAsync(closeConnection: false).AsTask().GetAwaiter().GetResult();
+
+    ValueTask IConnectionOwnedReader.CloseFromConnectionAsync()
+        => CloseCoreAsync(closeConnection: false);
 
     public override bool Read()
     {
         EnsureOpen();
+        if (_cursor is not null)
+        {
+            _currentStreamingRow = (_command
+                ?? throw new InvalidOperationException("Remote cursor reader has no command."))
+                .RunOperation(_cursor.ReadRow);
+            _streamHasRows |= _currentStreamingRow is not null;
+            return _currentStreamingRow is not null;
+        }
         if (_rowIndex + 1 >= CurrentResult.Rows.Count)
         {
             _rowIndex = CurrentResult.Rows.Count;
@@ -304,11 +382,19 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
         return true;
     }
 
-    public override Task<bool> ReadAsync(CancellationToken cancellationToken)
+    public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
-        return cancellationToken.IsCancellationRequested
-            ? Task.FromCanceled<bool>(cancellationToken)
-            : Task.FromResult(Read());
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_cursor is not null)
+        {
+            _currentStreamingRow = await (_command
+                    ?? throw new InvalidOperationException("Remote cursor reader has no command."))
+                .RunOperationAsync(_cursor.ReadRowAsync, cancellationToken)
+                .ConfigureAwait(false);
+            _streamHasRows |= _currentStreamingRow is not null;
+            return _currentStreamingRow is not null;
+        }
+        return Read();
     }
 
     public override int Depth => 0;
@@ -329,7 +415,9 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
         }
     }
 
-    private bool HasCurrentRow => _rowIndex >= 0 && _rowIndex < CurrentResult.Rows.Count;
+    private bool HasCurrentRow
+        => _currentStreamingRow is not null
+           || _rowIndex >= 0 && _rowIndex < CurrentResult.Rows.Count;
 
     private RemoteResponseValue CurrentValue(int ordinal)
     {
@@ -338,7 +426,7 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
             throw new InvalidOperationException("No current row. Call Read before accessing values.");
 
         ValidateOrdinal(ordinal);
-        var row = CurrentResult.Rows[_rowIndex];
+        var row = _currentStreamingRow ?? CurrentResult.Rows[_rowIndex];
         if (ordinal >= row.Count)
             throw new IndexOutOfRangeException($"column ordinal {ordinal} is out of range");
 
@@ -431,5 +519,59 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader
     {
         if (IsClosed)
             throw new InvalidOperationException("The data reader is closed.");
+    }
+
+    private bool EnsureCursorHasRows()
+        => (_command
+            ?? throw new InvalidOperationException("Remote cursor reader has no command."))
+            .RunOperation(
+                token => (_cursor
+                    ?? throw new InvalidOperationException("Remote cursor reader has no cursor."))
+                    .EnsureHasRows(token));
+
+    private RemoteResponseValue? FindFirstStreamingNonNullValue(int ordinal)
+        => (_command
+            ?? throw new InvalidOperationException("Remote cursor reader has no command."))
+            .RunOperation(
+                token => (_cursor
+                    ?? throw new InvalidOperationException("Remote cursor reader has no cursor."))
+                    .FindFirstNonNullValue(ordinal, token));
+
+    private async ValueTask CloseCoreAsync(bool closeConnection)
+    {
+        if (_isClosed)
+            return;
+
+        _isClosed = true;
+        Exception? failure = null;
+        try
+        {
+            if (_cursor is not null)
+                await _cursor.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+        finally
+        {
+            _readerConnection?.ReaderClosed(this);
+            if (closeConnection
+                && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+            {
+                try
+                {
+                    if (_connection is not null)
+                        await _connection.CloseAsync().ConfigureAwait(false);
+                }
+                catch (Exception exception) when (failure is not null)
+                {
+                    _ = exception;
+                }
+            }
+        }
+
+        if (failure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
 }

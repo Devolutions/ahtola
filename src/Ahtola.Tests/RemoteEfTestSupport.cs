@@ -141,6 +141,9 @@ internal sealed class ScriptedHranaHandler : HttpMessageHandler
 
         using var document = JsonDocument.Parse(
             await request.Content!.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+        if (request.RequestUri!.AbsolutePath.EndsWith("/v3/cursor", StringComparison.Ordinal))
+            return RespondToCursor(document.RootElement.GetProperty("batch"));
+
         var requestEntry = document.RootElement.GetProperty("requests")[0];
 
         var responseRoot = new JsonObject();
@@ -185,6 +188,18 @@ internal sealed class ScriptedHranaHandler : HttpMessageHandler
                 },
             };
         }
+        else if (requestEntry.GetProperty("type").GetString() == "close")
+        {
+            responseRoot["baton"] = null;
+            responseRoot["results"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["type"] = "ok",
+                    ["response"] = new JsonObject { ["type"] = "close" },
+                },
+            };
+        }
         else
         {
             var sql = requestEntry.GetProperty("stmt").GetProperty("sql").GetString()!;
@@ -204,6 +219,69 @@ internal sealed class ScriptedHranaHandler : HttpMessageHandler
         return new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = new StringContent(responseRoot.ToJsonString(), Encoding.UTF8, "application/json"),
+        };
+    }
+
+    private HttpResponseMessage RespondToCursor(JsonElement batch)
+    {
+        var lines = new StringBuilder();
+        lines.AppendLine("""{"baton":"scripted-cursor-baton","base_url":null}""");
+        var stepOutcomes = new List<BatchStepOutcome>();
+        var stepIndex = 0;
+        foreach (var step in batch.GetProperty("steps").EnumerateArray())
+        {
+            var shouldRun = !step.TryGetProperty("condition", out var condition)
+                || EvaluateBatchCondition(condition, stepOutcomes, _isAutocommit);
+            if (!shouldRun)
+            {
+                stepOutcomes.Add(BatchStepOutcome.Skipped);
+                stepIndex++;
+                continue;
+            }
+
+            var sql = step.GetProperty("stmt").GetProperty("sql").GetString()!;
+            var (result, error) = RespondTo(sql);
+            if (error is not null)
+            {
+                lines.AppendLine(new JsonObject
+                {
+                    ["type"] = "step_error",
+                    ["step"] = stepIndex,
+                    ["error"] = error.DeepClone(),
+                }.ToJsonString());
+                stepOutcomes.Add(BatchStepOutcome.Failed);
+                stepIndex++;
+                continue;
+            }
+
+            lines.AppendLine(new JsonObject
+            {
+                ["type"] = "step_begin",
+                ["step"] = stepIndex,
+                ["cols"] = result!["cols"]?.DeepClone() ?? new JsonArray(),
+            }.ToJsonString());
+            foreach (var row in result["rows"]?.AsArray() ?? [])
+            {
+                lines.AppendLine(new JsonObject
+                {
+                    ["type"] = "row",
+                    ["row"] = row?.DeepClone() ?? new JsonArray(),
+                }.ToJsonString());
+            }
+            lines.AppendLine(new JsonObject
+            {
+                ["type"] = "step_end",
+                ["affected_row_count"] = result["affected_row_count"]?.DeepClone() ?? 0,
+                ["last_insert_rowid"] = result["last_insert_rowid"]?.DeepClone(),
+            }.ToJsonString());
+            stepOutcomes.Add(BatchStepOutcome.Succeeded);
+            stepIndex++;
+        }
+
+        lines.AppendLine("""{"type":"replication_index","replication_index":null}""");
+        return new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(lines.ToString(), Encoding.UTF8, "application/x-ndjson"),
         };
     }
 

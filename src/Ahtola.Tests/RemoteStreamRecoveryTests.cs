@@ -297,11 +297,13 @@ public sealed class RemoteStreamRecoveryTests
         }
 
         public string GetSql(int index)
-            => Requests[index]
-                .GetProperty("requests")[0]
-                .GetProperty("stmt")
-                .GetProperty("sql")
-                .GetString()!;
+        {
+            var root = Requests[index];
+            var statement = root.TryGetProperty("requests", out var requests)
+                ? requests[0].GetProperty("stmt")
+                : root.GetProperty("batch").GetProperty("steps")[0].GetProperty("stmt");
+            return statement.GetProperty("sql").GetString()!;
+        }
 
         public string? GetBatchReplicationIndex(int index)
             => Requests[index]
@@ -318,6 +320,17 @@ public sealed class RemoteStreamRecoveryTests
                 await request.Content!.ReadAsStringAsync(cancellationToken));
             var root = document.RootElement.Clone();
             Requests.Add(root);
+            if (request.RequestUri!.AbsolutePath.EndsWith("/v3/cursor", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        ToCursorResponse(_responses.Dequeue()),
+                        Encoding.UTF8,
+                        "application/x-ndjson"),
+                };
+            }
+
             var requestType = root.GetProperty("requests")[0].GetProperty("type").GetString();
             var response = requestType == "close"
                 ? """{"results":[{"type":"ok","response":{"type":"close"}}]}"""
@@ -326,6 +339,45 @@ public sealed class RemoteStreamRecoveryTests
             {
                 Content = new StringContent(response, Encoding.UTF8, "application/json"),
             };
+        }
+
+        private static string ToCursorResponse(string pipelineResponse)
+        {
+            using var document = JsonDocument.Parse(pipelineResponse);
+            var root = document.RootElement;
+            var baton = root.TryGetProperty("baton", out var batonElement)
+                && batonElement.ValueKind == JsonValueKind.String
+                    ? batonElement.GetString()
+                    : "cursor-error";
+            var lines = new StringBuilder()
+                .Append("{\"baton\":")
+                .Append(JsonSerializer.Serialize(baton))
+                .AppendLine(",\"base_url\":null}");
+            var result = root.GetProperty("results")[0];
+            if (result.GetProperty("type").GetString() == "error")
+            {
+                lines.Append("{\"type\":\"step_error\",\"step\":0,\"error\":")
+                    .Append(result.GetProperty("error").GetRawText())
+                    .AppendLine("}");
+                lines.AppendLine("""{"type":"replication_index","replication_index":null}""");
+                return lines.ToString();
+            }
+
+            var statement = result.GetProperty("response").GetProperty("result");
+            lines.Append("{\"type\":\"step_begin\",\"step\":0,\"cols\":")
+                .Append(statement.GetProperty("cols").GetRawText())
+                .AppendLine("}");
+            foreach (var row in statement.GetProperty("rows").EnumerateArray())
+            {
+                lines.Append("{\"type\":\"row\",\"row\":")
+                    .Append(row.GetRawText())
+                    .AppendLine("}");
+            }
+            lines.Append("{\"type\":\"step_end\",\"affected_row_count\":")
+                .Append(statement.GetProperty("affected_row_count").GetRawText())
+                .AppendLine(",\"last_insert_rowid\":null}");
+            lines.AppendLine("""{"type":"replication_index","replication_index":null}""");
+            return lines.ToString();
         }
     }
 

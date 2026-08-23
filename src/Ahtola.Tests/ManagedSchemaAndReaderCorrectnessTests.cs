@@ -494,11 +494,45 @@ public sealed class ManagedSchemaAndReaderCorrectnessTests
         {
             using var document = JsonDocument.Parse(
                 await request.Content!.ReadAsStringAsync(cancellationToken));
-            var sql = document.RootElement
-                .GetProperty("requests")[0]
-                .GetProperty("stmt")
-                .GetProperty("sql")
-                .GetString();
+            var cursor = request.RequestUri!.AbsolutePath.EndsWith("/v3/cursor", StringComparison.Ordinal);
+            var root = document.RootElement;
+            if (!cursor
+                && root.GetProperty("requests")[0].GetProperty("type").GetString() == "close")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """{"baton":null,"results":[{"type":"ok","response":{"type":"close"}}]}""",
+                        Encoding.UTF8,
+                        "application/json"),
+                };
+            }
+
+            var statement = cursor
+                ? root.GetProperty("batch").GetProperty("steps")[0].GetProperty("stmt")
+                : root.GetProperty("requests")[0].GetProperty("stmt");
+            var sql = statement.GetProperty("sql").GetString();
+            if (cursor)
+            {
+                var cursorResponse = sql!.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+                    ? """
+                      {"baton":"schema-cursor","base_url":null}
+                      {"type":"step_begin","step":0,"cols":[{"name":"value","decltype":"INTEGER"}]}
+                      {"type":"row","row":[{"type":"integer","value":"42"}]}
+                      {"type":"step_end","affected_row_count":0,"last_insert_rowid":null}
+                      {"type":"replication_index","replication_index":null}
+                      """
+                    : """
+                      {"baton":"schema-cursor","base_url":null}
+                      {"type":"step_begin","step":0,"cols":[]}
+                      {"type":"step_end","affected_row_count":0,"last_insert_rowid":null}
+                      {"type":"replication_index","replication_index":null}
+                      """;
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(cursorResponse + "\n", Encoding.UTF8, "application/x-ndjson"),
+                };
+            }
 
             var response = sql!.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
                 ? """{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"value","decltype":"INTEGER"}],"rows":[[{"type":"integer","value":"42"}]],"affected_row_count":0}}}]}"""

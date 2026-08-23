@@ -701,7 +701,24 @@ public sealed class SqliteRemoteFacadeTests
             Authorization = request.Headers.Authorization?.ToString();
             using var document = JsonDocument.Parse(
                 await request.Content!.ReadAsStringAsync(cancellationToken));
+            if (request.RequestUri!.AbsolutePath.EndsWith("/v3/cursor", StringComparison.Ordinal))
+            {
+                var statement = document.RootElement
+                    .GetProperty("batch").GetProperty("steps")[0].GetProperty("stmt");
+                return await RespondToCursorAsync(statement, cancellationToken);
+            }
+
             var requestEntry = document.RootElement.GetProperty("requests")[0];
+            if (requestEntry.GetProperty("type").GetString() == "close")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """{"baton":null,"results":[{"type":"ok","response":{"type":"close"}}]}""",
+                        Encoding.UTF8,
+                        "application/json"),
+                };
+            }
             if (requestEntry.TryGetProperty("batch", out var batch))
             {
                 var stepResults = new List<string>();
@@ -778,6 +795,72 @@ public sealed class SqliteRemoteFacadeTests
             return new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new StringContent(response, Encoding.UTF8, "application/json"),
+            };
+        }
+
+        private async Task<HttpResponseMessage> RespondToCursorAsync(
+            JsonElement statement,
+            CancellationToken cancellationToken)
+        {
+            CaptureRealArguments(statement);
+            var sql = statement.GetProperty("sql").GetString()!;
+            SqlStatements.Add(sql);
+            if (string.Equals(sql, "CANCEL", StringComparison.Ordinal))
+            {
+                CancellationRequestStarted.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            if (string.Equals(sql, "TRANSIENT", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                {
+                    ReasonPhrase = "temporarily unavailable",
+                    Content = new StringContent("retry later", Encoding.UTF8, "text/plain"),
+                };
+            }
+
+            string response;
+            if (string.Equals(sql, "BAD", StringComparison.Ordinal))
+            {
+                response = """
+                           {"baton":"facade-cursor","base_url":null}
+                           {"type":"step_error","step":0,"error":{"message":"remote syntax error","code":"SQLITE_ERROR"}}
+                           {"type":"replication_index","replication_index":null}
+                           """;
+            }
+            else if (string.Equals(sql, "SELECT typed_values", StringComparison.Ordinal))
+            {
+                response = """
+                           {"baton":"facade-cursor","base_url":null}
+                           {"type":"step_begin","step":0,"cols":[{"name":"integer"},{"name":"boolean"},{"name":"datetime"},{"name":"datetimeoffset"},{"name":"guid"},{"name":"timespan"},{"name":"decimal"}]}
+                           {"type":"row","row":[{"type":"text","value":"7"},{"type":"text","value":"true"},{"type":"text","value":"2024-01-02 03:04:05"},{"type":"text","value":"2024-01-02T03:04:05+02:00"},{"type":"blob","base64":"Z0UjAauJ780BI0VniavN7w"},{"type":"text","value":"01:30:00"},{"type":"text","value":"12.50"}]}
+                           {"type":"step_end","affected_row_count":0,"last_insert_rowid":null}
+                           {"type":"replication_index","replication_index":null}
+                           """;
+            }
+            else if (sql.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                response = """
+                           {"baton":"facade-cursor","base_url":null}
+                           {"type":"step_begin","step":0,"cols":[{"name":"value","decltype":"INTEGER"}]}
+                           {"type":"row","row":[{"type":"integer","value":"42"}]}
+                           {"type":"step_end","affected_row_count":0,"last_insert_rowid":null}
+                           {"type":"replication_index","replication_index":null}
+                           """;
+            }
+            else
+            {
+                response = """
+                           {"baton":"facade-cursor","base_url":null}
+                           {"type":"step_begin","step":0,"cols":[]}
+                           {"type":"step_end","affected_row_count":1,"last_insert_rowid":null}
+                           {"type":"replication_index","replication_index":null}
+                           """;
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(response + "\n", Encoding.UTF8, "application/x-ndjson"),
             };
         }
 
