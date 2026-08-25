@@ -38,10 +38,19 @@ internal static class ManagedFtsLimits
 /// </remarks>
 internal abstract record ManagedFtsNode;
 
+internal sealed record ManagedFtsMatchNoneNode : ManagedFtsNode
+{
+    public static ManagedFtsMatchNoneNode Instance { get; } = new();
+}
+
 internal sealed record ManagedFtsTermNode(string Text, bool IsPrefix, string? Column, bool AnchoredAtStart)
     : ManagedFtsNode;
 
-internal sealed record ManagedFtsPhraseNode(IReadOnlyList<string> Terms, string? Column, bool AnchoredAtStart)
+internal sealed record ManagedFtsPhraseNode(
+    IReadOnlyList<string> Terms,
+    string? Column,
+    bool AnchoredAtStart,
+    bool LastTermIsPrefix = false)
     : ManagedFtsNode;
 
 internal sealed record ManagedFtsNearNode(IReadOnlyList<string> Terms, int Distance, string? Column)
@@ -60,9 +69,16 @@ internal sealed record ManagedFtsNotNode(ManagedFtsNode Operand) : ManagedFtsNod
 /// </summary>
 internal sealed class ManagedFtsQueryLanguage
 {
+    private enum SyntaxProfile
+    {
+        MethodIndex,
+        SqliteFts5,
+    }
+
     private readonly string _text;
     private readonly ManagedFtsTokenizerOptions _options;
     private readonly Func<string, bool> _isKnownColumn;
+    private readonly SyntaxProfile _profile;
     private int _offset;
     private int _depth;
     private int _termCount;
@@ -70,11 +86,13 @@ internal sealed class ManagedFtsQueryLanguage
     private ManagedFtsQueryLanguage(
         string text,
         ManagedFtsTokenizerOptions options,
-        Func<string, bool> isKnownColumn)
+        Func<string, bool> isKnownColumn,
+        SyntaxProfile profile)
     {
         _text = text;
         _options = options;
         _isKnownColumn = isKnownColumn;
+        _profile = profile;
     }
 
     public static ManagedFtsNode Parse(
@@ -88,7 +106,24 @@ internal sealed class ManagedFtsQueryLanguage
         if (query.AsSpan().Trim().Length == 0)
             throw new EmbeddedSqlException("fts query is empty");
 
-        var parser = new ManagedFtsQueryLanguage(query, options, isKnownColumn);
+        var parser = new ManagedFtsQueryLanguage(query, options, isKnownColumn, SyntaxProfile.MethodIndex);
+        var node = parser.ParseOr();
+        parser.ExpectEnd();
+        return node;
+    }
+
+    public static ManagedFtsNode ParseFts5(
+        string query,
+        ManagedFtsTokenizerOptions options,
+        Func<string, bool> isKnownColumn)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(isKnownColumn);
+        if (query.AsSpan().Trim().Length == 0)
+            throw new EmbeddedSqlException("fts query is empty");
+
+        var parser = new ManagedFtsQueryLanguage(query, options, isKnownColumn, SyntaxProfile.SqliteFts5);
         var node = parser.ParseOr();
         parser.ExpectEnd();
         return node;
@@ -97,9 +132,47 @@ internal sealed class ManagedFtsQueryLanguage
     private ManagedFtsNode ParseOr()
     {
         using var _ = Descend();
-        var expression = ParseAnd();
+        var expression = _profile == SyntaxProfile.SqliteFts5 ? ParseFts5And() : ParseAnd();
         while (TryReadKeyword("OR"))
-            expression = new ManagedFtsOrNode(expression, ParseAnd());
+        {
+            expression = new ManagedFtsOrNode(
+                expression,
+                _profile == SyntaxProfile.SqliteFts5 ? ParseFts5And() : ParseAnd());
+        }
+
+        return expression;
+    }
+
+    private ManagedFtsNode ParseFts5And()
+    {
+        using var _ = Descend();
+        var expression = ParseFts5Not();
+        while (TryReadKeyword("AND"))
+            expression = new ManagedFtsAndNode(expression, ParseFts5Not());
+
+        return expression;
+    }
+
+    private ManagedFtsNode ParseFts5Not()
+    {
+        using var _ = Descend();
+        var expression = ParseFts5ImplicitAnd();
+        while (TryReadKeyword("NOT"))
+        {
+            expression = new ManagedFtsAndNode(
+                expression,
+                new ManagedFtsNotNode(ParseFts5ImplicitAnd()));
+        }
+
+        return expression;
+    }
+
+    private ManagedFtsNode ParseFts5ImplicitAnd()
+    {
+        using var _ = Descend();
+        var expression = ParsePrimary();
+        while (IsFts5ImplicitOperandStart())
+            expression = new ManagedFtsAndNode(expression, ParsePrimary());
 
         return expression;
     }
@@ -146,8 +219,21 @@ internal sealed class ManagedFtsQueryLanguage
         }
 
         var column = TryReadColumnPrefix();
+        if (_profile == SyntaxProfile.SqliteFts5 && column is not null && TryRead('('))
+        {
+            var expression = ParseOr();
+            if (!TryRead(')'))
+                throw Error("Expected ')' to close FTS column filter.");
+            return ConstrainToColumn(expression, column);
+        }
+
         if (IsKeywordAtOffset("NEAR"))
             return ParseNear(column);
+        if (_profile == SyntaxProfile.SqliteFts5
+            && (IsKeywordAtOffset("AND") || IsKeywordAtOffset("OR") || IsKeywordAtOffset("NOT")))
+        {
+            throw Error("Expected an FTS term.");
+        }
 
         var anchored = TryRead('^');
         if (TryRead('"'))
@@ -218,6 +304,11 @@ internal sealed class ManagedFtsQueryLanguage
     }
 
     private ManagedFtsNode ParseNear(string? column)
+        => _profile == SyntaxProfile.SqliteFts5
+            ? ParseFts5Near(column)
+            : ParseMethodNear(column);
+
+    private ManagedFtsNode ParseMethodNear(string? column)
     {
         _offset += "NEAR".Length;
         var distance = 10;
@@ -271,6 +362,88 @@ internal sealed class ManagedFtsQueryLanguage
         return new ManagedFtsNearNode(terms, distance, column);
     }
 
+    private ManagedFtsNode ParseFts5Near(string? column)
+    {
+        _offset += "NEAR".Length;
+        if (TryRead('/'))
+            throw Error("FTS5 syntax error near '/'.");
+        if (!TryRead('('))
+            throw Error("Expected '(' after NEAR.");
+
+        var terms = new List<string>();
+        var operandCount = 0;
+        var distance = 10;
+        while (true)
+        {
+            SkipWhitespace();
+            if (TryRead(','))
+            {
+                SkipWhitespace();
+                var digits = ReadDigits();
+                if (digits.Length == 0
+                    || !int.TryParse(
+                        digits,
+                        System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out distance)
+                    || distance < 0
+                    || distance > ManagedFtsLimits.MaxNearDistance)
+                {
+                    throw Error($"NEAR distance must be between 0 and {ManagedFtsLimits.MaxNearDistance}.");
+                }
+
+                if (!TryRead(')'))
+                    throw Error("Expected ')' after NEAR distance.");
+                break;
+            }
+            if (TryRead(')'))
+                break;
+
+            string operand;
+            if (TryRead('"'))
+            {
+                var start = _offset;
+                while (_offset < _text.Length && _text[_offset] != '"')
+                    _offset++;
+                if (_offset == _text.Length)
+                    throw Error("Unterminated FTS phrase.");
+                operand = _text[start.._offset];
+                _offset++;
+            }
+            else
+            {
+                operand = ReadNearWord();
+            }
+
+            if (operand.Length == 0)
+                throw Error("Expected an FTS phrase inside NEAR.");
+
+            var tokens = ManagedFtsTokenization.TokenizeQueryText(operand, _options);
+            if (tokens.Count == 0)
+            {
+                CountTerm();
+                terms.Add(ManagedFtsTokenization.NormalizeTerm(operand, _options));
+            }
+            else
+            {
+                foreach (var token in tokens)
+                {
+                    CountTerm();
+                    terms.Add(token);
+                }
+            }
+
+            operandCount++;
+        }
+
+        if (operandCount < 2)
+            throw Error("NEAR requires at least two phrases.");
+
+        // FTS5 counts intervening tokens, while the postings evaluator compares absolute token
+        // positions. Adjacent phrases therefore have a position delta of one at distance zero.
+        return new ManagedFtsNearNode(terms, checked(distance + 1), column);
+    }
+
     private ManagedFtsNode ParsePhrase(string? column, bool anchored)
     {
         var start = _offset;
@@ -283,7 +456,8 @@ internal sealed class ManagedFtsQueryLanguage
         var phraseText = _text[start.._offset];
         _offset++;
 
-        if (TryRead('*'))
+        var prefix = TryRead('*');
+        if (prefix && _profile != SyntaxProfile.SqliteFts5)
             throw Error("A prefix wildcard is valid only after an unquoted FTS term.");
 
         var tokens = ManagedFtsTokenization.TokenizeQueryText(phraseText, _options);
@@ -293,7 +467,7 @@ internal sealed class ManagedFtsQueryLanguage
         if (tokens.Count == 1)
         {
             CountTerm();
-            return new ManagedFtsTermNode(tokens[0], IsPrefix: false, column, anchored);
+            return new ManagedFtsTermNode(tokens[0], prefix, column, anchored);
         }
 
         var terms = new string[tokens.Count];
@@ -303,8 +477,34 @@ internal sealed class ManagedFtsQueryLanguage
             terms[index] = tokens[index];
         }
 
-        return new ManagedFtsPhraseNode(terms, column, anchored);
+        return new ManagedFtsPhraseNode(terms, column, anchored, LastTermIsPrefix: prefix);
     }
+
+    internal static ManagedFtsNode ConstrainToColumn(ManagedFtsNode node, string column)
+        => node switch
+        {
+            ManagedFtsMatchNoneNode => node,
+            ManagedFtsTermNode term => ConstrainLeaf(term.Column, column)
+                ? term with { Column = column }
+                : ManagedFtsMatchNoneNode.Instance,
+            ManagedFtsPhraseNode phrase => ConstrainLeaf(phrase.Column, column)
+                ? phrase with { Column = column }
+                : ManagedFtsMatchNoneNode.Instance,
+            ManagedFtsNearNode near => ConstrainLeaf(near.Column, column)
+                ? near with { Column = column }
+                : ManagedFtsMatchNoneNode.Instance,
+            ManagedFtsAndNode and => new ManagedFtsAndNode(
+                ConstrainToColumn(and.Left, column),
+                ConstrainToColumn(and.Right, column)),
+            ManagedFtsOrNode or => new ManagedFtsOrNode(
+                ConstrainToColumn(or.Left, column),
+                ConstrainToColumn(or.Right, column)),
+            ManagedFtsNotNode not => new ManagedFtsNotNode(ConstrainToColumn(not.Operand, column)),
+            _ => throw new ArgumentOutOfRangeException(nameof(node)),
+        };
+
+    private static bool ConstrainLeaf(string? existing, string column)
+        => existing is null || string.Equals(existing, column, StringComparison.OrdinalIgnoreCase);
 
     private string? TryReadColumnPrefix()
     {
@@ -333,6 +533,17 @@ internal sealed class ManagedFtsQueryLanguage
         return !IsKeywordAtOffset("OR");
     }
 
+    private bool IsFts5ImplicitOperandStart()
+    {
+        SkipWhitespace();
+        if (_offset >= _text.Length || _text[_offset] is ')' or ',')
+            return false;
+
+        return !IsKeywordAtOffset("OR")
+            && !IsKeywordAtOffset("AND")
+            && !IsKeywordAtOffset("NOT");
+    }
+
     private string ReadWord()
     {
         SkipWhitespace();
@@ -340,6 +551,20 @@ internal sealed class ManagedFtsQueryLanguage
         while (_offset < _text.Length
             && !char.IsWhiteSpace(_text[_offset])
             && _text[_offset] is not ('(' or ')' or '"' or '*' or '-' or ':' or '^'))
+        {
+            _offset++;
+        }
+
+        return _text[start.._offset];
+    }
+
+    private string ReadNearWord()
+    {
+        SkipWhitespace();
+        var start = _offset;
+        while (_offset < _text.Length
+            && !char.IsWhiteSpace(_text[_offset])
+            && _text[_offset] is not ('(' or ')' or ',' or '"' or '*' or '-' or ':' or '^'))
         {
             _offset++;
         }

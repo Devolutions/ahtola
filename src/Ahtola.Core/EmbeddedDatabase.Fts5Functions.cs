@@ -17,16 +17,23 @@ public sealed partial class EmbeddedDatabase
                 $"unable to use function {function.Name.ToLowerInvariant()} in the requested context");
         }
 
-        var binding = column.Qualifier is { } qualifier
-            ? row.GetFts5SourceForQualifier(qualifier)
-            : row.GetFts5SourceForTable(column.UnqualifiedName ?? column.Name);
-        if (binding is null)
+        for (var scope = row; scope is not null; scope = scope.Parent)
         {
-            throw new EmbeddedSqlException(
-                $"unable to use function {function.Name.ToLowerInvariant()} in the requested context");
+            if (!TryResolveColumnLocally(scope, column))
+                continue;
+
+            var localScope = scope.Parent is null ? scope : scope with { Parent = null };
+            var binding = column.Qualifier is { } qualifier
+                ? localScope.GetFts5SourceForQualifier(qualifier)
+                : localScope.GetFts5SourceForTable(column.UnqualifiedName ?? column.Name);
+            if (binding is not null)
+                return binding;
+
+            break;
         }
 
-        return binding;
+        throw new EmbeddedSqlException(
+            $"unable to use function {function.Name.ToLowerInvariant()} in the requested context");
     }
 
     private static SqlValue EvaluateFts5Bm25(

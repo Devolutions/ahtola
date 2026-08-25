@@ -610,30 +610,14 @@ internal sealed class ManagedFts5Table : ManagedVirtualTable
         if (value.Kind != SqlValueKind.Text)
             throw new EmbeddedSqlException("fts5 MATCH requires a text query");
 
-        var query = ManagedFtsQueryLanguage.Parse(
+        var query = ManagedFtsQueryLanguage.ParseFts5(
             value.AsText(),
             _definition.Tokenizer,
             name => ResolveColumnIndex(name) is not null);
         return columnIndex == TableColumnIndex
             ? query
-            : ApplyDefaultColumn(query, _columnNames[columnIndex]);
+            : ManagedFtsQueryLanguage.ConstrainToColumn(query, _columnNames[columnIndex]);
     }
-
-    private static ManagedFtsNode ApplyDefaultColumn(ManagedFtsNode node, string column)
-        => node switch
-        {
-            ManagedFtsTermNode term => term.Column is null ? term with { Column = column } : term,
-            ManagedFtsPhraseNode phrase => phrase.Column is null ? phrase with { Column = column } : phrase,
-            ManagedFtsNearNode near => near.Column is null ? near with { Column = column } : near,
-            ManagedFtsAndNode and => new ManagedFtsAndNode(
-                ApplyDefaultColumn(and.Left, column),
-                ApplyDefaultColumn(and.Right, column)),
-            ManagedFtsOrNode or => new ManagedFtsOrNode(
-                ApplyDefaultColumn(or.Left, column),
-                ApplyDefaultColumn(or.Right, column)),
-            ManagedFtsNotNode not => new ManagedFtsNotNode(ApplyDefaultColumn(not.Operand, column)),
-            _ => throw new ArgumentOutOfRangeException(nameof(node)),
-        };
 
     private sealed class Cursor(ManagedFts5Table table)
         : ManagedVirtualTableCursor, IManagedFts5Cursor

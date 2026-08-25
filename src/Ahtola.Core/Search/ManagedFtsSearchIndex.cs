@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 
 namespace Ahtola.Core.Search;
 
@@ -372,6 +373,7 @@ internal sealed class ManagedFtsSearchIndex
         IReadOnlyList<double> columnWeights)
         => node switch
         {
+            ManagedFtsMatchNoneNode => [],
             ManagedFtsTermNode term => EvaluateTerm(term, accumulator, columnWeights),
             ManagedFtsPhraseNode phrase => EvaluatePhrase(phrase, accumulator, columnWeights),
             ManagedFtsNearNode near => EvaluateNear(near, accumulator, columnWeights),
@@ -552,9 +554,19 @@ internal sealed class ManagedFtsSearchIndex
         var columnMask = ResolveColumnMask(phrase.Column);
         var candidates = new List<ScoreCandidate>();
         var matches = new HashSet<long>();
-        foreach (var rowId in IntersectTerms(phrase.Terms))
+        var finalTerms = phrase.LastTermIsPrefix
+            ? ExpandTerm(new ManagedFtsTermNode(phrase.Terms[^1], IsPrefix: true, phrase.Column, AnchoredAtStart: false))
+                .ToArray()
+            : [phrase.Terms[^1]];
+        foreach (var rowId in IntersectPhraseTerms(phrase.Terms, finalTerms, phrase.LastTermIsPrefix))
         {
-            var frequency = CountPhrase(rowId, phrase.Terms, columnMask, phrase.AnchoredAtStart);
+            var frequency = CountPhrase(
+                rowId,
+                phrase.Terms,
+                finalTerms,
+                phrase.LastTermIsPrefix,
+                columnMask,
+                phrase.AnchoredAtStart);
             if (frequency == 0)
                 continue;
 
@@ -652,10 +664,47 @@ internal sealed class ManagedFtsSearchIndex
         return candidates ?? [];
     }
 
-    private int CountPhrase(long rowId, IReadOnlyList<string> terms, uint columnMask, bool anchored)
+    private IEnumerable<long> IntersectPhraseTerms(
+        IReadOnlyList<string> terms,
+        IReadOnlyList<string> finalTerms,
+        bool finalTermIsPrefix)
+    {
+        if (!finalTermIsPrefix)
+            return IntersectTerms(terms);
+
+        HashSet<long>? candidates = null;
+        if (terms.Count > 1)
+            candidates = new HashSet<long>(IntersectTerms(terms.Take(terms.Count - 1).ToArray()));
+
+        var finalCandidates = new HashSet<long>();
+        foreach (var term in finalTerms)
+        {
+            if (!_postings.TryGetValue(term, out var list))
+                continue;
+            foreach (var posting in list.Entries)
+            {
+                if (IsLive(posting))
+                    finalCandidates.Add(posting.RowId);
+            }
+        }
+
+        if (candidates is null)
+            return finalCandidates;
+        candidates.IntersectWith(finalCandidates);
+        return candidates;
+    }
+
+    private int CountPhrase(
+        long rowId,
+        IReadOnlyList<string> terms,
+        IReadOnlyList<string> finalTerms,
+        bool finalTermIsPrefix,
+        uint columnMask,
+        bool anchored)
     {
         var streams = new long[terms.Count][];
-        for (var index = 0; index < terms.Count; index++)
+        var exactTermCount = finalTermIsPrefix ? terms.Count - 1 : terms.Count;
+        for (var index = 0; index < exactTermCount; index++)
         {
             if (!TryGetPositions(terms[index], rowId, out var positions))
                 return 0;
@@ -673,13 +722,20 @@ internal sealed class ManagedFtsSearchIndex
                 continue;
 
             var matched = true;
-            for (var index = 1; index < streams.Length; index++)
+            for (var index = 1; index < exactTermCount; index++)
             {
                 if (Array.BinarySearch(streams[index], start + index) < 0)
                 {
                     matched = false;
                     break;
                 }
+            }
+
+            if (matched && finalTermIsPrefix)
+            {
+                matched = finalTerms.Any(term
+                    => TryGetPositions(term, rowId, out var positions)
+                        && Array.BinarySearch(positions, start + terms.Count - 1) >= 0);
             }
 
             if (matched)
@@ -1142,7 +1198,7 @@ internal sealed class ManagedFtsSearchIndex
             SqlValueKind.Text => value.AsText(),
             SqlValueKind.Integer => value.AsInteger().ToString(CultureInfo.InvariantCulture),
             SqlValueKind.Real => value.AsReal().ToString("R", CultureInfo.InvariantCulture),
-            SqlValueKind.Blob => string.Empty,
+            SqlValueKind.Blob => Encoding.UTF8.GetString(value.AsBlob().Span),
             _ => string.Empty,
         };
 

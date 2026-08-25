@@ -411,6 +411,8 @@ internal static class ManagedFtsFunctions
     {
         switch (node)
         {
+            case ManagedFtsMatchNoneNode:
+                return;
             case ManagedFtsTermNode term:
                 if (!AppliesToColumn(term.Column, columnName))
                     return;
@@ -431,7 +433,14 @@ internal static class ManagedFtsFunctions
                 return;
             case ManagedFtsPhraseNode phrase:
                 if (AppliesToColumn(phrase.Column, columnName))
+                {
+                    if (phrase.LastTermIsPrefix && ++prefixTerms > ManagedFtsLimits.MaxHighlightPrefixTerms)
+                    {
+                        throw new EmbeddedSqlException(
+                            $"fts highlight query uses more than {ManagedFtsLimits.MaxHighlightPrefixTerms} prefix terms");
+                    }
                     CollectPhraseSpans(lookup, phrase, destination);
+                }
                 return;
             case ManagedFtsNearNode near:
                 if (AppliesToColumn(near.Column, columnName))
@@ -469,7 +478,10 @@ internal static class ManagedFtsFunctions
             var matched = true;
             for (var index = 1; index < phrase.Terms.Count; index++)
             {
-                if (!lookup.TryGetAtPosition(phrase.Terms[index], first.Position + index, out var token))
+                var found = phrase.LastTermIsPrefix && index == phrase.Terms.Count - 1
+                    ? lookup.TryGetPrefixAtPosition(phrase.Terms[index], first.Position + index, out var token)
+                    : lookup.TryGetAtPosition(phrase.Terms[index], first.Position + index, out token);
+                if (!found)
                 {
                     matched = false;
                     break;
@@ -597,6 +609,35 @@ internal static class ManagedFtsFunctions
             {
                 token = occurrences[low];
                 return true;
+            }
+
+            token = null!;
+            return false;
+        }
+
+        public bool TryGetPrefixAtPosition(string prefix, int position, out ManagedFtsToken token)
+        {
+            foreach (var (term, occurrences) in _byTerm)
+            {
+                if (!term.StartsWith(prefix, StringComparison.Ordinal))
+                    continue;
+
+                var low = 0;
+                var high = occurrences.Count;
+                while (low < high)
+                {
+                    var middle = low + ((high - low) >> 1);
+                    if (occurrences[middle].Position < position)
+                        low = middle + 1;
+                    else
+                        high = middle;
+                }
+
+                if (low < occurrences.Count && occurrences[low].Position == position)
+                {
+                    token = occurrences[low];
+                    return true;
+                }
             }
 
             token = null!;
