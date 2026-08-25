@@ -7945,18 +7945,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var schema = definition.Table.Schema;
-        var columns = statement.Columns ?? schema.Columns.Select(static column => column.Name).ToArray();
-        var assignments = ResolveVirtualTableColumns(schema, columns);
+        var columns = statement.Columns ?? schema.VisibleColumns.Select(static column => column.Name).ToArray();
+        var assignments = ResolveVirtualTableInsertColumns(schema, columns);
         var mutations = new List<IReadOnlyList<SqlValue>>(statement.Rows.Count);
         foreach (var row in statement.Rows)
         {
             if (row.Length != assignments.Length)
-                throw new EmbeddedSqlException($"table {statement.TableName} has {schema.Columns.Count} columns but {row.Length} values were supplied");
+            {
+                throw new EmbeddedSqlException(
+                    $"table {statement.TableName} has {columns.Length} columns but {row.Length} values were supplied");
+            }
 
             var values = Enumerable.Repeat(SqlValue.Null, schema.Columns.Count).ToArray();
+            long? newRowId = null;
             for (var index = 0; index < row.Length; index++)
-                values[assignments[index]] = Evaluate(row[index], parameters, null, context);
-            mutations.Add(BuildVirtualTableUpdateArguments(null, null, values));
+            {
+                var value = Evaluate(row[index], parameters, null, context);
+                if (assignments[index] < 0)
+                    newRowId = ManagedFts5Table.ReadRowId(value, "new rowid");
+                else
+                    values[assignments[index]] = value;
+            }
+            mutations.Add(BuildVirtualTableUpdateArguments(null, newRowId, values));
         }
 
         return ExecuteVirtualTableMutations(context.VirtualTables!, definition, mutations);
@@ -7989,7 +7999,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             outerRow: null,
             statement.Where,
             []);
-        var assignments = ResolveVirtualTableColumns(
+        var assignments = ResolveVirtualTableInsertColumns(
             definition.Table.Schema,
             statement.Assignments.Select(static assignment => assignment.Column).ToArray());
         var mutations = new List<IReadOnlyList<SqlValue>>();
@@ -8007,9 +8017,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
 
             var values = row.Values.ToArray();
+            if (definition.Table is ManagedFts5Table)
+            {
+                for (var index = 0; index < definition.Table.Schema.Columns.Count; index++)
+                {
+                    if (definition.Table.Schema.Columns[index].IsHidden)
+                        values[index] = SqlValue.Null;
+                }
+            }
+            var newRowId = row.RowId;
             for (var index = 0; index < statement.Assignments.Count; index++)
-                values[assignments[index]] = Evaluate(statement.Assignments[index].Value, parameters, row, context);
-            mutations.Add(BuildVirtualTableUpdateArguments(row.RowId, row.RowId, values));
+            {
+                var value = Evaluate(statement.Assignments[index].Value, parameters, row, context);
+                if (assignments[index] < 0)
+                {
+                    newRowId = ManagedFts5Table.ReadRowId(value, "new rowid")
+                        ?? throw new EmbeddedSqlException("datatype mismatch");
+                }
+                else
+                {
+                    values[assignments[index]] = value;
+                }
+            }
+            mutations.Add(BuildVirtualTableUpdateArguments(row.RowId, newRowId, values));
         }
 
         return ExecuteVirtualTableMutations(context.VirtualTables!, definition, mutations);
@@ -8051,6 +8081,36 @@ public sealed partial class EmbeddedDatabase : IDisposable
             .Select(row => BuildVirtualTableUpdateArguments(row.RowId, null, row.Values))
             .ToArray();
         return ExecuteVirtualTableMutations(context.VirtualTables!, definition, mutations);
+    }
+
+    private static int[] ResolveVirtualTableInsertColumns(
+        ManagedVirtualTableSchema schema,
+        IReadOnlyList<string> names)
+    {
+        var indexes = new int[names.Count];
+        var seen = new HashSet<int>();
+        for (var index = 0; index < names.Count; index++)
+        {
+            var columnIndex = -1;
+            for (var candidate = 0; candidate < schema.Columns.Count; candidate++)
+            {
+                if (string.Equals(schema.Columns[candidate].Name, names[index], StringComparison.OrdinalIgnoreCase))
+                {
+                    columnIndex = candidate;
+                    break;
+                }
+            }
+
+            // A real schema column shadows rowid/_rowid_/oid, just as it does for ordinary tables.
+            if (columnIndex < 0 && EmbeddedTable.IsRowidAliasName(names[index]))
+                columnIndex = -2;
+            if (columnIndex == -1 || !seen.Add(columnIndex))
+                throw new EmbeddedSqlException($"no such column: {names[index]}");
+
+            indexes[index] = columnIndex;
+        }
+
+        return indexes;
     }
 
     private static int[] ResolveVirtualTableColumns(
@@ -24203,7 +24263,7 @@ out bool hasReturning)
                             group.Representative,
                             WithOuterAggregateScope(context, group.Rows))));
             }
-            if (statement.OrderBy.Count > 0)
+            if (statement.OrderBy.Count > 0 && !source.OrderByConsumed)
             {
                 var orderCollations = resolvedOrderBy
                     .Select(term => GetEffectiveCollation(term.Expression, context))
@@ -27889,7 +27949,10 @@ out bool hasReturning)
                     AmbiguousQualifiedColumns: ambiguousQualifiedColumns,
                     QualifiedMethodIndexSources: CombineMethodIndexSources(
                         GetMethodIndexSources(leftRow),
-                        GetMethodIndexSources(rightRow)));
+                        GetMethodIndexSources(rightRow)),
+                    QualifiedFts5Sources: CombineFts5Sources(
+                        GetFts5Sources(leftRow),
+                        GetFts5Sources(rightRow)));
                 if (source.Condition is not null
                     && !JoinConditionMatches(source, joinPairs, row, leftRow, rightRow, parameters, context))
                 {
@@ -27930,7 +27993,8 @@ out bool hasReturning)
                         GetMethodIndexSources(leftRow),
                         rowsForLeft.Rows.FirstOrDefault() is { } rightTemplate
                             ? GetMethodIndexSources(rightTemplate)
-                            : [])));
+                            : []),
+                    QualifiedFts5Sources: GetFts5Sources(leftRow)));
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
                     return CreateResult(rows);
             }
@@ -27968,7 +28032,8 @@ out bool hasReturning)
                         left.Rows.FirstOrDefault() is { } leftTemplate
                             ? GetMethodIndexSources(leftTemplate)
                             : [],
-                        GetMethodIndexSources(rightRow))));
+                        GetMethodIndexSources(rightRow)),
+                    QualifiedFts5Sources: GetFts5Sources(rightRow)));
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
                     return CreateResult(rows);
             }
@@ -28596,6 +28661,34 @@ out bool hasReturning)
     private static IReadOnlyDictionary<string, MethodIndexSourceBinding>? CombineMethodIndexSources(
         Dictionary<string, MethodIndexSourceBinding> left,
         Dictionary<string, MethodIndexSourceBinding> right)
+    {
+        if (left.Count == 0 && right.Count == 0)
+            return null;
+
+        foreach (var (qualifier, binding) in right)
+            left.TryAdd(qualifier, binding);
+
+        return left;
+    }
+
+    private static Dictionary<string, ManagedFts5SourceBinding> GetFts5Sources(SourceRow row)
+    {
+        var sources = new Dictionary<string, ManagedFts5SourceBinding>(StringComparer.OrdinalIgnoreCase);
+        if (row.QualifiedFts5Sources is not null)
+        {
+            foreach (var (qualifier, binding) in row.QualifiedFts5Sources)
+                sources.TryAdd(qualifier, binding);
+        }
+
+        if (row.Fts5Source is { } own && row.RowIdQualifier is { } qualifierName)
+            sources.TryAdd(qualifierName, own);
+
+        return sources;
+    }
+
+    private static IReadOnlyDictionary<string, ManagedFts5SourceBinding>? CombineFts5Sources(
+        Dictionary<string, ManagedFts5SourceBinding> left,
+        Dictionary<string, ManagedFts5SourceBinding> right)
     {
         if (left.Count == 0 && right.Count == 0)
             return null;
@@ -29475,11 +29568,24 @@ out bool hasReturning)
                 new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase)
                 {
                     [qualifier] = cursor.RowId,
-                }));
+                },
+                Fts5Source: cursor is IManagedFts5Cursor fts5Cursor
+                    ? fts5Cursor.CurrentBinding
+                    : null,
+                QualifiedFts5Sources: cursor is IManagedFts5Cursor qualifiedFts5Cursor
+                    ? new Dictionary<string, ManagedFts5SourceBinding>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        [qualifier] = qualifiedFts5Cursor.CurrentBinding,
+                    }
+                    : null));
             cursor.Next();
         }
 
-        return new SourceData(columns, rows, OmittedVirtualTablePredicates: omittedPredicates);
+        return new SourceData(
+            columns,
+            rows,
+            OmittedVirtualTablePredicates: omittedPredicates,
+            OrderByConsumed: plan.OrderByConsumed && plannerInput.OrderBy.Count == sourceOrderBy.Count);
     }
 
     private IReadOnlyList<SqlValue> BuildVirtualTableFilterArguments(
@@ -34581,6 +34687,9 @@ out bool hasReturning)
             "FTS_SNIPPET" => Search.ManagedFtsFunctions.Snippet(
                 arguments,
                 ResolveBoundFtsTokenizer(function, row, context)),
+            "BM25" => EvaluateFts5Bm25(function, arguments, row),
+            "HIGHLIGHT" => EvaluateFts5Highlight(function, arguments, row),
+            "SNIPPET" => EvaluateFts5Snippet(function, arguments, row),
             _ => throw new EmbeddedSqlException($"no such function: {function.Name}"),
         };
     }
@@ -51938,7 +52047,9 @@ internal sealed record SourceRow(
     IReadOnlyDictionary<string, EmbeddedColumn>? QualifiedColumnDefinitions = null,
     IReadOnlySet<string>? AmbiguousQualifiedColumns = null,
     MethodIndexSourceBinding? MethodIndexSource = null,
-    IReadOnlyDictionary<string, MethodIndexSourceBinding>? QualifiedMethodIndexSources = null)
+    IReadOnlyDictionary<string, MethodIndexSourceBinding>? QualifiedMethodIndexSources = null,
+    ManagedFts5SourceBinding? Fts5Source = null,
+    IReadOnlyDictionary<string, ManagedFts5SourceBinding>? QualifiedFts5Sources = null)
 {
     public SqlValue GetValue(string name)
         => GetValue(name, allowQualifiedLookup: true);
@@ -51966,6 +52077,47 @@ internal sealed record SourceRow(
             && string.Equals(owner, qualifier, StringComparison.OrdinalIgnoreCase)
                 ? own
                 : Parent?.GetMethodIndexSourceForQualifier(qualifier);
+    }
+
+    public ManagedFts5SourceBinding? GetFts5SourceForQualifier(string qualifier)
+    {
+        if (QualifiedFts5Sources is { } qualified && qualified.TryGetValue(qualifier, out var bound))
+            return bound;
+
+        return Fts5Source is { } own
+            && RowIdQualifier is { } owner
+            && string.Equals(owner, qualifier, StringComparison.OrdinalIgnoreCase)
+                ? own
+                : Parent?.GetFts5SourceForQualifier(qualifier);
+    }
+
+    public ManagedFts5SourceBinding? GetFts5SourceForTable(string tableName)
+    {
+        ManagedFts5SourceBinding? resolved = null;
+        if (QualifiedFts5Sources is not null)
+        {
+            foreach (var binding in QualifiedFts5Sources.Values)
+            {
+                if (!string.Equals(binding.Table.TableName, tableName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (resolved is not null
+                    && (!ReferenceEquals(resolved.Table, binding.Table) || resolved.RowId != binding.RowId))
+                {
+                    return null;
+                }
+
+                resolved = binding;
+            }
+        }
+
+        if (resolved is null
+            && Fts5Source is { } own
+            && string.Equals(own.Table.TableName, tableName, StringComparison.OrdinalIgnoreCase))
+        {
+            resolved = own;
+        }
+
+        return resolved ?? Parent?.GetFts5SourceForTable(tableName);
     }
 
     /// <summary>
@@ -52300,4 +52452,5 @@ internal sealed record SourceData(
     IReadOnlyList<SourceRow> Rows,
     IReadOnlyList<string?>? Collations = null,
     IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null,
-    IReadOnlyList<Expression>? OmittedVirtualTablePredicates = null);
+    IReadOnlyList<Expression>? OmittedVirtualTablePredicates = null,
+    bool OrderByConsumed = false);

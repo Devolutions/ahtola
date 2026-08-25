@@ -31,11 +31,10 @@ internal static class ManagedFtsLimits
     public const int MaxHighlightPrefixTerms = 64;
 }
 
-/// <summary>The extended managed FTS query grammar used by method indexes.</summary>
+/// <summary>The extended managed FTS query grammar used by method indexes and managed FTS5.</summary>
 /// <remarks>
-/// A superset of <see cref="ManagedFtsQueryParser"/>, which stays untouched for the shipped
-/// <c>fts5</c> virtual table. The additions are column filters (<c>col:term</c>), initial-token
-/// anchors (<c>^term</c>) and <c>NEAR/n(a b)</c>.
+/// A superset of <see cref="ManagedFtsQueryParser"/>. The additions are column filters
+/// (<c>col:term</c>), initial-token anchors (<c>^term</c>) and <c>NEAR/n(a b)</c>.
 /// </remarks>
 internal abstract record ManagedFtsNode;
 
