@@ -262,6 +262,7 @@ internal sealed class MvStore
     private readonly Dictionary<ulong, MvccTransactionState> _finalizedStates = [];
     private readonly Dictionary<ulong, ulong> _finalizedCommitTimestamps = [];
     private readonly Dictionary<MvccRowId, List<MvccRowVersion>> _rows = [];
+    private readonly Dictionary<long, OrderedTableKeys> _orderedTableKeys = [];
     private readonly Dictionary<string, long> _tableIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<long, string> _tableNames = [];
     private readonly Dictionary<long, long> _nextRowIds = [];
@@ -272,6 +273,7 @@ internal sealed class MvStore
     private ulong _schemaGeneration;
     private ulong _commitGeneration;
     private ulong? _schemaChangeTransaction;
+    private bool _checkpointInProgress;
     private bool _hasUnresolvedLegacyRows;
     private bool _hasIndeterminateCommit;
     private MvccLogicalLog? _logicalLog;
@@ -339,6 +341,7 @@ internal sealed class MvStore
                 {
                     chain = [];
                     _rows[op.RowId] = chain;
+                    IndexRowLocked(op.RowId);
                 }
 
                 if (op.IsDelete)
@@ -484,7 +487,9 @@ internal sealed class MvStore
                 throw new EmbeddedSqlException(
                     "The MVCC store has an indeterminate logical-log commit; dispose and reopen the database before starting another transaction.");
             }
-            if (_exclusiveTxId is not null || _schemaChangeTransaction is not null)
+            if (_checkpointInProgress
+                || _exclusiveTxId is not null
+                || _schemaChangeTransaction is not null)
                 throw new EmbeddedBusyException();
 
             var beginTs = NextBeginTimestamp();
@@ -504,8 +509,9 @@ internal sealed class MvStore
                 throw new EmbeddedSqlException(
                     "The MVCC store has an indeterminate logical-log commit; dispose and reopen the database before starting another transaction.");
             }
-            if (_exclusiveTxId is { } held
-                && (existing is null || held != existing.Value.Value))
+            if (_checkpointInProgress
+                || (_exclusiveTxId is { } held
+                    && (existing is null || held != existing.Value.Value)))
             {
                 throw new EmbeddedBusyException();
             }
@@ -549,6 +555,8 @@ internal sealed class MvStore
         lock (_gate)
         {
             var tx = RequireActive(id);
+            if (_checkpointInProgress)
+                throw new EmbeddedBusyException();
             if (tx.BeginCommitGeneration != _commitGeneration)
                 throw new EmbeddedBusyException();
             if (_schemaChangeTransaction is { } owner && owner != id.Value)
@@ -621,6 +629,7 @@ internal sealed class MvStore
             }
 
             _rows.Clear();
+            _orderedTableKeys.Clear();
             _tableIds.Clear();
             _tableNames.Clear();
             _nextRowIds.Clear();
@@ -646,6 +655,7 @@ internal sealed class MvStore
             {
                 chain = [];
                 _rows[rowId] = chain;
+                IndexRowLocked(rowId);
             }
             else if (!rowId.Key.IsInteger)
             {
@@ -725,6 +735,7 @@ internal sealed class MvStore
             {
                 chain = [];
                 _rows[rowId] = chain;
+                IndexRowLocked(rowId);
             }
 
             chain.Add(new MvccRowVersion(
@@ -848,6 +859,29 @@ internal sealed class MvStore
             }
 
             return results;
+        }
+    }
+
+    /// <summary>
+    /// Enumerates this table's visible MVCC effects in SQLite key order. Each
+    /// move locks only long enough to locate and clone the next entry, so the
+    /// caller retains no store lock and buffers no table-sized snapshot.
+    /// </summary>
+    internal IEnumerable<MvccVisibleRow> EnumerateVisible(
+        MvccTxId txId,
+        long tableId,
+        IComparer<MvccKey> comparer)
+    {
+        ArgumentNullException.ThrowIfNull(comparer);
+        RegisterTableKeyComparer(tableId, comparer);
+
+        var hasPrevious = false;
+        var previous = default(MvccKey);
+        while (TryGetNextVisible(txId, tableId, comparer, hasPrevious, previous, out var row))
+        {
+            yield return row;
+            previous = row.Key;
+            hasPrevious = true;
         }
     }
 
@@ -1107,7 +1141,7 @@ internal sealed class MvStore
         }
 
         if (chain.Count == 0)
-            _rows.Remove(op.RowId);
+            RemoveRowLocked(op.RowId);
     }
 
     private void AbortLocked(MvccTxId id, MvccTransaction tx)
@@ -1128,7 +1162,7 @@ internal sealed class MvStore
             }
 
             if (chain.Count == 0)
-                _rows.Remove(rowId);
+                RemoveRowLocked(rowId);
         }
 
         tx.MarkAborted();
@@ -1323,6 +1357,29 @@ internal sealed class MvStore
             return HasActiveTransactionsLocked();
     }
 
+    /// <summary>
+    /// Acquires the process-shared stop-the-world checkpoint boundary. The lease
+    /// closes the transaction-admission race between checking the reader floor
+    /// and beginning catalog materialization.
+    /// </summary>
+    internal bool TryAcquireCheckpoint(out CheckpointLease? lease)
+    {
+        lock (_gate)
+        {
+            if (_checkpointInProgress
+                || _schemaChangeTransaction is not null
+                || HasActiveTransactionsLocked())
+            {
+                lease = null;
+                return false;
+            }
+
+            _checkpointInProgress = true;
+            lease = new CheckpointLease(this);
+            return true;
+        }
+    }
+
     /// <summary>Count of version chains currently held (test/diagnostic).</summary>
     internal int VersionChainCount
     {
@@ -1342,6 +1399,8 @@ internal sealed class MvStore
             if (!HasActiveTransactionsLocked())
             {
                 _rows.Clear();
+                foreach (var ordered in _orderedTableKeys.Values)
+                    ordered.Keys.Clear();
                 return;
             }
 
@@ -1359,7 +1418,7 @@ internal sealed class MvStore
                     && beginTs < lwm);
 
                 if (chain.Count == 0)
-                    _rows.Remove(rowId);
+                    RemoveRowLocked(rowId);
             }
         }
     }
@@ -1373,6 +1432,32 @@ internal sealed class MvStore
         }
 
         return false;
+    }
+
+    private void ReleaseCheckpoint()
+    {
+        lock (_gate)
+        {
+            if (!_checkpointInProgress)
+                throw new InvalidOperationException("The MVCC checkpoint lease is not held.");
+            _checkpointInProgress = false;
+        }
+    }
+
+    internal sealed class CheckpointLease : IDisposable
+    {
+        private MvStore? _store;
+
+        internal CheckpointLease(MvStore store)
+        {
+            _store = store;
+        }
+
+        public void Dispose()
+        {
+            var store = Interlocked.Exchange(ref _store, null);
+            store?.ReleaseCheckpoint();
+        }
     }
 
     private ulong ComputeReaderLowWaterMarkLocked()
@@ -1407,7 +1492,7 @@ internal sealed class MvStore
                 && endTs < lowestActiveBegin);
 
             if (chain.Count == 0)
-                _rows.Remove(rowId);
+                RemoveRowLocked(rowId);
         }
 
         if (_finalizedStates.Count > 4096)
@@ -1423,4 +1508,178 @@ internal sealed class MvStore
             }
         }
     }
+
+    private void RegisterTableKeyComparer(long tableId, IComparer<MvccKey> comparer)
+    {
+        lock (_gate)
+        {
+            if (_orderedTableKeys.TryGetValue(tableId, out var existing))
+            {
+                var compatible = ReferenceEquals(existing.Comparer, comparer)
+                    || existing.Comparer is MvccKeyComparer registered
+                        && comparer is MvccKeyComparer requested
+                        && registered.IsCompatibleWith(requested);
+                if (!compatible)
+                {
+                    throw new InvalidOperationException(
+                        "The MVCC table key descriptor changed while its identity remained live.");
+                }
+                return;
+            }
+
+            var ordered = new OrderedTableKeys(comparer);
+            foreach (var rowId in _rows.Keys)
+            {
+                if (rowId.TableId == tableId)
+                    AddOrderedKey(ordered.Keys, rowId.Key);
+            }
+            _orderedTableKeys.Add(tableId, ordered);
+        }
+    }
+
+    private bool TryGetNextVisible(
+        MvccTxId txId,
+        long tableId,
+        IComparer<MvccKey> comparer,
+        bool hasPrevious,
+        MvccKey previous,
+        out MvccVisibleRow row)
+    {
+        lock (_gate)
+        {
+            var tx = RequireActive(txId);
+            if (!_orderedTableKeys.TryGetValue(tableId, out var ordered))
+                throw new InvalidOperationException("MVCC ordered table registration was lost.");
+
+            var hasCandidate = TryGetNextKey(ordered.Keys, comparer, hasPrevious, previous, out var candidate);
+            while (hasCandidate)
+            {
+                var rowId = new MvccRowId(tableId, candidate);
+                if (_rows.TryGetValue(rowId, out var chain)
+                    && TryResolveVisibleEffectLocked(tx, chain, out var cells, out var isDelete))
+                {
+                    row = new MvccVisibleRow(candidate, cells, isDelete);
+                    return true;
+                }
+
+                previous = candidate;
+                hasPrevious = true;
+                hasCandidate = TryGetNextKey(ordered.Keys, comparer, hasPrevious, previous, out candidate);
+            }
+
+            row = default;
+            return false;
+        }
+    }
+
+    private bool TryResolveVisibleEffectLocked(
+        MvccTransaction tx,
+        IReadOnlyList<MvccRowVersion> chain,
+        out SqlValue[]? cells,
+        out bool isDelete)
+    {
+        for (var index = chain.Count - 1; index >= 0; index--)
+        {
+            var version = chain[index];
+            if (!IsVisibleTo(version, tx))
+                continue;
+
+            isDelete = version.IsTombstone;
+            cells = isDelete ? null : (SqlValue[])version.Cells.Clone();
+            return true;
+        }
+
+        foreach (var version in chain)
+        {
+            if (version.End is null)
+                continue;
+
+            var end = version.End.Value;
+            if (end.IsTimestamp
+                    ? end.Value <= tx.BeginTimestamp
+                    : end.Value == tx.Id.Value || LookupCreatorVisibility(end.Value, tx))
+            {
+                cells = null;
+                isDelete = true;
+                return true;
+            }
+        }
+
+        cells = null;
+        isDelete = false;
+        return false;
+    }
+
+    private static bool TryGetNextKey(
+        SortedSet<MvccKey> keys,
+        IComparer<MvccKey> comparer,
+        bool hasPrevious,
+        MvccKey previous,
+        out MvccKey key)
+    {
+        if (keys.Count == 0)
+        {
+            key = default;
+            return false;
+        }
+
+        if (!hasPrevious)
+        {
+            key = keys.Min;
+            return true;
+        }
+
+        var maximum = keys.Max;
+        if (comparer.Compare(previous, maximum) >= 0)
+        {
+            key = default;
+            return false;
+        }
+
+        foreach (var candidate in keys.GetViewBetween(previous, maximum))
+        {
+            if (comparer.Compare(candidate, previous) > 0)
+            {
+                key = candidate;
+                return true;
+            }
+        }
+
+        key = default;
+        return false;
+    }
+
+    private void IndexRowLocked(MvccRowId rowId)
+    {
+        if (_orderedTableKeys.TryGetValue(rowId.TableId, out var ordered))
+            AddOrderedKey(ordered.Keys, rowId.Key);
+    }
+
+    private static void AddOrderedKey(SortedSet<MvccKey> keys, MvccKey key)
+    {
+        if (keys.Add(key))
+            return;
+        if (keys.TryGetValue(key, out var existing) && existing.Equals(key))
+            return;
+        throw new InvalidDataException(
+            "Distinct MVCC identities compare equal under the table's SQLite key descriptor.");
+    }
+
+    private void RemoveRowLocked(MvccRowId rowId)
+    {
+        _rows.Remove(rowId);
+        if (_orderedTableKeys.TryGetValue(rowId.TableId, out var ordered))
+            ordered.Keys.Remove(rowId.Key);
+    }
+
+    private sealed class OrderedTableKeys(IComparer<MvccKey> comparer)
+    {
+        internal IComparer<MvccKey> Comparer { get; } =
+            comparer ?? throw new ArgumentNullException(nameof(comparer));
+
+        internal SortedSet<MvccKey> Keys { get; } =
+            new(comparer);
+    }
 }
+
+internal readonly record struct MvccVisibleRow(MvccKey Key, SqlValue[]? Cells, bool IsDelete);
