@@ -686,9 +686,9 @@ plain-INNER run** of the FROM tree into a segment of freely permutable members
 plus a pool of ON conjuncts, chooses an order and a physical shape per step with
 a ported subset of Turso's cost model, and re-synthesizes a left-deep
 `JoinTableSource` tree with each conjunct attached at the first step where it
-becomes evaluable. Everything downstream — `TryBuildCompiledJoinSource`,
-`VdbeJoinOperatorPlan`, `VdbeJoinScanPlan`, `VdbeJoinEquiProbe` — is unchanged;
-the optimizer is a plan rewrite, not an engine rewrite.
+becomes evaluable. The exact physical choice is threaded into
+`TryBuildCompiledJoinSource`: scan/hash shapes retain `VdbeJoinScanPlan`, while
+an outer-bound persisted-index choice becomes a `VdbeJoinIndexScanPlan`.
 
 **Barriers are partition walls, not ordering hints.** A join node freezes its
 whole subtree into one opaque member when it is `LEFT`/`RIGHT`/`FULL`,
@@ -697,9 +697,10 @@ rewrite. Barrier members never interleave with their siblings and never donate
 predicates to the surrounding segment, while a reorderable region *inside* a
 barrier is still optimized independently. This is deliberately stricter than
 Turso's `required_lhs_by_table` / `left_join_illegal_map` legality bitmask
-(`join.rs:1258-1324`), which allows partial interleaving around an outer join:
-that scheme only pays for itself together with per-table access-method search,
-which needs index-seek join leaves this engine does not have. Every other
+(`join.rs:1258-1324`), which allows partial interleaving around an outer join.
+Ahtola keeps the stricter wall even though plain-INNER segments now have
+per-table seek choices, so this change cannot alter LEFT/RIGHT/FULL,
+NATURAL, or USING semantics. Every other
 decline — an unresolvable or ambiguous column reference, a correlated predicate,
 a member with no `sqlite_stat1` row, a source the compiled join builder cannot
 lower, or a synthesized tree the compiled-join validator later rejects — falls
@@ -722,29 +723,41 @@ in increasing numeric order, so no hash-table enumeration order can reach the
 result. Exact cost ties are broken by the lexicographically smallest member
 order, which makes the unmodified FROM order the winner of any tie.
 
-**Cost model** (`Compilation/JoinOrdering/JoinCostModel.cs`). `estimate_scan_cost`
-(`cost.rs:120-135`) and `estimate_hash_join_cost` (`access_method.rs:1200-1235`)
-are ported with the `CostModelParams` constants of `cost_params.rs:103-141`.
-Two deliberate deviations, both documented in code:
-- `estimate_index_cost` (`cost.rs:171`) is **not** ported. Every join input is a
-  full scan of a materialized cursor source, so awarding a per-seek discount
-  would model an access path the executor cannot produce.
+**Cost model** (`Compilation/JoinOrdering/JoinCostModel.cs`).
+`estimate_scan_cost` (`cost.rs:120-135`), `estimate_index_cost`
+(`cost.rs:171-236`), and `estimate_hash_join_cost`
+(`access_method.rs:1200-1235`) are ported with the `CostModelParams` constants
+of `cost_params.rs:103-141`. Index costing uses accumulated outer cardinality
+as the seek count, a unique full key as one row per seek, and otherwise the
+matching `sqlite_stat1` leading-prefix average. One deliberate hash deviation
+is documented in code:
 - The grace-hash spill term is replaced by an explicit buffering charge on
   whichever side is materialized into the operator's list. The managed operator
   has no memory budget to spill against, and without that charge the ported
   constants would rank a large build side as cheap, because `hash_lookup_cost`
   exceeds `hash_insert_cost`.
 
-Index statistics still participate where they describe the *data* rather than the
-access path: the expected rows matching one key value come from a rowid-alias or
-unique-index guarantee, else from `sqlite_stat1`'s per-index leading average,
-else from `sel_eq_unindexed`. That figure is equally valid for a hash probe.
+The managed executor does not yet open the persisted B-tree directly, so seek
+cost also includes the one-time O(N log N) projection/sort that reconstructs
+its MVCC-visible index view. This keeps large unhinted joins on the cheaper hash
+shape. A usable mandatory `INDEXED BY` candidate still selects the named seek;
+an unusable hint declines to the directive-aware evaluator rather than silently
+substituting another access method.
 
-**Shape selection.** Each step is scored against the three shapes the executor
-can run — nested-loop cross scan, hash-build-right, hash-build-left — and the
-winner is threaded back into `TryBuildCompiledJoinSource` as a per-node override
-of the existing `hashBuildRight` flag. Steps with no usable equality key have
-only one executable shape and are costed as the full comparison product.
+**Shape selection.** Each step is scored against nested-loop cross scan,
+hash-build-right, hash-build-left, and every executable persisted-index seek.
+A seek requires a contiguous leading equality prefix whose other endpoints are
+already in the outer mask. Its comparison collation must equal the effective
+index collation, and affinity conversion may apply only to the outer probe key,
+never to stored index values. Partial, expression, method, custom/overridden
+collation, missing-statistics, `NOT INDEXED`, prefix-gap, and unsafe-affinity
+candidates decline. The full ON condition remains as a residual predicate.
+
+`VdbeJoinIndexScanPlan` reconstructs one MVCC-visible index-ordered view per
+statement using the same durable index projection/sort machinery as managed
+index scans. Each outer row then performs a binary lower-bound probe and visits
+only the contiguous equal-prefix candidates; NULL probe keys visit none. This
+is a real bounded seek, but not yet a direct pager/B-tree cursor seek.
 
 **WHERE accounting.** Comparison conjuncts of the statement's WHERE clause that
 reference exactly one member and compare it against a literal or parameter are
@@ -771,17 +784,22 @@ reports its collation instead — silently downgrading a `NOCASE`/`RTRIM` column
 Name-based resolution (an explicit `COLLATE`, a bare column reference) still uses
 the statement's own source, so a name always means what the SQL text says.
 
-**Evidence.** The join cursor's `EXPLAIN` p4 text now carries the chosen leaf
-order (`… [scan order: seed, big, small]`) alongside the existing hash-build
-side, and `EmbeddedDatabase.JoinOrderDiagnostics` (internal) counts segments
-considered/reordered, DP vs greedy plans, declines and pushed WHERE terms.
+**Evidence.** The join cursor's `EXPLAIN` p4 text carries the chosen leaf order
+and exact `index-seek` choice; `EXPLAIN QUERY PLAN` emits
+`SEARCH <table> USING INDEX <name> (<prefix>=?)`.
+`EmbeddedDatabase.JoinOrderDiagnostics` counts segments, DP/greedy plans,
+declines, and pushed WHERE terms. `VdbeJoinIndexSeekMetrics` separately counts
+materialized index rows, probes, key comparisons, and candidate rows visited.
+`IndexSeekJoinTests` includes SQLite differential cases, durable reopen,
+fallbacks, plan shapes, and a work-bound assertion proving probes rather than
+outer-by-inner scans.
 
-**Residual gaps.** Index-seek join leaves, STAT4 histograms, bloom filters and
-auto-indexes for joins are still open; see `compile-nway-join-not-index-driven`,
-`compile-no-access-method-selection`, `vdbe-bloom-filter-opcodes` and
-`vdbe-autoindex-for-joins`. The two-table unadorned INNER route
-(`TryCompileJoinSelect`) keeps its own binary stat1 swap and is not routed
-through the enumerator.
+**Residual gaps.** Multi-index AND intersection, direct pager/B-tree cursor
+reuse, STAT4 histograms, bloom filters, transient join auto-indexes, and Turso's
+finer-grained outer-join interleaving remain open. The per-member candidate list
+and per-step access-choice union are the extension point for a future
+`MultiIndexIntersectionRight`; its RowSet lifecycle, duplicate suppression,
+costing, and branch-shaped EXPLAIN are intentionally not mixed into this change.
 
 ## 5. Parser / dialect layer
 22 entries — the smallest gap *per failure-line* ratio in the inventory, which

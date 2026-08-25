@@ -334,11 +334,14 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   opaque aggregate state do not yet spill. Prefer modest databases and explicit
   transactions for writes (managed writes are slower than native SQLite and the
   gap grows with table size).
-- **Planner** — `ANALYZE` / `sqlite_stat1` feed index scoring and limited join
-  cost gates (selective outer for two-table INNER nested loops; equijoin hash
-  build side). Full System-R DP join reordering and multi-index AND intersection
-  are still deferred; OUTER JOIN order stays correctness-preserving. Prefer
-  `ORDER BY` when order matters (`GROUP BY` is first-encounter order).
+- **Planner** — `ANALYZE` / `sqlite_stat1` feed index scoring, System-R DP join
+  reordering for up to eight freely reorderable INNER members (greedy above
+  that), hash-build selection, and durable secondary-index equality seeks bound
+  by preceding outer rows. OUTER/NATURAL/USING barriers remain
+  correctness-preserving. Multi-index AND intersection, STAT4 histograms,
+  transient join auto-indexes, and direct pager-cursor join seeks are still
+  deferred. Prefer `ORDER BY` when order matters (`GROUP BY` is
+  first-encounter order).
 - **File-backed platforms** — desktop physical files support Windows, 64-bit
   Linux, and macOS. Browser WebAssembly uses the separate OPFS package and its
   asynchronous data source (with an opt-in synchronous read-mirror profile, see

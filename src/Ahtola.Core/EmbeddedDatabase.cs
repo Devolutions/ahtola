@@ -17350,6 +17350,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         }
 
+        // An analyzed ordinary index may be selected only by the shared costed join planner.
+        // Decline the legacy two-table nested-loop route so two-table and N-way seeks execute
+        // through the same outer-bound access implementation.
+        if (join.Kind == JoinKind.Inner
+            && join.Condition is not null
+            && (HasAnalyzedOrdinaryJoinIndex(join.Left, context)
+                || HasAnalyzedOrdinaryJoinIndex(join.Right, context)))
+        {
+            return false;
+        }
+
         // The builder needs at least one column per side (a base table always has one).
         if (leftTarget.Columns.Length == 0 || rightTarget.Columns.Length == 0)
             return false;
@@ -17360,6 +17371,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             if (ContainsAggregate(projection.Expression) || ContainsWindowFunction(projection.Expression))
                 return false;
+        }
+
+        bool HasAnalyzedOrdinaryJoinIndex(TableSource source, QueryContext queryContext)
+        {
+            if (source is not NamedTableSource named
+                || named.IndexDirective is NotIndexedDirective
+                || !queryContext.Tables.TryGetValue(named.Name, out var table))
+            {
+                return false;
+            }
+
+            return table.Indexes.Any(index =>
+                (named.IndexDirective is not IndexedByDirective indexedBy
+                    || string.Equals(index.Name, indexedBy.IndexName, StringComparison.OrdinalIgnoreCase))
+                && !index.IsPartial
+                && !index.IsMethodIndex
+                && index.Columns.Count > 0
+                && index.Columns.All(static column => !column.IsExpression)
+                && TryGetSqliteStat1PrefixAverage(queryContext, table.Name, index.Name, 1, out _));
         }
 
         // Build the combined (left ++ right) row shape exactly as GetJoinRows does, so a
@@ -18201,7 +18231,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow,
         out CompiledJoinSource compiled,
-        IReadOnlyDictionary<JoinTableSource, bool>? hashBuildRightOverrides = null)
+        IReadOnlyDictionary<JoinTableSource, bool>? hashBuildRightOverrides = null,
+        IReadOnlyDictionary<JoinTableSource, CompiledJoinIndexSelection>? indexSeekSelections = null)
     {
         // The bytecode join operator has no semi/anti lowering: VdbeJoinKind only models the
         // four SQL join types. Decline so the rewritten select stays on the evaluator, which
@@ -18214,7 +18245,42 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (source is NamedTableSource)
         {
-            var target = ResolveScanTarget(source, context);
+            CompiledJoinIndexSelection? selectedSeek = null;
+            if (indexSeekSelections is not null)
+            {
+                foreach (var pair in indexSeekSelections)
+                {
+                    if (ReferenceEquals(pair.Key.Right, source))
+                    {
+                        selectedSeek = pair.Value;
+                        break;
+                    }
+                }
+            }
+
+            // INDEXED BY is mandatory. It may be removed from the leaf scan only when this
+            // exact leaf is the selected RHS seek using the named index; otherwise decline
+            // compilation and retain the directive-aware evaluator route.
+            var scanSource = source;
+            if (source is NamedTableSource
+                {
+                    IndexDirective: IndexedByDirective indexedBy,
+                } named)
+            {
+                if (selectedSeek is null
+                    || !string.Equals(
+                        selectedSeek.Candidate.Name,
+                        indexedBy.IndexName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    compiled = null!;
+                    return false;
+                }
+
+                scanSource = named with { IndexDirective = null };
+            }
+
+            var target = ResolveScanTarget(scanSource, context);
             if (target is null || target.Columns.Length == 0)
             {
                 compiled = null!;
@@ -18235,7 +18301,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 new VdbeJoinScanPlan(
                     target.TableName,
                     target.Columns.Length,
-                    target.CreateCursorSource()),
+                    selectedSeek is null
+                        ? target.CreateCursorSource()
+                        : new VdbeCursorSource([])),
                 target.TableName,
                 target.Columns,
                 BuildQualifiedColumns(target.Qualifier, target.Columns),
@@ -18259,14 +18327,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 context,
                 outerRow,
                 out var left,
-                hashBuildRightOverrides)
+                hashBuildRightOverrides,
+                indexSeekSelections)
             || !TryBuildCompiledJoinSource(
                 join.Right,
                 parameters,
                 context,
                 outerRow,
                 out var right,
-                hashBuildRightOverrides))
+                hashBuildRightOverrides,
+                indexSeekSelections))
         {
             compiled = null!;
             return false;
@@ -18346,7 +18416,30 @@ public sealed partial class EmbeddedDatabase : IDisposable
             // them before this point, and CanUseCompiledSelectRoute declines the whole select.
             _ => throw new InvalidOperationException($"Unknown join kind {join.Kind}."),
         };
-        var equiProbe = TryCreateCompiledJoinEquiProbe(join, context);
+        VdbeJoinPlanNode rightPlan = right.Plan;
+        string? indexSeekDescription = null;
+        if (indexSeekSelections is not null
+            && indexSeekSelections.TryGetValue(join, out var indexSelection))
+        {
+            if (kind != VdbeJoinKind.Inner
+                || !TryCreateCompiledJoinIndexScanPlan(
+                    join,
+                    indexSelection,
+                    left,
+                    right,
+                    context,
+                    outerRow,
+                    out rightPlan,
+                    out indexSeekDescription))
+            {
+                compiled = null!;
+                return false;
+            }
+        }
+
+        var equiProbe = indexSeekDescription is null
+            ? TryCreateCompiledJoinEquiProbe(join, context)
+            : null;
         // INNER equijoin: hash-build the smaller estimated side (default still right).
         // OUTER joins keep hash-build-right so unmatched-side semantics stay correct.
         var hashBuildRight = true;
@@ -18377,13 +18470,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         var plan = new VdbeJoinOperatorPlan(
             left.Plan,
-            right.Plan,
+            rightPlan,
             kind,
             join.Condition is null && joinPairs.Count == 0 ? null : condition,
             equiProbe,
             hashBuildRight);
         var scanOrder = left.ScanOrder.Concat(right.ScanOrder).ToArray();
-        var shape = equiProbe is null
+        var shape = indexSeekDescription is not null
+            ? $"{plan.SourceCount}-way {kind.ToString().ToUpperInvariant()} join {indexSeekDescription}"
+            : equiProbe is null
             ? $"{plan.SourceCount}-way {kind.ToString().ToUpperInvariant()} join"
             : hashBuildRight
                 ? $"{plan.SourceCount}-way {kind.ToString().ToUpperInvariant()} equijoin hash-build right"
@@ -18402,6 +18497,126 @@ public sealed partial class EmbeddedDatabase : IDisposable
             outputColumns,
             rawOutputColumns,
             scanOrder);
+        return true;
+    }
+
+    private bool TryCreateCompiledJoinIndexScanPlan(
+        JoinTableSource join,
+        CompiledJoinIndexSelection selection,
+        CompiledJoinSource left,
+        CompiledJoinSource right,
+        QueryContext context,
+        SourceRow? outerRow,
+        out VdbeJoinPlanNode plan,
+        out string description)
+    {
+        plan = null!;
+        description = string.Empty;
+        if (join.Right is not NamedTableSource named
+            || !context.Tables.TryGetValue(named.Name, out var table)
+            || table.Indexes.FirstOrDefault(index =>
+                string.Equals(index.Name, selection.Candidate.Name, StringComparison.OrdinalIgnoreCase)) is not { } index
+            || index.IsPartial
+            || index.IsMethodIndex
+            || index.Columns.Any(static column => column.IsExpression)
+            || selection.EqualityTerms.Count == 0
+            || selection.EqualityTerms.Count > selection.Candidate.Columns.Count)
+        {
+            return false;
+        }
+
+        var keys = new EquiJoinKey[selection.EqualityTerms.Count];
+        for (var position = 0; position < keys.Length; position++)
+        {
+            if (TryCreateEquiJoinKey(
+                    selection.EqualityTerms[position],
+                    join,
+                    left.OutputColumns,
+                    right.OutputColumns,
+                    context) is not { } key
+                || key.RightColumn.Index != selection.Candidate.Columns[position].ColumnOrdinal
+                || key.RightConvertsTextToNumeric
+                || key.RightConvertsNumericToText
+                || !string.Equals(
+                    key.Collation,
+                    selection.Candidate.Columns[position].Collation,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            keys[position] = key;
+        }
+
+        (VdbeCursorSource Source, IReadOnlyList<SqlValue[]> Keys) Materialize()
+        {
+            var visibleRows = GetNamedTableRows(
+                named,
+                context,
+                maximumRows: null,
+                outerRow).Rows;
+            var entries = GetManagedIndexEntries(table, index, visibleRows, context);
+            var rows = entries.Select(static entry => entry.Row.Values).ToArray();
+            var rowIds = table.HasRowid
+                ? entries.Select(static entry => entry.Row.RowId ?? 0L).ToArray()
+                : null;
+            return (
+                new VdbeCursorSource(rows, rowIds),
+                entries.Select(static entry => entry.Key).ToArray());
+        }
+
+        SqlValue[]? BuildSeekKey(VdbeJoinRow outer)
+        {
+            var result = new SqlValue[keys.Length];
+            for (var position = 0; position < keys.Length; position++)
+            {
+                var key = keys[position];
+                if (key.LeftColumn.Index < 0 || key.LeftColumn.Index >= outer.Values.Length)
+                    return null;
+
+                var value = outer.Values[key.LeftColumn.Index];
+                if (value.Kind == SqlValueKind.Null)
+                    return null;
+                if (key.LeftConvertsTextToNumeric)
+                    value = ApplyComparisonNumericAffinity(value);
+                else if (key.LeftConvertsNumericToText && value.Kind is SqlValueKind.Integer or SqlValueKind.Real)
+                    value = SqlValue.Text(ToSqlText(value));
+                result[position] = value;
+            }
+
+            return result;
+        }
+
+        int ComparePrefix(SqlValue[] stored, SqlValue[] seek)
+        {
+            for (var position = 0; position < seek.Length; position++)
+            {
+                var column = selection.Candidate.Columns[position];
+                var comparison = Compare(stored[position], seek[position], column.Collation);
+                if (comparison == 0)
+                    continue;
+                return column.Descending ? -comparison : comparison;
+            }
+
+            return 0;
+        }
+
+        var prefix = string.Join(
+            ", ",
+            selection.Candidate.Columns
+                .Take(keys.Length)
+                .Select(column => $"{table.Columns[column.ColumnOrdinal]}=?"));
+        var searchDescription = $"SEARCH {table.Name} USING INDEX {index.Name} ({prefix})";
+        plan = new VdbeJoinIndexScanPlan(
+            table.Name,
+            index.Name,
+            searchDescription,
+            table.Columns.Length,
+            Materialize,
+            BuildSeekKey,
+            ComparePrefix,
+            _joinIndexSeekMetrics);
+        description = $"index-seek {table.Name} USING INDEX {index.Name} ({prefix})";
         return true;
     }
 
@@ -22001,6 +22216,28 @@ out bool hasReturning)
                 ],
                 0);
         }
+        if (statement.Inner is SelectStatement joinSelect
+            && HasExplainSafeBounds(joinSelect)
+            && CanUseCompiledSelectRoute(joinSelect, compilationContext, outerRow: null)
+            && TryCompileSelect(
+                joinSelect,
+                parameters,
+                compilationContext,
+                outerRow: null,
+                out var compiledJoinSelect)
+            && GetCompiledJoinIndexSearchDescriptions(compiledJoinSelect.Program) is { Count: > 0 } searches)
+        {
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                searches.Select((detail, index) => new[]
+                {
+                    SqlValue.Integer(index + 1),
+                    SqlValue.Integer(0),
+                    SqlValue.Integer(0),
+                    SqlValue.Text(detail),
+                }).ToArray(),
+                0);
+        }
 
         var usesCompiledProgram = statement.Inner switch
         {
@@ -22051,6 +22288,32 @@ out bool hasReturning)
                 ],
             ],
             0);
+    }
+
+    private static IReadOnlyList<string> GetCompiledJoinIndexSearchDescriptions(VdbeProgram program)
+    {
+        var searches = new List<string>();
+        foreach (var instruction in program.Instructions)
+        {
+            if (instruction is OpenJoinCursorInstruction open)
+                Collect(open.Plan.Root);
+        }
+
+        return searches;
+
+        void Collect(VdbeJoinPlanNode node)
+        {
+            if (node is VdbeJoinIndexScanPlan index)
+            {
+                searches.Add(index.SearchDescription);
+                return;
+            }
+
+            if (node is not VdbeJoinOperatorPlan join)
+                return;
+            Collect(join.Left);
+            Collect(join.Right);
+        }
     }
 
     private static bool HasExplainSafeBounds(SelectStatement select) =>
@@ -23661,32 +23924,7 @@ out bool hasReturning)
             context,
             maximumRows: null,
             outerRow).Rows;
-        var entries = new List<(SourceRow Row, SqlValue[] Key)>(visibleRows.Count);
-        foreach (var row in visibleRows)
-        {
-            context.CheckInterrupt();
-            var rowId = table.HasRowid ? row.RowId : null;
-            if (!IndexExpressionSemantics.Qualifies(
-                    plan.Index,
-                    table,
-                    row.Values,
-                    rowId,
-                    EvaluateIndexExpression))
-            {
-                continue;
-            }
-
-            entries.Add((
-                row,
-                IndexExpressionSemantics.ProjectKey(
-                    plan.Index,
-                    table,
-                    row.Values,
-                    rowId,
-                    EvaluateIndexExpression)));
-        }
-
-        entries.Sort((left, right) => CompareManagedIndexEntries(table, plan.Index, left, right));
+        var entries = GetManagedIndexEntries(table, plan.Index, visibleRows, context);
         var qualifier = plan.Source.Alias ?? plan.Source.Name;
         var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
         var rows = entries.Select(entry => entry.Row with
@@ -23701,6 +23939,41 @@ out bool hasReturning)
         }).ToArray();
 
         return new SourceData(table.Columns, rows);
+    }
+
+    private List<(SourceRow Row, SqlValue[] Key)> GetManagedIndexEntries(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyList<SourceRow> visibleRows,
+        QueryContext context)
+    {
+        var entries = new List<(SourceRow Row, SqlValue[] Key)>(visibleRows.Count);
+        foreach (var row in visibleRows)
+        {
+            context.CheckInterrupt();
+            var rowId = table.HasRowid ? row.RowId : null;
+            if (!IndexExpressionSemantics.Qualifies(
+                    index,
+                    table,
+                    row.Values,
+                    rowId,
+                    EvaluateIndexExpression))
+            {
+                continue;
+            }
+
+            entries.Add((
+                row,
+                IndexExpressionSemantics.ProjectKey(
+                    index,
+                    table,
+                    row.Values,
+                    rowId,
+                    EvaluateIndexExpression)));
+        }
+
+        entries.Sort((left, right) => CompareManagedIndexEntries(table, index, left, right));
+        return entries;
     }
 
     /// <summary>

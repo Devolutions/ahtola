@@ -4,9 +4,7 @@ namespace Ahtola.Core.Compilation.JoinOrdering;
 /// The physical shape a single left-deep join step can take in this engine.
 /// </summary>
 /// <remarks>
-/// Deliberately limited to the shapes <c>VdbeJoinOperatorPlan</c> can actually execute. There
-/// is no index-seek leaf: every join input is a full scan of a materialized row source, so the
-/// cost model never awards a seek discount it cannot honor.
+/// Deliberately limited to the shapes <c>VdbeJoinOperatorPlan</c> can actually execute.
 /// </remarks>
 internal enum JoinStepShape
 {
@@ -24,14 +22,18 @@ internal enum JoinStepShape
     /// INNER equijoins only, matching <c>VdbeJoinOperatorPlan.HashBuildRight == false</c>.
     /// </summary>
     HashBuildLeft,
+
+    /// <summary>
+    /// The right member is positioned once per accumulated outer row through a durable index's
+    /// contiguous equality prefix.
+    /// </summary>
+    IndexSeekRight,
 }
 
 /// <summary>
 /// Cost-model constants ported from Turso v0.8.0-pre.7
 /// <c>core/translate/optimizer/cost_params.rs</c> (<c>CostModelParams::new</c>, lines 103-141).
-/// Only the subset the managed engine can honor is ported; the omitted parameters
-/// (<c>index_bonus</c>, <c>hash_bytes_per_row</c> spill accounting, STAT4-style per-value
-/// selectivities) are recorded in <c>docs/turso-gap-analysis.md</c> rather than approximated.
+/// Only the subset the managed engine can honor is ported.
 /// </summary>
 internal static class JoinCostParams
 {
@@ -59,6 +61,12 @@ internal static class JoinCostParams
     /// <summary>cost_params.rs: <c>cpu_cost_per_row</c>.</summary>
     public const double CpuCostPerRow = 0.003;
 
+    /// <summary>cost_params.rs: <c>cpu_cost_per_seek</c>.</summary>
+    public const double CpuCostPerSeek = 0.01;
+
+    /// <summary>cost_params.rs: <c>index_bonus</c>.</summary>
+    public const double IndexBonus = 0.5;
+
     /// <summary>cost_params.rs: <c>hash_cpu_cost</c>.</summary>
     public const double HashCpuCost = 0.001;
 
@@ -76,20 +84,6 @@ internal static class JoinCostParams
 /// The ported subset of Turso's <c>core/translate/optimizer/cost.rs</c> and
 /// <c>access_method.rs</c> cost formulas, narrowed to the access paths this engine executes.
 /// </summary>
-/// <remarks>
-/// <para>
-/// Every formula here is deliberately expressed in terms of a <em>materialized full scan</em>
-/// of each join input, because <c>VdbeJoinScanPlan</c> is always a full scan over an
-/// already-bound cursor source. <c>estimate_index_cost</c> (cost.rs:171) is <b>not</b> ported:
-/// awarding its per-seek discount would model an access path the executor cannot produce.
-/// </para>
-/// <para>
-/// Index statistics still participate, but only where they describe the <em>data</em> rather
-/// than the access path: <see cref="RowsAfterStep"/> consumes an average-rows-per-key figure
-/// read from <c>sqlite_stat1</c>, which is a property of the column's value distribution and is
-/// equally valid for a hash probe.
-/// </para>
-/// </remarks>
 internal static class JoinCostModel
 {
     /// <summary>
@@ -153,6 +147,63 @@ internal static class JoinCostModel
     }
 
     /// <summary>
+    /// One-time incremental cost of reconstructing the managed, MVCC-visible index view used by
+    /// join seeks. Turso seeks an already-open B-tree; Ahtola currently projects and sorts the
+    /// visible base rows once per statement, so that O(N log N) work must not be hidden.
+    /// </summary>
+    public static double EstimateManagedIndexViewBuildCost(double rowCount)
+    {
+        var rows = Sanitize(rowCount);
+        return EstimateSortCost(rows) + rows * JoinCostParams.CpuCostPerRow;
+    }
+
+    /// <summary>
+    /// Port of Turso <c>cost.rs:171-236</c> (<c>estimate_index_cost</c>). The outer cardinality
+    /// is the number of B-tree seeks; <paramref name="rowsPerSeek"/> comes from the matching
+    /// <c>sqlite_stat1</c> leading-prefix average, or one for a unique full-key equality.
+    /// </summary>
+    public static double EstimateIndexSeekCost(
+        double baseRowCount,
+        int indexColumnCount,
+        int tableColumnCount,
+        bool hasRowIdAlias,
+        bool covering,
+        double inputCardinality,
+        double rowsPerSeek)
+    {
+        var baseRows = Math.Max(1.0, Sanitize(baseRowCount));
+        var seeks = Math.Max(1.0, Sanitize(inputCardinality));
+        var matches = Math.Max(0.0, Sanitize(rowsPerSeek));
+        var indexRowsPerPage = Math.Max(
+            1.0,
+            JoinCostParams.RowsPerTablePage
+                * (tableColumnCount + (hasRowIdAlias ? 0.0 : 1.0))
+                / (indexColumnCount + 1.0));
+        var treeDepth = baseRows <= 1.0
+            ? 1.0
+            : Math.Max(1.0, Math.Ceiling(Math.Log(baseRows) / Math.Log(indexRowsPerPage)));
+        var fullScan = Math.Abs(matches - baseRows) < 1.0;
+        var seekCost = fullScan
+            ? treeDepth + (seeks - 1.0) * treeDepth * JoinCostParams.CacheReuseFactor
+            : seeks * treeDepth;
+        var leafPages = Math.Max(matches / indexRowsPerPage, 1.0);
+        var leafScanCost = fullScan
+            ? leafPages + (seeks - 1.0) * leafPages * JoinCostParams.CacheReuseFactor
+            : matches <= 1.0
+                ? 0.0
+                : leafPages + (seeks - 1.0) * leafPages * JoinCostParams.CacheReuseFactor;
+        var tableLookupCost = covering
+            ? 0.0
+            : seeks * (matches / baseRows) * Math.Max(baseRows / JoinCostParams.RowsPerTablePage, 1.0);
+        var cpuCost = seeks * JoinCostParams.CpuCostPerSeek
+            + seeks * matches * JoinCostParams.CpuCostPerRow;
+
+        return Math.Max(
+            0.001,
+            seekCost + leafScanCost + tableLookupCost + cpuCost - JoinCostParams.IndexBonus);
+    }
+
+    /// <summary>
     /// The cost of one left-deep step under a given <paramref name="shape"/>.
     /// <paramref name="leftCardinality"/> is the accumulated cardinality produced so far and
     /// <paramref name="rightRowCount"/> the base row count of the member being added.
@@ -207,6 +258,10 @@ internal static class JoinCostModel
                 + BufferCost(left)
                 + EstimateHashJoinCost(buildCardinality: left, probeCardinality: right, probeMultiplier: 1.0)
                 + emitCost,
+
+            JoinStepShape.IndexSeekRight => throw new ArgumentException(
+                "Index seeks require EstimateIndexSeekCost.",
+                nameof(shape)),
 
             _ => throw new ArgumentOutOfRangeException(nameof(shape)),
         };
