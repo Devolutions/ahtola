@@ -325,6 +325,19 @@ internal static class VdbeSpillRecordCodec
         return bytes[0];
     }
 
+    public static bool ReadBoolean(
+        IFile file,
+        ref long position,
+        VdbeExecutionMetrics metrics,
+        string kind) =>
+        ReadByte(file, ref position, metrics) switch
+        {
+            0 => false,
+            1 => true,
+            var value => throw new InvalidDataException(
+                $"Unknown execution spill {kind} marker {value}."),
+        };
+
     private static void WriteValue(
         IFile file,
         ref long position,
@@ -423,7 +436,7 @@ internal static class VdbeSpillRecordCodec
         var length = ReadLength(file, ref position, recordEnd, metrics, "blob");
         var bytes = new byte[length];
         ReadExact(file, ref position, bytes, metrics);
-        return SqlValue.Blob(bytes);
+        return SqlValue.BlobOwned(bytes);
     }
 
     private static int ReadLength(

@@ -232,7 +232,7 @@ internal static class VdbeManagedFootprint
     private const long NullableInt64SlotBytes = 16;
     private const long JoinRowObjectBytes = 32;
     private const long BuildEntryObjectBytes = 48;
-    private const long SpillPayloadObjectBytes = 32;
+    private const long SpillPayloadObjectBytes = 48;
     private const long DictionaryEntryBytes = 24;
     private const long PriorityQueueObjectBytes = 64;
     private const long PriorityQueueNodeBytes = 48;
@@ -276,7 +276,7 @@ internal static class VdbeManagedFootprint
         return checked(
             EstimateArray(SqlValueSlotBytes, columnCount)
             + (columnCount * SpillPayloadObjectBytes)
-            + (payloadLength * sizeof(char)));
+            + (payloadLength * 3));
     }
 
     public static long EstimateHashBuildEntryFromEncodedLength(
@@ -293,8 +293,11 @@ internal static class VdbeManagedFootprint
             + EstimateArray(SqlValueSlotBytes, columnCount)
             + EstimateArray(NullableInt64SlotBytes, rowIdCount)
             + ((columnCount + 1L) * SpillPayloadObjectBytes)
-            + (payloadLength * sizeof(char)));
+            + (payloadLength * 3));
     }
+
+    public static long EstimateUtf8Scratch(int byteCount) =>
+        byteCount == 0 ? 0 : EstimateArray(sizeof(byte), byteCount);
 
     public static long EstimateReferenceListStorage(int capacity) =>
         capacity == 0 ? 0 : EstimateArray(ReferenceBytes, capacity);
@@ -398,6 +401,13 @@ internal static class VdbeManagedFootprint
                 throw new OutOfMemoryException("A managed execution container exceeded the supported capacity.");
         }
         return capacity;
+    }
+
+    public static long EstimateContainerReplacement(long currentBytes, long replacementBytes)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(currentBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(replacementBytes);
+        return replacementBytes > currentBytes ? replacementBytes : 0;
     }
 
     private static long EstimateValuePayload(SqlValue value) => value.Kind switch

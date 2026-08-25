@@ -2765,12 +2765,20 @@ public sealed class ResumableStatement : IDisposable
                 if (!_executionOptions.AllowTemporaryFileSpill)
                     throw new VdbeMemoryLimitExceededException(_bufferMemoryLimitBytes, recordBytes);
 
-                _spill ??= CreateSpill();
-                _spill.WriteSingleRow(record, recordBytes, cancellationToken);
-                _spill.CompactRunTiers(
-                    _comparer,
-                    _memory,
-                    cancellationToken);
+                _memory.RetainOrThrow(recordBytes);
+                try
+                {
+                    _spill ??= CreateSpill();
+                    _spill.WriteSingleRow(record, recordBytes, cancellationToken);
+                    _spill.CompactRunTiers(
+                        _comparer,
+                        _memory,
+                        cancellationToken);
+                }
+                finally
+                {
+                    _memory.Release(recordBytes);
+                }
                 return;
             }
         }
@@ -3060,9 +3068,12 @@ public sealed class ResumableStatement : IDisposable
             var capacity = VdbeManagedFootprint.GetListCapacityForCount(
                 _rows.Capacity,
                 requiredCount);
-            var listGrowth = checked(
-                VdbeManagedFootprint.EstimateReferenceListStorage(capacity)
-                - VdbeManagedFootprint.EstimateReferenceListStorage(_rows.Capacity));
+            var currentListBytes =
+                VdbeManagedFootprint.EstimateReferenceListStorage(_rows.Capacity);
+            var listGrowth = VdbeManagedFootprint.EstimateContainerReplacement(
+                currentListBytes,
+                VdbeManagedFootprint.EstimateReferenceListStorage(capacity));
+            var replacedListBytes = listGrowth > 0 ? currentListBytes : 0;
             var workspaceBytes = VdbeManagedFootprint.EstimateSortWorkspace(requiredCount);
             var workspaceGrowth = checked(workspaceBytes - _sortWorkspaceBytes);
             var retainedBytes = checked(recordBytes + listGrowth + workspaceGrowth);
@@ -3074,7 +3085,12 @@ public sealed class ResumableStatement : IDisposable
                 if (capacity != _rows.Capacity)
                     _rows.Capacity = capacity;
                 _rows.Add(record);
-                _bufferedBytes = checked(_bufferedBytes + retainedBytes);
+                if (replacedListBytes > 0)
+                    _memory.Release(replacedListBytes, rows: 0);
+                _bufferedBytes = checked(
+                    _bufferedBytes
+                    + retainedBytes
+                    - replacedListBytes);
                 _sortWorkspaceBytes = workspaceBytes;
                 return true;
             }
@@ -3645,14 +3661,18 @@ public sealed class ResumableStatement : IDisposable
                 runs.Count + 1);
             if (capacity == runs.Capacity)
                 return;
-            var growthBytes = checked(
-                VdbeManagedFootprint.EstimateRunDescriptorListStorage(capacity)
-                - VdbeManagedFootprint.EstimateRunDescriptorListStorage(runs.Capacity));
+            var currentStorageBytes =
+                VdbeManagedFootprint.EstimateRunDescriptorListStorage(runs.Capacity);
+            var growthBytes = VdbeManagedFootprint.EstimateContainerReplacement(
+                currentStorageBytes,
+                VdbeManagedFootprint.EstimateRunDescriptorListStorage(capacity));
             _memory.RetainOrThrow(growthBytes, rows: 0);
             try
             {
                 runs.Capacity = capacity;
-                _runDescriptorBytes = checked(_runDescriptorBytes + growthBytes);
+                if (_runDescriptorBytes > 0)
+                    _memory.Release(_runDescriptorBytes, rows: 0);
+                _runDescriptorBytes = growthBytes;
             }
             catch
             {

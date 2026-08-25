@@ -247,6 +247,23 @@ public class HashJoinSpillExecutionTests
                     metrics,
                     CancellationToken.None));
         }
+
+        using var unknownBoolean = fileSystem.OpenFile(
+            "unknown-boolean.spill",
+            FileOpenMode.CreateNew);
+        var booleanPosition = VdbeSpillRecordCodec.InitializeFile(
+            unknownBoolean,
+            VdbeSpillFileKind.HashMatchMap,
+            metrics);
+        VdbeSpillRecordCodec.WriteByte(unknownBoolean, ref booleanPosition, 2, metrics);
+        booleanPosition = VdbeSpillRecordCodec.FileHeaderSize;
+
+        Assert.Throws<InvalidDataException>(
+            () => VdbeSpillRecordCodec.ReadBoolean(
+                    unknownBoolean,
+                    ref booleanPosition,
+                    metrics,
+                    "hash match-map"));
     }
 
     [TestCase(0x03)]

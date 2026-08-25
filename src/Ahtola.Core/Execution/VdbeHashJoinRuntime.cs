@@ -546,9 +546,12 @@ internal static class VdbeHashJoinRuntime
             var entriesCapacity = VdbeManagedFootprint.GetListCapacityForCount(
                 entries.Capacity,
                 requiredCount);
-            var growthBytes = checked(
-                VdbeManagedFootprint.EstimateReferenceListStorage(entriesCapacity)
-                - VdbeManagedFootprint.EstimateReferenceListStorage(entries.Capacity));
+            var currentEntriesBytes =
+                VdbeManagedFootprint.EstimateReferenceListStorage(entries.Capacity);
+            var growthBytes = VdbeManagedFootprint.EstimateContainerReplacement(
+                currentEntriesBytes,
+                VdbeManagedFootprint.EstimateReferenceListStorage(entriesCapacity));
+            var replacedBytes = growthBytes > 0 ? currentEntriesBytes : 0;
 
             List<int>? bucket = null;
             var isNewKey = key is not null && !buckets.TryGetValue(key, out bucket);
@@ -557,11 +560,17 @@ internal static class VdbeHashJoinRuntime
             {
                 if (isNewKey)
                 {
+                    var currentDictionaryBytes =
+                        VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count);
+                    var dictionaryGrowth = VdbeManagedFootprint.EstimateContainerReplacement(
+                        currentDictionaryBytes,
+                        VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count + 1));
                     growthBytes = checked(
                         growthBytes
                         + VdbeManagedFootprint.BucketListObjectBytes
-                        + VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count + 1)
-                        - VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count));
+                        + dictionaryGrowth);
+                    if (dictionaryGrowth > 0)
+                        replacedBytes = checked(replacedBytes + currentDictionaryBytes);
                     bucketCapacity = VdbeManagedFootprint.GetListCapacityForCount(0, 1);
                     growthBytes = checked(
                         growthBytes
@@ -569,13 +578,19 @@ internal static class VdbeHashJoinRuntime
                 }
                 else
                 {
+                    var currentBucketBytes =
+                        VdbeManagedFootprint.EstimateInt32ListStorage(bucket!.Capacity);
                     bucketCapacity = VdbeManagedFootprint.GetListCapacityForCount(
-                        bucket!.Capacity,
+                        bucket.Capacity,
                         bucket.Count + 1);
+                    var bucketGrowth = VdbeManagedFootprint.EstimateContainerReplacement(
+                        currentBucketBytes,
+                        VdbeManagedFootprint.EstimateInt32ListStorage(bucketCapacity));
                     growthBytes = checked(
                         growthBytes
-                        + VdbeManagedFootprint.EstimateInt32ListStorage(bucketCapacity)
-                        - VdbeManagedFootprint.EstimateInt32ListStorage(bucket.Capacity));
+                        + bucketGrowth);
+                    if (bucketGrowth > 0)
+                        replacedBytes = checked(replacedBytes + currentBucketBytes);
                 }
             }
 
@@ -611,7 +626,12 @@ internal static class VdbeHashJoinRuntime
                     }
                     bucket!.Add(entryIndex);
                 }
-                _retainedBytes = checked(_retainedBytes + retainedBytes);
+                if (replacedBytes > 0)
+                    _memory.Release(replacedBytes, rows: 0);
+                _retainedBytes = checked(
+                    _retainedBytes
+                    + retainedBytes
+                    - replacedBytes);
                 _retainedRows++;
                 return true;
             }
@@ -856,13 +876,22 @@ internal static class VdbeHashJoinRuntime
                     List<BuildEntry>? bucket = null;
                     var isNewKey = !buckets.TryGetValue(entry.Key, out bucket);
                     var growthBytes = 0L;
+                    var replacedBytes = 0L;
                     var bucketCapacity = 0;
                     if (isNewKey)
                     {
+                        var currentDictionaryBytes =
+                            VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count);
+                        var dictionaryGrowth =
+                            VdbeManagedFootprint.EstimateContainerReplacement(
+                                currentDictionaryBytes,
+                                VdbeManagedFootprint.EstimateDictionaryStorage(
+                                    buckets.Count + 1));
                         growthBytes = checked(
                             VdbeManagedFootprint.BucketListObjectBytes
-                            + VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count + 1)
-                            - VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count));
+                            + dictionaryGrowth);
+                        if (dictionaryGrowth > 0)
+                            replacedBytes = currentDictionaryBytes;
                         bucketCapacity = VdbeManagedFootprint.GetListCapacityForCount(0, 1);
                         growthBytes = checked(
                             growthBytes
@@ -870,12 +899,16 @@ internal static class VdbeHashJoinRuntime
                     }
                     else
                     {
+                        var currentBucketBytes =
+                            VdbeManagedFootprint.EstimateReferenceListStorage(bucket!.Capacity);
                         bucketCapacity = VdbeManagedFootprint.GetListCapacityForCount(
-                            bucket!.Capacity,
+                            bucket.Capacity,
                             bucket.Count + 1);
-                        growthBytes = checked(
-                            VdbeManagedFootprint.EstimateReferenceListStorage(bucketCapacity)
-                            - VdbeManagedFootprint.EstimateReferenceListStorage(bucket.Capacity));
+                        growthBytes = VdbeManagedFootprint.EstimateContainerReplacement(
+                            currentBucketBytes,
+                            VdbeManagedFootprint.EstimateReferenceListStorage(bucketCapacity));
+                        if (growthBytes > 0)
+                            replacedBytes = currentBucketBytes;
                     }
 
                     if (!context.Memory.TryRetain(growthBytes, rows: 0))
@@ -893,6 +926,8 @@ internal static class VdbeHashJoinRuntime
                             bucket.Capacity = bucketCapacity;
                         }
                         bucket!.Add(entry);
+                        if (replacedBytes > 0)
+                            context.Memory.Release(replacedBytes, rows: 0);
                     }
                     catch
                     {
@@ -903,6 +938,7 @@ internal static class VdbeHashJoinRuntime
                     retainedBytes = checked(
                         retainedBytes
                         + growthBytes
+                        - replacedBytes
                         + lease.RetainedBytes);
                     retainedRows++;
                     lease.Transfer();
@@ -955,7 +991,11 @@ internal static class VdbeHashJoinRuntime
             var position = checked(VdbeSpillRecordCodec.FileHeaderSize + ordinal);
             if (position >= _matched.File.Length)
                 return false;
-            return VdbeSpillRecordCodec.ReadByte(_matched.File, ref position, _options.Metrics) != 0;
+            return VdbeSpillRecordCodec.ReadBoolean(
+                _matched.File,
+                ref position,
+                _options.Metrics,
+                "hash match-map");
         }
 
         private void WriteEntry(
