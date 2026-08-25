@@ -7,6 +7,8 @@ internal sealed class VdbeJoinExecutionContext(
     VdbeExecutionOptions options,
     VdbeExecutionMemory memory)
 {
+    private List<IDisposable>? _pendingCleanup;
+
     public VdbeExecutionOptions Options { get; } = options;
 
     public VdbeExecutionMemory Memory { get; } = memory;
@@ -20,12 +22,17 @@ internal sealed class VdbeJoinExecutionContext(
 
     public Exception? CleanupFailure { get; private set; }
 
-    public void RecordCleanupFailure(Exception exception)
+    public void RecordCleanupFailure(Exception exception, IDisposable? retryable = null)
     {
         ArgumentNullException.ThrowIfNull(exception);
         CleanupFailure = CleanupFailure is null
             ? exception
             : new AggregateException(CleanupFailure, exception);
+        if (retryable is not null
+            && !(_pendingCleanup?.Contains(retryable) ?? false))
+        {
+            (_pendingCleanup ??= []).Add(retryable);
+        }
     }
 
     public Exception? TakeCleanupFailure()
@@ -33,6 +40,33 @@ internal sealed class VdbeJoinExecutionContext(
         var failure = CleanupFailure;
         CleanupFailure = null;
         return failure;
+    }
+
+    public bool HasPendingCleanup => _pendingCleanup is { Count: > 0 };
+
+    public void RetryPendingCleanup()
+    {
+        if (_pendingCleanup is not { Count: > 0 } pending)
+            return;
+
+        List<Exception>? failures = null;
+        for (var index = pending.Count - 1; index >= 0; index--)
+        {
+            try
+            {
+                pending[index].Dispose();
+                pending.RemoveAt(index);
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+
+        if (failures is [var failure])
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        if (failures is { Count: > 1 })
+            throw new AggregateException(failures);
     }
 
     public static VdbeJoinExecutionContext CreateDefault()
@@ -138,12 +172,11 @@ internal static class VdbeHashJoinRuntime
         int? maximumRows,
         VdbeJoinExecutionContext context)
     {
-        var retained = new List<BuildEntry>();
-        var buckets = new Dictionary<string, List<int>>(StringComparer.Ordinal);
         HashSpill? spill = null;
         LoadedPartition? loadedPartition = null;
         var unloadablePartition = -1;
         var trackUnmatchedBuild = buildIsRight && plan.Kind is VdbeJoinKind.Right or VdbeJoinKind.Full;
+        HashBuildBuffer? buffered = HashBuildBuffer.TryCreate(context.Memory, trackUnmatchedBuild);
         var emitted = 0;
 
         try
@@ -153,26 +186,23 @@ internal static class VdbeHashJoinRuntime
             {
                 context.ThrowIfCancellationRequested();
                 var key = buildKey(row);
-                var retainedBytes = checked(
-                    VdbeSpillRecordCodec.EstimateRetainedBytes(row.Values, key, row.RowIds.Length)
-                    + (trackUnmatchedBuild ? 1 : 0));
-                var entry = new BuildEntry(row, key, ordinal++, retainedBytes);
+                var retainedBytes = Math.Max(
+                    VdbeManagedFootprint.EstimateHashBuildEntry(
+                        row.Values,
+                        key,
+                        row.RowIds.Length),
+                    VdbeManagedFootprint.EstimateHashBuildEntryFromEncodedLength(
+                        EstimateEncodedEntryPayload(row, key),
+                        row.Values.Length,
+                        row.RowIds.Length));
+                if (retainedBytes > context.Memory.LimitBytes)
+                    throw new VdbeMemoryLimitExceededException(context.Memory.LimitBytes, retainedBytes);
+                var currentOrdinal = ordinal++;
 
-                if (spill is null && context.Memory.TryRetain(retainedBytes))
-                {
-                    var index = retained.Count;
-                    retained.Add(entry);
-                    if (key is not null)
-                    {
-                        if (!buckets.TryGetValue(key, out var bucket))
-                        {
-                            bucket = [];
-                            buckets.Add(key, bucket);
-                        }
-                        bucket.Add(index);
-                    }
+                if (spill is null
+                    && buffered is not null
+                    && buffered.TryAdd(row, key, currentOrdinal, retainedBytes))
                     continue;
-                }
 
                 if (!context.Options.AllowTemporaryFileSpill)
                     throw new VdbeMemoryLimitExceededException(context.Memory.LimitBytes, retainedBytes);
@@ -184,21 +214,34 @@ internal static class VdbeHashJoinRuntime
                         buildNode.ColumnCount,
                         buildNode.SourceCount,
                         trackUnmatchedBuild);
-                    foreach (var buffered in retained)
-                        spill.WriteBuild(buffered, context);
-                    foreach (var buffered in retained)
-                        context.Memory.Release(buffered.RetainedBytes);
-                    retained.Clear();
-                    buckets.Clear();
+                    if (buffered is not null)
+                    {
+                        foreach (var retained in buffered.Entries)
+                            spill.WriteBuild(retained, context);
+                        buffered.Dispose();
+                        buffered = null;
+                    }
                 }
 
-                spill.WriteBuild(entry, context);
+                context.Memory.RetainOrThrow(retainedBytes);
+                try
+                {
+                    spill.WriteBuild(
+                        new BuildEntry(row, key, currentOrdinal, retainedBytes),
+                        context);
+                }
+                finally
+                {
+                    context.Memory.Release(retainedBytes);
+                }
             }
 
             if (spill is not null)
                 spill.CompleteBuild(context);
 
-            bool[]? matched = trackUnmatchedBuild && spill is null ? new bool[retained.Count] : null;
+            bool[]? matched = trackUnmatchedBuild && spill is null
+                ? buffered!.CreateMatchedMap()
+                : null;
             foreach (var probe in probeNode.Enumerate(maximumRows: null, context))
             {
                 context.ThrowIfCancellationRequested();
@@ -209,12 +252,12 @@ internal static class VdbeHashJoinRuntime
                 {
                     if (spill is null)
                     {
-                        if (buckets.TryGetValue(key, out var candidateIndices))
+                        if (buffered!.TryGetCandidates(key, out var candidateIndices))
                         {
                             foreach (var buildIndex in candidateIndices)
                             {
                                 context.ThrowIfCancellationRequested();
-                                var build = retained[buildIndex];
+                                var build = buffered[buildIndex];
                                 var combined = Combine(build.Row, probe, buildIsRight);
                                 if (!Matches(plan, build.Row, probe, combined, buildIsRight))
                                     continue;
@@ -242,33 +285,50 @@ internal static class VdbeHashJoinRuntime
                             }
                         }
 
-                        IEnumerable<BuildEntry> candidates;
                         if (loadedPartition is not null)
                         {
-                            candidates = loadedPartition.Find(key);
+                            foreach (var build in loadedPartition.Find(key))
+                            {
+                                context.ThrowIfCancellationRequested();
+                                var combined = Combine(build.Row, probe, buildIsRight);
+                                if (!Matches(plan, build.Row, probe, combined, buildIsRight))
+                                    continue;
+
+                                matchedProbe = true;
+                                if (trackUnmatchedBuild)
+                                    spill.MarkMatched(build.Ordinal, context);
+                                yield return combined;
+                                if (maximumRows is { } maximum && ++emitted >= maximum)
+                                    yield break;
+                            }
                         }
                         else
                         {
                             context.Options.Metrics.HashPartitionFallbackScan();
-                            candidates = spill.ReadPartition(partition, context);
-                        }
+                            foreach (var lease in spill.ReadPartition(partition, context))
+                            {
+                                VdbeJoinRow? combinedResult = null;
+                                using (lease)
+                                {
+                                    context.ThrowIfCancellationRequested();
+                                    var build = lease.Entry;
+                                    if (!string.Equals(build.Key, key, StringComparison.Ordinal))
+                                        continue;
 
-                        foreach (var build in candidates)
-                        {
-                            context.ThrowIfCancellationRequested();
-                            if (!string.Equals(build.Key, key, StringComparison.Ordinal))
-                                continue;
+                                    var combined = Combine(build.Row, probe, buildIsRight);
+                                    if (!Matches(plan, build.Row, probe, combined, buildIsRight))
+                                        continue;
 
-                            var combined = Combine(build.Row, probe, buildIsRight);
-                            if (!Matches(plan, build.Row, probe, combined, buildIsRight))
-                                continue;
+                                    matchedProbe = true;
+                                    if (trackUnmatchedBuild)
+                                        spill.MarkMatched(build.Ordinal, context);
+                                    combinedResult = combined;
+                                }
 
-                            matchedProbe = true;
-                            if (trackUnmatchedBuild)
-                                spill.MarkMatched(build.Ordinal, context);
-                            yield return combined;
-                            if (maximumRows is { } maximum && ++emitted >= maximum)
-                                yield break;
+                                yield return combinedResult;
+                                if (maximumRows is { } maximum && ++emitted >= maximum)
+                                    yield break;
+                            }
                         }
                     }
                 }
@@ -288,24 +348,30 @@ internal static class VdbeHashJoinRuntime
                 var nullProbe = NullRow(probeNode);
                 if (spill is null)
                 {
-                    for (var index = 0; index < retained.Count; index++)
+                    for (var index = 0; index < buffered!.Count; index++)
                     {
                         context.ThrowIfCancellationRequested();
                         if (matched![index])
                             continue;
-                        yield return Combine(nullProbe, retained[index].Row);
+                        yield return Combine(nullProbe, buffered[index].Row);
                         if (maximumRows is { } maximum && ++emitted >= maximum)
                             yield break;
                     }
                 }
                 else
                 {
-                    foreach (var build in spill.ReadBuildOrder(context))
+                    foreach (var lease in spill.ReadBuildOrder(context))
                     {
-                        context.ThrowIfCancellationRequested();
-                        if (spill.IsMatched(build.Ordinal, context))
-                            continue;
-                        yield return Combine(nullProbe, build.Row);
+                        VdbeJoinRow? combined = null;
+                        using (lease)
+                        {
+                            context.ThrowIfCancellationRequested();
+                            var build = lease.Entry;
+                            if (spill.IsMatched(build.Ordinal, context))
+                                continue;
+                            combined = Combine(nullProbe, build.Row);
+                        }
+                        yield return combined;
                         if (maximumRows is { } maximum && ++emitted >= maximum)
                             yield break;
                     }
@@ -322,16 +388,13 @@ internal static class VdbeHashJoinRuntime
             {
                 context.RecordCleanupFailure(exception);
             }
-            foreach (var entry in retained)
+            try
             {
-                try
-                {
-                    context.Memory.Release(entry.RetainedBytes);
-                }
-                catch (Exception exception)
-                {
-                    context.RecordCleanupFailure(exception);
-                }
+                buffered?.Dispose();
+            }
+            catch (Exception exception)
+            {
+                context.RecordCleanupFailure(exception);
             }
             try
             {
@@ -339,7 +402,7 @@ internal static class VdbeHashJoinRuntime
             }
             catch (Exception exception)
             {
-                context.RecordCleanupFailure(exception);
+                context.RecordCleanupFailure(exception, spill);
             }
         }
     }
@@ -386,11 +449,203 @@ internal static class VdbeHashJoinRuntime
         return hash;
     }
 
+    private static long EstimateEncodedEntryPayload(VdbeJoinRow row, string? key)
+    {
+        var total = checked(
+            sizeof(long)
+            + sizeof(byte)
+            + VdbeSpillRecordCodec.EstimateEncodedValuesLength(row.Values));
+        if (key is not null)
+            total = checked(total + VdbeSpillRecordCodec.EstimateEncodedStringLength(key));
+        foreach (var rowId in row.RowIds)
+            total = checked(total + sizeof(byte) + (rowId.HasValue ? sizeof(long) : 0));
+        return total;
+    }
+
     private sealed record BuildEntry(
         VdbeJoinRow Row,
         string? Key,
         long Ordinal,
         long RetainedBytes);
+
+    private sealed class BuildEntryLease(
+        BuildEntry entry,
+        VdbeExecutionMemory memory,
+        long retainedBytes) : IDisposable
+    {
+        private bool _transferred;
+
+        public BuildEntry Entry { get; } = entry;
+
+        public long RetainedBytes { get; } = retainedBytes;
+
+        public void Transfer() => _transferred = true;
+
+        public void Dispose()
+        {
+            if (_transferred)
+                return;
+            _transferred = true;
+            memory.Release(RetainedBytes);
+        }
+    }
+
+    private sealed class HashBuildBuffer : IDisposable
+    {
+        private const long BufferObjectBytes = 64;
+
+        private readonly VdbeExecutionMemory _memory;
+        private readonly bool _trackMatches;
+        private List<BuildEntry>? _entries;
+        private Dictionary<string, List<int>>? _buckets;
+        private long _retainedBytes;
+        private int _retainedRows;
+
+        private HashBuildBuffer(VdbeExecutionMemory memory, bool trackMatches, long retainedBytes)
+        {
+            _memory = memory;
+            _trackMatches = trackMatches;
+            _retainedBytes = retainedBytes;
+            _entries = [];
+            _buckets = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        }
+
+        public int Count => _entries?.Count ?? 0;
+
+        public BuildEntry this[int index] => _entries![index];
+
+        public IEnumerable<BuildEntry> Entries => _entries ?? [];
+
+        public static HashBuildBuffer? TryCreate(VdbeExecutionMemory memory, bool trackMatches)
+        {
+            var retainedBytes = checked(
+                BufferObjectBytes
+                + VdbeManagedFootprint.ListObjectBytes
+                + VdbeManagedFootprint.DictionaryObjectBytes);
+            if (!memory.TryRetain(retainedBytes, rows: 0))
+                return null;
+            try
+            {
+                return new HashBuildBuffer(memory, trackMatches, retainedBytes);
+            }
+            catch
+            {
+                memory.Release(retainedBytes, rows: 0);
+                throw;
+            }
+        }
+
+        public bool TryAdd(
+            VdbeJoinRow row,
+            string? key,
+            long ordinal,
+            long entryBytes)
+        {
+            var entries = _entries
+                ?? throw new ObjectDisposedException(nameof(HashBuildBuffer));
+            var buckets = _buckets
+                ?? throw new ObjectDisposedException(nameof(HashBuildBuffer));
+            var requiredCount = checked(entries.Count + 1);
+            var entriesCapacity = VdbeManagedFootprint.GetListCapacityForCount(
+                entries.Capacity,
+                requiredCount);
+            var growthBytes = checked(
+                VdbeManagedFootprint.EstimateReferenceListStorage(entriesCapacity)
+                - VdbeManagedFootprint.EstimateReferenceListStorage(entries.Capacity));
+
+            List<int>? bucket = null;
+            var isNewKey = key is not null && !buckets.TryGetValue(key, out bucket);
+            var bucketCapacity = 0;
+            if (key is not null)
+            {
+                if (isNewKey)
+                {
+                    growthBytes = checked(
+                        growthBytes
+                        + VdbeManagedFootprint.BucketListObjectBytes
+                        + VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count + 1)
+                        - VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count));
+                    bucketCapacity = VdbeManagedFootprint.GetListCapacityForCount(0, 1);
+                    growthBytes = checked(
+                        growthBytes
+                        + VdbeManagedFootprint.EstimateInt32ListStorage(bucketCapacity));
+                }
+                else
+                {
+                    bucketCapacity = VdbeManagedFootprint.GetListCapacityForCount(
+                        bucket!.Capacity,
+                        bucket.Count + 1);
+                    growthBytes = checked(
+                        growthBytes
+                        + VdbeManagedFootprint.EstimateInt32ListStorage(bucketCapacity)
+                        - VdbeManagedFootprint.EstimateInt32ListStorage(bucket.Capacity));
+                }
+            }
+
+            if (_trackMatches)
+            {
+                growthBytes = checked(
+                    growthBytes
+                    + VdbeManagedFootprint.EstimateBooleanArray(requiredCount)
+                    - VdbeManagedFootprint.EstimateBooleanArray(entries.Count));
+            }
+
+            var retainedBytes = checked(entryBytes + growthBytes);
+            if (!_memory.TryRetain(retainedBytes))
+                return false;
+
+            try
+            {
+                if (entriesCapacity != entries.Capacity)
+                    entries.Capacity = entriesCapacity;
+                var entry = new BuildEntry(row, key, ordinal, entryBytes);
+                var entryIndex = entries.Count;
+                entries.Add(entry);
+                if (key is not null)
+                {
+                    if (isNewKey)
+                    {
+                        bucket = new List<int>(bucketCapacity);
+                        buckets.Add(key, bucket);
+                    }
+                    else if (bucketCapacity != bucket!.Capacity)
+                    {
+                        bucket.Capacity = bucketCapacity;
+                    }
+                    bucket!.Add(entryIndex);
+                }
+                _retainedBytes = checked(_retainedBytes + retainedBytes);
+                _retainedRows++;
+                return true;
+            }
+            catch
+            {
+                _memory.Release(retainedBytes);
+                throw;
+            }
+        }
+
+        public bool TryGetCandidates(string key, out List<int> candidates) =>
+            _buckets!.TryGetValue(key, out candidates!);
+
+        public bool[] CreateMatchedMap()
+        {
+            if (!_trackMatches)
+                throw new InvalidOperationException("This hash build does not track matches.");
+            return new bool[Count];
+        }
+
+        public void Dispose()
+        {
+            if (_entries is null)
+                return;
+            _entries = null;
+            _buckets = null;
+            _memory.Release(_retainedBytes, _retainedRows);
+            _retainedBytes = 0;
+            _retainedRows = 0;
+        }
+    }
 
     private sealed class LoadedPartition : IDisposable
     {
@@ -507,7 +762,7 @@ internal static class VdbeHashJoinRuntime
             _buildOrder?.File.FlushToDisk();
         }
 
-        public IEnumerable<BuildEntry> ReadPartition(
+        public IEnumerable<BuildEntryLease> ReadPartition(
             int partitionIndex,
             VdbeJoinExecutionContext context)
         {
@@ -524,31 +779,91 @@ internal static class VdbeHashJoinRuntime
             int partitionIndex,
             VdbeJoinExecutionContext context)
         {
-            var retainedBytes = 0L;
+            var dictionaryBytes = VdbeManagedFootprint.DictionaryObjectBytes;
+            if (!context.Memory.TryRetain(dictionaryBytes, rows: 0))
+                return null;
+
+            var retainedBytes = dictionaryBytes;
             var retainedRows = 0;
-            var buckets = new Dictionary<string, List<BuildEntry>>(StringComparer.Ordinal);
+            Dictionary<string, List<BuildEntry>>? buckets = null;
             var transferred = false;
             try
             {
-                foreach (var entry in ReadPartition(partitionIndex, context))
+                buckets = new Dictionary<string, List<BuildEntry>>(StringComparer.Ordinal);
+                var partition = _partitions[partitionIndex];
+                _options.Metrics.HashPartitionScanned();
+                VdbeSpillRecordCodec.ValidateFile(
+                    partition.File.File,
+                    VdbeSpillFileKind.HashPartition,
+                    _options.Metrics);
+                long position = VdbeSpillRecordCodec.FileHeaderSize;
+                for (var index = 0; index < partition.Count; index++)
                 {
-                    var bytes = VdbeSpillRecordCodec.EstimateRetainedBytes(
-                        entry.Row.Values,
-                        entry.Key,
-                        entry.Row.RowIds.Length);
-                    if (!context.Memory.TryRetain(bytes))
+                    using var lease = TryReadEntry(
+                        partition.File.File,
+                        ref position,
+                        context,
+                        requireAvailable: false);
+                    if (lease is null)
                         return null;
 
-                    retainedBytes = checked(retainedBytes + bytes);
-                    retainedRows++;
+                    var entry = lease.Entry;
                     if (entry.Key is null)
                         continue;
-                    if (!buckets.TryGetValue(entry.Key, out var bucket))
+
+                    List<BuildEntry>? bucket = null;
+                    var isNewKey = !buckets.TryGetValue(entry.Key, out bucket);
+                    var growthBytes = 0L;
+                    var bucketCapacity = 0;
+                    if (isNewKey)
                     {
-                        bucket = [];
-                        buckets.Add(entry.Key, bucket);
+                        growthBytes = checked(
+                            VdbeManagedFootprint.BucketListObjectBytes
+                            + VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count + 1)
+                            - VdbeManagedFootprint.EstimateDictionaryStorage(buckets.Count));
+                        bucketCapacity = VdbeManagedFootprint.GetListCapacityForCount(0, 1);
+                        growthBytes = checked(
+                            growthBytes
+                            + VdbeManagedFootprint.EstimateReferenceListStorage(bucketCapacity));
                     }
-                    bucket.Add(entry with { RetainedBytes = bytes });
+                    else
+                    {
+                        bucketCapacity = VdbeManagedFootprint.GetListCapacityForCount(
+                            bucket!.Capacity,
+                            bucket.Count + 1);
+                        growthBytes = checked(
+                            VdbeManagedFootprint.EstimateReferenceListStorage(bucketCapacity)
+                            - VdbeManagedFootprint.EstimateReferenceListStorage(bucket.Capacity));
+                    }
+
+                    if (!context.Memory.TryRetain(growthBytes, rows: 0))
+                        return null;
+
+                    try
+                    {
+                        if (isNewKey)
+                        {
+                            bucket = new List<BuildEntry>(bucketCapacity);
+                            buckets.Add(entry.Key, bucket);
+                        }
+                        else if (bucketCapacity != bucket!.Capacity)
+                        {
+                            bucket.Capacity = bucketCapacity;
+                        }
+                        bucket!.Add(entry);
+                    }
+                    catch
+                    {
+                        context.Memory.Release(growthBytes, rows: 0);
+                        throw;
+                    }
+
+                    retainedBytes = checked(
+                        retainedBytes
+                        + growthBytes
+                        + lease.RetainedBytes);
+                    retainedRows++;
+                    lease.Transfer();
                 }
 
                 transferred = true;
@@ -567,7 +882,7 @@ internal static class VdbeHashJoinRuntime
             }
         }
 
-        public IEnumerable<BuildEntry> ReadBuildOrder(VdbeJoinExecutionContext context)
+        public IEnumerable<BuildEntryLease> ReadBuildOrder(VdbeJoinExecutionContext context)
         {
             if (_buildOrder is null)
                 return [];
@@ -649,7 +964,7 @@ internal static class VdbeHashJoinRuntime
             }
         }
 
-        private IEnumerable<BuildEntry> ReadEntries(
+        private IEnumerable<BuildEntryLease> ReadEntries(
             IFile file,
             int count,
             VdbeJoinExecutionContext context)
@@ -657,11 +972,42 @@ internal static class VdbeHashJoinRuntime
             long position = VdbeSpillRecordCodec.FileHeaderSize;
             for (var index = 0; index < count; index++)
             {
-                context.ThrowIfCancellationRequested();
-                var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(
+                yield return TryReadEntry(
                     file,
                     ref position,
-                    _options.Metrics);
+                    context,
+                    requireAvailable: true)!;
+            }
+        }
+
+        private BuildEntryLease? TryReadEntry(
+            IFile file,
+            ref long position,
+            VdbeJoinExecutionContext context,
+            bool requireAvailable)
+        {
+            context.ThrowIfCancellationRequested();
+            var recordStart = position;
+            var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(
+                file,
+                ref position,
+                _options.Metrics);
+            var retainedBytes = VdbeManagedFootprint.EstimateHashBuildEntryFromEncodedLength(
+                recordEnd - position,
+                _columnCount,
+                _rowIdCount);
+            if (retainedBytes > context.Memory.LimitBytes)
+                throw new VdbeMemoryLimitExceededException(context.Memory.LimitBytes, retainedBytes);
+            if (!context.Memory.TryRetain(retainedBytes))
+            {
+                position = recordStart;
+                if (requireAvailable)
+                    throw new VdbeMemoryLimitExceededException(context.Memory.LimitBytes, retainedBytes);
+                return null;
+            }
+
+            try
+            {
                 var ordinal = VdbeSpillRecordCodec.ReadInt64(file, ref position, _options.Metrics);
                 var hasKey = VdbeSpillRecordCodec.ReadByte(file, ref position, _options.Metrics);
                 var key = hasKey switch
@@ -688,11 +1034,18 @@ internal static class VdbeHashJoinRuntime
                     };
                 }
                 VdbeSpillRecordCodec.RequireRecordEnd(position, recordEnd);
-                yield return new BuildEntry(
+                var entry = new BuildEntry(
                     new VdbeJoinRow(values, rowIds),
                     key,
                     ordinal,
-                    RetainedBytes: 0);
+                    retainedBytes);
+                return new BuildEntryLease(entry, context.Memory, retainedBytes);
+            }
+            catch
+            {
+                position = recordStart;
+                context.Memory.Release(retainedBytes);
+                throw;
             }
         }
 
@@ -700,7 +1053,6 @@ internal static class VdbeHashJoinRuntime
         {
             if (_disposed)
                 return;
-            _disposed = true;
 
             List<Exception>? cleanupFailures = null;
             foreach (var partition in _partitions)
@@ -735,6 +1087,8 @@ internal static class VdbeHashJoinRuntime
                 (cleanupFailures ??= []).Add(exception);
             }
 
+            if (cleanupFailures is null)
+                _disposed = true;
             if (cleanupFailures is [var cleanupFailure])
                 ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
             if (cleanupFailures is { Count: > 1 })

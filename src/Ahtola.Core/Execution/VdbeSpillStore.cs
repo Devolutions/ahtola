@@ -108,9 +108,6 @@ internal static class VdbeSpillRecordCodec
     private const byte FormatVersion = 1;
     public const int FileHeaderSize = 10;
     private const int RecordLengthSize = 5;
-    private const long RowObjectOverhead = 32;
-    private const long ValueSlotOverhead = 16;
-    private const long KeyObjectOverhead = 24;
 
     public static long InitializeFile(
         IFile file,
@@ -204,25 +201,6 @@ internal static class VdbeSpillRecordCodec
             throw new InvalidDataException("Execution spill record has unexpected trailing or missing data.");
     }
 
-    public static long EstimateRetainedBytes(IReadOnlyList<SqlValue> values, string? key = null, int rowIdCount = 0)
-    {
-        long total = checked(RowObjectOverhead + (values.Count * ValueSlotOverhead) + (rowIdCount * sizeof(long)));
-        if (key is not null)
-            total = checked(total + KeyObjectOverhead + (key.Length * sizeof(char)));
-        foreach (var value in values)
-            total = checked(total + EstimateValuePayloadBytes(value));
-        return total;
-    }
-
-    public static long EstimateValuePayloadBytes(SqlValue value) => value.Kind switch
-    {
-        SqlValueKind.Null => 1,
-        SqlValueKind.Integer or SqlValueKind.Real => 9,
-        SqlValueKind.Text => checked(5L + Encoding.UTF8.GetByteCount(value.AsText())),
-        SqlValueKind.Blob => checked(5L + value.AsBlobSpan().Length),
-        _ => throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}."),
-    };
-
     public static void WriteValues(
         IFile file,
         ref long position,
@@ -232,6 +210,27 @@ internal static class VdbeSpillRecordCodec
         foreach (var value in values)
             WriteValue(file, ref position, value, metrics);
     }
+
+    public static long EstimateEncodedValuesLength(IReadOnlyList<SqlValue> values)
+    {
+        var total = 0L;
+        foreach (var value in values)
+        {
+            var valueLength = value.Kind switch
+            {
+                SqlValueKind.Null => 1L,
+                SqlValueKind.Integer or SqlValueKind.Real => 1L + sizeof(long),
+                SqlValueKind.Text => 1L + sizeof(int) + Encoding.UTF8.GetByteCount(value.AsText()),
+                SqlValueKind.Blob => 1L + sizeof(int) + value.AsBlobSpan().Length,
+                _ => throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}."),
+            };
+            total = checked(total + valueLength);
+        }
+        return total;
+    }
+
+    public static long EstimateEncodedStringLength(string value) =>
+        checked((long)sizeof(int) + Encoding.UTF8.GetByteCount(value));
 
     public static SqlValue[] ReadValues(
         IFile file,
@@ -363,14 +362,14 @@ internal static class VdbeSpillRecordCodec
     private static SqlValue ReadValue(IFile file, ref long position, VdbeExecutionMetrics metrics)
     {
         var kindByte = ReadByte(file, ref position, metrics);
-        var isJson = (kindByte & 0x80) != 0;
-        return (SqlValueKind)(kindByte & 0x0F) switch
+        return kindByte switch
         {
-            SqlValueKind.Null when !isJson => SqlValue.Null,
-            SqlValueKind.Integer when !isJson => SqlValue.Integer(ReadInt64(file, ref position, metrics)),
-            SqlValueKind.Real when !isJson => ReadReal(file, ref position, metrics),
-            SqlValueKind.Text => ReadText(file, ref position, metrics, isJson),
-            SqlValueKind.Blob when !isJson => ReadBlob(file, ref position, metrics),
+            0x00 => SqlValue.Null,
+            0x01 => SqlValue.Integer(ReadInt64(file, ref position, metrics)),
+            0x02 => ReadReal(file, ref position, metrics),
+            0x03 => ReadText(file, ref position, metrics, isJson: false),
+            0x04 => ReadBlob(file, ref position, metrics),
+            0x83 => ReadText(file, ref position, metrics, isJson: true),
             _ => throw new InvalidDataException($"Unknown spilled value tag 0x{kindByte:X2}."),
         };
     }

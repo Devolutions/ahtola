@@ -372,10 +372,10 @@ public sealed class ResumableStatement : IDisposable
                         _virtualCursors[close.Cursor.Index]?.Dispose();
                         _virtualCursors[close.Cursor.Index] = null;
                         var joinState = _joinCursorStates[close.Cursor.Index];
-                        _joinCursorStates[close.Cursor.Index] = null;
                         try
                         {
                             joinState?.Close();
+                            _joinCursorStates[close.Cursor.Index] = null;
                         }
                         catch
                         {
@@ -1821,10 +1821,10 @@ public sealed class ResumableStatement : IDisposable
         for (var index = 0; index < _joinCursorStates.Length; index++)
         {
             var joinState = _joinCursorStates[index];
-            _joinCursorStates[index] = null;
             try
             {
                 joinState?.Close();
+                _joinCursorStates[index] = null;
             }
             catch (Exception exception)
             {
@@ -2707,13 +2707,16 @@ public sealed class ResumableStatement : IDisposable
         private readonly VdbeExecutionMemory _memory;
         private readonly List<SqlValue[]> _rows = [];
         private long _bufferedBytes;
+        private long _sortWorkspaceBytes;
         private SorterSpill? _spill;
         private bool _sorted;
         private int _position = -1;
         private PriorityQueue<int, MergeKey>? _merge;
         private SorterSpill.RunReader[]? _readers;
-        private SqlValue[]? _pending;
+        private SorterSpill.RowLease?[]? _mergeHeads;
+        private SorterSpill.RowLease? _pending;
         private int _pendingRunIndex;
+        private long _mergeInfrastructureBytes;
 
         public SorterRuntime(
             VdbeRowComparer comparer,
@@ -2744,29 +2747,32 @@ public sealed class ResumableStatement : IDisposable
             }
 
             var recordBytes = EstimateRecordBytes(record);
+            if (recordBytes > _memory.LimitBytes)
+                throw new VdbeMemoryLimitExceededException(_memory.LimitBytes, recordBytes);
             if (_rows.Count >= _bufferRowCapacity)
                 FlushBuffered(cancellationToken);
 
-            if (!_memory.TryRetain(recordBytes))
+            if (!TryBuffer(record, recordBytes))
             {
                 if (_rows.Count > 0)
                 {
                     FlushBuffered(cancellationToken);
-                    if (_memory.TryRetain(recordBytes))
-                        goto retained;
+                    if (TryBuffer(record, recordBytes))
+                        return;
                 }
 
                 if (!_executionOptions.AllowTemporaryFileSpill)
                     throw new VdbeMemoryLimitExceededException(_bufferMemoryLimitBytes, recordBytes);
 
-                _spill ??= new SorterSpill(_columnCount, _executionOptions);
-                _spill.WriteRun([record], cancellationToken);
+                _spill ??= new SorterSpill(_columnCount, _executionOptions, _memory);
+                _spill.WriteSingleRow(record, recordBytes, cancellationToken);
+                _spill.ConsolidateRuns(
+                    _comparer,
+                    _executionOptions.SorterMergeFanIn,
+                    _memory,
+                    cancellationToken);
                 return;
             }
-
-        retained:
-            _rows.Add(record);
-            _bufferedBytes = checked(_bufferedBytes + recordBytes);
         }
 
         // Sorts the buffered records and positions on the first one. Returns false (and
@@ -2794,6 +2800,7 @@ public sealed class ResumableStatement : IDisposable
                 _spill.ConsolidateRuns(
                     _comparer,
                     _executionOptions.SorterMergeFanIn,
+                    _memory,
                     cancellationToken);
                 StartMerge(cancellationToken);
                 _position = 0;
@@ -2810,6 +2817,12 @@ public sealed class ResumableStatement : IDisposable
             var sorted = SortBufferedRows(cancellationToken);
             _rows.Clear();
             _rows.AddRange(sorted);
+            if (_sortWorkspaceBytes > 0)
+            {
+                _memory.Release(_sortWorkspaceBytes, rows: 0);
+                _bufferedBytes -= _sortWorkspaceBytes;
+                _sortWorkspaceBytes = 0;
+            }
             _sorted = true;
             _position = 0;
             return true;
@@ -2825,7 +2838,8 @@ public sealed class ResumableStatement : IDisposable
             // Spill path: the current record is the head of the merge heap, staged in
             // _pending. MoveNext refills the heap and re-stages the next head.
             if (_merge is not null)
-                return _pending ?? throw new InvalidOperationException("Sorter is not positioned on a record.");
+                return _pending?.Record
+                    ?? throw new InvalidOperationException("Sorter is not positioned on a record.");
 
             if (_position >= _rows.Count)
                 throw new InvalidOperationException("Sorter is not positioned on a record.");
@@ -2845,16 +2859,27 @@ public sealed class ResumableStatement : IDisposable
             // drops the run association and would emit at most one record per run.
             if (_merge is not null)
             {
-                if (_readers![_pendingRunIndex].TryReadNext(out var next, cancellationToken))
-                    _merge.Enqueue(_pendingRunIndex, new MergeKey(next, _pendingRunIndex, _comparer));
+                var refillRunIndex = _pendingRunIndex;
+                _pending?.Dispose();
+                _pending = null;
+                if (_readers![refillRunIndex].TryReadNext(
+                    _memory,
+                    out var next,
+                    cancellationToken))
+                {
+                    _mergeHeads![refillRunIndex] = next;
+                    _merge.Enqueue(
+                        refillRunIndex,
+                        new MergeKey(next.Record, refillRunIndex, _comparer));
+                }
 
                 if (!_merge.TryDequeue(out _pendingRunIndex, out var key))
                 {
-                    _pending = null;
                     return false;
                 }
 
-                _pending = key.Record;
+                _pending = _mergeHeads![_pendingRunIndex];
+                _mergeHeads[_pendingRunIndex] = null;
                 return true;
             }
 
@@ -2904,39 +2929,48 @@ public sealed class ResumableStatement : IDisposable
         // equal-key rows across runs keep their global insertion order — stability.
         private void StartMerge(CancellationToken cancellationToken)
         {
-            _merge = new PriorityQueue<int, MergeKey>(MergeKey.Comparer);
-            _readers = new SorterSpill.RunReader[_spill!.RunCount];
-
-            for (var runIndex = 0; runIndex < _spill.RunCount; runIndex++)
+            var runCount = _spill!.RunCount;
+            var infrastructureBytes = VdbeManagedFootprint.EstimateMergeInfrastructure(runCount);
+            _memory.RetainOrThrow(infrastructureBytes, rows: 0);
+            _mergeInfrastructureBytes = infrastructureBytes;
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var reader = _spill.OpenRunReader(runIndex);
-                _readers[runIndex] = reader;
-                if (reader.TryReadNext(out var first, cancellationToken))
-                    _merge.Enqueue(runIndex, new MergeKey(first, runIndex, _comparer));
-            }
+                _merge = new PriorityQueue<int, MergeKey>(runCount, MergeKey.Comparer);
+                _readers = new SorterSpill.RunReader[runCount];
+                _mergeHeads = new SorterSpill.RowLease[runCount];
 
-            // Stage the first head so Current() can return it before the first MoveNext.
-            if (!_merge.TryDequeue(out _pendingRunIndex, out var key))
+                for (var runIndex = 0; runIndex < runCount; runIndex++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var reader = _spill.OpenRunReader(runIndex);
+                    _readers[runIndex] = reader;
+                    if (reader.TryReadNext(_memory, out var first, cancellationToken))
+                    {
+                        _mergeHeads[runIndex] = first;
+                        _merge.Enqueue(
+                            runIndex,
+                            new MergeKey(first.Record, runIndex, _comparer));
+                    }
+                }
+
+                // Stage the first head so Current() can return it before the first MoveNext.
+                if (!_merge.TryDequeue(out _pendingRunIndex, out _))
+                    return;
+                _pending = _mergeHeads[_pendingRunIndex];
+                _mergeHeads[_pendingRunIndex] = null;
+            }
+            catch
             {
-                _pending = null;
-                return;
+                DisposeMerge();
+                throw;
             }
-
-            _pending = key.Record;
         }
 
         public void Dispose()
         {
             try
             {
-                if (_readers is not null)
-                {
-                    foreach (var reader in _readers)
-                        reader?.Dispose();
-                    _readers = null;
-                }
-
+                DisposeMerge();
                 _spill?.Dispose();
                 _spill = null;
             }
@@ -2945,7 +2979,9 @@ public sealed class ResumableStatement : IDisposable
                 if (_bufferedBytes > 0)
                     _memory.Release(_bufferedBytes, _rows.Count);
                 _rows.Clear();
+                _rows.Capacity = 0;
                 _bufferedBytes = 0;
+                _sortWorkspaceBytes = 0;
                 _merge = null;
                 _pending = null;
             }
@@ -2963,15 +2999,81 @@ public sealed class ResumableStatement : IDisposable
                     _bufferedBytes);
             }
 
-            _spill ??= new SorterSpill(_columnCount, _executionOptions);
+            _spill ??= new SorterSpill(_columnCount, _executionOptions, _memory);
             _spill.WriteRun(SortBufferedRows(cancellationToken), cancellationToken);
             _memory.Release(_bufferedBytes, _rows.Count);
             _rows.Clear();
+            _rows.Capacity = 0;
             _bufferedBytes = 0;
+            _sortWorkspaceBytes = 0;
+            _spill.ConsolidateRuns(
+                _comparer,
+                _executionOptions.SorterMergeFanIn,
+                _memory,
+                cancellationToken);
         }
 
         private static long EstimateRecordBytes(SqlValue[] record) =>
-            VdbeSpillRecordCodec.EstimateRetainedBytes(record);
+            Math.Max(
+                VdbeManagedFootprint.EstimateSorterRow(record),
+                VdbeManagedFootprint.EstimateSorterRowFromEncodedLength(
+                    VdbeSpillRecordCodec.EstimateEncodedValuesLength(record),
+                    record.Length));
+
+        private bool TryBuffer(SqlValue[] record, long recordBytes)
+        {
+            var requiredCount = checked(_rows.Count + 1);
+            var capacity = VdbeManagedFootprint.GetListCapacityForCount(
+                _rows.Capacity,
+                requiredCount);
+            var listGrowth = checked(
+                VdbeManagedFootprint.EstimateReferenceListStorage(capacity)
+                - VdbeManagedFootprint.EstimateReferenceListStorage(_rows.Capacity));
+            var workspaceBytes = VdbeManagedFootprint.EstimateSortWorkspace(requiredCount);
+            var workspaceGrowth = checked(workspaceBytes - _sortWorkspaceBytes);
+            var retainedBytes = checked(recordBytes + listGrowth + workspaceGrowth);
+            if (!_memory.TryRetain(retainedBytes))
+                return false;
+
+            try
+            {
+                if (capacity != _rows.Capacity)
+                    _rows.Capacity = capacity;
+                _rows.Add(record);
+                _bufferedBytes = checked(_bufferedBytes + retainedBytes);
+                _sortWorkspaceBytes = workspaceBytes;
+                return true;
+            }
+            catch
+            {
+                _memory.Release(retainedBytes);
+                throw;
+            }
+        }
+
+        private void DisposeMerge()
+        {
+            _pending?.Dispose();
+            _pending = null;
+            if (_mergeHeads is not null)
+            {
+                foreach (var head in _mergeHeads)
+                    head?.Dispose();
+                _mergeHeads = null;
+            }
+            if (_readers is not null)
+            {
+                foreach (var reader in _readers)
+                    reader?.Dispose();
+                _readers = null;
+            }
+            _merge = null;
+            if (_mergeInfrastructureBytes > 0)
+            {
+                _memory.Release(_mergeInfrastructureBytes, rows: 0);
+                _mergeInfrastructureBytes = 0;
+            }
+        }
 
         // Heap priority: orders by the row comparer, then by RunIndex so equal-key rows
         // across runs keep their global insertion order. The record is carried alongside
@@ -3005,18 +3107,29 @@ public sealed class ResumableStatement : IDisposable
     {
         private readonly int _columnCount;
         private readonly VdbeExecutionOptions _executionOptions;
+        private readonly VdbeExecutionMemory _memory;
         private readonly VdbeTemporaryFile _temporaryFile;
         private readonly IFile _file;
-        private readonly List<(long Offset, int RowCount)> _runs = [];
+        private List<RunDescriptor>? _runs;
         private long _writePosition;
+        private long _runDescriptorBytes;
+        private bool _disposed;
 
-        public SorterSpill(int columnCount, VdbeExecutionOptions executionOptions)
+        public SorterSpill(
+            int columnCount,
+            VdbeExecutionOptions executionOptions,
+            VdbeExecutionMemory memory)
         {
             _columnCount = columnCount;
             _executionOptions = executionOptions;
-            var temporaryFile = VdbeTemporaryFile.Create(executionOptions, "sorter");
+            _memory = memory;
+            _runDescriptorBytes = VdbeManagedFootprint.ListObjectBytes;
+            memory.RetainOrThrow(_runDescriptorBytes, rows: 0);
+            VdbeTemporaryFile? temporaryFile = null;
             try
             {
+                _runs = [];
+                temporaryFile = VdbeTemporaryFile.Create(executionOptions, "sorter");
                 _writePosition = VdbeSpillRecordCodec.InitializeFile(
                     temporaryFile.File,
                     VdbeSpillFileKind.SorterRun,
@@ -3026,12 +3139,14 @@ public sealed class ResumableStatement : IDisposable
             {
                 try
                 {
-                    temporaryFile.Dispose();
+                    temporaryFile?.Dispose();
                 }
                 catch (Exception cleanupFailure)
                 {
+                    memory.Release(_runDescriptorBytes, rows: 0);
                     throw new AggregateException(primaryFailure, cleanupFailure);
                 }
+                memory.Release(_runDescriptorBytes, rows: 0);
                 ExceptionDispatchInfo.Capture(primaryFailure).Throw();
                 throw;
             }
@@ -3040,18 +3155,69 @@ public sealed class ResumableStatement : IDisposable
             _file = temporaryFile.File;
         }
 
-        public int RunCount => _runs.Count;
+        public int RunCount => _runs?.Count ?? 0;
+
+        public void WriteSingleRow(
+            SqlValue[] row,
+            long retainedBytes,
+            CancellationToken cancellationToken)
+        {
+            var offset = _writePosition;
+            ReserveRunDescriptor();
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var recordStart = VdbeSpillRecordCodec.BeginRecord(ref _writePosition);
+                VdbeSpillRecordCodec.WriteValues(
+                    _file,
+                    ref _writePosition,
+                    row,
+                    _executionOptions.Metrics);
+                VdbeSpillRecordCodec.CompleteRecord(
+                    _file,
+                    recordStart,
+                    _writePosition,
+                    _executionOptions.Metrics);
+                _file.FlushToDisk();
+                _runs!.Add(new RunDescriptor(offset, 1, retainedBytes));
+                _executionOptions.Metrics.SorterRunWritten();
+            }
+            catch (Exception primaryFailure)
+            {
+                try
+                {
+                    _file.SetLength(offset);
+                    _writePosition = offset;
+                }
+                catch (Exception rollbackFailure)
+                {
+                    throw new AggregateException(primaryFailure, rollbackFailure);
+                }
+                ExceptionDispatchInfo.Capture(primaryFailure).Throw();
+                throw;
+            }
+        }
 
         // Appends one stably-sorted run and remembers its descriptor. The caller hands
         // in already-sorted rows; this store is format-only and does not re-sort.
         public void WriteRun(List<SqlValue[]> sorted, CancellationToken cancellationToken)
         {
             var offset = _writePosition;
+            var maximumRetainedRowBytes = 0L;
+            ReserveRunDescriptor();
             try
             {
                 foreach (var row in sorted)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    var encodedLength = VdbeSpillRecordCodec.EstimateEncodedValuesLength(row);
+                    maximumRetainedRowBytes = Math.Max(
+                        maximumRetainedRowBytes,
+                        Math.Max(
+                            VdbeManagedFootprint.EstimateSorterRow(row),
+                            VdbeManagedFootprint.EstimateSorterRowFromEncodedLength(
+                                encodedLength,
+                                row.Length)));
                     var recordStart = VdbeSpillRecordCodec.BeginRecord(ref _writePosition);
                     VdbeSpillRecordCodec.WriteValues(
                         _file,
@@ -3066,7 +3232,10 @@ public sealed class ResumableStatement : IDisposable
                 }
 
                 _file.FlushToDisk();
-                _runs.Add((offset, sorted.Count));
+                _runs!.Add(new RunDescriptor(
+                    offset,
+                    sorted.Count,
+                    maximumRetainedRowBytes));
                 _executionOptions.Metrics.SorterRunWritten();
             }
             catch (Exception primaryFailure)
@@ -3088,32 +3257,61 @@ public sealed class ResumableStatement : IDisposable
         public void ConsolidateRuns(
             VdbeRowComparer comparer,
             int maximumFanIn,
+            VdbeExecutionMemory memory,
             CancellationToken cancellationToken)
         {
-            while (_runs.Count > maximumFanIn)
+            var runs = _runs
+                ?? throw new ObjectDisposedException(nameof(SorterSpill));
+            while (runs.Count > 1)
             {
+                var finalFanIn = GetEffectiveFanIn(
+                    start: 0,
+                    Math.Min(maximumFanIn, runs.Count),
+                    memory.AvailableBytes);
+                if (runs.Count <= maximumFanIn && finalFanIn == runs.Count)
+                    return;
+
                 var passOffset = _writePosition;
+                var consolidatedBytes = checked(
+                    VdbeManagedFootprint.ListObjectBytes
+                    + VdbeManagedFootprint.EstimateRunDescriptorListStorage(runs.Count));
+                memory.RetainOrThrow(consolidatedBytes, rows: 0);
                 try
                 {
-                    var consolidated = new List<(long Offset, int RowCount)>();
-                    for (var start = 0; start < _runs.Count; start += maximumFanIn)
+                    var consolidated = new List<RunDescriptor>(runs.Count);
+                    for (var start = 0; start < runs.Count;)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        var count = Math.Min(maximumFanIn, _runs.Count - start);
-                        if (count == 1)
+                        var remaining = runs.Count - start;
+                        if (remaining == 1)
                         {
-                            consolidated.Add(_runs[start]);
+                            consolidated.Add(runs[start]);
+                            start++;
                             continue;
                         }
 
+                        var count = GetEffectiveFanIn(
+                            start,
+                            Math.Min(maximumFanIn, remaining),
+                            memory.AvailableBytes);
+                        if (count < 2)
+                        {
+                            var requestedBytes = EstimateMergeBytes(start, 2);
+                            throw new VdbeMemoryLimitExceededException(
+                                memory.LimitBytes,
+                                requestedBytes);
+                        }
                         consolidated.Add(MergeRunGroup(
-                            _runs.GetRange(start, count),
+                            start,
+                            count,
                             comparer,
+                            memory,
                             cancellationToken));
+                        start += count;
                     }
 
-                    _runs.Clear();
-                    _runs.AddRange(consolidated);
+                    runs.Clear();
+                    runs.AddRange(consolidated);
                 }
                 catch (Exception primaryFailure)
                 {
@@ -3129,22 +3327,36 @@ public sealed class ResumableStatement : IDisposable
                     ExceptionDispatchInfo.Capture(primaryFailure).Throw();
                     throw;
                 }
+                finally
+                {
+                    memory.Release(consolidatedBytes, rows: 0);
+                }
             }
         }
 
-        private (long Offset, int RowCount) MergeRunGroup(
-            IReadOnlyList<(long Offset, int RowCount)> inputs,
+        private RunDescriptor MergeRunGroup(
+            int start,
+            int count,
             VdbeRowComparer comparer,
+            VdbeExecutionMemory memory,
             CancellationToken cancellationToken)
         {
             var offset = _writePosition;
-            var readers = new RunReader[inputs.Count];
+            RunReader[]? readers = null;
+            RowLease[]? heads = null;
+            RowLease? current = null;
+            var infrastructureBytes = VdbeManagedFootprint.EstimateMergeInfrastructure(count);
+            memory.RetainOrThrow(infrastructureBytes, rows: 0);
             try
             {
-                var heap = new PriorityQueue<int, SpillMergeKey>(SpillMergeKey.Comparer);
-                for (var index = 0; index < inputs.Count; index++)
+                readers = new RunReader[count];
+                heads = new RowLease[count];
+                var heap = new PriorityQueue<int, SpillMergeKey>(
+                    count,
+                    SpillMergeKey.Comparer);
+                for (var index = 0; index < count; index++)
                 {
-                    var input = inputs[index];
+                    var input = _runs![start + index];
                     var reader = new RunReader(
                         _file,
                         input.Offset,
@@ -3152,14 +3364,21 @@ public sealed class ResumableStatement : IDisposable
                         _columnCount,
                         _executionOptions.Metrics);
                     readers[index] = reader;
-                    if (reader.TryReadNext(out var row, cancellationToken))
-                        heap.Enqueue(index, new SpillMergeKey(row, index, comparer));
+                    if (reader.TryReadNext(memory, out var row, cancellationToken))
+                    {
+                        heads[index] = row;
+                        heap.Enqueue(
+                            index,
+                            new SpillMergeKey(row.Record, index, comparer));
+                    }
                 }
 
                 var rowsWritten = 0;
                 while (heap.TryDequeue(out var readerIndex, out var key))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    current = heads[readerIndex];
+                    heads[readerIndex] = null!;
                     var recordStart = VdbeSpillRecordCodec.BeginRecord(ref _writePosition);
                     VdbeSpillRecordCodec.WriteValues(
                         _file,
@@ -3173,13 +3392,23 @@ public sealed class ResumableStatement : IDisposable
                         _executionOptions.Metrics);
                     rowsWritten = checked(rowsWritten + 1);
 
-                    if (readers[readerIndex].TryReadNext(out var next, cancellationToken))
-                        heap.Enqueue(readerIndex, new SpillMergeKey(next, readerIndex, comparer));
+                    current.Dispose();
+                    current = null;
+                    if (readers[readerIndex].TryReadNext(memory, out var next, cancellationToken))
+                    {
+                        heads[readerIndex] = next;
+                        heap.Enqueue(
+                            readerIndex,
+                            new SpillMergeKey(next.Record, readerIndex, comparer));
+                    }
                 }
 
                 _file.FlushToDisk();
                 _executionOptions.Metrics.SorterRunWritten();
-                return (offset, rowsWritten);
+                return new RunDescriptor(
+                    offset,
+                    rowsWritten,
+                    GetMaximumRetainedRowBytes(start, count));
             }
             catch (Exception primaryFailure)
             {
@@ -3197,27 +3426,108 @@ public sealed class ResumableStatement : IDisposable
             }
             finally
             {
-                foreach (var reader in readers)
-                    reader?.Dispose();
+                current?.Dispose();
+                if (heads is not null)
+                {
+                    foreach (var head in heads)
+                        head?.Dispose();
+                }
+                if (readers is not null)
+                {
+                    foreach (var reader in readers)
+                        reader?.Dispose();
+                }
+                memory.Release(infrastructureBytes, rows: 0);
             }
         }
 
         public RunReader OpenRunReader(int runIndex)
         {
-            var (offset, rowCount) = _runs[runIndex];
+            var run = _runs![runIndex];
             VdbeSpillRecordCodec.ValidateFile(
                 _file,
                 VdbeSpillFileKind.SorterRun,
                 _executionOptions.Metrics);
             return new RunReader(
                 _file,
-                offset,
-                rowCount,
+                run.Offset,
+                run.RowCount,
                 _columnCount,
                 _executionOptions.Metrics);
         }
 
-        public void Dispose() => _temporaryFile.Dispose();
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _temporaryFile.Dispose();
+            _disposed = true;
+            _runs = null;
+            _memory.Release(_runDescriptorBytes, rows: 0);
+            _runDescriptorBytes = 0;
+        }
+
+        private int GetEffectiveFanIn(int start, int maximumFanIn, long availableBytes)
+        {
+            var fanIn = 0;
+            for (var count = 1; count <= maximumFanIn; count++)
+            {
+                if (EstimateMergeBytes(start, count) > availableBytes)
+                    break;
+                fanIn = count;
+            }
+            return fanIn;
+        }
+
+        private long EstimateMergeBytes(int start, int count)
+        {
+            var total = VdbeManagedFootprint.EstimateMergeInfrastructure(count);
+            for (var index = 0; index < count; index++)
+            {
+                total = checked(
+                    total
+                    + _runs![start + index].MaximumRetainedRowBytes);
+            }
+            return total;
+        }
+
+        private long GetMaximumRetainedRowBytes(int start, int count)
+        {
+            var maximum = 0L;
+            for (var index = 0; index < count; index++)
+                maximum = Math.Max(maximum, _runs![start + index].MaximumRetainedRowBytes);
+            return maximum;
+        }
+
+        private void ReserveRunDescriptor()
+        {
+            var runs = _runs
+                ?? throw new ObjectDisposedException(nameof(SorterSpill));
+            var capacity = VdbeManagedFootprint.GetListCapacityForCount(
+                runs.Capacity,
+                runs.Count + 1);
+            if (capacity == runs.Capacity)
+                return;
+            var growthBytes = checked(
+                VdbeManagedFootprint.EstimateRunDescriptorListStorage(capacity)
+                - VdbeManagedFootprint.EstimateRunDescriptorListStorage(runs.Capacity));
+            _memory.RetainOrThrow(growthBytes, rows: 0);
+            try
+            {
+                runs.Capacity = capacity;
+                _runDescriptorBytes = checked(_runDescriptorBytes + growthBytes);
+            }
+            catch
+            {
+                _memory.Release(growthBytes, rows: 0);
+                throw;
+            }
+        }
+
+        private readonly record struct RunDescriptor(
+            long Offset,
+            int RowCount,
+            long MaximumRetainedRowBytes);
 
         private readonly struct SpillMergeKey
         {
@@ -3242,6 +3552,24 @@ public sealed class ResumableStatement : IDisposable
 
         // Reads one run's records back one at a time using positional IFile access. Multiple
         // readers share the file safely because each carries its own explicit offset.
+        public sealed class RowLease(
+            SqlValue[] record,
+            VdbeExecutionMemory memory,
+            long retainedBytes) : IDisposable
+        {
+            private bool _disposed;
+
+            public SqlValue[] Record { get; } = record;
+
+            public void Dispose()
+            {
+                if (_disposed)
+                    return;
+                _disposed = true;
+                memory.Release(retainedBytes);
+            }
+        }
+
         public sealed class RunReader : IDisposable
         {
             private readonly IFile _file;
@@ -3265,22 +3593,32 @@ public sealed class ResumableStatement : IDisposable
 
             public int RowsRemaining { get; private set; }
 
-            public bool TryReadNext(out SqlValue[] row, CancellationToken cancellationToken)
+            public bool TryReadNext(
+                VdbeExecutionMemory memory,
+                out RowLease row,
+                CancellationToken cancellationToken)
             {
                 if (RowsRemaining <= 0)
                 {
-                    row = Array.Empty<SqlValue>();
+                    row = null!;
                     return false;
                 }
 
                 var rowStart = _position;
+                var retainedBytes = 0L;
+                var retained = false;
                 try
                 {
                     var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(
                         _file,
                         ref _position,
                         _metrics);
-                    row = VdbeSpillRecordCodec.ReadValues(
+                    retainedBytes = VdbeManagedFootprint.EstimateSorterRowFromEncodedLength(
+                        recordEnd - _position,
+                        _columnCount);
+                    memory.RetainOrThrow(retainedBytes);
+                    retained = true;
+                    var values = VdbeSpillRecordCodec.ReadValues(
                         _file,
                         ref _position,
                         _columnCount,
@@ -3288,11 +3626,14 @@ public sealed class ResumableStatement : IDisposable
                         cancellationToken);
                     VdbeSpillRecordCodec.RequireRecordEnd(_position, recordEnd);
                     RowsRemaining--;
+                    row = new RowLease(values, memory, retainedBytes);
                     return true;
                 }
                 catch
                 {
                     _position = rowStart;
+                    if (retained)
+                        memory.Release(retainedBytes);
                     throw;
                 }
             }
@@ -3652,6 +3993,10 @@ public sealed class ResumableStatement : IDisposable
             {
                 failure = exception;
             }
+            finally
+            {
+                _enumerator = null;
+            }
 
             if (_context?.TakeCleanupFailure() is { } cleanupFailure)
             {
@@ -3660,9 +4005,25 @@ public sealed class ResumableStatement : IDisposable
                     : new AggregateException(failure, cleanupFailure);
             }
 
-            _enumerator = null;
-            _context = null;
-            CurrentRow = null;
+            if (_context?.HasPendingCleanup == true)
+            {
+                try
+                {
+                    _context.RetryPendingCleanup();
+                }
+                catch (Exception retryFailure)
+                {
+                    failure = failure is null
+                        ? retryFailure
+                        : new AggregateException(failure, retryFailure);
+                }
+            }
+
+            if (_context?.HasPendingCleanup != true)
+            {
+                _context = null;
+                CurrentRow = null;
+            }
             if (failure is not null)
                 ExceptionDispatchInfo.Capture(failure).Throw();
         }

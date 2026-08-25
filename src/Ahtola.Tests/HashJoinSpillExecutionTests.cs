@@ -53,7 +53,7 @@ public class HashJoinSpillExecutionTests
         var right =
             new[] { Row(2, "r2a"), Row(3, "r3"), Row(2, "r2b"), Row(null, "rn") };
         var program = JoinProgram(left, right, VdbeJoinKind.Full);
-        var options = Options(new InMemoryFileSystem(), metrics, memoryLimitBytes: 160);
+        var options = Options(new InMemoryFileSystem(), metrics, memoryLimitBytes: 1024);
 
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
@@ -83,7 +83,7 @@ public class HashJoinSpillExecutionTests
             right,
             VdbeJoinKind.Inner,
             hashBuildRight: false);
-        var options = Options(new InMemoryFileSystem(), metrics, memoryLimitBytes: 128);
+        var options = Options(new InMemoryFileSystem(), metrics, memoryLimitBytes: 1024);
 
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
@@ -92,7 +92,7 @@ public class HashJoinSpillExecutionTests
             ("l2a", "r2"),
             ("l2b", "r2"));
         metrics.HashPartitionsCreated.Should().Be(16);
-        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(128);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(1024);
     }
 
     [Test]
@@ -136,7 +136,7 @@ public class HashJoinSpillExecutionTests
                 cancellation.Cancel();
                 return true;
             });
-        var options = Options(fileSystem, metrics, memoryLimitBytes: 128);
+        var options = Options(fileSystem, metrics, memoryLimitBytes: 1024);
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
         Assert.Throws<OperationCanceledException>(() => statement.StepResumable(cancellation.Token));
@@ -160,7 +160,7 @@ public class HashJoinSpillExecutionTests
         var metrics = new VdbeExecutionMetrics();
         var right = Enumerable.Range(0, 40).Select(static value => Row(value, $"r{value}")).ToArray();
         var program = JoinProgram([Row(1, "left")], right, VdbeJoinKind.Inner);
-        var options = Options(fileSystem, metrics, memoryLimitBytes: 128);
+        var options = Options(fileSystem, metrics, memoryLimitBytes: 1024);
         faults.FailOnOccurrence(operation, occurrence);
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
@@ -216,24 +216,33 @@ public class HashJoinSpillExecutionTests
                 () => VdbeSpillRecordCodec.ReadRecordEnd(truncated, ref position, metrics));
         }
 
-        using var unknownTag = fileSystem.OpenFile("unknown-tag.spill", FileOpenMode.CreateNew);
-        var unknownPosition = VdbeSpillRecordCodec.InitializeFile(
-            unknownTag,
-            VdbeSpillFileKind.SorterRun,
-            metrics);
-        var unknownStart = VdbeSpillRecordCodec.BeginRecord(ref unknownPosition);
-        VdbeSpillRecordCodec.WriteByte(unknownTag, ref unknownPosition, 0x7F, metrics);
-        VdbeSpillRecordCodec.CompleteRecord(unknownTag, unknownStart, unknownPosition, metrics);
-        unknownPosition = VdbeSpillRecordCodec.FileHeaderSize;
-        VdbeSpillRecordCodec.ReadRecordEnd(unknownTag, ref unknownPosition, metrics);
-
-        Assert.Throws<InvalidDataException>(
-            () => VdbeSpillRecordCodec.ReadValues(
+        foreach (var reservedTag in new byte[] { 0x05, 0x13, 0x80, 0x84, 0x93, 0xFF })
+        {
+            using var unknownTag = fileSystem.OpenFile(
+                $"unknown-tag-{reservedTag:X2}.spill",
+                FileOpenMode.CreateNew);
+            var unknownPosition = VdbeSpillRecordCodec.InitializeFile(
                 unknownTag,
-                ref unknownPosition,
-                count: 1,
-                metrics,
-                CancellationToken.None));
+                VdbeSpillFileKind.SorterRun,
+                metrics);
+            var unknownStart = VdbeSpillRecordCodec.BeginRecord(ref unknownPosition);
+            VdbeSpillRecordCodec.WriteByte(unknownTag, ref unknownPosition, reservedTag, metrics);
+            VdbeSpillRecordCodec.CompleteRecord(
+                unknownTag,
+                unknownStart,
+                unknownPosition,
+                metrics);
+            unknownPosition = VdbeSpillRecordCodec.FileHeaderSize;
+            VdbeSpillRecordCodec.ReadRecordEnd(unknownTag, ref unknownPosition, metrics);
+
+            Assert.Throws<InvalidDataException>(
+                () => VdbeSpillRecordCodec.ReadValues(
+                    unknownTag,
+                    ref unknownPosition,
+                    count: 1,
+                    metrics,
+                    CancellationToken.None));
+        }
     }
 
     [Test]
@@ -248,7 +257,7 @@ public class HashJoinSpillExecutionTests
             Enumerable.Range(0, 40).Select(static value => Row(value, $"r{value}")).ToArray(),
             VdbeJoinKind.Inner,
             condition: (_, _, _) => throw primary);
-        var options = Options(fileSystem, metrics, memoryLimitBytes: 128);
+        var options = Options(fileSystem, metrics, memoryLimitBytes: 1024);
         faults.FailNext(FileSystemOperation.Delete, "cleanup failed");
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
@@ -266,7 +275,7 @@ public class HashJoinSpillExecutionTests
     [Test]
     public void NestedSubprogramSharesTheParentExecutionBudget()
     {
-        const long budget = 192;
+        const long budget = 1024;
         var metrics = new VdbeExecutionMetrics();
         var fileSystem = new TrackingFileSystem();
         var child = new VdbeSubprogram(JoinProgram(
@@ -298,6 +307,60 @@ public class HashJoinSpillExecutionTests
         metrics.CurrentRetainedBytes.Should().Be(0);
         metrics.HashPartitionsCreated.Should().Be(16);
         metrics.ActiveSpillFiles.Should().Be(0);
+    }
+
+    [Test]
+    public void OversizedSkewBuildRecordFailsBeforeItCanBeRetainedOrSpilled()
+    {
+        const long budget = 2048;
+        var metrics = new VdbeExecutionMetrics();
+        var fileSystem = new TrackingFileSystem();
+        var right = Enumerable.Range(0, 8)
+            .Select(static value => Row(1, $"small-{value}"))
+            .Append(Row(1, new string('x', 4096)))
+            .ToArray();
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            JoinProgram([Row(1, "left")], right, VdbeJoinKind.Inner),
+            Options(fileSystem, metrics, budget));
+
+        var failure = Assert.Throws<VdbeMemoryLimitExceededException>(
+            () => statement.StepResumable());
+
+        failure!.LimitBytes.Should().Be(budget);
+        failure.RequestedBytes.Should().BeGreaterThan(budget);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Created.Should().OnlyContain(path => !fileSystem.FileExists(path));
+    }
+
+    [Test]
+    public void DeleteFailureLeavesHashCleanupRetryableForReset()
+    {
+        var faults = new DeterministicFaultInjector();
+        var backing = new InMemoryFileSystem(faults);
+        var fileSystem = new TrackingFileSystem(backing);
+        var metrics = new VdbeExecutionMetrics();
+        var right = Enumerable.Range(0, 40)
+            .Select(static value => Row(value, $"r{value}"))
+            .ToArray();
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            JoinProgram([Row(-1, "left")], right, VdbeJoinKind.Inner),
+            Options(fileSystem, metrics, memoryLimitBytes: 1024));
+        for (var occurrence = 1; occurrence <= 34; occurrence++)
+            faults.FailOnOccurrence(FileSystemOperation.Delete, occurrence);
+
+        Assert.Catch<Exception>(() => Drain(statement));
+
+        metrics.ActiveSpillFiles.Should().Be(1);
+        fileSystem.Created.Where(backing.FileExists).Should().ContainSingle();
+
+        faults.ClearScheduled();
+        statement.Reset();
+
+        metrics.ActiveSpillFiles.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        fileSystem.Created.Should().OnlyContain(path => !backing.FileExists(path));
     }
 
     private static VdbeExecutionOptions Options(
@@ -379,7 +442,7 @@ public class HashJoinSpillExecutionTests
             VdbeJoinKind.Inner);
         using var statement = ResumableStatement.CreateWithExecutionOptions(
             program,
-            Options(fileSystem, metrics, memoryLimitBytes: 128));
+            Options(fileSystem, metrics, memoryLimitBytes: 1024));
 
         Drain(statement);
         return fileSystem.DeletedPayloads;
