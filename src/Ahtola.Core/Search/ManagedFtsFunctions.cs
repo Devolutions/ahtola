@@ -432,7 +432,8 @@ internal static class ManagedFtsFunctions
                 }
                 return;
             case ManagedFtsPhraseNode phrase:
-                if (phrase.IsPrefix && ++prefixTerms > ManagedFtsLimits.MaxHighlightPrefixTerms)
+                prefixTerms += phrase.Terms.Count(static term => term.IsPrefix);
+                if (prefixTerms > ManagedFtsLimits.MaxHighlightPrefixTerms)
                 {
                     throw new EmbeddedSqlException(
                         $"fts highlight query uses more than {ManagedFtsLimits.MaxHighlightPrefixTerms} prefix terms");
@@ -443,7 +444,8 @@ internal static class ManagedFtsFunctions
             case ManagedFtsNearNode near:
                 foreach (var phrase in near.Phrases)
                 {
-                    if (phrase.IsPrefix && ++prefixTerms > ManagedFtsLimits.MaxHighlightPrefixTerms)
+                    prefixTerms += phrase.Terms.Count(static term => term.IsPrefix);
+                    if (prefixTerms > ManagedFtsLimits.MaxHighlightPrefixTerms)
                     {
                         throw new EmbeddedSqlException(
                             $"fts highlight query uses more than {ManagedFtsLimits.MaxHighlightPrefixTerms} prefix terms");
@@ -477,7 +479,7 @@ internal static class ManagedFtsFunctions
 
         foreach (var match in FindPhraseMatches(
                      lookup,
-                     new ManagedFtsNearPhrase(phrase.Terms, phrase.IsPrefix),
+                     new ManagedFtsNearPhrase(phrase.Terms),
                      phrase.AnchoredAtStart))
         {
             AddMatchSpan(destination, match.Span.Start, match.Span.End);
@@ -493,9 +495,10 @@ internal static class ManagedFtsFunctions
             return [];
 
         var matches = new List<PhraseMatch>();
-        var firstOccurrences = phrase.Terms.Count == 1 && phrase.IsPrefix
-            ? lookup.GetPrefix(phrase.Terms[0])
-            : lookup.Get(phrase.Terms[0]);
+        var firstTerm = phrase.Terms[0];
+        var firstOccurrences = firstTerm.IsPrefix
+            ? lookup.GetPrefix(firstTerm.Text)
+            : lookup.Get(firstTerm.Text);
         foreach (var first in firstOccurrences)
         {
             if (anchoredAtStart && first.Position != 0)
@@ -506,9 +509,10 @@ internal static class ManagedFtsFunctions
             for (var index = 1; index < phrase.Terms.Count; index++)
             {
                 var position = first.Position + index;
-                var found = phrase.IsPrefix && index == phrase.Terms.Count - 1
-                    ? lookup.TryGetPrefixAtPosition(phrase.Terms[index], position, out var token)
-                    : lookup.TryGetAtPosition(phrase.Terms[index], position, out token);
+                var phraseTerm = phrase.Terms[index];
+                var found = phraseTerm.IsPrefix
+                    ? lookup.TryGetPrefixAtPosition(phraseTerm.Text, position, out var token)
+                    : lookup.TryGetAtPosition(phraseTerm.Text, position, out token);
                 if (!found)
                 {
                     matched = false;

@@ -60,7 +60,8 @@ by Ahtola's private payload.
 
 MATCH supports bounded FTS5 term, phrase, quoted-phrase prefix, binary
 `NOT`, column-filter, initial-token anchor, and `NEAR(phrase ..., distance)`
-grammar, including prefix and quoted-phrase operands within `NEAR`. Implicit
+grammar, including `+` phrase concatenation and independently prefixed phrase
+components within or outside `NEAR`. Implicit
 `AND` binds more tightly than binary `NOT`. Barewords use SQLite FTS5's
 restricted character set; reserved punctuation such as `.`, `/`, and `,`
 must be quoted. A

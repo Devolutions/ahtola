@@ -387,7 +387,9 @@ public sealed class ManagedSearchVirtualTableTests
                 (4, 'one two three filler filler filler filler'),
                 (5, 'or not near'),
                 (6, 'one three two'),
-                (7, 'one two three');
+                (7, 'one two three'),
+                (8, 'only two three'),
+                (9, 'one twin three');
             """,
         ];
 
@@ -445,6 +447,30 @@ public sealed class ManagedSearchVirtualTableTests
             "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(a c \"a b\",1)' ORDER BY rowid;",
             "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(one two, 1)' ORDER BY rowid;",
             "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(\"one\"\"two\" three,1)' ORDER BY rowid;",
+            """
+            SELECT rowid, highlight(near_edges, 0, '[', ']')
+            FROM near_edges
+            WHERE near_edges MATCH 'one + two'
+            ORDER BY rowid;
+            """,
+            """
+            SELECT rowid, highlight(near_edges, 0, '[', ']')
+            FROM near_edges
+            WHERE near_edges MATCH 'NEAR(one + tw* three,1)'
+            ORDER BY rowid;
+            """,
+            """
+            SELECT rowid, highlight(near_edges, 0, '[', ']')
+            FROM near_edges
+            WHERE near_edges MATCH 'NEAR(on* + two three,1)'
+            ORDER BY rowid;
+            """,
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH '\"!!!\" + one' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH '\"\" + one' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(\"!!!\" + one two,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH '\"!!!\" one' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'one \"!!!\"' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH '\"!!!\" AND one' ORDER BY rowid;",
             """
             SELECT rowid, highlight(near_edges, 0, '[', ']')
             FROM near_edges
@@ -513,6 +539,22 @@ public sealed class ManagedSearchVirtualTableTests
         {
             var sql =
                 $"SELECT rowid FROM near_docs WHERE near_docs MATCH '{invalidBareword}';";
+            Action managedInvalid = () => ReadRowsAsStrings(managed, sql);
+            Action stockInvalid = () => ReadRowsAsStrings(stock, sql);
+            managedInvalid.Should().Throw<EmbeddedSqlException>();
+            stockInvalid.Should().Throw<MsData.SqliteException>();
+        }
+
+        const string reservedConcatenation =
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'one + OR';";
+        Action managedReserved = () => ReadRowsAsStrings(managed, reservedConcatenation);
+        Action stockReserved = () => ReadRowsAsStrings(stock, reservedConcatenation);
+        managedReserved.Should().Throw<EmbeddedSqlException>();
+        stockReserved.Should().Throw<MsData.SqliteException>();
+
+        foreach (var invalidNear in new[] { "NEAR()", "NEAR(,1)" })
+        {
+            var sql = $"SELECT rowid FROM near_edges WHERE near_edges MATCH '{invalidNear}';";
             Action managedInvalid = () => ReadRowsAsStrings(managed, sql);
             Action stockInvalid = () => ReadRowsAsStrings(stock, sql);
             managedInvalid.Should().Throw<EmbeddedSqlException>();

@@ -71,6 +71,16 @@ public sealed class ManagedFtsSearchEngineTests
     }
 
     [Test]
+    public void LegacyGrammarDoesNotAdoptFts5PhraseConcatenation()
+    {
+        var index = CreateIndex(1);
+        index.Upsert(1, [], [SqlValue.Text("one two")]);
+
+        RowIds(index, "one + two").Should().BeEmpty();
+        RowIds(index, "\"one two\"").Should().Equal(1);
+    }
+
+    [Test]
     public void RankingIsDeterministicWithRowidTieBreak()
     {
         var index = CreateIndex(1);

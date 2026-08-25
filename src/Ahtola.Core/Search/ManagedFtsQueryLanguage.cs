@@ -47,17 +47,20 @@ internal abstract record ManagedFtsNode;
 
 internal sealed record ManagedFtsNoMatchNode : ManagedFtsNode;
 
+internal sealed record ManagedFtsOmittedNode : ManagedFtsNode;
+
 internal sealed record ManagedFtsTermNode(string Text, bool IsPrefix, string? Column, bool AnchoredAtStart)
     : ManagedFtsNode;
 
+internal sealed record ManagedFtsPhraseTerm(string Text, bool IsPrefix);
+
 internal sealed record ManagedFtsPhraseNode(
-    IReadOnlyList<string> Terms,
-    bool IsPrefix,
+    IReadOnlyList<ManagedFtsPhraseTerm> Terms,
     string? Column,
     bool AnchoredAtStart)
     : ManagedFtsNode;
 
-internal sealed record ManagedFtsNearPhrase(IReadOnlyList<string> Terms, bool IsPrefix);
+internal sealed record ManagedFtsNearPhrase(IReadOnlyList<ManagedFtsPhraseTerm> Terms);
 
 internal sealed record ManagedFtsNearNode(
     IReadOnlyList<ManagedFtsNearPhrase> Phrases,
@@ -114,7 +117,7 @@ internal sealed class ManagedFtsQueryLanguage
         var parser = new ManagedFtsQueryLanguage(query, options, isKnownColumn, syntax);
         var node = parser.ParseOr();
         parser.ExpectEnd();
-        return node;
+        return NormalizeOmitted(node);
     }
 
     private ManagedFtsNode ParseOr()
@@ -125,11 +128,16 @@ internal sealed class ManagedFtsQueryLanguage
             : ParseManagedAnd();
         while (TryReadKeyword("OR"))
         {
+            var right = _syntax == ManagedFtsQuerySyntax.SqliteFts5
+                ? ParseFts5ExplicitAnd()
+                : ParseManagedAnd();
             expression = new ManagedFtsOrNode(
-                expression,
                 _syntax == ManagedFtsQuerySyntax.SqliteFts5
-                    ? ParseFts5ExplicitAnd()
-                    : ParseManagedAnd());
+                    ? NormalizeOmitted(expression)
+                    : expression,
+                _syntax == ManagedFtsQuerySyntax.SqliteFts5
+                    ? NormalizeOmitted(right)
+                    : right);
         }
 
         return expression;
@@ -169,7 +177,11 @@ internal sealed class ManagedFtsQueryLanguage
         using var _ = Descend();
         var expression = ParseFts5Not();
         while (TryReadKeyword("AND"))
-            expression = new ManagedFtsAndNode(expression, ParseFts5Not());
+        {
+            expression = new ManagedFtsAndNode(
+                NormalizeOmitted(expression),
+                NormalizeOmitted(ParseFts5Not()));
+        }
 
         return expression;
     }
@@ -181,8 +193,8 @@ internal sealed class ManagedFtsQueryLanguage
         while (TryReadKeyword("NOT"))
         {
             expression = new ManagedFtsAndNode(
-                expression,
-                new ManagedFtsNotNode(ParseFts5ImplicitAnd()));
+                NormalizeOmitted(expression),
+                new ManagedFtsNotNode(NormalizeOmitted(ParseFts5ImplicitAnd())));
         }
 
         return expression;
@@ -193,7 +205,15 @@ internal sealed class ManagedFtsQueryLanguage
         using var _ = Descend();
         var expression = ParsePrimary();
         while (IsFts5ImplicitOperandStart())
-            expression = new ManagedFtsAndNode(expression, ParsePrimary());
+        {
+            var right = ParsePrimary();
+            expression = expression switch
+            {
+                ManagedFtsOmittedNode => right,
+                _ when right is ManagedFtsOmittedNode => expression,
+                _ => new ManagedFtsAndNode(expression, right),
+            };
+        }
 
         return expression;
     }
@@ -223,12 +243,13 @@ internal sealed class ManagedFtsQueryLanguage
             return ParseNear(column);
 
         var anchored = TryRead('^');
+        if (_syntax == ManagedFtsQuerySyntax.SqliteFts5)
+            return ParseFts5Phrase(column, anchored);
+
         if (TryRead('"'))
             return ParsePhrase(column, anchored);
 
-        var term = _syntax == ManagedFtsQuerySyntax.SqliteFts5
-            ? ReadFts5Bareword()
-            : ReadWord();
+        var term = ReadWord();
         if (term.Length == 0)
             throw Error("Expected an FTS term.");
 
@@ -289,7 +310,10 @@ internal sealed class ManagedFtsQueryLanguage
             terms[index] = tokens[index];
         }
 
-        return new ManagedFtsPhraseNode(terms, IsPrefix: false, column, anchored);
+        return new ManagedFtsPhraseNode(
+            terms.Select(static term => new ManagedFtsPhraseTerm(term, IsPrefix: false)).ToArray(),
+            column,
+            anchored);
     }
 
     private ManagedFtsNode ParseNear(string? column)
@@ -351,7 +375,10 @@ internal sealed class ManagedFtsQueryLanguage
             throw Error("NEAR requires at least two terms.");
 
         return new ManagedFtsNearNode(
-            terms.Select(static term => new ManagedFtsNearPhrase([term], IsPrefix: false)).ToArray(),
+            terms
+                .Select(static term => new ManagedFtsNearPhrase(
+                    [new ManagedFtsPhraseTerm(term, IsPrefix: false)]))
+                .ToArray(),
             distance,
             column);
     }
@@ -363,6 +390,7 @@ internal sealed class ManagedFtsQueryLanguage
 
         var distance = 10;
         var phrases = new List<ManagedFtsNearPhrase>();
+        var operandCount = 0;
         while (true)
         {
             SkipWhitespace();
@@ -388,20 +416,57 @@ internal sealed class ManagedFtsQueryLanguage
                 break;
             }
 
-            phrases.Add(ParseFts5NearPhrase());
+            var phrase = ParseFts5NearPhrase();
+            operandCount++;
+            if (phrase.Terms.Count != 0)
+                phrases.Add(phrase);
         }
 
+        if (operandCount == 0)
+            throw Error("NEAR requires at least one phrase.");
         if (phrases.Count == 0)
-            throw Error("NEAR requires at least one term.");
+            return new ManagedFtsOmittedNode();
 
         return new ManagedFtsNearNode(phrases, distance, column, SqliteDistance: true);
     }
 
     private ManagedFtsNearPhrase ParseFts5NearPhrase()
     {
-        var phraseText = TryRead('"') ? ReadQuotedText() : ReadFts5Bareword();
-        if (phraseText.Length == 0)
-            throw Error("Expected an FTS phrase inside NEAR.");
+        var terms = ParseFts5PhraseAtom();
+        while (TryRead('+'))
+            terms.AddRange(ParseFts5PhraseAtom());
+
+        return new ManagedFtsNearPhrase(terms);
+    }
+
+    private ManagedFtsNode ParseFts5Phrase(string? column, bool anchored)
+    {
+        var terms = ParseFts5PhraseAtom();
+        while (TryRead('+'))
+            terms.AddRange(ParseFts5PhraseAtom());
+
+        return terms.Count switch
+        {
+            0 => new ManagedFtsOmittedNode(),
+            1 => new ManagedFtsTermNode(terms[0].Text, terms[0].IsPrefix, column, anchored),
+            _ => new ManagedFtsPhraseNode(terms, column, anchored),
+        };
+    }
+
+    private List<ManagedFtsPhraseTerm> ParseFts5PhraseAtom()
+    {
+        var quoted = TryRead('"');
+        if (!quoted
+            && (IsKeywordAtOffset("AND")
+                || IsKeywordAtOffset("OR")
+                || IsKeywordAtOffset("NOT")))
+        {
+            throw Error("Expected an FTS phrase.");
+        }
+
+        var phraseText = quoted ? ReadQuotedText() : ReadFts5Bareword();
+        if (!quoted && phraseText.Length == 0)
+            throw Error("Expected an FTS phrase.");
 
         var prefix = TryRead('*') && !_options.IsGramTokenizer;
         if (TryRead('*'))
@@ -409,22 +474,18 @@ internal sealed class ManagedFtsQueryLanguage
 
         var tokens = ManagedFtsTokenization.TokenizeQueryText(phraseText, _options);
         if (tokens.Count == 0)
+            return [];
+
+        var terms = new List<ManagedFtsPhraseTerm>(tokens.Count);
+        for (var index = 0; index < tokens.Count; index++)
         {
             CountTerm();
-            return new ManagedFtsNearPhrase(
-                [ManagedFtsTokenization.NormalizeTerm(phraseText, _options)],
-                prefix);
+            terms.Add(new ManagedFtsPhraseTerm(
+                tokens[index],
+                prefix && index == tokens.Count - 1));
         }
 
-        var terms = new string[tokens.Count];
-        var index = 0;
-        foreach (var token in tokens)
-        {
-            CountTerm();
-            terms[index++] = token;
-        }
-
-        return new ManagedFtsNearPhrase(terms, prefix);
+        return terms;
     }
 
     private ManagedFtsNode ParsePhrase(string? column, bool anchored)
@@ -452,7 +513,14 @@ internal sealed class ManagedFtsQueryLanguage
             terms[index] = tokens[index];
         }
 
-        return new ManagedFtsPhraseNode(terms, prefix, column, anchored);
+        return new ManagedFtsPhraseNode(
+            terms
+                .Select((term, index) => new ManagedFtsPhraseTerm(
+                    term,
+                    prefix && index == terms.Length - 1))
+                .ToArray(),
+            column,
+            anchored);
     }
 
     private string? TryReadColumnPrefix()
@@ -588,6 +656,9 @@ internal sealed class ManagedFtsQueryLanguage
         => _syntax == ManagedFtsQuerySyntax.SqliteFts5
             ? IsFts5BarewordCharacter(value)
             : IsWordChar(value);
+
+    private static ManagedFtsNode NormalizeOmitted(ManagedFtsNode node)
+        => node is ManagedFtsOmittedNode ? new ManagedFtsNoMatchNode() : node;
 
     /// <summary>
     /// The characters that can continue a bare term. This must agree with <see cref="ReadWord"/>

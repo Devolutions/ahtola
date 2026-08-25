@@ -553,24 +553,14 @@ internal sealed class ManagedFtsSearchIndex
     {
         RequirePositions("phrase");
         var columnMask = ResolveColumnMask(phrase.Column);
-        if (phrase.IsPrefix)
-        {
-            return EvaluatePrefixPhrase(
-                phrase,
-                accumulator,
-                columnWeights,
-                columnMask,
-                includedRowFrequencies);
-        }
-
         var candidates = new List<ScoreCandidate>();
         var matches = new HashSet<long>();
-        foreach (var rowId in IntersectTerms(phrase.Terms))
+        var nearPhrase = new ManagedFtsNearPhrase(phrase.Terms);
+        foreach (var rowId in FindPhraseCandidates(nearPhrase))
         {
             var frequencies = CountPhraseByColumn(
                 rowId,
                 phrase.Terms,
-                isPrefix: false,
                 columnMask,
                 phrase.AnchoredAtStart);
             var candidate = CreateFrequencyCandidate(rowId, frequencies);
@@ -587,45 +577,6 @@ internal sealed class ManagedFtsSearchIndex
         return matches;
     }
 
-    private HashSet<long> EvaluatePrefixPhrase(
-        ManagedFtsPhraseNode phrase,
-        Dictionary<long, double>? accumulator,
-        IReadOnlyList<double> columnWeights,
-        uint columnMask,
-        IReadOnlyDictionary<long, int[]>? includedRowFrequencies)
-    {
-        var candidates = new List<ScoreCandidate>();
-        var matches = new HashSet<long>();
-        var nearPhrase = new ManagedFtsNearPhrase(phrase.Terms, IsPrefix: true);
-        foreach (var rowId in FindPhraseCandidates(nearPhrase))
-        {
-            var frequencies = CountPhraseByColumn(
-                rowId,
-                phrase.Terms,
-                isPrefix: true,
-                columnMask,
-                phrase.AnchoredAtStart);
-            var candidate = CreateFrequencyCandidate(rowId, frequencies);
-            if (candidate.Frequency == 0)
-                continue;
-
-            matches.Add(rowId);
-            candidates.Add(candidate);
-        }
-
-        if (accumulator is not null)
-        {
-            Accumulate(
-                accumulator,
-                candidates,
-                columnMask,
-                columnWeights,
-                includedRowFrequencies);
-        }
-
-        return matches;
-    }
-
     private HashSet<long> EvaluateNear(
         ManagedFtsNearNode near,
         Dictionary<long, double>? accumulator,
@@ -636,7 +587,10 @@ internal sealed class ManagedFtsSearchIndex
         if (near.SqliteDistance)
             return EvaluateSqliteNear(near, accumulator, columnWeights, columnMask);
 
-        var terms = near.Phrases.SelectMany(static phrase => phrase.Terms).ToArray();
+        var terms = near.Phrases
+            .SelectMany(static phrase => phrase.Terms)
+            .Select(static term => term.Text)
+            .ToArray();
         var candidates = new List<ScoreCandidate>();
         var matches = new HashSet<long>();
         foreach (var rowId in IntersectTerms(terms))
@@ -697,7 +651,6 @@ internal sealed class ManagedFtsSearchIndex
             EvaluatePhrase(
                 new ManagedFtsPhraseNode(
                     phrase.Terms,
-                    phrase.IsPrefix,
                     near.Column,
                     AnchoredAtStart: false),
                 accumulator,
@@ -791,14 +744,14 @@ internal sealed class ManagedFtsSearchIndex
         for (var index = 0; index < phrase.Terms.Count; index++)
         {
             var termRows = new HashSet<long>();
-            var isPrefix = phrase.IsPrefix && index == phrase.Terms.Count - 1;
-            var terms = isPrefix
+            var phraseTerm = phrase.Terms[index];
+            var terms = phraseTerm.IsPrefix
                 ? ExpandTerm(new ManagedFtsTermNode(
-                    phrase.Terms[index],
+                    phraseTerm.Text,
                     IsPrefix: true,
                     Column: null,
                     AnchoredAtStart: false))
-                : [phrase.Terms[index]];
+                : [phraseTerm.Text];
             foreach (var term in terms)
             {
                 if (!_postings.TryGetValue(term, out var list))
@@ -835,14 +788,14 @@ internal sealed class ManagedFtsSearchIndex
         var streams = new long[phrase.Terms.Count][];
         for (var index = 0; index < phrase.Terms.Count; index++)
         {
-            var isPrefix = phrase.IsPrefix && index == phrase.Terms.Count - 1;
-            if (isPrefix)
+            var phraseTerm = phrase.Terms[index];
+            if (phraseTerm.IsPrefix)
             {
-                streams[index] = GetPrefixPositions(phrase.Terms[index], rowId);
+                streams[index] = GetPrefixPositions(phraseTerm.Text, rowId);
                 if (streams[index].Length == 0)
                     return [];
             }
-            else if (TryGetPositions(phrase.Terms[index], rowId, out var positions))
+            else if (TryGetPositions(phraseTerm.Text, rowId, out var positions))
             {
                 streams[index] = positions;
             }
@@ -930,15 +883,14 @@ internal sealed class ManagedFtsSearchIndex
 
     private int[] CountPhraseByColumn(
         long rowId,
-        IReadOnlyList<string> terms,
-        bool isPrefix,
+        IReadOnlyList<ManagedFtsPhraseTerm> terms,
         uint columnMask,
         bool anchored)
     {
         var frequencies = new int[_columnCount];
         foreach (var occurrence in GetPhraseOccurrences(
                      rowId,
-                     new ManagedFtsNearPhrase(terms, isPrefix),
+                     new ManagedFtsNearPhrase(terms),
                      columnMask,
                      anchored))
         {
