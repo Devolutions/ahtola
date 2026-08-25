@@ -197,6 +197,11 @@ internal enum ManagedReplicaDurableBoundary
     MainFileRollbackLeasesReleased,
 
     /// <summary>
+    /// Hit after the original WAL is durably captured but before the replacement intent is published.
+    /// </summary>
+    MainFileReplacementOriginalWalCaptured,
+
+    /// <summary>
     /// Hit after the deterministic replacement intent is durable and before the main-file swap.
     /// </summary>
     MainFileReplacementIntentPublished,
@@ -215,6 +220,12 @@ internal enum ManagedReplicaDurableBoundary
     /// Hit after rollback restores the exact old database image but before retiring recovery state.
     /// </summary>
     MainFileRollbackDatabaseRestored,
+
+    /// <summary>
+    /// Hit after rollback restores the original database sidecar generation but before retiring
+    /// recovery state.
+    /// </summary>
+    MainFileRollbackSidecarsRestored,
 
     /// <summary>
     /// Hit after rollback retires its durable replacement intent and deterministic artifacts.

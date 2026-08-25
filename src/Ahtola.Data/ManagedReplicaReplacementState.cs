@@ -11,6 +11,7 @@ internal static class ManagedReplicaReplacementState
     internal const string IntentSuffix = ".ahtola-replica-replacement";
     internal const string BackupSuffix = ".ahtola-replica-replacement.bak";
     internal const string DisplacedSuffix = ".ahtola-replica-replacement.displaced";
+    internal const string OriginalWalSuffix = ".ahtola-replica-replacement.original-wal";
     internal const string StagingSuffix = ".ahtola-replica-replacement.tmp";
 
     private const int MaximumIntentLength = 4096;
@@ -19,6 +20,8 @@ internal static class ManagedReplicaReplacementState
     internal static string GetBackupPath(string databasePath) => databasePath + BackupSuffix;
 
     internal static string GetDisplacedPath(string databasePath) => databasePath + DisplacedSuffix;
+
+    internal static string GetOriginalWalPath(string databasePath) => databasePath + OriginalWalSuffix;
 
     internal static bool HasArtifacts(string databasePath)
         => GetArtifactPaths(databasePath).Any(File.Exists);
@@ -29,6 +32,7 @@ internal static class ManagedReplicaReplacementState
         databasePath + StagingSuffix,
         GetBackupPath(databasePath),
         GetDisplacedPath(databasePath),
+        GetOriginalWalPath(databasePath),
     ];
 
     internal static void DeleteArtifacts(string databasePath)
@@ -38,9 +42,19 @@ internal static class ManagedReplicaReplacementState
     }
 
     internal static void Prepare(string databasePath, string replacementPath)
+        => Prepare(
+            databasePath,
+            replacementPath,
+            ComputeSha256(databasePath + ManagedReplicaBootstrapper.MetadataSuffix));
+
+    internal static void Prepare(
+        string databasePath,
+        string replacementPath,
+        string replacementMetadataSha256)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(replacementPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(replacementMetadataSha256);
 
         if (HasArtifacts(databasePath))
         {
@@ -54,20 +68,39 @@ internal static class ManagedReplicaReplacementState
             throw new InvalidDataException(
                 "Managed embedded replica replacement intent requires the database, replacement, and metadata files.");
         }
+        if (File.Exists(databasePath + "-journal"))
+        {
+            throw new InvalidDataException(
+                "Managed embedded replica replacement cannot capture a database with an active rollback journal.");
+        }
 
+        var originalWalPath = databasePath + "-wal";
+        var originalWalBackupPath = GetOriginalWalPath(databasePath);
+        string? originalWalSha256 = null;
+        if (File.Exists(originalWalPath))
+        {
+            CopyFileDurably(originalWalPath, originalWalBackupPath);
+            originalWalSha256 = ComputeSha256(originalWalBackupPath);
+            ManagedReplicaFaultInjection.Hit(
+                ManagedReplicaDurableBoundary.MainFileReplacementOriginalWalCaptured);
+        }
         var intent = new ReplacementIntent(
             ComputeSha256(databasePath),
             ComputeSha256(replacementPath),
-            ComputeSha256(databasePath + ManagedReplicaBootstrapper.MetadataSuffix));
+            ComputeSha256(databasePath + ManagedReplicaBootstrapper.MetadataSuffix),
+            ParseSha256(replacementMetadataSha256),
+            originalWalSha256);
         var intentPath = databasePath + IntentSuffix;
         var stagingPath = databasePath + StagingSuffix;
         var bytes = StrictUtf8.GetBytes(
-            "version=1\n"
+            "version=2\n"
             + $"backup={Path.GetFileName(GetBackupPath(databasePath))}\n"
             + $"displaced={Path.GetFileName(GetDisplacedPath(databasePath))}\n"
+            + $"original_wal_sha256={intent.OriginalWalSha256 ?? "absent"}\n"
             + $"original_sha256={intent.OriginalDatabaseSha256}\n"
             + $"replacement_sha256={intent.ReplacementDatabaseSha256}\n"
-            + $"metadata_sha256={intent.OriginalMetadataSha256}\n");
+            + $"original_metadata_sha256={intent.OriginalMetadataSha256}\n"
+            + $"replacement_metadata_sha256={intent.ReplacementMetadataSha256}\n");
 
         try
         {
@@ -91,25 +124,21 @@ internal static class ManagedReplicaReplacementState
 
         ManagedReplicaFaultInjection.Hit(
             ManagedReplicaDurableBoundary.MainFileReplacementIntentPublished);
+        DeleteIfExists(databasePath + "-wal");
+        DeleteIfExists(databasePath + "-shm");
     }
 
     internal static void CompletePublication(string databasePath)
     {
         var intent = Read(databasePath);
-        _ = ManagedReplicaBootstrapper.LoadMetadata(databasePath)
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(databasePath)
             ?? throw new InvalidDataException(
                 "Managed embedded replica replacement publication has no metadata.");
         ValidateCurrentDatabase(databasePath, intent.ReplacementDatabaseSha256);
-        if (string.Equals(
-                ComputeSha256(databasePath + ManagedReplicaBootstrapper.MetadataSuffix),
-                intent.OriginalMetadataSha256,
-                StringComparison.Ordinal))
-        {
-            throw new InvalidDataException(
-                "Managed embedded replica replacement metadata does not describe the published database.");
-        }
+        ValidateReplacementMetadata(databasePath, metadata, intent);
 
         DeleteIfExists(GetBackupPath(databasePath));
+        DeleteIfExists(GetOriginalWalPath(databasePath));
         ManagedReplicaFaultInjection.Hit(
             ManagedReplicaDurableBoundary.MainFileReplacementBackupRetired);
         DeleteIfExists(GetDisplacedPath(databasePath));
@@ -123,10 +152,9 @@ internal static class ManagedReplicaReplacementState
     {
         var intent = Read(databasePath);
         ValidateCurrentDatabase(databasePath, intent.ReplacementDatabaseSha256);
-        if (string.Equals(
-                ComputeSha256(databasePath + ManagedReplicaBootstrapper.MetadataSuffix),
-                intent.OriginalMetadataSha256,
-                StringComparison.Ordinal))
+        var metadataSha256 = ComputeSha256(
+            databasePath + ManagedReplicaBootstrapper.MetadataSuffix);
+        if (string.Equals(metadataSha256, intent.OriginalMetadataSha256, StringComparison.Ordinal))
         {
             return false;
         }
@@ -139,6 +167,9 @@ internal static class ManagedReplicaReplacementState
     {
         var intent = Read(databasePath);
         ValidateCurrentDatabase(databasePath, intent.OriginalDatabaseSha256);
+        ReconcileRollbackSidecars(databasePath, intent);
+        ManagedReplicaFaultInjection.Hit(
+            ManagedReplicaDurableBoundary.MainFileRollbackSidecarsRestored);
         DeleteIfExists(GetBackupPath(databasePath));
         DeleteIfExists(GetDisplacedPath(databasePath));
         DeleteIfExists(databasePath + StagingSuffix);
@@ -155,11 +186,13 @@ internal static class ManagedReplicaReplacementState
         var displacedPath = GetDisplacedPath(databasePath);
         if (!File.Exists(intentPath))
         {
-            if (File.Exists(backupPath) || File.Exists(displacedPath))
+            if (File.Exists(backupPath)
+                || File.Exists(displacedPath))
             {
                 throw new InvalidDataException(
                     "Managed embedded replica replacement recovery found a backup without its durable intent.");
             }
+            DeleteIfExists(GetOriginalWalPath(databasePath));
             DeleteIfExists(stagingPath);
             return;
         }
@@ -184,7 +217,24 @@ internal static class ManagedReplicaReplacementState
         var currentSha256 = ComputeSha256(databasePath);
         if (string.Equals(currentSha256, intent.OriginalDatabaseSha256, StringComparison.Ordinal))
         {
-            CompleteRollback(databasePath);
+            ValidateOriginalWalState(databasePath, intent);
+            IDisposable? rollbackLock = null;
+            try
+            {
+                rollbackLock = File.Exists(displacedPath)
+                    ? ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
+                        databasePath,
+                        displacedPath,
+                        CancellationToken.None)
+                    : ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
+                        databasePath,
+                        CancellationToken.None);
+                CompleteRollback(databasePath);
+            }
+            finally
+            {
+                rollbackLock?.Dispose();
+            }
             return;
         }
         if (!string.Equals(currentSha256, intent.ReplacementDatabaseSha256, StringComparison.Ordinal))
@@ -207,6 +257,7 @@ internal static class ManagedReplicaReplacementState
             throw new InvalidDataException(
                 "Managed embedded replica replacement recovery cannot restore the original database because its backup is missing.");
         }
+        ValidateOriginalWalState(databasePath, intent);
 
         IDisposable? replacementLock = null;
         try
@@ -264,8 +315,8 @@ internal static class ManagedReplicaReplacementState
         var filenameComparison = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
-        if (lines.Length != 7
-            || lines[0] != "version=1"
+        if (lines.Length != 9
+            || lines[0] != "version=2"
             || !string.Equals(
                 lines[1],
                 $"backup={Path.GetFileName(GetBackupPath(databasePath))}",
@@ -274,18 +325,22 @@ internal static class ManagedReplicaReplacementState
                 lines[2],
                 $"displaced={Path.GetFileName(GetDisplacedPath(databasePath))}",
                 filenameComparison)
-            || !lines[3].StartsWith("original_sha256=", StringComparison.Ordinal)
-            || !lines[4].StartsWith("replacement_sha256=", StringComparison.Ordinal)
-            || !lines[5].StartsWith("metadata_sha256=", StringComparison.Ordinal)
-            || lines[6].Length != 0)
+            || !lines[3].StartsWith("original_wal_sha256=", StringComparison.Ordinal)
+            || !lines[4].StartsWith("original_sha256=", StringComparison.Ordinal)
+            || !lines[5].StartsWith("replacement_sha256=", StringComparison.Ordinal)
+            || !lines[6].StartsWith("original_metadata_sha256=", StringComparison.Ordinal)
+            || !lines[7].StartsWith("replacement_metadata_sha256=", StringComparison.Ordinal)
+            || lines[8].Length != 0)
         {
             throw InvalidIntent();
         }
 
         return new ReplacementIntent(
-            ParseSha256(lines[3]["original_sha256=".Length..]),
-            ParseSha256(lines[4]["replacement_sha256=".Length..]),
-            ParseSha256(lines[5]["metadata_sha256=".Length..]));
+            ParseSha256(lines[4]["original_sha256=".Length..]),
+            ParseSha256(lines[5]["replacement_sha256=".Length..]),
+            ParseSha256(lines[6]["original_metadata_sha256=".Length..]),
+            ParseSha256(lines[7]["replacement_metadata_sha256=".Length..]),
+            ParseOptionalSha256(lines[3]["original_wal_sha256=".Length..]));
     }
 
     private static string ParseSha256(string value)
@@ -305,8 +360,105 @@ internal static class ManagedReplicaReplacementState
         return value;
     }
 
+    private static string? ParseOptionalSha256(string value)
+        => string.Equals(value, "absent", StringComparison.Ordinal)
+            ? null
+            : ParseSha256(value);
+
     private static void ValidateCurrentDatabase(string databasePath, string expectedSha256)
         => ValidateFile(databasePath, expectedSha256, "database");
+
+    private static void ValidateReplacementMetadata(
+        string databasePath,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
+        ReplacementIntent intent)
+    {
+        if (!string.Equals(
+                ComputeSha256(databasePath + ManagedReplicaBootstrapper.MetadataSuffix),
+                intent.ReplacementMetadataSha256,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                "Managed embedded replica replacement metadata does not match the expected published generation.");
+        }
+    }
+
+    private static void ValidateOriginalWalState(string databasePath, ReplacementIntent intent)
+    {
+        var backupPath = GetOriginalWalPath(databasePath);
+        var walPath = databasePath + "-wal";
+        if (intent.OriginalWalSha256 is not { } expected)
+        {
+            if (File.Exists(backupPath))
+                throw new InvalidDataException(
+                    "Managed embedded replica replacement recovery found an unexpected original WAL backup.");
+            return;
+        }
+
+        if (File.Exists(backupPath))
+        {
+            ValidateFile(backupPath, expected, "original WAL backup");
+            return;
+        }
+        ValidateFile(walPath, expected, "restored original WAL");
+    }
+
+    private static void ReconcileRollbackSidecars(
+        string databasePath,
+        ReplacementIntent intent)
+    {
+        var sidecars = GetSqliteSidecarPaths(databasePath);
+        var displacedExists = File.Exists(GetDisplacedPath(databasePath));
+        var walPath = databasePath + "-wal";
+        var originalWalBackupPath = GetOriginalWalPath(databasePath);
+        var originalWalAlreadyRestored =
+            intent.OriginalWalSha256 is { } expectedOriginalWal
+            && !File.Exists(originalWalBackupPath)
+            && File.Exists(walPath)
+            && string.Equals(ComputeSha256(walPath), expectedOriginalWal, StringComparison.Ordinal);
+        if (!displacedExists && File.Exists(databasePath + "-journal"))
+        {
+            throw new InvalidDataException(
+                "Managed embedded replica replacement rollback found a rollback journal without the displaced replacement database.");
+        }
+        if (!displacedExists && File.Exists(walPath))
+        {
+            if (intent.OriginalWalSha256 is not { } expected
+                || !string.Equals(ComputeSha256(walPath), expected, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "Managed embedded replica replacement rollback found an unrecognized WAL without the displaced replacement database.");
+            }
+        }
+
+        foreach (var path in sidecars)
+        {
+            if (!originalWalAlreadyRestored || !string.Equals(path, walPath, StringComparison.Ordinal))
+                DeleteIfExists(path);
+        }
+        if (intent.OriginalWalSha256 is not null)
+        {
+            if (originalWalAlreadyRestored)
+                return;
+            if (!File.Exists(originalWalBackupPath))
+            {
+                throw new InvalidDataException(
+                    "Managed embedded replica replacement rollback cannot restore the original WAL because its backup is missing.");
+            }
+            File.Move(originalWalBackupPath, walPath, overwrite: true);
+        }
+        else
+        {
+            DeleteIfExists(originalWalBackupPath);
+        }
+    }
+
+    private static IReadOnlyList<string> GetSqliteSidecarPaths(string databasePath) =>
+    [
+        databasePath + "-wal",
+        databasePath + "-shm",
+        databasePath + "-journal",
+    ];
 
     private static void ValidateFile(string path, string expectedSha256, string role)
     {
@@ -330,6 +482,24 @@ internal static class ManagedReplicaReplacementState
         return Convert.ToHexString(SHA256.HashData(stream));
     }
 
+    private static void CopyFileDurably(string sourcePath, string destinationPath)
+    {
+        using var source = new FileStream(
+            sourcePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var destination = new FileStream(
+            destinationPath,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 128 * 1024,
+            FileOptions.WriteThrough);
+        source.CopyTo(destination);
+        destination.Flush(flushToDisk: true);
+    }
+
     private static InvalidDataException InvalidIntent()
         => new("Managed embedded replica replacement intent is invalid or corrupt.");
 
@@ -342,5 +512,7 @@ internal static class ManagedReplicaReplacementState
     private readonly record struct ReplacementIntent(
         string OriginalDatabaseSha256,
         string ReplacementDatabaseSha256,
-        string OriginalMetadataSha256);
+        string OriginalMetadataSha256,
+        string ReplacementMetadataSha256,
+        string? OriginalWalSha256);
 }

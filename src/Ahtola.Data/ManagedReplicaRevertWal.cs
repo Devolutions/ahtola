@@ -93,6 +93,9 @@ internal static class ManagedReplicaRevertWal
                        databasePath,
                        state.CommittedDatabaseSizeInPages,
                        state.CommittedDatabaseSha256,
+                       WithPhase(
+                           pending,
+                           ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady),
                        snapshots.CommittedPages,
                        snapshots.PageSize,
                        ManagedReplicaDurableBoundary.RevertCommittedRestoreStagedDatabase,
@@ -158,6 +161,9 @@ internal static class ManagedReplicaRevertWal
                    databasePath,
                    state.CommittedDatabaseSizeInPages,
                    state.CommittedDatabaseSha256,
+                   WithPhase(
+                       metadata,
+                       ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady),
                    snapshots.CommittedPages,
                    snapshots.PageSize,
                    ManagedReplicaDurableBoundary.RevertCommittedRestoreStagedDatabase,
@@ -246,6 +252,28 @@ internal static class ManagedReplicaRevertWal
         WritePhaseMetadata(databasePath, updated);
         ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaPushIntentPublished);
         return updated;
+    }
+
+    private static ManagedReplicaBootstrapper.ManagedReplicaMetadata WithPhase(
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
+        ManagedReplicaBootstrapper.ManagedReplicaRevertPhase phase)
+    {
+        var state = metadata.RevertState
+                    ?? throw new InvalidOperationException(
+                        "Managed embedded replica metadata has no pending checkpoint revert capture.");
+        return metadata with
+        {
+            RevertState = state with
+            {
+                Phase = phase,
+                AttemptedFirstSequence = phase == ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown
+                    ? state.AttemptedFirstSequence
+                    : 0,
+                AttemptedWatermark = phase == ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown
+                    ? state.AttemptedWatermark
+                    : 0,
+            },
+        };
     }
 
     internal static ManagedReplicaBootstrapper.ManagedReplicaMetadata ClearPushIntent(
@@ -814,22 +842,7 @@ internal static class ManagedReplicaRevertWal
         ManagedReplicaBootstrapper.ManagedReplicaRevertPhase phase,
         ManagedReplicaDurableBoundary boundary)
     {
-        var state = metadata.RevertState
-                    ?? throw new InvalidOperationException(
-                        "Managed embedded replica metadata has no pending checkpoint revert capture.");
-        var updated = metadata with
-        {
-            RevertState = state with
-            {
-                Phase = phase,
-                AttemptedFirstSequence = phase == ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown
-                    ? state.AttemptedFirstSequence
-                    : 0,
-                AttemptedWatermark = phase == ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown
-                    ? state.AttemptedWatermark
-                    : 0,
-            },
-        };
+        var updated = WithPhase(metadata, phase);
         WritePhaseMetadata(databasePath, updated);
         ManagedReplicaFaultInjection.Hit(boundary);
         return updated;
@@ -864,6 +877,11 @@ internal static class ManagedReplicaRevertWal
                    databasePath,
                    state.OriginalDatabaseSizeInPages,
                    state.OriginalDatabaseSha256,
+                   metadata with
+                   {
+                       DatabaseSha256 = state.OriginalDatabaseSha256,
+                       RevertState = null,
+                   },
                    frames.OriginalPages,
                    frames.PageSize,
                    ManagedReplicaDurableBoundary.RevertRestoreStagedDatabase,
@@ -907,13 +925,6 @@ internal static class ManagedReplicaRevertWal
             DeleteIfExists(path);
     }
 
-    private static void DeleteSqliteSidecars(string databasePath)
-    {
-        DeleteIfExists(databasePath + "-wal");
-        DeleteIfExists(databasePath + "-shm");
-        DeleteIfExists(databasePath + "-journal");
-    }
-
     private static void DeleteIfExists(string path)
     {
         if (File.Exists(path))
@@ -924,6 +935,7 @@ internal static class ManagedReplicaRevertWal
         string databasePath,
         uint databaseSizeInPages,
         string expectedSha256,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata replacementMetadata,
         IReadOnlyList<SqliteCheckpointRevertPage> pages,
         int pageSize,
         ManagedReplicaDurableBoundary? stagedBoundary,
@@ -971,8 +983,10 @@ internal static class ManagedReplicaRevertWal
                 databasePath,
                 databaseStagingPath,
                 cancellationToken);
-            ManagedReplicaReplacementState.Prepare(databasePath, databaseStagingPath);
-            DeleteSqliteSidecars(databasePath);
+            ManagedReplicaReplacementState.Prepare(
+                databasePath,
+                databaseStagingPath,
+                ManagedReplicaBootstrapper.ComputeMetadataSha256(replacementMetadata));
             ManagedReplicaApplyLock.ReplaceMainFile(
                 mainFileReplacementLock,
                 databaseStagingPath,

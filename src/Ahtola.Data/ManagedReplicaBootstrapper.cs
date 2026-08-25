@@ -2162,12 +2162,26 @@ internal static class ManagedReplicaBootstrapper
             var tableMap = RebuildTableMapFromSchema(stagingPath, options.RemoteEncryption);
             var installedFingerprint = ComputeDatabaseFingerprint(stagingPath);
             var remoteBaseSha256 = PublishRemoteBaseSnapshot(options.Path, metadata, stagingPath);
+            var replacementMetadata = new ManagedReplicaMetadata(
+                header.Revision,
+                installedFingerprint,
+                metadata.ClientId,
+                header.Protocol,
+                tableMap)
+            {
+                PushState = metadata.PushState,
+                JournalBaseWatermark = AdvanceJournalBaseWatermark(metadata, acknowledgedLocalChanges),
+                RemoteBaseSha256 = remoteBaseSha256,
+            };
             ManagedReplicaReplacementState.Recover(options.Path);
             mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
                 options.Path,
                 stagingPath,
                 cancellationToken);
-            ManagedReplicaReplacementState.Prepare(options.Path, stagingPath);
+            ManagedReplicaReplacementState.Prepare(
+                options.Path,
+                stagingPath,
+                ComputeMetadataSha256(replacementMetadata));
             ManagedReplicaApplyLock.ReplaceMainFile(
                 mainFileReplacementLock,
                 stagingPath,
@@ -2195,16 +2209,16 @@ internal static class ManagedReplicaBootstrapper
             await WriteMetadataAsync(
                     metadataStagingPath,
                     metadataPath,
-                    header.Revision,
-                    installedFingerprint,
-                    header.Protocol,
-                    tableMap,
+                    replacementMetadata.Revision,
+                    replacementMetadata.DatabaseSha256,
+                    replacementMetadata.Protocol,
+                    replacementMetadata.TableNamesByStableId,
                     cancellationToken,
                     replaceExisting: true,
-                    clientId: metadata.ClientId,
-                    pushState: metadata.PushState,
-                    journalBaseWatermark: AdvanceJournalBaseWatermark(metadata, acknowledgedLocalChanges),
-                    remoteBaseSha256: remoteBaseSha256)
+                    clientId: replacementMetadata.ClientId,
+                    pushState: replacementMetadata.PushState,
+                    journalBaseWatermark: replacementMetadata.JournalBaseWatermark,
+                    remoteBaseSha256: replacementMetadata.RemoteBaseSha256)
                 .ConfigureAwait(false);
             metadataInstalled = true;
             CompleteRemoteBaseSnapshotPublication(options.Path);
@@ -2743,6 +2757,18 @@ internal static class ManagedReplicaBootstrapper
             destinationBackupFileName: null,
             ignoreMetadataErrors: false);
     }
+
+    internal static string ComputeMetadataSha256(ManagedReplicaMetadata metadata)
+        => Convert.ToHexString(SHA256.HashData(CreateMetadataBytes(
+            metadata.Revision,
+            metadata.DatabaseSha256,
+            metadata.Protocol,
+            metadata.TableNamesByStableId,
+            metadata.ClientId,
+            metadata.RevertState,
+            metadata.PushState,
+            metadata.JournalBaseWatermark,
+            metadata.RemoteBaseSha256)));
 
     private static byte[] CreateMetadataBytes(
         string revision,

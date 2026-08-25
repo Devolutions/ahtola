@@ -297,6 +297,83 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [Test]
+    public async Task ColdOpenRollbackDiscardsCommittedReplacementGenerationWal()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("rollback-replacement-wal");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        CrossProcessReplicaRaceWorker? walWriter = null;
+        var publicationFailed = false;
+        var rollbackRestored = false;
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+            {
+                connection.Open();
+                using (ManagedReplicaFaultInjection.Push(boundary =>
+                       {
+                           if (boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease
+                               && walWriter is null)
+                           {
+                               walWriter = new CrossProcessReplicaRaceWorker(
+                                   TestContext.CurrentContext.WorkDirectory,
+                                   path,
+                                   "sqlite-wal-crash");
+                               walWriter.WaitForProbeState("committed");
+                               walWriter.WaitForCrashCompletion();
+                               File.Exists(path + "-wal").Should().BeTrue();
+                           }
+                           else if (boundary == ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished)
+                           {
+                               publicationFailed = true;
+                               throw new IOException("Injected publication failure after replacement WAL commit.");
+                           }
+                           else if (publicationFailed
+                                    && boundary == ManagedReplicaDurableBoundary.MainFileRollbackSidecarsRestored)
+                           {
+                               rollbackRestored = true;
+                               throw new IOException("Injected crash after restoring the original database generation.");
+                           }
+                           else if (rollbackRestored
+                                    && boundary == ManagedReplicaDurableBoundary.MainFileReplacementRecoveryStarted)
+                           {
+                               throw new IOException("Injected automatic recovery interruption.");
+                           }
+                       }))
+                {
+                    var exception = Assert.ThrowsAsync<IOException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                    exception!.Message.Should().Be("Injected automatic recovery interruption.");
+                }
+            }
+
+            File.Exists(path + "-wal").Should().BeTrue(
+                "the committed replacement-generation WAL must survive until cold recovery reconciles it");
+            File.Exists(ManagedReplicaReplacementState.GetDisplacedPath(path)).Should().BeTrue();
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeTrue();
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+        }
+        finally
+        {
+            walWriter?.Dispose();
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementOriginalWalCaptured), 42)]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementIntentPublished), 42)]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementSourceLeaseReleased), 42)]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease), 42)]
@@ -366,6 +443,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
 
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored))]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackSidecarsRestored))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackIntentRetired))]
     public async Task ColdOpenRecoversEveryWindowsReplacementRollbackPhase(
         string interruptedBoundaryName)
@@ -628,6 +706,74 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             DeleteReplicaFiles(path);
             if (File.Exists(stagingPath))
                 File.Delete(stagingPath);
+        }
+    }
+
+    [Test]
+    public void ChangedParseableMetadataCannotRetireAReplacementBackup()
+    {
+        var path = NewReplicaPath("replacement-unrelated-metadata");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", initialImage));
+        var stagingPath = path + ".replacement";
+        var metadataStagingPath = path + ".unrelated-metadata";
+        IDisposable? replacementLock = null;
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+                connection.Open();
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            var replacementSha256 = Convert.ToHexString(
+                System.Security.Cryptography.SHA256.HashData(updatedImage));
+            var expectedReplacementMetadata = metadata with
+            {
+                Revision = "revision-43",
+                DatabaseSha256 = replacementSha256,
+            };
+            File.WriteAllBytes(stagingPath, updatedImage);
+            replacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
+                path,
+                stagingPath,
+                CancellationToken.None);
+            ManagedReplicaReplacementState.Prepare(
+                path,
+                stagingPath,
+                ManagedReplicaBootstrapper.ComputeMetadataSha256(expectedReplacementMetadata));
+            ManagedReplicaApplyLock.ReplaceMainFile(
+                replacementLock,
+                stagingPath,
+                path,
+                ManagedReplicaReplacementState.GetBackupPath(path),
+                static () => { });
+            replacementLock!.Dispose();
+            replacementLock = null;
+
+            ManagedReplicaBootstrapper.WriteMetadata(
+                metadataStagingPath,
+                path + ManagedReplicaBootstrapper.MetadataSuffix,
+                expectedReplacementMetadata with { Revision = "unrelated-revision" });
+
+            Action reopen = () =>
+            {
+                using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+                connection.Open();
+            };
+
+            reopen.Should().Throw<InvalidDataException>()
+                .WithMessage("*metadata does not match the expected published generation*");
+            File.Exists(ManagedReplicaReplacementState.GetBackupPath(path)).Should().BeTrue();
+            File.Exists(path + ManagedReplicaReplacementState.IntentSuffix).Should().BeTrue();
+        }
+        finally
+        {
+            replacementLock?.Dispose();
+            DeleteReplicaFiles(path);
+            if (File.Exists(stagingPath))
+                File.Delete(stagingPath);
+            if (File.Exists(metadataStagingPath))
+                File.Delete(metadataStagingPath);
         }
     }
 
@@ -1034,6 +1180,30 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             return;
         }
 
+        if (mode == "sqlite-wal-crash")
+        {
+            using var connection = new NativeSqliteConnection(
+                $"Data Source={databasePath};Mode=ReadWrite;Default Timeout=30;Pooling=False");
+            connection.Open();
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;";
+                command.ExecuteNonQuery();
+            }
+            using (var transaction = connection.BeginTransaction())
+            using (var command = connection.CreateCommand())
+            {
+                command.Transaction = transaction;
+                command.CommandText = "UPDATE bootstrap_marker SET value = 126;";
+                command.ExecuteNonQuery().Should().Be(1);
+                transaction.Commit();
+            }
+            File.Exists(databasePath + "-wal").Should().BeTrue();
+            File.WriteAllText(blockedPath, "committed");
+            Process.GetCurrentProcess().Kill(entireProcessTree: false);
+            Thread.Sleep(Timeout.Infinite);
+        }
+
         if (mode == "alias-noop-pull")
         {
             var metadata = ManagedReplicaBootstrapper.LoadMetadata(databasePath)!.Value;
@@ -1254,6 +1424,17 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             _worker.WaitForExit();
             _worker.ExitCode.Should().Be(0, $"worker output:{Environment.NewLine}{_output}");
             File.ReadAllText(_completedPath).Should().Be(_mode);
+        }
+
+        internal void WaitForCrashCompletion()
+        {
+            if (_completed)
+                return;
+            _worker.WaitForExit(TimeSpan.FromSeconds(30)).Should().BeTrue(
+                "the committed WAL writer must terminate without SQLite cleanup");
+            _worker.WaitForExit();
+            _completed = true;
+            _worker.ExitCode.Should().NotBe(0);
         }
 
         public void Dispose()

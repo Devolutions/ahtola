@@ -641,6 +641,13 @@ internal static class ManagedReplicaApplyLock
                     ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased);
             }
             File.Replace(backupPath, destinationPath, displacedPath, ignoreMetadataErrors: false);
+            if (OperatingSystem.IsWindows())
+            {
+                // A writer may have entered either inode while ReplaceFile required their leases
+                // to be released. Reacquire both before rollback state or sidecars are reconciled.
+                _destinationMainFileLease = AcquireSqliteMainFileLease(destinationPath);
+                _replacementMainFileLease = AcquireSqliteMainFileLease(displacedPath);
+            }
         }
 
         public void Dispose()
