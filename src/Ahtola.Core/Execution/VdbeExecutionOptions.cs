@@ -27,7 +27,10 @@ public sealed class VdbeExecutionOptions
     /// The retained-memory budget for spill-aware operators. The name is retained for source compatibility.
     /// </param>
     /// <param name="temporaryDirectory">The existing directory or logical path prefix for spill files.</param>
-    /// <param name="sorterMergeFanIn">The maximum run heads retained by a merge pass.</param>
+    /// <param name="sorterMergeFanIn">
+    /// The upper bound on run heads retained by a merge pass. The runtime reduces it when
+    /// the statement's available memory cannot hold that many managed rows and heap nodes.
+    /// </param>
     /// <param name="allowTemporaryFileSpill">
     /// Whether an operator may exceed its in-memory share by writing to the temporary file system.
     /// Set this to <see langword="false"/> for <c>temp_store=MEMORY</c>, where writing the same
@@ -69,7 +72,10 @@ public sealed class VdbeExecutionOptions
     /// </summary>
     public long MemoryLimitBytes => SorterMemoryLimitBytes;
 
-    /// <summary>The maximum run heads retained by a single merge pass.</summary>
+    /// <summary>
+    /// The configured upper bound on run heads retained by a single merge pass.
+    /// The effective fan-in is also bounded by the statement's available memory.
+    /// </summary>
     public int SorterMergeFanIn { get; }
 
     /// <summary>Whether operators may use the temporary file system after exhausting memory.</summary>
