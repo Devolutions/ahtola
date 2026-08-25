@@ -37,7 +37,6 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     private const int RevertCommittedRestoreStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedRestoreStagedDatabase;
     private const int RevertCommittedRestoreDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedRestoreDatabasePublished;
     private const int RevertCommittedReadyMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertCommittedReadyMetadataPublished;
-    private const int RevertPushIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertPushIntentPublished;
     private const int RevertConflictRestoreIntentPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertConflictRestoreIntentPublished;
     private const int RevertRestoreStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.RevertRestoreStagedDatabase;
     private const int RevertRestoreDatabasePublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertRestoreDatabasePublished;
@@ -2610,7 +2609,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             connection.Open();
             using (ManagedReplicaFaultInjection.Push(point =>
                    {
-                       if (point == ManagedReplicaDurableBoundary.RevertPushIntentPublished)
+                       if (point == ManagedReplicaDurableBoundary.ReplicaPushIntentPublished)
                            throw new InvalidOperationException("Injected push-intent interruption.");
                    }))
             {
@@ -2618,8 +2617,10 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                     () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
             }
 
-            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.RevertState!.Value.Phase.Should()
-                .Be(ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown);
+            var interrupted = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            interrupted.RevertState!.Value.Phase.Should()
+                .Be(ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady);
+            interrupted.PushState.Should().NotBeNull();
             scenario.Handler.PushCallCount.Should().Be(1);
 
             var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
@@ -3279,6 +3280,8 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             exception.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.Conflict);
             AhtolaReplicaPushFailure.Classify(exception).Should().Be(AhtolaReplicaPushFailureKind.Conflict);
             connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().BeNull(
+                "a definitive remote conflict resolves the ambiguous push outcome");
             handler.PullCallCount.Should().Be(1);
             handler.PushCallCount.Should().Be(1);
         }

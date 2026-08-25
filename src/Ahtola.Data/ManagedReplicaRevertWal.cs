@@ -39,8 +39,7 @@ internal static class ManagedReplicaRevertWal
                         ManagedReplicaBootstrapper.WriteMetadata(
                             metadataStagingPath,
                             databasePath + ManagedReplicaBootstrapper.MetadataSuffix,
-                            metadata,
-                            state);
+                            metadata with { RevertState = state });
                     }
                     finally
                     {
@@ -193,47 +192,68 @@ internal static class ManagedReplicaRevertWal
     internal static ManagedReplicaBootstrapper.ManagedReplicaMetadata MarkPushStarted(
         string databasePath,
         ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
-        ReplicaLocalChangeBatch batch)
+        ReplicaLocalChangeBatch batch,
+        long sourcePullGeneration)
     {
         ArgumentException.ThrowIfNullOrEmpty(databasePath);
         if (batch.Changes.Count == 0
             || batch.FirstSequence <= 0
-            || batch.Watermark <= batch.FirstSequence)
+            || batch.Watermark <= batch.FirstSequence
+            || sourcePullGeneration < 0)
         {
             throw new ArgumentException("The protected replica push batch is empty or invalid.", nameof(batch));
         }
-        if (metadata.RevertState is not { } state)
-            return metadata;
-        _ = ReadAndValidate(databasePath, state);
-        if (state.Phase == ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown)
+
+        var pushState = new ManagedReplicaBootstrapper.ManagedReplicaPushState(
+            sourcePullGeneration,
+            batch.FirstSequence,
+            batch.Watermark);
+        if (metadata.PushState is { } existing)
         {
-            if (state.AttemptedFirstSequence != batch.FirstSequence
-                || state.AttemptedWatermark != batch.Watermark)
+            if (existing != pushState)
             {
                 throw new InvalidDataException(
-                    "Managed embedded replica checkpoint recovery references a different protected push batch.");
+                    "Managed embedded replica push recovery references a different protected batch.");
             }
-            ValidateCommittedReady(databasePath, state);
+
+            if (metadata.RevertState is { } protectedState)
+            {
+                _ = ReadAndValidate(databasePath, protectedState);
+                ValidateCommittedReady(databasePath, protectedState);
+            }
             return metadata;
         }
-        if (state.Phase != ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady)
+
+        if (metadata.RevertState is { } state)
         {
-            throw new InvalidOperationException(
-                "Managed embedded replica checkpoint recovery is not ready to push local changes.");
+            _ = ReadAndValidate(databasePath, state);
+            if (state.Phase is not (
+                    ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady
+                    or ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown))
+            {
+                throw new InvalidOperationException(
+                    "Managed embedded replica checkpoint recovery is not ready to push local changes.");
+            }
+            ValidateCommittedReady(databasePath, state);
         }
 
-        ValidateCommittedReady(databasePath, state);
-        var updated = metadata with
-        {
-            RevertState = state with
-            {
-                Phase = ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown,
-                AttemptedFirstSequence = batch.FirstSequence,
-                AttemptedWatermark = batch.Watermark,
-            },
-        };
+        var updated = metadata with { PushState = pushState };
         WritePhaseMetadata(databasePath, updated);
-        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertPushIntentPublished);
+        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaPushIntentPublished);
+        return updated;
+    }
+
+    internal static ManagedReplicaBootstrapper.ManagedReplicaMetadata ClearPushIntent(
+        string databasePath,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(databasePath);
+        if (metadata.PushState is null)
+            return metadata;
+
+        var updated = metadata with { PushState = null };
+        WritePhaseMetadata(databasePath, updated);
+        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaPushIntentRetired);
         return updated;
     }
 
@@ -748,8 +768,7 @@ internal static class ManagedReplicaRevertWal
             ManagedReplicaBootstrapper.WriteMetadata(
                 metadataStagingPath,
                 databasePath + ManagedReplicaBootstrapper.MetadataSuffix,
-                metadata with { DatabaseSha256 = databaseSha256, RevertState = null },
-                revertState: null);
+                metadata with { DatabaseSha256 = databaseSha256, RevertState = null });
         }
         finally
         {
@@ -794,8 +813,7 @@ internal static class ManagedReplicaRevertWal
             ManagedReplicaBootstrapper.WriteMetadata(
                 metadataStagingPath,
                 databasePath + ManagedReplicaBootstrapper.MetadataSuffix,
-                updated,
-                updated.RevertState);
+                updated);
         }
         finally
         {

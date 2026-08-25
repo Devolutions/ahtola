@@ -1049,6 +1049,12 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         ManagedReplicaPageMaterializingFileSystem? retainedMaterializer,
         CancellationToken cancellationToken)
     {
+        await using var pushFlight = await ManagedReplicaPushLock
+            .AcquireExclusiveAsync(replicaOptions.Path, cancellationToken)
+            .ConfigureAwait(false);
+        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaPushFlightLockAcquired);
+        cancellationToken.ThrowIfCancellationRequested();
+
         // Every step below that mutates durable local state -- selecting the batch, publishing the
         // push intent, restoring the pre-push image, acknowledging the journal, and publishing the
         // conflict marker -- runs while the exclusive physical apply lease is held (see
@@ -1068,14 +1074,19 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         {
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaPushPublicationLockAcquired);
             cancellationToken.ThrowIfCancellationRequested();
-            recoveringUnknownPush = metadata.RevertState is
-            {
-                Phase: ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown,
-            };
+            ThrowIfReplicaConflictIsPending(replicaOptions.Path);
+            metadata = ManagedReplicaBootstrapper.LoadMetadata(replicaOptions.Path)
+                ?? throw new AhtolaException(
+                    "Managed embedded replica metadata was removed before a push could begin.",
+                    AhtolaReplicaPushFailureKind.InvalidLocalState);
+            metadata = ManagedReplicaRevertWal.PrepareSynchronization(replicaOptions.Path, metadata);
+            _metadata = metadata;
+            _changeJournal = ManagedReplicaChangeJournal.Open(replicaOptions.Path);
+            recoveringUnknownPush = metadata.PushState.HasValue;
             if (recoveringUnknownPush)
             {
-                var state = metadata.RevertState!.Value;
-                batch = _changeJournal.ReadBatch(state.AttemptedFirstSequence, state.AttemptedWatermark);
+                var state = metadata.PushState!.Value;
+                batch = _changeJournal.ReadBatch(state.FirstSequence, state.Watermark);
             }
             else
             {
@@ -1106,6 +1117,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var generation = new PushPublicationGeneration(
             selectionMetadata.Revision,
             selectionMetadata.RevertState?.Phase,
+            selectionMetadata.PushState,
             _changeJournal.Generation);
 
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pushing));
@@ -1119,24 +1131,25 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             disposeHttpClient: false,
             automaticRedirectsDisabled: true);
 
-        const long sourcePullGeneration = 0;
+        var sourcePullGeneration = selectionMetadata.PushState?.SourcePullGeneration ?? 0;
         if (recoveringUnknownPush)
         {
             var remoteWatermark = await remote.ReadReplicaPushWatermarkAsync(
-                    metadata.ClientId,
+                    selectionMetadata.ClientId,
                     ToCommandTimeoutSeconds(replicaOptions.HttpPolicy.RequestTimeout),
                     cancellationToken)
                 .ConfigureAwait(false);
             if (remoteWatermark is { } watermark)
             {
-                if (watermark.PullGeneration > sourcePullGeneration)
+                if (watermark.PullGeneration != sourcePullGeneration)
                 {
                     throw new AhtolaException(
-                        "Remote replica push acknowledgement is ahead of the local pull generation.",
+                        watermark.PullGeneration > sourcePullGeneration
+                            ? "Remote replica push acknowledgement is ahead of the local pull generation."
+                            : "Remote replica push acknowledgement regressed behind the local pull generation.",
                         AhtolaReplicaPushFailureKind.InvalidLocalState);
                 }
-                if (watermark.PullGeneration == sourcePullGeneration
-                    && watermark.ChangeId >= batch.Changes[^1].Sequence)
+                if (watermark.ChangeId >= batch.Changes[^1].Sequence)
                 {
                     return await PublishPushAcknowledgementAsync(
                             replicaOptions,
@@ -1145,8 +1158,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                             retainedMaterializer)
                         .ConfigureAwait(false);
                 }
-                if (watermark.PullGeneration == sourcePullGeneration
-                    && watermark.ChangeId >= batch.FirstSequence)
+                if (watermark.ChangeId >= batch.FirstSequence)
                 {
                     throw new AhtolaException(
                         "Remote replica push acknowledgement splits the pending local batch.",
@@ -1162,9 +1174,17 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaPushPublicationLockAcquired);
             cancellationToken.ThrowIfCancellationRequested();
             metadata = ValidatePushPublicationGeneration(replicaOptions.Path, generation, batch);
-            metadata = ManagedReplicaRevertWal.MarkPushStarted(replicaOptions.Path, metadata, batch);
+            metadata = ManagedReplicaRevertWal.MarkPushStarted(
+                replicaOptions.Path,
+                metadata,
+                batch,
+                sourcePullGeneration);
             _metadata = metadata;
-            generation = generation with { RevertPhase = metadata.RevertState?.Phase };
+            generation = generation with
+            {
+                RevertPhase = metadata.RevertState?.Phase,
+                PushState = metadata.PushState,
+            };
         }
 
         try
@@ -1176,6 +1196,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                     ToCommandTimeoutSeconds(replicaOptions.HttpPolicy.RequestTimeout),
                     cancellationToken)
                 .ConfigureAwait(false);
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaPushRemoteCommitObserved);
         }
         catch (Exception exception) when (
             AhtolaReplicaPushFailure.Classify(exception) == AhtolaReplicaPushFailureKind.Conflict)
@@ -1213,6 +1234,12 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                     _metadata = ManagedReplicaBootstrapper.LoadMetadata(replicaOptions.Path);
                 }
 
+                current = ManagedReplicaBootstrapper.LoadMetadata(replicaOptions.Path)
+                    ?? throw new AhtolaException(
+                        "Managed embedded replica metadata was removed while recording a push conflict.",
+                        AhtolaReplicaPushFailureKind.InvalidLocalState);
+                current = ManagedReplicaRevertWal.ClearPushIntent(replicaOptions.Path, current);
+                _metadata = current;
                 RecordPushConflict(replicaOptions.Path, batch, exception);
             }
 
@@ -1235,6 +1262,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     private readonly record struct PushPublicationGeneration(
         string Revision,
         ManagedReplicaBootstrapper.ManagedReplicaRevertPhase? RevertPhase,
+        ManagedReplicaBootstrapper.ManagedReplicaPushState? PushState,
         ReplicaJournalGeneration Journal);
 
     /// <summary>
@@ -1325,6 +1353,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var durable = ManagedReplicaChangeJournal.Open(databasePath);
         if (!string.Equals(current.Revision, generation.Revision, StringComparison.Ordinal)
             || current.RevertState?.Phase != generation.RevertPhase
+            || current.PushState != generation.PushState
             || durable.Generation != generation.Journal)
         {
             throw new AhtolaException(

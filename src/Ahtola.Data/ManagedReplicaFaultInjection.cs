@@ -45,6 +45,30 @@ internal enum ManagedReplicaDurableBoundary
     ReplicaPushPublicationLockAcquired,
 
     /// <summary>
+    /// Hit after the physical-identity push-flight lease has excluded every competing process,
+    /// before local state is selected or any remote request is made.
+    /// </summary>
+    ReplicaPushFlightLockAcquired,
+
+    /// <summary>
+    /// Hit immediately after metadata durably records the exact pending batch and source pull
+    /// generation, before watermark verification or remote SQL replay.
+    /// </summary>
+    ReplicaPushIntentPublished,
+
+    /// <summary>
+    /// Hit after the remote push transaction returned success, before uncancellable local
+    /// acknowledgement publication begins.
+    /// </summary>
+    ReplicaPushRemoteCommitObserved,
+
+    /// <summary>
+    /// Hit after metadata durably retires a push intent following acknowledgement or a definitive
+    /// conflict.
+    /// </summary>
+    ReplicaPushIntentRetired,
+
+    /// <summary>
     /// Hit immediately after the exclusive physical apply lease is acquired for an explicit
     /// conflict resolution's local publication (journal discard and marker retirement), before any
     /// irreversible work.
@@ -135,7 +159,6 @@ internal enum ManagedReplicaDurableBoundary
     RevertCommittedRestoreStagedDatabase,
     RevertCommittedRestoreDatabasePublished,
     RevertCommittedReadyMetadataPublished,
-    RevertPushIntentPublished,
     RevertConflictRestoreIntentPublished,
     RevertRestoreStagedDatabase,
     RevertRestoreDatabasePublished,

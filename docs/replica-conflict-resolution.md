@@ -107,7 +107,41 @@ assigned high-water mark is a header field the file's own length does not
 constrain, so a header implying an implausible gap span (or a saturated
 sequence) is rejected as corruption rather than walked.
 
-## 2. Recording a conflict
+## 2. Push outcome publication and conflict recording
+
+### Ambiguous push outcomes
+
+Every non-empty push now publishes an independent push-intent record before
+remote SQL can be sent. Metadata version 7 carries push intent without a
+checkpoint revert bundle; version 8 carries both. Versions 2–6 remain readable,
+and a version-6 `PushOutcomeUnknown` revert phase is projected into the same
+in-memory push intent for recovery.
+
+The local binary record is exact and integrity protected: version byte `1`,
+followed by the source pull generation, first journal sequence, and exclusive
+watermark as three little-endian signed 64-bit integers, followed by SHA-256 of
+that 25-byte payload. Bad base64, wrong length or version, checksum failure,
+negative generation, non-positive first sequence, a non-ascending watermark,
+trailing bytes, or disagreement with a legacy revert attempt fails closed while
+loading metadata, before network access or journal movement.
+
+Recovery queries the remote `turso_sync_last_change_id` row for the persisted
+client id before replaying SQL:
+
+- the same pull generation with `change_id` at or beyond the batch's last
+  sequence proves the whole batch committed and performs only local
+  acknowledgement;
+- no row, no table, or a watermark strictly before the batch permits one replay;
+- a watermark inside the batch, or a different pull generation in either
+  direction, is `InvalidLocalState` and preserves the intent and journal.
+
+The intent is cleared only after the journal acknowledgement is durable or the
+server has definitively rejected the batch. A transport error, cancellation, or
+process exit leaves the exact recovery range in metadata. Once remote commit or
+refusal is known, acknowledgement or conflict publication runs with
+`CancellationToken.None`.
+
+### Recording a definitive conflict
 
 `ManagedReplicaConnectionHost.PushLocalChangesAsync` catches any push failure
 that `AhtolaReplicaPushFailure.Classify` maps to
@@ -116,14 +150,16 @@ that `AhtolaReplicaPushFailure.Classify` maps to
 1. If a revert-WAL bundle was captured for this push, restores the exact
    pre-push database image (`ManagedReplicaRevertWal.RestorePendingCheckpoint`).
    The revert phase graph is unchanged; no new phase was added.
-2. Durably publishes the conflict marker for the exact batch that was rejected
+2. Durably retires the now-resolved push intent.
+3. Durably publishes the conflict marker for the exact batch that was rejected
    (`BatchFirstSequence`, `BatchWatermark`, the server-reported sequence, and
    the conservatively classified unresolved subset).
-3. Rethrows the original `AhtolaReplicaConflictException`.
+4. Rethrows the original `AhtolaReplicaConflictException`.
 
-A crash between (1) and (2) leaves **no** marker. That is safe: the journal was
-never acknowledged, so the next push re-attempts the same batch and re-observes
-the same conflict, and the ordinary revert-phase recovery handles the bundle
+A crash before (3) leaves **no** marker. That is safe: the journal was never
+acknowledged, so recovery either verifies the still-present intent or re-attempts
+the same batch after its retirement and re-observes the same definitive
+conflict. The ordinary revert-phase recovery handles a half-restored bundle
 exactly as it does today. Recording before restoring would instead risk blocking
 synchronization while the database is still mid-restore.
 
@@ -141,6 +177,13 @@ short name resolves to the same key as the canonical path) and is backed by an
 OS byte-range lock on a carrier file, so a second **process** serializes too.
 Explicit conflict resolution takes the same lease around its journal discard and
 marker retirement.
+
+A third physical-identity carrier (`push`) provides a dedicated cross-process
+push-flight lease. It is acquired before local batch selection and held across
+watermark verification and remote SQL replay. This closes the check-then-send
+race where two processes could both observe a pre-batch watermark and replay one
+non-idempotent batch. It excludes only another push; local commands, journal
+append, and unrelated apply work continue under their existing leases.
 
 `ManagedReplicaLockCarrier` names that carrier from the database's physical
 identity (volume/device plus file/inode id) inside one stable, per-user lock
@@ -168,17 +211,18 @@ where closing any descriptor for a file drops every lock the process holds on
 it. Lock order is always apply lease first, journal lease second — the journal
 lease is only ever taken as a leaf — so the two can never deadlock.
 
-The network round trips are deliberately **outside** the lease: holding a
-physical lock across unbounded remote I/O would let one stalled replica block
-every other participant indefinitely. Releasing it means local state can move
-underneath a push, so every re-acquisition re-validates the generation it was
-negotiated against — the metadata revision, the revert phase, and the journal's
-durable shape (`ReplicaJournalGeneration`: assigned sequence, acknowledgement
-watermark, retained count, discard count). A mismatch fails closed with
-`AhtolaReplicaPushFailureKind.InvalidLocalState` rather than persisting a stale
-in-memory journal over another writer's work. The single benign exception is
-"another participant already acknowledged at least this batch", which completes
-as a no-op and adopts the durable journal.
+The network round trips are deliberately **outside the apply and journal
+leases**. They remain inside the push-flight lease, which blocks no local
+publication. Local state can therefore move underneath a push, so every
+re-acquisition of the apply lease re-validates the generation it was negotiated
+against — the metadata revision, revert phase, independent push state, and the
+journal's durable shape (`ReplicaJournalGeneration`: assigned sequence,
+acknowledgement watermark, retained count, discard count). A mismatch fails
+closed with `AhtolaReplicaPushFailureKind.InvalidLocalState` rather than
+persisting a stale in-memory journal over another writer's work. Recovery then
+uses the durable intent and remote watermark. The single benign exception is
+"already acknowledged at least this batch", which completes as a no-op and
+adopts the durable journal.
 
 The acknowledgement and conflict-recording steps are deliberately uncancellable:
 by the time either runs, the remote has already committed or definitively
@@ -356,3 +400,12 @@ ownership and generation validation, cancellation at the publication boundary
 and after a durable discard, deterministic staging artifacts, publication reopen
 failure, crash points before metadata publication and before marker retirement,
 the page-protocol and schema-quarantine fail-closed paths, and artifact cleanup.
+
+`src/Ahtola.Tests/ManagedEmbeddedReplicaPushRecoveryTests.cs` covers ordinary
+lost-response recovery, intent-before-send ordering, remote-commit and
+acknowledgement interruptions, a journal append racing the remote commit,
+split/ahead/regressed watermarks, malformed v7/v8 records, legacy v6 projection,
+and cancellation on both sides of the remote-decision boundary.
+`ManagedReplicaJournalAndLockCarrierRegressionTests` additionally proves that
+the push carrier converges across hard-link aliases and excludes a real child
+process until release.

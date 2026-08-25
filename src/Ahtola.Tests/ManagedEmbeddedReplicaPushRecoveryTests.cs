@@ -1,0 +1,583 @@
+using System.Buffers.Binary;
+using AwesomeAssertions;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text.Json;
+
+namespace Ahtola.Tests;
+
+public sealed partial class ManagedEmbeddedReplicaConnectionTests
+{
+    [Test]
+    public async Task OrdinaryAmbiguousPushUsesRemoteWatermarkWithoutReplayingSql()
+    {
+        var path = NewReplicaPath("managed-replica-ordinary-ambiguous-push");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var replayCount = 0;
+        var watermarkReadCount = 0;
+        var handler = new ReplicaPushHandler(
+            [
+                CreatePullResponse("revision-42", image),
+                CreatePullResponse("revision-42", [], declaredPages: 1),
+            ],
+            (request, _) =>
+            {
+                if (IsReplicaPushBatch(request))
+                {
+                    replayCount++;
+                    return Task.FromException<HttpResponseMessage>(
+                        new HttpRequestException("Response was lost after the remote commit."));
+                }
+
+                watermarkReadCount++;
+                return Task.FromResult(ReplicaPushHandler.WatermarkResponse(0, 1));
+            });
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+
+            Assert.ThrowsAsync<HttpRequestException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            var interrupted = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            interrupted.RevertState.Should().BeNull();
+            interrupted.PushState.Should().Be(
+                new ManagedReplicaBootstrapper.ManagedReplicaPushState(0, 1, 2));
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            replayCount.Should().Be(1, "the remote watermark proves the first replay committed");
+            watermarkReadCount.Should().Be(1);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().BeNull();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task OrdinaryPushIntentInterruptionQueriesThenSendsTheBatchOnce()
+    {
+        var path = NewReplicaPath("managed-replica-ordinary-push-intent");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var replayCount = 0;
+        var watermarkReadCount = 0;
+        var handler = new ReplicaPushHandler(
+            [
+                CreatePullResponse("revision-42", image),
+                CreatePullResponse("revision-42", [], declaredPages: 1),
+            ],
+            (request, _) =>
+            {
+                if (IsReplicaPushBatch(request))
+                {
+                    replayCount++;
+                    return Task.FromResult(ReplicaPushHandler.SuccessfulBatchResponse(5));
+                }
+
+                watermarkReadCount++;
+                return Task.FromResult(ReplicaPushHandler.EmptyWatermarkResponse());
+            });
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.ReplicaPushIntentPublished)
+                           throw new InvalidOperationException("Injected push-intent interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            handler.PushCallCount.Should().Be(0, "intent publication precedes every remote request");
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().NotBeNull();
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            watermarkReadCount.Should().Be(1);
+            replayCount.Should().Be(1);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().BeNull();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task CrashAfterRemoteCommitObservationRecoversWithoutReplayingSql()
+    {
+        var path = NewReplicaPath("managed-replica-remote-commit-observed");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var replayCount = 0;
+        var handler = new ReplicaPushHandler(
+            [
+                CreatePullResponse("revision-42", image),
+                CreatePullResponse("revision-42", [], declaredPages: 1),
+            ],
+            (request, _) =>
+            {
+                if (IsReplicaPushBatch(request))
+                {
+                    replayCount++;
+                    return Task.FromResult(ReplicaPushHandler.SuccessfulBatchResponse(5));
+                }
+
+                return Task.FromResult(ReplicaPushHandler.WatermarkResponse(0, 1));
+            });
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.ReplicaPushRemoteCommitObserved)
+                           throw new InvalidOperationException("Injected post-commit interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().NotBeNull();
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            replayCount.Should().Be(1);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task JournalAppendDuringRemoteCommitRecoversTheProtectedBatchWithoutLosingTheAppend()
+    {
+        var path = NewReplicaPath("managed-replica-concurrent-append-during-push");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var replayCount = 0;
+        var watermarkReadCount = 0;
+        var handler = new ReplicaPushHandler(
+            [CreatePullResponse("revision-42", image)],
+            (request, _) =>
+            {
+                if (IsReplicaPushBatch(request))
+                {
+                    replayCount++;
+                    ManagedReplicaChangeJournal.Open(path).AppendCommitted(
+                    [
+                        ReplicaLocalChange.Schema(
+                            "CREATE TABLE concurrently_journaled(value INTEGER);"),
+                    ]);
+                    return Task.FromResult(ReplicaPushHandler.SuccessfulBatchResponse(5));
+                }
+
+                watermarkReadCount++;
+                return Task.FromResult(ReplicaPushHandler.WatermarkResponse(0, 1));
+            });
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+
+            var interrupted = Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            interrupted!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().NotBeNull();
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
+                .Select(change => change.Sequence).Should().Equal(1L, 2L);
+
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.ReplicaPushIntentRetired)
+                           throw new InvalidOperationException("Injected intent-retirement interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            replayCount.Should().Be(1, "the remote watermark covers the protected first batch");
+            watermarkReadCount.Should().Be(1);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().BeNull();
+            var durable = ManagedReplicaChangeJournal.Open(path);
+            durable.AcknowledgedWatermark.Should().Be(2);
+            durable.ReadBatch(int.MaxValue).Changes.Select(change => change.Sequence).Should().Equal(2L);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task CrashAfterJournalAcknowledgementCompletesIntentRetirementOnRetry()
+    {
+        var path = NewReplicaPath("managed-replica-push-ack-interruption");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var replayCount = 0;
+        var handler = new ReplicaPushHandler(
+            [
+                CreatePullResponse("revision-42", image),
+                CreatePullResponse("revision-42", [], declaredPages: 1),
+            ],
+            (request, _) =>
+            {
+                if (IsReplicaPushBatch(request))
+                {
+                    replayCount++;
+                    return Task.FromResult(ReplicaPushHandler.SuccessfulBatchResponse(5));
+                }
+
+                return Task.FromResult(ReplicaPushHandler.WatermarkResponse(0, 1));
+            });
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.JournalAcknowledgementPersisted)
+                           throw new InvalidOperationException("Injected acknowledgement interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            ManagedReplicaChangeJournal.Open(path).AcknowledgedWatermark.Should().Be(2);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().NotBeNull();
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            replayCount.Should().Be(1);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().BeNull();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(0, 1, "splits")]
+    [TestCase(1, 0, "ahead")]
+    public void InvalidRemoteWatermarkFailsClosedWithoutReplayingSql(
+        long pullGeneration,
+        long changeId,
+        string expectedMessage)
+    {
+        var path = NewReplicaPath("managed-replica-invalid-push-watermark");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var replayCount = 0;
+        var handler = new ReplicaPushHandler(
+            [CreatePullResponse("revision-42", image)],
+            (request, _) =>
+            {
+                if (IsReplicaPushBatch(request))
+                    replayCount++;
+                return Task.FromResult(
+                    ReplicaPushHandler.WatermarkResponse(pullGeneration, changeId));
+            });
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (20);");
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.ReplicaPushIntentPublished)
+                           throw new InvalidOperationException("Injected push-intent interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            var exception = Assert.ThrowsAsync<AhtolaException>(
+                () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+
+            exception!.ReplicaPushFailureKind.Should().Be(AhtolaReplicaPushFailureKind.InvalidLocalState);
+            exception.Message.Should().Contain(expectedMessage);
+            replayCount.Should().Be(0);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().HaveCount(2);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().NotBeNull();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase("bad-base64")]
+    [TestCase("checksum")]
+    [TestCase("truncated")]
+    [TestCase("trailing")]
+    [TestCase("version")]
+    [TestCase("negative-generation")]
+    [TestCase("zero-first-sequence")]
+    [TestCase("invalid-watermark")]
+    public void MalformedPushIntentFailsClosedBeforeNetworkAccess(string corruption)
+    {
+        var path = NewReplicaPath("managed-replica-corrupt-push-intent");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var handler = new ReplicaPushHandler(
+            [CreatePullResponse("revision-42", image)],
+            _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+
+        try
+        {
+            var options = CreateOptions(path, handler);
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+                using (ManagedReplicaFaultInjection.Push(boundary =>
+                       {
+                           if (boundary == ManagedReplicaDurableBoundary.ReplicaPushIntentPublished)
+                               throw new InvalidOperationException("Injected push-intent interruption.");
+                       }))
+                {
+                    Assert.ThrowsAsync<InvalidOperationException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                }
+            }
+
+            CorruptPushState(path + ManagedReplicaBootstrapper.MetadataSuffix, corruption);
+
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<InvalidDataException>(() => reopened.Open());
+            handler.PushCallCount.Should().Be(0);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task CancellationWhileWaitingForPushFlightLeavesNoIntent()
+    {
+        var path = NewReplicaPath("managed-replica-push-lock-cancellation");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var handler = new ReplicaPushHandler(
+            [CreatePullResponse("revision-42", image)],
+            _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+            await using var held = await ManagedReplicaPushLock
+                .AcquireExclusiveAsync(path, CancellationToken.None)
+                .ConfigureAwait(false);
+            using var cancellation = new CancellationTokenSource();
+            var sync = connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token);
+            await Task.Delay(100);
+            cancellation.Cancel();
+
+            Assert.CatchAsync<OperationCanceledException>(() => sync);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().BeNull();
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().ContainSingle();
+            handler.PushCallCount.Should().Be(0);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void CancellationAfterRemoteCommitStillPublishesAcknowledgement()
+    {
+        var path = NewReplicaPath("managed-replica-post-commit-cancellation");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var handler = new ReplicaPushHandler(
+            [CreatePullResponse("revision-42", image)],
+            _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+            using var cancellation = new CancellationTokenSource();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.ReplicaPushRemoteCommitObserved)
+                           cancellation.Cancel();
+                   }))
+            {
+                Assert.CatchAsync<OperationCanceledException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), cancellation.Token));
+            }
+
+            ManagedReplicaChangeJournal.Open(path).AcknowledgedWatermark.Should().Be(2);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().BeNull();
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            handler.PushCallCount.Should().Be(1);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task LegacyCheckpointBoundPushOutcomeRecoversThroughIndependentIntent()
+    {
+        var path = NewReplicaPath("managed-replica-legacy-v6-push-intent");
+        try
+        {
+            var scenario = PreparePendingCheckpointPush(
+                path,
+                static (_, _) => Task.FromResult(ReplicaPushHandler.WatermarkResponse(0, 2)));
+            using var connection = AhtolaConnection.CreateReplica(scenario.Options);
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.ReplicaPushIntentPublished)
+                           throw new InvalidOperationException("Injected push-intent interruption.");
+                   }))
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            var push = metadata.PushState!.Value;
+            var legacy = metadata with
+            {
+                PushState = null,
+                RevertState = metadata.RevertState!.Value with
+                {
+                    Phase = ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown,
+                    AttemptedFirstSequence = push.FirstSequence,
+                    AttemptedWatermark = push.Watermark,
+                },
+            };
+            var metadataPath = path + ManagedReplicaBootstrapper.MetadataSuffix;
+            var inconsistentStagingPath = metadataPath + $".inconsistent-{Guid.NewGuid():N}.tmp";
+            ManagedReplicaBootstrapper.WriteMetadata(
+                inconsistentStagingPath,
+                metadataPath,
+                legacy with { PushState = push with { Watermark = push.Watermark + 1 } });
+            File.ReadAllText(metadataPath).Should().StartWith("version=8\n");
+            Assert.Throws<InvalidDataException>(() => ManagedReplicaBootstrapper.LoadMetadata(path));
+
+            var stagingPath = metadataPath + $".legacy-{Guid.NewGuid():N}.tmp";
+            ManagedReplicaBootstrapper.WriteMetadata(stagingPath, metadataPath, legacy);
+            File.ReadAllText(metadataPath).Should().StartWith("version=6\n");
+
+            var loaded = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            loaded.PushState.Should().Be(push);
+            loaded.RevertState!.Value.Phase.Should()
+                .Be(ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown);
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            connection.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().BeNull();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    private static bool IsReplicaPushBatch(HttpRequestMessage request)
+    {
+        using var document = JsonDocument.Parse(
+            request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+        return document.RootElement.GetProperty("requests")[0].TryGetProperty("batch", out _);
+    }
+
+    private static void CorruptPushState(string metadataPath, string corruption)
+    {
+        const string field = "push_state_base64=";
+        const int payloadLength = 1 + (3 * sizeof(long));
+        var text = File.ReadAllText(metadataPath);
+        var valueOffset = text.IndexOf(field, StringComparison.Ordinal) + field.Length;
+        valueOffset.Should().BeGreaterThanOrEqualTo(field.Length);
+        var valueEnd = text.IndexOf('\n', valueOffset);
+        valueEnd.Should().BeGreaterThan(valueOffset);
+        var encoded = text[valueOffset..valueEnd];
+        string replacement;
+        if (corruption == "bad-base64")
+        {
+            replacement = "***";
+        }
+        else
+        {
+            var bytes = Convert.FromBase64String(encoded);
+            bytes = corruption switch
+            {
+                "checksum" => CorruptChecksum(bytes),
+                "truncated" => bytes[..^1],
+                "trailing" => [.. bytes, 0],
+                "version" => RewriteAndRehash(bytes, static value => value[0] = 2),
+                "negative-generation" => RewriteAndRehash(
+                    bytes,
+                    static value => BinaryPrimitives.WriteInt64LittleEndian(value.AsSpan(1), -1)),
+                "zero-first-sequence" => RewriteAndRehash(
+                    bytes,
+                    static value => BinaryPrimitives.WriteInt64LittleEndian(
+                        value.AsSpan(1 + sizeof(long)),
+                        0)),
+                "invalid-watermark" => RewriteAndRehash(
+                    bytes,
+                    static value =>
+                    {
+                        var firstSequence = BinaryPrimitives.ReadInt64LittleEndian(
+                            value.AsSpan(1 + sizeof(long)));
+                        BinaryPrimitives.WriteInt64LittleEndian(
+                            value.AsSpan(1 + (2 * sizeof(long))),
+                            firstSequence);
+                    }),
+                _ => throw new ArgumentOutOfRangeException(nameof(corruption), corruption, null),
+            };
+            replacement = Convert.ToBase64String(bytes);
+        }
+
+        File.WriteAllText(metadataPath, text[..valueOffset] + replacement + text[valueEnd..]);
+        return;
+
+        static byte[] CorruptChecksum(byte[] bytes)
+        {
+            bytes[^1] ^= 0xff;
+            return bytes;
+        }
+
+        static byte[] RewriteAndRehash(byte[] bytes, Action<byte[]> rewrite)
+        {
+            rewrite(bytes);
+            SHA256.HashData(bytes.AsSpan(0, payloadLength)).CopyTo(bytes.AsSpan(payloadLength));
+            return bytes;
+        }
+    }
+}
