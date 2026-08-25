@@ -389,8 +389,13 @@ public sealed class ManagedSearchVirtualTableTests
                 (6, 'one three two'),
                 (7, 'one two three'),
                 (8, 'only two three'),
-                (9, 'one twin three');
+                (9, 'one twin three'),
+                (10, 'on two three');
             """,
+            "CREATE VIRTUAL TABLE near_detail_column USING fts5(body, detail=column);",
+            "INSERT INTO near_detail_column VALUES ('one two three');",
+            "CREATE VIRTUAL TABLE near_detail_none USING fts5(body, detail=none);",
+            "INSERT INTO near_detail_none VALUES ('one two three');",
         ];
 
         using var database = new EmbeddedDatabase();
@@ -468,6 +473,20 @@ public sealed class ManagedSearchVirtualTableTests
             "SELECT rowid FROM near_edges WHERE near_edges MATCH '\"!!!\" + one' ORDER BY rowid;",
             "SELECT rowid FROM near_edges WHERE near_edges MATCH '\"\" + one' ORDER BY rowid;",
             "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(\"!!!\" + one two,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'on* + \"\" + two' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'on* + \"!!!\" + two' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'on* + \"\"' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'one + tw* + \"\" + three' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'on* + \"\"* + two' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'on* + \"\" + \"\"* + two' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'on + \"\"* + two' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'one + \"\" + two' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH '\"\" + on* + two' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(on* + \"\" + two three,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(on* + \"\"* + two three,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(on* + \"\" + \"\"* + two three,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(one + \"\" + two three,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(\"\" + on* + two three,1)' ORDER BY rowid;",
             "SELECT rowid FROM near_edges WHERE near_edges MATCH '\"!!!\" one' ORDER BY rowid;",
             "SELECT rowid FROM near_edges WHERE near_edges MATCH 'one \"!!!\"' ORDER BY rowid;",
             "SELECT rowid FROM near_edges WHERE near_edges MATCH '\"!!!\" AND one' ORDER BY rowid;",
@@ -480,6 +499,12 @@ public sealed class ManagedSearchVirtualTableTests
             "SELECT rowid FROM near_edges WHERE near_edges MATCH 'or' ORDER BY rowid;",
             "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR' ORDER BY rowid;",
             "SELECT rowid FROM near_edges WHERE near_edges MATCH 'OR\U0001F4A9' ORDER BY rowid;",
+            "SELECT rowid FROM near_detail_column WHERE near_detail_column MATCH 'NEAR(one,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_detail_column WHERE near_detail_column MATCH 'NEAR(on* + \"\",1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_detail_column WHERE near_detail_column MATCH 'NEAR(on + \"\"*,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_detail_none WHERE near_detail_none MATCH 'NEAR(one,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_detail_none WHERE near_detail_none MATCH 'NEAR(on* + \"\",1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_detail_none WHERE near_detail_none MATCH 'NEAR(on + \"\"*,1)' ORDER BY rowid;",
             """
             SELECT rowid, highlight(phrase_docs, 0, '[', ']')
             FROM phrase_docs
@@ -497,6 +522,19 @@ public sealed class ManagedSearchVirtualTableTests
         ];
         foreach (var sql in oracleQueries)
             ReadRowsAsStrings(managed, sql).Should().Equal(ReadRowsAsStrings(stock, sql), sql);
+
+        foreach (var positionalQuery in new[]
+        {
+            "on* + \"\" + two",
+            "NEAR(on* + \"\" + two,1)",
+        })
+        {
+            var sql = $"SELECT rowid FROM near_detail_column WHERE near_detail_column MATCH '{positionalQuery}';";
+            Action managedPositional = () => ReadRowsAsStrings(managed, sql);
+            Action stockPositional = () => ReadRowsAsStrings(stock, sql);
+            managedPositional.Should().Throw<EmbeddedSqlException>();
+            stockPositional.Should().Throw<MsData.SqliteException>();
+        }
 
         AssertScoresMatchStock(
             managed,

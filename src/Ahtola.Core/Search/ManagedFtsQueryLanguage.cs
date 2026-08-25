@@ -418,32 +418,29 @@ internal sealed class ManagedFtsQueryLanguage
 
             var phrase = ParseFts5NearPhrase();
             operandCount++;
-            if (phrase.Terms.Count != 0)
-                phrases.Add(phrase);
+            if (phrase.Count != 0)
+                phrases.Add(new ManagedFtsNearPhrase(phrase));
         }
 
         if (operandCount == 0)
             throw Error("NEAR requires at least one phrase.");
         if (phrases.Count == 0)
             return new ManagedFtsOmittedNode();
+        if (phrases.Count == 1 && phrases[0].Terms.Count == 1)
+        {
+            var term = phrases[0].Terms[0];
+            return new ManagedFtsTermNode(term.Text, term.IsPrefix, column, AnchoredAtStart: false);
+        }
 
         return new ManagedFtsNearNode(phrases, distance, column, SqliteDistance: true);
     }
 
-    private ManagedFtsNearPhrase ParseFts5NearPhrase()
-    {
-        var terms = ParseFts5PhraseAtom();
-        while (TryRead('+'))
-            terms.AddRange(ParseFts5PhraseAtom());
-
-        return new ManagedFtsNearPhrase(terms);
-    }
+    private IReadOnlyList<ManagedFtsPhraseTerm> ParseFts5NearPhrase()
+        => ParseFts5ConcatenatedPhrase();
 
     private ManagedFtsNode ParseFts5Phrase(string? column, bool anchored)
     {
-        var terms = ParseFts5PhraseAtom();
-        while (TryRead('+'))
-            terms.AddRange(ParseFts5PhraseAtom());
+        var terms = ParseFts5ConcatenatedPhrase();
 
         return terms.Count switch
         {
@@ -453,7 +450,27 @@ internal sealed class ManagedFtsQueryLanguage
         };
     }
 
-    private List<ManagedFtsPhraseTerm> ParseFts5PhraseAtom()
+    private List<ManagedFtsPhraseTerm> ParseFts5ConcatenatedPhrase()
+    {
+        var firstAtom = ParseFts5PhraseAtom();
+        var terms = firstAtom.Terms;
+        while (TryRead('+'))
+        {
+            var atom = ParseFts5PhraseAtom();
+            if (atom.Terms.Count == 0 && terms.Count != 0)
+            {
+                terms[^1] = terms[^1] with { IsPrefix = atom.IsPrefix };
+            }
+            else
+            {
+                terms.AddRange(atom.Terms);
+            }
+        }
+
+        return terms;
+    }
+
+    private ParsedFts5PhraseAtom ParseFts5PhraseAtom()
     {
         var quoted = TryRead('"');
         if (!quoted
@@ -474,7 +491,7 @@ internal sealed class ManagedFtsQueryLanguage
 
         var tokens = ManagedFtsTokenization.TokenizeQueryText(phraseText, _options);
         if (tokens.Count == 0)
-            return [];
+            return new ParsedFts5PhraseAtom([], prefix);
 
         var terms = new List<ManagedFtsPhraseTerm>(tokens.Count);
         for (var index = 0; index < tokens.Count; index++)
@@ -485,8 +502,12 @@ internal sealed class ManagedFtsQueryLanguage
                 prefix && index == tokens.Count - 1));
         }
 
-        return terms;
+        return new ParsedFts5PhraseAtom(terms, prefix);
     }
+
+    private readonly record struct ParsedFts5PhraseAtom(
+        List<ManagedFtsPhraseTerm> Terms,
+        bool IsPrefix);
 
     private ManagedFtsNode ParsePhrase(string? column, bool anchored)
     {
