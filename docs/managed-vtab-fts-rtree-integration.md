@@ -58,8 +58,12 @@ The managed `fts5` module accepts bare identifier columns with optional
 tables require SQLite's shadow-table/trigger contracts and are not represented
 by Ahtola's private payload.
 
-MATCH supports the bounded managed term, phrase, prefix, boolean, column
-filter, initial-token anchor, and NEAR grammar. Both `table MATCH ?` and
+MATCH supports bounded FTS5 term, phrase, quoted-phrase prefix, binary
+`NOT`, column-filter, initial-token anchor, and `NEAR(term ..., distance)`
+grammar. Implicit `AND` binds more tightly than binary `NOT`, and a
+`column MATCH ?` restriction intersects every explicit column filter in the
+query. BLOB content is decoded as UTF-8 for indexing and auxiliary rendering
+while the stored SQL value remains a BLOB. Both `table MATCH ?` and
 `column MATCH ?` are planner constraints. MATCH cursors expose the hidden
 `rank` column, use SQLite's negative BM25 convention (lower is better), return
 default scans in rank order, and consume a complete `ORDER BY rank ASC|DESC`.

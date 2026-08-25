@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 
 namespace Ahtola.Core.Search;
 
@@ -372,6 +373,7 @@ internal sealed class ManagedFtsSearchIndex
         IReadOnlyList<double> columnWeights)
         => node switch
         {
+            ManagedFtsNoMatchNode => [],
             ManagedFtsTermNode term => EvaluateTerm(term, accumulator, columnWeights),
             ManagedFtsPhraseNode phrase => EvaluatePhrase(phrase, accumulator, columnWeights),
             ManagedFtsNearNode near => EvaluateNear(near, accumulator, columnWeights),
@@ -550,6 +552,9 @@ internal sealed class ManagedFtsSearchIndex
     {
         RequirePositions("phrase");
         var columnMask = ResolveColumnMask(phrase.Column);
+        if (phrase.IsPrefix)
+            return EvaluatePrefixPhrase(phrase, accumulator, columnWeights, columnMask);
+
         var candidates = new List<ScoreCandidate>();
         var matches = new HashSet<long>();
         foreach (var rowId in IntersectTerms(phrase.Terms))
@@ -568,6 +573,49 @@ internal sealed class ManagedFtsSearchIndex
         return matches;
     }
 
+    private HashSet<long> EvaluatePrefixPhrase(
+        ManagedFtsPhraseNode phrase,
+        Dictionary<long, double>? accumulator,
+        IReadOnlyList<double> columnWeights,
+        uint columnMask)
+    {
+        var frequencies = new Dictionary<long, int>();
+        var terms = phrase.Terms.ToArray();
+        var prefix = new ManagedFtsTermNode(
+            terms[^1],
+            IsPrefix: true,
+            phrase.Column,
+            AnchoredAtStart: false);
+        foreach (var expanded in ExpandTerm(prefix))
+        {
+            terms[^1] = expanded;
+            foreach (var rowId in IntersectTerms(terms))
+            {
+                var frequency = CountPhrase(rowId, terms, columnMask, phrase.AnchoredAtStart);
+                if (frequency == 0)
+                    continue;
+
+                frequencies[rowId] = frequencies.TryGetValue(rowId, out var existing)
+                    ? existing + frequency
+                    : frequency;
+            }
+        }
+
+        var matches = new HashSet<long>(frequencies.Keys);
+        if (accumulator is not null)
+        {
+            Accumulate(
+                accumulator,
+                frequencies
+                    .Select(entry => new ScoreCandidate(entry.Key, entry.Value, [], [], columnMask))
+                    .ToList(),
+                columnMask,
+                columnWeights);
+        }
+
+        return matches;
+    }
+
     private HashSet<long> EvaluateNear(
         ManagedFtsNearNode near,
         Dictionary<long, double>? accumulator,
@@ -579,7 +627,9 @@ internal sealed class ManagedFtsSearchIndex
         var matches = new HashSet<long>();
         foreach (var rowId in IntersectTerms(near.Terms))
         {
-            var frequency = CountNear(rowId, near.Terms, near.Distance, columnMask);
+            var frequency = near.SqliteDistance
+                ? CountSqliteNear(rowId, near.Terms, near.Distance, columnMask)
+                : CountNear(rowId, near.Terms, near.Distance, columnMask);
             if (frequency == 0)
                 continue;
 
@@ -720,6 +770,73 @@ internal sealed class ManagedFtsSearchIndex
 
             if (matched)
                 count++;
+        }
+
+        return count;
+    }
+
+    private int CountSqliteNear(long rowId, IReadOnlyList<string> terms, int distance, uint columnMask)
+    {
+        var termIndices = new Dictionary<string, int>(StringComparer.Ordinal);
+        var requirements = new List<int>();
+        var streams = new List<long[]>();
+        foreach (var term in terms)
+        {
+            if (termIndices.TryGetValue(term, out var existing))
+            {
+                requirements[existing]++;
+                continue;
+            }
+            if (!TryGetPositions(term, rowId, out var positions))
+                return 0;
+
+            termIndices.Add(term, streams.Count);
+            streams.Add(positions);
+            requirements.Add(1);
+        }
+
+        var maximumSpan = checked(distance + 1);
+        var count = 0;
+        for (var column = 0; column < _columnCount; column++)
+        {
+            if ((columnMask & (1u << column)) == 0)
+                continue;
+
+            var events = new List<NearEvent>();
+            for (var termIndex = 0; termIndex < streams.Count; termIndex++)
+            {
+                var positions = streams[termIndex];
+                var start = LowerBound(positions, EncodePosition(column, 0));
+                while (start < positions.Length && (int)(positions[start] >> 32) == column)
+                {
+                    events.Add(new NearEvent((int)(positions[start] & 0xFFFFFFFFL), termIndex));
+                    start++;
+                }
+            }
+
+            events.Sort(static (left, right)
+                => left.Position == right.Position
+                    ? left.TermIndex.CompareTo(right.TermIndex)
+                    : left.Position.CompareTo(right.Position));
+            var occurrences = new int[streams.Count];
+            var covered = 0;
+            var leftIndex = 0;
+            for (var rightIndex = 0; rightIndex < events.Count; rightIndex++)
+            {
+                var right = events[rightIndex];
+                if (++occurrences[right.TermIndex] == requirements[right.TermIndex])
+                    covered++;
+
+                while (covered == streams.Count)
+                {
+                    var left = events[leftIndex];
+                    if (right.Position - left.Position <= maximumSpan)
+                        count++;
+                    if (occurrences[left.TermIndex]-- == requirements[left.TermIndex])
+                        covered--;
+                    leftIndex++;
+                }
+            }
         }
 
         return count;
@@ -1142,7 +1259,7 @@ internal sealed class ManagedFtsSearchIndex
             SqlValueKind.Text => value.AsText(),
             SqlValueKind.Integer => value.AsInteger().ToString(CultureInfo.InvariantCulture),
             SqlValueKind.Real => value.AsReal().ToString("R", CultureInfo.InvariantCulture),
-            SqlValueKind.Blob => string.Empty,
+            SqlValueKind.Blob => Encoding.UTF8.GetString(value.AsBlob().Span),
             _ => string.Empty,
         };
 
@@ -1181,6 +1298,8 @@ internal sealed class ManagedFtsSearchIndex
         uint ColumnMask,
         long[] Positions,
         int[] ColumnFrequencies);
+
+    private readonly record struct NearEvent(int Position, int TermIndex);
 
     /// <summary>One document's contribution to a term's score, before BM25 is applied.</summary>
     private readonly record struct ScoreCandidate(

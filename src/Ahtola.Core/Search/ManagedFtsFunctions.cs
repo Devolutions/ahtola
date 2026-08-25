@@ -411,6 +411,8 @@ internal static class ManagedFtsFunctions
     {
         switch (node)
         {
+            case ManagedFtsNoMatchNode:
+                return;
             case ManagedFtsTermNode term:
                 if (!AppliesToColumn(term.Column, columnName))
                     return;
@@ -430,6 +432,11 @@ internal static class ManagedFtsFunctions
                 }
                 return;
             case ManagedFtsPhraseNode phrase:
+                if (phrase.IsPrefix && ++prefixTerms > ManagedFtsLimits.MaxHighlightPrefixTerms)
+                {
+                    throw new EmbeddedSqlException(
+                        $"fts highlight query uses more than {ManagedFtsLimits.MaxHighlightPrefixTerms} prefix terms");
+                }
                 if (AppliesToColumn(phrase.Column, columnName))
                     CollectPhraseSpans(lookup, phrase, destination);
                 return;
@@ -469,7 +476,11 @@ internal static class ManagedFtsFunctions
             var matched = true;
             for (var index = 1; index < phrase.Terms.Count; index++)
             {
-                if (!lookup.TryGetAtPosition(phrase.Terms[index], first.Position + index, out var token))
+                var position = first.Position + index;
+                var found = phrase.IsPrefix && index == phrase.Terms.Count - 1
+                    ? lookup.TryGetPrefixAtPosition(phrase.Terms[index], position, out var token)
+                    : lookup.TryGetAtPosition(phrase.Terms[index], position, out token);
+                if (!found)
                 {
                     matched = false;
                     break;
@@ -491,6 +502,9 @@ internal static class ManagedFtsFunctions
         if (near.Terms.Count == 0)
             return;
 
+        var distance = near.SqliteDistance
+            ? checked(near.Distance + 1)
+            : near.Distance;
         foreach (var anchor in lookup.Get(near.Terms[0]))
         {
             var occurrences = new ManagedFtsToken[near.Terms.Count];
@@ -500,8 +514,8 @@ internal static class ManagedFtsFunctions
             {
                 if (!lookup.TryGetInRange(
                         near.Terms[index],
-                        Math.Max(0, anchor.Position - near.Distance),
-                        anchor.Position + near.Distance,
+                        Math.Max(0, anchor.Position - distance),
+                        anchor.Position + distance,
                         out occurrences[index]))
                 {
                     matched = false;
@@ -535,11 +549,13 @@ internal static class ManagedFtsFunctions
     private sealed class Fts5TokenLookup
     {
         private readonly Dictionary<string, List<ManagedFtsToken>> _byTerm = new(StringComparer.Ordinal);
+        private readonly Dictionary<int, ManagedFtsToken> _byPosition = [];
 
         public Fts5TokenLookup(IReadOnlyList<ManagedFtsToken> tokens)
         {
             foreach (var token in tokens)
             {
+                _byPosition.TryAdd(token.Position, token);
                 if (!_byTerm.TryGetValue(token.Text, out var occurrences))
                 {
                     occurrences = [];
@@ -596,6 +612,18 @@ internal static class ManagedFtsFunctions
             if (low < occurrences.Count && occurrences[low].Position == position)
             {
                 token = occurrences[low];
+                return true;
+            }
+
+            token = null!;
+            return false;
+        }
+
+        public bool TryGetPrefixAtPosition(string prefix, int position, out ManagedFtsToken token)
+        {
+            if (_byPosition.TryGetValue(position, out token!)
+                && token.Text.StartsWith(prefix, StringComparison.Ordinal))
+            {
                 return true;
             }
 

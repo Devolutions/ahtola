@@ -17,10 +17,7 @@ public sealed partial class EmbeddedDatabase
                 $"unable to use function {function.Name.ToLowerInvariant()} in the requested context");
         }
 
-        var binding = column.Qualifier is { } qualifier
-            ? row.GetFts5SourceForQualifier(qualifier)
-            : row.GetFts5SourceForTable(column.UnqualifiedName ?? column.Name);
-        if (binding is null)
+        if (!row.TryResolveFts5Source(column, out var binding) || binding is null)
         {
             throw new EmbeddedSqlException(
                 $"unable to use function {function.Name.ToLowerInvariant()} in the requested context");

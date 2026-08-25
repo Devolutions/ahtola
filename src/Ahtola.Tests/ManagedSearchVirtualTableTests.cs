@@ -342,6 +342,96 @@ public sealed class ManagedSearchVirtualTableTests
     }
 
     [Test]
+    public void Fts5ReviewedQueryAndContentSemanticsMatchStockSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE VIRTUAL TABLE documents USING fts5(a, b);",
+            "INSERT INTO documents(rowid, a, b) VALUES (1, 'one', 'one');",
+            "INSERT INTO documents(rowid, a, b) VALUES (2, 'one two', 'two');",
+            "INSERT INTO documents(rowid, a, b) VALUES (3, 'one three', 'three');",
+            "INSERT INTO documents(rowid, a, b) VALUES (4, 'one two three', 'two three');",
+            "INSERT INTO documents(rowid, a, b) VALUES (10, 'blob', x'636166C3A9206E6F6972');",
+            "CREATE TABLE no_shadow(marker TEXT);",
+            "INSERT INTO no_shadow VALUES ('x');",
+            "CREATE TABLE shadows(documents TEXT);",
+            "INSERT INTO shadows VALUES ('ordinary');",
+            "CREATE VIRTUAL TABLE near_docs USING fts5(body);",
+            "INSERT INTO near_docs(rowid, body) VALUES (1, 'one x two'), (2, 'one x x two'), (3, 'two x one');",
+            "CREATE VIRTUAL TABLE phrase_docs USING fts5(body);",
+            "INSERT INTO phrase_docs(rowid, body) VALUES (1, 'one two three'), (2, 'one two throw'), (3, 'one two thyme');",
+        ];
+
+        using var database = new EmbeddedDatabase();
+        using var managed = database.Connect();
+        using var stock = new MsData.SqliteConnection("Data Source=:memory:");
+        stock.Open();
+        foreach (var sql in setup)
+        {
+            Execute(managed, sql);
+            Execute(stock, sql);
+        }
+
+        string[] oracleQueries =
+        [
+            "SELECT rowid FROM documents WHERE b MATCH 'a:one' ORDER BY rowid;",
+            "SELECT rowid FROM documents WHERE b MATCH 'a:one OR two' ORDER BY rowid;",
+            "SELECT rowid FROM documents WHERE documents MATCH 'one NOT two three' ORDER BY rowid;",
+            """
+            SELECT rowid, typeof(b), highlight(documents, 1, '[', ']'),
+                   snippet(documents, 1, '<', '>', '...', 8)
+            FROM documents
+            WHERE documents MATCH 'café'
+            ORDER BY rowid;
+            """,
+            "SELECT rowid FROM near_docs WHERE near_docs MATCH 'NEAR(one two,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_docs WHERE near_docs MATCH 'NEAR(one x two,0)' ORDER BY rowid;",
+            "SELECT rowid FROM near_docs WHERE near_docs MATCH 'NEAR(one,1)' ORDER BY rowid;",
+            """
+            SELECT rowid, highlight(phrase_docs, 0, '[', ']')
+            FROM phrase_docs
+            WHERE phrase_docs MATCH '"one two thr"*'
+            ORDER BY rowid;
+            """,
+            """
+            SELECT (SELECT bm25(documents) FROM no_shadow),
+                   (SELECT highlight(documents, 0, '[', ']') FROM no_shadow),
+                   (SELECT snippet(documents, 0, '[', ']', '...', 5) FROM no_shadow)
+            FROM documents
+            WHERE documents MATCH 'one'
+            ORDER BY rowid;
+            """,
+        ];
+        foreach (var sql in oracleQueries)
+            ReadRowsAsStrings(managed, sql).Should().Equal(ReadRowsAsStrings(stock, sql), sql);
+
+        foreach (var auxiliary in new[]
+                 {
+                     "bm25(documents)",
+                     "highlight(documents, 0, '[', ']')",
+                     "snippet(documents, 0, '[', ']', '...', 5)",
+                 })
+        {
+            var sql = $"""
+                SELECT (SELECT {auxiliary} FROM shadows)
+                FROM documents
+                WHERE documents MATCH 'one';
+                """;
+            Action managedShadow = () => ReadRowsAsStrings(managed, sql);
+            Action stockShadow = () => ReadRowsAsStrings(stock, sql);
+            managedShadow.Should().Throw<EmbeddedSqlException>();
+            stockShadow.Should().Throw<MsData.SqliteException>();
+        }
+
+        const string legacyNear =
+            "SELECT rowid FROM near_docs WHERE near_docs MATCH 'NEAR/1(one two)';";
+        Action managedLegacyNear = () => ReadRowsAsStrings(managed, legacyNear);
+        Action stockLegacyNear = () => ReadRowsAsStrings(stock, legacyNear);
+        managedLegacyNear.Should().Throw<EmbeddedSqlException>();
+        stockLegacyNear.Should().Throw<MsData.SqliteException>();
+    }
+
+    [Test]
     public void Fts5AuxiliariesBindThroughJoinsAndMayBeShadowed()
     {
         using var database = new EmbeddedDatabase();

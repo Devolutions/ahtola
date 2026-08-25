@@ -613,7 +613,8 @@ internal sealed class ManagedFts5Table : ManagedVirtualTable
         var query = ManagedFtsQueryLanguage.Parse(
             value.AsText(),
             _definition.Tokenizer,
-            name => ResolveColumnIndex(name) is not null);
+            name => ResolveColumnIndex(name) is not null,
+            ManagedFtsQuerySyntax.SqliteFts5);
         return columnIndex == TableColumnIndex
             ? query
             : ApplyDefaultColumn(query, _columnNames[columnIndex]);
@@ -622,9 +623,10 @@ internal sealed class ManagedFts5Table : ManagedVirtualTable
     private static ManagedFtsNode ApplyDefaultColumn(ManagedFtsNode node, string column)
         => node switch
         {
-            ManagedFtsTermNode term => term.Column is null ? term with { Column = column } : term,
-            ManagedFtsPhraseNode phrase => phrase.Column is null ? phrase with { Column = column } : phrase,
-            ManagedFtsNearNode near => near.Column is null ? near with { Column = column } : near,
+            ManagedFtsNoMatchNode noMatch => noMatch,
+            ManagedFtsTermNode term => ApplyDefaultColumn(term, column),
+            ManagedFtsPhraseNode phrase => ApplyDefaultColumn(phrase, column),
+            ManagedFtsNearNode near => ApplyDefaultColumn(near, column),
             ManagedFtsAndNode and => new ManagedFtsAndNode(
                 ApplyDefaultColumn(and.Left, column),
                 ApplyDefaultColumn(and.Right, column)),
@@ -634,6 +636,24 @@ internal sealed class ManagedFts5Table : ManagedVirtualTable
             ManagedFtsNotNode not => new ManagedFtsNotNode(ApplyDefaultColumn(not.Operand, column)),
             _ => throw new ArgumentOutOfRangeException(nameof(node)),
         };
+
+    private static ManagedFtsNode ApplyDefaultColumn(ManagedFtsTermNode term, string column)
+        => term.Column is null
+            ? term with { Column = column }
+            : ColumnsEqual(term.Column, column) ? term : new ManagedFtsNoMatchNode();
+
+    private static ManagedFtsNode ApplyDefaultColumn(ManagedFtsPhraseNode phrase, string column)
+        => phrase.Column is null
+            ? phrase with { Column = column }
+            : ColumnsEqual(phrase.Column, column) ? phrase : new ManagedFtsNoMatchNode();
+
+    private static ManagedFtsNode ApplyDefaultColumn(ManagedFtsNearNode near, string column)
+        => near.Column is null
+            ? near with { Column = column }
+            : ColumnsEqual(near.Column, column) ? near : new ManagedFtsNoMatchNode();
+
+    private static bool ColumnsEqual(string left, string right)
+        => string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
 
     private sealed class Cursor(ManagedFts5Table table)
         : ManagedVirtualTableCursor, IManagedFts5Cursor

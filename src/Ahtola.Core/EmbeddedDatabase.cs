@@ -52116,6 +52116,51 @@ internal sealed record SourceRow(
 
     public ManagedFts5SourceBinding? GetFts5SourceForTable(string tableName)
     {
+        var resolved = GetLocalFts5SourceForTable(tableName);
+        return resolved ?? Parent?.GetFts5SourceForTable(tableName);
+    }
+
+    public bool TryResolveFts5Source(
+        ColumnExpression column,
+        out ManagedFts5SourceBinding? binding)
+    {
+        if (column.Qualifier is { } qualifier)
+        {
+            if (AmbiguousQualifiedColumns?.Contains(column.Name) == true)
+                ThrowAmbiguousColumn(column.Name);
+            if (QualifiedColumns?.ContainsKey(column.Name) == true)
+            {
+                binding = GetLocalFts5SourceForQualifier(qualifier);
+                return true;
+            }
+        }
+        else if (FindUnqualifiedColumnIndex(column.Name) is not null)
+        {
+            binding = GetLocalFts5SourceForTable(column.Name);
+            return true;
+        }
+
+        if (Parent is not null)
+            return Parent.TryResolveFts5Source(column, out binding);
+
+        binding = null;
+        return false;
+    }
+
+    private ManagedFts5SourceBinding? GetLocalFts5SourceForQualifier(string qualifier)
+    {
+        if (QualifiedFts5Sources is { } qualified && qualified.TryGetValue(qualifier, out var bound))
+            return bound;
+
+        return Fts5Source is { } own
+            && RowIdQualifier is { } owner
+            && string.Equals(owner, qualifier, StringComparison.OrdinalIgnoreCase)
+                ? own
+                : null;
+    }
+
+    private ManagedFts5SourceBinding? GetLocalFts5SourceForTable(string tableName)
+    {
         ManagedFts5SourceBinding? resolved = null;
         if (QualifiedFts5Sources is not null)
         {
@@ -52140,7 +52185,7 @@ internal sealed record SourceRow(
             resolved = own;
         }
 
-        return resolved ?? Parent?.GetFts5SourceForTable(tableName);
+        return resolved;
     }
 
     /// <summary>
