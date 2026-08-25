@@ -11,53 +11,79 @@ internal static class MvccDualCursor
     internal readonly record struct Row(MvccKey Key, SqlValue[] Cells);
 
     /// <summary>
-    /// Merges an ordered base image with typed MVCC overlays. The supplied
-    /// comparison must be the owning table's SQLite key comparison, including
-    /// collations and directions for a WITHOUT ROWID primary key.
+    /// Lazily overlays an ordered base image with the ordered MVCC range. This
+    /// mirrors Turso's two-peek cursor: equal keys consume both inputs, and only
+    /// the winning input advances for unequal keys.
     /// </summary>
+    internal static IEnumerable<Row> EnumerateVisibleRows(
+        MvStore store,
+        MvccTxId txId,
+        long tableId,
+        IEnumerable<Row> baseRows,
+        IComparer<MvccKey> comparer)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(baseRows);
+        ArgumentNullException.ThrowIfNull(comparer);
+
+        using var baseCursor = baseRows.GetEnumerator();
+        using var overlayCursor = store.EnumerateVisible(txId, tableId, comparer).GetEnumerator();
+        var hasBase = baseCursor.MoveNext();
+        var hasOverlay = overlayCursor.MoveNext();
+
+        while (hasBase || hasOverlay)
+        {
+            if (!hasOverlay)
+            {
+                var baseRow = baseCursor.Current;
+                yield return new Row(baseRow.Key, (SqlValue[])baseRow.Cells.Clone());
+                hasBase = baseCursor.MoveNext();
+                continue;
+            }
+
+            if (!hasBase)
+            {
+                var overlay = overlayCursor.Current;
+                if (!overlay.IsDelete)
+                    yield return new Row(overlay.Key, overlay.Cells!);
+                hasOverlay = overlayCursor.MoveNext();
+                continue;
+            }
+
+            var comparison = comparer.Compare(baseCursor.Current.Key, overlayCursor.Current.Key);
+            if (comparison < 0)
+            {
+                var baseRow = baseCursor.Current;
+                yield return new Row(baseRow.Key, (SqlValue[])baseRow.Cells.Clone());
+                hasBase = baseCursor.MoveNext();
+                continue;
+            }
+
+            var winner = overlayCursor.Current;
+            if (!winner.IsDelete)
+                yield return new Row(winner.Key, winner.Cells!);
+            hasOverlay = overlayCursor.MoveNext();
+            if (comparison == 0)
+                hasBase = baseCursor.MoveNext();
+        }
+    }
+
+    /// <summary>Compatibility materializer for callers that require a list.</summary>
     internal static IReadOnlyList<Row> MergeVisibleRows(
         MvStore store,
         MvccTxId txId,
         long tableId,
         IReadOnlyList<Row> baseRows,
-        Comparison<MvccKey> compare)
+        IComparer<MvccKey> comparer)
     {
-        ArgumentNullException.ThrowIfNull(store);
-        ArgumentNullException.ThrowIfNull(baseRows);
-        ArgumentNullException.ThrowIfNull(compare);
-
-        var results = new List<Row>(baseRows.Count);
-        var covered = new HashSet<MvccKey>();
-
-        foreach (var baseRow in baseRows)
-        {
-            var identity = new MvccRowId(tableId, baseRow.Key);
-            if (store.TryRead(txId, identity, out var overlay) && overlay is not null)
-            {
-                results.Add(new Row(baseRow.Key, overlay));
-                covered.Add(baseRow.Key);
-                continue;
-            }
-
-            if (store.IsBaseRowInvalidated(txId, identity))
-            {
-                covered.Add(baseRow.Key);
-                continue;
-            }
-
-            results.Add(new Row(baseRow.Key, (SqlValue[])baseRow.Cells.Clone()));
-            covered.Add(baseRow.Key);
-        }
-
-        foreach (var (identity, cells) in store.ScanVisible(txId))
-        {
-            if (identity.TableId != tableId || covered.Contains(identity.Key))
-                continue;
-            results.Add(new Row(identity.Key, cells));
-        }
-
-        results.Sort((left, right) => compare(left.Key, right.Key));
-        return results;
+        ArgumentNullException.ThrowIfNull(comparer);
+        return EnumerateVisibleRows(
+                store,
+                txId,
+                tableId,
+                baseRows,
+                comparer)
+            .ToArray();
     }
 
     /// <summary>
@@ -77,18 +103,16 @@ internal static class MvccDualCursor
         if (baseRowIds.Count != baseRows.Count)
             throw new ArgumentException("Base row id and cell lists must have equal length.");
 
-        var typedBaseRows = new Row[baseRowIds.Count];
-        for (var i = 0; i < baseRowIds.Count; i++)
-        {
-            typedBaseRows[i] = new Row(MvccKey.FromInteger(baseRowIds[i]), baseRows[i]);
-        }
+        var typedBaseRows = baseRowIds
+            .Select((rowId, index) => new Row(MvccKey.FromInteger(rowId), baseRows[index]))
+            .OrderBy(static row => row.Key.Integer);
 
-        return MergeVisibleRows(
+        return EnumerateVisibleRows(
                 store,
                 txId,
                 tableId,
                 typedBaseRows,
-                static (left, right) => left.Integer.CompareTo(right.Integer))
+                MvccKeyComparer.Integer)
             .Select(static row => (row.Key.Integer, row.Cells))
             .ToArray();
     }

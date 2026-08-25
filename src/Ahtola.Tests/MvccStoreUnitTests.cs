@@ -122,6 +122,35 @@ public sealed class MvccStoreUnitTests
     }
 
     [Test]
+    public void CheckpointLeaseClosesTransactionAdmissionUntilReleased()
+    {
+        var store = new MvStore();
+
+        store.TryAcquireCheckpoint(out var lease).Should().BeTrue();
+        lease.Should().NotBeNull();
+        ((Action)(() => store.BeginTransaction())).Should().Throw<EmbeddedBusyException>();
+        ((Action)(() => store.BeginExclusiveTransaction())).Should().Throw<EmbeddedBusyException>();
+
+        lease!.Dispose();
+        var transaction = store.BeginTransaction();
+        store.Rollback(transaction.Id);
+    }
+
+    [Test]
+    public void ActiveTransactionPreventsCheckpointLease()
+    {
+        var store = new MvStore();
+        var transaction = store.BeginTransaction();
+
+        store.TryAcquireCheckpoint(out var lease).Should().BeFalse();
+        lease.Should().BeNull();
+
+        store.Rollback(transaction.Id);
+        store.TryAcquireCheckpoint(out lease).Should().BeTrue();
+        lease!.Dispose();
+    }
+
+    [Test]
     public void ScanVisibleReturnsCommittedRowsOnly()
     {
         var store = new MvStore();
@@ -228,5 +257,28 @@ public sealed class MvccStoreUnitTests
             [MvccLogOp.Upsert(new MvccRowId(-2, 1), [SqlValue.Text("legacy")])]);
 
         store.CanUpgradeLegacyLog.Should().BeFalse();
+    }
+
+    [Test]
+    public void OrderedRangeDropsKeyRolledBackToSavepoint()
+    {
+        var store = new MvStore();
+        var table = store.GetOrCreateTableId("t");
+        var tx = store.BeginTransaction();
+        store.Insert(tx.Id, new MvccRowId(table, 1), [SqlValue.Integer(1)]);
+
+        store.EnumerateVisible(tx.Id, table, MvccKeyComparer.Integer)
+            .Select(row => row.Key.Integer)
+            .Should()
+            .Equal(1L);
+
+        store.BeginNamedSavepoint(tx.Id, "s");
+        store.Insert(tx.Id, new MvccRowId(table, 2), [SqlValue.Integer(2)]);
+        store.RollbackToNamedSavepoint(tx.Id, "s");
+
+        store.EnumerateVisible(tx.Id, table, MvccKeyComparer.Integer)
+            .Select(row => row.Key.Integer)
+            .Should()
+            .Equal(1L);
     }
 }

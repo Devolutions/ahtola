@@ -140,6 +140,10 @@ public sealed class MvccCheckpointStateMachineTests
 
             ReadFileLength(fileSystem, path + "-log").Should().Be(logLength);
             AssertCommittedWal(fileSystem, path + "-wal");
+
+            // A failed durability phase must release process-local admission.
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "ROLLBACK;");
         }
 
         using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
@@ -184,6 +188,39 @@ public sealed class MvccCheckpointStateMachineTests
         finalWal.ScanRecovery().LastCommittedFrameNumber.Should().Be(0);
     }
 
+    [TestCase(FileSystemOperation.Write)]
+    [TestCase(FileSystemOperation.FlushToDisk)]
+    public void MaterializationFaultColdReopensFromTheLogicalLog(FileSystemOperation operation)
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        var path = $"mvcc-{operation}-materialization-failure.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(v INTEGER);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO t VALUES (59);");
+            Execute(connection, "COMMIT;");
+
+            faults.FailNext(operation);
+            Assert.Throws<IOException>(() => database.RunMvccCheckpoint("TRUNCATE"));
+        }
+
+        using (var reopened = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = reopened.Connect())
+        {
+            ReadScalar(connection, "SELECT v FROM t;").Should().Be(59L);
+            reopened.RunMvccCheckpoint("TRUNCATE").Busy.Should().BeFalse();
+        }
+
+        using var final = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var finalConnection = final.Connect();
+        ReadScalar(finalConnection, "SELECT v FROM t;").Should().Be(59L);
+    }
+
     [Test]
     public void ActiveConcurrentReaderPreventsLogicalLogRetirement()
     {
@@ -210,6 +247,31 @@ public sealed class MvccCheckpointStateMachineTests
         Execute(reader, "ROLLBACK;");
         database.RunMvccCheckpoint("TRUNCATE").Busy.Should().BeFalse();
         ReadFileLength(fileSystem, path + "-log").Should().Be(56);
+    }
+
+    [Test]
+    public void SharedCheckpointLeaseBlocksAdmissionFromASecondDatabaseInstance()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "mvcc-shared-checkpoint-lease.db";
+        using var first = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var second = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var firstConnection = first.Connect();
+        using var secondConnection = second.Connect();
+        Execute(firstConnection, "CREATE TABLE t(v INTEGER);");
+        Execute(firstConnection, "PRAGMA journal_mode=mvcc;");
+        second.EnsureMvccAttachedIfDurable();
+
+        ReferenceEquals(first.MvStore, second.MvStore).Should().BeTrue();
+        first.MvStore!.TryAcquireCheckpoint(out var lease).Should().BeTrue();
+        using (lease)
+        {
+            Assert.Throws<EmbeddedBusyException>(
+                () => Execute(secondConnection, "BEGIN CONCURRENT;"));
+        }
+
+        Execute(secondConnection, "BEGIN CONCURRENT;");
+        Execute(secondConnection, "ROLLBACK;");
     }
 
     [Test]

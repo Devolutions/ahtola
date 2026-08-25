@@ -9,14 +9,15 @@ internal enum MvccCheckpointPhase : byte
 {
     Prepare = 0,
     AcquireLock = 1,
-    CollectRows = 2,
-    MaterializeCatalog = 3,
-    PersistCatalog = 4,
+    BuildSnapshot = 2,
+    MaterializeRows = 3,
+    CommitPager = 4,
     BackfillMainStore = 5,
-    TruncateLogicalLog = 6,
-    ResetWal = 7,
-    GarbageCollect = 8,
-    Finalize = 9,
+    SyncMainStore = 6,
+    RetireLogicalLog = 7,
+    ResetWal = 8,
+    GarbageCollect = 9,
+    Complete = 10,
 }
 
 /// <summary>Outcome of a managed MVCC checkpoint attempt.</summary>
@@ -45,4 +46,32 @@ internal static class MvccCheckpoint
     internal static bool IsPassive(string? mode)
         => mode is null
             || mode.Equals("PASSIVE", StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// Retained phase driver for the managed synchronous checkpoint. Unlike Turso's
+/// cooperative driver, each entered phase completes synchronously before the
+/// next phase is published.
+/// </summary>
+internal sealed class MvccCheckpointStateMachine
+{
+    internal MvccCheckpointPhase Phase { get; private set; } = MvccCheckpointPhase.Prepare;
+
+    internal void Enter(MvccCheckpointPhase phase)
+    {
+        if (phase <= Phase)
+            throw new InvalidOperationException(
+                $"MVCC checkpoint cannot move from {Phase} to {phase}.");
+        Phase = phase;
+    }
+
+    internal MvccCheckpointResult Result(
+        bool busy,
+        long logFramesBefore,
+        long checkpointedFrames)
+        => new(
+            Busy: busy,
+            LogFramesBefore: logFramesBefore,
+            CheckpointedFrames: checkpointedFrames,
+            CompletedThrough: Phase);
 }

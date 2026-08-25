@@ -95,6 +95,99 @@ public sealed class MvccHeaderAndDualCursorTests
         merged.Select(r => r.RowId).OrderBy(x => x).Should().Equal(1L, 99L);
     }
 
+    [Test]
+    public void DualCursorConsumesOnlyThePrefixNeededForFirstWinner()
+    {
+        var store = new MvStore();
+        var table = store.GetOrCreateTableId("t");
+        var tx = store.BeginTransaction();
+        store.Insert(tx.Id, new MvccRowId(table, 50_000), [SqlValue.Integer(50_000)]);
+        var visitedBaseRows = 0;
+
+        IEnumerable<MvccDualCursor.Row> BaseRows()
+        {
+            for (var rowId = 1L; rowId <= 100_000; rowId++)
+            {
+                visitedBaseRows++;
+                yield return new MvccDualCursor.Row(
+                    MvccKey.FromInteger(rowId),
+                    [SqlValue.Integer(rowId)]);
+            }
+        }
+
+        var rows = MvccDualCursor.EnumerateVisibleRows(
+            store,
+            tx.Id,
+            table,
+            BaseRows(),
+            MvccKeyComparer.Integer);
+        visitedBaseRows.Should().Be(0);
+
+        using var cursor = rows.GetEnumerator();
+        cursor.MoveNext().Should().BeTrue();
+        cursor.Current.Key.Integer.Should().Be(1);
+        visitedBaseRows.Should().Be(1);
+    }
+
+    [Test]
+    public void DualCursorUsesCompositePrimaryKeyCollationAndDirection()
+    {
+        var schema = new SqlitePrimaryKeySchema(
+        [
+            new SqlitePrimaryKeyTerm(
+                0,
+                "name",
+                SqliteKeySortOrder.Ascending,
+                SqliteKeyCollation.FromName("NOCASE")),
+            new SqlitePrimaryKeyTerm(
+                1,
+                "rank",
+                SqliteKeySortOrder.Descending,
+                SqliteKeyCollation.Binary),
+        ]);
+        var recordComparer = new SqliteIndexRecordComparer(
+            SqliteTextEncoding.Utf8,
+            schema.Terms.Select(term =>
+                new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+        var comparer = MvccKeyComparer.ForRecord(recordComparer);
+        var store = new MvStore();
+        var table = store.GetOrCreateTableId("t");
+        var tx = store.BeginTransaction();
+        var alphaTwo = MvccKey.FromPrimaryKey(
+            schema,
+            [SqlValue.Text("ALPHA"), SqlValue.Integer(2)],
+            SqliteTextEncoding.Utf8);
+        var betaOne = MvccKey.FromPrimaryKey(
+            schema,
+            [SqlValue.Text("beta"), SqlValue.Integer(1)],
+            SqliteTextEncoding.Utf8);
+        store.Insert(tx.Id, new MvccRowId(table, betaOne), [SqlValue.Text("beta-1")]);
+        store.Insert(tx.Id, new MvccRowId(table, alphaTwo), [SqlValue.Text("alpha-2")]);
+
+        var alphaThree = MvccKey.FromPrimaryKey(
+            schema,
+            [SqlValue.Text("alpha"), SqlValue.Integer(3)],
+            SqliteTextEncoding.Utf8);
+        var alphaOne = MvccKey.FromPrimaryKey(
+            schema,
+            [SqlValue.Text("alpha"), SqlValue.Integer(1)],
+            SqliteTextEncoding.Utf8);
+        var merged = MvccDualCursor.EnumerateVisibleRows(
+                store,
+                tx.Id,
+                table,
+                [
+                    new MvccDualCursor.Row(alphaThree, [SqlValue.Text("alpha-3")]),
+                    new MvccDualCursor.Row(alphaOne, [SqlValue.Text("alpha-1")]),
+                ],
+                comparer)
+            .ToArray();
+
+        merged.Select(row => row.Cells[0].AsText())
+            .Should()
+            .Equal("alpha-3", "alpha-2", "alpha-1", "beta-1");
+    }
+
     private static SqlValue ReadValue(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);

@@ -77,6 +77,13 @@ public sealed class SqliteIndexRecordComparer
     /// <summary>The database text encoding used to interpret text record fields.</summary>
     public SqliteTextEncoding TextEncoding { get; }
 
+    internal bool HasSameSemantics(SqliteIndexRecordComparer other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        return TextEncoding == other.TextEncoding
+            && _terms.SequenceEqual(other._terms);
+    }
+
     /// <summary>Compares two complete SQLite record payloads.</summary>
     public int Compare(ReadOnlySpan<byte> leftRecord, ReadOnlySpan<byte> rightRecord)
         => Compare(SqliteRecordCodec.Decode(leftRecord, TextEncoding), SqliteRecordCodec.Decode(rightRecord, TextEncoding));

@@ -2755,10 +2755,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     Busy: false,
                     LogFramesBefore: 0,
                     CheckpointedFrames: 0,
-                    CompletedThrough: MvccCheckpointPhase.Finalize);
+                    CompletedThrough: MvccCheckpointPhase.Complete);
             }
 
-            var phase = MvccCheckpointPhase.Prepare;
+            var stateMachine = new MvccCheckpointStateMachine();
             var log = store.LogicalLog;
             var logBefore = log?.ApproximatePayloadBytes ?? 0L;
             var requiresLogUpgrade = log?.RequiresVersion4Upgrade == true;
@@ -2768,94 +2768,81 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     "cannot safely checkpoint a legacy MVCC logical log with unresolved table identities.");
             }
 
-            phase = MvccCheckpointPhase.AcquireLock;
+            stateMachine.Enter(MvccCheckpointPhase.AcquireLock);
             var wantTruncate = MvccCheckpoint.ShouldTruncateLog(mode);
 
-            // An active concurrent transaction pins an MVCC reader floor. Do not
-            // materialize, retire the log, or reset the WAL beneath that snapshot.
-            if (store.HasActiveTransactions())
+            if (!store.TryAcquireCheckpoint(out var checkpointLease))
+                return stateMachine.Result(busy: true, logBefore, checkpointedFrames: 0);
+            using (checkpointLease)
             {
-                return new MvccCheckpointResult(
-                    Busy: true,
-                    LogFramesBefore: logBefore,
-                    CheckpointedFrames: 0,
-                    CompletedThrough: phase);
-            }
+                stateMachine.Enter(MvccCheckpointPhase.BuildSnapshot);
+                // The current catalog serializer remains the pager commit boundary.
 
-            phase = MvccCheckpointPhase.CollectRows;
-            // Snapshot is taken inside MergeConcurrentCatalogFromStoreLocked.
+                stateMachine.Enter(MvccCheckpointPhase.MaterializeRows);
+                var merged = MergeConcurrentCatalogFromStoreLocked(LiveCatalog);
 
-            phase = MvccCheckpointPhase.MaterializeCatalog;
-            var merged = MergeConcurrentCatalogFromStoreLocked(LiveCatalog);
-
-            phase = MvccCheckpointPhase.PersistCatalog;
-            if (_fileStore is null)
-            {
-                PublishCatalog(merged);
-            }
-            else
-            {
-                PersistFileCatalog(
-                    merged,
-                    pragmaHeader: null,
-                    forceFullRewrite: false,
-                    busyTimeout,
-                    checkpointAfterCommit: false);
-
-                phase = MvccCheckpointPhase.BackfillMainStore;
-                try
+                stateMachine.Enter(MvccCheckpointPhase.CommitPager);
+                if (_fileStore is null)
                 {
-                    _ = _fileStore.BackfillMvccCheckpoint(busyTimeout);
+                    PublishCatalog(merged);
                 }
-                catch (SqlitePagerBusyException)
+                else
                 {
-                    return new MvccCheckpointResult(
-                        Busy: true,
-                        LogFramesBefore: logBefore,
-                        CheckpointedFrames: 0,
-                        CompletedThrough: phase);
+                    PersistFileCatalog(
+                        merged,
+                        pragmaHeader: null,
+                        forceFullRewrite: false,
+                        busyTimeout,
+                        checkpointAfterCommit: false);
+
+                    try
+                    {
+                        _ = _fileStore.BackfillMvccCheckpoint(busyTimeout);
+                    }
+                    catch (SqlitePagerBusyException)
+                    {
+                        return stateMachine.Result(busy: true, logBefore, checkpointedFrames: 0);
+                    }
+
+                    stateMachine.Enter(MvccCheckpointPhase.BackfillMainStore);
+                    stateMachine.Enter(MvccCheckpointPhase.SyncMainStore);
                 }
-            }
 
-            var checkpointed = logBefore;
-            if ((wantTruncate || requiresLogUpgrade) && log is not null)
-            {
-                phase = MvccCheckpointPhase.TruncateLogicalLog;
-                log.TruncateAfterCheckpoint(synchronousMode);
-                if (requiresLogUpgrade)
-                    log.UpgradeToVersion4AfterCheckpoint(synchronousMode);
-                if (wantTruncate)
-                    checkpointed = logBefore;
-            }
-
-            if (wantTruncate && _fileStore is not null)
-            {
-                phase = MvccCheckpointPhase.ResetWal;
-                try
+                var checkpointed = logBefore;
+                if ((wantTruncate || requiresLogUpgrade) && log is not null)
                 {
-                    _ = _fileStore.ResetMvccCheckpointWal(busyTimeout);
+                    log.TruncateAfterCheckpoint(synchronousMode);
+                    if (requiresLogUpgrade)
+                        log.UpgradeToVersion4AfterCheckpoint(synchronousMode);
+                    if (wantTruncate)
+                        checkpointed = logBefore;
+                    stateMachine.Enter(MvccCheckpointPhase.RetireLogicalLog);
                 }
-                catch (SqlitePagerBusyException)
+
+                if (wantTruncate && _fileStore is not null)
                 {
-                    // The main store and logical log are already durable. Retain the
-                    // validated WAL for a later restart rather than losing reader data.
-                    return new MvccCheckpointResult(
-                        Busy: true,
-                        LogFramesBefore: logBefore,
-                        CheckpointedFrames: checkpointed,
-                        CompletedThrough: phase);
+                    try
+                    {
+                        _ = _fileStore.ResetMvccCheckpointWal(busyTimeout);
+                    }
+                    catch (SqlitePagerBusyException)
+                    {
+                        // The main store and logical log are already durable. Retain the
+                        // validated WAL for a later restart rather than losing reader data.
+                        return stateMachine.Result(busy: true, logBefore, checkpointed);
+                    }
+                    stateMachine.Enter(MvccCheckpointPhase.ResetWal);
                 }
+
+                store.GarbageCollectAfterCheckpoint();
+                stateMachine.Enter(MvccCheckpointPhase.GarbageCollect);
+
+                stateMachine.Enter(MvccCheckpointPhase.Complete);
+                return stateMachine.Result(
+                    busy: false,
+                    logBefore,
+                    checkpointedFrames: wantTruncate ? checkpointed : 0);
             }
-
-            phase = MvccCheckpointPhase.GarbageCollect;
-            store.GarbageCollectAfterCheckpoint();
-
-            phase = MvccCheckpointPhase.Finalize;
-            return new MvccCheckpointResult(
-                Busy: false,
-                LogFramesBefore: logBefore,
-                CheckpointedFrames: wantTruncate ? checkpointed : 0,
-                CompletedThrough: phase);
         }
     }
 
@@ -3959,7 +3946,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ExecuteTableList: executeTableList,
             ConcurrentMvStore: concurrentMvStore,
             ConcurrentMvccTxId: concurrentMvccTxId,
-            ConcurrentBaseTables: concurrentMvStore is null ? null : CloneTablesShallow(catalog.Tables),
+            ConcurrentBaseTables: concurrentMvStore is null || !MayMutate(statement)
+                ? null
+                : CloneTablesShallow(catalog.Tables),
             ConcurrentMvccIdentityTracker: concurrentMvStore is null ? null : new ConcurrentMvccIdentityTracker(),
             MvccTextEncoding: GetTextEncoding(),
             VirtualTables: catalog.VirtualTables,
@@ -28828,61 +28817,66 @@ out bool hasReturning)
         if (context.ConcurrentMvStore is { } store
             && context.ConcurrentMvccTxId is { } txId)
         {
-            SqliteIndexRecordComparer? primaryKeyComparer = null;
+            IComparer<MvccKey> keyComparer = MvccKeyComparer.Integer;
             if (!table.HasRowid)
             {
                 var primaryKey = table.PrimaryKeySchema
                     ?? throw new EmbeddedSqlException(
                         $"WITHOUT ROWID table '{source.Name}' is missing primary-key metadata for concurrent MVCC.");
-                primaryKeyComparer = new SqliteIndexRecordComparer(
-                    context.MvccTextEncoding,
-                    primaryKey.Terms.Select(term =>
-                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+                keyComparer = MvccKeyComparer.ForRecord(
+                    new SqliteIndexRecordComparer(
+                        context.MvccTextEncoding,
+                        primaryKey.Terms.Select(term =>
+                            new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray()));
             }
 
-            var baseRows = new MvccDualCursor.Row[table.Rows.Count];
-            for (var i = 0; i < table.Rows.Count; i++)
+            IEnumerable<MvccDualCursor.Row> EnumerateBaseRows()
             {
-                var rowId = i < table.RowIds.Count ? table.RowIds[i] : i + 1;
-                var key = table.HasRowid
-                    ? MvccKey.FromInteger(rowId)
-                    : MvccKey.FromPrimaryKey(
-                        table.PrimaryKeySchema!,
-                        table.Rows[i],
-                        context.MvccTextEncoding);
-                baseRows[i] = new MvccDualCursor.Row(key, table.Rows[i]);
+                foreach (var index in table.GetScanOrderIndices())
+                {
+                    var rowId = index < table.RowIds.Count ? table.RowIds[index] : index + 1;
+                    var key = table.HasRowid
+                        ? MvccKey.FromInteger(rowId)
+                        : MvccKey.FromPrimaryKey(
+                            table.PrimaryKeySchema!,
+                            table.Rows[index],
+                            context.MvccTextEncoding);
+                    yield return new MvccDualCursor.Row(key, table.Rows[index]);
+                }
             }
 
             var tableId = store.GetOrCreateTableId(source.Name);
-            var merged = MvccDualCursor.MergeVisibleRows(
+            var merged = MvccDualCursor.EnumerateVisibleRows(
                 store,
                 txId,
                 tableId,
-                baseRows,
-                (left, right) => table.HasRowid
-                    ? left.Integer.CompareTo(right.Integer)
-                    : primaryKeyComparer!.Compare(left.Record.Span, right.Record.Span));
-            var count = merged.Count;
-            if (maximumRows is { } maximum && maximum < count)
-                count = (int)maximum;
+                EnumerateBaseRows(),
+                keyComparer);
 
-            var dualSourceRows = new SourceRow[count];
-            for (var outputIndex = 0; outputIndex < count; outputIndex++)
+            IEnumerable<SourceRow> EnumerateSourceRows()
             {
-                var row = merged[outputIndex];
-                dualSourceRows[outputIndex] = new SourceRow(
-                    table.Columns,
-                    row.Cells,
-                    qualifiedColumns,
-                    outerRow,
-                    RowId: table.HasRowid ? row.Key.Integer : null,
-                    RowIdQualifier: qualifier,
-                    ColumnDefinitions: table.ColumnDefinitions,
-                    QualifiedColumnDefinitions: qualifiedColumnDefinitions,
-                    MethodIndexSource: methodIndexSource);
+                long emitted = 0;
+                using var cursor = merged.GetEnumerator();
+                while (maximumRows is not { } maximum || emitted < maximum)
+                {
+                    if (!cursor.MoveNext())
+                        yield break;
+                    emitted++;
+                    var row = cursor.Current;
+                    yield return new SourceRow(
+                        table.Columns,
+                        row.Cells,
+                        qualifiedColumns,
+                        outerRow,
+                        RowId: table.HasRowid ? row.Key.Integer : null,
+                        RowIdQualifier: qualifier,
+                        ColumnDefinitions: table.ColumnDefinitions,
+                        QualifiedColumnDefinitions: qualifiedColumnDefinitions,
+                        MethodIndexSource: methodIndexSource);
+                }
             }
 
-            return new SourceData(table.Columns, dualSourceRows);
+            return new SourceData(table.Columns, new LazyReadOnlyList<SourceRow>(EnumerateSourceRows()));
         }
 
         var rowCount = table.Rows.Count;
@@ -49243,6 +49237,8 @@ internal sealed class EmbeddedTable
     private readonly Dictionary<string, int> _columnIndices;
     private bool _hasEffectivePrimaryKeyConflictAlgorithm;
     private InsertConflictAlgorithm? _effectivePrimaryKeyConflictAlgorithm;
+    private int[]? _cachedRowidScanOrder;
+    private long _cachedRowidScanOrderRevision = -1;
 
     public EmbeddedTable(
         string name,
@@ -49973,6 +49969,33 @@ internal sealed class EmbeddedTable
     public bool HasRowid => !WithoutRowid;
 
     public bool WithoutRowid { get; }
+
+    internal IEnumerable<int> GetScanOrderIndices()
+    {
+        if (!HasRowid)
+        {
+            for (var index = 0; index < Rows.Count; index++)
+                yield return index;
+            yield break;
+        }
+
+        if (_cachedRowidScanOrder is null
+            || _cachedRowidScanOrderRevision != Rows.Revision
+            || _cachedRowidScanOrder.Length != Rows.Count)
+        {
+            if (RowIds.Count != Rows.Count)
+                throw new InvalidOperationException($"Table '{Name}' has inconsistent row identity metadata.");
+
+            _cachedRowidScanOrder = Enumerable.Range(0, Rows.Count).ToArray();
+            Array.Sort(
+                _cachedRowidScanOrder,
+                (left, right) => RowIds[left].CompareTo(RowIds[right]));
+            _cachedRowidScanOrderRevision = Rows.Revision;
+        }
+
+        foreach (var index in _cachedRowidScanOrder)
+            yield return index;
+    }
 
     public bool Strict { get; }
 
@@ -52301,3 +52324,83 @@ internal sealed record SourceData(
     IReadOnlyList<string?>? Collations = null,
     IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null,
     IReadOnlyList<Expression>? OmittedVirtualTablePredicates = null);
+
+internal sealed class LazyReadOnlyList<T>(IEnumerable<T> source) : IReadOnlyList<T>
+{
+    private readonly object _gate = new();
+    private readonly List<T> _cache = [];
+    private IEnumerator<T>? _source = (source ?? throw new ArgumentNullException(nameof(source))).GetEnumerator();
+
+    public int Count
+    {
+        get
+        {
+            lock (_gate)
+            {
+                while (MoveNextLocked())
+                {
+                }
+                return _cache.Count;
+            }
+        }
+    }
+
+    public T this[int index]
+    {
+        get
+        {
+            if (index < 0)
+                throw new ArgumentOutOfRangeException(nameof(index));
+            lock (_gate)
+            {
+                while (_cache.Count <= index && MoveNextLocked())
+                {
+                }
+                return index < _cache.Count
+                    ? _cache[index]
+                    : throw new ArgumentOutOfRangeException(nameof(index));
+            }
+        }
+    }
+
+    public IEnumerator<T> GetEnumerator()
+    {
+        for (var index = 0; TryGet(index, out var item); index++)
+            yield return item!;
+    }
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+
+    private bool TryGet(int index, out T? item)
+    {
+        lock (_gate)
+        {
+            while (_cache.Count <= index && MoveNextLocked())
+            {
+            }
+            if (index < _cache.Count)
+            {
+                item = _cache[index];
+                return true;
+            }
+        }
+
+        item = default;
+        return false;
+    }
+
+    private bool MoveNextLocked()
+    {
+        if (_source is null)
+            return false;
+        if (_source.MoveNext())
+        {
+            _cache.Add(_source.Current);
+            return true;
+        }
+
+        _source.Dispose();
+        _source = null;
+        return false;
+    }
+}

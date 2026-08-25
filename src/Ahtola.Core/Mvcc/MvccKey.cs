@@ -130,3 +130,47 @@ internal enum MvccKeyKind : byte
     Integer = 0,
     Record = 1,
 }
+
+/// <summary>
+/// SQLite ordering for one MVCC object. Encoded SQLite records are never
+/// compared bytewise because serial types, collations, and DESC terms all
+/// participate in their B-tree order.
+/// </summary>
+internal sealed class MvccKeyComparer : IComparer<MvccKey>
+{
+    private static readonly MvccKeyComparer IntegerInstance = new(recordComparer: null);
+    private readonly SqliteIndexRecordComparer? _recordComparer;
+
+    private MvccKeyComparer(SqliteIndexRecordComparer? recordComparer)
+        => _recordComparer = recordComparer;
+
+    internal static IComparer<MvccKey> Integer => IntegerInstance;
+
+    internal static IComparer<MvccKey> ForRecord(SqliteIndexRecordComparer comparer)
+        => new MvccKeyComparer(comparer ?? throw new ArgumentNullException(nameof(comparer)));
+
+    internal bool IsCompatibleWith(MvccKeyComparer other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        if (_recordComparer is null || other._recordComparer is null)
+            return _recordComparer is null && other._recordComparer is null;
+        return _recordComparer.HasSameSemantics(other._recordComparer);
+    }
+
+    public int Compare(MvccKey left, MvccKey right)
+    {
+        if (left.Kind != right.Kind)
+            throw new InvalidOperationException("An MVCC object cannot mix integer and record keys.");
+
+        if (left.IsInteger)
+        {
+            if (_recordComparer is not null)
+                throw new InvalidOperationException("A record-key MVCC object received an integer key.");
+            return left.Integer.CompareTo(right.Integer);
+        }
+
+        if (_recordComparer is null)
+            throw new InvalidOperationException("An integer-key MVCC object received a record key.");
+        return _recordComparer.Compare(left.Record.Span, right.Record.Span);
+    }
+}

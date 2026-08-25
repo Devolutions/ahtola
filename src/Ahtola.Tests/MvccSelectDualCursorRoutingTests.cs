@@ -443,6 +443,18 @@ public sealed class MvccSelectDualCursorRoutingTests
         Convert.ToInt64(Scalar(connection, "SELECT COUNT(*) FROM child;")).Should().Be(0L);
     }
 
+    [Test]
+    public void ConcurrentLimitOneAllocationDoesNotScaleWithTheBaseCatalog()
+    {
+        const int largeRowCount = 10_000;
+        var smallAllocation = MeasureConcurrentLimitOneAllocation(rowCount: 10);
+        var largeAllocation = MeasureConcurrentLimitOneAllocation(largeRowCount);
+
+        largeAllocation.Should().BeLessThan(
+            smallAllocation + 256 * 1024,
+            "a warmed LIMIT 1 scan should retain only the lazy cursor peeks and consumed row");
+    }
+
     private static object? Scalar(SqliteConnection connection, string sql)
     {
         using var command = connection.CreateCommand();
@@ -464,6 +476,49 @@ public sealed class MvccSelectDualCursorRoutingTests
         {
             return exception;
         }
+    }
+
+    private static long MeasureConcurrentLimitOneAllocation(int rowCount)
+    {
+        var fileSystem = new Ahtola.Core.Storage.InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile($"mvcc-limit-{rowCount}.db", fileSystem);
+        using var connection = database.Connect();
+        using (var create = connection.Prepare("CREATE TABLE t(v INTEGER);"))
+            _ = create.Step();
+
+        var values = new System.Text.StringBuilder("INSERT INTO t VALUES ");
+        for (var value = 1; value <= rowCount; value++)
+        {
+            if (value != 1)
+                values.Append(',');
+            values.Append('(').Append(value).Append(')');
+        }
+        values.Append(';');
+        using (var seed = connection.Prepare(values.ToString()))
+            _ = seed.Step();
+        using (var mode = connection.Prepare("PRAGMA journal_mode=mvcc;"))
+            _ = mode.Step();
+        using (var begin = connection.Prepare("BEGIN CONCURRENT;"))
+            _ = begin.Step();
+
+        // Build and cache the rowid scan order before measuring statement execution.
+        ExecuteLimitOne(connection);
+        ExecuteLimitOne(connection);
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        ExecuteLimitOne(connection);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        using (var rollback = connection.Prepare("ROLLBACK;"))
+            _ = rollback.Step();
+        return allocated;
+    }
+
+    private static void ExecuteLimitOne(EmbeddedConnection connection)
+    {
+        using var statement = connection.Prepare("SELECT v FROM t LIMIT 1;");
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).AsInteger().Should().Be(1L);
     }
 
     private sealed class RoutingFileDatabase : IDisposable
