@@ -2075,6 +2075,7 @@ internal static class ManagedReplicaBootstrapper
             $".{Path.GetFileName(options.Path)}.protected-{Guid.NewGuid():N}.tmp");
         var databaseInstalled = false;
         var metadataInstalled = false;
+        var preserveBackup = false;
         IDisposable? mainFileReplacementLock = null;
         try
         {
@@ -2170,6 +2171,15 @@ internal static class ManagedReplicaBootstrapper
                 options.Path,
                 backupPath,
                 () => databaseInstalled = true);
+            if (OperatingSystem.IsWindows()
+                && !string.Equals(
+                    ComputeDatabaseFingerprint(options.Path),
+                    installedFingerprint,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "Managed embedded replica changed during its Windows replacement lock handoff.");
+            }
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished);
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -2210,10 +2220,18 @@ internal static class ManagedReplicaBootstrapper
             // interruption must preserve that matched pair rather than restore only DB.
             if (databaseInstalled && !metadataInstalled && File.Exists(backupPath))
             {
-                ManagedReplicaApplyLock.RollBackMainFile(
-                    mainFileReplacementLock,
-                    backupPath,
-                    options.Path);
+                try
+                {
+                    ManagedReplicaApplyLock.RollBackMainFile(
+                        mainFileReplacementLock,
+                        backupPath,
+                        options.Path);
+                }
+                catch
+                {
+                    preserveBackup = true;
+                    throw;
+                }
             }
             throw;
         }
@@ -2224,7 +2242,8 @@ internal static class ManagedReplicaBootstrapper
             DeleteIfExists(metadataStagingPath);
             DeleteIfExists(protectedStagingPath);
             DeleteStagingSidecars(protectedStagingPath);
-            DeleteIfExists(backupPath);
+            if (!preserveBackup)
+                DeleteIfExists(backupPath);
             mainFileReplacementLock?.Dispose();
         }
     }

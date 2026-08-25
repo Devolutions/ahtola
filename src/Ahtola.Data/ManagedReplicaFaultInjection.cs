@@ -176,6 +176,25 @@ internal enum ManagedReplicaDurableBoundary
     /// waits for the push/apply publication leases.
     /// </summary>
     PartialImagePublicationLockWaiting,
+
+    /// <summary>
+    /// Windows-only boundary after the private replacement inode's SQLite byte-range lease is
+    /// released because ReplaceFile cannot rename a locked source, while the old destination inode
+    /// remains locked.
+    /// </summary>
+    MainFileReplacementSourceLeaseReleased,
+
+    /// <summary>
+    /// Windows-only boundary after ReplaceFile publishes the replacement inode and before its
+    /// SQLite byte-range lease is reacquired through the final path.
+    /// </summary>
+    MainFileReplacementPublishedBeforeLease,
+
+    /// <summary>
+    /// Windows-only boundary after rollback releases both SQLite inode leases and before ReplaceFile
+    /// restores the retained backup.
+    /// </summary>
+    MainFileRollbackLeasesReleased,
 }
 
 /// <summary>

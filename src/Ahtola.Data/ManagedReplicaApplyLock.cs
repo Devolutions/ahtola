@@ -174,7 +174,7 @@ internal static class ManagedReplicaLockCarrier
         return pathCarrier;
     }
 
-    private static void EnsureCarrier(string carrierPath)
+    internal static void EnsureCarrier(string carrierPath)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(carrierPath)!);
 
@@ -260,6 +260,184 @@ internal static class ManagedReplicaLockCarrier
 }
 
 /// <summary>
+/// Acquires only the physical-identity carrier for an existing database inode. Registrations make
+/// the carrier safely reclaimable: every holder and waiter registers under one directory guard
+/// before opening the carrier, and the last registration removes both files.
+/// </summary>
+internal sealed class ManagedReplicaPhysicalCarrierLease : IAsyncDisposable
+{
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> Gates =
+        new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, byte> ActiveRegistrations =
+        new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, object> RegistryGates =
+        new(StringComparer.Ordinal);
+
+    private SemaphoreSlim? _gate;
+    private SqliteWalByteRangeLockLease? _carrierLease;
+    private Registration? _registration;
+
+    private ManagedReplicaPhysicalCarrierLease(
+        SemaphoreSlim? gate,
+        SqliteWalByteRangeLockLease? carrierLease,
+        Registration? registration)
+    {
+        _gate = gate;
+        _carrierLease = carrierLease;
+        _registration = registration;
+    }
+
+    internal static async ValueTask<ManagedReplicaPhysicalCarrierLease> AcquireAsync(
+        string databasePath,
+        string kind,
+        CancellationToken cancellationToken)
+    {
+        while (ManagedReplicaLockCarrier.TryResolvePhysical(databasePath, kind) is { } carrierPath)
+        {
+            Registration? registration = null;
+            SemaphoreSlim? gate = null;
+            SqliteWalByteRangeLockLease? carrierLease = null;
+            var gateHeld = false;
+            try
+            {
+                registration = Registration.Create(carrierPath);
+                gate = Gates.GetOrAdd(carrierPath, static _ => new SemaphoreSlim(1, 1));
+                await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                gateHeld = true;
+                carrierLease = new SqliteWalByteRangeLock(carrierPath).AcquireExclusive(
+                    offset: 0,
+                    length: 1,
+                    Timeout.InfiniteTimeSpan,
+                    cancellationToken);
+                if (string.Equals(
+                        ManagedReplicaLockCarrier.TryResolvePhysical(databasePath, kind),
+                        carrierPath,
+                        StringComparison.Ordinal))
+                {
+                    return new ManagedReplicaPhysicalCarrierLease(gate, carrierLease, registration);
+                }
+            }
+            catch
+            {
+                carrierLease?.Dispose();
+                if (gateHeld)
+                    gate!.Release();
+                registration?.Dispose();
+                throw;
+            }
+
+            carrierLease.Dispose();
+            gate.Release();
+            registration.Dispose();
+        }
+
+        return new ManagedReplicaPhysicalCarrierLease(null, null, null);
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Interlocked.Exchange(ref _carrierLease, null)?.Dispose();
+        Interlocked.Exchange(ref _gate, null)?.Release();
+        Interlocked.Exchange(ref _registration, null)?.Dispose();
+        return ValueTask.CompletedTask;
+    }
+
+    private sealed class Registration : IDisposable
+    {
+        private readonly string _carrierPath;
+        private readonly string _holderPath;
+        private SqliteWalByteRangeLockLease? _holderLease;
+
+        private Registration(
+            string carrierPath,
+            string holderPath,
+            SqliteWalByteRangeLockLease holderLease)
+        {
+            _carrierPath = carrierPath;
+            _holderPath = holderPath;
+            _holderLease = holderLease;
+        }
+
+        internal static Registration Create(string carrierPath)
+        {
+            var directory = Path.GetDirectoryName(carrierPath)!;
+            Directory.CreateDirectory(directory);
+            var registryPath = Path.Combine(directory, "physical-carrier-registry.lock");
+            ManagedReplicaLockCarrier.EnsureCarrier(registryPath);
+            lock (RegistryGates.GetOrAdd(registryPath, static _ => new object()))
+            {
+                using var registryLease = new SqliteWalByteRangeLock(registryPath).AcquireExclusive(
+                    offset: 0,
+                    length: 1,
+                    Timeout.InfiniteTimeSpan,
+                    CancellationToken.None);
+
+                CleanupStaleRegistrations(carrierPath);
+                ManagedReplicaLockCarrier.EnsureCarrier(carrierPath);
+                var holderPath = string.Concat(
+                    carrierPath,
+                    ".holder-",
+                    Environment.ProcessId.ToString(CultureInfo.InvariantCulture),
+                    "-",
+                    Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+                ManagedReplicaLockCarrier.EnsureCarrier(holderPath);
+                var holderLease = new SqliteWalByteRangeLock(holderPath).AcquireExclusive(
+                    offset: 0,
+                    length: 1,
+                    Timeout.InfiniteTimeSpan,
+                    CancellationToken.None);
+                ActiveRegistrations.TryAdd(holderPath, 0);
+                return new Registration(carrierPath, holderPath, holderLease);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _holderLease, null) is not { } holderLease)
+                return;
+
+            var directory = Path.GetDirectoryName(_carrierPath)!;
+            var registryPath = Path.Combine(directory, "physical-carrier-registry.lock");
+            lock (RegistryGates.GetOrAdd(registryPath, static _ => new object()))
+            {
+                using var registryLease = new SqliteWalByteRangeLock(registryPath).AcquireExclusive(
+                    offset: 0,
+                    length: 1,
+                    Timeout.InfiniteTimeSpan,
+                    CancellationToken.None);
+                ActiveRegistrations.TryRemove(_holderPath, out _);
+                holderLease.Dispose();
+                File.Delete(_holderPath);
+                CleanupStaleRegistrations(_carrierPath);
+                if (!EnumerateHolderPaths(_carrierPath).Any())
+                    File.Delete(_carrierPath);
+            }
+        }
+
+        private static void CleanupStaleRegistrations(string carrierPath)
+        {
+            foreach (var holderPath in EnumerateHolderPaths(carrierPath))
+            {
+                if (ActiveRegistrations.ContainsKey(holderPath))
+                    continue;
+                var marker = new SqliteWalByteRangeLock(holderPath);
+                if (!marker.TryAcquireExclusive(offset: 0, length: 1, out var staleLease))
+                    continue;
+                staleLease!.Dispose();
+                File.Delete(holderPath);
+            }
+        }
+
+        private static IEnumerable<string> EnumerateHolderPaths(string carrierPath)
+        {
+            var directory = Path.GetDirectoryName(carrierPath)!;
+            var pattern = Path.GetFileName(carrierPath) + ".holder-*";
+            return Directory.EnumerateFiles(directory, pattern, SearchOption.TopDirectoryOnly);
+        }
+    }
+}
+
+/// <summary>
 /// Narrow seam for the single exclusive lease that must be held across a managed embedded
 /// replica's apply sequence: from the moment WAL/journal sidecar state is validated, through
 /// checkpoint, main-file swap, and metadata publication (or rollback/cleanup on failure). Holding
@@ -305,7 +483,6 @@ internal static class ManagedReplicaApplyLock
     internal const string CarrierSuffix = ".ahtola-replica-apply-lock";
     private const long PendingByte = 0x4000_0000;
     private const long SQLiteExclusiveRangeLength = 512;
-    private static readonly TimeSpan ReplacementLockTimeout = TimeSpan.FromSeconds(30);
     private static IManagedReplicaApplyLockCoordinator _current = CrossProcessManagedReplicaApplyLockCoordinator.Instance;
 
     internal static IManagedReplicaApplyLockCoordinator Current
@@ -338,6 +515,8 @@ internal static class ManagedReplicaApplyLock
 
         IDisposable? destinationMainFileLease = null;
         IDisposable? replacementMainFileLease = null;
+        ManagedReplicaPhysicalCarrierLease? replacementPushCarrier = null;
+        ManagedReplicaPhysicalCarrierLease? replacementApplyCarrier = null;
         try
         {
             // The caller already owns the final path's stable push/apply carriers. Lock the two
@@ -347,6 +526,16 @@ internal static class ManagedReplicaApplyLock
             // while the old destination remains locked. The GUID staging path deliberately gets no
             // named carrier of its own; creating one per replacement would leak permanent files
             // into the shared carrier directory.
+            replacementPushCarrier = ManagedReplicaPhysicalCarrierLease.AcquireAsync(
+                    replacementPath,
+                    ManagedReplicaLockCarrier.PushKind,
+                    cancellationToken)
+                .AsTask().GetAwaiter().GetResult();
+            replacementApplyCarrier = ManagedReplicaPhysicalCarrierLease.AcquireAsync(
+                    replacementPath,
+                    ManagedReplicaLockCarrier.ApplyKind,
+                    cancellationToken)
+                .AsTask().GetAwaiter().GetResult();
             destinationMainFileLease = new SqliteWalByteRangeLock(path).AcquireExclusive(
                 PendingByte,
                 SQLiteExclusiveRangeLength,
@@ -360,12 +549,15 @@ internal static class ManagedReplicaApplyLock
             return new MainFileReplacementLease(
                 destinationMainFileLease,
                 replacementMainFileLease,
-                cancellationToken);
+                replacementPushCarrier,
+                replacementApplyCarrier);
         }
         catch
         {
             replacementMainFileLease?.Dispose();
             destinationMainFileLease?.Dispose();
+            replacementApplyCarrier?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            replacementPushCarrier?.DisposeAsync().AsTask().GetAwaiter().GetResult();
             throw;
         }
     }
@@ -404,10 +596,13 @@ internal static class ManagedReplicaApplyLock
     private sealed class MainFileReplacementLease(
         IDisposable destinationMainFileLease,
         IDisposable replacementMainFileLease,
-        CancellationToken cancellationToken) : IDisposable
+        ManagedReplicaPhysicalCarrierLease replacementPushCarrier,
+        ManagedReplicaPhysicalCarrierLease replacementApplyCarrier) : IDisposable
     {
         private IDisposable? _destinationMainFileLease = destinationMainFileLease;
         private IDisposable? _replacementMainFileLease = replacementMainFileLease;
+        private ManagedReplicaPhysicalCarrierLease? _replacementPushCarrier = replacementPushCarrier;
+        private ManagedReplicaPhysicalCarrierLease? _replacementApplyCarrier = replacementApplyCarrier;
 
         internal void ReleaseMainFileLease()
             => Interlocked.Exchange(ref _destinationMainFileLease, null)?.Dispose();
@@ -419,12 +614,20 @@ internal static class ManagedReplicaApplyLock
             Action replacementCompleted)
         {
             if (OperatingSystem.IsWindows())
+            {
                 Interlocked.Exchange(ref _replacementMainFileLease, null)?.Dispose();
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.MainFileReplacementSourceLeaseReleased);
+            }
 
             File.Replace(replacementPath, destinationPath, backupPath, ignoreMetadataErrors: false);
             replacementCompleted();
             if (OperatingSystem.IsWindows())
+            {
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease);
                 _replacementMainFileLease = AcquireSqliteMainFileLease(destinationPath);
+            }
         }
 
         internal void RollBack(string backupPath, string destinationPath)
@@ -433,6 +636,8 @@ internal static class ManagedReplicaApplyLock
             {
                 ReleaseMainFileLease();
                 Interlocked.Exchange(ref _replacementMainFileLease, null)?.Dispose();
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased);
             }
             File.Replace(backupPath, destinationPath, destinationBackupFileName: null, ignoreMetadataErrors: false);
         }
@@ -441,14 +646,18 @@ internal static class ManagedReplicaApplyLock
         {
             ReleaseMainFileLease();
             Interlocked.Exchange(ref _replacementMainFileLease, null)?.Dispose();
+            Interlocked.Exchange(ref _replacementApplyCarrier, null)
+                ?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            Interlocked.Exchange(ref _replacementPushCarrier, null)
+                ?.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
 
         private IDisposable AcquireSqliteMainFileLease(string path)
             => new SqliteWalByteRangeLock(path).AcquireExclusive(
                 PendingByte,
                 SQLiteExclusiveRangeLength,
-                ReplacementLockTimeout,
-                cancellationToken);
+                Timeout.InfiniteTimeSpan,
+                CancellationToken.None);
     }
 }
 
@@ -595,6 +804,7 @@ internal static class ManagedReplicaPushLock
     {
         var gates = new List<SemaphoreSlim>(2);
         var carrierLeases = new List<SqliteWalByteRangeLockLease>(2);
+        ManagedReplicaPhysicalCarrierLease? physicalLease = null;
         try
         {
             var stableCarrier = ManagedReplicaLockCarrier.EnsureStable(
@@ -609,38 +819,17 @@ internal static class ManagedReplicaPushLock
                 Timeout.InfiniteTimeSpan,
                 cancellationToken));
 
-            while (ManagedReplicaLockCarrier.EnsurePhysical(
-                       databasePath,
-                       ManagedReplicaLockCarrier.PushKind) is { } physicalCarrier)
-            {
-                var physicalGate = Gates.GetOrAdd(physicalCarrier, static _ => new SemaphoreSlim(1, 1));
-                await physicalGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-                gates.Add(physicalGate);
-                var physicalLease = new SqliteWalByteRangeLock(physicalCarrier).AcquireExclusive(
-                    offset: 0,
-                    length: 1,
-                    Timeout.InfiniteTimeSpan,
-                    cancellationToken);
-                if (string.Equals(
-                        ManagedReplicaLockCarrier.TryResolvePhysical(
-                            databasePath,
-                            ManagedReplicaLockCarrier.PushKind),
-                        physicalCarrier,
-                        StringComparison.Ordinal))
-                {
-                    carrierLeases.Add(physicalLease);
-                    break;
-                }
-
-                physicalLease.Dispose();
-                gates.RemoveAt(gates.Count - 1);
-                physicalGate.Release();
-            }
-
-            return new Lease(gates, carrierLeases);
+            physicalLease = await ManagedReplicaPhysicalCarrierLease.AcquireAsync(
+                    databasePath,
+                    ManagedReplicaLockCarrier.PushKind,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return new Lease(gates, carrierLeases, physicalLease);
         }
         catch
         {
+            if (physicalLease is not null)
+                await physicalLease.DisposeAsync().ConfigureAwait(false);
             for (var index = carrierLeases.Count - 1; index >= 0; index--)
                 carrierLeases[index].Dispose();
             for (var index = gates.Count - 1; index >= 0; index--)
@@ -651,13 +840,17 @@ internal static class ManagedReplicaPushLock
 
     private sealed class Lease(
         IReadOnlyList<SemaphoreSlim> gates,
-        IReadOnlyList<SqliteWalByteRangeLockLease> carrierLeases) : IAsyncDisposable
+        IReadOnlyList<SqliteWalByteRangeLockLease> carrierLeases,
+        ManagedReplicaPhysicalCarrierLease physicalLease) : IAsyncDisposable
     {
         private IReadOnlyList<SemaphoreSlim>? _gates = gates;
         private IReadOnlyList<SqliteWalByteRangeLockLease>? _carrierLeases = carrierLeases;
+        private ManagedReplicaPhysicalCarrierLease? _physicalLease = physicalLease;
 
-        public ValueTask DisposeAsync()
+        public async ValueTask DisposeAsync()
         {
+            if (Interlocked.Exchange(ref _physicalLease, null) is { } physical)
+                await physical.DisposeAsync().ConfigureAwait(false);
             if (Interlocked.Exchange(ref _carrierLeases, null) is { } leases)
             {
                 for (var index = leases.Count - 1; index >= 0; index--)
@@ -668,7 +861,6 @@ internal static class ManagedReplicaPushLock
                 for (var index = heldGates.Count - 1; index >= 0; index--)
                     heldGates[index].Release();
             }
-            return ValueTask.CompletedTask;
         }
     }
 }
@@ -683,6 +875,7 @@ internal sealed class CrossProcessManagedReplicaApplyLockCoordinator : IManagedR
     {
         var localLeases = new List<IAsyncDisposable>(2);
         var carrierLeases = new List<SqliteWalByteRangeLockLease>(2);
+        ManagedReplicaPhysicalCarrierLease? physicalLease = null;
         try
         {
             var stableCarrier = ManagedReplicaLockCarrier.EnsureStable(
@@ -697,39 +890,17 @@ internal sealed class CrossProcessManagedReplicaApplyLockCoordinator : IManagedR
                 Timeout.InfiniteTimeSpan,
                 cancellationToken));
 
-            while (ManagedReplicaLockCarrier.EnsurePhysical(
-                       path,
-                       ManagedReplicaLockCarrier.ApplyKind) is { } physicalCarrier)
-            {
-                var physicalLocalLease = await InProcessManagedReplicaApplyLockCoordinator
-                    .AcquireCarrierAsync(physicalCarrier, cancellationToken)
-                    .ConfigureAwait(false);
-                localLeases.Add(physicalLocalLease);
-                var physicalLease = new SqliteWalByteRangeLock(physicalCarrier).AcquireExclusive(
-                    offset: 0,
-                    length: 1,
-                    Timeout.InfiniteTimeSpan,
-                    cancellationToken);
-                if (string.Equals(
-                        ManagedReplicaLockCarrier.TryResolvePhysical(
-                            path,
-                            ManagedReplicaLockCarrier.ApplyKind),
-                        physicalCarrier,
-                        StringComparison.Ordinal))
-                {
-                    carrierLeases.Add(physicalLease);
-                    break;
-                }
-
-                physicalLease.Dispose();
-                localLeases.RemoveAt(localLeases.Count - 1);
-                await physicalLocalLease.DisposeAsync().ConfigureAwait(false);
-            }
-
-            return new Lease(localLeases, carrierLeases);
+            physicalLease = await ManagedReplicaPhysicalCarrierLease.AcquireAsync(
+                    path,
+                    ManagedReplicaLockCarrier.ApplyKind,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return new Lease(localLeases, carrierLeases, physicalLease);
         }
         catch
         {
+            if (physicalLease is not null)
+                await physicalLease.DisposeAsync().ConfigureAwait(false);
             for (var index = carrierLeases.Count - 1; index >= 0; index--)
                 carrierLeases[index].Dispose();
             for (var index = localLeases.Count - 1; index >= 0; index--)
@@ -740,13 +911,17 @@ internal sealed class CrossProcessManagedReplicaApplyLockCoordinator : IManagedR
 
     private sealed class Lease(
         IReadOnlyList<IAsyncDisposable> localLeases,
-        IReadOnlyList<SqliteWalByteRangeLockLease> carrierLeases) : IAsyncDisposable
+        IReadOnlyList<SqliteWalByteRangeLockLease> carrierLeases,
+        ManagedReplicaPhysicalCarrierLease physicalLease) : IAsyncDisposable
     {
         private IReadOnlyList<IAsyncDisposable>? _localLeases = localLeases;
         private IReadOnlyList<SqliteWalByteRangeLockLease>? _carrierLeases = carrierLeases;
+        private ManagedReplicaPhysicalCarrierLease? _physicalLease = physicalLease;
 
         public async ValueTask DisposeAsync()
         {
+            if (Interlocked.Exchange(ref _physicalLease, null) is { } physical)
+                await physical.DisposeAsync().ConfigureAwait(false);
             if (Interlocked.Exchange(ref _carrierLeases, null) is { } carrierLocks)
             {
                 for (var index = carrierLocks.Count - 1; index >= 0; index--)
@@ -791,7 +966,7 @@ internal sealed class InProcessManagedReplicaApplyLockCoordinator : IManagedRepl
                 path,
                 ManagedReplicaLockCarrier.ApplyKind);
             leases.Add(await AcquireCarrierAsync(stableCarrier, cancellationToken).ConfigureAwait(false));
-            while (ManagedReplicaLockCarrier.EnsurePhysical(
+            while (ManagedReplicaLockCarrier.TryResolvePhysical(
                        path,
                        ManagedReplicaLockCarrier.ApplyKind) is { } physicalCarrier)
             {

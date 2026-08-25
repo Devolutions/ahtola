@@ -107,6 +107,220 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public async Task WindowsReplacementHandoffsRemainContentionSafeForOrdinarySqliteWriters()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("replace-windows-handoff");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        CrossProcessReplicaRaceWorker? sourceGapWriter = null;
+        CrossProcessReplicaRaceWorker? publishedGapWriter = null;
+        Task? releasePublishedWriter = null;
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.MainFileReplacementSourceLeaseReleased
+                           && sourceGapWriter is null)
+                       {
+                           sourceGapWriter = new CrossProcessReplicaRaceWorker(
+                               TestContext.CurrentContext.WorkDirectory,
+                               path,
+                               "sqlite-write");
+                           sourceGapWriter.WaitForBlockedProbe();
+                       }
+                       else if (boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease
+                                && publishedGapWriter is null)
+                       {
+                           publishedGapWriter = new CrossProcessReplicaRaceWorker(
+                               TestContext.CurrentContext.WorkDirectory,
+                               path,
+                               "sqlite-hold");
+                           publishedGapWriter.WaitForProbeState("acquired");
+                           releasePublishedWriter = Task.Run(async () =>
+                           {
+                               await Task.Delay(500).ConfigureAwait(false);
+                               publishedGapWriter.ReleaseBlockedProbe();
+                           });
+                       }
+                   }))
+            {
+                var result = await connection.SyncAsync(
+                    new AhtolaSyncOptions(),
+                    CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            }
+
+            await releasePublishedWriter!.WaitAsync(TimeSpan.FromSeconds(30));
+            publishedGapWriter!.WaitForCompletion();
+            sourceGapWriter!.ReleaseBlockedProbe();
+            sourceGapWriter.WaitForCompletion();
+            ReadBootstrapMarker(connection).Should().Be(84);
+        }
+        finally
+        {
+            sourceGapWriter?.Dispose();
+            publishedGapWriter?.Dispose();
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task WindowsRollbackHandoffPreservesTheRecoverableBackupWhenInterrupted()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("rollback-windows-handoff");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        CrossProcessReplicaRaceWorker? rollbackWriter = null;
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease)
+                       {
+                           throw new IOException("Injected replacement reacquisition failure.");
+                       }
+
+                       if (boundary == ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased)
+                       {
+                           rollbackWriter = new CrossProcessReplicaRaceWorker(
+                               TestContext.CurrentContext.WorkDirectory,
+                               path,
+                               "sqlite-hold");
+                           rollbackWriter.WaitForProbeState("acquired");
+                           rollbackWriter.ReleaseBlockedProbe();
+                           rollbackWriter.WaitForCompletion();
+                           throw new IOException("Injected rollback handoff interruption.");
+                       }
+                   }))
+            {
+                var exception = Assert.ThrowsAsync<IOException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                exception!.Message.Should().Be("Injected rollback handoff interruption.");
+            }
+
+            rollbackWriter.Should().NotBeNull();
+            Directory.GetFiles(
+                    Path.GetDirectoryName(path)!,
+                    $".{Path.GetFileName(path)}.apply-*.bak")
+                .Should().ContainSingle(
+                    "an interrupted rollback must retain the old database image for recovery");
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+        }
+        finally
+        {
+            rollbackWriter?.Dispose();
+            foreach (var backupPath in Directory.GetFiles(
+                         Path.GetDirectoryName(path)!,
+                         $".{Path.GetFileName(path)}.apply-*.bak"))
+            {
+                File.Delete(backupPath);
+            }
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ReplacementPhysicalCarriersBlockAHardLinkAliasNoOpPullAfterPublication()
+    {
+        var path = NewReplicaPath("replace-physical-alias");
+        var aliasPath = path + ".alias";
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        CrossProcessReplicaRaceWorker? aliasPull = null;
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.IncrementalApplyStagedDatabase)
+                       {
+                           var directory = Path.GetDirectoryName(path)!;
+                           var stagingPath = Directory.GetFiles(
+                                   directory,
+                                   $".{Path.GetFileName(path)}.apply-*.tmp")
+                               .Single();
+                           ManagedReplicaJournalAndLockCarrierRegressionTests.RequireHardLink(
+                               aliasPath,
+                               stagingPath,
+                               verifyPhysicalIdentity: false);
+                           using var stream = new FileStream(
+                               stagingPath,
+                               FileMode.Open,
+                               FileAccess.Read,
+                               FileShare.ReadWrite | FileShare.Delete);
+                           var fingerprint = Convert.ToHexString(
+                               System.Security.Cryptography.SHA256.HashData(stream));
+                           var aliasMetadataPath =
+                               aliasPath + ManagedReplicaBootstrapper.MetadataSuffix;
+                           File.Copy(
+                               path + ManagedReplicaBootstrapper.MetadataSuffix,
+                               aliasMetadataPath);
+                           var aliasMetadataStagingPath =
+                               aliasMetadataPath + $".{Guid.NewGuid():N}.tmp";
+                           ManagedReplicaBootstrapper.WriteMetadata(
+                               aliasMetadataStagingPath,
+                               aliasMetadataPath,
+                               ManagedReplicaBootstrapper.LoadMetadata(path)!.Value with
+                               {
+                                   Revision = "revision-43",
+                                   DatabaseSha256 = fingerprint,
+                               });
+                       }
+                       else if (boundary == ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished)
+                       {
+                           aliasPull = new CrossProcessReplicaRaceWorker(
+                               TestContext.CurrentContext.WorkDirectory,
+                               aliasPath,
+                               "alias-noop-pull");
+                           aliasPull.WaitForBlockedProbe();
+                       }
+                   }))
+            {
+                var result = await connection.SyncAsync(
+                    new AhtolaSyncOptions(),
+                    CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            }
+
+            aliasPull.Should().NotBeNull();
+            aliasPull!.ReleaseBlockedProbe();
+            aliasPull.WaitForCompletion();
+            ReadBootstrapMarker(connection).Should().Be(84);
+        }
+        finally
+        {
+            aliasPull?.Dispose();
+            DeleteReplicaFiles(aliasPath);
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     [NonParallelizable]
     public void RepeatedMainFileReplacementDoesNotCreateGuidStagingCarriers()
     {
@@ -139,8 +353,12 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 File.Delete(backupPath);
             }
 
-            Directory.Exists(lockDirectory).Should().BeFalse(
-                "private replacement paths use their database inode directly and create no named carriers");
+            var retainedFiles = Directory.Exists(lockDirectory)
+                ? Directory.GetFiles(lockDirectory)
+                : [];
+            retainedFiles.Should().ContainSingle(
+                path => Path.GetFileName(path) == "physical-carrier-registry.lock",
+                "replacement generations reclaim their physical carriers and holder registrations");
         }
         finally
         {
@@ -337,6 +555,62 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         var releasePath = ReadWorkerValue("AHTOLA_REPLICA_RACE_RELEASE");
         File.WriteAllText(startedPath, string.Empty);
 
+        if (mode == "sqlite-hold")
+        {
+            using var connection = new NativeSqliteConnection(
+                $"Data Source={databasePath};Mode=ReadWrite;Default Timeout=30;Pooling=False");
+            connection.Open();
+            using var transaction = connection.BeginTransaction();
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "UPDATE bootstrap_marker SET value = value;";
+            command.ExecuteNonQuery().Should().Be(1);
+            File.WriteAllText(blockedPath, "acquired");
+            WaitForWorkerFile(
+                releasePath,
+                TimeSpan.FromSeconds(30),
+                "The ordinary SQLite writer was not released from the handoff probe.");
+            transaction.Rollback();
+            File.WriteAllText(completedPath, mode);
+            return;
+        }
+
+        if (mode == "alias-noop-pull")
+        {
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(databasePath)!.Value;
+            using var probeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            try
+            {
+                await ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                        CreateOptions(
+                            databasePath,
+                            new PullUpdatesHandler(
+                                CreatePullResponse(
+                                    metadata.Revision,
+                                    [],
+                                    declaredPages: 1))),
+                        metadata,
+                        new AhtolaSyncOptions(),
+                        pendingLocalChanges: [],
+                        acknowledgedLocalChanges: [],
+                        probeTimeout.Token)
+                    .ConfigureAwait(false);
+                File.WriteAllText(completedPath, "alias-noop-pull-acquired-without-blocking");
+                return;
+            }
+            catch (OperationCanceledException) when (probeTimeout.IsCancellationRequested)
+            {
+                File.WriteAllText(blockedPath, "blocked");
+            }
+
+            WaitForWorkerFile(
+                releasePath,
+                TimeSpan.FromSeconds(30),
+                "The alias no-op pull was not released after publication.");
+            File.WriteAllText(completedPath, mode);
+            return;
+        }
+
         if (mode == "sqlite-write")
         {
             try
@@ -345,6 +619,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 File.WriteAllText(completedPath, "sqlite-write-acquired-without-blocking");
                 return;
             }
+
             catch (Microsoft.Data.Sqlite.SqliteException exception)
                 when (exception.SqliteErrorCode is 5 or 6)
             {
@@ -488,13 +763,16 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         }
 
         internal void WaitForBlockedProbe()
+            => WaitForProbeState("blocked");
+
+        internal void WaitForProbeState(string expected)
         {
             WaitForWorkerFile(
                 _blockedPath,
                 TimeSpan.FromSeconds(30),
                 "The replacement-generation publication contender acquired without blocking.",
                 _worker);
-            File.ReadAllText(_blockedPath).Should().Be("blocked");
+            File.ReadAllText(_blockedPath).Should().Be(expected);
         }
 
         internal void ReleaseBlockedProbe()

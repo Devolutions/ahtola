@@ -933,6 +933,7 @@ internal static class ManagedReplicaRevertWal
         var databaseBackupPath = CreateStagingPath(databasePath, "restore-backup");
         IDisposable? mainFileReplacementLock = null;
         var databaseInstalled = false;
+        var preserveBackup = false;
         try
         {
             using (var stream = new FileStream(
@@ -975,6 +976,15 @@ internal static class ManagedReplicaRevertWal
                 databasePath,
                 databaseBackupPath,
                 () => databaseInstalled = true);
+            if (OperatingSystem.IsWindows()
+                && !string.Equals(
+                    ComputeSha256(databasePath),
+                    expectedSha256,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "Managed embedded replica checkpoint recovery changed during its Windows replacement lock handoff.");
+            }
             if (publishedBoundary is { } published)
                 ManagedReplicaFaultInjection.Hit(published);
             cancellationToken.ThrowIfCancellationRequested();
@@ -989,17 +999,26 @@ internal static class ManagedReplicaRevertWal
             {
                 if (databaseInstalled && File.Exists(databaseBackupPath))
                 {
-                    ManagedReplicaApplyLock.RollBackMainFile(
-                        mainFileReplacementLock,
-                        databaseBackupPath,
-                        databasePath);
+                    try
+                    {
+                        ManagedReplicaApplyLock.RollBackMainFile(
+                            mainFileReplacementLock,
+                            databaseBackupPath,
+                            databasePath);
+                    }
+                    catch
+                    {
+                        preserveBackup = true;
+                        throw;
+                    }
                 }
             }
             finally
             {
                 mainFileReplacementLock?.Dispose();
                 DeleteIfExists(databaseStagingPath);
-                DeleteIfExists(databaseBackupPath);
+                if (!preserveBackup)
+                    DeleteIfExists(databaseBackupPath);
             }
             throw;
         }

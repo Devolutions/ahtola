@@ -649,7 +649,10 @@ public sealed class ManagedReplicaJournalAndLockCarrierRegressionTests
     /// one. .NET exposes no managed hard-link API (only symbolic links) and this repository does not
     /// add P/Invoke outside <c>Ahtola.Core/Storage</c>, so the platform tool is used instead.
     /// </summary>
-    private static void RequireHardLink(string linkPath, string targetPath)
+    internal static void RequireHardLink(
+        string linkPath,
+        string targetPath,
+        bool verifyPhysicalIdentity = true)
     {
         var startInfo = OperatingSystem.IsWindows()
             ? new ProcessStartInfo("fsutil.exe", ["hardlink", "create", linkPath, targetPath])
@@ -682,6 +685,9 @@ public sealed class ManagedReplicaJournalAndLockCarrierRegressionTests
 
         if (!File.Exists(linkPath))
             Assert.Ignore("The host reported success but produced no hard link.");
+
+        if (!verifyPhysicalIdentity)
+            return;
 
         // Prove the result really is one physical file under two names before relying on it: a tool
         // that silently copied would make every assertion in the caller vacuously pass.
