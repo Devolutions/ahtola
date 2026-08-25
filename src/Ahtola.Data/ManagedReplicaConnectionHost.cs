@@ -445,6 +445,11 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         AhtolaReplicaOptions options,
         CancellationToken cancellationToken)
     {
+        if (ManagedReplicaReplacementState.HasArtifacts(options.Path))
+        {
+            await PrepareExistingReplicaForOpenAsync(syncEntry, options.Path, cancellationToken)
+                .ConfigureAwait(false);
+        }
         if (IsReplicaFilePresent(options.Path))
         {
             await PrepareExistingReplicaForOpenAsync(syncEntry, options.Path, cancellationToken)
@@ -463,18 +468,21 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         string databasePath,
         CancellationToken cancellationToken)
     {
+        var hasReplacementArtifacts = ManagedReplicaReplacementState.HasArtifacts(databasePath);
         var metadata = ManagedReplicaBootstrapper.LoadMetadata(databasePath);
         var hasRecoveryArtifacts = ManagedReplicaRevertWal.GetArtifactPaths(databasePath).Any(File.Exists);
         if (metadata is null)
         {
-            if (hasRecoveryArtifacts)
+            if (hasReplacementArtifacts || hasRecoveryArtifacts)
             {
                 throw new InvalidDataException(
-                    "Managed embedded replica checkpoint recovery artifacts have no matching metadata.");
+                    "Managed embedded replica recovery artifacts have no matching metadata.");
             }
             return;
         }
-        if (!metadata.Value.RevertState.HasValue && !hasRecoveryArtifacts)
+        if (!hasReplacementArtifacts
+            && !metadata.Value.RevertState.HasValue
+            && !hasRecoveryArtifacts)
             return;
 
         await syncEntry.PublishAsync(
@@ -493,6 +501,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         await using var applyLease = await ManagedReplicaApplyLock
             .AcquireExclusiveAsync(databasePath, cancellationToken)
             .ConfigureAwait(false);
+        ManagedReplicaReplacementState.Recover(databasePath);
         var current = ManagedReplicaBootstrapper.LoadMetadata(databasePath)
                       ?? throw new InvalidDataException(
                           "Managed embedded replica checkpoint recovery metadata is missing.");
@@ -851,7 +860,8 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var metadata = ManagedReplicaBootstrapper.LoadMetadata(_options.Path);
         if (metadata is { } value)
         {
-            if (value.RevertState is
+            if (ManagedReplicaReplacementState.HasArtifacts(_options.Path)
+                || value.RevertState is
                 {
                     Phase: ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.Captured
                     or ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.RestoreCommitted
@@ -869,10 +879,11 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             metadata = value;
             _metadata = value;
         }
-        else if (ManagedReplicaRevertWal.GetArtifactPaths(_options.Path).Any(File.Exists))
+        else if (ManagedReplicaReplacementState.HasArtifacts(_options.Path)
+                 || ManagedReplicaRevertWal.GetArtifactPaths(_options.Path).Any(File.Exists))
         {
             throw new InvalidDataException(
-                "Managed embedded replica checkpoint recovery artifacts have no matching metadata.");
+                "Managed embedded replica recovery artifacts have no matching metadata.");
         }
 
         var retainedLease = _materializationLease;

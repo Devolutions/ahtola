@@ -122,6 +122,7 @@ internal static class ManagedReplicaRevertWal
         ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
     {
         ArgumentException.ThrowIfNullOrEmpty(databasePath);
+        ManagedReplicaReplacementState.Recover(databasePath);
         CleanupTemporaryArtifacts(databasePath);
         if (metadata.RevertState is not { } state)
         {
@@ -930,10 +931,10 @@ internal static class ManagedReplicaRevertWal
         CancellationToken cancellationToken)
     {
         var databaseStagingPath = CreateStagingPath(databasePath, "restore");
-        var databaseBackupPath = CreateStagingPath(databasePath, "restore-backup");
+        var databaseBackupPath = ManagedReplicaReplacementState.GetBackupPath(databasePath);
+        var displacedPath = ManagedReplicaReplacementState.GetDisplacedPath(databasePath);
         IDisposable? mainFileReplacementLock = null;
         var databaseInstalled = false;
-        var preserveBackup = false;
         try
         {
             using (var stream = new FileStream(
@@ -965,10 +966,12 @@ internal static class ManagedReplicaRevertWal
             if (stagedBoundary is { } staged)
                 ManagedReplicaFaultInjection.Hit(staged);
             cancellationToken.ThrowIfCancellationRequested();
+            ManagedReplicaReplacementState.Recover(databasePath);
             mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
                 databasePath,
                 databaseStagingPath,
                 cancellationToken);
+            ManagedReplicaReplacementState.Prepare(databasePath, databaseStagingPath);
             DeleteSqliteSidecars(databasePath);
             ManagedReplicaApplyLock.ReplaceMainFile(
                 mainFileReplacementLock,
@@ -991,7 +994,7 @@ internal static class ManagedReplicaRevertWal
             return new SnapshotPublicationLease(
                 mainFileReplacementLock,
                 databaseStagingPath,
-                databaseBackupPath);
+                databasePath);
         }
         catch
         {
@@ -999,26 +1002,20 @@ internal static class ManagedReplicaRevertWal
             {
                 if (databaseInstalled && File.Exists(databaseBackupPath))
                 {
-                    try
-                    {
-                        ManagedReplicaApplyLock.RollBackMainFile(
-                            mainFileReplacementLock,
-                            databaseBackupPath,
-                            databasePath);
-                    }
-                    catch
-                    {
-                        preserveBackup = true;
-                        throw;
-                    }
+                    ManagedReplicaApplyLock.RollBackMainFile(
+                        mainFileReplacementLock,
+                        databaseBackupPath,
+                        databasePath,
+                        displacedPath);
+                    ManagedReplicaFaultInjection.Hit(
+                        ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored);
+                    ManagedReplicaReplacementState.CompleteRollback(databasePath);
                 }
             }
             finally
             {
                 mainFileReplacementLock?.Dispose();
                 DeleteIfExists(databaseStagingPath);
-                if (!preserveBackup)
-                    DeleteIfExists(databaseBackupPath);
             }
             throw;
         }
@@ -1027,15 +1024,21 @@ internal static class ManagedReplicaRevertWal
     private sealed class SnapshotPublicationLease(
         IDisposable? mainFileReplacementLock,
         string databaseStagingPath,
-        string databaseBackupPath) : IDisposable
+        string databasePath) : IDisposable
     {
         private IDisposable? _mainFileReplacementLock = mainFileReplacementLock;
 
         public void Dispose()
         {
-            Interlocked.Exchange(ref _mainFileReplacementLock, null)?.Dispose();
-            DeleteIfExists(databaseStagingPath);
-            DeleteIfExists(databaseBackupPath);
+            try
+            {
+                _ = ManagedReplicaReplacementState.TryCompletePublication(databasePath);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _mainFileReplacementLock, null)?.Dispose();
+                DeleteIfExists(databaseStagingPath);
+            }
         }
     }
 

@@ -195,6 +195,37 @@ internal enum ManagedReplicaDurableBoundary
     /// restores the retained backup.
     /// </summary>
     MainFileRollbackLeasesReleased,
+
+    /// <summary>
+    /// Hit after the deterministic replacement intent is durable and before the main-file swap.
+    /// </summary>
+    MainFileReplacementIntentPublished,
+
+    /// <summary>
+    /// Hit after completed publication deletes the old-image backup but before retiring the intent.
+    /// </summary>
+    MainFileReplacementBackupRetired,
+
+    /// <summary>
+    /// Hit after completed publication retires its durable replacement intent.
+    /// </summary>
+    MainFileReplacementIntentRetired,
+
+    /// <summary>
+    /// Hit after rollback restores the exact old database image but before retiring recovery state.
+    /// </summary>
+    MainFileRollbackDatabaseRestored,
+
+    /// <summary>
+    /// Hit after rollback retires its durable replacement intent and deterministic artifacts.
+    /// </summary>
+    MainFileRollbackIntentRetired,
+
+    /// <summary>
+    /// Hit when durable replacement recovery finds an intent, before it validates or mutates any
+    /// database, metadata, or replacement artifact.
+    /// </summary>
+    MainFileReplacementRecoveryStarted,
 }
 
 /// <summary>

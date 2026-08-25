@@ -107,6 +107,56 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public async Task ReplacementIntentIsCapturedUnderOrdinarySqliteWriteExclusion()
+    {
+        var path = NewReplicaPath("replace-intent-sqlite-lock");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        CrossProcessReplicaRaceWorker? contender = null;
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary != ManagedReplicaDurableBoundary.MainFileReplacementIntentPublished
+                           || contender is not null)
+                       {
+                           return;
+                       }
+
+                       contender = new CrossProcessReplicaRaceWorker(
+                           TestContext.CurrentContext.WorkDirectory,
+                           path,
+                           "sqlite-write");
+                       contender.WaitForBlockedProbe();
+                   }))
+            {
+                var result = await connection.SyncAsync(
+                    new AhtolaSyncOptions(),
+                    CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            }
+
+            contender.Should().NotBeNull();
+            contender!.ReleaseBlockedProbe();
+            contender.WaitForCompletion();
+            ReadBootstrapMarker(connection).Should().Be(84);
+        }
+        finally
+        {
+            contender?.Dispose();
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public async Task WindowsReplacementHandoffsRemainContentionSafeForOrdinarySqliteWriters()
     {
         Assume.That(OperatingSystem.IsWindows(), Is.True);
@@ -186,6 +236,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             CreatePullResponse("revision-43", updatedImage),
         ]);
         CrossProcessReplicaRaceWorker? rollbackWriter = null;
+        var rollbackInterrupted = false;
 
         try
         {
@@ -207,32 +258,440 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                            rollbackWriter.WaitForProbeState("acquired");
                            rollbackWriter.ReleaseBlockedProbe();
                            rollbackWriter.WaitForCompletion();
+                           rollbackInterrupted = true;
                            throw new IOException("Injected rollback handoff interruption.");
+                       }
+
+                       if (rollbackInterrupted
+                           && boundary == ManagedReplicaDurableBoundary.MainFileReplacementRecoveryStarted)
+                       {
+                           throw new IOException("Injected automatic recovery interruption.");
                        }
                    }))
             {
                 var exception = Assert.ThrowsAsync<IOException>(
-                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
-                exception!.Message.Should().Be("Injected rollback handoff interruption.");
+                   () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                exception!.Message.Should().Be("Injected automatic recovery interruption.");
             }
 
             rollbackWriter.Should().NotBeNull();
-            Directory.GetFiles(
-                    Path.GetDirectoryName(path)!,
-                    $".{Path.GetFileName(path)}.apply-*.bak")
-                .Should().ContainSingle(
-                    "an interrupted rollback must retain the old database image for recovery");
+            File.Exists(ManagedReplicaReplacementState.GetBackupPath(path)).Should().BeTrue(
+                "an interrupted rollback must retain the deterministic old-image backup");
+            File.Exists(path + ManagedReplicaReplacementState.IntentSuffix).Should().BeTrue(
+                "the backup must remain discoverable through durable replacement intent");
             ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+
+            connection.Dispose();
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            recovered.Dispose();
+            File.ReadAllBytes(path).Should().Equal(initialImage);
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
         }
         finally
         {
             rollbackWriter?.Dispose();
-            foreach (var backupPath in Directory.GetFiles(
-                         Path.GetDirectoryName(path)!,
-                         $".{Path.GetFileName(path)}.apply-*.bak"))
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementIntentPublished), 42)]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementSourceLeaseReleased), 42)]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease), 42)]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished), 42)]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.IncrementalApplyMetadataPublished), 84)]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementBackupRetired), 84)]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementIntentRetired), 84)]
+    public async Task ColdOpenRecoversEveryWindowsReplacementPublicationPhase(
+        string interruptedBoundaryName,
+        long expectedMarker)
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var interruptedBoundary = Enum.Parse<ManagedReplicaDurableBoundary>(interruptedBoundaryName);
+        var path = NewReplicaPath($"replace-cold-open-{interruptedBoundary}");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        var phaseInterrupted = false;
+        var automaticRecoveryInterrupted = false;
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
             {
-                File.Delete(backupPath);
+                connection.Open();
+                using (ManagedReplicaFaultInjection.Push(boundary =>
+                       {
+                           if (!phaseInterrupted && boundary == interruptedBoundary)
+                           {
+                               phaseInterrupted = true;
+                               throw new IOException($"Interrupted at {boundary}.");
+                           }
+                           if (phaseInterrupted
+                               && boundary == ManagedReplicaDurableBoundary.MainFileReplacementRecoveryStarted)
+                           {
+                               automaticRecoveryInterrupted = true;
+                               throw new IOException("Interrupted automatic replacement recovery.");
+                           }
+                       }))
+                {
+                    var exception = Assert.ThrowsAsync<IOException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                    exception!.Message.Should().Be(
+                        automaticRecoveryInterrupted
+                            ? "Interrupted automatic replacement recovery."
+                            : $"Interrupted at {interruptedBoundary}.");
+                }
             }
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(expectedMarker);
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+            var expectedRevision = expectedMarker == 42 ? "revision-42" : "revision-43";
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be(expectedRevision);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased))]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored))]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackIntentRetired))]
+    public async Task ColdOpenRecoversEveryWindowsReplacementRollbackPhase(
+        string interruptedBoundaryName)
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var interruptedBoundary = Enum.Parse<ManagedReplicaDurableBoundary>(interruptedBoundaryName);
+        var path = NewReplicaPath($"rollback-cold-open-{interruptedBoundary}");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        var forwardInterrupted = false;
+        var rollbackInterrupted = false;
+        var automaticRecoveryInterrupted = false;
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+            {
+                connection.Open();
+                using (ManagedReplicaFaultInjection.Push(boundary =>
+                       {
+                           if (!forwardInterrupted
+                               && boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease)
+                           {
+                               forwardInterrupted = true;
+                               throw new IOException("Injected forward handoff interruption.");
+                           }
+                           if (forwardInterrupted
+                               && !rollbackInterrupted
+                               && boundary == interruptedBoundary)
+                           {
+                               rollbackInterrupted = true;
+                               throw new IOException($"Interrupted at {boundary}.");
+                           }
+                           if (rollbackInterrupted
+                               && boundary == ManagedReplicaDurableBoundary.MainFileReplacementRecoveryStarted)
+                           {
+                               automaticRecoveryInterrupted = true;
+                               throw new IOException("Interrupted automatic replacement recovery.");
+                           }
+                       }))
+                {
+                    var exception = Assert.ThrowsAsync<IOException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                    exception!.Message.Should().Be(
+                        automaticRecoveryInterrupted
+                            ? "Interrupted automatic replacement recovery."
+                            : $"Interrupted at {interruptedBoundary}.");
+                }
+            }
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            recovered.Dispose();
+            File.ReadAllBytes(path).Should().Equal(initialImage);
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task SameProcessRetryRecoversAnInterruptedWindowsRollbackWithoutReenteringTheMainFileLease()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("rollback-same-process-retry");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        var forwardInterrupted = false;
+        var rollbackInterrupted = false;
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (!forwardInterrupted
+                           && boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease)
+                       {
+                           forwardInterrupted = true;
+                           throw new IOException("Injected forward handoff interruption.");
+                       }
+                       if (!rollbackInterrupted
+                           && boundary == ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased)
+                       {
+                           rollbackInterrupted = true;
+                           throw new IOException("Injected rollback interruption.");
+                       }
+                   }))
+            {
+                Assert.ThrowsAsync<IOException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+            }
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+
+            result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            ReadBootstrapMarker(connection).Should().Be(84);
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task FailedPublicationReopenRecoversAPreSwapReplacementIntent()
+    {
+        var path = NewReplicaPath("replace-reopen-recovery");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.MainFileReplacementIntentPublished)
+                           throw new IOException("Injected pre-swap publication interruption.");
+                   }))
+            {
+                var exception = Assert.ThrowsAsync<IOException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                exception!.Message.Should().Be("Injected pre-swap publication interruption.");
+            }
+
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse(
+                "failed publication reopen must recover replacement state before exposing the database");
+            ReadBootstrapMarker(connection).Should().Be(42);
+            using var command = connection.CreateCommand();
+            command.CommandText = "CREATE TABLE post_recovery(value INTEGER)";
+            command.ExecuteNonQuery();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void ColdOpenFailsClosedForAReplacementBackupWithoutIntent()
+    {
+        var path = NewReplicaPath("replacement-backup-without-intent");
+        var image = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+                connection.Open();
+            File.Copy(path, ManagedReplicaReplacementState.GetBackupPath(path));
+
+            Action reopen = () =>
+            {
+                using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+                connection.Open();
+            };
+
+            reopen.Should().Throw<InvalidDataException>()
+                .WithMessage("*backup without its durable intent*");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void ColdOpenFailsClosedForACorruptReplacementIntent()
+    {
+        var path = NewReplicaPath("corrupt-replacement-intent");
+        var image = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+                connection.Open();
+            File.WriteAllText(
+                path + ManagedReplicaReplacementState.IntentSuffix,
+                "not-a-valid-intent");
+
+            Action reopen = () =>
+            {
+                using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+                connection.Open();
+            };
+
+            reopen.Should().Throw<InvalidDataException>()
+                .WithMessage("*intent is invalid or corrupt*");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void ColdOpenFailsClosedForAMissingOrCorruptReplacementBackup(bool corruptBackup)
+    {
+        var path = NewReplicaPath(corruptBackup
+            ? "corrupt-replacement-backup"
+            : "missing-replacement-backup");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", initialImage));
+        var stagingPath = path + ".replacement.tmp";
+        var backupPath = ManagedReplicaReplacementState.GetBackupPath(path);
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+                connection.Open();
+            File.WriteAllBytes(stagingPath, updatedImage);
+            ManagedReplicaReplacementState.Prepare(path, stagingPath);
+            File.Replace(stagingPath, path, backupPath);
+            if (corruptBackup)
+                File.WriteAllText(backupPath, "corrupt");
+            else
+                File.Delete(backupPath);
+
+            Action reopen = () =>
+            {
+                using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+                connection.Open();
+            };
+
+            reopen.Should().Throw<InvalidDataException>()
+                .WithMessage(corruptBackup
+                    ? "*backup is missing or corrupt*"
+                    : "*backup is missing*");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+            if (File.Exists(stagingPath))
+                File.Delete(stagingPath);
+        }
+    }
+
+    [Test]
+    public void LocalArtifactEnumerationIncludesReplacementRecoveryState()
+    {
+        var path = NewReplicaPath("replacement-artifact-enumeration");
+
+        ManagedReplicaBootstrapper.GetLocalArtifactPaths(path).Should().Contain(
+            ManagedReplicaReplacementState.GetArtifactPaths(path));
+    }
+
+    [Test]
+    public void CaseInsensitiveFileSystemsAcceptEquivalentReplacementPathCasing()
+    {
+        Assume.That(OperatingSystem.IsWindows() || OperatingSystem.IsMacOS(), Is.True);
+        var path = NewReplicaPath("replacement-path-case");
+        var image = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image));
+        var stagingPath = path + ".replacement";
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+                connection.Open();
+            File.Copy(path, stagingPath);
+            ManagedReplicaReplacementState.Prepare(path, stagingPath);
+
+            var equivalentPath = path.ToUpperInvariant();
+            ManagedReplicaReplacementState.HasArtifacts(equivalentPath).Should().BeTrue();
+            ManagedReplicaReplacementState.Recover(equivalentPath);
+
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void WindowsReplacementIntentSupportsLongUnicodeFilenames()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = Path.Combine(
+            TestContext.CurrentContext.WorkDirectory,
+            $"{new string('\u754c', 130)}-{Guid.NewGuid():N}.db");
+        var image = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-42", image));
+        var stagingPath = path + ".replacement";
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+                connection.Open();
+            File.Copy(path, stagingPath);
+            ManagedReplicaReplacementState.Prepare(path, stagingPath);
+
+            ManagedReplicaReplacementState.Recover(path);
+
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+        }
+        finally
+        {
             DeleteReplicaFiles(path);
         }
     }

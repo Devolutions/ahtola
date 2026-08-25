@@ -47,6 +47,7 @@ internal static class ManagedReplicaBootstrapper
         DeleteIfExists(path + BaseSnapshotSuffix);
         DeleteIfExists(path + BaseSnapshotPreviousSuffix);
         ManagedReplicaRevertWal.DeleteArtifacts(path);
+        ManagedReplicaReplacementState.DeleteArtifacts(path);
         DeleteStagingSidecars(path);
         // Keep the main file present until every sidecar is gone. Apply-lock aliases resolve an
         // existing target by physical identity; deleting it first would let a missing-path key
@@ -2065,7 +2066,8 @@ internal static class ManagedReplicaBootstrapper
     {
         var directory = Path.GetDirectoryName(Path.GetFullPath(options.Path))!;
         var stagingPath = Path.Combine(directory, $".{Path.GetFileName(options.Path)}.apply-{Guid.NewGuid():N}.tmp");
-        var backupPath = Path.Combine(directory, $".{Path.GetFileName(options.Path)}.apply-{Guid.NewGuid():N}.bak");
+        var backupPath = ManagedReplicaReplacementState.GetBackupPath(options.Path);
+        var displacedPath = ManagedReplicaReplacementState.GetDisplacedPath(options.Path);
         var metadataPath = options.Path + MetadataSuffix;
         var metadataStagingPath = Path.Combine(
             directory,
@@ -2075,7 +2077,6 @@ internal static class ManagedReplicaBootstrapper
             $".{Path.GetFileName(options.Path)}.protected-{Guid.NewGuid():N}.tmp");
         var databaseInstalled = false;
         var metadataInstalled = false;
-        var preserveBackup = false;
         IDisposable? mainFileReplacementLock = null;
         try
         {
@@ -2161,10 +2162,12 @@ internal static class ManagedReplicaBootstrapper
             var tableMap = RebuildTableMapFromSchema(stagingPath, options.RemoteEncryption);
             var installedFingerprint = ComputeDatabaseFingerprint(stagingPath);
             var remoteBaseSha256 = PublishRemoteBaseSnapshot(options.Path, metadata, stagingPath);
+            ManagedReplicaReplacementState.Recover(options.Path);
             mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
                 options.Path,
                 stagingPath,
                 cancellationToken);
+            ManagedReplicaReplacementState.Prepare(options.Path, stagingPath);
             ManagedReplicaApplyLock.ReplaceMainFile(
                 mainFileReplacementLock,
                 stagingPath,
@@ -2212,7 +2215,7 @@ internal static class ManagedReplicaBootstrapper
             }
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyMetadataPublished);
             cancellationToken.ThrowIfCancellationRequested();
-            DeleteIfExists(backupPath);
+            ManagedReplicaReplacementState.CompletePublication(options.Path);
         }
         catch
         {
@@ -2220,18 +2223,14 @@ internal static class ManagedReplicaBootstrapper
             // interruption must preserve that matched pair rather than restore only DB.
             if (databaseInstalled && !metadataInstalled && File.Exists(backupPath))
             {
-                try
-                {
-                    ManagedReplicaApplyLock.RollBackMainFile(
-                        mainFileReplacementLock,
-                        backupPath,
-                        options.Path);
-                }
-                catch
-                {
-                    preserveBackup = true;
-                    throw;
-                }
+                ManagedReplicaApplyLock.RollBackMainFile(
+                    mainFileReplacementLock,
+                    backupPath,
+                    options.Path,
+                    displacedPath);
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored);
+                ManagedReplicaReplacementState.CompleteRollback(options.Path);
             }
             throw;
         }
@@ -2242,8 +2241,6 @@ internal static class ManagedReplicaBootstrapper
             DeleteIfExists(metadataStagingPath);
             DeleteIfExists(protectedStagingPath);
             DeleteStagingSidecars(protectedStagingPath);
-            if (!preserveBackup)
-                DeleteIfExists(backupPath);
             mainFileReplacementLock?.Dispose();
         }
     }
@@ -3604,6 +3601,9 @@ internal static class ManagedReplicaBootstrapper
     /// bootstrap/download as a side effect, which existence checks must never do.</summary>
     internal static ManagedReplicaLocalState GetLocalState(string databasePath)
     {
+        if (ManagedReplicaReplacementState.HasArtifacts(databasePath))
+            return ManagedReplicaLocalState.Inconsistent;
+
         var databaseExists = File.Exists(databasePath);
         var metadataExists = File.Exists(databasePath + MetadataSuffix);
         var pageStateExists = File.Exists(
@@ -3648,6 +3648,7 @@ internal static class ManagedReplicaBootstrapper
         databasePath + "-wal",
         databasePath + "-shm",
         databasePath + "-journal",
+        .. ManagedReplicaReplacementState.GetArtifactPaths(databasePath),
         .. ManagedReplicaRevertWal.GetArtifactPaths(databasePath),
         databasePath + BaseSnapshotSuffix,
         databasePath + BaseSnapshotPreviousSuffix,

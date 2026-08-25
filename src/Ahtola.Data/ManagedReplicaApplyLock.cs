@@ -582,15 +582,16 @@ internal static class ManagedReplicaApplyLock
     internal static void RollBackMainFile(
         IDisposable? replacementLock,
         string backupPath,
-        string destinationPath)
+        string destinationPath,
+        string displacedPath)
     {
         if (replacementLock is MainFileReplacementLease lease)
         {
-            lease.RollBack(backupPath, destinationPath);
+            lease.RollBack(backupPath, destinationPath, displacedPath);
             return;
         }
 
-        File.Replace(backupPath, destinationPath, destinationBackupFileName: null, ignoreMetadataErrors: false);
+        File.Replace(backupPath, destinationPath, displacedPath, ignoreMetadataErrors: false);
     }
 
     private sealed class MainFileReplacementLease(
@@ -630,7 +631,7 @@ internal static class ManagedReplicaApplyLock
             }
         }
 
-        internal void RollBack(string backupPath, string destinationPath)
+        internal void RollBack(string backupPath, string destinationPath, string displacedPath)
         {
             if (OperatingSystem.IsWindows())
             {
@@ -639,7 +640,7 @@ internal static class ManagedReplicaApplyLock
                 ManagedReplicaFaultInjection.Hit(
                     ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased);
             }
-            File.Replace(backupPath, destinationPath, destinationBackupFileName: null, ignoreMetadataErrors: false);
+            File.Replace(backupPath, destinationPath, displacedPath, ignoreMetadataErrors: false);
         }
 
         public void Dispose()
