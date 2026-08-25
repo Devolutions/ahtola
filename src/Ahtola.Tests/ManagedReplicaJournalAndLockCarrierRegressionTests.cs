@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Text;
 using Ahtola.Core;
 using AwesomeAssertions;
 
@@ -268,7 +269,12 @@ public sealed class ManagedReplicaJournalAndLockCarrierRegressionTests
                 Path.GetFullPath(path),
                 "the point of this case is that the two names stay textually distinct");
 
-            foreach (var kind in new[] { ManagedReplicaLockCarrier.ApplyKind, ManagedReplicaLockCarrier.JournalKind })
+            foreach (var kind in new[]
+                     {
+                         ManagedReplicaLockCarrier.ApplyKind,
+                         ManagedReplicaLockCarrier.JournalKind,
+                         ManagedReplicaLockCarrier.PushKind,
+                     })
             {
                 ManagedReplicaLockCarrier.Ensure(aliasPath, kind)
                     .Should().Be(ManagedReplicaLockCarrier.Ensure(path, kind));
@@ -341,6 +347,65 @@ public sealed class ManagedReplicaJournalAndLockCarrierRegressionTests
     }
 
     [Test]
+    public async Task PushFlightLeaseSerializesAHardLinkAliasAcrossProcesses()
+    {
+        var path = NewReplicaPath("push-flight-hard-link-process");
+        var aliasPath = path + ".hardlink";
+        try
+        {
+            File.WriteAllBytes(path, [1, 2, 3, 4]);
+            RequireHardLink(aliasPath, path);
+            using var worker = new CrossProcessPushLockWorker(
+                TestContext.CurrentContext.WorkDirectory,
+                path);
+
+            var contenderStarted = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var contender = Task.Run(async () =>
+            {
+                contenderStarted.TrySetResult();
+                await using var lease = await ManagedReplicaPushLock
+                    .AcquireExclusiveAsync(aliasPath, CancellationToken.None)
+                    .ConfigureAwait(false);
+            });
+
+            await contenderStarted.Task.WaitAsync(Settle);
+            await Task.Delay(BlockedProbe);
+            contender.IsCompleted.Should().BeFalse(
+                "a child process holding the real path's push flight must exclude a hard-link alias");
+
+            worker.Release();
+            await contender.WaitAsync(Settle);
+        }
+        finally
+        {
+            if (File.Exists(aliasPath))
+                File.Delete(aliasPath);
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    [Category("ProcessWorker")]
+    [NonParallelizable]
+    public async Task CrossProcessPushFlightLockWorker()
+    {
+        var databasePath = Environment.GetEnvironmentVariable("AHTOLA_PUSH_LOCK_WORKER_DATABASE");
+        if (string.IsNullOrEmpty(databasePath))
+            return;
+
+        var readyPath = ReadWorkerValue("AHTOLA_PUSH_LOCK_WORKER_READY");
+        var releasePath = ReadWorkerValue("AHTOLA_PUSH_LOCK_WORKER_RELEASE");
+        var resultPath = ReadWorkerValue("AHTOLA_PUSH_LOCK_WORKER_RESULT");
+        await using var lease = await ManagedReplicaPushLock
+            .AcquireExclusiveAsync(databasePath, CancellationToken.None)
+            .ConfigureAwait(false);
+        File.WriteAllText(readyPath, string.Empty);
+        WaitForFile(releasePath, Settle, "The push-flight worker was not released.");
+        File.WriteAllText(resultPath, "released");
+    }
+
+    [Test]
     public void JournalLeaseSerializesAHardLinkAliasBehindItsRealPath()
     {
         var path = NewReplicaPath("journal-lease-hard-link");
@@ -409,7 +474,7 @@ public sealed class ManagedReplicaJournalAndLockCarrierRegressionTests
     }
 
     [Test]
-    public void GetLocalArtifactPathsListsBothPhysicalIdentityCarriersSoCleanupRemovesThem()
+    public void GetLocalArtifactPathsListsEveryPhysicalIdentityCarrierSoCleanupRemovesThem()
     {
         var path = NewReplicaPath("carrier-artifact-enumeration");
         try
@@ -417,12 +482,14 @@ public sealed class ManagedReplicaJournalAndLockCarrierRegressionTests
             File.WriteAllBytes(path, [1, 2, 3, 4]);
             var apply = ManagedReplicaLockCarrier.Ensure(path, ManagedReplicaLockCarrier.ApplyKind);
             var journal = ManagedReplicaLockCarrier.Ensure(path, ManagedReplicaLockCarrier.JournalKind);
+            var push = ManagedReplicaLockCarrier.Ensure(path, ManagedReplicaLockCarrier.PushKind);
 
-            ManagedReplicaBootstrapper.GetLocalArtifactPaths(path).Should().Contain([apply, journal]);
+            ManagedReplicaBootstrapper.GetLocalArtifactPaths(path).Should().Contain([apply, journal, push]);
 
             DeleteReplicaFiles(path);
             File.Exists(apply).Should().BeFalse();
             File.Exists(journal).Should().BeFalse();
+            File.Exists(push).Should().BeFalse();
         }
         finally
         {
@@ -431,6 +498,112 @@ public sealed class ManagedReplicaJournalAndLockCarrierRegressionTests
     }
 
     // ---- helpers ------------------------------------------------------------------------------
+
+    private static string ReadWorkerValue(string name)
+        => Environment.GetEnvironmentVariable(name)
+           ?? throw new InvalidOperationException($"The push-flight worker is missing {name}.");
+
+    private static void WaitForFile(
+        string path,
+        TimeSpan timeout,
+        string message,
+        Process? worker = null)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (!File.Exists(path))
+        {
+            if (worker is { HasExited: true })
+                Assert.Fail($"{message} The worker exited with code {worker.ExitCode}.");
+            if (stopwatch.Elapsed >= timeout)
+                Assert.Fail(message);
+            Thread.Sleep(25);
+        }
+    }
+
+    private sealed class CrossProcessPushLockWorker : IDisposable
+    {
+        private readonly Process _worker;
+        private readonly string _releasePath;
+        private readonly string _resultPath;
+        private readonly StringBuilder _output = new();
+        private bool _released;
+
+        internal CrossProcessPushLockWorker(string workDirectory, string databasePath)
+        {
+            var token = Guid.NewGuid().ToString("N");
+            var readyPath = Path.Combine(workDirectory, $"push-lock-ready-{token}");
+            _releasePath = Path.Combine(workDirectory, $"push-lock-release-{token}");
+            _resultPath = Path.Combine(workDirectory, $"push-lock-result-{token}");
+            var testDirectory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
+            var startInfo = new ProcessStartInfo(
+                Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+            {
+                WorkingDirectory = testDirectory.FullName,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            startInfo.ArgumentList.Add("vstest");
+            startInfo.ArgumentList.Add(Path.Combine(testDirectory.FullName, "Ahtola.Tests.dll"));
+            startInfo.ArgumentList.Add(
+                "--TestCaseFilter:FullyQualifiedName=Ahtola.Tests.ManagedReplicaJournalAndLockCarrierRegressionTests."
+                + nameof(CrossProcessPushFlightLockWorker));
+            startInfo.Environment["AHTOLA_PUSH_LOCK_WORKER_DATABASE"] = databasePath;
+            startInfo.Environment["AHTOLA_PUSH_LOCK_WORKER_READY"] = readyPath;
+            startInfo.Environment["AHTOLA_PUSH_LOCK_WORKER_RELEASE"] = _releasePath;
+            startInfo.Environment["AHTOLA_PUSH_LOCK_WORKER_RESULT"] = _resultPath;
+
+            _worker = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("Failed to start the push-flight lock worker.");
+            _worker.OutputDataReceived += AppendOutput;
+            _worker.ErrorDataReceived += AppendOutput;
+            _worker.BeginOutputReadLine();
+            _worker.BeginErrorReadLine();
+            WaitForFile(
+                readyPath,
+                TimeSpan.FromSeconds(60),
+                "The push-flight lock worker did not report readiness.",
+                _worker);
+        }
+
+        internal void Release()
+        {
+            if (_released)
+                return;
+            _released = true;
+            File.WriteAllText(_releasePath, string.Empty);
+            if (!_worker.WaitForExit(TimeSpan.FromSeconds(60)))
+            {
+                _worker.Kill(entireProcessTree: true);
+                Assert.Fail(
+                    "The push-flight lock worker did not exit within 60 seconds:"
+                    + Environment.NewLine
+                    + _output);
+            }
+
+            _worker.WaitForExit();
+            _worker.ExitCode.Should().Be(0, $"worker output:{Environment.NewLine}{_output}");
+            File.ReadAllText(_resultPath).Should().Be("released");
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                Release();
+            }
+            finally
+            {
+                _worker.Dispose();
+            }
+        }
+
+        private void AppendOutput(object sender, DataReceivedEventArgs args)
+        {
+            if (args.Data is { } line)
+                _output.AppendLine(line);
+        }
+    }
 
     /// <summary>
     /// Holds <paramref name="holderPath"/>'s lease, proves a second acquisition through

@@ -1504,7 +1504,7 @@ public sealed class ManagedReplicaConflictRebaseTests
     }
 
     [Test]
-    public void PushFailsClosedWhenAnotherWriterAdvancesTheJournalDuringTheRoundTrip()
+    public void PushFailsClosedWhenAnotherWriterAdvancesTheJournalBetweenSelectionAndIntent()
     {
         var path = NewReplicaPath("conflict-push-generation");
         var image = CreateJournalDatabaseImage(path + ".source");
@@ -1518,11 +1518,13 @@ public sealed class ManagedReplicaConflictRebaseTests
             using (ManagedReplicaFaultInjection.Push(boundary =>
             {
                 if (boundary != ManagedReplicaDurableBoundary.ReplicaPushPublicationLockAcquired
-                    || Interlocked.Increment(ref hits) != 1)
+                    || Interlocked.Increment(ref hits) != 2)
                 {
                     return;
                 }
-                // Another participant journals a new local change while this push holds nothing.
+                // Journal append uses its own leaf lease, so another participant can move it while
+                // this call holds the apply lease. The generation selected under the first apply
+                // acquisition must reject that movement under this second one, before intent or I/O.
                 ManagedReplicaChangeJournal.Open(path).AppendCommitted(
                     [Row(0, "journal_events", 99, "INSERT INTO journal_events VALUES (99)")]);
             }))

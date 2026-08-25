@@ -49,6 +49,9 @@ internal static class ManagedReplicaLockCarrier
     /// <summary>Carrier kind for the change-journal append/persist lease.</summary>
     internal const string JournalKind = "journal";
 
+    /// <summary>Carrier kind for the cross-process remote push flight.</summary>
+    internal const string PushKind = "push";
+
     /// <summary>
     /// Resolves and creates the carrier file for <paramref name="databasePath"/>, failing closed
     /// when the physical identity behind the path cannot be proven.
@@ -331,6 +334,64 @@ internal static class ManagedReplicaJournalLock
         {
             Interlocked.Exchange(ref _carrierLease, null)?.Dispose();
             Interlocked.Exchange(ref _gate, null)?.Release();
+        }
+    }
+}
+
+/// <summary>
+/// Serializes remote push flights for one physical replica across aliases and processes.
+/// </summary>
+/// <remarks>
+/// The apply and journal leases remain short and are never held across network I/O. This separate
+/// lease spans watermark verification and SQL replay so two processes cannot both observe the same
+/// pre-batch watermark and replay one non-idempotent batch concurrently. It excludes only another
+/// push flight; local commands and unrelated apply work continue to use their existing leases.
+/// </remarks>
+internal static class ManagedReplicaPushLock
+{
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> Gates =
+        new(StringComparer.Ordinal);
+
+    internal static async ValueTask<IAsyncDisposable> AcquireExclusiveAsync(
+        string databasePath,
+        CancellationToken cancellationToken)
+    {
+        var carrierPath = ManagedReplicaLockCarrier.Ensure(
+            databasePath,
+            ManagedReplicaLockCarrier.PushKind);
+        var gate = Gates.GetOrAdd(carrierPath, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        SqliteWalByteRangeLockLease? carrierLease = null;
+        try
+        {
+            carrierLease = new SqliteWalByteRangeLock(carrierPath).AcquireExclusive(
+                offset: 0,
+                length: 1,
+                Timeout.InfiniteTimeSpan,
+                cancellationToken);
+            return new Lease(gate, carrierLease);
+        }
+        catch
+        {
+            carrierLease?.Dispose();
+            gate.Release();
+            throw;
+        }
+    }
+
+    private sealed class Lease(
+        SemaphoreSlim gate,
+        SqliteWalByteRangeLockLease carrierLease) : IAsyncDisposable
+    {
+        private SemaphoreSlim? _gate = gate;
+        private SqliteWalByteRangeLockLease? _carrierLease = carrierLease;
+
+        public ValueTask DisposeAsync()
+        {
+            Interlocked.Exchange(ref _carrierLease, null)?.Dispose();
+            Interlocked.Exchange(ref _gate, null)?.Release();
+            return ValueTask.CompletedTask;
         }
     }
 }
