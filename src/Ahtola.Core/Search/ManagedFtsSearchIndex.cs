@@ -1,9 +1,16 @@
 using System.Globalization;
+using System.Text;
 
 namespace Ahtola.Core.Search;
 
 /// <summary>One scored search hit. Ordering is score descending, then rowid ascending.</summary>
 internal readonly record struct ManagedFtsHit(long RowId, double Score);
+
+internal enum ManagedFtsScoringProfile
+{
+    Managed,
+    SqliteFts5,
+}
 
 /// <summary>
 /// The managed inverted index behind a <c>USING fts</c> method index: term dictionary, per-document
@@ -47,6 +54,7 @@ internal sealed class ManagedFtsSearchIndex
     private readonly double[] _columnWeights;
     private readonly ManagedFtsDetailLevel _detail;
     private readonly bool _columnSize;
+    private readonly ManagedFtsScoringProfile _scoringProfile;
     private readonly Dictionary<long, Document> _documents = [];
     private readonly Dictionary<string, PostingList> _postings = new(StringComparer.Ordinal);
     private readonly long[] _columnTokenTotals;
@@ -59,9 +67,11 @@ internal sealed class ManagedFtsSearchIndex
         ManagedFtsTokenizerOptions tokenizer,
         IReadOnlyList<double> columnWeights,
         ManagedFtsDetailLevel detail = ManagedFtsDetailLevel.Full,
-        bool columnSize = true)
+        bool columnSize = true,
+        ManagedFtsScoringProfile scoringProfile = ManagedFtsScoringProfile.Managed)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(columnCount, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(columnCount, sizeof(uint) * 8);
         ArgumentNullException.ThrowIfNull(tokenizer);
         ArgumentNullException.ThrowIfNull(columnWeights);
         if (columnWeights.Count != columnCount)
@@ -72,6 +82,7 @@ internal sealed class ManagedFtsSearchIndex
         _columnWeights = columnWeights.ToArray();
         _detail = detail;
         _columnSize = columnSize;
+        _scoringProfile = scoringProfile;
         _columnTokenTotals = new long[columnCount];
     }
 
@@ -172,8 +183,11 @@ internal sealed class ManagedFtsSearchIndex
                 if (!perTerm.TryGetValue(token.Text, out var occurrence))
                 {
                     occurrence = new TermOccurrence();
-                    if (_detail == ManagedFtsDetailLevel.Columns)
+                    if (_detail == ManagedFtsDetailLevel.Columns
+                        || _scoringProfile == ManagedFtsScoringProfile.SqliteFts5)
+                    {
                         occurrence.ColumnFrequencies = new int[_columnCount];
+                    }
                     perTerm.Add(token.Text, occurrence);
                 }
 
@@ -181,8 +195,11 @@ internal sealed class ManagedFtsSearchIndex
                 occurrence.ColumnMask |= 1u << column;
                 if (_detail == ManagedFtsDetailLevel.Full)
                     occurrence.Positions.Add(EncodePosition(column, token.Position));
-                else if (_detail == ManagedFtsDetailLevel.Columns)
+                else if (_detail == ManagedFtsDetailLevel.Columns
+                    || _scoringProfile == ManagedFtsScoringProfile.SqliteFts5)
+                {
                     occurrence.ColumnFrequencies[column]++;
+                }
             }
         }
 
@@ -219,11 +236,13 @@ internal sealed class ManagedFtsSearchIndex
                 occurrence.Positions.Sort();
                 positions = occurrence.Positions.ToArray();
             }
-            else if (_detail == ManagedFtsDetailLevel.Columns)
+            else if (_detail == ManagedFtsDetailLevel.Columns
+                || _scoringProfile == ManagedFtsScoringProfile.SqliteFts5)
             {
                 // Compact to just the columns the term actually occurs in, ascending. This is the
-                // minimum metadata a column-filtered query and a per-column BM25 term weight need
-                // once positions are not recorded.
+                // minimum metadata a column-filtered query or SQLite-compatible per-column BM25
+                // weight needs once positions are not recorded. detail=none still refuses column
+                // filters; the derived frequencies are retained only for observable ranking.
                 columnFrequencies = new int[System.Numerics.BitOperations.PopCount(occurrence.ColumnMask)];
                 var next = 0;
                 for (var column = 0; column < _columnCount; column++)
@@ -290,10 +309,21 @@ internal sealed class ManagedFtsSearchIndex
 
     /// <summary>Evaluates a parsed query and returns hits ordered by score desc, rowid asc.</summary>
     public IReadOnlyList<ManagedFtsHit> Search(ManagedFtsNode query, int? limit = null)
+        => Search(query, _columnWeights, limit);
+
+    /// <summary>Evaluates a parsed query with call-specific BM25 column weights.</summary>
+    public IReadOnlyList<ManagedFtsHit> Search(
+        ManagedFtsNode query,
+        IReadOnlyList<double> columnWeights,
+        int? limit = null)
     {
         ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(columnWeights);
+        if (columnWeights.Count != _columnCount)
+            throw new ArgumentException("One weight per indexed column is required.", nameof(columnWeights));
+
         var accumulator = new Dictionary<long, double>();
-        var matches = Evaluate(query, accumulator);
+        var matches = Evaluate(query, accumulator, columnWeights);
         if (matches.Count > ManagedFtsLimits.MaxMatchRows)
             throw new EmbeddedSqlException($"fts query matches more than {ManagedFtsLimits.MaxMatchRows} rows");
 
@@ -316,28 +346,44 @@ internal sealed class ManagedFtsSearchIndex
     public bool Matches(ManagedFtsNode query, long rowId)
     {
         ArgumentNullException.ThrowIfNull(query);
-        return _documents.ContainsKey(rowId) && Evaluate(query, accumulator: null).Contains(rowId);
+        return _documents.ContainsKey(rowId)
+            && Evaluate(query, null, _columnWeights).Contains(rowId);
     }
 
     /// <summary>The BM25 score of one document for a query, or 0 when it does not match.</summary>
-    public double Score(ManagedFtsNode query, long rowId)
+    public double Score(
+        ManagedFtsNode query,
+        long rowId,
+        IReadOnlyList<double>? columnWeights = null)
     {
         ArgumentNullException.ThrowIfNull(query);
+        var weights = columnWeights ?? _columnWeights;
+        if (weights.Count != _columnCount)
+            throw new ArgumentException("One weight per indexed column is required.", nameof(columnWeights));
         var accumulator = new Dictionary<long, double>();
-        return Evaluate(query, accumulator).Contains(rowId) && accumulator.TryGetValue(rowId, out var score)
+        return Evaluate(query, accumulator, weights).Contains(rowId)
+            && accumulator.TryGetValue(rowId, out var score)
             ? score
             : 0.0;
     }
 
-    private HashSet<long> Evaluate(ManagedFtsNode node, Dictionary<long, double>? accumulator)
+    private HashSet<long> Evaluate(
+        ManagedFtsNode node,
+        Dictionary<long, double>? accumulator,
+        IReadOnlyList<double> columnWeights)
         => node switch
         {
-            ManagedFtsTermNode term => EvaluateTerm(term, accumulator),
-            ManagedFtsPhraseNode phrase => EvaluatePhrase(phrase, accumulator),
-            ManagedFtsNearNode near => EvaluateNear(near, accumulator),
-            ManagedFtsAndNode and => Intersect(Evaluate(and.Left, accumulator), Evaluate(and.Right, accumulator)),
-            ManagedFtsOrNode or => Union(Evaluate(or.Left, accumulator), Evaluate(or.Right, accumulator)),
-            ManagedFtsNotNode not => Exclude(EvaluateExclusion(not.Operand)),
+            ManagedFtsNoMatchNode => [],
+            ManagedFtsTermNode term => EvaluateTerm(term, accumulator, columnWeights),
+            ManagedFtsPhraseNode phrase => EvaluatePhrase(phrase, accumulator, columnWeights),
+            ManagedFtsNearNode near => EvaluateNear(near, accumulator, columnWeights),
+            ManagedFtsAndNode and => Intersect(
+                Evaluate(and.Left, accumulator, columnWeights),
+                Evaluate(and.Right, accumulator, columnWeights)),
+            ManagedFtsOrNode or => Union(
+                Evaluate(or.Left, accumulator, columnWeights),
+                Evaluate(or.Right, accumulator, columnWeights)),
+            ManagedFtsNotNode not => Exclude(EvaluateExclusion(not.Operand, columnWeights)),
             _ => throw new ArgumentOutOfRangeException(nameof(node)),
         };
 
@@ -351,12 +397,16 @@ internal sealed class ManagedFtsSearchIndex
     /// that survives through another branch — <c>(NOT b) OR x</c> and <c>a NOT (b NOT c)</c> both
     /// keep rows the negated branch scored — so the exclusion is evaluated in isolation instead.
     /// </remarks>
-    private HashSet<long> EvaluateExclusion(ManagedFtsNode node)
-        => Evaluate(node, new Dictionary<long, double>());
+    private HashSet<long> EvaluateExclusion(
+        ManagedFtsNode node,
+        IReadOnlyList<double> columnWeights)
+        => Evaluate(node, new Dictionary<long, double>(), columnWeights);
 
-    private HashSet<long> EvaluateTerm(ManagedFtsTermNode term, Dictionary<long, double>? accumulator)
+    private HashSet<long> EvaluateTerm(
+        ManagedFtsTermNode term,
+        Dictionary<long, double>? accumulator,
+        IReadOnlyList<double> columnWeights)
     {
-        var matches = new HashSet<long>();
         if (term.AnchoredAtStart)
         {
             // An anchored term asks "is this the first token of the column", which needs the token's
@@ -366,6 +416,10 @@ internal sealed class ManagedFtsSearchIndex
         }
 
         var columnMask = ResolveColumnMask(term.Column);
+        if (term.IsPrefix && _scoringProfile == ManagedFtsScoringProfile.SqliteFts5)
+            return EvaluateSqlitePrefixTerm(term, accumulator, columnWeights, columnMask);
+
+        var matches = new HashSet<long>();
         foreach (var expanded in ExpandTerm(term))
         {
             if (!_postings.TryGetValue(expanded, out var list))
@@ -386,50 +440,162 @@ internal sealed class ManagedFtsSearchIndex
                 candidates.Add(new ScoreCandidate(
                     posting.RowId,
                     frequency,
-                    posting.Positions,
+                    term.AnchoredAtStart
+                        ? posting.Positions
+                            .Where(encoded => (encoded & 0xFFFFFFFFL) == 0
+                                && (columnMask & (1u << (int)(encoded >> 32))) != 0)
+                            .ToArray()
+                        : posting.Positions,
                     posting.ColumnFrequencies,
                     posting.ColumnMask));
                 matches.Add(posting.RowId);
             }
 
             if (accumulator is not null)
-                Accumulate(accumulator, candidates, columnMask);
+                Accumulate(accumulator, candidates, columnMask, columnWeights);
         }
 
         return matches;
     }
 
-    private HashSet<long> EvaluatePhrase(ManagedFtsPhraseNode phrase, Dictionary<long, double>? accumulator)
+    private HashSet<long> EvaluateSqlitePrefixTerm(
+        ManagedFtsTermNode term,
+        Dictionary<long, double>? accumulator,
+        IReadOnlyList<double> columnWeights,
+        uint columnMask)
+    {
+        var aggregates = new Dictionary<long, PrefixScoreCandidate>();
+        foreach (var expanded in ExpandTerm(term))
+        {
+            if (!_postings.TryGetValue(expanded, out var list))
+                continue;
+
+            foreach (var posting in list.Entries)
+            {
+                if (!IsLive(posting) || (posting.ColumnMask & columnMask) == 0)
+                    continue;
+
+                var frequency = term.AnchoredAtStart
+                    ? CountAnchored(posting.Positions, columnMask)
+                    : CountInColumns(posting, columnMask);
+                if (frequency == 0)
+                    continue;
+
+                if (!aggregates.TryGetValue(posting.RowId, out var aggregate))
+                {
+                    aggregate = new PrefixScoreCandidate(_columnCount);
+                    aggregates.Add(posting.RowId, aggregate);
+                }
+
+                aggregate.Frequency += frequency;
+                aggregate.ColumnMask |= posting.ColumnMask & columnMask;
+                if (posting.Positions.Length != 0)
+                {
+                    foreach (var encoded in posting.Positions)
+                    {
+                        var bit = 1u << (int)(encoded >> 32);
+                        if ((columnMask & bit) != 0
+                            && (!term.AnchoredAtStart || (encoded & 0xFFFFFFFFL) == 0))
+                        {
+                            aggregate.Positions.Add(encoded);
+                        }
+                    }
+                }
+                else
+                {
+                    var next = 0;
+                    for (var column = 0; column < _columnCount; column++)
+                    {
+                        var bit = 1u << column;
+                        if ((posting.ColumnMask & bit) == 0)
+                            continue;
+                        if ((columnMask & bit) != 0)
+                            aggregate.ColumnFrequencies[column] += posting.ColumnFrequencies[next];
+                        next++;
+                    }
+                }
+            }
+        }
+
+        var matches = new HashSet<long>(aggregates.Keys);
+        if (accumulator is null || aggregates.Count == 0)
+            return matches;
+
+        var candidates = new List<ScoreCandidate>(aggregates.Count);
+        foreach (var (rowId, aggregate) in aggregates)
+        {
+            aggregate.Positions.Sort();
+            var compactFrequencies = new int[System.Numerics.BitOperations.PopCount(aggregate.ColumnMask)];
+            var next = 0;
+            for (var column = 0; column < _columnCount; column++)
+            {
+                if ((aggregate.ColumnMask & (1u << column)) != 0)
+                    compactFrequencies[next++] = aggregate.ColumnFrequencies[column];
+            }
+
+            candidates.Add(new ScoreCandidate(
+                rowId,
+                aggregate.Frequency,
+                aggregate.Positions.ToArray(),
+                aggregate.Positions.Count == 0 ? compactFrequencies : [],
+                aggregate.ColumnMask));
+        }
+
+        Accumulate(accumulator, candidates, columnMask, columnWeights);
+        return matches;
+    }
+
+    private HashSet<long> EvaluatePhrase(
+        ManagedFtsPhraseNode phrase,
+        Dictionary<long, double>? accumulator,
+        IReadOnlyList<double> columnWeights,
+        IReadOnlyDictionary<long, int[]>? includedRowFrequencies = null)
     {
         RequirePositions("phrase");
         var columnMask = ResolveColumnMask(phrase.Column);
         var candidates = new List<ScoreCandidate>();
         var matches = new HashSet<long>();
-        foreach (var rowId in IntersectTerms(phrase.Terms))
+        var nearPhrase = new ManagedFtsNearPhrase(phrase.Terms);
+        foreach (var rowId in FindPhraseCandidates(nearPhrase))
         {
-            var frequency = CountPhrase(rowId, phrase.Terms, columnMask, phrase.AnchoredAtStart);
-            if (frequency == 0)
+            var frequencies = CountPhraseByColumn(
+                rowId,
+                phrase.Terms,
+                columnMask,
+                phrase.AnchoredAtStart);
+            var candidate = CreateFrequencyCandidate(rowId, frequencies);
+            if (candidate.Frequency == 0)
                 continue;
 
             matches.Add(rowId);
-            candidates.Add(new ScoreCandidate(rowId, frequency, [], [], columnMask));
+            candidates.Add(candidate);
         }
 
         if (accumulator is not null)
-            Accumulate(accumulator, candidates, columnMask);
+            Accumulate(accumulator, candidates, columnMask, columnWeights, includedRowFrequencies);
 
         return matches;
     }
 
-    private HashSet<long> EvaluateNear(ManagedFtsNearNode near, Dictionary<long, double>? accumulator)
+    private HashSet<long> EvaluateNear(
+        ManagedFtsNearNode near,
+        Dictionary<long, double>? accumulator,
+        IReadOnlyList<double> columnWeights)
     {
         RequirePositions("NEAR");
         var columnMask = ResolveColumnMask(near.Column);
+        if (near.SqliteDistance)
+            return EvaluateSqliteNear(near, accumulator, columnWeights, columnMask);
+
+        var terms = near.Phrases
+            .SelectMany(static phrase => phrase.Terms)
+            .Select(static term => term.Text)
+            .ToArray();
         var candidates = new List<ScoreCandidate>();
         var matches = new HashSet<long>();
-        foreach (var rowId in IntersectTerms(near.Terms))
+        foreach (var rowId in IntersectTerms(terms))
         {
-            var frequency = CountNear(rowId, near.Terms, near.Distance, columnMask);
+            var frequency = CountNear(rowId, terms, near.Distance, columnMask);
             if (frequency == 0)
                 continue;
 
@@ -438,7 +604,59 @@ internal sealed class ManagedFtsSearchIndex
         }
 
         if (accumulator is not null)
-            Accumulate(accumulator, candidates, columnMask);
+            Accumulate(accumulator, candidates, columnMask, columnWeights);
+
+        return matches;
+    }
+
+    private HashSet<long> EvaluateSqliteNear(
+        ManagedFtsNearNode near,
+        Dictionary<long, double>? accumulator,
+        IReadOnlyList<double> columnWeights,
+        uint columnMask)
+    {
+        var matches = new HashSet<long>();
+        var matchedPhraseFrequencies = Enumerable
+            .Range(0, near.Phrases.Count)
+            .Select(static _ => new Dictionary<long, int[]>())
+            .ToArray();
+        foreach (var rowId in IntersectPhrases(near.Phrases))
+        {
+            var nearMatch = FindSqliteNearMatches(
+                rowId,
+                near.Phrases,
+                near.Distance,
+                columnMask);
+            var mask = GetFrequencyColumnMask(nearMatch.GroupFrequencies);
+            if (mask == 0)
+                continue;
+
+            matches.Add(rowId);
+            for (var phraseIndex = 0; phraseIndex < near.Phrases.Count; phraseIndex++)
+            {
+                matchedPhraseFrequencies[phraseIndex].Add(
+                    rowId,
+                    nearMatch.PhraseColumnFrequencies[phraseIndex]);
+            }
+        }
+
+        if (accumulator is null || matches.Count == 0)
+            return matches;
+
+        // SQLite FTS5 scores every phrase in a NEAR group independently. The proximity
+        // predicate only limits which rows and columns receive those phrase contributions.
+        for (var phraseIndex = 0; phraseIndex < near.Phrases.Count; phraseIndex++)
+        {
+            var phrase = near.Phrases[phraseIndex];
+            EvaluatePhrase(
+                new ManagedFtsPhraseNode(
+                    phrase.Terms,
+                    near.Column,
+                    AnchoredAtStart: false),
+                accumulator,
+                columnWeights,
+                matchedPhraseFrequencies[phraseIndex]);
+        }
 
         return matches;
     }
@@ -502,24 +720,97 @@ internal sealed class ManagedFtsSearchIndex
         return candidates ?? [];
     }
 
-    private int CountPhrase(long rowId, IReadOnlyList<string> terms, uint columnMask, bool anchored)
+    private IEnumerable<long> IntersectPhrases(IReadOnlyList<ManagedFtsNearPhrase> phrases)
     {
-        var streams = new long[terms.Count][];
-        for (var index = 0; index < terms.Count; index++)
+        HashSet<long>? candidates = null;
+        foreach (var phrase in phrases)
         {
-            if (!TryGetPositions(terms[index], rowId, out var positions))
-                return 0;
+            var phraseCandidates = FindPhraseCandidates(phrase);
+            if (candidates is null)
+                candidates = phraseCandidates;
+            else
+                candidates.IntersectWith(phraseCandidates);
 
-            streams[index] = positions;
+            if (candidates.Count == 0)
+                return [];
         }
 
-        var count = 0;
+        return candidates ?? [];
+    }
+
+    private HashSet<long> FindPhraseCandidates(ManagedFtsNearPhrase phrase)
+    {
+        HashSet<long>? candidates = null;
+        for (var index = 0; index < phrase.Terms.Count; index++)
+        {
+            var termRows = new HashSet<long>();
+            var phraseTerm = phrase.Terms[index];
+            var terms = phraseTerm.IsPrefix
+                ? ExpandTerm(new ManagedFtsTermNode(
+                    phraseTerm.Text,
+                    IsPrefix: true,
+                    Column: null,
+                    AnchoredAtStart: false))
+                : [phraseTerm.Text];
+            foreach (var term in terms)
+            {
+                if (!_postings.TryGetValue(term, out var list))
+                    continue;
+
+                foreach (var posting in list.Entries)
+                {
+                    if (IsLive(posting))
+                        termRows.Add(posting.RowId);
+                }
+            }
+
+            if (candidates is null)
+                candidates = termRows;
+            else
+                candidates.IntersectWith(termRows);
+
+            if (candidates.Count == 0)
+                return [];
+        }
+
+        return candidates ?? [];
+    }
+
+    private List<PhraseOccurrence> GetPhraseOccurrences(
+        long rowId,
+        ManagedFtsNearPhrase phrase,
+        uint columnMask,
+        bool anchored)
+    {
+        if (phrase.Terms.Count == 0)
+            return [];
+
+        var streams = new long[phrase.Terms.Count][];
+        for (var index = 0; index < phrase.Terms.Count; index++)
+        {
+            var phraseTerm = phrase.Terms[index];
+            if (phraseTerm.IsPrefix)
+            {
+                streams[index] = GetPrefixPositions(phraseTerm.Text, rowId);
+                if (streams[index].Length == 0)
+                    return [];
+            }
+            else if (TryGetPositions(phraseTerm.Text, rowId, out var positions))
+            {
+                streams[index] = positions;
+            }
+            else
+            {
+                return [];
+            }
+        }
+
+        var occurrences = new List<PhraseOccurrence>();
         foreach (var start in streams[0])
         {
             var column = (int)(start >> 32);
-            if ((columnMask & (1u << column)) == 0)
-                continue;
-            if (anchored && (start & 0xFFFFFFFFL) != 0)
+            var position = (int)(start & 0xFFFFFFFFL);
+            if ((columnMask & (1u << column)) == 0 || (anchored && position != 0))
                 continue;
 
             var matched = true;
@@ -533,10 +824,80 @@ internal sealed class ManagedFtsSearchIndex
             }
 
             if (matched)
-                count++;
+            {
+                occurrences.Add(new PhraseOccurrence(
+                    column,
+                    position,
+                    checked(position + streams.Length - 1)));
+            }
         }
 
-        return count;
+        return occurrences;
+    }
+
+    private long[] GetPrefixPositions(string prefix, long rowId)
+    {
+        var positions = new List<long>();
+        foreach (var expanded in ExpandTerm(new ManagedFtsTermNode(
+                     prefix,
+                     IsPrefix: true,
+                     Column: null,
+                     AnchoredAtStart: false)))
+        {
+            if (TryGetPositions(expanded, rowId, out var expandedPositions))
+                positions.AddRange(expandedPositions);
+        }
+
+        positions.Sort();
+        return positions.ToArray();
+    }
+
+    private ScoreCandidate CreateFrequencyCandidate(long rowId, IReadOnlyList<int> frequencies)
+    {
+        var columnMask = GetFrequencyColumnMask(frequencies);
+        var compact = new int[System.Numerics.BitOperations.PopCount(columnMask)];
+        var next = 0;
+        var total = 0;
+        for (var column = 0; column < _columnCount; column++)
+        {
+            var frequency = frequencies[column];
+            total += frequency;
+            if (frequency != 0)
+                compact[next++] = frequency;
+        }
+
+        return new ScoreCandidate(rowId, total, [], compact, columnMask);
+    }
+
+    private uint GetFrequencyColumnMask(IReadOnlyList<int> frequencies)
+    {
+        var mask = 0u;
+        for (var column = 0; column < _columnCount; column++)
+        {
+            if (frequencies[column] != 0)
+                mask |= 1u << column;
+        }
+
+        return mask;
+    }
+
+    private int[] CountPhraseByColumn(
+        long rowId,
+        IReadOnlyList<ManagedFtsPhraseTerm> terms,
+        uint columnMask,
+        bool anchored)
+    {
+        var frequencies = new int[_columnCount];
+        foreach (var occurrence in GetPhraseOccurrences(
+                     rowId,
+                     new ManagedFtsNearPhrase(terms),
+                     columnMask,
+                     anchored))
+        {
+            frequencies[occurrence.Column]++;
+        }
+
+        return frequencies;
     }
 
     private int CountNear(long rowId, IReadOnlyList<string> terms, int distance, uint columnMask)
@@ -573,6 +934,140 @@ internal sealed class ManagedFtsSearchIndex
         }
 
         return count;
+    }
+
+    private SqliteNearMatch FindSqliteNearMatches(
+        long rowId,
+        IReadOnlyList<ManagedFtsNearPhrase> phrases,
+        int distance,
+        uint columnMask)
+    {
+        var phraseOccurrences = new List<PhraseOccurrence>[phrases.Count];
+        for (var index = 0; index < phrases.Count; index++)
+        {
+            phraseOccurrences[index] = GetPhraseOccurrences(
+                rowId,
+                phrases[index],
+                columnMask,
+                anchored: false);
+            if (phraseOccurrences[index].Count == 0)
+                return new SqliteNearMatch(phrases.Count, _columnCount);
+        }
+
+        var result = new SqliteNearMatch(phrases.Count, _columnCount);
+        for (var column = 0; column < _columnCount; column++)
+        {
+            if ((columnMask & (1u << column)) == 0)
+                continue;
+
+            var columnOccurrences = new List<PhraseOccurrence>[phrases.Count];
+            var maximumStarts = new List<int>();
+            for (var phraseIndex = 0; phraseIndex < phraseOccurrences.Length; phraseIndex++)
+            {
+                columnOccurrences[phraseIndex] = phraseOccurrences[phraseIndex]
+                    .Where(occurrence => occurrence.Column == column)
+                    .ToList();
+                if (columnOccurrences[phraseIndex].Count == 0)
+                    goto NextColumn;
+
+                maximumStarts.AddRange(
+                    columnOccurrences[phraseIndex].Select(static occurrence => occurrence.StartPosition));
+            }
+
+            maximumStarts.Sort();
+            var participatingRanges = Enumerable
+                .Range(0, phrases.Count)
+                .Select(static _ => new List<OccurrenceRange>())
+                .ToArray();
+            var previousMaximumStart = -1;
+            foreach (var maximumStart in maximumStarts)
+            {
+                if (maximumStart == previousMaximumStart)
+                    continue;
+                previousMaximumStart = maximumStart;
+
+                var ranges = new OccurrenceRange[phrases.Count];
+                var matches = true;
+                for (var phraseIndex = 0; phraseIndex < phrases.Count; phraseIndex++)
+                {
+                    var minimumStart = Math.Max(
+                        0L,
+                        (long)maximumStart - distance - phrases[phraseIndex].Terms.Count);
+                    var occurrences = columnOccurrences[phraseIndex];
+                    var first = LowerBoundByStart(occurrences, minimumStart);
+                    var end = UpperBoundByStart(occurrences, maximumStart);
+                    if (first == end)
+                    {
+                        matches = false;
+                        break;
+                    }
+
+                    ranges[phraseIndex] = new OccurrenceRange(first, end);
+                }
+
+                if (!matches)
+                    continue;
+
+                result.GroupFrequencies[column]++;
+                for (var phraseIndex = 0; phraseIndex < phrases.Count; phraseIndex++)
+                    AddOccurrenceRange(participatingRanges[phraseIndex], ranges[phraseIndex]);
+            }
+
+            for (var phraseIndex = 0; phraseIndex < phrases.Count; phraseIndex++)
+            {
+                result.PhraseColumnFrequencies[phraseIndex][column] =
+                    participatingRanges[phraseIndex].Sum(static range => range.End - range.Start);
+            }
+
+        NextColumn:
+            continue;
+        }
+
+        return result;
+    }
+
+    private static int LowerBoundByStart(IReadOnlyList<PhraseOccurrence> occurrences, long target)
+    {
+        var low = 0;
+        var high = occurrences.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) >> 1);
+            if (occurrences[middle].StartPosition < target)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        return low;
+    }
+
+    private static int UpperBoundByStart(IReadOnlyList<PhraseOccurrence> occurrences, int target)
+    {
+        var low = 0;
+        var high = occurrences.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) >> 1);
+            if (occurrences[middle].StartPosition <= target)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        return low;
+    }
+
+    private static void AddOccurrenceRange(List<OccurrenceRange> ranges, OccurrenceRange next)
+    {
+        if (ranges.Count == 0 || next.Start > ranges[^1].End)
+        {
+            ranges.Add(next);
+            return;
+        }
+
+        var previous = ranges[^1];
+        ranges[^1] = new OccurrenceRange(previous.Start, Math.Max(previous.End, next.End));
     }
 
     private static bool HasPositionWithin(long[] positions, int column, int anchorPosition, int distance)
@@ -676,30 +1171,145 @@ internal sealed class ManagedFtsSearchIndex
     private void Accumulate(
         Dictionary<long, double> accumulator,
         List<ScoreCandidate> candidates,
-        uint columnMask)
+        uint columnMask,
+        IReadOnlyList<double> columnWeights,
+        IReadOnlyDictionary<long, int[]>? includedRowFrequencies = null)
     {
         if (candidates.Count == 0)
             return;
 
         var documentCount = _documents.Count;
-        var idf = Math.Log(1.0 + ((documentCount - candidates.Count + 0.5) / (candidates.Count + 0.5)));
-        foreach (var candidate in candidates)
+        var idf = _scoringProfile == ManagedFtsScoringProfile.SqliteFts5
+            ? Math.Max(
+                0.000001,
+                Math.Log((documentCount - candidates.Count + 0.5) / (candidates.Count + 0.5)))
+            : Math.Log(1.0 + ((documentCount - candidates.Count + 0.5) / (candidates.Count + 0.5)));
+        foreach (var originalCandidate in candidates)
         {
-            if (!_documents.TryGetValue(candidate.RowId, out var document))
+            if (!_documents.TryGetValue(originalCandidate.RowId, out var document))
                 continue;
 
+            var candidate = originalCandidate;
+            var effectiveColumnMask = columnMask;
+            if (includedRowFrequencies is not null)
+            {
+                if (!includedRowFrequencies.TryGetValue(candidate.RowId, out var frequencies))
+                    continue;
+
+                candidate = CreateFrequencyCandidate(candidate.RowId, frequencies);
+                effectiveColumnMask &= candidate.PostingColumnMask;
+                if (effectiveColumnMask == 0)
+                    continue;
+            }
+
             double score;
-            if (candidate.Positions.Length != 0)
-                score = ScorePerColumn(document, candidate.Positions, idf, columnMask);
+            if (_scoringProfile == ManagedFtsScoringProfile.SqliteFts5)
+                score = ScoreSqliteFts5(
+                    document,
+                    candidate,
+                    idf,
+                    effectiveColumnMask,
+                    columnWeights);
+            else if (candidate.Positions.Length != 0)
+            {
+                score = ScorePerColumn(
+                    document,
+                    candidate.Positions,
+                    idf,
+                    effectiveColumnMask,
+                    columnWeights);
+            }
             else if (candidate.ColumnFrequencies.Length != 0)
-                score = ScorePerColumnFrequencies(document, candidate, idf, columnMask);
+            {
+                score = ScorePerColumnFrequencies(
+                    document,
+                    candidate,
+                    idf,
+                    effectiveColumnMask,
+                    columnWeights);
+            }
             else
-                score = ScoreUniform(document, candidate.Frequency, idf, columnMask);
+            {
+                score = ScoreUniform(
+                    document,
+                    candidate.Frequency,
+                    idf,
+                    effectiveColumnMask,
+                    columnWeights);
+            }
 
             accumulator[candidate.RowId] = accumulator.TryGetValue(candidate.RowId, out var existing)
                 ? existing + score
                 : score;
         }
+    }
+
+    private double ScoreSqliteFts5(
+        Document document,
+        in ScoreCandidate candidate,
+        double idf,
+        uint columnMask,
+        IReadOnlyList<double> columnWeights)
+    {
+        double weightedFrequency;
+        if (candidate.Positions.Length != 0)
+        {
+            Span<int> perColumn = stackalloc int[_columnCount];
+            foreach (var encoded in candidate.Positions)
+            {
+                var column = (int)(encoded >> 32);
+                if ((columnMask & (1u << column)) != 0)
+                    perColumn[column]++;
+            }
+
+            weightedFrequency = 0.0;
+            for (var column = 0; column < _columnCount; column++)
+                weightedFrequency += perColumn[column] * columnWeights[column];
+        }
+        else if (candidate.ColumnFrequencies.Length != 0)
+        {
+            weightedFrequency = 0.0;
+            var next = 0;
+            for (var column = 0; column < _columnCount; column++)
+            {
+                var bit = 1u << column;
+                if ((candidate.PostingColumnMask & bit) == 0)
+                    continue;
+
+                var frequency = candidate.ColumnFrequencies[next++];
+                if ((columnMask & bit) != 0)
+                    weightedFrequency += frequency * columnWeights[column];
+            }
+        }
+        else
+        {
+            // detail=none has no column attribution. Preserve its aggregate-frequency behavior;
+            // phrase and NEAR candidates require detail=full and carry exact per-column counts.
+            var weight = 0.0;
+            for (var column = 0; column < _columnCount; column++)
+            {
+                if ((columnMask & (1u << column)) != 0)
+                    weight = Math.Max(weight, columnWeights[column]);
+            }
+
+            weightedFrequency = candidate.Frequency * weight;
+        }
+
+        if (weightedFrequency <= 0.0)
+            return 0.0;
+
+        var documentLength = document.ColumnLengths.Sum();
+        var totalTokens = 0L;
+        foreach (var total in _columnTokenTotals)
+            totalTokens += total;
+        var averageLength = _documents.Count == 0 ? 0.0 : (double)totalTokens / _documents.Count;
+        var normalization = averageLength <= 0.0
+            ? 1.0
+            : 1.0 - BM25B + (BM25B * documentLength / averageLength);
+        return idf
+            * weightedFrequency
+            * (BM25K1 + 1.0)
+            / (weightedFrequency + (BM25K1 * normalization));
     }
 
     /// <summary>
@@ -716,7 +1326,8 @@ internal sealed class ManagedFtsSearchIndex
         Document document,
         in ScoreCandidate candidate,
         double idf,
-        uint columnMask)
+        uint columnMask,
+        IReadOnlyList<double> columnWeights)
     {
         var score = 0.0;
         var next = 0;
@@ -730,13 +1341,18 @@ internal sealed class ManagedFtsSearchIndex
             if ((columnMask & bit) == 0 || frequency == 0)
                 continue;
 
-            score += _columnWeights[column] * idf * Saturate(frequency, document.ColumnLengths[column], column);
+            score += columnWeights[column] * idf * Saturate(frequency, document.ColumnLengths[column], column);
         }
 
         return score;
     }
 
-    private double ScorePerColumn(Document document, long[] positions, double idf, uint columnMask)
+    private double ScorePerColumn(
+        Document document,
+        long[] positions,
+        double idf,
+        uint columnMask,
+        IReadOnlyList<double> columnWeights)
     {
         Span<int> perColumn = stackalloc int[_columnCount];
         foreach (var encoded in positions)
@@ -752,13 +1368,18 @@ internal sealed class ManagedFtsSearchIndex
             if (perColumn[column] == 0)
                 continue;
 
-            score += _columnWeights[column] * idf * Saturate(perColumn[column], document.ColumnLengths[column], column);
+            score += columnWeights[column] * idf * Saturate(perColumn[column], document.ColumnLengths[column], column);
         }
 
         return score;
     }
 
-    private double ScoreUniform(Document document, int frequency, double idf, uint columnMask)
+    private double ScoreUniform(
+        Document document,
+        int frequency,
+        double idf,
+        uint columnMask,
+        IReadOnlyList<double> columnWeights)
     {
         // Phrase and NEAR match a contiguous window, so their frequency is not attributable to a
         // single column stream. Attribute it to the heaviest selected column, which keeps the score
@@ -770,9 +1391,9 @@ internal sealed class ManagedFtsSearchIndex
             if ((columnMask & (1u << column)) == 0 || document.ColumnLengths[column] == 0)
                 continue;
 
-            if (bestColumn < 0 || _columnWeights[column] > bestWeight)
+            if (bestColumn < 0 || columnWeights[column] > bestWeight)
             {
-                bestWeight = _columnWeights[column];
+                bestWeight = columnWeights[column];
                 bestColumn = column;
             }
         }
@@ -905,7 +1526,7 @@ internal sealed class ManagedFtsSearchIndex
             SqlValueKind.Text => value.AsText(),
             SqlValueKind.Integer => value.AsInteger().ToString(CultureInfo.InvariantCulture),
             SqlValueKind.Real => value.AsReal().ToString("R", CultureInfo.InvariantCulture),
-            SqlValueKind.Blob => string.Empty,
+            SqlValueKind.Blob => Encoding.UTF8.GetString(value.AsBlob().Span),
             _ => string.Empty,
         };
 
@@ -945,6 +1566,20 @@ internal sealed class ManagedFtsSearchIndex
         long[] Positions,
         int[] ColumnFrequencies);
 
+    private readonly record struct PhraseOccurrence(int Column, int StartPosition, int EndPosition);
+
+    private readonly record struct OccurrenceRange(int Start, int End);
+
+    private sealed class SqliteNearMatch(int phraseCount, int columnCount)
+    {
+        public int[] GroupFrequencies { get; } = new int[columnCount];
+
+        public int[][] PhraseColumnFrequencies { get; } = Enumerable
+            .Range(0, phraseCount)
+            .Select(_ => new int[columnCount])
+            .ToArray();
+    }
+
     /// <summary>One document's contribution to a term's score, before BM25 is applied.</summary>
     private readonly record struct ScoreCandidate(
         long RowId,
@@ -952,6 +1587,14 @@ internal sealed class ManagedFtsSearchIndex
         long[] Positions,
         int[] ColumnFrequencies,
         uint PostingColumnMask);
+
+    private sealed class PrefixScoreCandidate(int columnCount)
+    {
+        public int Frequency;
+        public uint ColumnMask;
+        public List<long> Positions { get; } = [];
+        public int[] ColumnFrequencies { get; } = new int[columnCount];
+    }
 
     private sealed class PostingList
     {
