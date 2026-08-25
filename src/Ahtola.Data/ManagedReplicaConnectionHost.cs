@@ -478,16 +478,25 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             return;
 
         await syncEntry.PublishAsync(
-                cancellationToken =>
-                {
-                    var current = ManagedReplicaBootstrapper.LoadMetadata(databasePath)
-                                  ?? throw new InvalidDataException(
-                                      "Managed embedded replica checkpoint recovery metadata is missing.");
-                    _ = ManagedReplicaRevertWal.PrepareSynchronization(databasePath, current);
-                    return Task.CompletedTask;
-                },
+                token => PrepareSynchronizationWithPublicationLocksAsync(databasePath, token),
                 cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    private static async Task PrepareSynchronizationWithPublicationLocksAsync(
+        string databasePath,
+        CancellationToken cancellationToken)
+    {
+        await using var pushLease = await ManagedReplicaPushLock
+            .AcquireExclusiveAsync(databasePath, cancellationToken)
+            .ConfigureAwait(false);
+        await using var applyLease = await ManagedReplicaApplyLock
+            .AcquireExclusiveAsync(databasePath, cancellationToken)
+            .ConfigureAwait(false);
+        var current = ManagedReplicaBootstrapper.LoadMetadata(databasePath)
+                      ?? throw new InvalidDataException(
+                          "Managed embedded replica checkpoint recovery metadata is missing.");
+        _ = ManagedReplicaRevertWal.PrepareSynchronization(databasePath, current);
     }
 
     private static bool IsReplicaFilePresent(string path)
@@ -842,15 +851,20 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var metadata = ManagedReplicaBootstrapper.LoadMetadata(_options.Path);
         if (metadata is { } value)
         {
-            if (value.RevertState is null
-                || value.RevertState is
+            if (value.RevertState is
                 {
                     Phase: ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.Captured
                     or ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.RestoreCommitted
                     or ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.RestoreOriginal,
-                })
+                }
+                || ManagedReplicaRevertWal.GetArtifactPaths(_options.Path).Any(File.Exists))
             {
-                value = ManagedReplicaRevertWal.PrepareSynchronization(_options.Path, value);
+                PrepareSynchronizationWithPublicationLocksAsync(_options.Path, CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult();
+                value = ManagedReplicaBootstrapper.LoadMetadata(_options.Path)
+                    ?? throw new InvalidDataException(
+                        "Managed embedded replica checkpoint recovery metadata is missing.");
             }
             metadata = value;
             _metadata = value;
@@ -1414,18 +1428,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     /// authoritative, and a corrupt marker throws rather than being ignored.
     /// </summary>
     private static void ThrowIfReplicaConflictIsPending(string databasePath)
-    {
-        if (ManagedReplicaConflictState.TryRead(databasePath) is not { } state)
-            return;
-
-        throw new AhtolaReplicaConflictPendingException(
-            "Managed embedded replica has an unresolved push conflict; "
-            + $"{state.UnresolvedSequences.Count} locally journaled change(s) were rejected by the remote "
-            + "and are quarantined. Inspect the conflict and resolve or discard it explicitly before "
-            + "synchronizing again.",
-            state.ConflictKind,
-            state.UnresolvedSequences.Count);
-    }
+        => ManagedReplicaConflictState.ThrowIfPending(databasePath);
 
     /// <summary>
     /// Reads the open push conflict, if any, and classifies every change in the rejected batch.
@@ -1662,7 +1665,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                 new AhtolaSyncOptions(options?.Progress),
                 pendingLocalChanges,
                 acknowledgedLocalChanges,
-                quarantined,
+                state,
                 cancellationToken)
             .ConfigureAwait(false);
 

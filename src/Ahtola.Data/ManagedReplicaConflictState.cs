@@ -52,6 +52,32 @@ internal readonly record struct ManagedReplicaConflictState(
 
     internal static bool Exists(string databasePath) => File.Exists(GetPath(databasePath));
 
+    internal static void ThrowIfPending(string databasePath)
+    {
+        if (TryRead(databasePath) is { } state)
+            throw CreatePendingException(state);
+    }
+
+    internal static void ValidatePullPublication(
+        string databasePath,
+        ManagedReplicaConflictState? expectedState)
+    {
+        var current = TryRead(databasePath);
+        if (expectedState is not { } expected)
+        {
+            if (current is { } pending)
+                throw CreatePendingException(pending);
+            return;
+        }
+
+        if (current is not { } actual || !HasSameDurableIdentity(actual, expected))
+        {
+            throw new InvalidDataException(
+                "Managed replica conflict state changed while an explicit conflict rebase pull was "
+                + "in flight; the stale pull was not published.");
+        }
+    }
+
     /// <summary>
     /// Reads the durable marker, or returns <see langword="null"/> when no conflict is open.
     /// Corrupt or self-inconsistent content is never silently ignored.
@@ -207,6 +233,26 @@ internal readonly record struct ManagedReplicaConflictState(
         GetPath(databasePath),
         GetStagingPath(databasePath),
     ];
+
+    private static AhtolaReplicaConflictPendingException CreatePendingException(
+        ManagedReplicaConflictState state)
+        => new(
+            "Managed embedded replica has an unresolved push conflict; "
+            + $"{state.UnresolvedSequences.Count} locally journaled change(s) were rejected by the remote "
+            + "and are quarantined. Inspect the conflict and resolve or discard it explicitly before "
+            + "synchronizing again.",
+            state.ConflictKind,
+            state.UnresolvedSequences.Count);
+
+    private static bool HasSameDurableIdentity(
+        ManagedReplicaConflictState left,
+        ManagedReplicaConflictState right)
+        => left.ConflictKind == right.ConflictKind
+           && string.Equals(left.RemoteErrorCode, right.RemoteErrorCode, StringComparison.Ordinal)
+           && left.ConflictingSequence == right.ConflictingSequence
+           && left.BatchFirstSequence == right.BatchFirstSequence
+           && left.BatchWatermark == right.BatchWatermark
+           && left.UnresolvedSequences.SequenceEqual(right.UnresolvedSequences);
 
     private static void DeleteStagingArtifact(string stagingPath, bool throwOnFailure)
     {

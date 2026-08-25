@@ -557,7 +557,15 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             var requestPending = requestJournal.ReadBatch(int.MaxValue).Changes;
             var stalePullHandler = new DelayedPullHandler(
                 CreateLogicalPullResponse("revision-43", body: []));
-            var stalePull = ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+            var pullWaitingForPublication = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<AhtolaSyncResult> stalePull;
+            using var pullBoundary = ManagedReplicaFaultInjection.Push(boundary =>
+            {
+                if (boundary == ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting)
+                    pullWaitingForPublication.TrySetResult();
+            });
+            stalePull = ManagedReplicaBootstrapper.CheckForUpdatesAsync(
                 CreateOptions(aliasPath, stalePullHandler),
                 requestMetadata,
                 new AhtolaSyncOptions(),
@@ -570,7 +578,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 TestContext.CurrentContext.WorkDirectory,
                 path);
             stalePullHandler.Release();
-            await Task.Delay(TimeSpan.FromMilliseconds(250));
+            await pullWaitingForPublication.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
             stalePull.IsCompleted.Should().BeFalse(
                 "pull publication through an alias must queue behind the process holding the "

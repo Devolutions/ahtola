@@ -69,6 +69,12 @@ internal enum ManagedReplicaDurableBoundary
     ReplicaPushIntentRetired,
 
     /// <summary>
+    /// Hit after a pull response is fully available locally and immediately before it waits for
+    /// the push-flight lease that protects publication.
+    /// </summary>
+    ReplicaPullPublicationLockWaiting,
+
+    /// <summary>
     /// Hit immediately after the exclusive physical apply lease is acquired for an explicit
     /// conflict resolution's local publication (journal discard and marker retirement), before any
     /// irreversible work.
@@ -164,6 +170,12 @@ internal enum ManagedReplicaDurableBoundary
     RevertRestoreDatabasePublished,
     RevertRestoreMetadataPublished,
     RevertRetired,
+
+    /// <summary>
+    /// Hit after all remote pages are available and immediately before partial-image completion
+    /// waits for the push/apply publication leases.
+    /// </summary>
+    PartialImagePublicationLockWaiting,
 }
 
 /// <summary>

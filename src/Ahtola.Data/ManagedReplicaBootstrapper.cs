@@ -828,7 +828,7 @@ internal static class ManagedReplicaBootstrapper
                 syncOptions,
                 pendingLocalChanges,
                 acknowledgedLocalChanges,
-                quarantinedSequences: null,
+                expectedConflictState: null,
                 cancellationToken)
             .ConfigureAwait(false)).Result;
 
@@ -855,27 +855,31 @@ internal static class ManagedReplicaBootstrapper
     /// the staleness baseline in <see cref="TryUseCurrentLocalStateAsPullBase"/>.
     /// </param>
     /// <param name="acknowledgedLocalChanges">Already-pushed changes retained for base rebuilds.</param>
-    /// <param name="quarantinedSequences">
-    /// Journal sequences that are still durably pending but must never be replayed onto the newly
-    /// pulled base — the unresolved half of an open push conflict (see
-    /// <see cref="ManagedReplicaConflictState"/>). They stay part of
+    /// <param name="expectedConflictState">
+    /// The open conflict an explicit rebase pull was negotiated against. Its unresolved journal
+    /// sequences must never be replayed onto the newly pulled base. They stay part of
     /// <paramref name="pendingLocalChanges"/> for the staleness comparison (which must keep seeing
     /// the journal exactly as it is on disk, or the retry loop could never converge), but are
     /// filtered out of the set handed to the replay path so the remote value wins for the rows
-    /// they touch.
+    /// they touch. A normal pull passes <see langword="null"/> and fails if any conflict appears
+    /// before publication; an explicit rebase fails if the marker no longer exactly matches this
+    /// state.
     /// </param>
     /// <param name="cancellationToken">Cancels the pull.</param>
     internal static async Task<ManagedReplicaPullOutcome> CheckForUpdatesAsync(
         AhtolaReplicaOptions options, ManagedReplicaMetadata metadata, AhtolaSyncOptions syncOptions,
         IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
         IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
-        IReadOnlySet<long>? quarantinedSequences,
+        ManagedReplicaConflictState? expectedConflictState,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(pendingLocalChanges);
         ArgumentNullException.ThrowIfNull(acknowledgedLocalChanges);
+        IReadOnlySet<long>? quarantinedSequences = expectedConflictState is { } conflict
+            ? new HashSet<long>(conflict.UnresolvedSequences)
+            : null;
         ManagedReplicaSupportMatrix.ValidateOptions(options);
-        ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
+        ManagedReplicaRevertWal.ValidateSynchronizationReady(options.Path, metadata);
         // The whole pull-and-apply cycle below is retried, in place, whenever the apply lease
         // reveals that local state already moved past the snapshot (metadata, pending local
         // changes) this iteration's request/response were negotiated against -- see
@@ -962,6 +966,8 @@ internal static class ManagedReplicaBootstrapper
                 // apply. Besides excluding an in-flight push intent, this order prevents a main-file
                 // replacement from changing the physical identity behind the push carrier while an
                 // older carrier is still held.
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting);
                 await using var logicalPushLease = await ManagedReplicaPushLock
                     .AcquireExclusiveAsync(options.Path, effectiveToken)
                     .ConfigureAwait(false);
@@ -969,6 +975,7 @@ internal static class ManagedReplicaBootstrapper
                     .ConfigureAwait(false);
                 ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
                 effectiveToken.ThrowIfCancellationRequested();
+                ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
 
                 // The request above (and this response) were negotiated against `metadata` and
                 // `pendingLocalChanges` as they stood BEFORE the network round trip and the wait
@@ -988,6 +995,7 @@ internal static class ManagedReplicaBootstrapper
                     acknowledgedLocalChanges = freshLogicalAcknowledgedLocalChanges;
                     continue;
                 }
+                ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
 
                 var (outcome, statistics, replayed) = await ApplyLogicalUpdatesAsync(
                     options, metadata, header, body, syncOptions,
@@ -1020,6 +1028,29 @@ internal static class ManagedReplicaBootstrapper
             }
             if (pages.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
             {
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting);
+                await using var noOpPushLease = await ManagedReplicaPushLock
+                    .AcquireExclusiveAsync(options.Path, effectiveToken)
+                    .ConfigureAwait(false);
+                await using var noOpApplyLease = await ManagedReplicaApplyLock
+                    .AcquireExclusiveAsync(options.Path, effectiveToken)
+                    .ConfigureAwait(false);
+                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
+                effectiveToken.ThrowIfCancellationRequested();
+                ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
+                if (!TryUseCurrentLocalStateAsPullBase(
+                        options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
+                        out var freshNoOpMetadata,
+                        out var freshNoOpPendingLocalChanges,
+                        out var freshNoOpAcknowledgedLocalChanges))
+                {
+                    metadata = freshNoOpMetadata;
+                    pendingLocalChanges = freshNoOpPendingLocalChanges;
+                    acknowledgedLocalChanges = freshNoOpAcknowledgedLocalChanges;
+                    continue;
+                }
+                ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
                 syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
                 return new ManagedReplicaPullOutcome(
                     new AhtolaSyncResult(AhtolaSyncOutcome.UpToDate,
@@ -1039,6 +1070,8 @@ internal static class ManagedReplicaBootstrapper
 
             // Keep the same push-to-apply order as the logical branch. The response is already fully
             // staged in memory, so no remote I/O is covered by either lease.
+            ManagedReplicaFaultInjection.Hit(
+                ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting);
             await using var pagesPushLease = await ManagedReplicaPushLock
                 .AcquireExclusiveAsync(options.Path, effectiveToken)
                 .ConfigureAwait(false);
@@ -1046,6 +1079,7 @@ internal static class ManagedReplicaBootstrapper
                 .ConfigureAwait(false);
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
             effectiveToken.ThrowIfCancellationRequested();
+            ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
 
             if (!TryUseCurrentLocalStateAsPullBase(
                     options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
@@ -1058,6 +1092,7 @@ internal static class ManagedReplicaBootstrapper
                 acknowledgedLocalChanges = freshPagesAcknowledgedLocalChanges;
                 continue;
             }
+            ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
 
             // The response turned out to be a Pages stream (Incremental or ReplaceBase) even though
             // the remembered protocol is MvccLogical (a protocol-2 remote can still answer any given
@@ -1899,6 +1934,14 @@ internal static class ManagedReplicaBootstrapper
         if (!File.Exists(statePath))
             return metadata;
 
+        var requestBaseMetadata = LoadMetadata(options.Path)
+            ?? throw new NotSupportedException(
+                "Managed embedded replica metadata was removed before page materialization began.");
+        var requestBaseJournal = ManagedReplicaChangeJournal.Open(options.Path);
+        var requestBasePendingLocalChanges = requestBaseJournal.ReadBatch(int.MaxValue).Changes;
+        var requestBaseAcknowledgedLocalChanges = requestBaseMetadata.JournalBaseWatermark > 0
+            ? requestBaseJournal.ReadAcknowledged(requestBaseMetadata.JournalBaseWatermark)
+            : [];
         using var ownedFileSystem = retainedMaterializer is null
             ? new ManagedReplicaPageMaterializingFileSystem(
                 PhysicalFileSystem.Instance,
@@ -1925,6 +1968,8 @@ internal static class ManagedReplicaBootstrapper
         ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.PartialImageCompletionStarted);
         await fileSystem.MaterializeAllAsync(cancellationToken).ConfigureAwait(false);
 
+        ManagedReplicaFaultInjection.Hit(
+            ManagedReplicaDurableBoundary.PartialImagePublicationLockWaiting);
         await using var materializationPushLease = await ManagedReplicaPushLock
             .AcquireExclusiveAsync(options.Path, cancellationToken)
             .ConfigureAwait(false);
@@ -1932,7 +1977,21 @@ internal static class ManagedReplicaBootstrapper
             .AcquireExclusiveAsync(options.Path, cancellationToken)
             .ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
+        ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedState: null);
         RevalidateMaterializationPublicationMetadata(options.Path, metadata);
+        if (!TryUseCurrentLocalStateAsPullBase(
+                options.Path,
+                requestBaseMetadata,
+                requestBasePendingLocalChanges,
+                requestBaseAcknowledgedLocalChanges,
+                out _,
+                out _,
+                out _))
+        {
+            throw new InvalidOperationException(
+                "Managed embedded replica state changed while page materialization was in flight; "
+                + "the materialized image was not published.");
+        }
 
         var fingerprint = fileSystem.ComputeDatabaseFingerprint();
         var metadataPath = options.Path + MetadataSuffix;
@@ -2100,10 +2159,9 @@ internal static class ManagedReplicaBootstrapper
                 metadata = ManagedReplicaRevertWal.MarkRemoteApplyStarted(options.Path, metadata);
             mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
                 options.Path,
+                stagingPath,
                 cancellationToken);
             File.Replace(stagingPath, options.Path, backupPath, ignoreMetadataErrors: false);
-            mainFileReplacementLock?.Dispose();
-            mainFileReplacementLock = null;
             databaseInstalled = true;
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished);
             cancellationToken.ThrowIfCancellationRequested();
@@ -2137,9 +2195,6 @@ internal static class ManagedReplicaBootstrapper
             var remoteBaseSha256 = PublishRemoteBaseSnapshot(options.Path, metadata, options.Path);
             var tableMap = RebuildTableMapFromSchema(options.Path, options.RemoteEncryption);
             var installedFingerprint = ComputeDatabaseFingerprint(options.Path);
-            mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
-                options.Path,
-                cancellationToken);
             if (!string.Equals(
                     ComputeDatabaseFingerprint(options.Path),
                     installedFingerprint,
@@ -2179,8 +2234,7 @@ internal static class ManagedReplicaBootstrapper
             // interruption must preserve that matched pair rather than restore only DB.
             if (databaseInstalled && !metadataInstalled && File.Exists(backupPath))
             {
-                mainFileReplacementLock?.Dispose();
-                mainFileReplacementLock = null;
+                ManagedReplicaApplyLock.ReleaseMainFileLeaseForRollback(mainFileReplacementLock);
                 File.Replace(backupPath, options.Path, destinationBackupFileName: null, ignoreMetadataErrors: false);
             }
             throw;
@@ -3620,7 +3674,7 @@ internal static class ManagedReplicaBootstrapper
                      ManagedReplicaLockCarrier.PushKind,
                  })
         {
-            if (ManagedReplicaLockCarrier.TryResolve(databasePath, kind) is { } carrier)
+            foreach (var carrier in ManagedReplicaLockCarrier.TryResolveAll(databasePath, kind))
                 yield return carrier;
         }
     }
