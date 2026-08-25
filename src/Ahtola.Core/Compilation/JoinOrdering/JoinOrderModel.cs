@@ -10,7 +10,32 @@ namespace Ahtola.Core.Compilation.JoinOrdering;
 /// </param>
 /// <param name="RowCount">Estimated base cardinality, read from <c>sqlite_stat1</c>.</param>
 /// <param name="ColumnWidth">Number of value slots this member contributes to a joined row.</param>
-internal sealed record JoinSegmentMember(int OriginalIndex, double RowCount, int ColumnWidth);
+/// <param name="IndexCandidates">Persisted indexes whose leading-prefix statistics are available.</param>
+internal sealed record JoinSegmentMember(
+    int OriginalIndex,
+    double RowCount,
+    int ColumnWidth,
+    IReadOnlyList<JoinIndexCandidate>? IndexCandidates = null);
+
+/// <summary>
+/// One ordinary persisted B-tree index usable as an outer-bound join access. <c>Forced</c> is
+/// true when SQL named this index through mandatory <c>INDEXED BY</c>.
+/// </summary>
+internal sealed record JoinIndexCandidate(
+    string Name,
+    IReadOnlyList<JoinIndexColumn> Columns,
+    IReadOnlyList<double> RowsPerPrefix,
+    bool Unique,
+    bool Covering,
+    int TableColumnCount,
+    bool HasRowIdAlias,
+    bool Forced = false);
+
+/// <summary>One key column in persisted index order.</summary>
+internal readonly record struct JoinIndexColumn(
+    int ColumnOrdinal,
+    string Collation,
+    bool Descending);
 
 /// <summary>
 /// One AND-conjunct available to the segment, already resolved to the members it references.
@@ -33,6 +58,13 @@ internal sealed record JoinSegmentMember(int OriginalIndex, double RowCount, int
 /// <param name="Selectivity">
 /// Residual multiplier applied when the term is ready but cannot serve as a hash key.
 /// </param>
+/// <param name="EqualityLeftColumnOrdinal">Base-table ordinal of the left equality operand.</param>
+/// <param name="EqualityRightColumnOrdinal">Base-table ordinal of the right equality operand.</param>
+/// <param name="EqualityLeftConvertsTextToNumeric">Whether comparison affinity converts the left value.</param>
+/// <param name="EqualityLeftConvertsNumericToText">Whether comparison affinity textifies the left value.</param>
+/// <param name="EqualityRightConvertsTextToNumeric">Whether comparison affinity converts the right value.</param>
+/// <param name="EqualityRightConvertsNumericToText">Whether comparison affinity textifies the right value.</param>
+/// <param name="EqualityCollation">Resolved built-in comparison collation.</param>
 internal sealed record JoinPredicateTerm(
     ulong TableMask,
     bool IsEquality,
@@ -40,7 +72,22 @@ internal sealed record JoinPredicateTerm(
     ulong EqualityRightMask,
     double EqualityLeftMatchRows,
     double EqualityRightMatchRows,
-    double Selectivity);
+    double Selectivity,
+    int EqualityLeftColumnOrdinal = -1,
+    int EqualityRightColumnOrdinal = -1,
+    bool EqualityLeftConvertsTextToNumeric = false,
+    bool EqualityLeftConvertsNumericToText = false,
+    bool EqualityRightConvertsTextToNumeric = false,
+    bool EqualityRightConvertsNumericToText = false,
+    string? EqualityCollation = null);
+
+/// <summary>
+/// Exact persisted index and equality terms selected for one <c>IndexSeekRight</c> step.
+/// </summary>
+internal sealed record JoinIndexAccessChoice(
+    int CandidateIndex,
+    int[] EqualityTermIndices,
+    double RowsPerSeek);
 
 /// <summary>
 /// A maximal plain-INNER join segment: the members that may be freely permuted plus the pool of
@@ -59,12 +106,14 @@ internal sealed class JoinOrderPlan
     public JoinOrderPlan(
         int[] memberOrder,
         JoinStepShape[] stepShapes,
+        JoinIndexAccessChoice?[] indexAccesses,
         double cost,
         double cardinality,
         bool usedDynamicProgramming)
     {
         MemberOrder = memberOrder;
         StepShapes = stepShapes;
+        IndexAccesses = indexAccesses;
         Cost = cost;
         Cardinality = cardinality;
         UsedDynamicProgramming = usedDynamicProgramming;
@@ -78,6 +127,9 @@ internal sealed class JoinOrderPlan
     /// <c>MemberOrder[k]</c>; index 0 is unused because the first member is a bare scan.
     /// </summary>
     public JoinStepShape[] StepShapes { get; }
+
+    /// <summary>Selected index metadata for each <see cref="JoinStepShape.IndexSeekRight"/> step.</summary>
+    public JoinIndexAccessChoice?[] IndexAccesses { get; }
 
     public double Cost { get; }
 

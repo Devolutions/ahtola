@@ -781,6 +781,154 @@ public sealed class JoinOrderOptimizerTests
     }
 
     [Test]
+    public void IndexSeekCostMatchesThePinnedTursoFormula()
+    {
+        // cost.rs:171-236. Index rows/page = 50 * (3 columns + rowid) / (1 key + rowid) = 100.
+        // depth=2, four seeks=8; two rows/seek pays one cached leaf page sequence (1.6);
+        // non-covering table lookups=0.16; CPU=4*0.01 + 8*0.003; index bonus=0.5.
+        JoinCostModel.EstimateIndexSeekCost(
+                baseRowCount: 5000.0,
+                indexColumnCount: 1,
+                tableColumnCount: 3,
+                hasRowIdAlias: false,
+                covering: false,
+                inputCardinality: 4.0,
+                rowsPerSeek: 2.0)
+            .Should().BeApproximately(8.0 + 1.6 + 0.16 + 0.064 - 0.5, 1e-12);
+    }
+
+    [Test]
+    public void ManagedIndexViewBuildCostAccountsForTheOneTimeSort()
+    {
+        const double rows = 20_000.0;
+        JoinCostModel.EstimateManagedIndexViewBuildCost(rows).Should().BeApproximately(
+            rows * Math.Log2(rows) * JoinCostParams.SortCpuPerRow
+                + rows * JoinCostParams.CpuCostPerRow,
+            1e-9);
+    }
+
+    [Test]
+    public void UniqueFullKeyCandidateCompetesAsAnExecutableSeekShape()
+    {
+        var candidate = new JoinIndexCandidate(
+            "right_k",
+            [new JoinIndexColumn(0, "BINARY", Descending: false)],
+            [12.0],
+            Unique: true,
+            Covering: false,
+            TableColumnCount: 2,
+            HasRowIdAlias: false,
+            Forced: true);
+        var segment = new JoinSegment(
+        [
+            new JoinSegmentMember(0, 3.0, 1),
+            new JoinSegmentMember(1, 500.0, 2, [candidate]),
+        ],
+        [
+            new JoinPredicateTerm(
+                TableMask: 0b11,
+                IsEquality: true,
+                EqualityLeftMask: 0b01,
+                EqualityRightMask: 0b10,
+                EqualityLeftMatchRows: 1.0,
+                EqualityRightMatchRows: 12.0,
+                Selectivity: JoinCostParams.SelectivityEqualityIndexed,
+                EqualityLeftColumnOrdinal: 0,
+                EqualityRightColumnOrdinal: 0,
+                EqualityCollation: "BINARY"),
+        ]);
+
+        var plan = JoinOrderEnumerator.EvaluateOrder(segment, [0, 1]);
+        plan.StepShapes[1].Should().Be(JoinStepShape.IndexSeekRight);
+        plan.IndexAccesses[1].Should().NotBeNull();
+        plan.IndexAccesses[1]!.RowsPerSeek.Should().Be(1.0);
+    }
+
+    [Test]
+    public void UnhintedSeekDoesNotHideManagedIndexReconstructionCost()
+    {
+        var candidate = new JoinIndexCandidate(
+            "right_k",
+            [new JoinIndexColumn(0, "BINARY", Descending: false)],
+            [1.0],
+            Unique: true,
+            Covering: false,
+            TableColumnCount: 2,
+            HasRowIdAlias: false);
+        var segment = new JoinSegment(
+        [
+            new JoinSegmentMember(0, 4.0, 1),
+            new JoinSegmentMember(1, 20_000.0, 2, [candidate]),
+        ],
+        [
+            new JoinPredicateTerm(
+                TableMask: 0b11,
+                IsEquality: true,
+                EqualityLeftMask: 0b01,
+                EqualityRightMask: 0b10,
+                EqualityLeftMatchRows: 1.0,
+                EqualityRightMatchRows: 1.0,
+                Selectivity: JoinCostParams.SelectivityEqualityIndexed,
+                EqualityLeftColumnOrdinal: 0,
+                EqualityRightColumnOrdinal: 0,
+                EqualityCollation: "BINARY"),
+        ]);
+
+        JoinOrderEnumerator.EvaluateOrder(segment, [0, 1]).StepShapes[1]
+            .Should().NotBe(JoinStepShape.IndexSeekRight);
+    }
+
+    [Test]
+    public void ForcedIndexWaitsForItsOuterBindingMember()
+    {
+        var forced = new JoinIndexCandidate(
+            "b_k",
+            [new JoinIndexColumn(0, "BINARY", Descending: false)],
+            [1.0],
+            Unique: false,
+            Covering: false,
+            TableColumnCount: 2,
+            HasRowIdAlias: false,
+            Forced: true);
+        var segment = new JoinSegment(
+        [
+            new JoinSegmentMember(0, 1_000.0, 2),
+            new JoinSegmentMember(1, 1_000.0, 2, [forced]),
+            new JoinSegmentMember(2, 1.0, 1),
+        ],
+        [
+            new JoinPredicateTerm(
+                0b011,
+                true,
+                0b001,
+                0b010,
+                1.0,
+                1.0,
+                JoinCostParams.SelectivityEqualityIndexed,
+                EqualityLeftColumnOrdinal: 0,
+                EqualityRightColumnOrdinal: 0,
+                EqualityCollation: "BINARY"),
+            new JoinPredicateTerm(
+                0b110,
+                true,
+                0b100,
+                0b010,
+                1.0,
+                1.0,
+                JoinCostParams.SelectivityEqualityIndexed,
+                EqualityLeftColumnOrdinal: 0,
+                EqualityRightColumnOrdinal: 1,
+                EqualityCollation: "BINARY"),
+        ]);
+
+        var plan = JoinOrderEnumerator.Compute(segment);
+        plan.Should().NotBeNull();
+        var forcedStep = Array.IndexOf(plan!.MemberOrder, 1);
+        forcedStep.Should().BeGreaterThan(Array.IndexOf(plan.MemberOrder, 0));
+        plan.StepShapes[forcedStep].Should().Be(JoinStepShape.IndexSeekRight);
+    }
+
+    [Test]
     public void HashBuildSideIsChosenByCostNotByPosition()
     {
         // A small accumulated left against a large right prefers building the left, because the
@@ -813,7 +961,22 @@ public sealed class JoinOrderOptimizerTests
     {
         var segmentMembers = new JoinSegmentMember[members];
         for (var index = 0; index < members; index++)
-            segmentMembers[index] = new JoinSegmentMember(index, random.Next(1, 5000), ColumnWidth: 2);
+        {
+            segmentMembers[index] = new JoinSegmentMember(
+                index,
+                random.Next(1, 5000),
+                ColumnWidth: 2,
+                [
+                    new JoinIndexCandidate(
+                        $"i{index}_k",
+                        [new JoinIndexColumn(0, "BINARY", Descending: false)],
+                        [random.Next(1, 8)],
+                        Unique: false,
+                        Covering: false,
+                        TableColumnCount: 2,
+                        HasRowIdAlias: false),
+                ]);
+        }
 
         // A connected chain plus one extra random edge, so both equality and residual terms occur.
         var terms = new List<JoinPredicateTerm>();
@@ -828,7 +991,10 @@ public sealed class JoinOrderOptimizerTests
                 right,
                 EqualityLeftMatchRows: random.Next(1, 6),
                 EqualityRightMatchRows: random.Next(1, 6),
-                Selectivity: JoinCostParams.SelectivityEqualityUnindexed));
+                Selectivity: JoinCostParams.SelectivityEqualityUnindexed,
+                EqualityLeftColumnOrdinal: 0,
+                EqualityRightColumnOrdinal: 0,
+                EqualityCollation: "BINARY"));
         }
 
         if (members >= 3)

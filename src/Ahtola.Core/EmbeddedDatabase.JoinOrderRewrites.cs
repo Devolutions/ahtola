@@ -1,4 +1,5 @@
 using Ahtola.Core.Compilation.JoinOrdering;
+using Ahtola.Core.Execution;
 using Ahtola.Core.Parsing;
 
 namespace Ahtola.Core;
@@ -45,6 +46,7 @@ public sealed partial class EmbeddedDatabase
     private long _joinOrderGreedyPlans;
     private long _joinOrderDeclines;
     private long _joinOrderPushedWhereTerms;
+    private readonly VdbeJoinIndexSeekMetrics _joinIndexSeekMetrics = new();
 
     /// <summary>
     /// Counters describing what the join-order stage did on this database instance. Test-only
@@ -59,6 +61,8 @@ public sealed partial class EmbeddedDatabase
         Interlocked.Read(ref _joinOrderDeclines),
         Interlocked.Read(ref _joinOrderPushedWhereTerms));
 
+    internal VdbeJoinIndexSeekMetrics JoinIndexSeekMetrics => _joinIndexSeekMetrics;
+
     internal void ResetJoinOrderDiagnostics()
     {
         Interlocked.Exchange(ref _joinOrderSegmentsConsidered, 0);
@@ -67,6 +71,7 @@ public sealed partial class EmbeddedDatabase
         Interlocked.Exchange(ref _joinOrderGreedyPlans, 0);
         Interlocked.Exchange(ref _joinOrderDeclines, 0);
         Interlocked.Exchange(ref _joinOrderPushedWhereTerms, 0);
+        _joinIndexSeekMetrics.Reset();
     }
 
     /// <summary>
@@ -118,7 +123,8 @@ public sealed partial class EmbeddedDatabase
             result = new JoinOrderRewriteResult(
                 rewritten.Source,
                 rewritten.SlotMap,
-                state.HashBuildRight);
+                state.HashBuildRight,
+                state.IndexSeeks);
             return true;
         }
         catch (EmbeddedSqlException)
@@ -266,7 +272,13 @@ public sealed partial class EmbeddedDatabase
 
         var members = new JoinSegmentMember[infos.Length];
         for (var index = 0; index < infos.Length; index++)
-            members[index] = new JoinSegmentMember(index, infos[index].RowCount, infos[index].Width);
+        {
+            members[index] = new JoinSegmentMember(
+                index,
+                infos[index].RowCount,
+                infos[index].Width,
+                infos[index].IndexCandidates);
+        }
 
         Interlocked.Increment(ref _joinOrderSegmentsConsidered);
         var plan = JoinOrderEnumerator.Compute(new JoinSegment(members, terms));
@@ -285,7 +297,7 @@ public sealed partial class EmbeddedDatabase
                 return false;
         }
 
-        var synthesized = SynthesizeJoinOrder(rewrittenMembers, placements, plan, state);
+        var synthesized = SynthesizeJoinOrder(rewrittenMembers, infos, placements, plan, state);
         var slotMap = BuildJoinOrderSlotMap(rewrittenMembers, infos, plan.MemberOrder);
 
         Interlocked.Increment(ref _joinOrderSegmentsReordered);
@@ -353,6 +365,7 @@ public sealed partial class EmbeddedDatabase
     /// </summary>
     private static TableSource SynthesizeJoinOrder(
         JoinOrderRewrittenSource[] members,
+        JoinOrderMemberInfo[] infos,
         List<JoinOrderTermPlacement> placements,
         JoinOrderPlan plan,
         JoinOrderRewriteState state)
@@ -379,6 +392,13 @@ public sealed partial class EmbeddedDatabase
 
             var joined = new JoinTableSource(node, members[member].Source, condition, JoinKind.Inner);
             state.HashBuildRight[joined] = plan.StepShapes[step] != JoinStepShape.HashBuildLeft;
+            if (plan.IndexAccesses[step] is { } indexAccess)
+            {
+                state.IndexSeeks[joined] = new CompiledJoinIndexSelection(
+                    infos[member].IndexCandidates[indexAccess.CandidateIndex],
+                    indexAccess.EqualityTermIndices.Select(index => placements[index].Expression).ToArray());
+            }
+
             node = joined;
             placed = candidate;
         }
@@ -467,14 +487,92 @@ public sealed partial class EmbeddedDatabase
         if (qualifiers.Count == 0)
             return false;
 
+        var table = TryResolveJoinOrderBaseTable(source, context);
         info = new JoinOrderMemberInfo(
             qualifiers,
             columnNames,
             ambiguousColumnNames,
             rows,
             width,
-            TryResolveJoinOrderBaseTable(source, context));
+            table,
+            DescribeJoinIndexCandidates(source, table, context));
         return true;
+    }
+
+    private IReadOnlyList<JoinIndexCandidate> DescribeJoinIndexCandidates(
+        TableSource source,
+        EmbeddedTable? table,
+        QueryContext context)
+    {
+        if (source is not NamedTableSource named
+            || table is null
+            || named.IndexDirective is NotIndexedDirective)
+        {
+            return [];
+        }
+
+        var candidates = new List<JoinIndexCandidate>();
+        foreach (var index in table.Indexes)
+        {
+            if (named.IndexDirective is IndexedByDirective indexedBy
+                && !string.Equals(index.Name, indexedBy.IndexName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (index.Columns.Count == 0
+                || index.IsPartial
+                || index.IsMethodIndex
+                || index.Columns.Any(static column => column.IsExpression)
+                || index.Columns.Any(column =>
+                    !IsBuiltInCollation(IndexExpressionSemantics.GetCollationName(table, column))
+                    || IsOverriddenBuiltInCollation(
+                        IndexExpressionSemantics.GetCollationName(table, column))))
+            {
+                continue;
+            }
+
+            var columns = new JoinIndexColumn[index.Columns.Count];
+            var rowsPerPrefix = new List<double>(index.Columns.Count);
+            for (var position = 0; position < index.Columns.Count; position++)
+            {
+                var column = index.Columns[position];
+                columns[position] = new JoinIndexColumn(
+                    column.ColumnIndex,
+                    IndexExpressionSemantics.GetCollationName(table, column).ToUpperInvariant(),
+                    column.Descending);
+                if (!TryGetSqliteStat1PrefixAverage(
+                        context,
+                        table.Name,
+                        index.Name,
+                        position + 1,
+                        out var average))
+                {
+                    break;
+                }
+
+                rowsPerPrefix.Add(Math.Max(1.0, average));
+            }
+
+            if (rowsPerPrefix.Count == 0)
+                continue;
+
+            if (rowsPerPrefix.Count < columns.Length)
+                Array.Resize(ref columns, rowsPerPrefix.Count);
+
+            var indexedColumns = columns.Select(static column => column.ColumnOrdinal).ToHashSet();
+            candidates.Add(new JoinIndexCandidate(
+                index.Name,
+                columns,
+                rowsPerPrefix,
+                index.Unique && columns.Length == index.Columns.Count,
+                Enumerable.Range(0, table.Columns.Length).All(indexedColumns.Contains),
+                table.Columns.Length,
+                table.RowidAliasColumnIndex >= 0,
+                named.IndexDirective is IndexedByDirective));
+        }
+
+        return candidates;
     }
 
     /// <summary>
@@ -551,6 +649,13 @@ public sealed partial class EmbeddedDatabase
         ulong rightMask = 0;
         var leftMatchRows = 0.0;
         var rightMatchRows = 0.0;
+        var leftColumnOrdinal = -1;
+        var rightColumnOrdinal = -1;
+        var leftConvertsTextToNumeric = false;
+        var leftConvertsNumericToText = false;
+        var rightConvertsTextToNumeric = false;
+        var rightConvertsNumericToText = false;
+        string? collation = null;
         if (conjunct is BinaryExpression { Operator: BinaryOperator.Equal } binary
             && UnwrapCollation(binary.Left) is ColumnExpression { BooleanKeyword: null } leftColumn
             && UnwrapCollation(binary.Right) is ColumnExpression { BooleanKeyword: null } rightColumn
@@ -563,6 +668,40 @@ public sealed partial class EmbeddedDatabase
             rightMask = 1UL << rightMember;
             leftMatchRows = EstimateJoinOrderMatchRows(infos[leftMember], leftColumn, context);
             rightMatchRows = EstimateJoinOrderMatchRows(infos[rightMember], rightColumn, context);
+
+            var leftDefinition = TryResolveJoinOrderColumnDefinition(infos[leftMember], leftColumn, context);
+            var rightDefinition = TryResolveJoinOrderColumnDefinition(infos[rightMember], rightColumn, context);
+            if (leftDefinition is not null
+                && rightDefinition is not null
+                && infos[leftMember].Table!.TryGetColumnIndex(leftDefinition.Name, out leftColumnOrdinal)
+                && infos[rightMember].Table!.TryGetColumnIndex(rightDefinition.Name, out rightColumnOrdinal))
+            {
+                var leftAffinity = GetJoinKeyAffinity(leftDefinition);
+                var rightAffinity = GetJoinKeyAffinity(rightDefinition);
+                collation = GetExplicitCollation(binary.Left)
+                    ?? GetExplicitCollation(binary.Right)
+                    ?? NormalizeDeclaredCollation(leftDefinition.Collation)
+                    ?? NormalizeDeclaredCollation(rightDefinition.Collation)
+                    ?? "BINARY";
+                if (!IsHashableJoinKeyCollation(collation) || IsUnsafeCompiledCollation(collation))
+                {
+                    leftColumnOrdinal = -1;
+                    rightColumnOrdinal = -1;
+                    collation = null;
+                }
+                else
+                {
+                    leftConvertsTextToNumeric =
+                        IsNumericAffinity(rightAffinity) && !IsNumericAffinity(leftAffinity);
+                    leftConvertsNumericToText =
+                        rightAffinity == ColumnAffinity.Text && leftAffinity is null;
+                    rightConvertsTextToNumeric =
+                        IsNumericAffinity(leftAffinity) && !IsNumericAffinity(rightAffinity);
+                    rightConvertsNumericToText =
+                        leftAffinity == ColumnAffinity.Text && rightAffinity is null;
+                    collation = collation.ToUpperInvariant();
+                }
+            }
         }
 
         term = new JoinPredicateTerm(
@@ -572,7 +711,14 @@ public sealed partial class EmbeddedDatabase
             rightMask,
             leftMatchRows,
             rightMatchRows,
-            EstimateJoinOrderSelectivity(conjunct));
+            EstimateJoinOrderSelectivity(conjunct),
+            leftColumnOrdinal,
+            rightColumnOrdinal,
+            leftConvertsTextToNumeric,
+            leftConvertsNumericToText,
+            rightConvertsTextToNumeric,
+            rightConvertsNumericToText,
+            collation);
         return true;
     }
 
@@ -857,7 +1003,8 @@ public sealed partial class EmbeddedDatabase
                 context,
                 outerRow,
                 out var reordered,
-                rewrite.HashBuildRight)
+                rewrite.HashBuildRight,
+                rewrite.IndexSeeks)
             && reordered.Columns.Length == rewrite.SlotMap.Length)
         {
             // The physical row layout is permuted, but the projection metadata keeps FROM order
@@ -886,6 +1033,9 @@ public sealed partial class EmbeddedDatabase
         /// </summary>
         public Dictionary<JoinTableSource, bool> HashBuildRight { get; } =
             new(JoinOrderNodeIdentityComparer.Instance);
+
+        public Dictionary<JoinTableSource, CompiledJoinIndexSelection> IndexSeeks { get; } =
+            new(JoinOrderNodeIdentityComparer.Instance);
     }
 
     /// <summary>
@@ -909,7 +1059,8 @@ public sealed partial class EmbeddedDatabase
         HashSet<string> ambiguousColumnNames,
         double rowCount,
         int width,
-        EmbeddedTable? table)
+        EmbeddedTable? table,
+        IReadOnlyList<JoinIndexCandidate> indexCandidates)
     {
         public HashSet<string> Qualifiers { get; } = qualifiers;
 
@@ -922,9 +1073,15 @@ public sealed partial class EmbeddedDatabase
         public int Width { get; } = width;
 
         public EmbeddedTable? Table { get; } = table;
+
+        public IReadOnlyList<JoinIndexCandidate> IndexCandidates { get; } = indexCandidates;
     }
 
     private readonly record struct JoinOrderTermPlacement(Expression Expression, ulong Mask);
+
+    private sealed record CompiledJoinIndexSelection(
+        JoinIndexCandidate Candidate,
+        IReadOnlyList<Expression> EqualityTerms);
 
     private readonly record struct JoinOrderRewrittenSource(TableSource Source, int[] SlotMap, bool Changed);
 
@@ -935,7 +1092,8 @@ public sealed partial class EmbeddedDatabase
     private sealed record JoinOrderRewriteResult(
         TableSource Source,
         int[] SlotMap,
-        IReadOnlyDictionary<JoinTableSource, bool> HashBuildRight);
+        IReadOnlyDictionary<JoinTableSource, bool> HashBuildRight,
+        IReadOnlyDictionary<JoinTableSource, CompiledJoinIndexSelection> IndexSeeks);
 }
 
 /// <summary>Join-order stage counters. Test-only evidence, not a public API.</summary>
