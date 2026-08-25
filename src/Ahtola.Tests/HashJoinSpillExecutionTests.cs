@@ -10,7 +10,7 @@ public class HashJoinSpillExecutionTests
     [Test]
     public void EquiJoinSpillsWithinBudgetAndCleansEveryTemporaryFile()
     {
-        const long budget = 1024;
+        const long budget = 8192;
         var fileSystem = new TrackingFileSystem();
         var metrics = new VdbeExecutionMetrics();
         var right = Enumerable.Range(0, 200)
@@ -53,7 +53,7 @@ public class HashJoinSpillExecutionTests
         var right =
             new[] { Row(2, "r2a"), Row(3, "r3"), Row(2, "r2b"), Row(null, "rn") };
         var program = JoinProgram(left, right, VdbeJoinKind.Full);
-        var options = Options(new InMemoryFileSystem(), metrics, memoryLimitBytes: 1024);
+        var options = Options(new InMemoryFileSystem(), metrics, memoryLimitBytes: 8192);
 
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
@@ -83,7 +83,7 @@ public class HashJoinSpillExecutionTests
             right,
             VdbeJoinKind.Inner,
             hashBuildRight: false);
-        var options = Options(new InMemoryFileSystem(), metrics, memoryLimitBytes: 1024);
+        var options = Options(new InMemoryFileSystem(), metrics, memoryLimitBytes: 8192);
 
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
@@ -92,7 +92,7 @@ public class HashJoinSpillExecutionTests
             ("l2a", "r2"),
             ("l2b", "r2"));
         metrics.HashPartitionsCreated.Should().Be(16);
-        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(1024);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(8192);
     }
 
     [Test]
@@ -136,7 +136,7 @@ public class HashJoinSpillExecutionTests
                 cancellation.Cancel();
                 return true;
             });
-        var options = Options(fileSystem, metrics, memoryLimitBytes: 1024);
+        var options = Options(fileSystem, metrics, memoryLimitBytes: 8192);
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
         Assert.Throws<OperationCanceledException>(() => statement.StepResumable(cancellation.Token));
@@ -160,7 +160,7 @@ public class HashJoinSpillExecutionTests
         var metrics = new VdbeExecutionMetrics();
         var right = Enumerable.Range(0, 40).Select(static value => Row(value, $"r{value}")).ToArray();
         var program = JoinProgram([Row(1, "left")], right, VdbeJoinKind.Inner);
-        var options = Options(fileSystem, metrics, memoryLimitBytes: 1024);
+        var options = Options(fileSystem, metrics, memoryLimitBytes: 8192);
         faults.FailOnOccurrence(operation, occurrence);
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
@@ -233,16 +233,54 @@ public class HashJoinSpillExecutionTests
                 unknownPosition,
                 metrics);
             unknownPosition = VdbeSpillRecordCodec.FileHeaderSize;
-            VdbeSpillRecordCodec.ReadRecordEnd(unknownTag, ref unknownPosition, metrics);
+            var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(
+                unknownTag,
+                ref unknownPosition,
+                metrics);
 
             Assert.Throws<InvalidDataException>(
                 () => VdbeSpillRecordCodec.ReadValues(
                     unknownTag,
                     ref unknownPosition,
                     count: 1,
+                    recordEnd,
                     metrics,
                     CancellationToken.None));
         }
+    }
+
+    [TestCase(0x03)]
+    [TestCase(0x04)]
+    public void SharedCodecRejectsPayloadThatCrossesItsRecordBoundary(byte valueTag)
+    {
+        const int payloadLength = 64 * 1024;
+        var metrics = new VdbeExecutionMetrics();
+        var fileSystem = new InMemoryFileSystem();
+        using var file = fileSystem.OpenFile(
+            $"cross-record-{valueTag:X2}.spill",
+            FileOpenMode.CreateNew);
+        var position = VdbeSpillRecordCodec.InitializeFile(
+            file,
+            VdbeSpillFileKind.SorterRun,
+            metrics);
+        var recordStart = VdbeSpillRecordCodec.BeginRecord(ref position);
+        VdbeSpillRecordCodec.WriteByte(file, ref position, valueTag, metrics);
+        VdbeSpillRecordCodec.WriteInt32(file, ref position, payloadLength, metrics);
+        VdbeSpillRecordCodec.CompleteRecord(file, recordStart, position, metrics);
+        file.SetLength(checked(position + payloadLength));
+
+        position = VdbeSpillRecordCodec.FileHeaderSize;
+        var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(file, ref position, metrics);
+
+        Assert.Throws<InvalidDataException>(
+            () => VdbeSpillRecordCodec.ReadValues(
+                file,
+                ref position,
+                count: 1,
+                recordEnd,
+                metrics,
+                CancellationToken.None));
+        position.Should().Be(recordEnd);
     }
 
     [Test]
@@ -257,7 +295,7 @@ public class HashJoinSpillExecutionTests
             Enumerable.Range(0, 40).Select(static value => Row(value, $"r{value}")).ToArray(),
             VdbeJoinKind.Inner,
             condition: (_, _, _) => throw primary);
-        var options = Options(fileSystem, metrics, memoryLimitBytes: 1024);
+        var options = Options(fileSystem, metrics, memoryLimitBytes: 8192);
         faults.FailNext(FileSystemOperation.Delete, "cleanup failed");
         using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
@@ -275,7 +313,7 @@ public class HashJoinSpillExecutionTests
     [Test]
     public void NestedSubprogramSharesTheParentExecutionBudget()
     {
-        const long budget = 1024;
+        const long budget = 8192;
         var metrics = new VdbeExecutionMetrics();
         var fileSystem = new TrackingFileSystem();
         var child = new VdbeSubprogram(JoinProgram(
@@ -312,7 +350,7 @@ public class HashJoinSpillExecutionTests
     [Test]
     public void OversizedSkewBuildRecordFailsBeforeItCanBeRetainedOrSpilled()
     {
-        const long budget = 2048;
+        const long budget = 8192;
         var metrics = new VdbeExecutionMetrics();
         var fileSystem = new TrackingFileSystem();
         var right = Enumerable.Range(0, 8)
@@ -335,6 +373,119 @@ public class HashJoinSpillExecutionTests
     }
 
     [Test]
+    public void HashSpillRejectsBudgetBelowFixedInfrastructureBeforeCreatingFiles()
+    {
+        const string temporaryDirectory = "hash-spill-tests";
+        var infrastructureBytes = VdbeManagedFootprint.EstimateHashSpillInfrastructure(
+            temporaryDirectory,
+            partitionCount: 16,
+            trackUnmatchedBuild: false);
+        var budget = infrastructureBytes - 1;
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            JoinProgram(
+                [Row(-1, "left")],
+                Enumerable.Range(0, 100).Select(static value => Row(value, $"r{value}")).ToArray(),
+                VdbeJoinKind.Inner),
+            Options(fileSystem, metrics, budget));
+
+        var failure = Assert.Throws<VdbeMemoryLimitExceededException>(
+            () => statement.StepResumable());
+
+        failure!.LimitBytes.Should().Be(budget);
+        failure.RequestedBytes.Should().Be(infrastructureBytes);
+        metrics.SpillFilesCreated.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        fileSystem.Created.Should().BeEmpty();
+    }
+
+    [Test]
+    public void EmptyHashBuildSucceedsWhenInfrastructureReservationUsesTheWholeBudget()
+    {
+        const string temporaryDirectory = "hash-spill-tests";
+        var budget = VdbeManagedFootprint.EstimateHashSpillInfrastructure(
+            temporaryDirectory,
+            partitionCount: 16,
+            trackUnmatchedBuild: false);
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            JoinProgram([Row(1, "left")], [], VdbeJoinKind.Inner),
+            Options(fileSystem, metrics, budget));
+
+        Drain(statement).Should().BeEmpty();
+
+        metrics.PeakRetainedBytes.Should().Be(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.SpillFilesCreated.Should().Be(0);
+        fileSystem.Created.Should().BeEmpty();
+    }
+
+    [TestCase(VdbeJoinKind.Right, 0)]
+    [TestCase(VdbeJoinKind.Full, 1)]
+    public void EmptyUnmatchedHashBuildSucceedsWhenInfrastructureUsesTheWholeBudget(
+        VdbeJoinKind kind,
+        int expectedRowCount)
+    {
+        const string temporaryDirectory = "hash-spill-tests";
+        var budget = VdbeManagedFootprint.EstimateHashSpillInfrastructure(
+            temporaryDirectory,
+            partitionCount: 16,
+            trackUnmatchedBuild: true);
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            JoinProgram([Row(1, "left")], [], kind),
+            Options(fileSystem, metrics, budget));
+
+        var rows = Drain(statement);
+
+        rows.Should().HaveCount(expectedRowCount);
+        if (kind == VdbeJoinKind.Full)
+            Labels(rows[0]).Should().Be(("left", null));
+        metrics.PeakRetainedBytes.Should().Be(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.SpillFilesCreated.Should().Be(0);
+        fileSystem.Created.Should().BeEmpty();
+    }
+
+    [Test]
+    public void HashConstructionDeleteFailureRemainsRetryableForReset()
+    {
+        var faults = new DeterministicFaultInjector();
+        var backing = new InMemoryFileSystem(faults);
+        var fileSystem = new TrackingFileSystem(backing);
+        var metrics = new VdbeExecutionMetrics();
+        faults.FailOnOccurrence(
+            FileSystemOperation.Write,
+            occurrence: 3,
+            message: "construction failed");
+        for (var occurrence = 1; occurrence <= 64; occurrence++)
+            faults.FailOnOccurrence(FileSystemOperation.Delete, occurrence);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            JoinProgram(
+                [Row(1, "left")],
+                Enumerable.Range(0, 40).Select(static value => Row(value, $"r{value}")).ToArray(),
+                VdbeJoinKind.Inner),
+            Options(fileSystem, metrics, memoryLimitBytes: 8192));
+
+        Assert.Catch<Exception>(() => statement.StepResumable());
+
+        metrics.ActiveSpillFiles.Should().BeGreaterThan(0);
+        metrics.CurrentRetainedBytes.Should().BeGreaterThan(0);
+        fileSystem.Created.Where(backing.FileExists).Should().NotBeEmpty();
+
+        faults.ClearScheduled();
+        statement.Reset();
+
+        metrics.ActiveSpillFiles.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        fileSystem.Created.Should().OnlyContain(path => !backing.FileExists(path));
+        Drain(statement).Should().ContainSingle();
+    }
+
+    [Test]
     public void DeleteFailureLeavesHashCleanupRetryableForReset()
     {
         var faults = new DeterministicFaultInjector();
@@ -346,7 +497,7 @@ public class HashJoinSpillExecutionTests
             .ToArray();
         using var statement = ResumableStatement.CreateWithExecutionOptions(
             JoinProgram([Row(-1, "left")], right, VdbeJoinKind.Inner),
-            Options(fileSystem, metrics, memoryLimitBytes: 1024));
+            Options(fileSystem, metrics, memoryLimitBytes: 8192));
         for (var occurrence = 1; occurrence <= 34; occurrence++)
             faults.FailOnOccurrence(FileSystemOperation.Delete, occurrence);
 
@@ -442,7 +593,7 @@ public class HashJoinSpillExecutionTests
             VdbeJoinKind.Inner);
         using var statement = ResumableStatement.CreateWithExecutionOptions(
             program,
-            Options(fileSystem, metrics, memoryLimitBytes: 1024));
+            Options(fileSystem, metrics, memoryLimitBytes: 8192));
 
         Drain(statement);
         return fileSystem.DeletedPayloads;

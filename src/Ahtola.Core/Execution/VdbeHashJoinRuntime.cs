@@ -7,7 +7,7 @@ internal sealed class VdbeJoinExecutionContext(
     VdbeExecutionOptions options,
     VdbeExecutionMemory memory)
 {
-    private List<IDisposable>? _pendingCleanup;
+    private readonly VdbePendingCleanupRegistry _pendingCleanup = new();
 
     public VdbeExecutionOptions Options { get; } = options;
 
@@ -28,11 +28,8 @@ internal sealed class VdbeJoinExecutionContext(
         CleanupFailure = CleanupFailure is null
             ? exception
             : new AggregateException(CleanupFailure, exception);
-        if (retryable is not null
-            && !(_pendingCleanup?.Contains(retryable) ?? false))
-        {
-            (_pendingCleanup ??= []).Add(retryable);
-        }
+        if (retryable is not null)
+            _pendingCleanup.Register(retryable);
     }
 
     public Exception? TakeCleanupFailure()
@@ -42,32 +39,13 @@ internal sealed class VdbeJoinExecutionContext(
         return failure;
     }
 
-    public bool HasPendingCleanup => _pendingCleanup is { Count: > 0 };
+    public bool HasPendingCleanup => _pendingCleanup.HasPending;
 
-    public void RetryPendingCleanup()
-    {
-        if (_pendingCleanup is not { Count: > 0 } pending)
-            return;
+    public void RegisterPendingCleanup(IDisposable cleanup) => _pendingCleanup.Register(cleanup);
 
-        List<Exception>? failures = null;
-        for (var index = pending.Count - 1; index >= 0; index--)
-        {
-            try
-            {
-                pending[index].Dispose();
-                pending.RemoveAt(index);
-            }
-            catch (Exception exception)
-            {
-                (failures ??= []).Add(exception);
-            }
-        }
+    public void UnregisterPendingCleanup(IDisposable cleanup) => _pendingCleanup.Unregister(cleanup);
 
-        if (failures is [var failure])
-            ExceptionDispatchInfo.Capture(failure).Throw();
-        if (failures is { Count: > 1 })
-            throw new AggregateException(failures);
-    }
+    public void RetryPendingCleanup() => _pendingCleanup.Retry();
 
     public static VdbeJoinExecutionContext CreateDefault()
     {
@@ -176,11 +154,23 @@ internal static class VdbeHashJoinRuntime
         LoadedPartition? loadedPartition = null;
         var unloadablePartition = -1;
         var trackUnmatchedBuild = buildIsRight && plan.Kind is VdbeJoinKind.Right or VdbeJoinKind.Full;
-        HashBuildBuffer? buffered = HashBuildBuffer.TryCreate(context.Memory, trackUnmatchedBuild);
+        var spillInfrastructureBytes = VdbeManagedFootprint.EstimateHashSpillInfrastructure(
+            context.Options.TemporaryDirectory,
+            PartitionCount,
+            trackUnmatchedBuild);
+        VdbeMemoryReservation? spillInfrastructureReservation = null;
+        HashBuildBuffer? buffered = null;
         var emitted = 0;
 
         try
         {
+            if (context.Options.AllowTemporaryFileSpill)
+            {
+                spillInfrastructureReservation = VdbeMemoryReservation.TryCreate(
+                    context.Memory,
+                    spillInfrastructureBytes);
+            }
+            buffered = HashBuildBuffer.TryCreate(context.Memory, trackUnmatchedBuild);
             long ordinal = 0;
             foreach (var row in buildNode.Enumerate(maximumRows: null, context))
             {
@@ -209,11 +199,15 @@ internal static class VdbeHashJoinRuntime
 
                 if (spill is null)
                 {
-                    spill = new HashSpill(
-                        context.Options,
+                    spillInfrastructureReservation ??= VdbeMemoryReservation.Create(
+                        context.Memory,
+                        spillInfrastructureBytes);
+                    spill = HashSpill.Create(
+                        context,
                         buildNode.ColumnCount,
                         buildNode.SourceCount,
-                        trackUnmatchedBuild);
+                        trackUnmatchedBuild,
+                        ref spillInfrastructureReservation);
                     if (buffered is not null)
                     {
                         foreach (var retained in buffered.Entries)
@@ -240,7 +234,7 @@ internal static class VdbeHashJoinRuntime
                 spill.CompleteBuild(context);
 
             bool[]? matched = trackUnmatchedBuild && spill is null
-                ? buffered!.CreateMatchedMap()
+                ? buffered?.CreateMatchedMap() ?? []
                 : null;
             foreach (var probe in probeNode.Enumerate(maximumRows: null, context))
             {
@@ -252,7 +246,7 @@ internal static class VdbeHashJoinRuntime
                 {
                     if (spill is null)
                     {
-                        if (buffered!.TryGetCandidates(key, out var candidateIndices))
+                        if (buffered?.TryGetCandidates(key, out var candidateIndices) == true)
                         {
                             foreach (var buildIndex in candidateIndices)
                             {
@@ -348,7 +342,9 @@ internal static class VdbeHashJoinRuntime
                 var nullProbe = NullRow(probeNode);
                 if (spill is null)
                 {
-                    for (var index = 0; index < buffered!.Count; index++)
+                    if (buffered is null)
+                        yield break;
+                    for (var index = 0; index < buffered.Count; index++)
                     {
                         context.ThrowIfCancellationRequested();
                         if (matched![index])
@@ -404,6 +400,7 @@ internal static class VdbeHashJoinRuntime
             {
                 context.RecordCleanupFailure(exception, spill);
             }
+            spillInfrastructureReservation?.Dispose();
         }
     }
 
@@ -688,49 +685,65 @@ internal static class VdbeHashJoinRuntime
         private readonly VdbeExecutionOptions _options;
         private readonly int _columnCount;
         private readonly int _rowIdCount;
-        private readonly Partition[] _partitions;
-        private readonly VdbeTemporaryFile? _buildOrder;
-        private readonly VdbeTemporaryFile? _matched;
+        private readonly Partition?[] _partitions;
+        private readonly VdbeMemoryReservation _infrastructureReservation;
+        private VdbeTemporaryFile? _buildOrder;
+        private VdbeTemporaryFile? _matched;
         private long _buildOrderPosition;
         private bool _disposed;
 
-        public HashSpill(
+        private HashSpill(
             VdbeExecutionOptions options,
             int columnCount,
             int rowIdCount,
-            bool trackUnmatchedBuild)
+            VdbeMemoryReservation infrastructureReservation)
         {
             _options = options;
             _columnCount = columnCount;
             _rowIdCount = rowIdCount;
+            _infrastructureReservation = infrastructureReservation;
             _partitions = new Partition[PartitionCount];
+        }
+
+        public static HashSpill Create(
+            VdbeJoinExecutionContext context,
+            int columnCount,
+            int rowIdCount,
+            bool trackUnmatchedBuild,
+            ref VdbeMemoryReservation? infrastructureReservation)
+        {
+            var reservation = infrastructureReservation
+                ?? throw new InvalidOperationException("Hash spill infrastructure was not reserved.");
+            HashSpill spill;
             try
             {
-                for (var index = 0; index < _partitions.Length; index++)
-                {
-                    _partitions[index] = CreatePartition(options, index);
-                    options.Metrics.HashPartitionCreated();
-                }
+                spill = new HashSpill(
+                    context.Options,
+                    columnCount,
+                    rowIdCount,
+                    reservation);
+            }
+            catch
+            {
+                reservation.Dispose();
+                infrastructureReservation = null;
+                throw;
+            }
 
-                if (trackUnmatchedBuild)
-                {
-                    _buildOrder = VdbeTemporaryFile.Create(options, "hash-build-order");
-                    _buildOrderPosition = VdbeSpillRecordCodec.InitializeFile(
-                        _buildOrder.File,
-                        VdbeSpillFileKind.HashBuildOrder,
-                        options.Metrics);
-                    _matched = VdbeTemporaryFile.Create(options, "hash-matches");
-                    VdbeSpillRecordCodec.InitializeFile(
-                        _matched.File,
-                        VdbeSpillFileKind.HashMatchMap,
-                        options.Metrics);
-                }
+            context.RegisterPendingCleanup(spill);
+            infrastructureReservation = null;
+            try
+            {
+                spill.Initialize(trackUnmatchedBuild);
+                context.UnregisterPendingCleanup(spill);
+                return spill;
             }
             catch (Exception primaryFailure)
             {
                 try
                 {
-                    Dispose();
+                    spill.Dispose();
+                    context.UnregisterPendingCleanup(spill);
                 }
                 catch (Exception cleanupFailure)
                 {
@@ -741,10 +754,39 @@ internal static class VdbeHashJoinRuntime
             }
         }
 
+        private void Initialize(bool trackUnmatchedBuild)
+        {
+            for (var index = 0; index < _partitions.Length; index++)
+            {
+                var partition = new Partition();
+                _partitions[index] = partition;
+                partition.SetFile(VdbeTemporaryFile.Create(_options, $"hash-p{index:D3}"));
+                partition.Position = VdbeSpillRecordCodec.InitializeFile(
+                    partition.File.File,
+                    VdbeSpillFileKind.HashPartition,
+                    _options.Metrics);
+                _options.Metrics.HashPartitionCreated();
+            }
+
+            if (!trackUnmatchedBuild)
+                return;
+
+            _buildOrder = VdbeTemporaryFile.Create(_options, "hash-build-order");
+            _buildOrderPosition = VdbeSpillRecordCodec.InitializeFile(
+                _buildOrder.File,
+                VdbeSpillFileKind.HashBuildOrder,
+                _options.Metrics);
+            _matched = VdbeTemporaryFile.Create(_options, "hash-matches");
+            VdbeSpillRecordCodec.InitializeFile(
+                _matched.File,
+                VdbeSpillFileKind.HashMatchMap,
+                _options.Metrics);
+        }
+
         public void WriteBuild(BuildEntry entry, VdbeJoinExecutionContext context)
         {
             context.ThrowIfCancellationRequested();
-            var partition = _partitions[entry.Key is null ? 0 : GetPartition(entry.Key)];
+            var partition = _partitions[entry.Key is null ? 0 : GetPartition(entry.Key)]!;
             var position = partition.Position;
             WriteEntry(partition.File.File, ref position, entry, context);
             partition.Position = position;
@@ -758,7 +800,7 @@ internal static class VdbeHashJoinRuntime
         {
             context.ThrowIfCancellationRequested();
             foreach (var partition in _partitions)
-                partition.File.File.FlushToDisk();
+                partition!.File.File.FlushToDisk();
             _buildOrder?.File.FlushToDisk();
         }
 
@@ -766,7 +808,7 @@ internal static class VdbeHashJoinRuntime
             int partitionIndex,
             VdbeJoinExecutionContext context)
         {
-            var partition = _partitions[partitionIndex];
+            var partition = _partitions[partitionIndex]!;
             _options.Metrics.HashPartitionScanned();
             VdbeSpillRecordCodec.ValidateFile(
                 partition.File.File,
@@ -790,7 +832,7 @@ internal static class VdbeHashJoinRuntime
             try
             {
                 buckets = new Dictionary<string, List<BuildEntry>>(StringComparer.Ordinal);
-                var partition = _partitions[partitionIndex];
+                var partition = _partitions[partitionIndex]!;
                 _options.Metrics.HashPartitionScanned();
                 VdbeSpillRecordCodec.ValidateFile(
                     partition.File.File,
@@ -892,7 +934,7 @@ internal static class VdbeHashJoinRuntime
                 _options.Metrics);
             return ReadEntries(
                 _buildOrder.File,
-                _partitions.Sum(static partition => partition.Count),
+                _partitions.Sum(static partition => partition!.Count),
                 context);
         }
 
@@ -1013,13 +1055,18 @@ internal static class VdbeHashJoinRuntime
                 var key = hasKey switch
                 {
                     0 => null,
-                    1 => VdbeSpillRecordCodec.ReadString(file, ref position, _options.Metrics),
+                    1 => VdbeSpillRecordCodec.ReadString(
+                        file,
+                        ref position,
+                        recordEnd,
+                        _options.Metrics),
                     _ => throw new InvalidDataException($"Unknown hash spill key marker {hasKey}."),
                 };
                 var values = VdbeSpillRecordCodec.ReadValues(
                     file,
                     ref position,
                     _columnCount,
+                    recordEnd,
                     _options.Metrics,
                     context.CancellationToken);
                 var rowIds = new long?[_rowIdCount];
@@ -1061,7 +1108,7 @@ internal static class VdbeHashJoinRuntime
                     continue;
                 try
                 {
-                    partition.File.Dispose();
+                    partition.Dispose();
                 }
                 catch (Exception exception)
                 {
@@ -1088,46 +1135,30 @@ internal static class VdbeHashJoinRuntime
             }
 
             if (cleanupFailures is null)
+            {
+                _infrastructureReservation.Dispose();
                 _disposed = true;
+            }
             if (cleanupFailures is [var cleanupFailure])
                 ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
             if (cleanupFailures is { Count: > 1 })
                 throw new AggregateException(cleanupFailures);
         }
 
-        private static Partition CreatePartition(VdbeExecutionOptions options, int index)
+        private sealed class Partition : IDisposable
         {
-            var file = VdbeTemporaryFile.Create(options, $"hash-p{index:D3}");
-            try
-            {
-                var position = VdbeSpillRecordCodec.InitializeFile(
-                    file.File,
-                    VdbeSpillFileKind.HashPartition,
-                    options.Metrics);
-                return new Partition(file, position);
-            }
-            catch (Exception primaryFailure)
-            {
-                try
-                {
-                    file.Dispose();
-                }
-                catch (Exception cleanupFailure)
-                {
-                    throw new AggregateException(primaryFailure, cleanupFailure);
-                }
-                ExceptionDispatchInfo.Capture(primaryFailure).Throw();
-                throw;
-            }
-        }
+            private VdbeTemporaryFile? _file;
 
-        private sealed class Partition(VdbeTemporaryFile file, long position)
-        {
-            public VdbeTemporaryFile File { get; } = file;
+            public VdbeTemporaryFile File =>
+                _file ?? throw new InvalidOperationException("Hash spill partition is not initialized.");
 
-            public long Position { get; set; } = position;
+            public long Position { get; set; }
 
             public int Count { get; set; }
+
+            public void SetFile(VdbeTemporaryFile file) => _file = file;
+
+            public void Dispose() => _file?.Dispose();
         }
     }
 }

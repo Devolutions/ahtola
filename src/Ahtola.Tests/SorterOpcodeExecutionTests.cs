@@ -306,6 +306,41 @@ public class SorterOpcodeExecutionTests
     }
 
     [Test]
+    public void SizeTieredConsolidationKeepsManyRunRewriteGrowthLogarithmic()
+    {
+        const int runCount = 256;
+        const long encodedIntegerRecordBytes = 14;
+        const int maximumWritesPerRecord = 10;
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 4096,
+            temporaryDirectory: "sorter-size-tiers",
+            sorterMergeFanIn: 2,
+            metrics: metrics);
+        var values = Enumerable.Range(1, runCount)
+            .Reverse()
+            .Select(static value => (long)value)
+            .ToArray();
+        var program = SingleColumnSpillSorterProgram(
+            AscendingFirstColumn,
+            bufferRowCapacity: 1,
+            values);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+
+        DrainRows(statement)
+            .Select(row => row[0].AsInteger())
+            .Should()
+            .Equal(Enumerable.Range(1, runCount).Select(static value => (long)value));
+
+        metrics.SorterRunsWritten.Should().BeLessThanOrEqualTo((2L * runCount) - 1);
+        metrics.SpillBytesWritten.Should().BeLessThanOrEqualTo(
+            VdbeSpillRecordCodec.FileHeaderSize
+            + (runCount * encodedIntegerRecordBytes * maximumWritesPerRecord));
+        metrics.CurrentRetainedBytes.Should().Be(0);
+    }
+
+    [Test]
     public void LargeTextAndBlobRowsRemainWithinManagedMergeBudget()
     {
         const long budget = 12_000;
@@ -413,6 +448,47 @@ public class SorterOpcodeExecutionTests
         fileSystem.Created.Should().NotBeEmpty();
         fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
         fileSystem.Created.Should().OnlyContain(path => !fileSystem.FileExists(path));
+    }
+
+    [Test]
+    public void SpillConstructionDeleteFailureRemainsRetryableForReset()
+    {
+        var faults = new DeterministicFaultInjector();
+        var backing = new InMemoryFileSystem(faults);
+        var fileSystem = new TrackingFileSystem(backing);
+        var metrics = new VdbeExecutionMetrics();
+        faults.FailOnOccurrence(
+            FileSystemOperation.Write,
+            occurrence: 1,
+            message: "construction failed");
+        for (var occurrence = 1; occurrence <= 32; occurrence++)
+            faults.FailOnOccurrence(FileSystemOperation.Delete, occurrence);
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: 2048,
+            temporaryDirectory: "sorter-construction-cleanup",
+            metrics: metrics);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnSpillSorterProgram(
+                AscendingFirstColumn,
+                bufferRowCapacity: 1,
+                2,
+                1),
+            options);
+
+        Assert.Catch<Exception>(() => statement.StepResumable());
+
+        metrics.ActiveSpillFiles.Should().Be(1);
+        metrics.CurrentRetainedBytes.Should().BeGreaterThan(0);
+        fileSystem.Created.Where(backing.FileExists).Should().ContainSingle();
+
+        faults.ClearScheduled();
+        statement.Reset();
+
+        metrics.ActiveSpillFiles.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        fileSystem.Created.Should().OnlyContain(path => !backing.FileExists(path));
+        DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(1, 2);
     }
 
     [Test]
