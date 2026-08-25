@@ -3025,12 +3025,27 @@ public sealed class ResumableStatement : IDisposable
                 cancellationToken);
         }
 
-        private SorterSpill CreateSpill() =>
-            SorterSpill.Create(
-                _columnCount,
-                _executionOptions,
-                _memory,
-                _pendingCleanup);
+        private SorterSpill CreateSpill()
+        {
+            VdbeMemoryReservation? infrastructureReservation =
+                VdbeMemoryReservation.Create(
+                    _memory,
+                    VdbeManagedFootprint.EstimateSorterSpillInfrastructure(
+                        _executionOptions.TemporaryDirectory));
+            try
+            {
+                return SorterSpill.Create(
+                    _columnCount,
+                    _executionOptions,
+                    _memory,
+                    _pendingCleanup,
+                    ref infrastructureReservation);
+            }
+            finally
+            {
+                infrastructureReservation?.Dispose();
+            }
+        }
 
         private static long EstimateRecordBytes(SqlValue[] record) =>
             Math.Max(
@@ -3127,6 +3142,7 @@ public sealed class ResumableStatement : IDisposable
         private readonly int _columnCount;
         private readonly VdbeExecutionOptions _executionOptions;
         private readonly VdbeExecutionMemory _memory;
+        private readonly VdbeMemoryReservation _infrastructureReservation;
         private VdbeTemporaryFile? _temporaryFile;
         private IFile? _file;
         private List<RunDescriptor>? _runs;
@@ -3141,22 +3157,23 @@ public sealed class ResumableStatement : IDisposable
             int columnCount,
             VdbeExecutionOptions executionOptions,
             VdbeExecutionMemory memory,
-            long runDescriptorBytes)
+            VdbeMemoryReservation infrastructureReservation)
         {
             _columnCount = columnCount;
             _executionOptions = executionOptions;
             _memory = memory;
-            _runDescriptorBytes = runDescriptorBytes;
+            _infrastructureReservation = infrastructureReservation;
         }
 
         public static SorterSpill Create(
             int columnCount,
             VdbeExecutionOptions executionOptions,
             VdbeExecutionMemory memory,
-            VdbePendingCleanupRegistry pendingCleanup)
+            VdbePendingCleanupRegistry pendingCleanup,
+            ref VdbeMemoryReservation? infrastructureReservation)
         {
-            var runDescriptorBytes = VdbeManagedFootprint.ListObjectBytes;
-            memory.RetainOrThrow(runDescriptorBytes, rows: 0);
+            var reservation = infrastructureReservation
+                ?? throw new InvalidOperationException("Sorter spill infrastructure was not reserved.");
             SorterSpill spill;
             try
             {
@@ -3164,14 +3181,16 @@ public sealed class ResumableStatement : IDisposable
                     columnCount,
                     executionOptions,
                     memory,
-                    runDescriptorBytes);
+                    reservation);
             }
             catch
             {
-                memory.Release(runDescriptorBytes, rows: 0);
+                reservation.Dispose();
+                infrastructureReservation = null;
                 throw;
             }
 
+            infrastructureReservation = null;
             try
             {
                 pendingCleanup.Register(spill);
@@ -3205,7 +3224,10 @@ public sealed class ResumableStatement : IDisposable
 
         private void Initialize()
         {
-            _runs = [];
+            _runs = new List<RunDescriptor>(
+                VdbeManagedFootprint.GetListCapacityForCount(
+                    currentCapacity: 0,
+                    requiredCount: 1));
             _temporaryFile = VdbeTemporaryFile.Create(_executionOptions, "sorter");
             _file = _temporaryFile.File;
             _writePosition = VdbeSpillRecordCodec.InitializeFile(
@@ -3562,11 +3584,16 @@ public sealed class ResumableStatement : IDisposable
             if (_disposed)
                 return;
             _temporaryFile?.Dispose();
-            _disposed = true;
+            if (_runDescriptorBytes > 0)
+            {
+                _memory.Release(_runDescriptorBytes, rows: 0);
+                _runDescriptorBytes = 0;
+            }
+            _infrastructureReservation.Dispose();
+            _temporaryFile = null;
             _runs = null;
             _file = null;
-            _memory.Release(_runDescriptorBytes, rows: 0);
-            _runDescriptorBytes = 0;
+            _disposed = true;
         }
 
         private int GetEffectiveFanIn(int start, int maximumFanIn, long availableBytes)
