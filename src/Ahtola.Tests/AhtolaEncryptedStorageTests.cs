@@ -70,7 +70,7 @@ public class AhtolaEncryptedStorageTests
             var header = CreateFirstPage(SqlitePageSize.Default);
             "AHTLA"u8.CopyTo(header);
             header[5] = 0;
-            header[6] = 3;
+            header[6] = 9;
             unsupported.Write(0, header);
         }
 

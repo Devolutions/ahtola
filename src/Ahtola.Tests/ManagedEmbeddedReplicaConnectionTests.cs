@@ -8,7 +8,7 @@ using Ahtola.Core;
 
 namespace Ahtola.Tests;
 
-public sealed class ManagedEmbeddedReplicaConnectionTests
+public sealed partial class ManagedEmbeddedReplicaConnectionTests
 {
     private const int BootstrapStagedDatabaseBoundary = (int)ManagedReplicaDurableBoundary.BootstrapStagedDatabase;
     private const int BootstrapSafetyStatePublishedBoundary =
@@ -26,6 +26,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     // ManagedEncryptedFileOpenContractTests' Aes256Key/WrongAes256Key pair.
     private const string ReplicaEncryptionKeyHex = "202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F";
     private const string ReplicaEncryptionWrongKeyHex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+    private const string ReplicaEncryptionKey128Hex = "202122232425262728292A2B2C2D2E2F";
+    private const string ReplicaEncryptionWrongKey128Hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
     private const int RevertWalStagedBoundary = (int)ManagedReplicaDurableBoundary.RevertWalStaged;
     private const int RevertWalPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertWalPublished;
     private const int RevertMetadataPublishedBoundary = (int)ManagedReplicaDurableBoundary.RevertMetadataPublished;
@@ -3324,7 +3326,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [TestCase(UnsupportedReplicaMode.UnsupportedEncryptionCipher)]
-    [TestCase(UnsupportedReplicaMode.PartialQuery)]
+    [TestCase(UnsupportedReplicaMode.PartialQueryTooLong)]
     [TestCase(UnsupportedReplicaMode.PartialPrefixInvalidSegment)]
     public void CreateReplicaRejectsUnsupportedModesBeforeOpeningOrMutatingLocalState(
         UnsupportedReplicaMode mode)
@@ -3337,8 +3339,8 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         {
             using var connection = AhtolaConnection.CreateReplica(options);
             var exception = Assert.Throws<NotSupportedException>(() => connection.Open())!;
-            if (mode == UnsupportedReplicaMode.PartialQuery)
-                exception.Message.Should().Contain("query-selected bootstrap pages");
+            if (mode == UnsupportedReplicaMode.PartialQueryTooLong)
+                exception.Message.Should().Contain("UTF-8 bytes");
             if (mode == UnsupportedReplicaMode.PartialPrefixInvalidSegment)
                 exception.Message.Should().Contain("whole number of 4 KiB pages");
 
@@ -3346,6 +3348,60 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
             File.Exists(path).Should().BeFalse();
             File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
             File.Exists(path + ManagedReplicaChangeJournal.Suffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void QueryPagesRejectsAnEmptyOrWhitespaceQueryAtConstruction()
+    {
+        Assert.Throws<ArgumentException>(() => AhtolaPartialBootstrapOptions.QueryPages("   "));
+        Assert.Throws<ArgumentException>(() => AhtolaPartialBootstrapOptions.QueryPages(string.Empty));
+        Assert.Throws<ArgumentNullException>(() => AhtolaPartialBootstrapOptions.QueryPages(null!));
+    }
+
+    /// <summary>
+    /// Query bootstrap cannot be chunked: the server, not the client, decides which pages the query
+    /// selects, so there is no client-side page count to split across round trips. Turso's own client
+    /// forces <c>chunk_pages = None</c> whenever a query selector is present
+    /// (<c>database_sync_operations.rs::bootstrap_db_file_v1</c>). Both this and the
+    /// remote-encryption combination must fail before any request or local-state mutation.
+    /// </summary>
+    [TestCase(true)]
+    [TestCase(false)]
+    public void QueryBootstrapRejectsChunkingAndRemoteEncryptionBeforeAnyRequest(bool chunked)
+    {
+        var path = NewReplicaPath($"managed-replica-query-incompatible-{chunked}");
+        var handler = new PullUpdatesHandler(CreatePullResponse("unused", new byte[4096]));
+        var options = new AhtolaReplicaOptions(
+            path,
+            new Uri("https://example.test/cluster"),
+            authToken: "token-42")
+        {
+            PartialBootstrap = AhtolaPartialBootstrapOptions.QueryPages("SELECT 1;"),
+            PullBytesThreshold = chunked ? 4096 : null,
+            RemoteEncryption = chunked
+                ? null
+                : new AhtolaRemoteEncryptionOptions("c2VjcmV0", AhtolaRemoteEncryptionCipher.Aes256Gcm),
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler)
+            {
+                MessageHandlerDisablesAutomaticRedirects = true,
+            },
+        };
+
+        try
+        {
+            var exception = Assert.Throws<InvalidOperationException>(
+                () => AhtolaConnection.CreateReplica(options))!;
+            exception.Message.Should().Contain(
+                chunked ? "PullBytesThreshold cannot be combined" : "cannot be combined with remote encryption");
+
+            handler.CallCount.Should().Be(0);
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + ".ahtola-replica-meta").Should().BeFalse();
         }
         finally
         {
@@ -3837,8 +3893,13 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
-    public async Task ConflictRetryAfterReopenReusesExactPayloadAndAcknowledgesOnlyPushedEntries()
+    public async Task ConflictAfterReopenBlocksSyncUntilResolvedThenAcknowledgesOnlyPushedEntries()
     {
+        // A conflict is no longer retried by blindly re-pushing the batch the server already
+        // rejected: it durably blocks synchronization until the application resolves it
+        // explicitly (see ManagedReplicaConflictRebaseTests). What this test still pins down is
+        // the surrounding push accounting -- journal retention across reopen, the batch limit, and
+        // acknowledging only the entries a push actually carried.
         var path = NewReplicaPath("managed-replica-conflict-retry-after-reopen");
         var image = CreateJournalDatabaseImage(path + ".source");
         var payloads = new List<string>();
@@ -3886,13 +3947,30 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                 reopened.ReadManagedReplicaLocalChanges(10).Changes
                     .Select(change => change.Sequence).Should().Equal(1, 2);
                 reopened.ExecuteNonQuery("INSERT INTO journal_events VALUES (30);");
+                reopened.ExecuteNonQuery("INSERT INTO journal_events VALUES (40);");
+
+                // The rejected batch is durably quarantined: ordinary sync fails closed instead
+                // of re-pushing it.
+                Assert.ThrowsAsync<AhtolaReplicaConflictPendingException>(
+                    () => reopened.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                payloads.Should().HaveCount(1);
+
+                var report = (await reopened.InspectReplicaConflictAsync())!;
+                report.UnresolvedEntries.Select(entry => entry.Sequence).Should().Equal(1L);
+                report.EligibleEntries.Select(entry => entry.Sequence).Should().Equal(2L);
+
+                var discard = await reopened.ResolveReplicaConflictAsync(
+                    AhtolaReplicaConflictResolution.DiscardUnresolvedChanges,
+                    new AhtolaReplicaConflictResolutionOptions { AcknowledgeDataLoss = true });
+                discard.ConflictCleared.Should().BeTrue();
+                discard.DiscardedChangeCount.Should().Be(1);
 
                 var recovery = await reopened.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
                 recovery.Statistics.CdcOperations.Should().Be(2);
                 payloads.Should().HaveCount(2);
-                payloads[1].Should().Be(payloads[0]);
+                payloads[1].Should().NotContain("VALUES (10)", "the rejected statement must never be re-pushed");
                 reopened.ReadManagedReplicaLocalChanges(10).Changes
-                    .Select(change => change.Sequence).Should().Equal(3);
+                    .Select(change => change.Sequence).Should().Equal(4);
 
                 var final = await reopened.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
                 final.Statistics.CdcOperations.Should().Be(1);
@@ -5328,12 +5406,15 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
                     AhtolaRemoteEncryptionCipher.ChaCha20Poly1305),
                 HttpPolicy = options.HttpPolicy,
             },
-            UnsupportedReplicaMode.PartialQuery => new AhtolaReplicaOptions(
+            // AhtolaPartialBootstrapOptions.QueryPages accepts any non-whitespace query, so this
+            // exercises ManagedReplicaSupportMatrix's defensive cap on the encoded tag-7 selector.
+            UnsupportedReplicaMode.PartialQueryTooLong => new AhtolaReplicaOptions(
                 path,
                 options.RemoteUri,
                 options.AuthToken)
             {
-                PartialBootstrap = AhtolaPartialBootstrapOptions.QueryPages("SELECT 1"),
+                PartialBootstrap = AhtolaPartialBootstrapOptions.QueryPages(
+                    "SELECT " + new string('a', ManagedReplicaSupportMatrix.MaximumBootstrapQueryLength)),
                 HttpPolicy = options.HttpPolicy,
             },
             UnsupportedReplicaMode.PartialPrefixInvalidSegment => new AhtolaReplicaOptions(
@@ -5351,27 +5432,177 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
         };
     }
 
+    /// <summary>
+    /// Bootstrap, pull and reopen for every remote cipher that Turso format
+    /// version 0 assigns an on-disk cipher id to. The source image is genuinely
+    /// encrypted with that cipher (its reserved-byte count and page-1 cipher id
+    /// are asserted), so this proves the managed replica path decodes AEGIS pages
+    /// locally rather than only accepting the configuration.
+    /// </summary>
+    [TestCase(AhtolaRemoteEncryptionCipher.Aes128Gcm, ReplicaEncryptionKey128Hex, (byte)1, (byte)28)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aes256Gcm, ReplicaEncryptionKeyHex, (byte)2, (byte)28)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis256, ReplicaEncryptionKeyHex, (byte)3, (byte)48)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis256X2, ReplicaEncryptionKeyHex, (byte)4, (byte)48)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis256X4, ReplicaEncryptionKeyHex, (byte)5, (byte)48)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis128L, ReplicaEncryptionKey128Hex, (byte)6, (byte)32)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis128X2, ReplicaEncryptionKey128Hex, (byte)7, (byte)32)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis128X4, ReplicaEncryptionKey128Hex, (byte)8, (byte)32)]
+    public void CreateReplicaBootstrapsPullsAndReopensEveryFormatVersionZeroCipher(
+        AhtolaRemoteEncryptionCipher cipher,
+        string hexKey,
+        byte cipherId,
+        byte reservedBytes)
+    {
+        var path = NewReplicaPath($"managed-replica-{cipher}");
+        var sourcePath = path + ".source";
+        var image = CreateEncryptedDatabaseImage(sourcePath, hexKey, marker: 91, cipher: cipher);
+
+        image.AsSpan(0, 5).ToArray().Should().Equal(
+            "AHTLA"u8.ToArray(), "the fixture must be genuinely encrypted, not merely labeled as such");
+        image[6].Should().Be(cipherId, "page 1 records the Turso cipher id");
+        image[20].Should().Be(reservedBytes, "the reserved-byte count is the tag plus this cipher's nonce");
+
+        var receivedEncryptionKeys = new List<string?>();
+        var handler = new PullUpdatesHandler(
+            CreatePullResponse("revision-91", image),
+            request => receivedEncryptionKeys.Add(
+                request.Headers.TryGetValues(AhtolaRemoteClient.EncryptionKeyHeaderName, out var values)
+                    ? values.FirstOrDefault()
+                    : null));
+        var options = CreateEncryptedOptions(path, handler, hexKey, cipher);
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+
+                ReadBootstrapMarker(connection).Should().Be(91);
+                handler.CallCount.Should().Be(1);
+                receivedEncryptionKeys.Should().ContainSingle()
+                    .Which.Should().Be(options.RemoteEncryption!.Base64Key);
+            }
+
+            var persisted = ReadAllBytesShared(path);
+            persisted.AsSpan(0, 5).ToArray().Should().Equal(
+                "AHTLA"u8.ToArray(), "the bootstrapped local file must remain encrypted at rest");
+            persisted[6].Should().Be(cipherId);
+            persisted[20].Should().Be(reservedBytes);
+
+            // Reopen the materialized replica through the ordinary local path to
+            // prove the on-disk bytes are a plain Ahtola encrypted database.
+            using var reopened = new AhtolaConnection(ManagedEncryptionConnectionString(path, hexKey, cipher));
+            reopened.Open();
+            ReadBootstrapMarker(reopened).Should().Be(91);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    /// <summary>
+    /// A key of the right length but wrong value must fail closed for every
+    /// cipher, and the failed bootstrap must roll back completely.
+    /// </summary>
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis256, ReplicaEncryptionKeyHex, ReplicaEncryptionWrongKeyHex)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis256X2, ReplicaEncryptionKeyHex, ReplicaEncryptionWrongKeyHex)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis256X4, ReplicaEncryptionKeyHex, ReplicaEncryptionWrongKeyHex)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis128L, ReplicaEncryptionKey128Hex, ReplicaEncryptionWrongKey128Hex)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis128X2, ReplicaEncryptionKey128Hex, ReplicaEncryptionWrongKey128Hex)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis128X4, ReplicaEncryptionKey128Hex, ReplicaEncryptionWrongKey128Hex)]
+    public void CreateReplicaRejectsEveryAegisCipherWhenTheConfiguredKeyDoesNotMatch(
+        AhtolaRemoteEncryptionCipher cipher,
+        string hexKey,
+        string wrongHexKey)
+    {
+        var path = NewReplicaPath($"managed-replica-wrong-key-{cipher}");
+        var sourcePath = path + ".source";
+        var image = CreateEncryptedDatabaseImage(sourcePath, hexKey, cipher: cipher);
+
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-91", image));
+        var options = CreateEncryptedOptions(path, handler, wrongHexKey, cipher);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<InvalidDataException>(() => connection.Open())!
+                .Message.Should().Contain("failed authentication");
+
+            handler.CallCount.Should().Be(1);
+            File.Exists(path).Should().BeFalse(
+                "a failed bootstrap must roll back rather than leave an undecryptable database");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    /// <summary>
+    /// A replica configured for one cipher must refuse a database written with
+    /// another, at open time and with no fallback attempt.
+    /// </summary>
+    [Test]
+    public void CreateReplicaRejectsACipherMismatchWithoutFallback()
+    {
+        var path = NewReplicaPath("managed-replica-cipher-mismatch");
+        var sourcePath = path + ".source";
+        var image = CreateEncryptedDatabaseImage(
+            sourcePath, ReplicaEncryptionKeyHex, cipher: AhtolaRemoteEncryptionCipher.Aegis256);
+
+        var handler = new PullUpdatesHandler(CreatePullResponse("revision-91", image));
+        var options = CreateEncryptedOptions(
+            path, handler, ReplicaEncryptionKeyHex, AhtolaRemoteEncryptionCipher.Aegis256X2);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            Assert.Throws<InvalidDataException>(() => connection.Open())!
+                .Message.Should().Contain("cipher fallback is not permitted");
+            File.Exists(path).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
     private static string ManagedEncryptionConnectionString(string path, string hexKey)
         => $"Data Source={path};Local Provider=Managed;Encryption Cipher=Aes256Gcm;Encryption Key={hexKey}";
+
+    private static string ManagedEncryptionConnectionString(
+        string path,
+        string hexKey,
+        AhtolaRemoteEncryptionCipher cipher)
+        => $"Data Source={path};Local Provider=Managed;Encryption Cipher={cipher};Encryption Key={hexKey}";
 
     /// <summary>
     /// Builds a genuinely AES-256-GCM encrypted source database image (28 reserved bytes per
     /// page; page 1 begins with the "AHTLA" header, not the plaintext SQLite magic) for feeding
     /// through <see cref="CreatePullResponse"/> in encrypted-bootstrap tests.
     /// </summary>
-    private static void CreateEncryptedInitializedDatabase(string path, string hexKey, int marker)
+    private static void CreateEncryptedInitializedDatabase(
+        string path,
+        string hexKey,
+        int marker,
+        AhtolaRemoteEncryptionCipher cipher = AhtolaRemoteEncryptionCipher.Aes256Gcm)
     {
-        using var connection = new AhtolaConnection(ManagedEncryptionConnectionString(path, hexKey));
+        using var connection = new AhtolaConnection(ManagedEncryptionConnectionString(path, hexKey, cipher));
         connection.Open();
         connection.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
         connection.ExecuteNonQuery($"INSERT INTO bootstrap_marker VALUES ({marker});");
     }
 
-    private static byte[] CreateEncryptedDatabaseImage(string path, string hexKey, int marker = 42)
+    private static byte[] CreateEncryptedDatabaseImage(
+        string path,
+        string hexKey,
+        int marker = 42,
+        AhtolaRemoteEncryptionCipher cipher = AhtolaRemoteEncryptionCipher.Aes256Gcm)
     {
         try
         {
-            CreateEncryptedInitializedDatabase(path, hexKey, marker);
+            CreateEncryptedInitializedDatabase(path, hexKey, marker, cipher);
             return File.ReadAllBytes(path);
         }
         finally
@@ -5480,30 +5711,37 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     private static byte[] CreatePageSubsetPullResponse(
         string revision,
         byte[] databaseImage,
-        IReadOnlyList<uint> pageIds)
+        IReadOnlyList<uint> pageIds,
+        ulong? declaredPages = null,
+        ulong protocol = 1,
+        bool allowOutOfRangePageIds = false)
     {
-        var databasePages = checked((ulong)(databaseImage.Length / 4096));
+        var imagePages = checked((ulong)(databaseImage.Length / 4096));
+        var databasePages = declaredPages ?? imagePages;
         var header = new List<byte>();
         WriteLengthDelimitedField(header, 1, Encoding.UTF8.GetBytes(revision));
         WriteVarintField(header, 2, databasePages);
         WriteLengthDelimitedField(header, 3, []);
         WriteVarintField(header, 5, 0);
         WriteVarintField(header, 6, 1);
-        WriteVarintField(header, 8, 1);
+        WriteVarintField(header, 8, protocol);
 
         var response = new List<byte>();
         WriteDelimitedMessage(response, header);
         foreach (var pageId in pageIds)
         {
-            if ((ulong)pageId >= databasePages)
+            if (!allowOutOfRangePageIds && (ulong)pageId >= databasePages)
                 throw new ArgumentOutOfRangeException(nameof(pageIds));
             var page = new List<byte>();
             if (pageId != 0)
                 WriteVarintField(page, 1, pageId);
+            // An out-of-range page id still has to carry a well-formed 4 KiB payload so the
+            // bounds check, not the page-size check, is what rejects it.
+            var sourcePage = (ulong)pageId < imagePages ? pageId : 0;
             WriteLengthDelimitedField(
                 page,
                 2,
-                databaseImage.AsSpan(checked((int)pageId * 4096), 4096));
+                databaseImage.AsSpan(checked((int)sourcePage * 4096), 4096));
             WriteDelimitedMessage(response, page);
         }
 
@@ -5822,7 +6060,7 @@ public sealed class ManagedEmbeddedReplicaConnectionTests
     public enum UnsupportedReplicaMode
     {
         UnsupportedEncryptionCipher,
-        PartialQuery,
+        PartialQueryTooLong,
         PartialPrefixInvalidSegment,
     }
 

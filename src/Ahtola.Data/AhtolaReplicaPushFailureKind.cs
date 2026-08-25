@@ -8,9 +8,11 @@ public enum AhtolaReplicaPushFailureKind
 {
     /// <summary>
     /// The remote diverged from the locally journaled changes (for example a conflicting row or
-    /// schema write). The change journal is retained and is never rebased automatically; resolve
-    /// by rebasing the local changes against the current remote state or, once available, by
-    /// rolling back the offending prefix via the revert WAL.
+    /// schema write). The change journal is retained and is never rebased automatically, and a
+    /// durable conflict marker blocks further synchronization until the application resolves the
+    /// conflict explicitly with
+    /// <see cref="AhtolaConnection.InspectReplicaConflictAsync(CancellationToken)"/> and
+    /// <see cref="AhtolaConnection.ResolveReplicaConflictAsync(AhtolaReplicaConflictResolution, AhtolaReplicaConflictResolutionOptions?, CancellationToken)"/>.
     /// </summary>
     Conflict,
 

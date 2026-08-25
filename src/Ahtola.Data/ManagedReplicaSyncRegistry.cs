@@ -204,6 +204,20 @@ internal static class ManagedReplicaSyncRegistry
                 clearInFlightSync: false);
         }
 
+        /// <summary>
+        /// Runs <paramref name="stagedOperation"/> as one exclusive publication unit and returns its
+        /// result. Unlike <see cref="SynchronizeAsync"/> this never coalesces with an in-flight sync:
+        /// callers such as explicit conflict resolution choose a specific action, so joining someone
+        /// else's already-running operation and reporting its result would be wrong.
+        /// </summary>
+        public Task<T> PublishExclusiveAsync<T>(
+            Func<CancellationToken, Task<T>> stagedOperation,
+            CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(stagedOperation);
+            return PublishAsync(stagedOperation, cancellationToken, clearInFlightSync: false);
+        }
+
         private async Task<T> PublishAsync<T>(
             Func<CancellationToken, Task<T>> stagedOperation,
             CancellationToken cancellationToken,
@@ -213,6 +227,17 @@ internal static class ManagedReplicaSyncRegistry
             try
             {
                 await EnterPublicationAsync(request, cancellationToken).ConfigureAwait(false);
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.ReplicaPublicationOwnershipAcquired);
+
+                // The last consequence-free cancellation point of a publication: ownership is
+                // held, no host has been closed, and nothing durable has been touched. Observing
+                // cancellation here means the caller sees OperationCanceledException with the
+                // replica bit-for-bit unchanged. Past this line the staged operation defines its
+                // own irreversible boundaries and every host must be reopened before returning,
+                // so cancellation is no longer free.
+                cancellationToken.ThrowIfCancellationRequested();
+
                 ManagedReplicaConnectionHost[] hosts;
                 lock (_gate)
                     hosts = _hosts.ToArray();

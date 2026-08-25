@@ -38,6 +38,15 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         _encryption = ownsOptions ? null : options.Encryption?.CreateOwnedCopy();
     }
 
+    /// <summary>
+    /// Creates a data source over an explicitly owned OPFS directory, asynchronous only.
+    /// </summary>
+    /// <remarks>
+    /// This overload keeps the exact CLR signature that shipped before synchronous read-mirror
+    /// mode existed. Adding an optional parameter to it would have changed the signature and
+    /// broken every already-compiled caller at run time, so the mode is offered by the dedicated
+    /// overload below instead.
+    /// </remarks>
     public AhtolaBrowserDataSource(
         string databasePath,
         string ownedDirectory,
@@ -45,18 +54,76 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         bool readOnly = false,
         AhtolaBrowserEncryptionOptions? encryption = null)
         : this(
-            new AhtolaBrowserOptions(databasePath, ownedDirectory, sharedBufferSize, readOnly, encryption),
+            databasePath,
+            ownedDirectory,
+            sharedBufferSize,
+            readOnly,
+            encryption,
+            AhtolaBrowserSynchronousMode.AsyncOnly)
+    {
+    }
+
+    /// <summary>
+    /// Creates a data source over an explicitly owned OPFS directory, choosing whether provably
+    /// read-only statements may also be served synchronously from the managed in-memory mirror.
+    /// </summary>
+    public AhtolaBrowserDataSource(
+        string databasePath,
+        string ownedDirectory,
+        int sharedBufferSize,
+        bool readOnly,
+        AhtolaBrowserEncryptionOptions? encryption,
+        AhtolaBrowserSynchronousMode synchronousMode)
+        : this(
+            new AhtolaBrowserOptions(
+                databasePath,
+                ownedDirectory,
+                sharedBufferSize,
+                readOnly,
+                encryption,
+                synchronousMode),
             ownsOptions: true)
     {
     }
 
+    /// <summary>
+    /// Creates a data source that owns the database file's parent directory, asynchronous only.
+    /// </summary>
+    /// <inheritdoc
+    ///     cref="AhtolaBrowserDataSource(string, string, int, bool, AhtolaBrowserEncryptionOptions)"
+    ///     path="/remarks"/>
     public AhtolaBrowserDataSource(
         string databasePath,
         int sharedBufferSize = AhtolaBrowserOptions.DefaultSharedBufferSize,
         bool readOnly = false,
         AhtolaBrowserEncryptionOptions? encryption = null)
         : this(
-            new AhtolaBrowserOptions(databasePath, sharedBufferSize, readOnly, encryption),
+            databasePath,
+            sharedBufferSize,
+            readOnly,
+            encryption,
+            AhtolaBrowserSynchronousMode.AsyncOnly)
+    {
+    }
+
+    /// <summary>
+    /// Creates a data source that owns the database file's parent directory, choosing whether
+    /// provably read-only statements may also be served synchronously from the managed in-memory
+    /// mirror.
+    /// </summary>
+    public AhtolaBrowserDataSource(
+        string databasePath,
+        int sharedBufferSize,
+        bool readOnly,
+        AhtolaBrowserEncryptionOptions? encryption,
+        AhtolaBrowserSynchronousMode synchronousMode)
+        : this(
+            new AhtolaBrowserOptions(
+                databasePath,
+                sharedBufferSize,
+                readOnly,
+                encryption,
+                synchronousMode),
             ownsOptions: true)
     {
     }
@@ -70,6 +137,64 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
     bool IManagedDatabaseFactory.IsReadOnly => _options.IsReadOnly;
 
     bool IManagedDatabaseFactory.IsSharedMemory => _options.IsInMemory;
+
+    /// <summary>
+    /// Synchronous reads are served from the managed in-memory mirror, so they are
+    /// offered only when the caller opted into
+    /// <see cref="AhtolaBrowserSynchronousMode.ReadOnlyMirror"/>.
+    /// </summary>
+    bool IManagedDatabaseFactory.SupportsSynchronousReads => _options.AllowsSynchronousReads;
+
+    /// <summary>
+    /// Whether the OPFS mirror still owes the persistent store work. Synchronous
+    /// teardown fails closed while it does, so no mutation can be dropped.
+    /// </summary>
+    bool IManagedDatabaseFactory.HasPendingDurableWork => HasPendingDurableWork;
+
+    private bool HasPendingDurableWork
+    {
+        get
+        {
+            Task<StorageState>? initialization;
+            lock (_gate)
+                initialization = _initialization;
+
+            // Nothing is owed before the mirror exists, and a failed or still
+            // running initialization has no durable state to settle.
+            return initialization is { IsCompletedSuccessfully: true }
+                   && initialization.Result.Mirror.HasUnflushedWork;
+        }
+    }
+
+    /// <summary>
+    /// Snapshots how much durable-transport work this data source has performed
+    /// and still owes.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="AhtolaBrowserStorageMetrics.PersistentOperations"/> counts OPFS
+    /// worker round trips, so a workload that only performs supported synchronous
+    /// reads leaves it unchanged. An in-memory data source never reaches OPFS and
+    /// always reports zero.
+    /// <see cref="AhtolaBrowserStorageMetrics.PendingMutations"/> and
+    /// <see cref="AhtolaBrowserStorageMetrics.HasUnflushedWork"/> report the same owed work that
+    /// synchronous close and disposal fail closed on, including work already handed to a running
+    /// flush.
+    /// </remarks>
+    public AhtolaBrowserStorageMetrics GetStorageMetrics()
+    {
+        Task<StorageState>? initialization;
+        lock (_gate)
+            initialization = _initialization;
+
+        if (initialization is not { IsCompletedSuccessfully: true })
+            return default;
+
+        var metrics = initialization.Result.Mirror.GetMetrics();
+        return new AhtolaBrowserStorageMetrics(
+            metrics.PersistentOperations,
+            metrics.PendingMutations,
+            metrics.HasUnflushedWork);
+    }
 
     public new SqliteConnection CreateConnection()
     {
@@ -99,6 +224,72 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         }
     }
 
+    /// <summary>
+    /// Performs the one required asynchronous initialization and open, then returns
+    /// a connection intended for synchronous reads.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Available only when the data source was configured with
+    /// <see cref="AhtolaBrowserSynchronousMode.ReadOnlyMirror"/>. Once this task
+    /// completes, the database image lives in managed memory, so statements proven
+    /// incapable of mutating it — <c>SELECT</c>, <c>VALUES</c>, and <c>WITH</c>
+    /// whose terminal statement is <c>SELECT</c> or <c>VALUES</c> — execute
+    /// synchronously without any OPFS or worker operation.
+    /// </para>
+    /// <para>
+    /// Mutations, transactions, blobs, backups, <c>PRAGMA</c>, and <c>EXPLAIN</c>
+    /// still require the asynchronous API, because their durability depends on an
+    /// OPFS flush. The returned connection may be closed or disposed synchronously
+    /// only while no mutation is pending.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// The data source is asynchronous only.
+    /// </exception>
+    public async ValueTask<SqliteConnection> OpenSynchronousReadConnectionAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfSynchronousReadsNotEnabled();
+        return await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Performs the one required asynchronous initialization and open, then returns
+    /// an <see cref="global::Ahtola.AhtolaConnection"/> intended for synchronous reads.
+    /// </summary>
+    /// <inheritdoc cref="OpenSynchronousReadConnectionAsync" path="/remarks"/>
+    /// <exception cref="InvalidOperationException">
+    /// The data source is asynchronous only.
+    /// </exception>
+    public async ValueTask<global::Ahtola.AhtolaConnection> OpenSynchronousReadAhtolaConnectionAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfSynchronousReadsNotEnabled();
+        var connection = CreateAhtolaConnection();
+        try
+        {
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            return connection;
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private void ThrowIfSynchronousReadsNotEnabled()
+    {
+        ThrowIfDisposed();
+        if (_options.AllowsSynchronousReads)
+            return;
+
+        throw new InvalidOperationException(
+            "Synchronous reads require a data source created with "
+            + $"{nameof(AhtolaBrowserSynchronousMode)}.{nameof(AhtolaBrowserSynchronousMode.ReadOnlyMirror)}.");
+    }
+
     protected override DbConnection CreateDbConnection() => CreateConnection();
 
     protected override DbConnection OpenDbConnection()
@@ -119,7 +310,10 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
             try
             {
                 var inner = global::Ahtola.ManagedSharedMemoryDatabase.Open(_memoryName);
-                return new BrowserInMemoryManagedDatabaseAdapter(inner, ReleaseConnection);
+                return new BrowserInMemoryManagedDatabaseAdapter(
+                    inner,
+                    ReleaseConnection,
+                    allowSynchronousTeardown: _options.AllowsSynchronousReads);
             }
             catch
             {
@@ -270,7 +464,7 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
         {
             if (EffectiveEncryption is { } encryptionOptions)
             {
-                var cipher = await AhtolaBrowserWebCryptoPageCipher
+                var cipher = await AhtolaBrowserPageCipherFactory
                     .CreateAsync(encryptionOptions)
                     .ConfigureAwait(false);
                 encryption = new BrowserEncryptedPersistence(new AhtolaAsyncPageTransformer(cipher));

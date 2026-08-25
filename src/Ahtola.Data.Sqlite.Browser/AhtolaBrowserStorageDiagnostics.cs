@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.Versioning;
 using Ahtola.Core;
 using Ahtola.Core.Storage;
@@ -189,6 +191,155 @@ public static class AhtolaBrowserStorageDiagnostics
             details);
     }
 
+    /// <summary>
+    /// Warms a persistent connection opened in synchronous read-mirror mode, runs
+    /// many synchronous point reads, and proves they never crossed into the OPFS
+    /// worker.
+    /// </summary>
+    /// <param name="iterations">The number of synchronous point reads to perform.</param>
+    /// <param name="cancellationToken">Cancels setup and teardown.</param>
+    /// <remarks>
+    /// The proof is the unchanged worker-operation count, not the elapsed time:
+    /// timings vary widely across browsers and machines, so they are reported for
+    /// diagnostics rather than asserted.
+    /// </remarks>
+    public static async ValueTask<AhtolaBrowserSynchronousReadDiagnosticResult> RunSynchronousReadAsync(
+        int iterations = 1000,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(iterations, 1);
+
+        const int rowCount = 64;
+        var id = Guid.NewGuid().ToString("N");
+        var root = $"sync-read-{id}";
+        var databasePath = $"{root}/main.db";
+        long before;
+        long after;
+        long checksum;
+        var readerMatched = false;
+        double elapsedMilliseconds;
+
+        var source = new AhtolaBrowserDataSource(
+            databasePath,
+            root,
+            AhtolaBrowserOptions.DefaultSharedBufferSize,
+            readOnly: false,
+            encryption: null,
+            synchronousMode: AhtolaBrowserSynchronousMode.ReadOnlyMirror);
+        try
+        {
+            var connection = await source
+                .OpenSynchronousReadConnectionAsync(cancellationToken)
+                .ConfigureAwait(false);
+            try
+            {
+                await using (var setup = connection.CreateCommand())
+                {
+                    setup.CommandText =
+                        "CREATE TABLE probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL)";
+                    await setup.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+                await using (var seed = connection.CreateCommand())
+                {
+                    seed.CommandText =
+                        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < "
+                        + rowCount.ToString(CultureInfo.InvariantCulture)
+                        + ") INSERT INTO probe(id, value) SELECT n, n * 3 FROM seq";
+                    await seed.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                // The first synchronous read pays for statement preparation and page
+                // materialization, so it is excluded from the measured window.
+                using (var warm = connection.CreateCommand())
+                {
+                    warm.CommandText = "SELECT value FROM probe WHERE id = 1";
+                    _ = warm.ExecuteScalar();
+                }
+
+                before = source.GetStorageMetrics().PersistentOperations;
+                checksum = 0;
+                var stopwatch = Stopwatch.StartNew();
+                using (var probe = connection.CreateCommand())
+                {
+                    probe.CommandText = "SELECT value FROM probe WHERE id = $id";
+                    var parameter = probe.CreateParameter();
+                    parameter.ParameterName = "$id";
+                    probe.Parameters.Add(parameter);
+                    for (var index = 0; index < iterations; index++)
+                    {
+                        parameter.Value = (index % rowCount) + 1;
+                        checksum += Convert.ToInt64(probe.ExecuteScalar(), CultureInfo.InvariantCulture);
+                    }
+                }
+
+                stopwatch.Stop();
+                elapsedMilliseconds = stopwatch.Elapsed.TotalMilliseconds;
+
+                using (var reader = connection.CreateCommand())
+                {
+                    reader.CommandText = "SELECT id, value FROM probe WHERE id = 7";
+                    using var rows = reader.ExecuteReader();
+                    readerMatched = rows.Read() && rows.GetInt64(1) == 21 && !rows.Read();
+                }
+
+                after = source.GetStorageMetrics().PersistentOperations;
+
+                // Synchronous close is part of the contract: it is allowed only
+                // because the mirror owes the persistent store nothing.
+                connection.Close();
+            }
+            catch
+            {
+                await connection.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+
+            connection.Dispose();
+        }
+        finally
+        {
+            await source.DisposeAsync().ConfigureAwait(false);
+            await DeletePersistentDirectoryAsync(root).ConfigureAwait(false);
+        }
+
+        var expectedChecksum = ExpectedChecksum(iterations, rowCount);
+        return new AhtolaBrowserSynchronousReadDiagnosticResult(
+            iterations,
+            before,
+            after,
+            elapsedMilliseconds,
+            checksum == expectedChecksum && readerMatched,
+            $"checksum={checksum};expected={expectedChecksum};reader={readerMatched}");
+    }
+
+    private static long ExpectedChecksum(int iterations, int rowCount)
+    {
+        long expected = 0;
+        for (var index = 0; index < iterations; index++)
+            expected += ((index % rowCount) + 1) * 3L;
+        return expected;
+    }
+
+    private static async ValueTask DeletePersistentDirectoryAsync(string root)
+    {
+        try
+        {
+            await using var persistent = await OpfsAsyncFileSystem
+                .CreateAsync(root, 64 * 1024, CancellationToken.None)
+                .ConfigureAwait(false);
+            var paths = await persistent
+                .ListFilesAsync(root, CancellationToken.None)
+                .ConfigureAwait(false);
+            foreach (var path in paths)
+                await persistent.DeleteFileAsync(path, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (AhtolaBrowserDatabaseLockedException)
+        {
+            // Another context still owns the directory; leaving the diagnostic's
+            // scratch files behind must not fail the diagnostic itself.
+        }
+    }
+
     private static async ValueTask ExecuteToCompletionAsync(
         IManagedConnectionAdapter connection,
         string sql,
@@ -229,4 +380,39 @@ public readonly record struct AhtolaBrowserStorageDiagnosticResult(
         && PositionalIoMatches
         && AtomicReplaceMatches
         && ManagedPersistenceMatches;
+}
+
+/// <summary>
+/// Results from the synchronous read-mirror diagnostic.
+/// </summary>
+/// <param name="Iterations">The number of synchronous point reads performed.</param>
+/// <param name="WorkerOperationsBefore">
+/// OPFS worker operations recorded before the measured reads began.
+/// </param>
+/// <param name="WorkerOperationsAfter">
+/// OPFS worker operations recorded after the measured reads completed.
+/// </param>
+/// <param name="ElapsedMilliseconds">Wall time spent in the measured reads.</param>
+/// <param name="ValuesMatched">Whether every read returned the expected value.</param>
+/// <param name="Details">Human-readable detail for failure triage.</param>
+public readonly record struct AhtolaBrowserSynchronousReadDiagnosticResult(
+    int Iterations,
+    long WorkerOperationsBefore,
+    long WorkerOperationsAfter,
+    double ElapsedMilliseconds,
+    bool ValuesMatched,
+    string Details)
+{
+    /// <summary>Whether the reads caused no OPFS worker operation at all.</summary>
+    public bool WorkerOperationsUnchanged => WorkerOperationsAfter == WorkerOperationsBefore;
+
+    /// <summary>Average wall time per synchronous point read, in microseconds.</summary>
+    public double AverageMicrosecondsPerRead
+        => Iterations == 0 ? 0 : ElapsedMilliseconds * 1000d / Iterations;
+
+    /// <summary>
+    /// Whether the diagnostic proved the synchronous read-mirror contract: correct
+    /// values with zero worker crossings.
+    /// </summary>
+    public bool Succeeded => ValuesMatched && WorkerOperationsUnchanged;
 }

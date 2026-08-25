@@ -49,7 +49,13 @@ internal sealed record CreateIndexStatement(
     bool IfNotExists,
     Expression? Where = null,
     string? WhereSql = null,
-    string? Sql = null) : ParsedStatement;
+    string? Sql = null,
+    string? Method = null,
+    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null) : ParsedStatement
+{
+    /// <summary>True for <c>CREATE INDEX … USING method (…)</c>.</summary>
+    public bool IsMethodIndex => Method is not null;
+}
 
 internal sealed record DropIndexStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -529,6 +535,34 @@ internal enum JoinKind
     Left,
     Right,
     Full,
+
+    /// <summary>
+    /// Internal-only join produced by <c>EmbeddedDatabase.RewriteCorrelatedSubqueries</c>. It
+    /// keeps one copy of a left row when at least one right row satisfies the condition, and
+    /// projects only the left row shape. Turso spells this <c>JoinType::Semi</c>
+    /// (turso-src/core/translate/optimizer/unnest.rs:259-265). No SQL surface produces it: the
+    /// parser never emits it, so it can only appear after the correlated-subquery rewrite.
+    /// </summary>
+    Semi,
+
+    /// <summary>
+    /// Internal-only join produced by <c>EmbeddedDatabase.RewriteCorrelatedSubqueries</c>. It
+    /// keeps a left row when <em>no</em> right row satisfies the condition, and projects only
+    /// the left row shape. Turso spells this <c>JoinType::Anti</c>
+    /// (turso-src/core/translate/optimizer/unnest.rs:259-265).
+    /// </summary>
+    Anti,
+}
+
+internal static class JoinKindExtensions
+{
+    /// <summary>
+    /// True for the internal semi/anti joins, whose output row shape is exactly the left
+    /// side's: the right side only decides whether a left row survives, so its columns are
+    /// never visible to the enclosing query (they stay in scope for the join condition only).
+    /// </summary>
+    public static bool ProducesLeftShapeOnly(this JoinKind kind)
+        => kind is JoinKind.Semi or JoinKind.Anti;
 }
 
 internal enum CompoundOperator
@@ -782,9 +816,14 @@ internal sealed record EmbeddedIndex(
     Expression? Where = null,
     string? WhereSql = null,
     int? ConstraintOrdinal = null,
-    string? Sql = null)
+    string? Sql = null,
+    string? Method = null,
+    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null)
 {
     public bool IsPartial => Where is not null;
+
+    /// <summary>True when this index is served by a registered managed index method.</summary>
+    public bool IsMethodIndex => Method is not null;
 }
 
 internal abstract record Expression;

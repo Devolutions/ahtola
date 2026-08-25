@@ -10,11 +10,15 @@ public class AhtolaConnection :
     DbConnection,
     ILocalReaderConnection,
     IManagedSchemaConnection,
-    IAsyncExecutionConnection
+    IAsyncExecutionConnection,
+    IBrowserSynchronousExecutionPolicy
 {
     internal const int AutomaticSyncMaximumAttempts = 3;
     // Test-only transport seam. Production callers continue to use the default HttpClient transport.
     internal static Func<HttpMessageHandler?>? RemoteMessageHandlerFactory { get; set; }
+
+    // Test-only seam for the Hrana WebSocket transport. Production callers use ClientWebSocket.
+    internal static Func<IAhtolaWebSocketConnector?>? RemoteWebSocketConnectorFactory { get; set; }
 
     private AhtolaNativeDatabase? _nativeDatabase;
     private AhtolaReplicaDatabase? _replicaDatabase;
@@ -231,10 +235,14 @@ public class AhtolaConnection :
 
     public override void Close()
     {
-        if (_managedDatabaseFactory is not null && _managedDatabase is not null)
+        if (_managedDatabaseFactory is not null
+            && _managedDatabase is not null
+            && !AllowsSynchronousTeardown)
         {
             throw new PlatformNotSupportedException(
-                "Synchronous Close is not supported by the browser database source. Use CloseAsync.");
+                _managedDatabaseFactory.SupportsSynchronousReads
+                    ? "Synchronous Close cannot persist pending browser database mutations. Use CloseAsync."
+                    : "Synchronous Close is not supported by the browser database source. Use CloseAsync.");
         }
 
         _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: true);
@@ -395,10 +403,13 @@ public class AhtolaConnection :
         if (disposing
             && !_disposed
             && _managedDatabaseFactory is not null
-            && State != ConnectionState.Closed)
+            && State != ConnectionState.Closed
+            && !AllowsSynchronousTeardown)
         {
             throw new PlatformNotSupportedException(
-                "Synchronous disposal is not supported by the browser database source. Use DisposeAsync.");
+                _managedDatabaseFactory.SupportsSynchronousReads
+                    ? "Synchronous disposal cannot persist pending browser database mutations. Use DisposeAsync."
+                    : "Synchronous disposal is not supported by the browser database source. Use DisposeAsync.");
         }
 
         if (!disposing || _disposed)
@@ -577,6 +588,100 @@ public class AhtolaConnection :
             .SyncAsync(options, cancellationToken);
     }
 
+    /// <summary>
+    /// Returns an immutable classification of the managed embedded replica's open push conflict,
+    /// or <see langword="null"/> when no conflict is recorded. Pure read: no network access and no
+    /// local mutation, so it is safe to call at any time, including while synchronization is
+    /// blocked by <see cref="AhtolaReplicaConflictPendingException"/>.
+    /// </summary>
+    /// <remarks>
+    /// Turso's own sync engine treats a push conflict as terminal (see
+    /// <c>turso-src/sync/engine/src/database_sync_operations.rs</c>, <c>wal_push</c>); this
+    /// inspection and the matching
+    /// <see cref="ResolveReplicaConflictAsync(AhtolaReplicaConflictResolution, AhtolaReplicaConflictResolutionOptions?, CancellationToken)"/>
+    /// are an Ahtola managed extension over that behavior, not a port of it.
+    /// </remarks>
+    public Task<AhtolaReplicaConflictReport?> InspectReplicaConflictAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<AhtolaReplicaConflictReport?>(cancellationToken);
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException("Ahtola database is closed.");
+        if (_managedReplicaHost is not { } host)
+        {
+            throw new NotSupportedException(
+                "Replica conflict inspection requires a managed embedded replica connection.");
+        }
+
+        return host.InspectReplicaConflictAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Applies an explicit resolution to the managed embedded replica's open push conflict.
+    /// Nothing is ever resolved automatically: until this succeeds and clears the conflict,
+    /// explicit and automatic synchronization keep failing with
+    /// <see cref="AhtolaReplicaConflictPendingException"/>.
+    /// </summary>
+    /// <param name="resolution">The resolution to apply.</param>
+    /// <param name="options">
+    /// Resolution policy. Required — with
+    /// <see cref="AhtolaReplicaConflictResolutionOptions.AcknowledgeDataLoss"/> set — for
+    /// <see cref="AhtolaReplicaConflictResolution.DiscardUnresolvedChanges"/>.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the resolution.</param>
+    public Task<AhtolaReplicaConflictResolutionResult> ResolveReplicaConflictAsync(
+        AhtolaReplicaConflictResolution resolution,
+        AhtolaReplicaConflictResolutionOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<AhtolaReplicaConflictResolutionResult>(cancellationToken);
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException("Ahtola database is closed.");
+        if (_managedReplicaHost is not { } host)
+        {
+            throw new NotSupportedException(
+                "Replica conflict resolution requires a managed embedded replica connection.");
+        }
+        if (_transaction is not null)
+        {
+            throw new InvalidOperationException(
+                "Managed embedded replica conflict resolution cannot run while a transaction is active.");
+        }
+        lock (_readerLock)
+        {
+            if (_openReaders.Count != 0)
+            {
+                throw new InvalidOperationException(
+                    "Managed embedded replica conflict resolution cannot run while a data reader is active.");
+            }
+        }
+
+        return ResolveManagedReplicaConflictAsync(host, resolution, options, cancellationToken);
+    }
+
+    private async Task<AhtolaReplicaConflictResolutionResult> ResolveManagedReplicaConflictAsync(
+        ManagedReplicaConnectionHost host,
+        AhtolaReplicaConflictResolution resolution,
+        AhtolaReplicaConflictResolutionOptions? options,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await host.ResolveReplicaConflictAsync(resolution, options, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            if (host.TryGetDatabase(out var database))
+                _managedDatabase = database;
+        }
+    }
+
     internal async Task QuiesceManagedReplicaAsync(
         Func<CancellationToken, Task> stagedOperation,
         CancellationToken cancellationToken = default)
@@ -660,6 +765,32 @@ public class AhtolaConnection :
     internal bool IsManaged => _managedReplicaHost is not null || _managedDatabase is not null;
 
     internal bool RequiresAsyncExecution => _managedDatabaseFactory is not null;
+
+    /// <summary>
+    /// Whether this connection's data source opted into serving provably
+    /// read-only statements from a managed in-memory mirror.
+    /// </summary>
+    internal bool SupportsSynchronousReads
+        => _managedDatabaseFactory?.SupportsSynchronousReads == true;
+
+    /// <summary>
+    /// Whether <paramref name="sql"/> may execute synchronously on this connection.
+    /// </summary>
+    internal bool AllowsSynchronousSql(string? sql)
+        => !RequiresAsyncExecution
+           || (SupportsSynchronousReads
+               && AhtolaReadOnlySqlClassifier.IsProvenReadOnlyScript(sql));
+
+    bool IBrowserSynchronousExecutionPolicy.SupportsSynchronousReads => SupportsSynchronousReads;
+
+    bool IBrowserSynchronousExecutionPolicy.AllowsSynchronousSql(string? sql) => AllowsSynchronousSql(sql);
+
+    /// <summary>
+    /// Whether synchronous teardown can complete without owing durable work to the
+    /// backing store. Any pending mutation fails closed and requires async cleanup.
+    /// </summary>
+    internal bool AllowsSynchronousTeardown
+        => _managedDatabaseFactory is { SupportsSynchronousReads: true, HasPendingDurableWork: false };
 
     bool IAsyncExecutionConnection.RequiresAsyncExecution => RequiresAsyncExecution;
 
@@ -796,6 +927,32 @@ public class AhtolaConnection :
     }
 
     internal void ResetManagedReplicaCommandsForPublication() => ResetOpenCommands();
+
+    /// <summary>
+    /// Called by <see cref="ManagedReplicaConnectionHost"/> when a publication disposed this
+    /// connection's managed database and could not reopen it. Drops the now-disposed adapter so
+    /// <see cref="State"/> reports <see cref="ConnectionState.Closed"/> instead of advertising a
+    /// connection whose every command would fail, and releases readers/commands bound to it.
+    /// <see cref="Close"/> still tears the replica host down normally afterwards.
+    /// </summary>
+    internal void InvalidateManagedReplicaDatabase()
+    {
+        try
+        {
+            CloseOpenReaders();
+        }
+        finally
+        {
+            try
+            {
+                ResetOpenCommands();
+            }
+            finally
+            {
+                _managedDatabase = null;
+            }
+        }
+    }
 
     internal void TransactionCompleted(AhtolaTransaction transaction)
     {
@@ -1308,8 +1465,21 @@ public class AhtolaConnection :
         }
 
         ValidateDirectRemoteLocalProvider();
-        var endpoint = _connectionOptions.GetRemoteUri();
         var remoteEncryption = _connectionOptions.GetRemoteEncryptionOptions();
+        if (_connectionOptions.IsWebSocketRemote)
+        {
+            // ws/wss selects the persistent Hrana WebSocket transport; every other remote
+            // scheme keeps the stateless HTTP pipeline.
+            _remoteClient = new AhtolaRemoteClient(
+                _connectionOptions.GetRemoteWebSocketUri(),
+                _connectionOptions.AuthToken,
+                _connectionOptions.GetWebSocketOptions(),
+                remoteEncryption,
+                RemoteWebSocketConnectorFactory?.Invoke());
+            return;
+        }
+
+        var endpoint = _connectionOptions.GetRemoteUri();
         var handler = RemoteMessageHandlerFactory?.Invoke();
         _remoteClient = handler is null
             ? new AhtolaRemoteClient(endpoint, _connectionOptions.AuthToken, remoteEncryption)
@@ -1569,8 +1739,15 @@ public class AhtolaConnection :
 
     internal static bool IsTransientAutomaticSyncFailure(Exception exception, CancellationToken cancellationToken)
     {
-        if (exception is AhtolaReplicaConflictException || cancellationToken.IsCancellationRequested)
+        // An unresolved push conflict — reported the first time as AhtolaReplicaConflictException
+        // and on every subsequent attempt as AhtolaReplicaConflictPendingException — is never
+        // retryable: retrying would re-push a batch the server already rejected. Automatic sync
+        // stops and surfaces it so the application can resolve the conflict explicitly.
+        if (exception is AhtolaReplicaConflictException or AhtolaReplicaConflictPendingException
+            || cancellationToken.IsCancellationRequested)
+        {
             return false;
+        }
 
         return AhtolaReplicaPushFailure.Classify(exception) == AhtolaReplicaPushFailureKind.TransientTransport;
     }

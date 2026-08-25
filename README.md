@@ -93,6 +93,9 @@ options.UseAhtola("Data Source=app.db");
 
 // Direct Turso/Hrana:
 options.UseAhtola("Data Source=turso://my-db.turso.io;Auth Token=" + authToken);
+
+// Same server over a persistent Hrana WebSocket (legacy libSQL/sqld):
+options.UseAhtola("Data Source=wss://my-db.turso.io;Auth Token=" + authToken);
 ```
 
 ## Browser WebAssembly
@@ -112,11 +115,39 @@ command.CommandText = "CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, 
 await command.ExecuteNonQueryAsync();
 ```
 
-Browser-created connections are async-only. Use `OpenAsync`,
+Browser connections are asynchronous by default: `OpenAsync`,
 `ExecuteReaderAsync`, `ReadAsync`, transaction async methods, `OpenBlobAsync`,
-`BackupDatabaseAsync`, `CloseAsync`, and `DisposeAsync`. The corresponding
-synchronous operations fail rather than blocking WebAssembly on an incomplete
-browser promise.
+`BackupDatabaseAsync`, `CloseAsync`, and `DisposeAsync`. The synchronous
+counterparts fail rather than blocking WebAssembly on an incomplete browser
+promise.
+
+Opting into `AhtolaBrowserSynchronousMode.ReadOnlyMirror` additionally allows
+provably read-only statements to run on the synchronous ADO.NET surface. The
+asynchronous open materializes the database into managed memory, so those reads
+never touch OPFS:
+
+```csharp
+await using var dataSource = new AhtolaBrowserDataSource(
+    "my-app/main.db",
+    "my-app",
+    AhtolaBrowserOptions.DefaultSharedBufferSize,
+    readOnly: false,
+    encryption: null,
+    synchronousMode: AhtolaBrowserSynchronousMode.ReadOnlyMirror);
+var connection = await dataSource.OpenSynchronousReadConnectionAsync();
+
+using var query = connection.CreateCommand();
+query.CommandText = "SELECT name FROM items WHERE id = 42";
+var name = (string?)query.ExecuteScalar();   // no OPFS, no worker call
+```
+
+Only `SELECT`, `VALUES`, and `WITH …` whose terminal statement is
+`SELECT`/`VALUES` qualify. Mutations, DDL, `PRAGMA`, `EXPLAIN`, transactions,
+`ATTACH`/`DETACH`, writable CTEs, blobs, backup, and any batch containing an
+unproven statement still require the asynchronous API, because their durability
+depends on an OPFS flush. Synchronous `Close`/`Dispose` are allowed only while
+no mutation is pending; otherwise they fail closed and asynchronous cleanup is
+required.
 
 The host must be a secure context and cross-origin isolated:
 
@@ -131,6 +162,23 @@ AES-GCM format as desktop databases. See
 [docs/browser-wasm.md](docs/browser-wasm.md) for deployment and usage, and
 [docs/browser-encrypted-storage.md](docs/browser-encrypted-storage.md) for the
 encryption/durability design.
+
+### Trimming profile
+
+`Devolutions.Ahtola.Core`, `Devolutions.Ahtola.Data.Sqlite` (which embeds
+`Devolutions.Ahtola.Data`), `Devolutions.Ahtola.Data.Sqlite.Browser`, and
+`Devolutions.Ahtola.EntityFrameworkCore.Sqlite` all build with
+`IsTrimmable`/`IsAotCompatible` and no trim-warning suppression.
+
+| Stack | Trim status |
+| --- | --- |
+| Core ADO (`…Data.Sqlite` → `…Core`), desktop | **Trim- and NativeAOT-clean.** Zero `IL2xxx`/`IL3xxx` warnings across the closure under ILLink and ILC, and the published binary is executed by the gate. |
+| Browser + core ADO (`…Data.Sqlite.Browser` → `…Data.Sqlite` → `…Core`) | **Trim-clean.** A browser publish with `-p:SuppressTrimAnalysisWarnings=false -p:TrimmerSingleWarn=false` reports zero `IL2xxx`/`IL3xxx` warnings across the whole closure. |
+| Anything adding `…EntityFrameworkCore.Sqlite` | Zero warnings originate in Ahtola, but EF Core is annotated `RequiresUnreferencedCode`/`RequiresDynamicCode` upstream, so the published app still reports EF's own warnings. An EF profile is only trim-clean once that upstream chain is warning-free. |
+
+Both are gated by `./build.ps1 validate-browser-trim` (browser profiles) and
+`./build.ps1 validate-trim` (browser plus the desktop trimmed and NativeAOT
+publishes).
 
 Common connection-string keywords: `Data Source`, `Mode`, `Cache`, `Pooling`,
 `Foreign Keys`, `Default Timeout` / `Command Timeout`, `Foreign Read Only`,
@@ -293,7 +341,9 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   `ORDER BY` when order matters (`GROUP BY` is first-encounter order).
 - **File-backed platforms** — desktop physical files support Windows, 64-bit
   Linux, and macOS. Browser WebAssembly uses the separate OPFS package and its
-  async-only data source; in-memory works everywhere. Other platforms (e.g.
+  asynchronous data source (with an opt-in synchronous read-mirror profile, see
+  [docs/browser-wasm.md](docs/browser-wasm.md)); in-memory works everywhere.
+  Other platforms (e.g.
   32-bit Linux) throw `PlatformNotSupportedException` on physical open. macOS uses POSIX
   `fcntl(F_SETLK)` (process-associated locks, not Linux OFD); multi-engine
   claims on macOS need host verification.
@@ -321,14 +371,33 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   per-connection V1/V2 CDC tables and transactional COMMIT records. It is
   independent of the managed replica's private journal and does not provide a
   full sync engine or logical-replication replay.
+- **Partial replica bootstrap** — `AhtolaPartialBootstrapOptions.Prefix(...)` and
+  `QueryPages(...)` install a sparse image plus a durable page-state sidecar and
+  fault missing pages from the pinned bootstrap revision. `QueryPages` sends
+  Turso's `server_query_selector` (tag 7) on one unchunked request and therefore
+  **requires a remote that implements query selection** — Turso's vendored dev
+  server ignores tag 7 by design and returns the whole database instead. The
+  sidecar stores materialized pages as a run list, so a worst-case scattered
+  query result costs one run per page. Neither kind can be combined with remote
+  encryption, and `QueryPages` cannot be combined with `PullBytesThreshold`.
+  A fresh MVCC-logical bootstrap is not exposable until its mandatory logical
+  catch-up is durably marked complete; a crash in between is detected and the
+  catch-up resumed on the next open. See
+  [docs/replica-bootstrap-publication.md](docs/replica-bootstrap-publication.md).
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
   is null), AEGIS encryption ciphers, the full sync engine / advanced replica
   protocols, `CREATE SEQUENCE`, and typed-value extensions.
 - **Native / Sync companions** — not shipped. Connection-string paths that need
   them fail closed. OS P/Invoke in the pager for locks/WAL is intentional engine
   code, not a Rust SDK binding.
-- **Remote Hrana** — optional pure-managed HTTP `/v2/pipeline` on
-  `AhtolaConnection` (tests use a canned server). Not a cloud product surface.
+- **Remote Hrana** — optional pure-managed transports on `AhtolaConnection`:
+  the HTTP pipeline (`/v3/pipeline` + `/v3/cursor`, with `/v2/pipeline`
+  fallback) for `http`/`https`/`libsql`/`turso` URLs, and a persistent
+  WebSocket connection for `ws`/`wss` URLs (hrana3/hrana2/hrana1 subprotocol
+  negotiation, multiplexed request ids, v3 cursor paging). The WebSocket
+  transport targets legacy libSQL/sqld servers; the pinned Turso engine has no
+  native Hrana WebSocket server. Tests use canned servers. Not a cloud product
+  surface.
 
 Encryption format v0 uses a fixed 5-byte magic `AHTLA`, then version and cipher
 id (AES-GCM page AEAD).
@@ -343,6 +412,8 @@ Requires the .NET SDK and PowerShell 7+:
 ./build.ps1 pack              # -> ./artifacts/managed-packages
 ./build.ps1 pack-powershell   # -> ./artifacts/powershell-modules
 ./build.ps1 validate-runtime  # packed consumer trim + NativeAOT publish
+./build.ps1 validate-browser-trim  # browser trim analysis (ADO-only must be warning-free)
+./build.ps1 validate-trim          # browser + desktop trimmed/NativeAOT trim analysis
 ```
 
 Contributor details — the full task list, validation gates, conformance suite,

@@ -1278,6 +1278,18 @@ internal sealed class SqlParser
         var name = ParseSchemaQualifiedName(out var indexNameToken, out var indexSchemaToken);
         ExpectKeyword("ON");
         var tableName = ParseSchemaQualifiedName(out var tableNameToken);
+
+        // Turso-style method index: CREATE INDEX n ON t USING m (cols) WITH (k = literal, ...).
+        // Mirrors turso-src/core/schema.rs:5825-5894 and core/translate/index.rs:58-63.
+        string? method = null;
+        if (ConsumeKeyword("USING"))
+        {
+            if (unique)
+                throw Error("UNIQUE is not supported with an index method.");
+
+            method = ExpectIdentifier();
+        }
+
         Expect(TokenKind.LeftParen);
         var columns = new List<IndexedColumnDefinition>();
         do
@@ -1287,10 +1299,15 @@ internal sealed class SqlParser
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
 
+        var methodParameters = ParseIndexMethodParameters(method);
+
         Expression? where = null;
         string? whereSql = null;
         if (ConsumeKeyword("WHERE"))
         {
+            if (method is not null)
+                throw Error("A partial WHERE clause is not supported with an index method.");
+
             var startOffset = _lexer.Current.Offset;
             where = ParseExpression();
             whereSql = _sql[startOffset.._lexer.Current.Offset].Trim();
@@ -1298,9 +1315,111 @@ internal sealed class SqlParser
                 throw Error("Partial index WHERE clause requires an expression.");
         }
 
-        var createIndex = new CreateIndexStatement(name, tableName, columns, unique, ifNotExists, where, whereSql, NormalizeObjectSql(unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ", indexNameToken));
+        if (method is not null)
+        {
+            foreach (var column in columns)
+            {
+                if (column.IsExpression)
+                    throw Error("An index method column must be a plain column name.");
+                if (column.Descending)
+                    throw Error("DESC is not supported on an index method column.");
+                if (column.Collation is not null)
+                    throw Error("COLLATE is not supported on an index method column.");
+            }
+
+            if (columns.Count > Indexing.ManagedIndexMethodLimits.MaxIndexedColumns)
+            {
+                throw Error(
+                    $"An index method supports at most {Indexing.ManagedIndexMethodLimits.MaxIndexedColumns} columns.");
+            }
+        }
+
+        var createIndex = new CreateIndexStatement(
+            name,
+            tableName,
+            columns,
+            unique,
+            ifNotExists,
+            where,
+            whereSql,
+            NormalizeObjectSql(unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ", indexNameToken),
+            method,
+            methodParameters);
         _spans?.RecordQualifier(createIndex, tableNameToken);
         return createIndex;
+    }
+
+    private IReadOnlyList<Indexing.ManagedIndexMethodParameter>? ParseIndexMethodParameters(string? method)
+    {
+        if (!CurrentIsKeyword("WITH"))
+            return null;
+
+        if (method is null)
+            throw Error("WITH is valid only on an index that declares USING.");
+
+        ExpectKeyword("WITH");
+        Expect(TokenKind.LeftParen);
+        var parameters = new List<Indexing.ManagedIndexMethodParameter>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        do
+        {
+            var key = ExpectIdentifier();
+            Expect(TokenKind.Equal);
+            var value = ParseIndexMethodParameterLiteral(key);
+            if (!seen.Add(key))
+                throw Error($"Duplicate index method parameter '{key}'.");
+            if (parameters.Count >= Indexing.ManagedIndexMethodLimits.MaxParameters)
+            {
+                throw Error(
+                    $"An index method accepts at most {Indexing.ManagedIndexMethodLimits.MaxParameters} WITH parameters.");
+            }
+
+            parameters.Add(new Indexing.ManagedIndexMethodParameter(key, value));
+        }
+        while (Consume(TokenKind.Comma));
+        Expect(TokenKind.RightParen);
+        return parameters;
+    }
+
+    // Index method parameters are literals only, matching Turso's resolve_index_method_parameters
+    // (core/translate/index.rs:1170): no expressions, no parameters, no function calls.
+    private SqlValue ParseIndexMethodParameterLiteral(string key)
+    {
+        var negate = false;
+        if (Consume(TokenKind.Minus))
+            negate = true;
+        else
+            Consume(TokenKind.Plus);
+
+        if (!negate && ConsumeKeyword("NULL"))
+            return SqlValue.Null;
+        if (!negate && ConsumeKeyword("TRUE"))
+            return SqlValue.Integer(1);
+        if (!negate && ConsumeKeyword("FALSE"))
+            return SqlValue.Integer(0);
+
+        var token = _lexer.Current;
+        switch (token.Kind)
+        {
+            case TokenKind.Integer:
+                _lexer.Next();
+                if (!long.TryParse(token.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
+                    throw Error($"Index method parameter '{key}' has an out-of-range integer literal.");
+                return SqlValue.Integer(negate ? checked(-integer) : integer);
+            case TokenKind.Real:
+                _lexer.Next();
+                if (!double.TryParse(token.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var real))
+                    throw Error($"Index method parameter '{key}' has an invalid real literal.");
+                return SqlValue.Real(negate ? -real : real);
+            case TokenKind.String when !negate:
+                _lexer.Next();
+                return SqlValue.Text(token.Text);
+            case TokenKind.Blob when !negate:
+                _lexer.Next();
+                return SqlValue.Blob(Convert.FromHexString(token.Text));
+            default:
+                throw Error($"Index method parameter '{key}' requires a literal value.");
+        }
     }
 
     private IndexedColumnDefinition ParseIndexedColumn()

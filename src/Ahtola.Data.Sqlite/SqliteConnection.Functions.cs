@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -121,7 +122,7 @@ public partial class SqliteConnection
         return builder.ToString();
     }
 
-    private static T CoerceAccumulator<T>(object? value)
+    private static T CoerceAccumulator<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] T>(object? value)
     {
         if (value is T typed)
             return typed;
@@ -140,7 +141,9 @@ public partial class SqliteConnection
         return (T)value!;
     }
 
-    private static object DecodeTuple(string text, Type tupleType)
+    private static object DecodeTuple(
+        string text,
+        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] Type tupleType)
     {
         var fields = text.Split(TupleFieldSeparator);
         var elementTypes = tupleType.IsGenericType ? tupleType.GetGenericArguments() : Type.EmptyTypes;

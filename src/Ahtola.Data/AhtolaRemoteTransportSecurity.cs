@@ -11,7 +11,11 @@ internal static class AhtolaRemoteTransportSecurity
     {
         ArgumentNullException.ThrowIfNull(endpoint);
 
+        // wss is the WebSocket spelling of https, and ws the spelling of http; both go
+        // through the identical credential/TLS policy so the Hrana WebSocket transport
+        // cannot weaken it.
         if (endpoint.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            || endpoint.Scheme.Equals(Uri.UriSchemeWss, StringComparison.OrdinalIgnoreCase)
             || endpoint.IsLoopback)
         {
             return;

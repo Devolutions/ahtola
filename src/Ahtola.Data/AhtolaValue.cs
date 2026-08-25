@@ -45,4 +45,9 @@ public enum AhtolaEncryptionCipher
     Aegis128x2,
     /// <summary>AEGIS-128X4 cipher.</summary>
     Aegis128x4,
+    /// <summary>
+    /// AEGIS-256X4 cipher. Appended last so the existing members keep their
+    /// numeric values; ordinals here are not the on-disk cipher ids.
+    /// </summary>
+    Aegis256x4,
 }

@@ -15,9 +15,9 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Mode",
         "Cache",
         "Password",
-                "Password Scheme",
-                "Encryption Cipher",
-                "Encryption Key",
+        "Password Scheme",
+        "Encryption Cipher",
+        "Encryption Key",
         "Foreign Keys",
         "Recursive Triggers",
         "Default Timeout",
@@ -34,6 +34,11 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Read Your Writes",
         "Sync Interval",
         "Tls",
+        "Ws Keepalive Interval",
+        "Ws Keepalive Timeout",
+        "Ws Half Open Timeout",
+        "Ws Max Message Bytes",
+        "Ws Connect Attempts",
     ];
 
     private static readonly Dictionary<string, string> KeywordMap = new(StringComparer.OrdinalIgnoreCase)
@@ -44,12 +49,12 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["Mode"] = "Mode",
         ["Cache"] = "Cache",
         ["Password"] = "Password",
-                ["Password Scheme"] = "Password Scheme",
-                ["PasswordScheme"] = "Password Scheme",
-                ["Encryption Cipher"] = "Encryption Cipher",
-                ["EncryptionCipher"] = "Encryption Cipher",
-                ["Encryption Key"] = "Encryption Key",
-                ["EncryptionKey"] = "Encryption Key",
+        ["Password Scheme"] = "Password Scheme",
+        ["PasswordScheme"] = "Password Scheme",
+        ["Encryption Cipher"] = "Encryption Cipher",
+        ["EncryptionCipher"] = "Encryption Cipher",
+        ["Encryption Key"] = "Encryption Key",
+        ["EncryptionKey"] = "Encryption Key",
         ["Foreign Keys"] = "Foreign Keys",
         ["ForeignKeys"] = "Foreign Keys",
         ["Recursive Triggers"] = "Recursive Triggers",
@@ -84,6 +89,27 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["SyncInterval"] = "Sync Interval",
         ["Tls"] = "Tls",
         ["TLS"] = "Tls",
+        // Hrana WebSocket (ws/wss) transport tunables; ignored by the HTTP pipeline.
+        ["Ws Keepalive Interval"] = "Ws Keepalive Interval",
+        ["WsKeepaliveInterval"] = "Ws Keepalive Interval",
+        ["WebSocket Keepalive Interval"] = "Ws Keepalive Interval",
+        ["WebSocketKeepAliveInterval"] = "Ws Keepalive Interval",
+        ["Ws Keepalive Timeout"] = "Ws Keepalive Timeout",
+        ["WsKeepaliveTimeout"] = "Ws Keepalive Timeout",
+        ["WebSocket Keepalive Timeout"] = "Ws Keepalive Timeout",
+        ["WebSocketKeepAliveTimeout"] = "Ws Keepalive Timeout",
+        ["Ws Half Open Timeout"] = "Ws Half Open Timeout",
+        ["WsHalfOpenTimeout"] = "Ws Half Open Timeout",
+        ["WebSocket Half Open Timeout"] = "Ws Half Open Timeout",
+        ["WebSocketHalfOpenTimeout"] = "Ws Half Open Timeout",
+        ["Ws Max Message Bytes"] = "Ws Max Message Bytes",
+        ["WsMaxMessageBytes"] = "Ws Max Message Bytes",
+        ["WebSocket Max Message Bytes"] = "Ws Max Message Bytes",
+        ["WebSocketMaxMessageBytes"] = "Ws Max Message Bytes",
+        ["Ws Connect Attempts"] = "Ws Connect Attempts",
+        ["WsConnectAttempts"] = "Ws Connect Attempts",
+        ["WebSocket Connect Attempts"] = "Ws Connect Attempts",
+        ["WebSocketConnectAttempts"] = "Ws Connect Attempts",
     };
 
     public SqliteConnectionStringBuilder()
@@ -119,21 +145,21 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         set => SetString("Password", value);
     }
 
-        /// <summary>
-        /// Passphrase key-derivation scheme id (for example <c>Ahtola.Password.v1</c>).
-        /// Empty selects the catalog default. See <see cref="AhtolaPassphraseSchemes"/>.
-        /// </summary>
-        public string PasswordScheme
-        {
-            get => GetString("Password Scheme");
-            set => SetString("Password Scheme", value);
-        }
+    /// <summary>
+    /// Passphrase key-derivation scheme id (for example <c>Ahtola.Password.v1</c>).
+    /// Empty selects the catalog default. See <see cref="AhtolaPassphraseSchemes"/>.
+    /// </summary>
+    public string PasswordScheme
+    {
+        get => GetString("Password Scheme");
+        set => SetString("Password Scheme", value);
+    }
 
-        public string EncryptionCipher
-        {
-            get => GetString("Encryption Cipher");
-            set => SetString("Encryption Cipher", value);
-        }
+    public string EncryptionCipher
+    {
+        get => GetString("Encryption Cipher");
+        set => SetString("Encryption Cipher", value);
+    }
 
     public string EncryptionKey
     {
@@ -263,6 +289,80 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         set => SetNullable("Tls", value);
     }
 
+    /// <summary>
+    /// Hrana WebSocket keep-alive ping interval in seconds for <c>ws</c>/<c>wss</c> data
+    /// sources; 0 disables keep-alives. Ignored by the HTTP pipeline transport.
+    /// </summary>
+    public int WsKeepaliveInterval
+    {
+        get => GetInt("Ws Keepalive Interval", 30);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Ws Keepalive Interval"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Keep-alive pong grace period in seconds. Honoured on .NET 9 or newer; on net8.0
+    /// only the interval is applied.
+    /// </summary>
+    public int WsKeepaliveTimeout
+    {
+        get => GetInt("Ws Keepalive Timeout", 20);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Ws Keepalive Timeout"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Seconds of complete peer silence, while requests are outstanding, that abort a
+    /// <c>ws</c>/<c>wss</c> connection as half-open. <c>0</c> (the default) disables the check.
+    /// </summary>
+    /// <remarks>
+    /// This is the only half-open detection available on net8.0, where <c>ClientWebSocket</c>
+    /// has no pong timeout. Because a Hrana server sends nothing while a statement runs, any
+    /// non-zero value also caps how long a single request may take: set it above the longest
+    /// statement the workload issues.
+    /// </remarks>
+    public int WsHalfOpenTimeout
+    {
+        get => GetInt("Ws Half Open Timeout", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Ws Half Open Timeout"] = value;
+        }
+    }
+
+    /// <summary>Hard cap on a single reassembled Hrana WebSocket message, in bytes.</summary>
+    public int WsMaxMessageBytes
+    {
+        get => GetInt("Ws Max Message Bytes", 16 * 1024 * 1024);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(value, 8 * 1024);
+            this["Ws Max Message Bytes"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Bounded connection-establishment attempts for the Hrana WebSocket transport. It
+    /// never replays in-flight operations.
+    /// </summary>
+    public int WsConnectAttempts
+    {
+        get => GetInt("Ws Connect Attempts", 3);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(value, 1);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(value, 10);
+            this["Ws Connect Attempts"] = value;
+        }
+    }
+
     public override ICollection Keys => new ReadOnlyCollection<string>(CanonicalKeywords);
 
     public override ICollection Values => new ReadOnlyCollection<object?>(CanonicalKeywords.Select(GetValueOrDefault).ToArray());
@@ -344,6 +444,16 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             builder["Sync Interval"] = SyncInterval;
         if (base.ContainsKey("Tls"))
             builder["Tls"] = Tls!.Value;
+        if (base.ContainsKey("Ws Keepalive Interval"))
+            builder["Ws Keepalive Interval"] = WsKeepaliveInterval;
+        if (base.ContainsKey("Ws Keepalive Timeout"))
+            builder["Ws Keepalive Timeout"] = WsKeepaliveTimeout;
+        if (base.ContainsKey("Ws Half Open Timeout"))
+            builder["Ws Half Open Timeout"] = WsHalfOpenTimeout;
+        if (base.ContainsKey("Ws Max Message Bytes"))
+            builder["Ws Max Message Bytes"] = WsMaxMessageBytes;
+        if (base.ContainsKey("Ws Connect Attempts"))
+            builder["Ws Connect Attempts"] = WsConnectAttempts;
         if (base.ContainsKey("Encryption Cipher"))
             builder["Encryption Cipher"] = EncryptionCipher;
         if (base.ContainsKey("Encryption Key"))
@@ -362,75 +472,104 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
 
     internal AhtolaEncryptionOptions? CreateManagedEncryptionOptions()
     {
-            var password = Password;
-            var hasPassword = !string.IsNullOrEmpty(password);
-            var passwordScheme = PasswordScheme;
-            var cipher = GetString("Encryption Cipher");
-            var keyConfigured = base.TryGetValue("Encryption Key", out var keyValue);
-            var key = keyConfigured
-                ? Convert.ToString(keyValue, CultureInfo.InvariantCulture)
-                : null;
-            var hasKey = !string.IsNullOrWhiteSpace(key);
+        var password = Password;
+        var hasPassword = !string.IsNullOrEmpty(password);
+        var passwordScheme = PasswordScheme;
+        var cipher = GetString("Encryption Cipher");
+        var keyConfigured = base.TryGetValue("Encryption Key", out var keyValue);
+        var key = keyConfigured
+            ? Convert.ToString(keyValue, CultureInfo.InvariantCulture)
+            : null;
+        var hasKey = !string.IsNullOrWhiteSpace(key);
 
-            if (!hasPassword && !string.IsNullOrWhiteSpace(passwordScheme))
-            {
-                throw new InvalidOperationException(
-                    "Password Scheme requires Password=; it only selects passphrase key derivation.");
-            }
-
-            if (hasPassword && hasKey)
-            {
-                throw new InvalidOperationException(
-                    "Password and Encryption Key cannot be combined; use one passphrase or one hex key.");
-            }
-
-            if (hasPassword)
-            {
-                var scheme = AhtolaPassphraseSchemes.Resolve(passwordScheme);
-                if (!string.IsNullOrWhiteSpace(cipher)
-                    && !CipherNameMatches(cipher, scheme.PageCipher))
-                {
-                    throw new NotSupportedException(
-                        $"Password Scheme '{scheme.Id}' derives {scheme.PageCipher}; "
-                        + "Encryption Cipher must be omitted or match that page cipher.");
-                }
-
-                return scheme.DeriveEncryptionOptions(password);
-            }
-
-            if (string.IsNullOrWhiteSpace(cipher))
-            {
-                if (keyConfigured)
-                    throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
-
-                return null;
-            }
-
-            if (!hasKey)
-                throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
-
-            return cipher.ToLowerInvariant() switch
-            {
-                "aes128gcm" => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm, key!),
-                "aes256gcm" => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm, key!),
-                _ => throw new NotSupportedException(
-                    "Local Provider=Managed supports only Ahtola encrypted format version 0 with "
-                    + "AES128GCM (cipher ID 1) or AES256GCM (cipher ID 2); cipher fallback is not permitted."),
-            };
+        if (!hasPassword && !string.IsNullOrWhiteSpace(passwordScheme))
+        {
+            throw new InvalidOperationException(
+                "Password Scheme requires Password=; it only selects passphrase key derivation.");
         }
 
-        internal bool HasEncryptionOptions
-            => base.ContainsKey("Encryption Cipher")
-               || base.ContainsKey("Encryption Key")
-               || !string.IsNullOrEmpty(Password);
+        if (hasPassword && hasKey)
+        {
+            throw new InvalidOperationException(
+                "Password and Encryption Key cannot be combined; use one passphrase or one hex key.");
+        }
 
-        private static bool CipherNameMatches(string cipherName, Ahtola.Core.Storage.AhtolaEncryptionCipher cipher)
-            => cipherName.ToLowerInvariant() switch
+        if (hasPassword)
+        {
+            var scheme = AhtolaPassphraseSchemes.Resolve(passwordScheme);
+            if (!string.IsNullOrWhiteSpace(cipher)
+                && !CipherNameMatches(cipher, scheme.PageCipher))
             {
-                "aes128gcm" => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
-                "aes256gcm" => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
-                _ => false,
-            };
+                throw new NotSupportedException(
+                    $"Password Scheme '{scheme.Id}' derives {scheme.PageCipher}; "
+                    + "Encryption Cipher must be omitted or match that page cipher.");
+            }
+
+            return scheme.DeriveEncryptionOptions(password);
+        }
+
+        if (string.IsNullOrWhiteSpace(cipher))
+        {
+            if (keyConfigured)
+                throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
+
+            return null;
+        }
+
+        if (!hasKey)
+            throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
+
+        return cipher.ToLowerInvariant() switch
+        {
+            "aes128gcm" or "aes-128-gcm" or "aes_128_gcm"
+                => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm, key!),
+            "aes256gcm" or "aes-256-gcm" or "aes_256_gcm"
+                => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm, key!),
+            "aegis256" or "aegis-256" or "aegis_256"
+                => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256, key!),
+            "aegis256x2" or "aegis-256x2" or "aegis_256x2"
+                => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X2, key!),
+            "aegis256x4" or "aegis-256x4" or "aegis_256x4"
+                => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X4, key!),
+            "aegis128l" or "aegis-128l" or "aegis_128l"
+                => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128L, key!),
+            "aegis128x2" or "aegis-128x2" or "aegis_128x2"
+                => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X2, key!),
+            "aegis128x4" or "aegis-128x4" or "aegis_128x4"
+                => AhtolaEncryptionOptions.FromHex(Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X4, key!),
+            _ => throw new NotSupportedException(
+                "Local Provider=Managed supports only Ahtola encrypted format version 0 cipher IDs 1 through 8 "
+                + "(AES128GCM, AES256GCM, AEGIS256, AEGIS256X2, AEGIS256X4, AEGIS128L, AEGIS128X2, AEGIS128X4); "
+                + "cipher fallback is not permitted."),
+        };
+    }
+
+    internal bool HasEncryptionOptions
+        => base.ContainsKey("Encryption Cipher")
+           || base.ContainsKey("Encryption Key")
+           || !string.IsNullOrEmpty(Password);
+
+    private static bool CipherNameMatches(string cipherName, Ahtola.Core.Storage.AhtolaEncryptionCipher cipher)
+        => cipherName.ToLowerInvariant() switch
+        {
+            "aes128gcm" or "aes-128-gcm" or "aes_128_gcm"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
+            "aes256gcm" or "aes-256-gcm" or "aes_256_gcm"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
+            "aegis256" or "aegis-256" or "aegis_256"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256,
+            "aegis256x2" or "aegis-256x2" or "aegis_256x2"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X2,
+            "aegis256x4" or "aegis-256x4" or "aegis_256x4"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X4,
+            "aegis128l" or "aegis-128l" or "aegis_128l"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128L,
+            "aegis128x2" or "aegis-128x2" or "aegis_128x2"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X2,
+            "aegis128x4" or "aegis-128x4" or "aegis_128x4"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X4,
+            _ => false,
+        };
 
     private static string NormalizeKeyword(string keyword)
     {
@@ -515,7 +654,9 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Foreign Keys" => ConvertToNullableBoolean(value),
             "Recursive Triggers" or "Pooling" or "BinaryGUID" or "Foreign Read Only" or "Read Your Writes" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
             "Tls" => ConvertToNullableBoolean(value),
-            "Default Timeout" or "Version" or "Sync Interval" => Convert.ToInt32(value, CultureInfo.InvariantCulture),
+            "Default Timeout" or "Version" or "Sync Interval" or "Ws Keepalive Interval" or "Ws Keepalive Timeout"
+                or "Ws Half Open Timeout" or "Ws Max Message Bytes" or "Ws Connect Attempts"
+                => Convert.ToInt32(value, CultureInfo.InvariantCulture),
             "DateTimeKind" => ConvertDateTimeKind(value),
             "Local Provider" => ConvertLocalProvider(value),
             _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty,
@@ -545,9 +686,9 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Mode" => SqliteOpenMode.ReadWriteCreate,
             "Cache" => SqliteCacheMode.Default,
             "Password" => string.Empty,
-                        "Password Scheme" => string.Empty,
-                        "Encryption Cipher" => string.Empty,
-                        "Encryption Key" => string.Empty,
+            "Password Scheme" => string.Empty,
+            "Encryption Cipher" => string.Empty,
+            "Encryption Key" => string.Empty,
             "Foreign Keys" => null!,
             "Recursive Triggers" => false,
             "Default Timeout" => 30,
@@ -564,6 +705,11 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Read Your Writes" => true,
             "Sync Interval" => 0,
             "Tls" => null!,
+            "Ws Keepalive Interval" => 30,
+            "Ws Keepalive Timeout" => 20,
+            "Ws Half Open Timeout" => 0,
+            "Ws Max Message Bytes" => 16 * 1024 * 1024,
+            "Ws Connect Attempts" => 3,
             _ => throw new ArgumentException(Properties.Resources.KeywordNotSupported(keyword)),
         };
     }

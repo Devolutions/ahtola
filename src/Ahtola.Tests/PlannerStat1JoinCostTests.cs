@@ -123,6 +123,8 @@ public sealed class PlannerStat1JoinCostTests
         var openJoin = explain.Single(row => row[1].AsText() == "OpenJoinCursor");
         // EXPLAIN columns: addr, opcode, p1, p2, p3, p4, comment — p4 is index 5.
         openJoin[5].AsText().Should().Contain("hash-build left");
+        // The FROM order is already optimal here, so the cost optimizer keeps it.
+        openJoin[5].AsText().Should().Contain("scan order: small, seed, big");
 
         var rows = ReadRows(
             connection,
@@ -136,7 +138,7 @@ public sealed class PlannerStat1JoinCostTests
     }
 
     [Test]
-    public void ThreeWayInnerEquijoinKeepsHashBuildRightWhenLeftIsLarger()
+    public void ThreeWayInnerEquijoinReordersToDriveFromTheSmallestTable()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE big(id INTEGER PRIMARY KEY, b TEXT);");
@@ -149,7 +151,9 @@ public sealed class PlannerStat1JoinCostTests
         Execute(connection, "INSERT INTO seed VALUES (1);");
         Execute(connection, "ANALYZE;");
 
-        // Root is (big ⋈ small) ⋈ seed: left residual large, right seed=1 → hash-build right.
+        // FROM order is big(40), small(3), seed(1). The N-way cost optimizer drives from the
+        // one-row table instead, and the resulting root builds its hash over that tiny
+        // accumulated left side rather than over the 3-row right input.
         var explain = ReadRows(
             connection,
             """
@@ -157,12 +161,23 @@ public sealed class PlannerStat1JoinCostTests
             FROM big JOIN small ON big.id = small.id JOIN seed ON seed.x = big.id;
             """);
         var openJoin = explain.Single(row => row[1].AsText() == "OpenJoinCursor");
-        openJoin[5].AsText().Should().Contain("hash-build right");
+        openJoin[5].AsText().Should().Contain("scan order: seed, big, small");
+        openJoin[5].AsText().Should().Contain("hash-build left");
 
         ReadRows(
                 connection,
                 "SELECT COUNT(*) FROM big JOIN small ON big.id = small.id JOIN seed ON seed.x = big.id;")
             .Single()[0].Should().Be(SqlValue.Integer(1));
+
+        // Projection order still follows the FROM clause even though execution does not.
+        var rows = ReadRows(
+            connection,
+            """
+            SELECT big.b, small.s
+            FROM big JOIN small ON big.id = small.id JOIN seed ON seed.x = big.id;
+            """);
+        rows.Should().HaveCount(1);
+        rows[0].Should().Equal(SqlValue.Text("b1"), SqlValue.Text("s1"));
     }
 
     [Test]

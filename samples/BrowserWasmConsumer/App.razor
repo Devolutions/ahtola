@@ -1,7 +1,6 @@
 @using System.Globalization
 @using Ahtola
 @using Ahtola.Data.Sqlite
-@using Microsoft.EntityFrameworkCore
 
 <PageTitle>Ahtola browser package consumer</PageTitle>
 
@@ -22,7 +21,6 @@
             var storage = await AhtolaBrowserStorageDiagnostics.RunAsync();
             var crypto = await AhtolaBrowserCryptoDiagnostics.RunKnownAnswersAsync();
             var ado = await RunAdoAsync();
-            var ef = await RunEfAsync();
             long persistentAdo;
             try
             {
@@ -31,15 +29,6 @@
             catch (Exception exception)
             {
                 throw new InvalidOperationException("persistent-ado failed", exception);
-            }
-            long persistentEf;
-            try
-            {
-                persistentEf = await RunPersistentEfAsync();
-            }
-            catch (Exception exception)
-            {
-                throw new InvalidOperationException("persistent-ef failed", exception);
             }
             var persistentCore = await RunPersistentCoreAsync();
             var persistentFeatures = await RunPersistentFeaturesAsync();
@@ -54,12 +43,13 @@
             var persistentEncryptedPassword = await RunPersistentEncryptedPasswordAsync();
             var encryptedWrongKeyRejected = await RunEncryptedWrongKeyAsync();
             var encryptedCipherMismatchRejected = await RunEncryptedCipherMismatchAsync();
+            var syncReadMirror = await RunSynchronousReadMirrorAsync();
             status =
                 $"PASS:capabilities={capabilities.IsSupported};"
                 + $"storage={storage.Succeeded};"
                 + $"crypto={crypto.Succeeded};"
-                + $"ado={ado};ef={ef};"
-                + $"persistent-ado={persistentAdo};persistent-ef={persistentEf};"
+                + $"ado={ado};"
+                + $"persistent-ado={persistentAdo};"
                 + $"persistent-core={persistentCore};"
                 + $"persistent-features={persistentFeatures};"
                 + $"browser-memory={browserMemory};"
@@ -72,7 +62,8 @@
                 + $"encrypted-maintenance={encryptedMaintenance};"
                 + $"persistent-encrypted-password={persistentEncryptedPassword};"
                 + $"encrypted-wrong-key-rejected={encryptedWrongKeyRejected};"
-                + $"encrypted-cipher-mismatch-rejected={encryptedCipherMismatchRejected}";
+                + $"encrypted-cipher-mismatch-rejected={encryptedCipherMismatchRejected};"
+                + $"sync-read-mirror={syncReadMirror}";
         }
         catch (Exception exception)
         {
@@ -99,20 +90,6 @@
         return Convert.ToInt64(result, CultureInfo.InvariantCulture);
     }
 
-    private static async Task<long> RunEfAsync()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:;Mode=Memory");
-        await connection.OpenAsync();
-        var options = new DbContextOptionsBuilder<ProbeContext>()
-            .UseAhtola(connection)
-            .Options;
-        await using var context = new ProbeContext(options);
-        await context.Database.EnsureCreatedAsync();
-        context.Rows.Add(new ProbeRow { Value = 84 });
-        await context.SaveChangesAsync();
-        return await context.Rows.Select(static row => row.Value).SingleAsync();
-    }
-
     private static async Task<long> RunPersistentAdoAsync()
     {
         const string path = "packed-consumer/ado.db";
@@ -135,32 +112,6 @@
             return Convert.ToInt64(
                 await command.ExecuteScalarAsync(),
                 CultureInfo.InvariantCulture);
-        }
-    }
-
-    private static async Task<long> RunPersistentEfAsync()
-    {
-        const string path = "packed-consumer-ef/main.db";
-        await using (var source = new AhtolaBrowserDataSource(path))
-        {
-            await using var connection = await source.OpenConnectionAsync();
-            var options = new DbContextOptionsBuilder<ProbeContext>()
-                .UseAhtola(connection)
-                .Options;
-            await using var context = new ProbeContext(options);
-            await context.Database.EnsureCreatedAsync();
-            context.Rows.Add(new ProbeRow { Value = 168 });
-            await context.SaveChangesAsync();
-        }
-
-        await using (var source = new AhtolaBrowserDataSource(path))
-        {
-            await using var connection = await source.OpenConnectionAsync();
-            var options = new DbContextOptionsBuilder<ProbeContext>()
-                .UseAhtola(connection)
-                .Options;
-            await using var context = new ProbeContext(options);
-            return await context.Rows.Select(static row => row.Value).SingleAsync();
         }
     }
 
@@ -256,8 +207,123 @@
         }
     }
 
-    private static async Task<bool> RunReservedPathRejectedAsync()
+    /// <summary>
+    /// Exercises the opt-in synchronous read-mirror profile end to end: one async
+    /// startup and setup, synchronous point reads that must not reach the OPFS
+    /// worker, synchronous close, then an async durable write and reopen.
+    /// </summary>
+    private static async Task<bool> RunSynchronousReadMirrorAsync()
     {
+        const string path = "packed-consumer-sync/main.db";
+        const string owned = "packed-consumer-sync";
+        const int iterations = 500;
+
+        var diagnostic = await AhtolaBrowserStorageDiagnostics.RunSynchronousReadAsync(iterations);
+        if (!diagnostic.Succeeded)
+        {
+            throw new InvalidOperationException(
+                "sync-read diagnostic failed: "
+                + $"{diagnostic.Details};workerBefore={diagnostic.WorkerOperationsBefore};"
+                + $"workerAfter={diagnostic.WorkerOperationsAfter};"
+                + $"elapsedMs={diagnostic.ElapsedMilliseconds.ToString("F2", CultureInfo.InvariantCulture)};"
+                + $"avgUs={diagnostic.AverageMicrosecondsPerRead.ToString("F2", CultureInfo.InvariantCulture)}");
+        }
+
+        long scalarTotal;
+        long readerTotal;
+        await using (var source = new AhtolaBrowserDataSource(
+            path,
+            owned,
+            AhtolaBrowserOptions.DefaultSharedBufferSize,
+            readOnly: false,
+            encryption: null,
+            synchronousMode: AhtolaBrowserSynchronousMode.ReadOnlyMirror))
+        {
+            var connection = await source.OpenSynchronousReadConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL);"
+                + "INSERT INTO probe(id, value) VALUES (1, 3), (2, 5), (3, 7);",
+                "synchronous read-mirror setup");
+
+            var before = source.GetStorageMetrics().PersistentOperations;
+            scalarTotal = 0;
+            using (var scalar = connection.CreateCommand())
+            {
+                scalar.CommandText = "SELECT value FROM probe WHERE id = $id";
+                var parameter = scalar.CreateParameter();
+                parameter.ParameterName = "$id";
+                scalar.Parameters.Add(parameter);
+                for (var index = 0; index < iterations; index++)
+                {
+                    parameter.Value = (index % 3) + 1;
+                    scalarTotal += Convert.ToInt64(scalar.ExecuteScalar(), CultureInfo.InvariantCulture);
+                }
+            }
+
+            readerTotal = 0;
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText =
+                    "WITH ordered AS (SELECT value FROM probe ORDER BY id) SELECT value FROM ordered";
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                    readerTotal += reader.GetInt64(0);
+            }
+
+            var after = source.GetStorageMetrics().PersistentOperations;
+            if (after != before)
+            {
+                await connection.DisposeAsync();
+                throw new InvalidOperationException(
+                    $"synchronous reads crossed the OPFS worker: before={before};after={after}");
+            }
+
+            // A mutation must still go through the asynchronous, durable path, and
+            // the synchronous close is only legal because nothing is left pending.
+            await ExecuteFeatureAsync(
+                connection,
+                "INSERT INTO probe(id, value) VALUES (4, 11);",
+                "synchronous read-mirror durable write");
+            if (source.GetStorageMetrics().PendingMutations != 0)
+            {
+                await connection.DisposeAsync();
+                throw new InvalidOperationException("the durable write left unflushed mutations");
+            }
+
+            connection.Close();
+            connection.Dispose();
+        }
+
+        long reopened;
+        await using (var source = new AhtolaBrowserDataSource(
+            path,
+            owned,
+            AhtolaBrowserOptions.DefaultSharedBufferSize,
+            readOnly: false,
+            encryption: null,
+            synchronousMode: AhtolaBrowserSynchronousMode.ReadOnlyMirror))
+        {
+            var connection = await source.OpenSynchronousReadConnectionAsync();
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "SELECT sum(value) FROM probe";
+                reopened = Convert.ToInt64(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+            }
+
+            connection.Close();
+            connection.Dispose();
+        }
+
+        // 500 reads over values 3, 5, 7 starting at id 1: 167 + 167 + 166 draws.
+        var expectedScalar = 0L;
+        for (var index = 0; index < iterations; index++)
+            expectedScalar += ((index % 3) + 1) switch { 1 => 3L, 2 => 5L, _ => 7L };
+
+        return scalarTotal == expectedScalar && readerTotal == 15 && reopened == 26;
+    }
+
+    private static async Task<bool> RunReservedPathRejectedAsync()    {
         try
         {
             await using var source = new AhtolaBrowserDataSource(
@@ -641,15 +707,4 @@
         }
     }
 
-    private sealed class ProbeContext(DbContextOptions<ProbeContext> options) : DbContext(options)
-    {
-        public DbSet<ProbeRow> Rows => Set<ProbeRow>();
-    }
-
-    private sealed class ProbeRow
-    {
-        public int Id { get; set; }
-
-        public long Value { get; set; }
-    }
 }

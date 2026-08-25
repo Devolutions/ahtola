@@ -83,6 +83,9 @@ well as schema state for `CREATE`, `DROP`, and `RENAME`.
 - `fts5` is a small managed query/tokenizer subset, not FTS5 compatibility:
   tokenizer options, external/contentless tables, auxiliary functions,
   ranking, snippets, and FTS5-specific command syntax are unsupported.
+  For ranked full-text search over an ordinary table, use the `fts` **index
+  method** instead — see [docs/managed-index-methods.md](managed-index-methods.md),
+  which ships tokenizer options, BM25 ranking, highlighting and snippets.
 - `rtree` does not expose SQLite's full R-Tree auxiliary/geometry callback
   surface. `rtree_i32` accepts only signed 32-bit integer coordinates.
 - The private payload is a managed catalog extension, not a portable FTS5/R-Tree

@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace Ahtola;
 
@@ -16,7 +17,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
     /// </summary>
     internal const string EncryptionKeyHeaderName = "x-turso-encryption-key";
 
-    private readonly HttpClient _httpClient;
+    private readonly HttpClient? _httpClient;
     private readonly string? _authToken;
     private readonly string? _remoteEncryptionKey;
     private readonly bool _disposeHttpClient;
@@ -72,10 +73,11 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         _disposeHttpClient = disposeHttpClient;
     }
 
-    public bool HasOpenSession => _baton is not null;
+    public bool HasOpenSession => _webSocketTransport?.HasOpenSession ?? _baton is not null;
 
     public void ResetSession()
     {
+        _webSocketTransport?.ResetSession();
         _baton = null;
     }
 
@@ -91,6 +93,17 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         ArgumentNullException.ThrowIfNull(parameters);
 
         ValidateParameters(sql, parameters);
+        if (_webSocketTransport is { } webSocketTransport)
+        {
+            return await ExecuteOverWebSocketAsync(
+                    webSocketTransport,
+                    BuildStatement(sql, parameters, wantRows),
+                    commandTimeout,
+                    closeAfter,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
         var request = new RemotePipelineRequest
         {
             Baton = _baton,
@@ -120,6 +133,19 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         ArgumentNullException.ThrowIfNull(parameters);
 
         ValidateParameters(sql, parameters);
+        if (_webSocketTransport is { } webSocketTransport)
+        {
+            return await ExecuteCursorOverWebSocketAsync(
+                    webSocketTransport,
+                    sql,
+                    parameters,
+                    commandTimeout,
+                    closeAfter,
+                    cancellationToken,
+                    failureCallback)
+                .ConfigureAwait(false);
+        }
+
         if (_protocolVersion == RemoteProtocolVersion.V2)
         {
             var buffered = await ExecuteAsync(
@@ -192,16 +218,35 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             });
         }
 
+        var batch = new RemoteBatch
+        {
+            Steps = steps,
+            ReplicationIndex = _replicationIndex?.ToString(CultureInfo.InvariantCulture),
+        };
+
+        if (_webSocketTransport is { } webSocketTransport)
+        {
+            var batchResult = await ExecuteBatchOverWebSocketAsync(
+                    webSocketTransport,
+                    batch,
+                    commandTimeout,
+                    closeAfter,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return ProcessBatchResult(
+                batchResult,
+                commands.Count,
+                stepSucceeded,
+                replicaPush: false,
+                replayedChangeContexts: null);
+        }
+
         var request = new RemotePipelineRequest
         {
             Baton = _baton,
             Requests =
             [
-                RemoteStreamRequest.Batch(new RemoteBatch
-                {
-                    Steps = steps,
-                    ReplicationIndex = _replicationIndex?.ToString(CultureInfo.InvariantCulture),
-                }),
+                RemoteStreamRequest.Batch(batch),
             ],
         };
 
@@ -212,7 +257,6 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         UpdateSession(response, closeAfter);
         return ExtractBatchResults(response, commands.Count, stepSucceeded);
     }
-
     /// <summary>
     /// Replays a durably captured managed-replica batch using the same guarded Hrana batch
     /// shape as Turso v0.7.2's <c>send_push_batch</c>. A caller acknowledges its local journal
@@ -252,13 +296,16 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
 
         var replayedChangeSteps = new List<int>(changes.Changes.Count);
         var replayedChangeContexts = new Dictionary<int, ReplicaPushConflictContext>();
+        var replayedStatements = new HashSet<long>();
         foreach (var change in changes.Changes)
         {
-            // A multi-row statement is represented by more than one update hook record. Only
-            // its first record carries SQL, while all of its records advance together on ACK.
-            if (string.IsNullOrWhiteSpace(change.Sql))
+            // A multi-row statement is represented by more than one update hook record. Only its
+            // first record carries SQL; the rest name that record through StatementSequence and
+            // are transmitted by replaying it once.
+            if (!change.CarriesStatementSql)
                 continue;
 
+            replayedStatements.Add(change.Sequence);
             var step = steps.Count;
             replayedChangeSteps.Add(step);
             replayedChangeContexts.Add(
@@ -278,6 +325,10 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         if (replayedChangeSteps.Count == 0)
             throw new InvalidDataException("Managed replica journal batch has no replayable SQL.");
 
+        // The batch watermark retires every sequence in the batch, so every sequence in it has to
+        // be covered by a statement that was, or is being, transmitted.
+        ValidateReplicaPushCoverage(changes, replayedStatements);
+
         var watermarkStep = steps.Count;
         var watermarkParameters = new AhtolaParameterCollection();
         watermarkParameters.Add(clientId);
@@ -295,20 +346,40 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             Statement = BuildStatement("COMMIT", new AhtolaParameterCollection(), wantRows: false),
         });
 
-        var request = new RemotePipelineRequest
-        {
-            Requests = [RemoteStreamRequest.Batch(new RemoteBatch { Steps = steps })],
-        };
-        var response = await SendPipelineAsync(request, commandTimeout, cancellationToken, replicaPush: true).ConfigureAwait(false);
-        UpdateSession(response, closeAfter: false);
-
         var succeeded = new bool[steps.Count];
-        _ = ExtractBatchResults(
-            response,
-            steps.Count,
-            step => succeeded[step] = true,
-            replicaPush: true,
-            replayedChangeContexts: replayedChangeContexts);
+        if (_webSocketTransport is { } webSocketTransport)
+        {
+            var webSocketBatch = await ExecuteBatchOverWebSocketAsync(
+                    webSocketTransport,
+                    new RemoteBatch { Steps = steps },
+                    commandTimeout,
+                    closeAfter: false,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            _ = ProcessBatchResult(
+                webSocketBatch,
+                steps.Count,
+                step => succeeded[step] = true,
+                replicaPush: true,
+                replayedChangeContexts);
+        }
+        else
+        {
+            var request = new RemotePipelineRequest
+            {
+                Requests = [RemoteStreamRequest.Batch(new RemoteBatch { Steps = steps })],
+            };
+            var response = await SendPipelineAsync(request, commandTimeout, cancellationToken, replicaPush: true).ConfigureAwait(false);
+            UpdateSession(response, closeAfter: false);
+
+            _ = ExtractBatchResults(
+                response,
+                steps.Count,
+                step => succeeded[step] = true,
+                replicaPush: true,
+                replayedChangeContexts: replayedChangeContexts);
+        }
+
         foreach (var step in replayedChangeSteps)
         {
             if (!succeeded[step])
@@ -316,6 +387,59 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         }
         if (!succeeded[watermarkStep] || !succeeded[commitStep])
             throw new AhtolaException("Remote replica push did not commit its acknowledgement watermark.", AhtolaReplicaPushFailureKind.InvalidLocalState);
+    }
+
+    /// <summary>
+    /// Proves that acknowledging <paramref name="changes"/> can only retire rows a push transmits.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A row whose journal entry names no statement at all, or names one inside this batch that is
+    /// not being replayed, was never sent and must not be acknowledged.
+    /// </para>
+    /// <para>
+    /// A statement below the batch's first sequence belongs to an earlier batch that already
+    /// transmitted it. The journal is the authority on whether that batch was acknowledged rather
+    /// than discarded — it proves exactly that in
+    /// <c>ManagedReplicaChangeJournal.ValidateBatchIsFullyReplayable</c> before this request is
+    /// built — so this check must accept it. Re-deriving a stricter rule here would reject a batch
+    /// the journal certified and wedge synchronization permanently for any replica whose watermark
+    /// once split a statement.
+    /// </para>
+    /// </remarks>
+    private static void ValidateReplicaPushCoverage(
+        ReplicaLocalChangeBatch changes,
+        HashSet<long> replayedStatements)
+    {
+        foreach (var change in changes.Changes)
+        {
+            if (change.CarriesStatementSql)
+                continue;
+
+            var coveredHere = replayedStatements.Contains(change.StatementSequence);
+            var coveredEarlier = change.StatementSequence > 0
+                                 && change.StatementSequence < changes.FirstSequence;
+            if (!coveredHere && !coveredEarlier)
+            {
+                throw new InvalidDataException(
+                    $"Managed replica journal entry {change.Sequence} is not covered by any statement in "
+                    + "this push batch, so acknowledging the batch would retire a change the remote "
+                    + "never received.");
+            }
+        }
+    }
+
+    /// <summary>Runs the push coverage rule against a batch, without any network access.</summary>
+    internal static void ValidateReplicaPushCoverageForTesting(ReplicaLocalChangeBatch changes)
+    {
+        var replayed = new HashSet<long>();
+        foreach (var change in changes.Changes)
+        {
+            if (change.CarriesStatementSql)
+                replayed.Add(change.Sequence);
+        }
+
+        ValidateReplicaPushCoverage(changes, replayed);
     }
 
     internal async Task<(long PullGeneration, long ChangeId)?> ReadReplicaPushWatermarkAsync(
@@ -367,6 +491,12 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
 
     public async Task CloseAsync(int commandTimeout, CancellationToken cancellationToken)
     {
+        if (_webSocketTransport is { } webSocketTransport)
+        {
+            await CloseOverWebSocketAsync(webSocketTransport, commandTimeout, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         if (_baton is null)
             return;
 
@@ -384,8 +514,9 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
 
     public void Dispose()
     {
+        _webSocketTransport?.Dispose();
         if (_disposeHttpClient)
-            _httpClient.Dispose();
+            _httpClient?.Dispose();
     }
 
     private async Task<RemotePipelineResponse> SendPipelineAsync(
@@ -476,7 +607,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             }
 
             var stream = await response.Content.ReadAsStreamAsync(effectiveCancellationToken).ConfigureAwait(false);
-            var cursor = new RemoteCursor(
+            var cursor = new RemoteHttpCursor(
                 this,
                 response,
                 stream,
@@ -514,7 +645,8 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         CancellationToken cancellationToken)
         => await AhtolaRemoteTransportSecurity
             .SendAsync(
-                _httpClient,
+                _httpClient ?? throw new InvalidOperationException(
+                    "This remote client uses the Hrana WebSocket transport and has no HTTP pipeline."),
                 requestUri,
                 uri => CreateProtocolHttpRequest(uri, json),
                 _authToken,
@@ -597,11 +729,15 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         return request;
     }
 
-    internal static T DeserializeRemoteResult<T>(JsonElement result)
+    /// <summary>
+    /// Deserializes a Hrana result payload through source-generated metadata only, so the
+    /// remote path stays NativeAOT- and trim-safe (no reflection-based fallback).
+    /// </summary>
+    internal static T DeserializeRemoteResult<T>(JsonElement result, JsonTypeInfo<T> typeInfo)
     {
         try
         {
-            return result.Deserialize<T>(AhtolaRemoteJsonContext.Default.Options)
+            return result.Deserialize(typeInfo)
                    ?? throw new AhtolaException("Remote response returned an empty result.");
         }
         catch (JsonException ex)
@@ -609,6 +745,12 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             throw new AhtolaException($"Unable to parse remote response: {ex.Message}");
         }
     }
+
+    internal static JsonTypeInfo<RemoteStatementResult> StatementResultTypeInfo
+        => AhtolaRemoteJsonContext.Default.RemoteStatementResult;
+
+    internal static JsonTypeInfo<RemoteBatchResult> BatchResultTypeInfo
+        => AhtolaRemoteJsonContext.Default.RemoteBatchResult;
 
     private static RemoteStatement BuildStatement(string sql, AhtolaParameterCollection parameters, bool wantRows)
     {
@@ -701,7 +843,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                     throw new AhtolaException("Remote request returned an empty ok response.");
                 if (result.Response.Type != "execute")
                     throw new AhtolaException($"Remote request returned unexpected response type: {result.Response.Type}");
-                statementResult = result.Response.DeserializeResult<RemoteStatementResult>();
+                statementResult = result.Response.DeserializeResult(StatementResultTypeInfo);
                 break;
 
             case "error":
@@ -722,11 +864,26 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         bool replicaPush = false,
         IReadOnlyDictionary<int, ReplicaPushConflictContext>? replayedChangeContexts = null)
     {
+        var batch = ExtractBatchResultFromResponse(response, replicaPush);
+        var statementResults = ProcessBatchResult(
+            batch,
+            expectedCount,
+            stepSucceeded,
+            replicaPush,
+            replayedChangeContexts);
+
+        ValidateOptionalTrailingClose(response, "Remote batch");
+        return statementResults;
+    }
+
+    private static RemoteBatchResult ExtractBatchResultFromResponse(
+        RemotePipelineResponse response,
+        bool replicaPush)
+    {
         if (response.Results.Count == 0)
             throw new AhtolaException("Remote batch returned no results.");
 
         var result = response.Results[0];
-        List<RemoteStatementResult> statementResults;
         switch (result.Type)
         {
             case "ok":
@@ -735,21 +892,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                 if (result.Response.Type != "batch")
                     throw new AhtolaException($"Remote batch returned unexpected response type: {result.Response.Type}");
 
-                var batch = result.Response.DeserializeResult<RemoteBatchResult>();
-                UpdateReplicationIndex(batch.ReplicationIndex);
-                foreach (var statementResult in batch.StepResults)
-                {
-                    if (statementResult is not null)
-                        UpdateReplicationIndex(statementResult.ReplicationIndex);
-                }
-
-                statementResults = ExtractBatchStepResults(
-                    batch,
-                    expectedCount,
-                    stepSucceeded,
-                    replicaPush,
-                    replayedChangeContexts);
-                break;
+                return result.Response.DeserializeResult(BatchResultTypeInfo);
 
             case "error":
                 throw CreateRemoteError(result.Error, replicaPush);
@@ -757,9 +900,32 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             default:
                 throw new AhtolaException($"Remote batch returned unexpected result type: {result.Type}");
         }
+    }
 
-        ValidateOptionalTrailingClose(response, "Remote batch");
-        return statementResults;
+    /// <summary>
+    /// Shared by both transports: tracks replication indexes and projects Hrana step
+    /// results/errors onto the caller's command list.
+    /// </summary>
+    private IReadOnlyList<RemoteStatementResult> ProcessBatchResult(
+        RemoteBatchResult batch,
+        int expectedCount,
+        Action<int>? stepSucceeded,
+        bool replicaPush,
+        IReadOnlyDictionary<int, ReplicaPushConflictContext>? replayedChangeContexts)
+    {
+        UpdateReplicationIndex(batch.ReplicationIndex);
+        foreach (var statementResult in batch.StepResults)
+        {
+            if (statementResult is not null)
+                UpdateReplicationIndex(statementResult.ReplicationIndex);
+        }
+
+        return ExtractBatchStepResults(
+            batch,
+            expectedCount,
+            stepSucceeded,
+            replicaPush,
+            replayedChangeContexts);
     }
 
     private void UpdateReplicationIndex(JsonElement encodedIndex)
@@ -893,25 +1059,26 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         if (error is null)
             return new AhtolaRemoteSqlException("Remote SQL execution failed.", null, null, invalidLocalState);
 
+        var errorMessage = error.Message ?? string.Empty;
         if (replicaPush && IsConflict(error))
         {
             return new AhtolaReplicaConflictException(
-                $"Remote replica push conflicted: {error.Message}",
+                $"Remote replica push conflicted: {errorMessage}",
                 error.Code,
                 conflictKind,
                 localChangeSequence);
         }
 
         var message = string.IsNullOrWhiteSpace(error.Code)
-            ? $"Remote SQL execution failed: {error.Message}"
-            : $"Remote SQL execution failed: {error.Message} ({error.Code})";
-        return new AhtolaRemoteSqlException(message, error.Code, error.Message, invalidLocalState);
+            ? $"Remote SQL execution failed: {errorMessage}"
+            : $"Remote SQL execution failed: {errorMessage} ({error.Code})";
+        return new AhtolaRemoteSqlException(message, error.Code, errorMessage, invalidLocalState);
     }
 
     private static bool IsConflict(RemoteError error)
         => error.Code?.Contains("CONSTRAINT", StringComparison.OrdinalIgnoreCase) == true
            || error.Code?.Contains("CONFLICT", StringComparison.OrdinalIgnoreCase) == true
-           || error.Message.Contains("conflict", StringComparison.OrdinalIgnoreCase);
+           || error.Message?.Contains("conflict", StringComparison.OrdinalIgnoreCase) == true;
 
     private readonly record struct ReplicaPushConflictContext(
         AhtolaReplicaConflictKind Kind,
@@ -1130,131 +1297,6 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         }
     }
 
-    private sealed class RemoteStatement
-    {
-        [JsonPropertyName("sql")]
-        public string Sql { get; init; } = "";
-
-        [JsonPropertyName("args")]
-        public List<RemoteRequestValue> Args { get; } = [];
-
-        [JsonPropertyName("named_args")]
-        public List<RemoteNamedArg> NamedArgs { get; } = [];
-
-        [JsonPropertyName("want_rows")]
-        public bool WantRows { get; init; }
-    }
-
-    private sealed class RemoteBatch
-    {
-        [JsonPropertyName("steps")]
-        public List<RemoteBatchStep> Steps { get; init; } = [];
-
-        [JsonPropertyName("replication_index")]
-        public string? ReplicationIndex { get; init; }
-    }
-
-    private sealed class RemoteBatchStep
-    {
-        [JsonPropertyName("condition")]
-        public RemoteBatchCondition? Condition { get; init; }
-
-        [JsonPropertyName("stmt")]
-        public RemoteStatement Statement { get; init; } = new();
-    }
-
-    private sealed class RemoteBatchCondition
-    {
-        [JsonPropertyName("type")]
-        public string Type { get; init; } = "";
-
-        [JsonPropertyName("step")]
-        public int? Step { get; init; }
-
-        [JsonPropertyName("cond")]
-        public RemoteBatchCondition? Condition { get; init; }
-
-        [JsonPropertyName("conds")]
-        public List<RemoteBatchCondition>? Conditions { get; set; }
-    }
-
-    private sealed class RemoteNamedArg
-    {
-        [JsonPropertyName("name")]
-        public string Name { get; init; } = "";
-
-        [JsonPropertyName("value")]
-        public RemoteRequestValue Value { get; init; } = RemoteRequestValue.Null();
-    }
-
-    [JsonConverter(typeof(RemoteRequestValueJsonConverter))]
-    private sealed class RemoteRequestValue
-    {
-        public string Type { get; init; } = "";
-
-        public string? StringValue { get; init; }
-
-        public string? Base64 { get; init; }
-
-        public static RemoteRequestValue Null()
-        {
-            return new RemoteRequestValue
-            {
-                Type = "null",
-            };
-        }
-
-        public static RemoteRequestValue FromAhtolaValue(AhtolaValue value)
-        {
-            return value.ValueType switch
-            {
-                AhtolaValueType.Empty or AhtolaValueType.Null => Null(),
-                AhtolaValueType.Integer => new RemoteRequestValue
-                {
-                    Type = "integer",
-                    StringValue = value.IntValue.ToString(CultureInfo.InvariantCulture),
-                },
-                AhtolaValueType.Real => new RemoteRequestValue
-                {
-                    Type = "float",
-                    FloatValue = value.RealValue,
-                },
-                AhtolaValueType.Text => new RemoteRequestValue
-                {
-                    Type = "text",
-                    StringValue = value.StringValue ?? string.Empty,
-                },
-                AhtolaValueType.Blob => new RemoteRequestValue
-                {
-                    Type = "blob",
-                    Base64 = Convert.ToBase64String(value.BlobValue ?? []),
-                },
-                _ => throw new ArgumentOutOfRangeException(nameof(value), value.ValueType, null),
-            };
-        }
-
-        public double? FloatValue { get; init; }
-    }
-
-    private sealed class RemoteRequestValueJsonConverter : JsonConverter<RemoteRequestValue>
-    {
-        public override RemoteRequestValue Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-            => throw new NotSupportedException("Remote request values are serialized only.");
-
-        public override void Write(Utf8JsonWriter writer, RemoteRequestValue value, JsonSerializerOptions options)
-        {
-            writer.WriteStartObject();
-            writer.WriteString("type", value.Type);
-            if (value.FloatValue is { } floatValue)
-                writer.WriteNumber("value", floatValue);
-            else if (value.StringValue is not null)
-                writer.WriteString("value", value.StringValue);
-            else if (value.Base64 is not null)
-                writer.WriteString("base64", value.Base64);
-            writer.WriteEndObject();
-        }
-    }
-
     [JsonSourceGenerationOptions(DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
     [JsonSerializable(typeof(RemotePipelineRequest))]
     [JsonSerializable(typeof(RemoteCursorRequest))]
@@ -1266,26 +1308,23 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
     [JsonSerializable(typeof(RemoteRequestValue))]
     private sealed partial class AhtolaRemoteJsonContext : JsonSerializerContext;
 
-    internal sealed class RemoteCursor : IAsyncDisposable
+    /// <summary>
+    /// Hrana HTTP <c>/v3/cursor</c> cursor: newline-delimited JSON entries streamed from
+    /// a single HTTP response body.
+    /// </summary>
+    internal sealed class RemoteHttpCursor : RemoteCursor
     {
-        private const int MaximumTypeInferenceLookaheadRows = 64;
-
         private readonly AhtolaRemoteClient _owner;
         private readonly HttpResponseMessage _response;
         private readonly StreamReader _reader;
         private readonly int _commandTimeout;
         private readonly bool _closeAfter;
         private readonly Action<Exception>? _failureCallback;
-        private readonly Queue<List<RemoteResponseValue>> _bufferedRows = new();
-        private readonly HashSet<int> _exhaustedTypeInferenceOrdinals = [];
-        private List<RemoteResponseValue>? _pendingRow;
         private bool _stepOpen;
-        private bool _terminated;
         private bool _ownerFinished;
-        private bool _disposed;
         private bool _failureReported;
 
-        public RemoteCursor(
+        public RemoteHttpCursor(
             AhtolaRemoteClient owner,
             HttpResponseMessage response,
             Stream stream,
@@ -1304,56 +1343,6 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             _commandTimeout = commandTimeout;
             _closeAfter = closeAfter;
             _failureCallback = failureCallback;
-        }
-
-        public List<RemoteColumn> Columns { get; private set; } = [];
-
-        public int RecordsAffected { get; private set; }
-
-        public RemoteResponseValue? FindFirstNonNullValue(
-            int ordinal,
-            CancellationToken cancellationToken)
-        {
-            var collected = new List<List<RemoteResponseValue>>();
-            while (_bufferedRows.TryDequeue(out var buffered))
-                collected.Add(buffered);
-            if (_pendingRow is not null)
-            {
-                collected.Add(_pendingRow);
-                _pendingRow = null;
-            }
-
-            try
-            {
-                foreach (var row in collected)
-                {
-                    if (ordinal < row.Count && row[ordinal].Type != "null")
-                        return row[ordinal];
-                }
-
-                if (_exhaustedTypeInferenceOrdinals.Contains(ordinal))
-                    return null;
-
-                var rowsRead = 0;
-                while (!_terminated && rowsRead < MaximumTypeInferenceLookaheadRows)
-                {
-                    var row = ReadRowAsync(cancellationToken).AsTask().GetAwaiter().GetResult();
-                    if (row is null)
-                        break;
-                    collected.Add(row);
-                    rowsRead++;
-                    if (ordinal < row.Count && row[ordinal].Type != "null")
-                        return row[ordinal];
-                }
-                if (!_terminated && rowsRead == MaximumTypeInferenceLookaheadRows)
-                    _exhaustedTypeInferenceOrdinals.Add(ordinal);
-                return null;
-            }
-            finally
-            {
-                foreach (var row in collected)
-                    _bufferedRows.Enqueue(row);
-            }
         }
 
         public async Task InitializeAsync(CancellationToken cancellationToken)
@@ -1410,41 +1399,14 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             }
             catch (Exception exception)
             {
-                if (!_terminated)
+                if (!Terminated)
                     await HandleFailureAsync(exception).ConfigureAwait(false);
                 throw;
             }
         }
 
-        public bool EnsureHasRows(CancellationToken cancellationToken)
-            => EnsureHasRowsAsync(cancellationToken).AsTask().GetAwaiter().GetResult();
-
-        public async ValueTask<bool> EnsureHasRowsAsync(CancellationToken cancellationToken)
+        protected override async ValueTask<List<RemoteResponseValue>?> FetchRowAsync(CancellationToken cancellationToken)
         {
-            if (_pendingRow is not null || _bufferedRows.Count > 0)
-                return true;
-
-            _pendingRow = await ReadRowAsync(cancellationToken).ConfigureAwait(false);
-            return _pendingRow is not null;
-        }
-
-        public List<RemoteResponseValue>? ReadRow(CancellationToken cancellationToken)
-            => ReadRowAsync(cancellationToken).AsTask().GetAwaiter().GetResult();
-
-        public async ValueTask<List<RemoteResponseValue>?> ReadRowAsync(CancellationToken cancellationToken)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_bufferedRows.TryDequeue(out var buffered))
-                return buffered;
-            if (_pendingRow is not null)
-            {
-                var pending = _pendingRow;
-                _pendingRow = null;
-                return pending;
-            }
-            if (_terminated)
-                return null;
-
             using var readCancellation = CreateReadCancellation(cancellationToken);
             var effectiveCancellationToken = readCancellation?.Token ?? cancellationToken;
             try
@@ -1456,7 +1418,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                         : await ReadOptionalEntryAsync(effectiveCancellationToken).ConfigureAwait(false);
                     if (entry is null)
                     {
-                        _terminated = true;
+                        Terminated = true;
                         await FinishOwnerAsync(successful: true).ConfigureAwait(false);
                         return null;
                     }
@@ -1477,7 +1439,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                             if (!_stepOpen)
                                 throw Malformed("step_end was received outside a step");
                             _stepOpen = false;
-                            RecordsAffected = checked((int)entry.AffectedRowCount);
+                            RecordsAffected = checked((int)(entry.AffectedRowCount ?? 0));
                             break;
 
                         case "step_error":
@@ -1492,7 +1454,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                         case "replication_index":
                             if (_stepOpen)
                                 throw Malformed("cursor terminated before step_end");
-                            _terminated = true;
+                            Terminated = true;
                             await FinishOwnerAsync(successful: true).ConfigureAwait(false);
                             return null;
 
@@ -1506,21 +1468,21 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             }
             catch (Exception exception)
             {
-                if (!_terminated)
+                if (!Terminated)
                     await HandleFailureAsync(exception).ConfigureAwait(false);
                 throw;
             }
         }
 
-        public async ValueTask DisposeAsync()
+        public override async ValueTask DisposeAsync()
         {
-            if (_disposed)
+            if (Disposed)
                 return;
 
             try
             {
                 using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                while (!_terminated)
+                while (!Terminated)
                 {
                     if (await ReadRowAsync(cleanup.Token).ConfigureAwait(false) is null)
                         break;
@@ -1531,11 +1493,11 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             }
             finally
             {
-                _disposed = true;
+                Disposed = true;
                 _reader.Dispose();
                 _response.Dispose();
                 if (!_ownerFinished)
-                    await FinishOwnerAsync(successful: _terminated).ConfigureAwait(false);
+                    await FinishOwnerAsync(successful: Terminated).ConfigureAwait(false);
             }
         }
 
@@ -1593,7 +1555,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                 switch (entry.Type)
                 {
                     case "replication_index":
-                        _terminated = true;
+                        Terminated = true;
                         await FinishOwnerAsync(successful: true).ConfigureAwait(false);
                         return;
 
@@ -1624,10 +1586,10 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
 
         private async Task HandleFailureAsync(Exception failure)
         {
-            if (_disposed)
+            if (Disposed)
                 return;
 
-            _disposed = true;
+            Disposed = true;
             _reader.Dispose();
             _response.Dispose();
             await FinishOwnerAsync(successful: false).ConfigureAwait(false);
@@ -1647,9 +1609,6 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
                 .FinishCursorAsync(successful, _closeAfter, _commandTimeout)
                 .ConfigureAwait(false);
         }
-
-        private static AhtolaException Malformed(string detail)
-            => new($"Unable to parse remote cursor response: {detail}.");
     }
 }
 
@@ -1657,7 +1616,7 @@ internal sealed class RemoteReaderExecution
 {
     private RemoteReaderExecution(
         RemoteStatementResult? bufferedResult,
-        AhtolaRemoteClient.RemoteCursor? cursor,
+        RemoteCursor? cursor,
         AhtolaSchemaCollections.ReaderSchemaSource? schemaSource = null)
     {
         BufferedResult = bufferedResult;
@@ -1667,14 +1626,14 @@ internal sealed class RemoteReaderExecution
 
     public RemoteStatementResult? BufferedResult { get; }
 
-    public AhtolaRemoteClient.RemoteCursor? Cursor { get; }
+    public RemoteCursor? Cursor { get; }
 
     public AhtolaSchemaCollections.ReaderSchemaSource? SchemaSource { get; }
 
     public static RemoteReaderExecution FromBuffered(RemoteStatementResult result)
         => new(result, null);
 
-    public static RemoteReaderExecution FromCursor(AhtolaRemoteClient.RemoteCursor cursor)
+    public static RemoteReaderExecution FromCursor(RemoteCursor cursor)
         => new(null, cursor);
 
     public RemoteReaderExecution WithSchemaSource(AhtolaSchemaCollections.ReaderSchemaSource? schemaSource)
@@ -1705,7 +1664,7 @@ internal sealed class RemoteCursorEntry
     public List<RemoteResponseValue>? Row { get; init; }
 
     [JsonPropertyName("affected_row_count")]
-    public ulong AffectedRowCount { get; init; }
+    public ulong? AffectedRowCount { get; init; }
 
     [JsonPropertyName("last_insert_rowid")]
     public JsonElement LastInsertRowId { get; init; }
@@ -1746,19 +1705,24 @@ internal sealed class RemoteStreamResponse
     [JsonPropertyName("result")]
     public JsonElement Result { get; init; }
 
-    public T DeserializeResult<T>()
+    public T DeserializeResult<T>(JsonTypeInfo<T> typeInfo)
     {
         if (Result.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
             throw new AhtolaException($"Remote response {Type} did not include a result.");
 
-        return AhtolaRemoteClient.DeserializeRemoteResult<T>(Result);
+        return AhtolaRemoteClient.DeserializeRemoteResult(Result, typeInfo);
     }
 }
 
 internal sealed class RemoteError
 {
+    /// <summary>
+    /// Nullable so an absent <c>message</c> is distinguishable from an empty one: the Hrana
+    /// specs make it mandatory, and the WebSocket receive path faults the generation when it
+    /// is missing rather than reporting an empty SQL error to the caller.
+    /// </summary>
     [JsonPropertyName("message")]
-    public string Message { get; init; } = "";
+    public string? Message { get; init; }
 
     [JsonPropertyName("code")]
     public string? Code { get; init; }

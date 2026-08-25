@@ -14,17 +14,20 @@ internal sealed class BrowserMirroredFileSystem :
     IStoragePathResolver,
     ISnapshotFileIdentity,
     IPageCodecSource,
+    IMvccJournalModePolicy,
     IAsyncDisposable
 {
     private readonly object _gate = new();
     private readonly SemaphoreSlim _flushGate = new(1, 1);
     private readonly InMemoryFileSystem _memory = new();
-    private readonly IBrowserPersistentStore _persistent;
+    private readonly CountingBrowserPersistentStore _persistent;
     private readonly BrowserEncryptedPersistence? _encryption;
     private readonly AhtolaBrowserReservedSpaceCodec? _reservedSpaceCodec;
     private readonly string _rootDirectory;
     private readonly bool _ownsPersistent;
     private List<Operation> _pending = [];
+    private int _flushesInFlight;
+    private int _operationsInFlight;
     private int _disposed;
 
     private BrowserMirroredFileSystem(
@@ -33,11 +36,11 @@ internal sealed class BrowserMirroredFileSystem :
         bool ownsPersistent,
         BrowserEncryptedPersistence? encryption)
     {
-        _persistent = persistent;
+        _persistent = new CountingBrowserPersistentStore(persistent);
         _rootDirectory = Normalize(rootDirectory);
         _ownsPersistent = ownsPersistent;
         _encryption = encryption;
-        _reservedSpaceCodec = encryption is null ? null : new AhtolaBrowserReservedSpaceCodec();
+        _reservedSpaceCodec = encryption is null ? null : new AhtolaBrowserReservedSpaceCodec(encryption.Cipher);
         encryption?.SetBasePathProbe(_memory.FileExists);
     }
 
@@ -50,12 +53,76 @@ internal sealed class BrowserMirroredFileSystem :
     /// </summary>
     IPageCodec? IPageCodecSource.PageCodec => _reservedSpaceCodec;
 
+    /// <summary>
+    /// Refuses <c>PRAGMA journal_mode=mvcc</c> for a database whose cipher cannot
+    /// frame an <c>MVTX</c> logical-log chunk.
+    /// </summary>
+    /// <remarks>
+    /// The browser encrypts on its way to the persistent store rather than
+    /// through <see cref="AhtolaEncryptionFileSystem"/>, so the core's own
+    /// logical-log encryption check cannot see this cipher. Declaring it here
+    /// makes the pragma fail before header 255 is persisted and before any
+    /// commit produces a frame the flush path could not encrypt — matching the
+    /// desktop engine, which refuses the same ciphers when it builds its
+    /// logical-log AEAD.
+    /// </remarks>
+    string? IMvccJournalModePolicy.DescribeMvccUnsupportedReason()
+        => _encryption is null
+            ? null
+            : Core.Mvcc.MvccLogicalLog.DescribeMvccUnsupportedCipher(_encryption.Cipher);
+
     internal bool HasPendingMutations
     {
         get
         {
             lock (_gate)
                 return _pending.Count != 0;
+        }
+    }
+
+    /// <summary>
+    /// Whether the durable store is still owed work, either queued or already
+    /// handed to an in-flight flush. Synchronous teardown and the read-only flush
+    /// fast path both key on this rather than on the queue alone, so a concurrent
+    /// flush is never mistaken for a settled mirror.
+    /// </summary>
+    internal bool HasUnflushedWork
+    {
+        get
+        {
+            lock (_gate)
+                return HasUnflushedWorkLocked;
+        }
+    }
+
+    private bool HasUnflushedWorkLocked => _pending.Count != 0 || _flushesInFlight != 0;
+
+    /// <summary>Whether this mirror has been disposed.</summary>
+    internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
+    /// <summary>
+    /// The number of operations this mirror has issued to the durable store, which
+    /// in a browser is the number of OPFS worker round trips. Supported synchronous
+    /// reads never change it because they are served from managed memory.
+    /// </summary>
+    internal long PersistentOperationCount => _persistent.OperationCount;
+
+    /// <summary>Snapshots the mirror's durable-transport counters.</summary>
+    /// <remarks>
+    /// The owed-work count deliberately includes operations already handed to a running flush.
+    /// Reporting only the queue would say "nothing pending" for the entire duration of a flush —
+    /// exactly the window in which the durable store is owed the most — and would contradict
+    /// <see cref="HasUnflushedWork"/>, which synchronous teardown fails closed on.
+    /// </remarks>
+    internal BrowserMirrorMetrics GetMetrics()
+    {
+        lock (_gate)
+        {
+            return new BrowserMirrorMetrics(
+                _persistent.OperationCount,
+                _pending.Count,
+                _operationsInFlight,
+                HasUnflushedWorkLocked);
         }
     }
 
@@ -159,23 +226,45 @@ internal sealed class BrowserMirroredFileSystem :
         Enqueue(Operation.Replace(source, destination, replaceEmptyDestination));
     }
 
-    internal async ValueTask FlushPendingAsync(
+    internal ValueTask FlushPendingAsync(
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        await FlushPendingCoreAsync(cancellationToken).ConfigureAwait(false);
+
+        // A read-only workload owes the durable store nothing, so it must not pay
+        // for an asynchronous state machine, the flush semaphore, or a worker call.
+        // In-flight flushes count as owed work so a concurrent flush is never
+        // reported as settled.
+        if (!HasUnflushedWork)
+        {
+            return cancellationToken.IsCancellationRequested
+                ? ValueTask.FromCanceled(cancellationToken)
+                : ValueTask.CompletedTask;
+        }
+
+        return FlushPendingCoreAsync(cancellationToken);
     }
 
     private async ValueTask FlushPendingCoreAsync(CancellationToken cancellationToken)
     {
-        await _flushGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        lock (_gate)
+            _flushesInFlight++;
         try
         {
-            await ReplayPendingAsync(cancellationToken).ConfigureAwait(false);
+            await _flushGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await ReplayPendingAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                _flushGate.Release();
+            }
         }
         finally
         {
-            _flushGate.Release();
+            lock (_gate)
+                _flushesInFlight--;
         }
     }
 
@@ -188,11 +277,16 @@ internal sealed class BrowserMirroredFileSystem :
                 return;
             operations = _pending;
             _pending = [];
+
+            // Operations leave the queue but not the ledger: until they are written they are
+            // still owed to the durable store, and GetMetrics must keep reporting them.
+            _operationsInFlight += operations.Count;
         }
 
         var handles = new Dictionary<string, IAsyncFile>(StringComparer.Ordinal);
         var index = 0;
         Exception? closeError = null;
+        var requeued = false;
         try
         {
             for (; index < operations.Count; index++)
@@ -292,12 +386,25 @@ internal sealed class BrowserMirroredFileSystem :
         }
         catch
         {
+            // Move the unwritten tail back to the queue and out of flight in one step, so the
+            // owed-work count never double-counts or momentarily forgets an operation.
             lock (_gate)
+            {
                 _pending.InsertRange(0, operations.GetRange(index, operations.Count - index));
+                _operationsInFlight -= operations.Count;
+                requeued = true;
+            }
+
             throw;
         }
         finally
         {
+            if (!requeued)
+            {
+                lock (_gate)
+                    _operationsInFlight -= operations.Count;
+            }
+
             foreach (var file in handles.Values)
             {
                 try

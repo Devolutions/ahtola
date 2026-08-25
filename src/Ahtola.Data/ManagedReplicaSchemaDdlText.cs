@@ -172,6 +172,94 @@ internal static class ManagedReplicaSchemaDdlText
         return (tableName, columnName, alterSql[index..end]);
     }
 
+    /// <summary>
+    /// Best-effort extraction of the table a schema statement targets, used only by conflict
+    /// classification to decide whether a pending DDL statement <em>provably</em> has nothing to
+    /// do with a conflicting table. Returns <see langword="null"/> whenever the target cannot be
+    /// determined with certainty (an unrecognized shape, a trigger, or a drop of a non-table
+    /// object), which callers must treat as "may target anything" and classify conservatively.
+    /// </summary>
+    public static string? TryGetSchemaStatementTarget(string schemaSql)
+    {
+        ArgumentNullException.ThrowIfNull(schemaSql);
+        var index = SkipTrivia(schemaSql, 0);
+
+        if (MatchKeyword(schemaSql, ref index, "ALTER"))
+        {
+            return MatchKeyword(schemaSql, ref index, "TABLE")
+                ? TryReadQualifiedName(schemaSql, ref index)
+                : null;
+        }
+
+        if (MatchKeyword(schemaSql, ref index, "DROP"))
+        {
+            // Only DROP TABLE names a table directly. Dropping an index/view/trigger names the
+            // dependent object, whose owning table this scanner cannot resolve from text alone.
+            return MatchKeyword(schemaSql, ref index, "TABLE") && SkipIfExists(schemaSql, ref index)
+                ? TryReadQualifiedName(schemaSql, ref index)
+                : null;
+        }
+
+        if (!MatchKeyword(schemaSql, ref index, "CREATE"))
+            return null;
+
+        _ = MatchKeyword(schemaSql, ref index, "TEMP") || MatchKeyword(schemaSql, ref index, "TEMPORARY");
+        var unique = MatchKeyword(schemaSql, ref index, "UNIQUE");
+        if (MatchKeyword(schemaSql, ref index, "INDEX"))
+        {
+            if (!SkipIfNotExists(schemaSql, ref index) || TryReadQualifiedName(schemaSql, ref index) is null)
+                return null;
+            return MatchKeyword(schemaSql, ref index, "ON")
+                ? TryReadQualifiedName(schemaSql, ref index)
+                : null;
+        }
+
+        if (unique)
+            return null;
+
+        if (MatchKeyword(schemaSql, ref index, "TABLE") || MatchKeyword(schemaSql, ref index, "VIEW"))
+        {
+            return SkipIfNotExists(schemaSql, ref index)
+                ? TryReadQualifiedName(schemaSql, ref index)
+                : null;
+        }
+
+        // CREATE TRIGGER (and anything else) deliberately falls through to "unknown target".
+        return null;
+    }
+
+    private static bool SkipIfNotExists(string sql, ref int index)
+    {
+        if (!MatchKeyword(sql, ref index, "IF"))
+            return true;
+        return MatchKeyword(sql, ref index, "NOT") && MatchKeyword(sql, ref index, "EXISTS");
+    }
+
+    private static bool SkipIfExists(string sql, ref int index)
+    {
+        if (!MatchKeyword(sql, ref index, "IF"))
+            return true;
+        return MatchKeyword(sql, ref index, "EXISTS");
+    }
+
+    /// <summary>
+    /// Reads a possibly schema-qualified object name and returns its final (object) component.
+    /// </summary>
+    private static string? TryReadQualifiedName(string sql, ref int index)
+    {
+        if (!TryReadIdentifier(sql, index, out var name, out index))
+            return null;
+        index = SkipTrivia(sql, index);
+        if (index < sql.Length && sql[index] == '.')
+        {
+            index++;
+            if (!TryReadIdentifier(sql, index, out name, out index))
+                return null;
+        }
+
+        return string.IsNullOrEmpty(name) ? null : name;
+    }
+
     private static bool IsTableLevelConstraint(string sql, int index)
         => MatchKeywordNoAdvance(sql, index, "CONSTRAINT")
            || MatchKeywordNoAdvance(sql, index, "PRIMARY")

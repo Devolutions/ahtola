@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using Ahtola.Core;
 
 namespace Ahtola.Data.Sqlite;
@@ -57,28 +58,28 @@ public partial class SqliteConnection
         }
     }
 
-    private static object? InvokeNullableAggregateStep<TAccumulate>(Func<TAccumulate?, TAccumulate> function, object? accumulator, object?[] args)
+    private static object? InvokeNullableAggregateStep<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TAccumulate>(Func<TAccumulate?, TAccumulate> function, object? accumulator, object?[] args)
         => function(CoerceAccumulator<TAccumulate?>(accumulator));
 
-    private static object? InvokeNullableAggregateStep<T1, TAccumulate>(string name, Func<TAccumulate?, T1, TAccumulate> function, object? accumulator, object?[] args)
+    private static object? InvokeNullableAggregateStep<T1, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TAccumulate>(string name, Func<TAccumulate?, T1, TAccumulate> function, object? accumulator, object?[] args)
         => function(CoerceAccumulator<TAccumulate?>(accumulator), ConvertArgument<T1>(name, args[0], 0));
 
-    private static object? InvokeNullableAggregateStep<TAccumulate>(Func<TAccumulate?, object?[], TAccumulate> function, object? accumulator, object?[] args)
+    private static object? InvokeNullableAggregateStep<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TAccumulate>(Func<TAccumulate?, object?[], TAccumulate> function, object? accumulator, object?[] args)
         => function(CoerceAccumulator<TAccumulate?>(accumulator), args);
 
-    private static object? InvokeSeededAggregateStep<TAccumulate>(Func<TAccumulate, TAccumulate> function, object? accumulator, object?[] args)
+    private static object? InvokeSeededAggregateStep<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TAccumulate>(Func<TAccumulate, TAccumulate> function, object? accumulator, object?[] args)
         => function(CoerceAccumulator<TAccumulate>(accumulator));
 
-    private static object? InvokeSeededAggregateStep<T1, TAccumulate>(string name, Func<TAccumulate, T1, TAccumulate> function, object? accumulator, object?[] args)
+    private static object? InvokeSeededAggregateStep<T1, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TAccumulate>(string name, Func<TAccumulate, T1, TAccumulate> function, object? accumulator, object?[] args)
         => function(CoerceAccumulator<TAccumulate>(accumulator), ConvertArgument<T1>(name, args[0], 0));
 
-    private static object? InvokeSeededAggregateStep<T1, T2, TAccumulate>(string name, Func<TAccumulate, T1, T2, TAccumulate> function, object? accumulator, object?[] args)
+    private static object? InvokeSeededAggregateStep<T1, T2, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TAccumulate>(string name, Func<TAccumulate, T1, T2, TAccumulate> function, object? accumulator, object?[] args)
         => function(CoerceAccumulator<TAccumulate>(accumulator), ConvertArgument<T1>(name, args[0], 0), ConvertArgument<T2>(name, args[1], 1));
 
-    private static object? InvokeSeededAggregateStep<TAccumulate>(Func<TAccumulate, object?[], TAccumulate> function, object? accumulator, object?[] args)
+    private static object? InvokeSeededAggregateStep<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TAccumulate>(Func<TAccumulate, object?[], TAccumulate> function, object? accumulator, object?[] args)
         => function(CoerceAccumulator<TAccumulate>(accumulator), args);
 
-    private static object? InvokeResultSelector<TAccumulate, TResult>(Func<TAccumulate, TResult> resultSelector, object? accumulator)
+    private static object? InvokeResultSelector<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TAccumulate, TResult>(Func<TAccumulate, TResult> resultSelector, object? accumulator)
         => resultSelector(CoerceAccumulator<TAccumulate>(accumulator));
 
     private sealed class AggregateFunctionRegistration(

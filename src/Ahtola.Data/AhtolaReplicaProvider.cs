@@ -171,6 +171,10 @@ public sealed class AhtolaReplicaOptions
                 "Partial bootstrap requires BootstrapIfEmpty=True because it configures the initial remote bootstrap.");
         }
 
+        // Cross-option incompatibilities that must stay fail-closed for query bootstrap. These live
+        // here, not in ManagedReplicaSupportMatrix, because they are option-shape rules rather than
+        // managed-provider capability rules; the matrix calls Validate() first and then adds per-kind
+        // shape validation on top. Keep the two files in step when either changes.
         if (PartialBootstrap is not null && RemoteEncryption is not null)
         {
             throw new InvalidOperationException(
@@ -183,7 +187,6 @@ public sealed class AhtolaReplicaOptions
                 "PullBytesThreshold cannot be combined with query partial bootstrap because the server selects the query page set.");
         }
     }
-
     private static Uri NormalizeRemoteUri(Uri remoteUri)
     {
         if (!remoteUri.IsAbsoluteUri)

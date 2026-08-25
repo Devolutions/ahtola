@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.BlazorWebAssembly">
+  <!--
+    ADO-only browser trim consumer.
+
+    This sample deliberately references *only* the browser ADO package
+    (Devolutions.Ahtola.Data.Sqlite.Browser, which brings in Devolutions.Ahtola.Data.Sqlite and
+    Devolutions.Ahtola.Core). No Entity Framework Core. scripts/Invoke-BrowserTrimAnalysis.ps1
+    publishes it with trim analysis unsuppressed and requires *zero* IL2xxx/IL3xxx warnings from
+    the entire closure, which is the proof that the browser + core ADO stack is trim-clean.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <OverrideHtmlAssetPlaceholders>true</OverrideHtmlAssetPlaceholders>
+    <AhtolaPackageVersion Condition="'$(AhtolaPackageVersion)' == ''">0.0.0-managed-local</AhtolaPackageVersion>
+    <!-- The gate reads granular, unsuppressed trim warnings; never hide them here. -->
+    <SuppressTrimAnalysisWarnings>false</SuppressTrimAnalysisWarnings>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Devolutions.Ahtola.Data.Sqlite.Browser" Version="$(AhtolaPackageVersion)" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="10.0.11" />
+  </ItemGroup>
+</Project>

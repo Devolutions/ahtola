@@ -38,6 +38,12 @@ public class AhtolaCommand : DbCommand
         CommandText = command;
     }
 
+    /// <summary>
+    /// The command's text. Unlike the <c>Microsoft.Data.Sqlite</c>-compatible facade, this command
+    /// deliberately allows assignment while a reader is open: a reader snapshots the transaction
+    /// completion and the synchronous-execution decision for the statement it actually prepared,
+    /// so a later assignment can never retroactively change what an open reader is allowed to do.
+    /// </summary>
     [AllowNull]
     public override string CommandText { get; set; } = "";
     public override int CommandTimeout
@@ -215,14 +221,46 @@ public class AhtolaCommand : DbCommand
     internal bool RequiresAsyncExecution
         => _connection?.RequiresAsyncExecution == true;
 
+    /// <summary>
+    /// Whether this command's current text may execute synchronously. A browser
+    /// data source opted into <c>AhtolaBrowserSynchronousMode.ReadOnlyMirror</c>
+    /// permits statements proven incapable of mutating the database, because they
+    /// are served entirely from the managed in-memory mirror.
+    /// </summary>
+    /// <remarks>
+    /// Valid only for the command-level entry points, which classify the text they are about to
+    /// prepare. Anything that outlives the call — a data reader — must carry the
+    /// <see cref="BrowserSynchronousAuthorization"/> captured by
+    /// <see cref="CaptureSynchronousAuthorization"/> instead, because
+    /// <see cref="CommandText"/> is mutable.
+    /// </remarks>
+    internal bool AllowsSynchronousExecution
+        => _connection?.AllowsSynchronousSql(CommandText) != false;
+
+    /// <summary>
+    /// Captures an immutable synchronous-execution decision for the text this command is about to
+    /// prepare and execute. The resulting reader keeps it for its whole lifetime.
+    /// </summary>
+    internal BrowserSynchronousAuthorization CaptureSynchronousAuthorization()
+        => BrowserSynchronousAuthorization.Capture(_connection, CommandText);
+
+    /// <summary>
+    /// Whether this command's connection opted into synchronous read-mirror mode,
+    /// which distinguishes "this statement is not provably read-only" from
+    /// "this data source is asynchronous only".
+    /// </summary>
+    internal bool SupportsSynchronousReads
+        => _connection?.SupportsSynchronousReads == true;
+
     private void ThrowIfSynchronousBrowserOperation(string asyncAlternative)
     {
-        if (RequiresAsyncExecution)
-        {
-            throw new PlatformNotSupportedException(
-                $"Synchronous command execution is not supported by the browser database source. "
-                + $"Use {asyncAlternative}.");
-        }
+        if (AllowsSynchronousExecution)
+            return;
+
+        throw new PlatformNotSupportedException(
+            BrowserSynchronousExecutionContract.DescribeCommandRejection(
+                asyncAlternative,
+                SupportsSynchronousReads));
     }
 
     private void PrepareCore()

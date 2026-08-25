@@ -277,7 +277,7 @@ internal sealed class EncryptionPageCodec : IPageCodec, IDisposable
     public PageCodecId CodecId => _codecId;
 
     /// <inheritdoc />
-    public byte RequiredReservedBytes => checked((byte)AhtolaPageEncryption.MetadataSize);
+    public byte RequiredReservedBytes => checked((byte)_encryption.MetadataSize);
 
     internal AhtolaEncryptionCipher Cipher => _encryption.Cipher;
 

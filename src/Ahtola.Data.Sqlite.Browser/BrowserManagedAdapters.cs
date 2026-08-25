@@ -723,7 +723,7 @@ internal static class BrowserManagedAdapterErrors
 
     internal static void ThrowIfPending(BrowserMirroredFileSystem mirror, string operation)
     {
-        if (mirror.HasPendingMutations)
+        if (mirror.HasUnflushedWork)
         {
             throw new PlatformNotSupportedException(
                 $"Synchronous {operation} cannot persist pending browser database mutations. "
@@ -731,7 +731,24 @@ internal static class BrowserManagedAdapterErrors
         }
     }
 
-    internal static async ValueTask<Exception?> FlushAndCombineAsync(
+    /// <summary>
+    /// Flushes the mirror and merges any flush failure with an operation failure.
+    /// </summary>
+    /// <remarks>
+    /// A statement that mutated nothing leaves the mirror with no unflushed work,
+    /// so the whole flush is skipped: no semaphore wait, no asynchronous state
+    /// machine, and no OPFS worker call. Every successful mutation still leaves
+    /// work queued and therefore still flushes before the caller's operation
+    /// completes, and a failed flush is still surfaced.
+    /// </remarks>
+    internal static ValueTask<Exception?> FlushAndCombineAsync(
+        BrowserMirroredFileSystem mirror,
+        Exception? failure)
+        => !mirror.IsDisposed && !mirror.HasUnflushedWork
+            ? ValueTask.FromResult(failure)
+            : FlushAndCombineCoreAsync(mirror, failure);
+
+    private static async ValueTask<Exception?> FlushAndCombineCoreAsync(
         BrowserMirroredFileSystem mirror,
         Exception? failure)
     {

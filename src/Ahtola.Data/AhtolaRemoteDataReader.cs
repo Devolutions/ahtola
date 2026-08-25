@@ -2,6 +2,7 @@ using System.Collections;
 using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text;
 
@@ -14,7 +15,7 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
     private readonly CommandBehavior _behavior;
     private readonly int _recordsAffected;
     private readonly string? _commandText;
-    private readonly AhtolaRemoteClient.RemoteCursor? _cursor;
+    private readonly RemoteCursor? _cursor;
     private readonly AhtolaSchemaCollections.ReaderSchemaSource? _schemaSource;
     private readonly AhtolaCommand? _command;
     private readonly ILocalReaderConnection? _readerConnection;
@@ -31,7 +32,7 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
 
     public AhtolaRemoteDataReader(
         AhtolaCommand command,
-        AhtolaRemoteClient.RemoteCursor cursor,
+        RemoteCursor cursor,
         AhtolaSchemaCollections.ReaderSchemaSource? schemaSource,
         CommandBehavior behavior)
         : this(
@@ -55,7 +56,7 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
         IReadOnlyList<RemoteStatementResult> results,
         CommandBehavior behavior,
         string? commandText,
-        AhtolaRemoteClient.RemoteCursor? cursor,
+        RemoteCursor? cursor,
         AhtolaSchemaCollections.ReaderSchemaSource? schemaSource,
         AhtolaCommand? command)
     {
@@ -139,6 +140,8 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
         return CurrentValue(ordinal).GetDouble();
     }
 
+    [return: DynamicallyAccessedMembers(
+        DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     public override Type GetFieldType(int ordinal)
     {
         EnsureOpen();
@@ -294,8 +297,7 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
             _schemaSource,
             _commandText,
             FieldCount,
-            GetName,
-            GetFieldType);
+            this);
     }
 
     public override object this[int ordinal] => GetValue(ordinal);
@@ -485,6 +487,8 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
             throw new IndexOutOfRangeException($"column ordinal {ordinal} is out of range");
     }
 
+    [return: DynamicallyAccessedMembers(
+        DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     private static Type GetClrType(string valueType)
     {
         return valueType switch
@@ -498,7 +502,12 @@ internal sealed class AhtolaRemoteDataReader : DbDataReader, IConnectionOwnedRea
         };
     }
 
-    private static bool TryGetClrTypeFromDeclaredType(string? declaredType, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Type? clrType)
+    private static bool TryGetClrTypeFromDeclaredType(
+        string? declaredType,
+        [NotNullWhen(true)]
+        [DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
+        out Type? clrType)
     {
         clrType = null;
         if (string.IsNullOrWhiteSpace(declaredType))

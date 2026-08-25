@@ -404,7 +404,18 @@ internal sealed class EmbeddedFileStore : IDisposable
                 continue;
             }
 
-            var statement = SqlParser.Parse(entry.Sql, SqlParameterMap.Parse(entry.Sql));
+            // A method index carries its versioned state envelope in a trailing SQL comment. The
+            // envelope is only stripped once the candidate declaration has been parsed and proven to
+            // be a USING-method index, so an ordinary index whose own SQL text happens to end in a
+            // similar comment round-trips untouched. A newer or malformed envelope fails closed
+            // instead of silently loading as an empty index.
+            Indexing.ManagedIndexMethodStateSql.TrySplit(
+                entry.Sql,
+                ManagedIndexMethodSemantics.IsMethodIndexDeclaration,
+                out var declarationSql,
+                out var stateVersion,
+                out var state);
+            var statement = SqlParser.Parse(declarationSql, SqlParameterMap.Parse(declarationSql));
             if (statement is not CreateIndexStatement create)
                 throw new EmbeddedSqlException($"Stored schema for index '{entry.Name}' is not a CREATE INDEX statement.");
             if (!string.Equals(create.Name, entry.Name, StringComparison.OrdinalIgnoreCase)
@@ -417,6 +428,13 @@ internal sealed class EmbeddedFileStore : IDisposable
             var index = CreateIndexDefinition(entry.TableName, table, create);
             ValidateIndexRepresentable(entry.TableName, table, index);
             ValidateStoredIndex(entry, table, index, occupiedBtreePages);
+            if (index.IsMethodIndex)
+            {
+                ManagedIndexMethodSemantics
+                    .GetAttachment(entry.TableName, table, index)
+                    .LoadState(stateVersion, state);
+            }
+
             table.Indexes.Add(index);
             indexRootPages.Add(entry.Name, entry.RootPage);
             loadedIndexes.Add(entry.Name, index);
@@ -1185,19 +1203,19 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
 
             childHeight = childResult.Height;
-                        // SQLite table-interior separators are search upper bounds for the left
-                        // child, not a maintained copy of that child's live maximum rowid.
-                        // After deletes, the separator can stay strictly greater than every
-                        // remaining left-child rowid (stale separator). Equality is therefore
-                        // too strong; only reject keys that would violate the bound.
-                        if (childIndex < interior.Cells.Count
-                            && childResult.MaximumRowId > interior.Cells[childIndex].Cell.RowId)
-                        {
-                            throw new EmbeddedSqlException(
-                                $"Managed file database table rootpage {rootPage} interior page {pageNumber} separator {childIndex} is below maximum rowid on child page {childPage}.");
-                        }
+            // SQLite table-interior separators are search upper bounds for the left
+            // child, not a maintained copy of that child's live maximum rowid.
+            // After deletes, the separator can stay strictly greater than every
+            // remaining left-child rowid (stale separator). Equality is therefore
+            // too strong; only reject keys that would violate the bound.
+            if (childIndex < interior.Cells.Count
+                && childResult.MaximumRowId > interior.Cells[childIndex].Cell.RowId)
+            {
+                throw new EmbeddedSqlException(
+                    $"Managed file database table rootpage {rootPage} interior page {pageNumber} separator {childIndex} is below maximum rowid on child page {childPage}.");
+            }
 
-                        maximumRowId = childResult.MaximumRowId;
+            maximumRowId = childResult.MaximumRowId;
         }
 
         return new TableTreeReadResult(
@@ -10599,7 +10617,9 @@ internal sealed class EmbeddedFileStore : IDisposable
                     tableName,
                     rootPage,
                     index.Origin == EmbeddedIndexOrigin.Explicit
-                        ? index.Sql ?? BuildCreateIndexSql(tableName, index)
+                        ? index.IsMethodIndex
+                            ? ManagedIndexMethodSemantics.BuildPersistedSql(tableName, tables[tableName], index)
+                            : index.Sql ?? BuildCreateIndexSql(tableName, index)
                         : null));
             }
         }

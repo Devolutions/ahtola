@@ -13,6 +13,50 @@ internal enum ManagedReplicaDurableBoundary
     IncrementalApplyMetadataPublished,
     JournalAppendPersisted,
     JournalAcknowledgementPersisted,
+
+    /// <summary>
+    /// Hit immediately after an explicit, data-loss-acknowledged conflict discard has durably
+    /// replaced the change journal (see
+    /// <c>ManagedReplicaChangeJournal.DiscardUnacknowledged</c>), before the conflict marker is
+    /// retired. Distinct from <see cref="JournalAcknowledgementPersisted"/> precisely because a
+    /// discard is never a remote acknowledgement.
+    /// </summary>
+    JournalDiscardPersisted,
+
+    /// <summary>
+    /// Hit immediately after a push-conflict marker has been durably published (see
+    /// <c>ManagedReplicaConflictState.Write</c>), before the typed conflict exception is
+    /// rethrown, and again whenever a resolution rewrites the still-unresolved set.
+    /// </summary>
+    ConflictMarkerPublished,
+
+    /// <summary>
+    /// Hit immediately after a push-conflict marker has been removed, which is the single point
+    /// at which ordinary synchronization becomes unblocked again.
+    /// </summary>
+    ConflictMarkerRetired,
+    /// <summary>
+    /// Hit immediately after the exclusive physical apply lease is acquired for a managed replica
+    /// push publication step (batch selection, push-intent publication, journal acknowledgement,
+    /// conflict restore, and conflict-marker publication), before that step re-validates the
+    /// durable generation it was negotiated against. The network round trip itself is deliberately
+    /// outside the lease.
+    /// </summary>
+    ReplicaPushPublicationLockAcquired,
+
+    /// <summary>
+    /// Hit immediately after the exclusive physical apply lease is acquired for an explicit
+    /// conflict resolution's local publication (journal discard and marker retirement), before any
+    /// irreversible work.
+    /// </summary>
+    ReplicaConflictResolutionLockAcquired,
+
+    /// <summary>
+    /// Hit immediately after a publication request has taken ownership of the per-path publication
+    /// slot and before any host is closed. This is the boundary at which cancellation is still
+    /// completely free of consequences.
+    /// </summary>
+    ReplicaPublicationOwnershipAcquired,
     LogicalApplyCommitted,
     LogicalApplyCheckpointed,
     LogicalApplyMetadataPublished,
@@ -36,9 +80,52 @@ internal enum ManagedReplicaDurableBoundary
     /// off instead of deleting unconditionally.
     /// </summary>
     BootstrapCatchUpFailureObserved,
+
+    /// <summary>
+    /// Hit immediately after a bootstrap has durably published its (database, metadata) pair
+    /// together with the recorded obligation to run the mandatory post-bootstrap logical
+    /// catch-up, and strictly before that catch-up begins. Fires only for MVCC-logical
+    /// bootstraps, which are the only ones that owe a catch-up. It is deliberately outside the
+    /// bootstrap's own compensating cleanup, so an interruption here leaves exactly the durable
+    /// state a crash would: an installed replica that is not yet exposable. Tests use it to prove
+    /// the next open detects the owed catch-up and finishes it instead of re-downloading the
+    /// bootstrap or, worse, exposing a never-caught-up replica.
+    /// </summary>
+    BootstrapCatchUpRequirementPublished,
+
+    /// <summary>
+    /// Hit at the start of the mandatory post-bootstrap logical catch-up, after it has been
+    /// determined to be owed but before any of its work (partial-image completion or the
+    /// catch-up pull itself) runs.
+    /// </summary>
+    BootstrapCatchUpStarted,
+
+    /// <summary>
+    /// Hit once the mandatory post-bootstrap logical catch-up has fully succeeded and its own
+    /// metadata is durable, strictly before the bootstrap completion marker is retired -- the
+    /// single transition that makes the replica exposable. An interruption here leaves a replica
+    /// whose data is already current but whose marker still asserts the obligation; the next open
+    /// must repeat the (now no-op, same-revision) catch-up and retire the marker, never replay
+    /// anything harmful.
+    /// </summary>
+    BootstrapCatchUpPublished,
     PageMutationIntentPersisted,
     PageMutationDatabasePersisted,
     PartialImageCompletionStarted,
+
+    /// <summary>
+    /// Hit immediately after a newly completed full image has atomically replaced the remote-base
+    /// snapshot, and strictly before the metadata that records its hash is published. The
+    /// superseded snapshot is still retained at this point, so metadata's older hash still
+    /// resolves.
+    /// </summary>
+    PartialImageBaseSnapshotPublished,
+
+    /// <summary>
+    /// Hit immediately after the completed full image's metadata (carrying the new remote-base
+    /// hash) is durable, and strictly before the superseded snapshot copy is retired.
+    /// </summary>
+    PartialImageMetadataPublished,
     RevertWalStaged,
     RevertWalPublished,
     RevertMetadataPublished,

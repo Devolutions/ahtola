@@ -20,8 +20,8 @@ public enum AhtolaPartialBootstrapKind
 
 /// <summary>
 /// Configures partial bootstrap and lazy page loading for an embedded replica.
-/// The pure-managed provider supports prefix selection and fetches missing pages on demand
-/// from the pinned bootstrap revision. Query selection is not supported by that provider.
+/// The pure-managed provider supports prefix and server-side query selection, and fetches missing
+/// pages on demand from the pinned bootstrap revision.
 /// </summary>
 public sealed class AhtolaPartialBootstrapOptions
 {
@@ -63,8 +63,17 @@ public sealed class AhtolaPartialBootstrapOptions
 
     /// <summary>
     /// Creates a query strategy that bootstraps pages touched by <paramref name="query"/> on the server.
-    /// The pure-managed provider rejects this strategy explicitly.
+    /// The server -- not the client -- decides which pages the query selects, so the resulting page set
+    /// is arbitrary, unordered and generally non-contiguous, and the query is sent only on the single
+    /// bootstrap request. Missing pages are then faulted lazily by page id against the pinned bootstrap
+    /// revision; the query itself is never persisted or re-sent. This requires a remote that implements
+    /// Turso's <c>server_query_selector</c> field: Turso's vendored local dev server ignores it and
+    /// returns the whole database instead.
     /// </summary>
+    /// <remarks>
+    /// Cannot be combined with <see cref="AhtolaReplicaOptions.PullBytesThreshold"/> (the client cannot
+    /// chunk a page set it does not choose) or with <see cref="AhtolaReplicaOptions.RemoteEncryption"/>.
+    /// </remarks>
     public static AhtolaPartialBootstrapOptions QueryPages(
         string query,
         long? segmentSize = null,
@@ -146,6 +155,13 @@ public sealed class AhtolaRemoteEncryptionOptions
     /// </summary>
     public AhtolaRemoteEncryptionCipher Cipher { get; }
 
+    /// <summary>
+    /// SQLite reserved bytes per page for this cipher: the 16-byte tag plus the
+    /// cipher's nonce. Kept in agreement with the storage layer's own table by
+    /// <c>RemoteEncryptionContractTests</c>, which asserts this equals
+    /// <c>AhtolaEncryptedPageFormat.GetParameters(mapped).MetadataSize</c> for
+    /// every cipher that has an on-disk cipher id.
+    /// </summary>
     internal int ReservedBytes => Cipher switch
     {
         AhtolaRemoteEncryptionCipher.Aes256Gcm

@@ -429,12 +429,171 @@ public sealed class ManagedReplicaPageMaterializationTests
             0x01, 0x00, 0x03, 0x00);
     }
 
+    /// <summary>
+    /// A query-selected bootstrap leaves an arbitrary scattered set materialized instead of a prefix.
+    /// The materializer, its sidecar and the fault path are page-id keyed and strategy-agnostic
+    /// (mirroring Turso's <c>database_sync_lazy_storage.rs</c>, which has no notion of Prefix vs
+    /// Query), so a scattered initial set must behave exactly like a prefix one: materialized pages
+    /// are never refetched and each missing page faults by id.
+    /// </summary>
+    [Test]
+    public void ScatteredInitialSetNeverRefetchesMaterializedPagesAndFaultsMissingOnesById()
+    {
+        var fileSystem = CreatePartialDatabase(pageCount: 8, materializedPageIds: [5, 0, 3]);
+        var expected = CreatePage(0x81);
+        var source = new RecordingPageSource(databasePages: 8, pageFactory: _ => expected);
+
+        using var materializing = OpenMaterializing(fileSystem, source, prefetchSegments: false);
+        using var file = materializing.OpenFile("replica.db", FileOpenMode.OpenExisting, readOnly: true);
+        var page = new byte[PageSize];
+
+        // Already materialized: pages 3 and 5 sit inside otherwise-missing neighbourhoods.
+        file.Read(3 * PageSize, page).Should().Be(PageSize);
+        file.Read(5 * PageSize, page).Should().Be(PageSize);
+        source.CallCount.Should().Be(0);
+
+        // Missing: each fault addresses exactly the missing page id, in a non-contiguous pattern.
+        file.Read(4 * PageSize, page).Should().Be(PageSize);
+        page.Should().Equal(expected);
+        file.Read(7 * PageSize, page).Should().Be(PageSize);
+        page.Should().Equal(expected);
+
+        source.CallCount.Should().Be(2);
+        source.Requests.Should().SatisfyRespectively(
+            first => first.Should().Equal(4UL),
+            second => second.Should().Equal(7UL));
+
+        // Re-reading a now-materialized page is served from the durable cache.
+        file.Read(4 * PageSize, page).Should().Be(PageSize);
+        source.CallCount.Should().Be(2);
+    }
+
+    [Test]
+    public async Task ConcurrentFaultsOnAScatteredInitialSetShareOneRemoteFetch()
+    {
+        var fileSystem = CreatePartialDatabase(pageCount: 8, materializedPageIds: [6, 0, 2]);
+        var expected = CreatePage(0x82);
+        var source = new BlockingPageSource(databasePages: 8, expected);
+        using var materializing = OpenMaterializing(fileSystem, source, prefetchSegments: false);
+
+        var reads = Enumerable.Range(0, 8)
+            .Select(_ => Task.Run(() =>
+            {
+                using var file = materializing.OpenFile("replica.db", FileOpenMode.OpenExisting, readOnly: true);
+                var page = new byte[PageSize];
+                file.Read(5 * PageSize, page).Should().Be(PageSize);
+                return page;
+            }))
+            .ToArray();
+
+        await source.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        source.CallCount.Should().Be(1);
+        source.Release();
+
+        var pages = await Task.WhenAll(reads).WaitAsync(TimeSpan.FromSeconds(5));
+        pages.Should().AllSatisfy(page => page.Should().Equal(expected));
+        source.CallCount.Should().Be(1);
+    }
+
+    [Test]
+    public void ScatteredMaterializedStateSurvivesReopenWithoutAnotherFetch()
+    {
+        var fileSystem = CreatePartialDatabase(pageCount: 8, materializedPageIds: [7, 0, 4]);
+        var expected = CreatePage(0x83);
+        var firstSource = new RecordingPageSource(8, _ => expected);
+        using (var materializing = OpenMaterializing(fileSystem, firstSource, prefetchSegments: false))
+        using (var file = materializing.OpenFile("replica.db", FileOpenMode.OpenExisting, readOnly: true))
+        {
+            var page = new byte[PageSize];
+            file.Read(2 * PageSize, page).Should().Be(PageSize);
+            page.Should().Equal(expected);
+        }
+
+        var reopenedSource = new DelegatePageSource((_, _, _) =>
+            Task.FromException<ManagedReplicaPageBatch>(
+                new InvalidOperationException("A durable cache hit must not contact the remote source.")));
+        using var reopened = OpenMaterializing(fileSystem, reopenedSource, prefetchSegments: false);
+        using var reopenedFile = reopened.OpenFile("replica.db", FileOpenMode.OpenExisting, readOnly: true);
+        var reopenedPage = new byte[PageSize];
+
+        // Both the original scattered set and the page faulted above are still materialized.
+        reopenedFile.Read(4 * PageSize, reopenedPage).Should().Be(PageSize);
+        reopenedFile.Read(7 * PageSize, reopenedPage).Should().Be(PageSize);
+        reopenedFile.Read(2 * PageSize, reopenedPage).Should().Be(PageSize);
+        reopenedPage.Should().Equal(expected);
+        firstSource.CallCount.Should().Be(1);
+        reopenedSource.CallCount.Should().Be(0);
+    }
+
+    [Test]
+    public void LocalWritesReplaceWholeMissingPagesInAScatteredImage()
+    {
+        var fileSystem = CreatePartialDatabase(pageCount: 8, materializedPageIds: [0, 6]);
+        var expected = CreatePage(0x84);
+        var source = new DelegatePageSource((_, _, _) =>
+            Task.FromException<ManagedReplicaPageBatch>(
+                new InvalidOperationException("A local page replacement must not contact the remote source.")));
+        using (var materializing = OpenMaterializing(fileSystem, source, prefetchSegments: false))
+        using (var file = materializing.OpenFile("replica.db", FileOpenMode.OpenExisting))
+        {
+            var partialWrite = () => file.Write(3 * PageSize + 1, expected.AsSpan(1));
+
+            partialWrite.Should().Throw<InvalidDataException>();
+            file.Write(3 * PageSize, expected);
+            file.FlushToDisk();
+        }
+
+        using var reopened = OpenMaterializing(fileSystem, source, prefetchSegments: false);
+        using var reopenedFile = reopened.OpenFile("replica.db", FileOpenMode.OpenExisting, readOnly: true);
+        var page = new byte[PageSize];
+
+        reopenedFile.Read(3 * PageSize, page).Should().Be(PageSize);
+        page.Should().Equal(expected);
+        reopened.HasLocalMutations.Should().BeTrue();
+        source.CallCount.Should().Be(0);
+    }
+
+    /// <summary>
+    /// After a query bootstrap the query string is never persisted and never resent: later faults are
+    /// plain revision-pinned page-id selectors (tag 5), with no <c>server_query_selector</c> (tag 7).
+    /// </summary>
+    [Test]
+    public async Task TargetedPullOfAScatteredPageSetSendsPageIdsAndNeverTheQueryText()
+    {
+        var handler = new CapturingHandler(
+            CreateTargetedPullResponse(
+                Revision,
+                databasePages: 12,
+                new ManagedReplicaFetchedPage(1, CreatePage(0x41)),
+                new ManagedReplicaFetchedPage(4, CreatePage(0x44)),
+                new ManagedReplicaFetchedPage(9, CreatePage(0x49))));
+        var options = new AhtolaReplicaOptions(
+            "unused.db",
+            new Uri("https://example.test/cluster"),
+            authToken: "token-42")
+        {
+            PartialBootstrap = AhtolaPartialBootstrapOptions.QueryPages("SELECT 1;"),
+            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
+        };
+        var source = new ManagedReplicaPullPageSource(options);
+
+        var batch = await source.FetchPagesAsync(Revision, [1, 4, 9], CancellationToken.None);
+
+        batch.Revision.Should().Be(Revision);
+        batch.Pages.Select(page => page.PageId).Should().Equal(1UL, 4UL, 9UL);
+        var fields = ReadLengthDelimitedFields(handler.RequestBody!);
+        Encoding.UTF8.GetString(fields[2]).Should().Be(Revision);
+        fields.Should().ContainKey(5);
+        fields.Should().NotContainKey(7, "the bootstrap query is never persisted or resent for a lazy fault");
+    }
+
     private static InMemoryFileSystem CreatePartialDatabase(
         int pageCount,
-        int segmentSize = ManagedReplicaPageMaterializingFileSystem.DefaultSegmentSize)
+        int segmentSize = ManagedReplicaPageMaterializingFileSystem.DefaultSegmentSize,
+        IReadOnlyList<ulong>? materializedPageIds = null)
     {
         var fileSystem = new InMemoryFileSystem();
-        InitializePartialDatabase(fileSystem, "replica.db", pageCount, segmentSize);
+        InitializePartialDatabase(fileSystem, "replica.db", pageCount, segmentSize, materializedPageIds);
         return fileSystem;
     }
 
@@ -442,7 +601,8 @@ public sealed class ManagedReplicaPageMaterializationTests
         IFileSystem fileSystem,
         string databasePath,
         int pageCount,
-        int segmentSize = ManagedReplicaPageMaterializingFileSystem.DefaultSegmentSize)
+        int segmentSize = ManagedReplicaPageMaterializingFileSystem.DefaultSegmentSize,
+        IReadOnlyList<ulong>? materializedPageIds = null)
     {
         var header = SqliteDatabaseHeader.CreateDefault() with
         {
@@ -480,7 +640,7 @@ public sealed class ManagedReplicaPageMaterializationTests
             checked((ulong)pageCount),
             PageSize,
             segmentSize,
-            [0]);
+            materializedPageIds ?? [0]);
     }
 
     private static ManagedReplicaPageMaterializingFileSystem OpenMaterializing(

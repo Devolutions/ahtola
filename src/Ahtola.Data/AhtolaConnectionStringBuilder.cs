@@ -15,9 +15,9 @@ public sealed class AhtolaConnectionStringBuilder : DbConnectionStringBuilder
         ["Mode"] = "Mode",
         ["Cache"] = "Cache",
         ["Password"] = "Password",
-                ["Password Scheme"] = "Password Scheme",
-                ["PasswordScheme"] = "Password Scheme",
-                ["Foreign Keys"] = "Foreign Keys",
+        ["Password Scheme"] = "Password Scheme",
+        ["PasswordScheme"] = "Password Scheme",
+        ["Foreign Keys"] = "Foreign Keys",
         ["ForeignKeys"] = "Foreign Keys",
         ["Recursive Triggers"] = "Recursive Triggers",
         ["RecursiveTriggers"] = "Recursive Triggers",
@@ -47,6 +47,27 @@ public sealed class AhtolaConnectionStringBuilder : DbConnectionStringBuilder
         ["LocalProvider"] = "Local Provider",
         ["Foreign Read Only"] = "Foreign Read Only",
         ["ForeignReadOnly"] = "Foreign Read Only",
+        // Hrana WebSocket (ws/wss) transport tunables.
+        ["Ws Keepalive Interval"] = "Ws Keepalive Interval",
+        ["WsKeepaliveInterval"] = "Ws Keepalive Interval",
+        ["WebSocket Keepalive Interval"] = "Ws Keepalive Interval",
+        ["WebSocketKeepAliveInterval"] = "Ws Keepalive Interval",
+        ["Ws Keepalive Timeout"] = "Ws Keepalive Timeout",
+        ["WsKeepaliveTimeout"] = "Ws Keepalive Timeout",
+        ["WebSocket Keepalive Timeout"] = "Ws Keepalive Timeout",
+        ["WebSocketKeepAliveTimeout"] = "Ws Keepalive Timeout",
+        ["Ws Half Open Timeout"] = "Ws Half Open Timeout",
+        ["WsHalfOpenTimeout"] = "Ws Half Open Timeout",
+        ["WebSocket Half Open Timeout"] = "Ws Half Open Timeout",
+        ["WebSocketHalfOpenTimeout"] = "Ws Half Open Timeout",
+        ["Ws Max Message Bytes"] = "Ws Max Message Bytes",
+        ["WsMaxMessageBytes"] = "Ws Max Message Bytes",
+        ["WebSocket Max Message Bytes"] = "Ws Max Message Bytes",
+        ["WebSocketMaxMessageBytes"] = "Ws Max Message Bytes",
+        ["Ws Connect Attempts"] = "Ws Connect Attempts",
+        ["WsConnectAttempts"] = "Ws Connect Attempts",
+        ["WebSocket Connect Attempts"] = "Ws Connect Attempts",
+        ["WebSocketConnectAttempts"] = "Ws Connect Attempts",
     };
 
     public AhtolaConnectionStringBuilder()
@@ -82,17 +103,17 @@ public sealed class AhtolaConnectionStringBuilder : DbConnectionStringBuilder
         set => SetString("Password", value);
     }
 
-        /// <summary>
-        /// Passphrase key-derivation scheme id (for example <c>Ahtola.Password.v1</c>).
-        /// Empty selects the catalog default.
-        /// </summary>
-        public string PasswordScheme
-        {
-            get => GetString("Password Scheme");
-            set => SetString("Password Scheme", value);
-        }
+    /// <summary>
+    /// Passphrase key-derivation scheme id (for example <c>Ahtola.Password.v1</c>).
+    /// Empty selects the catalog default.
+    /// </summary>
+    public string PasswordScheme
+    {
+        get => GetString("Password Scheme");
+        set => SetString("Password Scheme", value);
+    }
 
-        public bool? ForeignKeys
+    public bool? ForeignKeys
     {
         get => GetNullableBool("Foreign Keys");
         set => SetNullable("Foreign Keys", value);
@@ -198,6 +219,96 @@ public sealed class AhtolaConnectionStringBuilder : DbConnectionStringBuilder
 
     internal bool IsLocalProviderConfigured => base.ContainsKey("Local Provider");
 
+    /// <summary>
+    /// WebSocket keep-alive ping interval in seconds for <c>ws</c>/<c>wss</c> data sources.
+    /// 0 disables keep-alives. Ignored by the HTTP pipeline transport.
+    /// </summary>
+    public int WsKeepaliveInterval
+    {
+        get => GetInt("Ws Keepalive Interval", (int)AhtolaHranaWebSocketOptions.Default.KeepAliveInterval.TotalSeconds);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Ws Keepalive Interval"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Keep-alive pong grace period in seconds for <c>ws</c>/<c>wss</c> data sources.
+    /// Honoured on .NET 9 or newer; on net8.0 only the interval is applied.
+    /// </summary>
+    public int WsKeepaliveTimeout
+    {
+        get => GetInt("Ws Keepalive Timeout", (int)AhtolaHranaWebSocketOptions.Default.KeepAliveTimeout.TotalSeconds);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Ws Keepalive Timeout"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Seconds of complete peer silence, while requests are outstanding, that abort a
+    /// <c>ws</c>/<c>wss</c> connection as half-open. <c>0</c> (the default) disables the
+    /// check.
+    /// </summary>
+    /// <remarks>
+    /// This is the only half-open detection available on net8.0, where
+    /// <c>ClientWebSocket</c> has no pong timeout. Because a Hrana server sends nothing while
+    /// a statement runs, any non-zero value also caps how long a single request may take:
+    /// set it above the longest statement the workload issues.
+    /// </remarks>
+    public int WsHalfOpenTimeout
+    {
+        get => GetInt("Ws Half Open Timeout", (int)AhtolaHranaWebSocketOptions.Default.HalfOpenTimeout.TotalSeconds);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Ws Half Open Timeout"] = value;
+        }
+    }
+
+    /// <summary>Hard cap on a single reassembled Hrana WebSocket message, in bytes.</summary>
+    public int WsMaxMessageBytes
+    {
+        get => GetInt("Ws Max Message Bytes", AhtolaHranaWebSocketOptions.Default.MaxMessageBytes);
+        set
+        {
+            if (value is < AhtolaHranaWebSocketOptions.MinimumMaxMessageBytes
+                or > AhtolaHranaWebSocketOptions.MaximumMaxMessageBytes)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(value),
+                    value,
+                    $"Ws Max Message Bytes must be between {AhtolaHranaWebSocketOptions.MinimumMaxMessageBytes} and {AhtolaHranaWebSocketOptions.MaximumMaxMessageBytes}.");
+            }
+
+            this["Ws Max Message Bytes"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Bounded connection-establishment attempts for the Hrana WebSocket transport. This
+    /// never replays in-flight operations; it only bounds how often a brand-new connection
+    /// is attempted before an operation fails.
+    /// </summary>
+    public int WsConnectAttempts
+    {
+        get => GetInt("Ws Connect Attempts", AhtolaHranaWebSocketOptions.Default.ConnectAttempts);
+        set
+        {
+            if (value is < 1 or > AhtolaHranaWebSocketOptions.MaximumConnectAttempts)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(value),
+                    value,
+                    $"Ws Connect Attempts must be between 1 and {AhtolaHranaWebSocketOptions.MaximumConnectAttempts}.");
+            }
+
+            this["Ws Connect Attempts"] = value;
+        }
+    }
+
     [AllowNull]
     public override object this[string keyword]
     {
@@ -244,13 +355,14 @@ public sealed class AhtolaConnectionStringBuilder : DbConnectionStringBuilder
 
         return cipher.ToLowerInvariant() switch
         {
-            "aes128gcm" => AhtolaEncryptionCipher.Aes128Gcm,
-            "aes256gcm" => AhtolaEncryptionCipher.Aes256Gcm,
-            "aegis256" => AhtolaEncryptionCipher.Aegis256,
-            "aegis256x2" => AhtolaEncryptionCipher.Aegis256x2,
-            "aegis128l" => AhtolaEncryptionCipher.Aegis128l,
-            "aegis128x2" => AhtolaEncryptionCipher.Aegis128x2,
-            "aegis128x4" => AhtolaEncryptionCipher.Aegis128x4,
+            "aes128gcm" or "aes-128-gcm" or "aes_128_gcm" => AhtolaEncryptionCipher.Aes128Gcm,
+            "aes256gcm" or "aes-256-gcm" or "aes_256_gcm" => AhtolaEncryptionCipher.Aes256Gcm,
+            "aegis256" or "aegis-256" or "aegis_256" => AhtolaEncryptionCipher.Aegis256,
+            "aegis256x2" or "aegis-256x2" or "aegis_256x2" => AhtolaEncryptionCipher.Aegis256x2,
+            "aegis256x4" or "aegis-256x4" or "aegis_256x4" => AhtolaEncryptionCipher.Aegis256x4,
+            "aegis128l" or "aegis-128l" or "aegis_128l" => AhtolaEncryptionCipher.Aegis128l,
+            "aegis128x2" or "aegis-128x2" or "aegis_128x2" => AhtolaEncryptionCipher.Aegis128x2,
+            "aegis128x4" or "aegis-128x4" or "aegis_128x4" => AhtolaEncryptionCipher.Aegis128x4,
             _ => throw new InvalidOperationException($"Unknown encryption cipher: {cipher}")
         };
     }

@@ -13,33 +13,87 @@ The desktop engine encrypts pages through `IPageCodec`
 Browser Web Crypto (`SubtleCrypto`) is promise-based and has no synchronous
 API, so it can never satisfy that contract on the .NET WebAssembly runtime.
 Deriving the raw key and using `System.Security.Cryptography.AesGcm` instead is
-not an option either: the package's crypto contract is Web Crypto with
-non-extractable key handles.
+not an option either: for the AES ciphers the package's crypto contract is Web
+Crypto with non-extractable key handles.
 
 The browser therefore splits the two concerns:
 
 ```mermaid
 flowchart LR
-    engine["Managed engine<br/>(plaintext pages,<br/>28 reserved bytes)"]
+    engine["Managed engine<br/>(plaintext pages,<br/>28/32/48 reserved bytes)"]
     mirror["BrowserMirroredFileSystem<br/>(synchronous in-memory mirror)"]
     transform["BrowserEncryptedPersistence<br/>(async AHTLA transform)"]
     opfs["OPFS<br/>(exact encrypted bytes)"]
 
     engine <--> mirror
     mirror -- "captured whole pages/frames/records" --> transform
-    transform -- "Web Crypto AES-GCM" --> opfs
+    transform -- "Web Crypto AES-GCM / managed AEGIS" --> opfs
     opfs -- "decrypt on load" --> mirror
 ```
 
 - The engine keeps operating on plaintext, synchronously, exactly as it does
   today. Nothing in `Ahtola.Core` becomes `async` for the browser's benefit.
-- `AhtolaBrowserReservedSpaceCodec` is an **identity** `IPageCodec` that
-  declares `RequiredReservedBytes = 28`. Binding it makes the pager create
-  databases with 28 reserved bytes per page from creation onward, and reject an
-  existing database whose reserved space disagrees. Those 28 bytes are where
-  the 16-byte AES-GCM tag and 12-byte nonce live once the page is encrypted.
+- `AhtolaBrowserReservedSpaceCodec` is an **identity** `IPageCodec` that declares
+  the configured cipher's reserved-byte count (28 for AES-GCM, 32 for the
+  AEGIS-128 family, 48 for the AEGIS-256 family). Binding it makes the pager
+  create databases with that reserved space from creation onward, and reject an
+  existing database whose reserved space disagrees. Those bytes are where the
+  16-byte tag and the cipher's nonce live once the page is encrypted. The codec
+  id embeds the cipher id, so two configurations that produce different on-disk
+  bytes never share an identity.
 - `BrowserEncryptedPersistence` performs the actual AHTLA transform
   asynchronously while the mirror replays its pending mutations to OPFS.
+
+## Cipher selection in the browser
+
+SubtleCrypto implements AES-GCM only. `AhtolaBrowserPageCipherFactory` therefore
+routes:
+
+| Cipher | Backing implementation |
+| ------ | ---------------------- |
+| `Aes128Gcm`, `Aes256Gcm` | Web Crypto, non-extractable key handle (unchanged) |
+| `Aegis256`, `Aegis256x2`, `Aegis256x4`, `Aegis128l`, `Aegis128x2`, `Aegis128x4` | `AhtolaManagedAegisPageCipher`, wrapping the pure-managed AEGIS core from `Ahtola.Core` |
+
+The AEGIS path completes its `ValueTask` synchronously and performs no
+JavaScript interop. Its output is byte-identical to the desktop engine's, which
+the suite asserts by replaying the desktop framer with the nonce the browser
+chose.
+
+> **Performance.** WebAssembly has no AES round instruction, so AEGIS falls back
+> to the constant-time bitsliced software round and is materially slower in the
+> browser than AES-GCM through Web Crypto, which reaches native code. Choose
+> AEGIS in the browser for on-disk compatibility with an AEGIS database, not for
+> throughput.
+
+Passphrase derivation (`Ahtola.Password.v1`) always produces an AES-256-GCM key,
+so it never selects an AEGIS cipher. `ChaCha20Poly1305` is rejected: Turso
+format version 0 assigns it no on-disk cipher id. See
+[`page-encryption-contract.md`](page-encryption-contract.md).
+
+### The two backends are not interchangeable
+
+`AhtolaBrowserCryptoService` is the **Web Crypto** backend and nothing else. It
+imports a non-extractable `AES-GCM` JavaScript key and every member is specified
+in terms of AES-GCM's fixed 12-byte nonce and 16-byte tag, so it accepts only
+`Aes128Gcm` and `Aes256Gcm`. Passing an AEGIS cipher throws
+`ArgumentOutOfRangeException`.
+
+That refusal matters because it cannot be caught by key length: an AEGIS-256 key
+is 32 bytes, exactly a valid AES-256 key, and an AEGIS-128 key is 16 bytes,
+exactly a valid AES-128 key. A service that accepted the cipher id and then
+imported an AES-GCM key would report `Cipher = Aegis256` while producing AES-GCM
+bytes — a cipher-confusion hazard that no downstream length check could detect.
+
+`AhtolaManagedAegisPageCipher` is the **pure-managed AEGIS** backend, and it is
+where every AEGIS cipher is served. It uses the cipher's real nonce width and
+rejects an AES-GCM-shaped 12-byte nonce rather than padding or truncating it.
+
+Both are selected by `AhtolaBrowserPageCipherFactory` on
+`AhtolaBrowserCryptoParameters.UsesWebCrypto`, which is exactly the set of
+ciphers whose nonce is 12 bytes. The suite pins each backend's output to
+published vectors — CFRG `draft-irtf-cfrg-aegis-aead` for AEGIS, NIST GCM for
+AES-GCM — so the cipher a seam reports is provably the cipher whose bytes it
+produces.
 
 `IPageCodecSource` (in `Ahtola.Core`) lets the mirror advertise its codec
 without being wrapped in `AhtolaPageCodecFileSystem`. Wrapping would hide the
@@ -96,6 +150,32 @@ and decrypts complete frames before the managed engine replays them. This makes
 `PRAGMA journal_mode=mvcc` and `BEGIN CONCURRENT` available without exposing key
 material or persisting row data in plaintext.
 
+#### MVCC requires an AES-GCM cipher
+
+The `MVTX` chunk frame reserves a **fixed** 16-byte tag plus 12-byte nonce, and
+that overhead is baked into every payload-size, offset, and CRC computation in
+`MvccLogicalLogFormat`. Turso format version 0 defines no logical-log framing for
+the wider AEGIS nonces (16 bytes for the AEGIS-128 family, 32 for AEGIS-256), so
+rather than invent one, MVCC is refused for those ciphers.
+
+The refusal happens at the `PRAGMA journal_mode` boundary, before journal-mode
+header 255 is persisted and before any transaction produces a frame:
+
+- Desktop storage answers from `AhtolaEncryptionFileSystem`'s cipher.
+- The browser mirror encrypts *out of band*, on its way to OPFS, so the core
+  cannot see its cipher through `AhtolaEncryptionFileSystem`. It declares the
+  restriction through the `IMvccJournalModePolicy` capability instead.
+
+Both routes produce the same `NotSupportedException` text, naming the cipher and
+its nonce width. Without the gate the pragma succeeded, `COMMIT` reported
+success, and the mismatch only surfaced during the asynchronous flush that
+followed — after the engine had already reported durability, with the pager
+already switched into a mode it could never commit in.
+
+An AEGIS database is otherwise unaffected: a refused switch leaves the journal
+mode untouched, and ordinary WAL or DELETE commits continue to persist and
+survive reopen.
+
 A header-only plaintext log can safely begin receiving encrypted frames because
 it contains no row data. A populated plaintext log presented to encrypted
 storage is rejected instead of being guessed or migrated in place; checkpoint
@@ -140,6 +220,13 @@ Encryption is applied in `PrepareAsync`, which is side-effect free; WAL chain
 state is committed only after the transformed bytes reach OPFS. A cancelled or
 failed flush therefore leaves the unreplayed mutations queued and replayable
 instead of advancing state or reporting false success.
+
+A statement that queued nothing owes the persistent store nothing, so the flush
+is skipped entirely — no semaphore wait, no OPFS call, and no cipher work. This
+is what makes the opt-in synchronous read-mirror mode (see
+[browser-wasm.md](browser-wasm.md)) free of storage crossings while leaving
+every mutation's flush-before-completion guarantee intact: queued work is always
+replayed, and a failed replay is always surfaced.
 
 ## Recovery runs before authentication
 

@@ -1,3 +1,6 @@
+using System.Data;
+using System.Data.Common;
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Ahtola;
@@ -62,6 +65,7 @@ try
     }
 
     const string encryptionKey = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+    const string encryptionKey128 = "000102030405060708090A0B0C0D0E0F";
     var encryptedPath = Path.Combine(Path.GetTempPath(), $"Ahtola-managed-package-{Guid.NewGuid():N}.db");
     try
     {
@@ -81,15 +85,14 @@ try
         }
 
         using var unsupported = new SqliteConnection(
-            $"Data Source={encryptedPath};Local Provider=Managed;Encryption Cipher=AEGIS256;Encryption Key={encryptionKey}");
+            $"Data Source={encryptedPath};Local Provider=Managed;Encryption Cipher=chacha20poly1305;Encryption Key={encryptionKey}");
         try
         {
             unsupported.Open();
-            throw new InvalidOperationException("The managed package accepted an unsupported encryption cipher.");
+            throw new InvalidOperationException("The managed package accepted a cipher with no on-disk cipher id.");
         }
         catch (NotSupportedException exception) when (
-            exception.Message.Contains("cipher ID 1", StringComparison.Ordinal)
-            && exception.Message.Contains("cipher ID 2", StringComparison.Ordinal))
+            exception.Message.Contains("cipher IDs 1 through 8", StringComparison.Ordinal))
         {
         }
     }
@@ -99,6 +102,59 @@ try
             File.Delete(encryptedPath + suffix);
     }
 
+    // Every Turso format version 0 cipher must round-trip from the packed
+    // package, including under NativeAOT and trimming: the AEGIS ciphers are
+    // implemented in managed code, so this is where a reflection-free, ILC-safe
+    // implementation proves itself outside the test host.
+    foreach (var (cipherName, cipherKey, expectedReservedBytes, expectedCipherId) in new[]
+             {
+                 ("AES128GCM", encryptionKey128, (byte)28, (byte)1),
+                 ("AES256GCM", encryptionKey, (byte)28, (byte)2),
+                 ("AEGIS256", encryptionKey, (byte)48, (byte)3),
+                 ("AEGIS256X2", encryptionKey, (byte)48, (byte)4),
+                 ("AEGIS256X4", encryptionKey, (byte)48, (byte)5),
+                 ("AEGIS128L", encryptionKey128, (byte)32, (byte)6),
+                 ("AEGIS128X2", encryptionKey128, (byte)32, (byte)7),
+                 ("AEGIS128X4", encryptionKey128, (byte)32, (byte)8),
+             })
+    {
+        var cipherPath = Path.Combine(Path.GetTempPath(), $"Ahtola-managed-package-{cipherName}-{Guid.NewGuid():N}.db");
+        try
+        {
+            var connectionString =
+                $"Data Source={cipherPath};Local Provider=Managed;Encryption Cipher={cipherName};Encryption Key={cipherKey}";
+            using (var cipherConnection = new SqliteConnection(connectionString))
+            {
+                cipherConnection.Open();
+                cipherConnection.ExecuteNonQuery("CREATE TABLE payload(value TEXT); INSERT INTO payload VALUES ('aegis');");
+            }
+
+            var header = new byte[21];
+            using (var stream = File.OpenRead(cipherPath))
+                stream.ReadExactly(header);
+
+            if (System.Text.Encoding.ASCII.GetString(header, 0, 5) != "AHTLA" || header[5] != 0)
+                throw new InvalidOperationException($"{cipherName} did not produce an AHTLA format version 0 header.");
+            if (header[6] != expectedCipherId)
+                throw new InvalidOperationException($"{cipherName} wrote cipher id {header[6]}, expected {expectedCipherId}.");
+            if (header[20] != expectedReservedBytes)
+                throw new InvalidOperationException($"{cipherName} reserved {header[20]} bytes, expected {expectedReservedBytes}.");
+
+            using (var reopened = new SqliteConnection(connectionString))
+            {
+                reopened.Open();
+                if (reopened.ExecuteScalar<string>("SELECT value FROM payload;") != "aegis")
+                    throw new InvalidOperationException($"The managed package did not reopen its {cipherName} database.");
+            }
+        }
+        finally
+        {
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+                File.Delete(cipherPath + suffix);
+        }
+    }
+
+
     if (AppDomain.CurrentDomain.GetAssemblies().Any(assembly =>
             string.Equals(assembly.GetName().Name, "Turso.Raw", StringComparison.Ordinal)))
     {
@@ -106,6 +162,7 @@ try
     }
 
     EnsureNoNativeCompanionWasRestored();
+    VerifyTrimSensitiveSurfaces();
     await VerifyEntityFrameworkIntegrationAsync(connection);
     VerifySourceFreeReplicaOptions();
     await VerifyOptionalCloudRuntimeAsync();
@@ -119,6 +176,68 @@ finally
     SqliteConnection.ClearAllPools();
     DeleteDatabase(databasePath);
 }
+// Trim/AOT-sensitive ADO surfaces. These are here so the packed consumer's trimmed and NativeAOT
+// publishes actually root them: the schema table, the annotated GetFieldType contract, the tuple
+// accumulator (Activator.CreateInstance over a ValueTuple), and the fail-closed native provider.
+static void VerifyTrimSensitiveSurfaces()
+{
+    using var connection = new SqliteConnection("Data Source=:memory:;Mode=Memory");
+    connection.Open();
+
+    using (var seed = connection.CreateCommand())
+    {
+        seed.CommandText =
+            "CREATE TABLE probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL, label TEXT);"
+            + "INSERT INTO probe(value, label) VALUES (10, 'a'), (20, 'b'), (30, 'c');";
+        seed.ExecuteNonQuery();
+    }
+
+    using (var command = connection.CreateCommand())
+    {
+        command.CommandText = "SELECT id, value, label FROM probe;";
+        using DbDataReader reader = command.ExecuteReader();
+
+        DataTable schema = reader.GetSchemaTable()
+            ?? throw new InvalidOperationException("The managed package reader produced no schema table.");
+        if (schema.Rows.Count != 3)
+            throw new InvalidOperationException("The managed package schema table lost a column.");
+        foreach (DataRow row in schema.Rows)
+        {
+            if (row[SchemaTableColumn.DataType] is not Type)
+                throw new InvalidOperationException("The managed package schema table lost its CLR types.");
+        }
+
+        if (!reader.Read() || reader.GetFieldType(0) != typeof(long) || reader.GetFieldType(2) != typeof(string))
+            throw new InvalidOperationException("The managed package reader reported unexpected field types.");
+    }
+
+    // Same accumulator shape EF Core's ef_avg uses: (decimal sum, ulong count). The accumulator
+    // round-trips through the engine as text, so the tuple is reconstructed on every step.
+    connection.CreateAggregate<decimal, (decimal Sum, ulong Count), decimal?>(
+        "probe_avg",
+        (Sum: 0m, Count: 0UL),
+        static (accumulator, value) => (accumulator.Sum + value, accumulator.Count + 1),
+        static accumulator => accumulator.Count == 0 ? null : accumulator.Sum / accumulator.Count);
+
+    using (var command = connection.CreateCommand())
+    {
+        command.CommandText = "SELECT probe_avg(value) FROM probe;";
+        if (Convert.ToDecimal(command.ExecuteScalar(), CultureInfo.InvariantCulture) != 20m)
+            throw new InvalidOperationException("The managed package tuple aggregate returned an unexpected result.");
+    }
+
+    // No native companion is shipped, and nothing probes for one by assembly name.
+    try
+    {
+        using var native = new SqliteConnection("Data Source=:memory:;Mode=Memory;Local Provider=Native");
+        native.Open();
+        throw new InvalidOperationException("Local Provider=Native must fail closed without the native companion.");
+    }
+    catch (NotSupportedException)
+    {
+    }
+}
+
 static async Task VerifyEntityFrameworkIntegrationAsync(SqliteConnection connection)
 {
     var options = new DbContextOptionsBuilder<ManagedPackageContext>()

@@ -67,6 +67,70 @@ internal sealed class DesktopAsyncPageCipher(Core.Storage.AhtolaEncryptionCipher
         => _key ?? throw new ObjectDisposedException(nameof(DesktopAsyncPageCipher));
 }
 
+/// <summary>
+/// Builds a browser mirror for an arbitrary AHTLA cipher, routing exactly the way
+/// <see cref="AhtolaBrowserPageCipherFactory"/> does inside the package: the
+/// AES-GCM ciphers through the Web Crypto stand-in, every AEGIS variant through
+/// the same pure-managed <see cref="AhtolaManagedAegisPageCipher"/> the browser
+/// uses. Off-browser there is no SubtleCrypto, so the stand-in is the only part
+/// that differs from production.
+/// </summary>
+internal sealed class BrowserCipherHarness : IAsyncDisposable
+{
+    private readonly BrowserEncryptedPersistence _persistence;
+
+    private BrowserCipherHarness(BrowserMirroredFileSystem mirror, BrowserEncryptedPersistence persistence)
+    {
+        Mirror = mirror;
+        _persistence = persistence;
+    }
+
+    public BrowserMirroredFileSystem Mirror { get; }
+
+    public static async ValueTask<BrowserCipherHarness> CreateAsync(
+        FakeBrowserPersistentStore store,
+        Core.Storage.AhtolaEncryptionCipher cipher,
+        string hexKey,
+        string ownedDirectory)
+    {
+        var key = Convert.FromHexString(hexKey);
+        IAhtolaAsyncPageCipher pageCipher =
+            cipher is Core.Storage.AhtolaEncryptionCipher.Aes128Gcm
+                or Core.Storage.AhtolaEncryptionCipher.Aes256Gcm
+                ? new DesktopAsyncPageCipher(cipher, key)
+                : new AhtolaManagedAegisPageCipher(cipher, key);
+        CryptographicOperations.ZeroMemory(key);
+
+        var persistence = new BrowserEncryptedPersistence(new AhtolaAsyncPageTransformer(pageCipher));
+        try
+        {
+            var mirror = await BrowserMirroredFileSystem.CreateAsync(
+                store,
+                ownedDirectory,
+                ownsPersistent: false,
+                encryption: persistence);
+            return new BrowserCipherHarness(mirror, persistence);
+        }
+        catch
+        {
+            await persistence.DisposeAsync();
+            throw;
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            await Mirror.DisposeAsync();
+        }
+        finally
+        {
+            await _persistence.DisposeAsync();
+        }
+    }
+}
+
 /// <summary>An in-memory stand-in for the browser's OPFS-backed persistent store.</summary>
 internal sealed class FakeBrowserPersistentStore : IBrowserPersistentStore
 {
@@ -79,6 +143,12 @@ internal sealed class FakeBrowserPersistentStore : IBrowserPersistentStore
     public List<string> FlushPaths { get; } = [];
 
     public byte[] Read(string path) => _files[path].AsSpan().ToArray();
+
+    /// <summary>
+    /// Optional gate invoked before every persisted write. A test can park a flush inside the
+    /// store to observe the mirror while durable work is genuinely in flight.
+    /// </summary>
+    public Func<string, CancellationToken, ValueTask>? BeforeWrite { get; set; }
 
     public bool Contains(string path) => _files.ContainsKey(path);
 
@@ -161,13 +231,31 @@ internal sealed class FakeBrowserPersistentStore : IBrowserPersistentStore
             ReadOnlyMemory<byte> source,
             CancellationToken cancellationToken = default)
         {
+            if (owner.BeforeWrite is { } gate)
+                return WriteGatedAsync(gate, position, source, cancellationToken);
+
+            WriteCore(position, source);
+            return ValueTask.CompletedTask;
+        }
+
+        private async ValueTask WriteGatedAsync(
+            Func<string, CancellationToken, ValueTask> gate,
+            long position,
+            ReadOnlyMemory<byte> source,
+            CancellationToken cancellationToken)
+        {
+            await gate(path, cancellationToken);
+            WriteCore(position, source);
+        }
+
+        private void WriteCore(long position, ReadOnlyMemory<byte> source)
+        {
             var content = owner._files[path];
             var required = (int)position + source.Length;
             if (content.Length < required)
                 Array.Resize(ref content, required);
             source.Span.CopyTo(content.AsSpan((int)position));
             owner._files[path] = content;
-            return ValueTask.CompletedTask;
         }
 
         public ValueTask SetLengthAsync(long length, CancellationToken cancellationToken = default)

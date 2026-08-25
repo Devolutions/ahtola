@@ -76,6 +76,7 @@ public class AhtolaConnectionOptions
                 AhtolaEncryptionCipher.Aes256Gcm => AhtolaRemoteEncryptionCipher.Aes256Gcm,
                 AhtolaEncryptionCipher.Aegis256 => AhtolaRemoteEncryptionCipher.Aegis256,
                 AhtolaEncryptionCipher.Aegis256x2 => AhtolaRemoteEncryptionCipher.Aegis256X2,
+                AhtolaEncryptionCipher.Aegis256x4 => AhtolaRemoteEncryptionCipher.Aegis256X4,
                 AhtolaEncryptionCipher.Aegis128l => AhtolaRemoteEncryptionCipher.Aegis128L,
                 AhtolaEncryptionCipher.Aegis128x2 => AhtolaRemoteEncryptionCipher.Aegis128X2,
                 AhtolaEncryptionCipher.Aegis128x4 => AhtolaRemoteEncryptionCipher.Aegis128X4,
@@ -196,6 +197,98 @@ public class AhtolaConnectionOptions
         return builder.Uri;
     }
 
+    /// <summary>
+    /// True when the data source addresses a Hrana WebSocket endpoint (<c>ws</c>/<c>wss</c>).
+    /// </summary>
+    /// <remarks>
+    /// <c>http</c>, <c>https</c>, <c>libsql</c> and <c>turso</c> stay on the HTTP pipeline;
+    /// only the explicit WebSocket schemes select the persistent transport.
+    /// </remarks>
+    internal bool IsWebSocketRemote
+    {
+        get
+        {
+            if (IsReplica || !Uri.TryCreate(DataSource, UriKind.Absolute, out var uri))
+                return false;
+
+            return AhtolaRemoteClient.IsWebSocketScheme(uri.Scheme);
+        }
+    }
+
+    /// <summary>
+    /// Builds the <c>ws</c>/<c>wss</c> endpoint used by the Hrana WebSocket transport.
+    /// </summary>
+    /// <remarks>
+    /// The upgrade happens on the URL's own path (the sqld server registers the WebSocket
+    /// route on <c>"/"</c>); the <c>/v2</c> and <c>/v3</c> suffixes belong to the HTTP
+    /// pipeline only and are never appended here.
+    /// </remarks>
+    internal Uri GetRemoteWebSocketUri()
+    {
+        if (!Uri.TryCreate(DataSource, UriKind.Absolute, out var uri)
+            || !AhtolaRemoteClient.IsWebSocketScheme(uri.Scheme))
+        {
+            throw new InvalidOperationException($"Data Source is not a remote Ahtola WebSocket URL: {DataSource}");
+        }
+
+        if (!string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
+            throw new InvalidOperationException("Remote Ahtola URLs must not include query strings or fragments.");
+        if (!string.IsNullOrEmpty(uri.UserInfo))
+            throw new InvalidOperationException("Remote Ahtola URLs must not include embedded user information; use Auth Token instead.");
+        if (string.IsNullOrEmpty(uri.Host))
+            throw new InvalidOperationException("Remote Ahtola URLs must include a host.");
+
+        var scheme = uri.Scheme.Equals("wss", StringComparison.OrdinalIgnoreCase)
+            ? ValidateTls(uri.Scheme, expectedTls: true, normalizedScheme: "wss")
+            : ValidateTls(uri.Scheme, expectedTls: false, normalizedScheme: "ws");
+
+        var builder = new UriBuilder(uri)
+        {
+            Scheme = scheme,
+            Port = uri.IsDefaultPort ? -1 : uri.Port,
+            UserName = string.Empty,
+            Password = string.Empty,
+        };
+
+        return builder.Uri;
+    }
+
+    /// <summary>Reads the validated Hrana WebSocket tunables from the connection string.</summary>
+    internal AhtolaHranaWebSocketOptions GetWebSocketOptions()
+    {
+        var defaults = AhtolaHranaWebSocketOptions.Default;
+        return new AhtolaHranaWebSocketOptions
+        {
+            KeepAliveInterval = ReadSeconds("Ws Keepalive Interval", defaults.KeepAliveInterval),
+            KeepAliveTimeout = ReadSeconds("Ws Keepalive Timeout", defaults.KeepAliveTimeout),
+            HalfOpenTimeout = ReadSeconds("Ws Half Open Timeout", defaults.HalfOpenTimeout),
+            MaxMessageBytes = ReadInt32("Ws Max Message Bytes", defaults.MaxMessageBytes),
+            ConnectAttempts = ReadInt32("Ws Connect Attempts", defaults.ConnectAttempts),
+        }.Validate();
+    }
+
+    private TimeSpan ReadSeconds(string keyword, TimeSpan defaultValue)
+    {
+        var raw = _builder.GetOption(keyword);
+        if (string.IsNullOrWhiteSpace(raw))
+            return defaultValue;
+        if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var seconds) || seconds < 0)
+            throw new InvalidOperationException($"{keyword} must be a non-negative number of seconds.");
+
+        return TimeSpan.FromSeconds(seconds);
+    }
+
+    private int ReadInt32(string keyword, int defaultValue)
+    {
+        var raw = _builder.GetOption(keyword);
+        if (string.IsNullOrWhiteSpace(raw))
+            return defaultValue;
+        if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
+            throw new InvalidOperationException($"{keyword} must be an integer.");
+
+        return value;
+    }
+
     public static AhtolaConnectionOptions Parse(string connectionString)
     {
         return new AhtolaConnectionOptions(new AhtolaConnectionStringBuilder(connectionString));
@@ -214,9 +307,9 @@ public class AhtolaConnectionOptions
             || GetEncryptionCipher().HasValue
                     || _builder.GetOption("Encryption Key") is not null
                     || !string.IsNullOrWhiteSpace(_builder.GetOption("Password")))
-                {
-                    return false;
-                }
+        {
+            return false;
+        }
 
         key = ManagedConnectionPoolKey.Create(
             dataSource,
@@ -281,94 +374,127 @@ public class AhtolaConnectionOptions
         ManagedLocalOpenMode mode,
         string dataSource)
     {
-            var password = _builder.GetOption("Password");
-            var hasPassword = !string.IsNullOrEmpty(password);
-                var passwordScheme = _builder.GetOption("Password Scheme");
-                var cipher = _builder.GetOption("Encryption Cipher");
-                var key = _builder.GetOption("Encryption Key");
-                var hasKey = !string.IsNullOrWhiteSpace(key);
+        var password = _builder.GetOption("Password");
+        var hasPassword = !string.IsNullOrEmpty(password);
+        var passwordScheme = _builder.GetOption("Password Scheme");
+        var cipher = _builder.GetOption("Encryption Cipher");
+        var key = _builder.GetOption("Encryption Key");
+        var hasKey = !string.IsNullOrWhiteSpace(key);
 
-                if (!hasPassword && !string.IsNullOrWhiteSpace(passwordScheme))
-                {
-                    throw new InvalidOperationException(
-                        "Password Scheme requires Password=; it only selects passphrase key derivation.");
-                }
+        if (!hasPassword && !string.IsNullOrWhiteSpace(passwordScheme))
+        {
+            throw new InvalidOperationException(
+                "Password Scheme requires Password=; it only selects passphrase key derivation.");
+        }
 
-                if (hasPassword && hasKey)
+        if (hasPassword && hasKey)
+        {
+            throw new InvalidOperationException(
+                "Password and Encryption Key cannot be combined; use one passphrase or one hex key.");
+        }
+
+        ManagedEncryptionOptions? options;
+        if (hasPassword)
+        {
+            var scheme = AhtolaPassphraseSchemes.Resolve(passwordScheme);
+            if (!string.IsNullOrWhiteSpace(cipher)
+                && !CipherNameMatches(cipher, scheme.PageCipher))
             {
-                    throw new InvalidOperationException(
-                        "Password and Encryption Key cannot be combined; use one passphrase or one hex key.");
-                }
-
-                ManagedEncryptionOptions? options;
-                if (hasPassword)
-                {
-                    var scheme = AhtolaPassphraseSchemes.Resolve(passwordScheme);
-                    if (!string.IsNullOrWhiteSpace(cipher)
-                        && !CipherNameMatches(cipher, scheme.PageCipher))
-                    {
-                        throw new NotSupportedException(
-                            $"Password Scheme '{scheme.Id}' derives {scheme.PageCipher}; "
-                            + "Encryption Cipher must be omitted or match that page cipher.");
-                    }
-
-                    options = scheme.DeriveEncryptionOptions(password!);
-                }
-                else if (string.IsNullOrWhiteSpace(cipher))
-                {
-                    if (key is not null)
-                {
-                    throw new InvalidOperationException(
-                        "Encryption Cipher is required when Encryption Key is specified.");
-                }
-
-                return null;
-            }
-            else if (!hasKey)
-            {
-                throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
-            }
-            else
-            {
-                options = cipher.ToLowerInvariant() switch
-                {
-                    "aes128gcm" => ManagedEncryptionOptions.FromHex(
-                        Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
-                        key!),
-                    "aes256gcm" => ManagedEncryptionOptions.FromHex(
-                        Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
-                        key!),
-                    _ => throw new NotSupportedException(
-                        "Local Provider=Managed supports only Ahtola encrypted format version 0 with "
-                        + "AES128GCM (cipher ID 1) or AES256GCM (cipher ID 2); cipher fallback is not permitted."),
-                };
-            }
-
-            if (mode == ManagedLocalOpenMode.Memory || dataSource == ":memory:")
-            {
-                options.Dispose();
                 throw new NotSupportedException(
-                    "Encryption is supported only for file-backed databases when Local Provider=Managed.");
+                    $"Password Scheme '{scheme.Id}' derives {scheme.PageCipher}; "
+                    + "Encryption Cipher must be omitted or match that page cipher.");
             }
 
-            return options;
-                }
-
-                private static bool CipherNameMatches(string cipherName, Ahtola.Core.Storage.AhtolaEncryptionCipher cipher)
-                    => cipherName.ToLowerInvariant() switch
-                    {
-                        "aes128gcm" => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
-                        "aes256gcm" => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
-                        _ => false,
-                    };
+            options = scheme.DeriveEncryptionOptions(password!);
+        }
+        else if (string.IsNullOrWhiteSpace(cipher))
+        {
+            if (key is not null)
+            {
+                throw new InvalidOperationException(
+                    "Encryption Cipher is required when Encryption Key is specified.");
             }
 
-            internal readonly record struct ManagedLocalOpenOptions(
-    string DataSource,
-    bool ReadOnly,
-    ManagedEncryptionOptions? Encryption,
-    string? SharedMemoryName,
-    bool ForeignReadOnly = false) : IDisposable
+            return null;
+        }
+        else if (!hasKey)
+        {
+            throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
+        }
+        else
+        {
+            options = cipher.ToLowerInvariant() switch
+            {
+                "aes128gcm" or "aes-128-gcm" or "aes_128_gcm" => ManagedEncryptionOptions.FromHex(
+                    Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
+                    key!),
+                "aes256gcm" or "aes-256-gcm" or "aes_256_gcm" => ManagedEncryptionOptions.FromHex(
+                    Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
+                    key!),
+                "aegis256" or "aegis-256" or "aegis_256" => ManagedEncryptionOptions.FromHex(
+                    Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256,
+                    key!),
+                "aegis256x2" or "aegis-256x2" or "aegis_256x2" => ManagedEncryptionOptions.FromHex(
+                    Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X2,
+                    key!),
+                "aegis256x4" or "aegis-256x4" or "aegis_256x4" => ManagedEncryptionOptions.FromHex(
+                    Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X4,
+                    key!),
+                "aegis128l" or "aegis-128l" or "aegis_128l" => ManagedEncryptionOptions.FromHex(
+                    Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128L,
+                    key!),
+                "aegis128x2" or "aegis-128x2" or "aegis_128x2" => ManagedEncryptionOptions.FromHex(
+                    Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X2,
+                    key!),
+                "aegis128x4" or "aegis-128x4" or "aegis_128x4" => ManagedEncryptionOptions.FromHex(
+                    Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X4,
+                    key!),
+                _ => throw new NotSupportedException(
+                    "Local Provider=Managed supports only Ahtola encrypted format version 0 cipher IDs 1 through 8 "
+                    + "(AES128GCM, AES256GCM, AEGIS256, AEGIS256X2, AEGIS256X4, AEGIS128L, AEGIS128X2, AEGIS128X4); "
+                    + "cipher fallback is not permitted."),
+            };
+        }
+
+        if (mode == ManagedLocalOpenMode.Memory || dataSource == ":memory:")
+        {
+            options.Dispose();
+            throw new NotSupportedException(
+                "Encryption is supported only for file-backed databases when Local Provider=Managed.");
+        }
+
+        return options;
+    }
+
+    private static bool CipherNameMatches(string cipherName, Ahtola.Core.Storage.AhtolaEncryptionCipher cipher)
+        => cipherName.ToLowerInvariant() switch
+        {
+            "aes128gcm" or "aes-128-gcm" or "aes_128_gcm"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
+            "aes256gcm" or "aes-256-gcm" or "aes_256_gcm"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
+            "aegis256" or "aegis-256" or "aegis_256"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256,
+            "aegis256x2" or "aegis-256x2" or "aegis_256x2"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X2,
+            "aegis256x4" or "aegis-256x4" or "aegis_256x4"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X4,
+            "aegis128l" or "aegis-128l" or "aegis_128l"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128L,
+            "aegis128x2" or "aegis-128x2" or "aegis_128x2"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X2,
+            "aegis128x4" or "aegis-128x4" or "aegis_128x4"
+                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X4,
+            _ => false,
+        };
+}
+
+internal readonly record struct ManagedLocalOpenOptions(
+string DataSource,
+bool ReadOnly,
+ManagedEncryptionOptions? Encryption,
+string? SharedMemoryName,
+bool ForeignReadOnly = false) : IDisposable
 {
     public void Dispose() => Encryption?.Dispose();
 }

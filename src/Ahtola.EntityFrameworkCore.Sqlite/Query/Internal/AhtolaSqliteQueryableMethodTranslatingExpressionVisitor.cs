@@ -1,7 +1,9 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Collections;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 using System.Reflection;
 using Microsoft.EntityFrameworkCore;
@@ -289,13 +291,14 @@ public sealed class AhtolaSqliteQueryableMethodTranslatingExpressionVisitor : Re
                     columnNullable: false),
                 ascending: true));
 
+        var nullableElementClrType = MakeNullable(elementClrType);
         Expression shaperExpression = new ProjectionBindingExpression(
-            selectExpression, new ProjectionMember(), MakeNullable(elementClrType));
+            selectExpression, new ProjectionMember(), nullableElementClrType);
 
-        if (elementClrType != shaperExpression.Type)
+        if (elementClrType != nullableElementClrType)
         {
             Debug.Assert(
-                MakeNullable(elementClrType) == shaperExpression.Type,
+                nullableElementClrType == shaperExpression.Type,
                 "expression.Type must be nullable of targetType");
 
             shaperExpression = Expression.Convert(shaperExpression, elementClrType);
@@ -583,22 +586,68 @@ public sealed class AhtolaSqliteQueryableMethodTranslatingExpressionVisitor : Re
             ?? expression.TypeMapping?.ClrType
             ?? expression.Type;
 
+    /// <summary>
+    /// Resolves the element type of an enumerable CLR type.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="Type.GetInterfaces"/> would answer this directly, but it requires
+    /// <see cref="DynamicallyAccessedMemberTypes.Interfaces"/> on its receiver and the receiver
+    /// here is <c>SqlExpression.Type</c>, whose getter declares no annotation — the requirement
+    /// cannot be propagated any further up, because the next frame is EF Core's own
+    /// <c>TranslatePrimitiveCollection</c> override signature. Reflecting anyway would leave a
+    /// permanent IL2072 in shipped source, so the shapes are resolved structurally instead.
+    /// </para>
+    /// <para>
+    /// The generic-argument count alone is not enough: <c>Dictionary&lt;TKey,
+    /// TValue&gt;.KeyCollection</c> and <c>ValueCollection</c> are generic over <em>two</em>
+    /// parameters and neither they nor any of their base types is <c>IEnumerable&lt;T&gt;</c>, so
+    /// they are recognized explicitly. Without that, <c>dictionary.Keys.Contains(...)</c> and
+    /// <c>dictionary.Values.Contains(...)</c> silently fail to translate.
+    /// </para>
+    /// </remarks>
     private static Type GetSequenceType(Type type)
     {
         if (type.IsArray)
             return type.GetElementType()!;
 
-        if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(IEnumerable<>))
-            return type.GetGenericArguments()[0];
-
-        foreach (var @interface in type.GetInterfaces())
+        for (var current = type; current is not null; current = current.BaseType)
         {
-            if (@interface.IsGenericType && @interface.GetGenericTypeDefinition() == typeof(IEnumerable<>))
-                return @interface.GetGenericArguments()[0];
+            if (!current.IsGenericType)
+                continue;
+
+            var arguments = current.GetGenericArguments();
+            var definition = current.GetGenericTypeDefinition();
+            if (DictionaryKeyCollections.Contains(definition))
+                return arguments[0];
+            if (DictionaryValueCollections.Contains(definition))
+                return arguments[1];
+            if (arguments.Length == 1 && typeof(IEnumerable).IsAssignableFrom(current))
+                return arguments[0];
         }
 
         throw new InvalidOperationException($"Type '{type}' is not an enumerable type.");
     }
+
+    /// <summary>
+    /// Key-view types whose element is the dictionary's first generic argument. Every other
+    /// dictionary in the BCL exposes its keys as <c>ICollection&lt;TKey&gt;</c> or
+    /// <c>IEnumerable&lt;TKey&gt;</c>, which the single-argument rule already covers.
+    /// </summary>
+    private static readonly HashSet<Type> DictionaryKeyCollections =
+    [
+        typeof(Dictionary<,>.KeyCollection),
+        typeof(SortedDictionary<,>.KeyCollection),
+    ];
+
+    /// <summary>
+    /// Value-view types whose element is the dictionary's second generic argument.
+    /// </summary>
+    private static readonly HashSet<Type> DictionaryValueCollections =
+    [
+        typeof(Dictionary<,>.ValueCollection),
+        typeof(SortedDictionary<,>.ValueCollection),
+    ];
 
     private static Type UnwrapNullableType(Type type)
         => Nullable.GetUnderlyingType(type) ?? type;
@@ -606,8 +655,49 @@ public sealed class AhtolaSqliteQueryableMethodTranslatingExpressionVisitor : Re
     private static bool IsNullableType(Type type)
         => !type.IsValueType || Nullable.GetUnderlyingType(type) is not null;
 
+    /// <summary>
+    /// Nullable counterparts of every value type the Ahtola SQLite type-mapping source can produce
+    /// for a primitive-collection element. Reifying them lets the projection keep its nullable shape
+    /// without <c>typeof(Nullable&lt;&gt;).MakeGenericType(...)</c>, which requires dynamic code
+    /// (IL3050) and is unavailable under NativeAOT.
+    /// </summary>
+    private static readonly Dictionary<Type, Type> NullableElementTypes = new()
+    {
+        [typeof(bool)] = typeof(bool?),
+        [typeof(byte)] = typeof(byte?),
+        [typeof(sbyte)] = typeof(sbyte?),
+        [typeof(char)] = typeof(char?),
+        [typeof(short)] = typeof(short?),
+        [typeof(ushort)] = typeof(ushort?),
+        [typeof(int)] = typeof(int?),
+        [typeof(uint)] = typeof(uint?),
+        [typeof(long)] = typeof(long?),
+        [typeof(ulong)] = typeof(ulong?),
+        [typeof(float)] = typeof(float?),
+        [typeof(double)] = typeof(double?),
+        [typeof(decimal)] = typeof(decimal?),
+        [typeof(Guid)] = typeof(Guid?),
+        [typeof(DateTime)] = typeof(DateTime?),
+        [typeof(DateTimeOffset)] = typeof(DateTimeOffset?),
+        [typeof(TimeSpan)] = typeof(TimeSpan?),
+        [typeof(DateOnly)] = typeof(DateOnly?),
+        [typeof(TimeOnly)] = typeof(TimeOnly?),
+    };
+
+    /// <summary>
+    /// Returns the nullable form of <paramref name="type"/>. Reference types and types that are
+    /// already <see cref="Nullable{T}"/> are returned unchanged. A value type outside the reified
+    /// map above (an enum, or a user struct with a custom value converter) keeps its non-nullable
+    /// form: the shaper then reads the element directly instead of reading a nullable and converting
+    /// back, which is the same observable result for a collection whose elements are non-nullable by
+    /// construction, and it avoids constructing a generic instantiation at run time.
+    /// </summary>
     private static Type MakeNullable(Type type)
-        => IsNullableType(type) ? type : typeof(Nullable<>).MakeGenericType(type);
+        => IsNullableType(type)
+            ? type
+            : NullableElementTypes.TryGetValue(type, out var nullable)
+                ? nullable
+                : type;
 
     /// <summary>
     ///     Wraps the given expression with any SQL logic necessary to convert a value coming out of a JSON document into the relational value

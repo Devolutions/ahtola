@@ -24,6 +24,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     private readonly List<string> _remainingSql = new();
     private readonly CommandBehavior _behavior;
     private readonly Action _closeCallback;
+    private readonly BrowserSynchronousAuthorization _synchronousAuthorization;
     private int _recordsAffected;
     private bool _isClosed;
     private bool _hasCurrentRow;
@@ -134,6 +135,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         _hadRecordsAffectedStatement = hadRecordsAffectedStatement;
         _behavior = behavior;
         _closeCallback = closeCallback;
+        _synchronousAuthorization = command.CaptureSynchronousAuthorization();
         ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
@@ -145,6 +147,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         _recordsAffected = recordsAffected;
         _behavior = behavior;
         _closeCallback = closeCallback;
+        _synchronousAuthorization = command.CaptureSynchronousAuthorization();
         ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
@@ -161,6 +164,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         _delegatedReader = delegatedReader ?? throw new ArgumentNullException(nameof(delegatedReader));
         _behavior = behavior;
         _closeCallback = closeCallback;
+        _synchronousAuthorization = command.CaptureSynchronousAuthorization();
         _skipDelegatedReaderToFirstColumnResult = skipToFirstColumnResult;
         if (skipToFirstColumnResult)
         {
@@ -735,7 +739,9 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         schema.Columns.Add(SchemaTableColumn.BaseColumnName, typeof(string));
         schema.Columns.Add(SchemaTableColumn.BaseSchemaName, typeof(string));
         schema.Columns.Add(SchemaTableColumn.BaseTableName, typeof(string));
-        schema.Columns.Add(SchemaTableColumn.DataType, typeof(Type));
+        // Share the single rooted DataType-column factory so both schema-table builders declare
+        // the column as typeof(Type) and the trim contract lives in exactly one place.
+        schema.Columns.Add(AhtolaSchemaCollections.CreateClrTypeColumn());
         schema.Columns.Add("DataTypeName", typeof(string));
         schema.Columns.Add(SchemaTableColumn.AllowDBNull, typeof(bool));
         schema.Columns.Add(SchemaTableColumn.IsAliased, typeof(bool));
@@ -1187,14 +1193,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         => _delegatedReader?.IsDBNullAsync(ordinal, cancellationToken) ?? CompleteAsync(() => IsDBNull(ordinal), cancellationToken);
 
     private void ThrowIfSynchronousBrowserOperation()
-    {
-        if (_command.RequiresAsyncExecution)
-        {
-            throw new PlatformNotSupportedException(
-                "Synchronous reader iteration is not supported by the browser database source. "
-                + "Use ReadAsync or NextResultAsync.");
-        }
-    }
+        => _synchronousAuthorization.ThrowIfReaderIterationRejected();
 
     public override Task<T> GetFieldValueAsync<T>(int ordinal, CancellationToken cancellationToken)
         => CompleteAsync(() =>
@@ -1238,11 +1237,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing && !_isClosed && _command.RequiresAsyncExecution)
-        {
-            throw new PlatformNotSupportedException(
-                "Synchronous reader disposal is not supported by the browser database source. Use DisposeAsync.");
-        }
+        if (disposing && !_isClosed)
+            _synchronousAuthorization.ThrowIfReaderDisposalRejected();
 
         if (disposing)
             CloseCore(throwOnError: false);

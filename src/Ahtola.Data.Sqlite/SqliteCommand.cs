@@ -464,14 +464,45 @@ public class SqliteCommand : DbCommand
     internal bool RequiresAsyncExecution
         => Connection?.RequiresAsyncExecution == true;
 
+    /// <summary>
+    /// Whether this command's current text may execute synchronously. A browser
+    /// data source opted into <c>AhtolaBrowserSynchronousMode.ReadOnlyMirror</c>
+    /// permits statements proven incapable of mutating the database, because they
+    /// are served entirely from the managed in-memory mirror.
+    /// </summary>
+    /// <remarks>
+    /// Valid only for the command-level entry points, which classify the text they are about to
+    /// prepare. A data reader outlives the call that produced it, so it carries the
+    /// <see cref="BrowserSynchronousAuthorization"/> captured by
+    /// <see cref="CaptureSynchronousAuthorization"/> instead.
+    /// </remarks>
+    internal bool AllowsSynchronousExecution
+        => Connection?.AllowsSynchronousSql(CommandText) != false;
+
+    /// <summary>
+    /// Captures an immutable synchronous-execution decision for the text this command is about to
+    /// prepare and execute, so a reader never re-derives it from mutable state.
+    /// </summary>
+    internal BrowserSynchronousAuthorization CaptureSynchronousAuthorization()
+        => BrowserSynchronousAuthorization.Capture(Connection, CommandText);
+
+    /// <summary>
+    /// Whether this command's connection opted into synchronous read-mirror mode,
+    /// which distinguishes "this statement is not provably read-only" from
+    /// "this data source is asynchronous only".
+    /// </summary>
+    internal bool SupportsSynchronousReads
+        => Connection?.SupportsSynchronousReads == true;
+
     private void ThrowIfSynchronousBrowserOperation(string asyncAlternative)
     {
-        if (RequiresAsyncExecution)
-        {
-            throw new PlatformNotSupportedException(
-                $"Synchronous command execution is not supported by the browser database source. "
-                + $"Use {asyncAlternative}.");
-        }
+        if (AllowsSynchronousExecution)
+            return;
+
+        throw new PlatformNotSupportedException(
+            BrowserSynchronousExecutionContract.DescribeCommandRejection(
+                asyncAlternative,
+                SupportsSynchronousReads));
     }
 
     private async ValueTask<DbDataReader> ExecuteManagedLocalAsync(

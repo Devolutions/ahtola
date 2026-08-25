@@ -380,9 +380,10 @@ public class AhtolaSqliteDatabaseCreator(
         {
             AhtolaSqliteConnection.ClearAllPools();
             // Remove the database file and every sidecar a managed replica may have written
-            // alongside it (-wal/-shm/-journal, the bootstrap/sync metadata, and the local
-            // change journal) — leaving any of these behind causes the next bootstrap to find
-            // an inconsistent partial state (see ManagedReplicaBootstrapper's own pair checks).
+            // alongside it (-wal/-shm/-journal, the bootstrap/sync metadata, the local change
+            // journal, and any open push-conflict marker) — leaving any of these behind causes
+            // the next bootstrap to find an inconsistent partial state (see
+            // ManagedReplicaBootstrapper's own pair checks).
             foreach (var path in ManagedReplicaBootstrapper.GetLocalArtifactPaths(replicaPath))
                 File.Delete(path);
         }
