@@ -45,6 +45,8 @@ internal static class SqliteBuiltinFunctions
         "VECTOR_DISTANCE_JACCARD", "VECTOR_DISTANCE_DOT", "VECTOR_CONCAT", "VECTOR_SLICE",
         // Managed full-text index method surface (Ahtola.Core.Search.ManagedFtsFunctions).
         "FTS_MATCH", "FTS_SCORE", "FTS_HIGHLIGHT", "FTS_SNIPPET",
+        // SQLite FTS5 auxiliary functions. These require a row from an fts5 virtual table.
+        "BM25", "HIGHLIGHT", "SNIPPET",
     };
 
     private static readonly HashSet<string> WindowOnlyNames = new(StringComparer.Ordinal)
@@ -98,6 +100,9 @@ internal static class SqliteBuiltinFunctions
         // WHERE clauses, generated columns, CHECK constraints) must therefore reject it, exactly
         // the way SQLite rejects any function it did not mark SQLITE_DETERMINISTIC.
         "FTS_SCORE",
+        "BM25",
+        "HIGHLIGHT",
+        "SNIPPET",
     };
 
     public static bool Contains(string name)
@@ -163,13 +168,13 @@ internal static class SqliteBuiltinFunctions
         if (normalized is "REPLACE" or "IIF" or "IF" or "VECTOR_SLICE")
             return [3];
 
-        if (normalized is "FTS_HIGHLIGHT")
+        if (normalized is "FTS_HIGHLIGHT" or "HIGHLIGHT")
             return [4];
 
-        if (normalized is "FTS_SNIPPET")
+        if (normalized is "FTS_SNIPPET" or "SNIPPET")
             return [6];
 
-        if (normalized is "FTS_MATCH" or "FTS_SCORE")
+        if (normalized is "FTS_MATCH" or "FTS_SCORE" or "BM25")
             return [-1];
 
         if (normalized is "COALESCE" or "CHAR" or "CONCAT" or "CONCAT_WS" or "FORMAT"

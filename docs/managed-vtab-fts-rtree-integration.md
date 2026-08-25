@@ -2,7 +2,7 @@
 
 ## Upstream reference
 
-Turso `v0.7.2` parses `CREATE VIRTUAL TABLE` into `CreateVirtualTable`
+The pinned Turso `v0.8.0-pre.7` source parses `CREATE VIRTUAL TABLE` into `CreateVirtualTable`
 (`turso-src/sqlite/parser/src/ast.rs`) and routes module instances through
 `VirtualTable` (`turso-src/core/vtab.rs`). Its planner calls `best_index` with
 constraints and ordering, then sends the plan and bound arguments to cursor
@@ -12,17 +12,18 @@ is implemented with Tantivy. The pinned source has no R-Tree module.
 
 The managed implementation follows the lifecycle shape without copying the
 native extension ABI or Tantivy dependency. Turso's index-method FTS remains a
-separate, possible future alignment path; this module is not an FTS5-parity
-claim.
+separate implementation path. Ahtola reuses its own pure-managed posting,
+query, ranking, and offset machinery for the SQL-compatible FTS5 slice below;
+it does not reuse Tantivy or claim Tantivy's storage representation.
 
 ## Implemented modules
 
 `ManagedVirtualTableModuleRegistry` statically registers direct singleton
 instances of these NativeAOT-safe modules:
 
-| Module | Accepted declaration | Initial scope |
+| Module | Accepted declaration | Scope |
 | --- | --- | --- |
-| `fts5` | One or more identifier column names | Managed token/posting index with term, phrase, prefix, AND/OR/NOT queries through the virtual-table cursor contract |
+| `fts5` | One or more identifier columns, optional `UNINDEXED`, and the options listed below | Content-owning managed FTS5 with bounded MATCH, rank/BM25, highlighting/snippets, and `optimize`/`rebuild` |
 | `rtree` | `id, min0, max0, ...` | Finite floating-point bounds and equality/range cursor constraints |
 | `rtree_i32` | `id, min0, max0, ...` | Integer-only coordinates and equality/range cursor constraints |
 
@@ -32,12 +33,60 @@ The modules use the canonical `ManagedVirtualTableModule`,
 registry's static constructor, uses no reflection or assembly scanning, and
 directly roots every module implementation for trimming and NativeAOT.
 
-`ManagedFtsTokenizer`, `ManagedFtsQueryParser`, and `ManagedFtsIndex` provide
-the FTS module's reusable tokenization, query parsing, and posting store.
+`ManagedFtsTokenization`, `ManagedFtsQueryLanguage`,
+`ManagedFtsSearchIndex`, and `ManagedFtsFunctions` provide the FTS module's
+reusable tokenization, bounded query parsing, scored posting store, and exact
+source-offset rendering.
 `ManagedRTreeBounds` and `ManagedRTreeIndex` provide inclusive
 N-dimensional bounds and deterministic spatial storage. The module adapters
 own virtual-table schema validation, `VUpdate` argument conversion, and
 transaction snapshots; the reusable components do not own catalog state.
+
+## Content-owning FTS5 SQL surface
+
+The managed `fts5` module accepts bare identifier columns with optional
+`UNINDEXED`, plus this fail-closed option subset:
+
+| Option | Accepted values | Managed behavior |
+| --- | --- | --- |
+| `tokenize` | `unicode61`, `ascii`, `trigram` | Selects the matching statically rooted managed tokenizer. Tokenizer modifiers and `porter` are rejected. |
+| `prefix` | One to 16 distinct integer lengths from 1 through 999 | Validated and retained in the declaration. Prefix MATCH uses the managed posting dictionary's bounded live-term expansion; no separate SQLite prefix shadow index is synthesized. |
+| `detail` | `full`, `column`, `none` | Controls retained positional/column detail. Phrase/NEAR and column-filter queries fail when the selected detail cannot answer them. |
+| `columnsize` | `0`, `1` | Accepted with SQLite-visible ranking semantics. Ahtola derives token lengths from its content rows instead of creating a `%_docsize` shadow table. |
+
+`content` and `content_rowid` are rejected. Contentless and external-content
+tables require SQLite's shadow-table/trigger contracts and are not represented
+by Ahtola's private payload.
+
+MATCH supports the bounded managed term, phrase, prefix, boolean, column
+filter, initial-token anchor, and NEAR grammar. Both `table MATCH ?` and
+`column MATCH ?` are planner constraints. MATCH cursors expose the hidden
+`rank` column, use SQLite's negative BM25 convention (lower is better), return
+default scans in rank order, and consume a complete `ORDER BY rank ASC|DESC`.
+A full scan exposes `rank` as NULL.
+
+These source-bound auxiliary functions are available on an FTS5 row:
+
+- `bm25(table [, weight...])`
+- `highlight(table, column, before, after)`
+- `snippet(table, column, before, after, ellipsis, tokens)`, including column
+  `-1` for automatic selection
+
+The first argument is resolved from the cursor binding carried by the row,
+including through joins and correlated outer-row chains. It is not inferred
+from a same-named ordinary column. Application-registered scalar callbacks
+still shadow these built-ins. BM25 uses SQLite's IDF floor, total-document
+length normalization, negative score convention, and per-column term weights.
+The default score is covered by stock-SQLite oracle tests; weighted
+phrase/NEAR scoring remains a deterministic approximation because the managed
+candidate currently retains aggregate phrase frequency rather than
+per-column phrase frequency.
+
+`INSERT INTO table VALUES (...)` targets visible columns only. Explicit
+`rowid`, `_rowid_`, and `oid` inserts and updates map to VUpdate's new-rowid
+slot unless a real declared column shadows that alias. Content-owning tables accept
+`INSERT INTO table(table) VALUES('optimize')` and `... VALUES('rebuild')`.
+Other commands, rank configuration, and `delete-all` fail closed.
 
 ## Durable managed catalog contract
 
@@ -67,8 +116,8 @@ other engines must not be expected to query or maintain these tables.
 SQL `INSERT`, `UPDATE`, and `DELETE` use the canonical foundation. The
 foundation extracts source-local conjunctive predicates and ordering, passes
 the selected `SqlValue` arguments to `Filter`, and honors
-`ManagedVirtualTableConstraintUsage.Omit`. FTS `MATCH` and R-Tree
-equality/range plans are therefore available through ordinary SQL, while DML
+`ManagedVirtualTableConstraintUsage.Omit`. FTS `MATCH`/rank ordering and R-Tree equality/range plans are therefore
+available through ordinary SQL, while DML
 uses the VUpdate old-rowid/new-rowid/declared-column layout under
 begin/sync/commit/rollback.
 
@@ -80,18 +129,18 @@ well as schema state for `CREATE`, `DROP`, and `RENAME`.
 
 ## Remaining product limitations
 
-- `fts5` is a small managed query/tokenizer subset, not FTS5 compatibility:
-  tokenizer options, external/contentless tables, auxiliary functions,
-  ranking, snippets, and FTS5-specific command syntax are unsupported.
-  For ranked full-text search over an ordinary table, use the `fts` **index
-  method** instead — see [docs/managed-index-methods.md](managed-index-methods.md),
-  which ships tokenizer options, BM25 ranking, highlighting and snippets.
+- FTS5 shadow tables, `%_data`/`%_idx`/`%_content`/`%_docsize` file layouts,
+  external/contentless tables, custom tokenizers, `fts5vocab`, rank
+  configuration, and the complete stock FTS5 query grammar remain
+  unsupported. The managed payload is not portable FTS5 storage.
+- The ordinary-table `fts` **index method** remains a separate Ahtola surface;
+  see [docs/managed-index-methods.md](managed-index-methods.md). It must not be
+  confused with the `CREATE VIRTUAL TABLE ... USING fts5` contract here.
 - `rtree` does not expose SQLite's full R-Tree auxiliary/geometry callback
-  surface. `rtree_i32` accepts only signed 32-bit integer coordinates.
+  surface or SQLite's outward-rounded float32 coordinate storage.
+  `rtree_i32` accepts only signed 32-bit integer coordinates.
 - The private payload is a managed catalog extension, not a portable FTS5/R-Tree
   file representation. Ahtola intentionally does not synthesize shadow tables.
-- The current generic DML path auto-assigns FTS rowids; explicitly naming
-  `rowid` in an `INSERT` column list is not supported yet.
 - Planner extraction is deliberately limited to source-local conjunctive
-  predicates. The modules do not consume ordering, so the engine remains
-  responsible for applying `ORDER BY`.
+  predicates. FTS5 consumes only a complete rank ordering; R-Tree and all
+  other ordering remain the engine's responsibility.
