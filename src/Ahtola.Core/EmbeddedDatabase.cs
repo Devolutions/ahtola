@@ -42787,14 +42787,6 @@ public sealed partial class EmbeddedConnection : IDisposable
     private VdbeExecutionOptions CreateVdbeExecutionOptions(EmbeddedDatabase database)
     {
         ArgumentNullException.ThrowIfNull(database);
-        if (_tempStore == 2)
-        {
-            return new VdbeExecutionOptions(
-                new InMemoryFileSystem(),
-                long.MaxValue,
-                temporaryDirectory: "ahtola-memory-sorter");
-        }
-
         var cacheSize = _cacheSizes.GetValueOrDefault(database, -2000);
         Int128 bytes = cacheSize < 0
             ? (Int128)(cacheSize == long.MinValue ? long.MaxValue : -cacheSize) * 1024
@@ -42804,6 +42796,15 @@ public sealed partial class EmbeddedConnection : IDisposable
             : bytes >= long.MaxValue
                 ? long.MaxValue
                 : (long)bytes;
+
+        if (_tempStore == 2)
+        {
+            return new VdbeExecutionOptions(
+                new InMemoryFileSystem(),
+                budget,
+                temporaryDirectory: "ahtola-memory-execution",
+                allowTemporaryFileSpill: false);
+        }
 
         return new VdbeExecutionOptions(
             PhysicalFileSystem.Instance,
