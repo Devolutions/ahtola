@@ -247,8 +247,9 @@ internal static class ManagedReplicaLogicalReplayer
 
     /// <summary>
     /// Replays the original SQL of still-unpushed local statements onto a freshly installed
-    /// ReplaceBase snapshot. Consecutive journal rows that share one statement (empty or repeated
-    /// <see cref="ReplicaLocalChange.Sql"/>) execute once. Used only after a complete page
+    /// ReplaceBase snapshot. Journal rows that share one statement (identified by
+    /// <see cref="ReplicaLocalChange.StatementSequence"/>) execute once, while two separate
+    /// executions of identical SQL still replay twice. Used only after a complete page
     /// replacement; incremental page patches cannot reconstruct a statement-level rebase.
     /// </summary>
     public static void ReplayPendingLocalStatements(
@@ -259,12 +260,25 @@ internal static class ManagedReplicaLogicalReplayer
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(pendingLocalChanges);
 
+        var replayed = new HashSet<long>();
         string? lastSql = null;
         foreach (var change in pendingLocalChanges)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (string.IsNullOrWhiteSpace(change.Sql) || string.Equals(change.Sql, lastSql, StringComparison.Ordinal))
+            if (!change.CarriesStatementSql)
                 continue;
+
+            // Statement identity, not SQL text: two consecutive executions of the same statement
+            // are two statements, and collapsing them by text would drop one of them.
+            if (change.StatementSequence != 0)
+            {
+                if (!replayed.Add(change.StatementSequence))
+                    continue;
+            }
+            else if (string.Equals(change.Sql, lastSql, StringComparison.Ordinal))
+            {
+                continue;
+            }
 
             lastSql = change.Sql;
             using var statement = connection.Prepare(change.Sql);

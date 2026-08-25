@@ -1,7 +1,191 @@
 using System.Collections.Concurrent;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using Ahtola.Core.Storage;
 
 namespace Ahtola;
+
+/// <summary>
+/// Resolves the single operating-system lock carrier that every alias of one physical replica
+/// database must share.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A carrier derived by concatenating a suffix onto <see cref="Path.GetFullPath(string)"/> is a
+/// <em>textual</em> derivation, so two names for the same physical file -- a hard link, a symbolic
+/// link, a junction/mount point, or a Windows short (8.3) name -- each produce their own carrier
+/// file and therefore their own, mutually invisible operating-system lock. Two processes holding
+/// what they each believe is the exclusive apply lease would then run concurrently over one
+/// database.
+/// </para>
+/// <para>
+/// The carrier is instead named from the file's <em>physical</em> identity (volume/device plus
+/// file/inode id) inside one stable directory, so every alias resolves to the same carrier
+/// regardless of how it was spelled or which process resolved it. The directory is deliberately
+/// not a sibling of the database: two hard links to one file may live in different directories,
+/// and a per-directory carrier would split them again.
+/// </para>
+/// <para>
+/// When a replica path does not exist yet (its very first bootstrap) there is no file identity to
+/// read, and a file that does not exist can have no hard links either; the carrier then falls back
+/// to the physical identity of the parent directory plus the file name, which is alias-safe for
+/// exactly that case. When neither can be proven -- a platform without file identity, or a missing
+/// parent directory -- resolution fails closed rather than silently handing back a carrier that
+/// cannot guarantee exclusion.
+/// </para>
+/// </remarks>
+internal static class ManagedReplicaLockCarrier
+{
+    /// <summary>
+    /// Overrides the stable lock directory. The default is per-user, so a deployment that shares
+    /// one replica file between operating-system users points every user at one shared directory.
+    /// </summary>
+    internal const string DirectoryVariable = "AHTOLA_REPLICA_LOCK_DIRECTORY";
+
+    /// <summary>Carrier kind for the exclusive apply/publication lease.</summary>
+    internal const string ApplyKind = "apply";
+
+    /// <summary>Carrier kind for the change-journal append/persist lease.</summary>
+    internal const string JournalKind = "journal";
+
+    /// <summary>
+    /// Resolves and creates the carrier file for <paramref name="databasePath"/>, failing closed
+    /// when the physical identity behind the path cannot be proven.
+    /// </summary>
+    internal static string Ensure(string databasePath, string kind)
+    {
+        var carrierPath = Resolve(databasePath, kind);
+        Directory.CreateDirectory(Path.GetDirectoryName(carrierPath)!);
+
+        // Opened and closed purely to create the carrier: the lease below takes its own handle.
+        using (File.Open(
+                   carrierPath,
+                   FileMode.OpenOrCreate,
+                   FileAccess.ReadWrite,
+                   FileShare.ReadWrite | FileShare.Delete))
+        {
+        }
+
+        return carrierPath;
+    }
+
+    /// <summary>
+    /// Resolves the carrier path without creating anything, or returns <see langword="null"/> when
+    /// the physical identity cannot be proven. Used by artifact enumeration, which must describe
+    /// what a replica owns without ever failing.
+    /// </summary>
+    internal static string? TryResolve(string databasePath, string kind)
+    {
+        try
+        {
+            return Resolve(databasePath, kind);
+        }
+        catch (Exception exception) when (exception is IOException
+                                              or UnauthorizedAccessException
+                                              or PlatformNotSupportedException
+                                              or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static string Resolve(string databasePath, string kind)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
+        var fullPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(databasePath));
+
+        if (TryReadFileIdentity(fullPath) is { } fileIdentity)
+            return Compose(kind, 'f', fileIdentity, name: null);
+
+        var parentDirectory = Path.GetDirectoryName(fullPath);
+        var fileName = Path.GetFileName(fullPath);
+        if (string.IsNullOrEmpty(parentDirectory) || string.IsNullOrEmpty(fileName))
+            throw FailClosed(fullPath);
+
+        try
+        {
+            var parentIdentity = SqliteWalSharedMemoryCarrierIdentity.FromDirectoryPath(parentDirectory);
+            return Compose(kind, 'd', parentIdentity, OperatingSystem.IsWindows() ? fileName.ToUpperInvariant() : fileName);
+        }
+        catch (Exception exception) when (exception is DirectoryNotFoundException
+                                              or FileNotFoundException
+                                              or PlatformNotSupportedException)
+        {
+            throw FailClosed(fullPath, exception);
+        }
+    }
+
+    private static SqliteWalSharedMemoryCarrierIdentity? TryReadFileIdentity(string fullPath)
+    {
+        try
+        {
+            return SqliteWalSharedMemoryCarrierIdentity.FromPath(fullPath);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    private static string Compose(
+        string kind,
+        char scope,
+        SqliteWalSharedMemoryCarrierIdentity identity,
+        string? name)
+    {
+        var builder = new StringBuilder(kind)
+            .Append('-')
+            .Append(scope)
+            .Append(identity.Device.ToString("x16", CultureInfo.InvariantCulture))
+            .Append(identity.File.ToString("x16", CultureInfo.InvariantCulture));
+        if (name is not null)
+        {
+            // The name only participates in the directory-identity fallback, where two different
+            // files legitimately share one parent identity. Hashing keeps the carrier name a fixed,
+            // path-separator-free, length-bounded token on every file system.
+            builder
+                .Append('-')
+                .Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(name))).AsSpan(0, 32));
+        }
+
+        return Path.Combine(ResolveDirectory(), builder.Append(".lock").ToString());
+    }
+
+    private static string ResolveDirectory()
+    {
+        if (Environment.GetEnvironmentVariable(DirectoryVariable) is { Length: > 0 } configured)
+            return Path.GetFullPath(configured);
+
+        var localApplicationData = Environment.GetFolderPath(
+            Environment.SpecialFolder.LocalApplicationData,
+            Environment.SpecialFolderOption.Create);
+        if (!string.IsNullOrEmpty(localApplicationData))
+            return Path.Combine(localApplicationData, "Ahtola", "replica-locks");
+
+        var userProfile = Environment.GetFolderPath(
+            Environment.SpecialFolder.UserProfile,
+            Environment.SpecialFolderOption.Create);
+        if (!string.IsNullOrEmpty(userProfile))
+            return Path.Combine(userProfile, ".ahtola", "replica-locks");
+
+        throw new IOException(
+            "Managed embedded replica could not resolve a stable lock directory for its cross-process "
+            + $"apply lease. Set the {DirectoryVariable} environment variable to a writable directory "
+            + "shared by every process that opens this replica.");
+    }
+
+    private static PlatformNotSupportedException FailClosed(string fullPath, Exception? inner = null)
+        => new(
+            $"Managed embedded replica could not prove the physical identity of '{fullPath}', so it "
+            + "cannot guarantee that every alias of this database shares one cross-process apply "
+            + "lease. The replica refuses to proceed rather than run two writers concurrently.",
+            inner);
+}
 
 /// <summary>
 /// Narrow seam for the single exclusive lease that must be held across a managed embedded
@@ -16,11 +200,11 @@ namespace Ahtola;
 /// direct caller such as a test -- never acquire it themselves, so the invariant holds regardless
 /// of how the bootstrapper is invoked.
 ///
-/// The only implementation today, <see cref="InProcessManagedReplicaApplyLockCoordinator"/>, only
-/// coordinates within this process. It is a placeholder for the forthcoming cross-process
-/// DELETE-mode SQLite OS lock (SHARED/RESERVED/PENDING/EXCLUSIVE main-file locking): when that
-/// lands, only <see cref="ManagedReplicaApplyLock.Current"/> needs to be repointed at the new
-/// implementation -- no bootstrapper call site, and no caller, should need to change.
+/// The default implementation, <see cref="CrossProcessManagedReplicaApplyLockCoordinator"/>,
+/// composes an in-process FIFO gate with a genuine operating-system byte-range lock over a carrier
+/// named from the database's physical identity, so the lease holds across processes and across
+/// every alias of the same file. <see cref="ManagedReplicaApplyLock.Current"/> is the only seam a
+/// test needs to redirect; no bootstrapper call site, and no caller, ever changes.
 /// </remarks>
 internal interface IManagedReplicaApplyLockCoordinator
 {
@@ -40,6 +224,12 @@ internal interface IManagedReplicaApplyLockCoordinator
 /// </summary>
 internal static class ManagedReplicaApplyLock
 {
+    /// <summary>
+    /// Legacy sibling carrier name. Builds before the physical-identity carrier put the lock file
+    /// next to the database, which split hard-link and other path aliases into separate locks. The
+    /// constant is retained so artifact enumeration still cleans up a file an older build left
+    /// behind; nothing acquires it any more.
+    /// </summary>
     internal const string CarrierSuffix = ".ahtola-replica-apply-lock";
     private const long PendingByte = 0x4000_0000;
     private const long SQLiteExclusiveRangeLength = 512;
@@ -66,6 +256,85 @@ internal static class ManagedReplicaApplyLock
             : null;
 }
 
+/// <summary>
+/// The exclusive lease that serializes <see cref="ManagedReplicaChangeJournal"/> append/persist
+/// across every instance, alias, and process that shares one physical replica database.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The journal publishes by rewriting the <em>whole</em> file, so two writers that each hold their
+/// own in-memory copy do not merge: whichever replaces last wins, and the other writer's durably
+/// appended, acknowledged, or discarded entries are silently gone. An in-object monitor cannot see
+/// a second <see cref="ManagedReplicaChangeJournal"/> instance, let alone a second process, so the
+/// serialization has to be an operating-system lock over the physical database identity.
+/// </para>
+/// <para>
+/// This is deliberately a <em>separate</em> carrier from the apply lease rather than a second byte
+/// range on the same one: on macOS the byte-range locks are process-associated POSIX locks, where
+/// closing any descriptor for a file drops every lock the process holds on it. Two independent
+/// carriers keep the two leases from interfering.
+/// </para>
+/// <para>
+/// Lock order is always apply lease first, journal lease second (the journal lease is only ever
+/// taken as a leaf, for the duration of one persist), so the two can never deadlock.
+/// </para>
+/// </remarks>
+internal static class ManagedReplicaJournalLock
+{
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> Gates =
+        new(StringComparer.Ordinal);
+
+    private static Func<string, IDisposable>? _override;
+
+    /// <summary>Test seam: replaces the physical lease with an in-process stand-in.</summary>
+    internal static Func<string, IDisposable>? Override
+    {
+        get => _override;
+        set => _override = value;
+    }
+
+    internal static IDisposable AcquireExclusive(string databasePath)
+    {
+        if (_override is { } factory)
+            return factory(databasePath);
+
+        var carrierPath = ManagedReplicaLockCarrier.Ensure(databasePath, ManagedReplicaLockCarrier.JournalKind);
+
+        // The in-process gate is taken first so threads of this process queue on a cheap semaphore
+        // instead of spinning on the operating-system lock, and so a reentrant-looking second
+        // acquisition inside one process is a deadlock we own rather than an OS-level lock upgrade
+        // whose behaviour differs per platform.
+        var gate = Gates.GetOrAdd(carrierPath, static _ => new SemaphoreSlim(1, 1));
+        gate.Wait();
+        try
+        {
+            var lease = new SqliteWalByteRangeLock(carrierPath).AcquireExclusive(
+                offset: 0,
+                length: 1,
+                Timeout.InfiniteTimeSpan,
+                CancellationToken.None);
+            return new Lease(gate, lease);
+        }
+        catch
+        {
+            gate.Release();
+            throw;
+        }
+    }
+
+    private sealed class Lease(SemaphoreSlim gate, IDisposable carrierLease) : IDisposable
+    {
+        private SemaphoreSlim? _gate = gate;
+        private IDisposable? _carrierLease = carrierLease;
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _carrierLease, null)?.Dispose();
+            Interlocked.Exchange(ref _gate, null)?.Release();
+        }
+    }
+}
+
 internal sealed class CrossProcessManagedReplicaApplyLockCoordinator : IManagedReplicaApplyLockCoordinator
 {
     internal static readonly CrossProcessManagedReplicaApplyLockCoordinator Instance = new();
@@ -80,15 +349,9 @@ internal sealed class CrossProcessManagedReplicaApplyLockCoordinator : IManagedR
         SqliteWalByteRangeLockLease? carrierLease = null;
         try
         {
-            var carrierPath = Path.GetFullPath(path) + ManagedReplicaApplyLock.CarrierSuffix;
-            using (File.Open(
-                       carrierPath,
-                       FileMode.OpenOrCreate,
-                       FileAccess.ReadWrite,
-                       FileShare.ReadWrite | FileShare.Delete))
-            {
-            }
-
+            // Named from the database's physical identity, so a hard link or any other alias of the
+            // same file resolves to this very carrier instead of minting a private one.
+            var carrierPath = ManagedReplicaLockCarrier.Ensure(path, ManagedReplicaLockCarrier.ApplyKind);
             carrierLease = new SqliteWalByteRangeLock(carrierPath).AcquireExclusive(
                 offset: 0,
                 length: 1,
@@ -123,10 +386,11 @@ internal sealed class CrossProcessManagedReplicaApplyLockCoordinator : IManagedR
 }
 
 /// <summary>
-/// In-process-only interim implementation of <see cref="IManagedReplicaApplyLockCoordinator"/>: a
-/// per-canonicalized-path FIFO exclusive async gate backed by <see cref="SemaphoreSlim"/>. Provides
-/// mutual exclusion within this process alone and intentionally makes no attempt at cross-process
-/// coordination -- that gap is exactly what the forthcoming DELETE-mode OS lock closes.
+/// The in-process half of the apply lease: a per-canonicalized-path FIFO exclusive async gate
+/// backed by <see cref="SemaphoreSlim"/>. It is composed with the physical carrier lock by
+/// <see cref="CrossProcessManagedReplicaApplyLockCoordinator"/> so threads of one process queue on
+/// a cheap semaphore rather than contending for the operating-system lock, and can also be
+/// selected on its own by a test that only needs in-process serialization.
 /// </summary>
 /// <remarks>
 /// Gates are created lazily per resolved <see cref="LockKey"/> and never removed. A real replica

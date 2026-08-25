@@ -63,6 +63,8 @@ submodule pointing at a moving branch tip in a release.
 ./build.ps1 validate-package           # pack + consumer restore/build/run/publish across net8/9/10
 ./build.ps1 validate-project-closure   # regex-scan project files for native/Rust refs
 ./build.ps1 validate-packed-closure     # validate built .nupkg contents
+./build.ps1 validate-browser-trim       # browser trim analysis (ADO-only must be warning-free)
+./build.ps1 validate-trim               # + desktop trimmed/NativeAOT trim analysis
 ./build.ps1 format-check                # dotnet format --verify-no-changes
 ```
 
@@ -220,6 +222,30 @@ design problem — stop and discuss it rather than landing it. The pure-managed
 closure scan does not catch AOT/trim violations automatically, so review new
 reflection against this list yourself before committing.
 
+Every shipped/embedded project (`Ahtola.Core`, `Ahtola.Data`,
+`Ahtola.Data.Sqlite`, `Ahtola.Data.Sqlite.Browser`,
+`Ahtola.EntityFrameworkCore.Sqlite`) sets `<IsAotCompatible>true</IsAotCompatible>`
+and `<IsTrimmable>true</IsTrimmable>`, so the trim/AOT analyzers run on every
+ordinary `dotnet build`. Never silence one of their diagnostics: no
+`UnconditionalSuppressMessage`, no `IL2xxx`/`IL3xxx` in `NoWarn`, no
+`SuppressTrimAnalysisWarnings=true`. `ManagedTrimAndAotContractTests` asserts
+those properties and the absence of suppressions, and
+`./build.ps1 validate-trim` publishes every consumer profile with trim
+analysis unsuppressed:
+
+- `samples/BrowserAdoTrimConsumer` (browser, ADO-only) and `samples/AdoTrimConsumer`
+  (desktop, ADO-only, trimmed and NativeAOT) must produce **zero** IL2xxx/IL3xxx
+  warnings in the entire closure. The desktop one is also executed after
+  publishing, so a contract that analyses cleanly but breaks at run time still
+  fails.
+- `samples/BrowserWasmConsumer` (adds EF Core) and `samples/ManagedPackageConsumer`
+  (trimmed and NativeAOT) must produce zero warnings attributed to Ahtola, and no
+  grouped `IL2104`/`IL3053` naming an Ahtola assembly. EF Core's own
+  `RequiresUnreferencedCode`/`RequiresDynamicCode` warnings are upstream and are
+  recorded, not suppressed.
+
+ILC and ILLink do not see the same reachable set, so a change can be clean under
+one and not the other — gate both before claiming a fix.
 ### Multi-targeting and version pins
 
 `Directory.Build.props` defines shared properties consumed by every project:
@@ -267,7 +293,26 @@ Keep types in `Ahtola.*` namespaces. The shipped package IDs are
 String references to `Turso.*` appear in a few places on purpose: the WAL
 interoperability contract (`docs/wal-interoperability-contract.md`) describes
 Turso's Rust engine as the interop *target*, and `AhtolaNativeProvider`/
-`AhtolaReplicaProvider`/`SqliteNativeProvider` load optional companion
-assemblies by name (`Turso.Data.Native`, `Turso.Data.Sync`) and fail closed
-when absent. These companions are **not shipped** from this repo. Changing
+`AhtolaReplicaProvider`/`SqliteNativeProvider` name the optional companion
+packages (`Turso.Data.Native`, `Turso.Data.Sync`) in their fail-closed
+diagnostics. These companions are **not shipped** from this repo. Changing
 those strings is a product decision, not a refactor — confirm before renaming.
+
+A companion registers itself by calling `Register(factory)` — from a
+`[ModuleInitializer]` or from application startup — and the provider throws
+`NotSupportedException` when nothing has registered. Nothing probes for a
+companion by assembly/type/method name: `Assembly.Load`, `Assembly.GetType` and
+`Type.GetMethod` are invisible to the trimmer and to NativeAOT, so reintroducing
+a load-by-name hook would break the trim gate.
+
+**This is a breaking change for already-published companion packages.** Any
+companion built against the previous behavior relied on being discovered by
+assembly name and never called `Register` itself; on this version it is simply
+never loaded, and `Local Provider=Native` fails closed with
+`NotSupportedException` even though the companion package is installed. Existing
+companions must publish a new release that calls
+`AhtolaNativeProvider.Register(factory)` (and, for the sync companion,
+`AhtolaReplicaProvider.Register(...)`) from a `[ModuleInitializer]` — or
+document that consumers must call it explicitly at startup. Releasing those
+companion versions is tracked separately; do not restore reflective probing to
+paper over it.

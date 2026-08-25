@@ -10,7 +10,7 @@
 
   <ItemGroup>
     <PackageReference Include="Devolutions.Ahtola.Data.Sqlite.Browser" Version="$(AhtolaPackageVersion)" />
-    <PackageReference Include="Devolutions.Ahtola.EntityFrameworkCore.Sqlite" Version="$(AhtolaPackageVersion)" />
     <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="10.0.11" />
   </ItemGroup>
+
 </Project>

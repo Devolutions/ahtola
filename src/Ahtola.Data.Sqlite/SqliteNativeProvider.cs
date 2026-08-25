@@ -5,6 +5,13 @@ namespace Ahtola.Data.Sqlite;
 /// <summary>
 /// Registers native-only SQLite facade operations supplied by the optional native companion package.
 /// </summary>
+/// <remarks>
+/// Activation is explicit: the companion calls <see cref="Register"/>, normally from a
+/// <c>[ModuleInitializer]</c>. Nothing is discovered by assembly name, because reflective probing
+/// is invisible to the trimmer and to NativeAOT. A companion built for the earlier
+/// load-by-name behavior must publish a release that calls <see cref="Register"/> itself;
+/// otherwise these operations fail closed even when the package is installed.
+/// </remarks>
 public static class SqliteNativeProvider
 {
     private static SqliteNativeProviderFactory? s_factory;
@@ -12,6 +19,10 @@ public static class SqliteNativeProvider
     /// <summary>
     /// Registers native SQLite facade operations.
     /// </summary>
+    /// <remarks>
+    /// Call this from a <c>[ModuleInitializer]</c> in the companion assembly, or explicitly during
+    /// application startup. It is the only activation path.
+    /// </remarks>
     public static void Register(SqliteNativeProviderFactory factory)
     {
         ArgumentNullException.ThrowIfNull(factory);
@@ -28,7 +39,9 @@ public static class SqliteNativeProvider
         => Volatile.Read(ref s_factory)
            ?? throw new NotSupportedException(
                "Local Provider=Native requires the Turso.Data.Sqlite.Native companion package. " +
-               "Add a matching PackageReference to use the native Ahtola SDK.");
+               "Add a matching PackageReference, and use a companion version that calls " +
+               "SqliteNativeProvider.Register(factory) from a module initializer or from " +
+               "application startup: this provider never loads a companion by assembly name.");
 }
 
 /// <summary>

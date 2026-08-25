@@ -15,6 +15,40 @@ public sealed class AhtolaBrowserOptions : IDisposable
     private AhtolaBrowserEncryptionOptions? _encryption;
 
     /// <summary>
+    /// Creates immutable browser database options, asynchronous only.
+    /// </summary>
+    /// <param name="databasePath">
+    /// A relative OPFS database path located below <paramref name="ownedDirectory"/>.
+    /// </param>
+    /// <param name="ownedDirectory">The relative OPFS directory exclusively owned by this data source.</param>
+    /// <param name="sharedBufferSize">The OPFS worker transfer buffer size, in bytes.</param>
+    /// <param name="readOnly">Whether connections reject database mutations.</param>
+    /// <param name="encryption">
+    /// Optional AHTLA page-encryption key material. It is copied, never placed in
+    /// <see cref="ConnectionString"/>, and released when these options are disposed.
+    /// </param>
+    /// <remarks>
+    /// This overload keeps the exact CLR signature that shipped before synchronous read-mirror
+    /// mode existed, so already-compiled callers keep binding to a method that is still there.
+    /// Use the overload that takes <see cref="AhtolaBrowserSynchronousMode"/> to opt in.
+    /// </remarks>
+    public AhtolaBrowserOptions(
+        string databasePath,
+        string ownedDirectory,
+        int sharedBufferSize = DefaultSharedBufferSize,
+        bool readOnly = false,
+        AhtolaBrowserEncryptionOptions? encryption = null)
+        : this(
+            databasePath,
+            ownedDirectory,
+            sharedBufferSize,
+            readOnly,
+            encryption,
+            AhtolaBrowserSynchronousMode.AsyncOnly)
+    {
+    }
+
+    /// <summary>
     /// Creates immutable browser database options.
     /// </summary>
     /// <param name="databasePath">
@@ -27,12 +61,19 @@ public sealed class AhtolaBrowserOptions : IDisposable
     /// Optional AHTLA page-encryption key material. It is copied, never placed in
     /// <see cref="ConnectionString"/>, and released when these options are disposed.
     /// </param>
+    /// <param name="synchronousMode">
+    /// Whether connections may serve provably read-only statements synchronously
+    /// from the managed in-memory mirror. Opting into
+    /// <see cref="AhtolaBrowserSynchronousMode.ReadOnlyMirror"/> still requires one
+    /// asynchronous initialization and open before any synchronous read.
+    /// </param>
     public AhtolaBrowserOptions(
         string databasePath,
         string ownedDirectory,
-        int sharedBufferSize = DefaultSharedBufferSize,
-        bool readOnly = false,
-        AhtolaBrowserEncryptionOptions? encryption = null)
+        int sharedBufferSize,
+        bool readOnly,
+        AhtolaBrowserEncryptionOptions? encryption,
+        AhtolaBrowserSynchronousMode synchronousMode)
     {
         IsInMemory = string.Equals(databasePath, ":memory:", StringComparison.Ordinal);
         if (IsInMemory)
@@ -65,8 +106,15 @@ public sealed class AhtolaBrowserOptions : IDisposable
 
         ArgumentOutOfRangeException.ThrowIfLessThan(sharedBufferSize, 64 * 1024);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(sharedBufferSize, 64 * 1024 * 1024);
+        if (synchronousMode is not (AhtolaBrowserSynchronousMode.AsyncOnly
+            or AhtolaBrowserSynchronousMode.ReadOnlyMirror))
+        {
+            throw new ArgumentOutOfRangeException(nameof(synchronousMode));
+        }
+
         SharedBufferSize = sharedBufferSize;
         IsReadOnly = readOnly;
+        SynchronousMode = synchronousMode;
         _encryption = encryption?.CreateOwnedCopy();
 
         // Key material is deliberately absent here: a connection string is routinely
@@ -86,8 +134,12 @@ public sealed class AhtolaBrowserOptions : IDisposable
     }
 
     /// <summary>
-    /// Creates options whose owned directory is the database path's parent directory.
+    /// Creates options whose owned directory is the database path's parent directory,
+    /// asynchronous only.
     /// </summary>
+    /// <inheritdoc
+    ///     cref="AhtolaBrowserOptions(string, string, int, bool, AhtolaBrowserEncryptionOptions)"
+    ///     path="/remarks"/>
     public AhtolaBrowserOptions(
         string databasePath,
         int sharedBufferSize = DefaultSharedBufferSize,
@@ -98,9 +150,48 @@ public sealed class AhtolaBrowserOptions : IDisposable
             GetParentDirectory(databasePath),
             sharedBufferSize,
             readOnly,
-            encryption)
+            encryption,
+            AhtolaBrowserSynchronousMode.AsyncOnly)
     {
     }
+
+    /// <summary>
+    /// Creates options whose owned directory is the database path's parent directory, choosing
+    /// whether provably read-only statements may also be served synchronously.
+    /// </summary>
+    public AhtolaBrowserOptions(
+        string databasePath,
+        int sharedBufferSize,
+        bool readOnly,
+        AhtolaBrowserEncryptionOptions? encryption,
+        AhtolaBrowserSynchronousMode synchronousMode)
+        : this(
+            databasePath,
+            GetParentDirectory(databasePath),
+            sharedBufferSize,
+            readOnly,
+            encryption,
+            synchronousMode)
+    {
+    }
+
+    /// <summary>
+    /// Gets whether connections may serve provably read-only statements
+    /// synchronously from the managed in-memory mirror.
+    /// </summary>
+    /// <remarks>
+    /// One asynchronous initialization and open is required before any synchronous
+    /// read; after it completes, supported synchronous reads execute entirely
+    /// against the managed in-memory mirror and never reach OPFS.
+    /// </remarks>
+    public AhtolaBrowserSynchronousMode SynchronousMode { get; }
+
+    /// <summary>
+    /// Gets whether supported synchronous reads are permitted after the
+    /// asynchronous open completes.
+    /// </summary>
+    public bool AllowsSynchronousReads
+        => SynchronousMode == AhtolaBrowserSynchronousMode.ReadOnlyMirror;
 
     /// <summary>
     /// Gets this instance's copy of the AHTLA encryption key material, or

@@ -7,6 +7,101 @@ namespace Ahtola.Tests;
 
 public sealed class RemoteEncryptionContractTests
 {
+    /// <summary>
+    /// Every remote cipher that Turso format version 0 gives an on-disk cipher id
+    /// passes the managed replica gate and maps to the matching storage cipher.
+    /// </summary>
+    [TestCase(AhtolaRemoteEncryptionCipher.Aes128Gcm, Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm, 28)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aes256Gcm, Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm, 28)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis256, Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256, 48)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis256X2, Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X2, 48)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis256X4, Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X4, 48)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis128L, Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128L, 32)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis128X2, Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X2, 32)]
+    [TestCase(AhtolaRemoteEncryptionCipher.Aegis128X4, Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X4, 32)]
+    public void ManagedReplicasAcceptEveryCipherWithAnOnDiskCipherId(
+        AhtolaRemoteEncryptionCipher remoteCipher,
+        Ahtola.Core.Storage.AhtolaEncryptionCipher storageCipher,
+        int reservedBytes)
+    {
+        ManagedReplicaEncryption.EnsureSupportedCipher(remoteCipher);
+
+        ManagedReplicaEncryption.TryMapToStorageCipher(remoteCipher, out var mapped).Should().BeTrue();
+        mapped.Should().Be(storageCipher);
+
+        // The wire configuration's reserved-byte table must agree with the storage
+        // layer's, otherwise a bootstrapped page stream would silently misalign.
+        var parameters = Ahtola.Core.Storage.AhtolaEncryptedPageFormat.GetParameters(mapped);
+        parameters.MetadataSize.Should().Be(reservedBytes);
+
+        var key = new byte[parameters.KeySize];
+        var options = new AhtolaRemoteEncryptionOptions(Convert.ToBase64String(key), remoteCipher);
+        options.ReservedBytes.Should().Be(parameters.MetadataSize);
+
+        using var managed = ManagedReplicaEncryption.CreateManagedOptions(options);
+        managed.Cipher.Should().Be(storageCipher);
+    }
+
+    /// <summary>
+    /// ChaCha20-Poly1305 is a Turso Cloud server-side cipher: it has no cipher id,
+    /// no page-1 header byte and no page framing in the pinned Rust engine, so a
+    /// managed embedded replica -- which must decode pages locally -- fails closed
+    /// with that reason rather than a generic "not implemented".
+    /// </summary>
+    [Test]
+    public void ManagedReplicasRejectChaCha20Poly1305BecauseItHasNoOnDiskCipherId()
+    {
+        Assert.Throws<NotSupportedException>(
+            () => ManagedReplicaEncryption.EnsureSupportedCipher(AhtolaRemoteEncryptionCipher.ChaCha20Poly1305))!
+            .Message.Should().Be(
+                "Turso encrypted-page format version 0 defines no on-disk cipher id for ChaCha20-Poly1305; "
+                + "it is a Turso Cloud server-side cipher only. A managed embedded replica decrypts pages "
+                + "locally, so it cannot open a database configured with it.");
+
+        ManagedReplicaEncryption
+            .TryMapToStorageCipher(AhtolaRemoteEncryptionCipher.ChaCha20Poly1305, out _)
+            .Should().BeFalse();
+    }
+
+    /// <summary>
+    /// ChaCha20-Poly1305 remains a valid <em>remote</em> descriptor: its 28
+    /// reserved bytes and its wire name are still honoured, because Turso Cloud
+    /// performs the crypto server-side.
+    /// </summary>
+    [Test]
+    public void ChaCha20Poly1305RemainsAValidRemoteDescriptor()
+    {
+        var options = new AhtolaRemoteEncryptionOptions("c2VjcmV0", AhtolaRemoteEncryptionCipher.ChaCha20Poly1305);
+
+        options.ReservedBytes.Should().Be(28);
+        options.NativeName.Should().Be("chacha20poly1305");
+    }
+
+    /// <summary>A key that is not valid base64 is rejected before any network call.</summary>
+    [Test]
+    public void ManagedReplicasRejectRemoteKeysThatAreNotBase64()
+    {
+        var options = new AhtolaRemoteEncryptionOptions("not base64!!", AhtolaRemoteEncryptionCipher.Aegis256);
+
+        Assert.Throws<ArgumentException>(() => ManagedReplicaEncryption.CreateManagedOptions(options))!
+            .Message.Should().Contain("not valid base64");
+    }
+
+    /// <summary>
+    /// A base64 key of the wrong length for the cipher is rejected too: a 32-byte
+    /// key decoded for a 16-byte cipher is still plausible-looking.
+    /// </summary>
+    [Test]
+    public void ManagedReplicasRejectRemoteKeysOfTheWrongLengthForTheCipher()
+    {
+        var options = new AhtolaRemoteEncryptionOptions(
+            Convert.ToBase64String(new byte[32]),
+            AhtolaRemoteEncryptionCipher.Aegis128L);
+
+        Assert.Throws<ArgumentException>(() => ManagedReplicaEncryption.CreateManagedOptions(options))!
+            .Message.Should().Contain("requires a 16-byte key");
+    }
+
     [Test]
     public void PartialBootstrapAndRemoteEncryptionAreMutuallyExclusive()
     {

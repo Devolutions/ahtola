@@ -11,9 +11,21 @@ namespace Ahtola.Core;
 /// The byte layouts and operation semantics mirror <c>core/vector</c> at Turso commit
 /// <c>277ddd050b1243bc19792e845c77f1ccd31896c8</c>.
 /// </remarks>
-internal static class SqliteVectorFunctions
+internal static partial class SqliteVectorFunctions
 {
     private const int MaximumManagedDimensions = 1_048_576;
+
+    /// <summary>
+    /// The largest serialized vector blob this build will copy, derived from the dimension cap.
+    /// </summary>
+    /// <remarks>
+    /// <c>float64</c> is the widest encoding at eight bytes per component, so the dimension cap
+    /// pins the blob cap. The check runs before the payload is copied out of the value and before
+    /// any length arithmetic that could overflow, so a hostile or accidental
+    /// <c>zeroblob(1&#160;000&#160;000&#160;000)</c> in an indexed column is rejected rather than
+    /// materialized twice and rejected afterwards.
+    /// </remarks>
+    private const int MaximumManagedBlobBytes = (MaximumManagedDimensions * sizeof(double)) + 16;
 
     private enum VectorType
     {
@@ -445,6 +457,16 @@ internal static class SqliteVectorFunctions
 
     private static VectorValue ParseBlob(ReadOnlySpan<byte> blob)
     {
+        // The length gate runs first, before the type byte is read and before any of the per-type
+        // length arithmetic below. Several of those expressions multiply the blob length (the
+        // float1bit bit capacity, for one), so an unbounded blob would raise an arithmetic overflow
+        // instead of a diagnosable SQL error — and would already have been copied by then.
+        if (blob.Length > MaximumManagedBlobBytes)
+        {
+            throw new EmbeddedSqlException(
+                $"vector blob of {blob.Length} bytes exceeds the managed limit of {MaximumManagedBlobBytes} bytes");
+        }
+
         VectorType type;
         int dataLength;
         var explicitDimensions = 0;
@@ -512,9 +534,25 @@ internal static class SqliteVectorFunctions
             }
         }
 
+        // Dimensionality is proven to be in range before the payload is copied, so nothing
+        // proportional to a rejected blob is ever allocated.
+        EnsureManagedDimensions(ImpliedDimensions(type, dataLength, explicitDimensions));
         var data = blob[..dataLength].ToArray();
         return Validate(type, explicitDimensions, data);
     }
+
+    /// <summary>The component count a blob claims, computed from lengths alone.</summary>
+    private static int ImpliedDimensions(VectorType type, int dataLength, int explicitDimensions)
+        => type switch
+        {
+            VectorType.Float32Dense => dataLength / sizeof(float),
+            VectorType.Float64Dense => dataLength / sizeof(double),
+
+            // A sparse blob's declared dimension count is validated against its entries later; what
+            // is bounded here is the entry count, which is what drives every allocation.
+            VectorType.Float32Sparse => dataLength < 4 ? 0 : (dataLength - 4) / 8,
+            _ => explicitDimensions,
+        };
 
     private static VectorValue Validate(VectorType type, int explicitDimensions, byte[] data)
     {

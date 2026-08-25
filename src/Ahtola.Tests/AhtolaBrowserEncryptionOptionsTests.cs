@@ -54,13 +54,27 @@ public sealed class AhtolaBrowserEncryptionOptionsTests
         action.Should().Throw<ArgumentException>();
     }
 
-    [TestCase(AhtolaEncryptionCipher.Aegis256)]
-    [TestCase(AhtolaEncryptionCipher.Aegis128l)]
-    public void NonAesGcmCiphersAreRejected(AhtolaEncryptionCipher cipher)
+    [TestCase(AhtolaEncryptionCipher.Aegis256, 32)]
+    [TestCase(AhtolaEncryptionCipher.Aegis256x2, 32)]
+    [TestCase(AhtolaEncryptionCipher.Aegis256x4, 32)]
+    [TestCase(AhtolaEncryptionCipher.Aegis128l, 16)]
+    [TestCase(AhtolaEncryptionCipher.Aegis128x2, 16)]
+    [TestCase(AhtolaEncryptionCipher.Aegis128x4, 16)]
+    public void AegisCiphersAreAcceptedWithTheirExactKeySize(AhtolaEncryptionCipher cipher, int keySize)
     {
-        var action = () => AhtolaBrowserEncryptionOptions.FromKey(cipher, new byte[32]);
+        using var options = AhtolaBrowserEncryptionOptions.FromKey(cipher, new byte[keySize]);
 
-        action.Should().Throw<ArgumentOutOfRangeException>();
+        options.Cipher.Should().Be(cipher);
+        options.IsPasswordDerived.Should().BeFalse();
+    }
+
+    [TestCase(AhtolaEncryptionCipher.Aegis256, 16)]
+    [TestCase(AhtolaEncryptionCipher.Aegis128l, 32)]
+    public void AegisCiphersRejectKeyLengthsThatDoNotMatchTheCipher(AhtolaEncryptionCipher cipher, int keySize)
+    {
+        var action = () => AhtolaBrowserEncryptionOptions.FromKey(cipher, new byte[keySize]);
+
+        action.Should().Throw<ArgumentException>();
     }
 
     [Test]

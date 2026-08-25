@@ -470,6 +470,63 @@ internal sealed class MvccLogicalLog : IDisposable
         return options is null ? null : new LogicalLogEncryption(options);
     }
 
+    /// <summary>
+    /// Fails closed when <paramref name="fileSystem"/> cannot host an MVCC
+    /// logical log, before the caller persists journal-mode header 255 or writes
+    /// a single <c>MVTX</c> frame.
+    /// </summary>
+    /// <remarks>
+    /// The chunk frame reserves a fixed 16-byte tag plus 12-byte nonce, so only
+    /// the AES-GCM ciphers fit; Turso format version 0 defines no logical-log
+    /// framing for the wider AEGIS nonces. Both the core encryption file system
+    /// and out-of-band backends such as the browser mirror are checked here so a
+    /// database is never left half-switched into a mode it cannot commit in.
+    /// </remarks>
+    internal static void ThrowIfMvccUnsupported(IFileSystem fileSystem)
+    {
+        var reason = DescribeMvccUnsupportedReason(fileSystem);
+        if (reason is not null)
+            throw new NotSupportedException(reason);
+    }
+
+    /// <summary>
+    /// The reason <paramref name="fileSystem"/> cannot host an MVCC logical log,
+    /// or <see langword="null"/> when it can.
+    /// </summary>
+    internal static string? DescribeMvccUnsupportedReason(IFileSystem fileSystem)
+    {
+        switch (fileSystem)
+        {
+            case IMvccJournalModePolicy policy when policy.DescribeMvccUnsupportedReason() is { } reason:
+                return reason;
+            case AhtolaEncryptionFileSystem encrypted:
+                return DescribeMvccUnsupportedCipher(encrypted.Encryption.Cipher);
+            case IFileSystemDecorator decorator:
+                return DescribeMvccUnsupportedReason(decorator.InnerFileSystem);
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>
+    /// The fail-closed reason for <paramref name="cipher"/>, or
+    /// <see langword="null"/> when its nonce and tag match the frame reservation.
+    /// </summary>
+    internal static string? DescribeMvccUnsupportedCipher(AhtolaEncryptionCipher cipher)
+    {
+        var parameters = AhtolaEncryptedPageFormat.GetParameters(cipher);
+        if (parameters.NonceSize == MvccLogicalLogFormat.EncryptionNonceSize
+            && parameters.TagSize == MvccLogicalLogFormat.EncryptionTagSize)
+        {
+            return null;
+        }
+
+        return $"The MVCC logical log frames every chunk with a {MvccLogicalLogFormat.EncryptionTagSize}-byte tag "
+               + $"and a {MvccLogicalLogFormat.EncryptionNonceSize}-byte nonce, so it supports only the AES-GCM "
+               + $"ciphers; '{cipher}' uses a {parameters.NonceSize}-byte nonce and Turso format version 0 "
+               + "defines no logical-log framing for it.";
+    }
+
     private static AhtolaEncryptionOptions? GetEncryptionOptions(IFileSystem fileSystem)
         => fileSystem switch
         {
@@ -789,13 +846,41 @@ internal sealed class MvccLogicalLog : IDisposable
         }
     }
 
+    /// <summary>
+    /// Chunk-level encryption for the MVCC logical log.
+    /// </summary>
+    /// <remarks>
+    /// The <c>MVTX</c> chunk frame reserves a fixed 16-byte tag plus 12-byte
+    /// nonce, and that overhead is baked into every payload-size and CRC
+    /// computation in <see cref="MvccLogicalLogFormat"/>. Turso defines no
+    /// logical-log framing for the wider AEGIS nonces, so rather than invent one,
+    /// ciphers whose nonce is not 12 bytes are refused up front.
+    /// </remarks>
     private sealed class LogicalLogEncryption : IDisposable
     {
         private readonly AhtolaEncryptionOptions _options;
+        private readonly Storage.Crypto.IAhtolaAead _aead;
 
         internal LogicalLogEncryption(AhtolaEncryptionOptions options)
         {
             _options = options.CreateOwnedCopy();
+            try
+            {
+                _aead = _options.CreateAead();
+                if (_aead.NonceSize != MvccLogicalLogFormat.EncryptionNonceSize
+                    || _aead.TagSize != MvccLogicalLogFormat.EncryptionTagSize)
+                {
+                    _aead.Dispose();
+                    throw new NotSupportedException(
+                        DescribeMvccUnsupportedCipher(options.Cipher)
+                        ?? $"'{options.Cipher}' cannot frame an MVCC logical-log chunk.");
+                }
+            }
+            catch
+            {
+                _options.Dispose();
+                throw;
+            }
         }
 
         internal byte[] EncryptPayload(
@@ -829,8 +914,7 @@ internal sealed class MvccLogicalLog : IDisposable
                     commitTs,
                     chunkIndex,
                     logVersion);
-                using var cipher = _options.CreateAesGcm();
-                cipher.Encrypt(
+                _aead.Encrypt(
                     nonce,
                     plaintext.Slice(plaintextOffset, plaintextLength),
                     ciphertext,
@@ -879,13 +963,18 @@ internal sealed class MvccLogicalLog : IDisposable
                         commitTs,
                         chunkIndex,
                         logVersion);
-                    using var cipher = _options.CreateAesGcm();
-                    cipher.Decrypt(
-                        nonce,
-                        ciphertext,
-                        tag,
-                        plaintext.AsSpan(plaintextOffset, plaintextLength),
-                        associatedData);
+                    if (!_aead.TryDecrypt(
+                            nonce,
+                            ciphertext,
+                            tag,
+                            plaintext.AsSpan(plaintextOffset, plaintextLength),
+                            associatedData))
+                    {
+                        CryptographicOperations.ZeroMemory(plaintext);
+                        throw new InvalidDataException(
+                            "MVCC logical-log payload authentication failed. The key is wrong or the log was tampered with.");
+                    }
+
                     plaintextOffset += plaintextLength;
                     encryptedOffset += plaintextLength + MvccLogicalLogFormat.EncryptionOverhead;
                 }
@@ -901,7 +990,11 @@ internal sealed class MvccLogicalLog : IDisposable
             }
         }
 
-        public void Dispose() => _options.Dispose();
+        public void Dispose()
+        {
+            _aead.Dispose();
+            _options.Dispose();
+        }
     }
 }
 

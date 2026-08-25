@@ -42,9 +42,22 @@ dotnet add package Devolutions.Ahtola.Data.Sqlite.Browser
 ```
 
 Targets `net8.0`, `net9.0`, `net10.0` — no `net48` / .NET Framework assets, no
-native SQLite binary, and no P/Invoke SDK to restore. The shipped packages are
-`IsAotCompatible`/`IsTrimmable` in `Ahtola.Core`, and the shipped
-provider/EF Core packages publish and trim cleanly on every supported TFM.
+native SQLite binary, and no P/Invoke SDK to restore. Every shipped package
+(`Devolutions.Ahtola.Core`, `Devolutions.Ahtola.Data.Sqlite` — which embeds
+`Devolutions.Ahtola.Data` — `Devolutions.Ahtola.Data.Sqlite.Browser`, and
+`Devolutions.Ahtola.EntityFrameworkCore.Sqlite`) builds with
+`IsAotCompatible`/`IsTrimmable` and ships no trim-warning suppression, so a
+trimmed or NativeAOT publish reports nothing from Ahtola itself.
+
+The ADO stack (`…Core` → `…Data.Sqlite` → optionally `…Data.Sqlite.Browser`) is
+trim-clean end to end: a publish with
+`-p:SuppressTrimAnalysisWarnings=false -p:TrimmerSingleWarn=false` reports zero
+`IL2xxx`/`IL3xxx` warnings across the whole closure. Adding
+`Devolutions.Ahtola.EntityFrameworkCore.Sqlite` still reports warnings, but they
+come from `Microsoft.EntityFrameworkCore`, which annotates `DbContext` and the
+query pipeline with `RequiresUnreferencedCode`/`RequiresDynamicCode`; none of
+them originate in Ahtola. An EF Core profile only becomes trim-clean once that
+upstream chain is warning-free.
 
 Adding `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` automatically brings in
 `Devolutions.Ahtola.Data.Sqlite`, which in turn brings in
@@ -66,8 +79,11 @@ Devolutions.Ahtola.Core` yourself. Add it directly only if you're writing an
   [Entity Framework Core](#entity-framework-core)).
 - **Blazor/.NET WebAssembly with durable OPFS storage** → add
   `Devolutions.Ahtola.Data.Sqlite.Browser`, create an
-  `AhtolaBrowserDataSource`, and use async APIs. See the
-  [browser deployment guide](browser-wasm.md).
+  `AhtolaBrowserDataSource`, and use async APIs. Opt into
+  `AhtolaBrowserSynchronousMode.ReadOnlyMirror` when existing repository code
+  needs synchronous reads: after one asynchronous open, provably read-only
+  statements are served from the managed in-memory mirror without touching OPFS.
+  See the [browser deployment guide](browser-wasm.md).
 
 ## The SQLite-compatible facade
 
@@ -149,7 +165,7 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 
 | Keyword | Notes |
 | --- | --- |
-| `Data Source` (`Filename`) | File path, `:memory:`, or a Turso/Hrana URL (`turso://…`, `libsql://…`, `https://…`) |
+| `Data Source` (`Filename`) | File path, `:memory:`, or a Turso/Hrana URL (`turso://…`, `libsql://…`, `https://…`, `wss://…`) |
 | `Mode` | `ReadWriteCreate` (default), `ReadWrite`, `ReadOnly`, `Memory` |
 | `Cache` | `Private` (default) / `Shared` |
 | `Pooling` | Connection pooling (default `true`) |
@@ -158,12 +174,35 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 | `Vfs` | Named VFS registration |
 | `Password` / `Password Scheme` | Passphrase-based encryption (see [Encryption](#encryption)) |
 | `Encryption Cipher` / `Encryption Key` | Raw-key encryption (hex AES-128/256-GCM) |
-| `Local Provider` | `Managed` (default) or `Native` |
+| `Local Provider` | `Managed` (default) or `Native`. `Native` requires the optional, non-shipped native companion to have called `AhtolaNativeProvider.Register(factory)` (typically from a `[ModuleInitializer]`); nothing is loaded by assembly name, so without a registration the connection fails closed with `NotSupportedException`. |
 | `Foreign Read Only` | Read another engine's open database without taking main-file locks (`Mode=ReadOnly` + `Pooling=False`) |
 | `DateTimeKind`, `BinaryGUID` | Facade-only ADO.NET conversion behavior |
 
+> **Companion compatibility.** Earlier versions activated `Local Provider=Native`
+> by loading `Turso.Data.Native` reflectively and invoking its
+> `NativeProviderRegistration.Register`. Reflective probing is invisible to the
+> trimmer and to NativeAOT, so it is gone: activation is now explicit only. A
+> companion package built against the old behavior never calls `Register` itself
+> and is therefore never activated — `Local Provider=Native` fails closed with
+> `NotSupportedException` even when the package is installed. Companions must
+> ship a release that calls `AhtolaNativeProvider.Register(...)`,
+> `SqliteNativeProvider.Register(...)` and `AhtolaReplicaProvider.Register(...)`
+> from a `[ModuleInitializer]`, or document an explicit startup call. That
+> companion release is tracked separately from this repository.
+
 Remote keywords accepted by both facades (see the Turso Cloud sections below):
 `Auth Token`, `Replica Path`, `Sync Interval`, `Read Your Writes`, `Tls`.
+
+Hrana WebSocket keywords, used only by `ws://`/`wss://` data sources (see
+[Hrana over WebSocket](#hrana-over-websocket-wswss)):
+
+| Keyword | Aliases | Default | Notes |
+| --- | --- | --- | --- |
+| `Ws Keepalive Interval` | `WsKeepaliveInterval`, `WebSocket Keepalive Interval`, `WebSocketKeepAliveInterval` | `30` | Keep-alive ping interval in seconds; `0` disables |
+| `Ws Keepalive Timeout` | `WsKeepaliveTimeout`, `WebSocket Keepalive Timeout`, `WebSocketKeepAliveTimeout` | `20` | Pong grace period in seconds (.NET 9+; ignored on net8.0) |
+| `Ws Half Open Timeout` | `WsHalfOpenTimeout`, `WebSocket Half Open Timeout`, `WebSocketHalfOpenTimeout` | `0` | Seconds of total peer silence, while requests are outstanding, that abort the connection as half-open. `0` disables it. This is the only half-open detection on net8.0; because a Hrana server sends nothing while a statement runs, a non-zero value also caps how long one request may take |
+| `Ws Max Message Bytes` | `WsMaxMessageBytes`, `WebSocket Max Message Bytes`, `WebSocketMaxMessageBytes` | `16777216` | Hard cap on one reassembled message (8 KiB–512 MiB) |
+| `Ws Connect Attempts` | `WsConnectAttempts`, `WebSocket Connect Attempts`, `WebSocketConnectAttempts` | `3` | Bounded connection-establishment attempts (1–10); never replays operations |
 
 ## Working with a local SQLite file
 
@@ -414,6 +453,116 @@ endpoint is pinned to that version and is never downgraded. No fallback is
 attempted after a baton has been issued, so an expired or invalid live session
 cannot be mistaken for protocol negotiation.
 
+## Hrana over WebSocket (ws/wss)
+
+A `ws://` or `wss://` data source opens a **persistent Hrana WebSocket
+connection** instead of the stateless HTTP pipeline. `http`, `https`, `libsql`
+and `turso` URLs are unaffected and keep using `/v3/pipeline` + `/v3/cursor`
+exactly as described above; the transport is chosen once, when the connection is
+opened, and never silently downgrades from WebSocket to HTTP.
+
+```csharp
+using var cloud = new SqliteConnection(
+    "Data Source=wss://my-db.turso.io;Auth Token=" + token);
+cloud.Open();
+```
+
+**Target server.** This transport implements the authoritative libSQL/sqld Hrana
+WebSocket protocol (`docs/HRANA_{1,2,3}_SPEC.md` in `tursodatabase/libsql`).
+The Turso engine pinned by this repository has **no native Hrana WebSocket
+server** — it maps `ws`/`wss` onto its HTTP pipeline endpoint — so point
+`ws`/`wss` connection strings at a legacy libSQL/sqld deployment (including
+Turso Cloud) rather than at the new engine.
+
+**Negotiation.** The upgrade happens on the URL's own path (there is no `/v2` or
+`/v3` suffix for WebSocket) and offers the JSON subprotocols `hrana3`, `hrana2`,
+`hrana1`. An empty/absent `Sec-WebSocket-Protocol` response is treated as
+Hrana 1, per the spec. `hrana3-protobuf` and any other unknown value are
+rejected and the socket is closed: this client speaks only the JSON encoding.
+Authentication travels in the first `hello` message as a JWT (a WebSocket has no
+per-message headers).
+
+**Features by negotiated version.**
+
+| Feature | v1 | v2 | v3 |
+| --- | --- | --- | --- |
+| `open_stream` / `close_stream` / `execute` / `batch` | yes | yes | yes |
+| `store_sql` / `close_sql` / `sequence` / `describe` | no | yes | yes |
+| `open_cursor` / `fetch_cursor` / `close_cursor` / `get_autocommit` | no | no | yes |
+| `ok` / `error` / `not` / `and` / `or` batch conditions | yes | yes | yes |
+| `is_autocommit` batch condition | no | no | yes |
+| `ExecuteReader` streaming | buffered `execute` | buffered `execute` | paged cursor |
+
+Version checks run **before** anything is written to the socket and before a
+stream is opened, so a request the negotiated version cannot serve never leaves
+a half-created `stream_id` behind. The `is_autocommit` check walks the whole
+condition tree, so it also catches the common `not(is_autocommit)` shape.
+
+**Fail-closed boundaries.**
+
+- **Remote encryption is refused over `ws`/`wss`.** The official `hello` message
+  has no encryption-key field, so the `x-turso-encryption-key` value the HTTP
+  pipeline sends as a header cannot be conveyed. Use an `https` URL instead.
+- **Protocol violations terminate the connection.** An unknown message
+  discriminator, a response for an unknown request id, a binary frame on a JSON
+  subprotocol, an unparsable message, or a message larger than
+  `Ws Max Message Bytes` closes the socket and fails every pending request.
+- **Malformed payloads are protocol violations, not data.** Every response is
+  checked against the contract for the request it answers — `result` for
+  `execute`/`batch`/`describe`, `is_autocommit` for `get_autocommit`,
+  `entries` + `done` for `fetch_cursor`, `error` for `response_error` — before
+  the waiting caller sees it. A missing or mistyped mandatory field, an
+  out-of-range integer, a row whose width does not match `cols`, or an unknown
+  nested discriminator (cursor entry type, value type) terminates the
+  generation instead of silently becoming `false`, `[]` or a skipped row.
+- **Nothing is ever replayed.** Streams, cursors and stored SQL die with their
+  connection. If the connection is lost while a session (transaction or cursor)
+  is open, the ADO.NET remote session is invalidated and the failure surfaces to
+  the caller; a later operation may open a brand-new connection and stream, but
+  the client never re-sends an in-flight statement.
+- **No transport downgrade.** A `ws`/`wss` connection never falls back to HTTP.
+- **TLS and credentials follow the HTTP policy.** `Auth Token` requires `wss`
+  (or a loopback host), the upgrade never follows redirects, and certificate
+  validation is left to the platform — there is no certificate bypass.
+
+**Concurrency.** One serialized send path and one continuous receive loop own the
+socket, so there is never a concurrent `SendAsync` or `ReceiveAsync`; keeping a
+receive outstanding is also what lets the runtime process keep-alive pongs.
+`CloseOutputAsync` is itself a send, so it is only issued once the send loop has
+been observed to stop — against a wedged peer the close frame is skipped and the
+socket is aborted instead. Requests are correlated by `request_id`, so the server
+may answer out of order across streams while per-stream ordering is preserved.
+
+**Cancellation.** Cancelling a command (or hitting `Command Timeout`) abandons
+only that caller's wait — the socket stays healthy and a late response for the
+abandoned id is discarded. Two details make that safe:
+
+- Requests that mint a server-side handle (`open_stream`, `open_cursor`) keep
+  their correlation slot after the caller walks away. If the server answers
+  late, the handle is closed immediately; if it cannot be closed, the
+  connection is retired so nothing leaks for the rest of its life.
+- The discard list is scoped to the connection and never evicted while the
+  connection lives, because an abandoned request can be answered arbitrarily
+  late and forgetting it first would turn a valid reply into a spurious
+  "unknown request id" abort. If more than 65 536 requests are abandoned
+  unanswered, the connection is retired rather than start forgetting.
+
+**Liveness.** On .NET 9+ the runtime enforces `Ws Keepalive Timeout` with real ping/pong,
+which a busy server keeps answering. On net8.0 `ClientWebSocket` has no pong timeout, so
+half-open detection is opt-in through `Ws Half Open Timeout`: a watchdog aborts the
+connection when nothing at all has arrived for that budget *and* a request has been
+outstanding that long. It sends no frames of its own. It is off by default on purpose —
+without ping/pong, "the server has sent nothing" cannot distinguish a dead socket from one
+running a slow statement, so any budget also caps how long one request may take. Set it
+above the longest statement the workload issues, or leave it disabled and rely on
+`Command Timeout`.
+
+**Disposal.** `Dispose()` and `DisposeAsync()` converge on one idempotent
+disposal. The graceful phase (drain, `close_stream`, close frame) is bounded by
+`Ws Close Timeout`; once that budget is spent the socket is aborted, and
+disposal still waits for both loops to terminate and the socket to be disposed.
+A synchronous `Dispose()` therefore never returns while the socket is live.
+
 ## Turso Cloud: managed embedded replica
 
 Add `Replica Path=<file>` to get a **managed embedded replica**: a local
@@ -464,18 +613,38 @@ pulls; unsafe residual deletes or schema changes fail closed until they have
 been pushed. Protocol-1 databases keep the page-incremental path.
 
 The pure-managed provider supports `AhtolaPartialBootstrapOptions.Prefix(...)`
-as the initial page selector. It publishes the selected complete 4 KiB pages,
-records the missing ranges in an integrity-protected durable sidecar, and
-fetches a missing page from the pinned bootstrap revision before the pager can
-observe its bytes. Concurrent faults are coalesced, `SegmentSize` controls the
-fetch segment, and `Prefetch` opts into fetching the rest of that segment.
-The bootstrap marker, metadata, and page-state sidecar are durable before the
-sparse database becomes visible. A physical partial replica has one
-process-exclusive materializer, and write-ahead mutation intents make an
-interrupted local page write recoverable without treating sparse zeroes as
-data. Query-selected bootstrap remains unsupported. Before an ordinary sync
-advances the revision, Ahtola pushes tracked local changes, completes the
-pinned image, and transitions back to the normal full-file publication path.
+and `AhtolaPartialBootstrapOptions.QueryPages(...)` as the initial page
+selector. It publishes the selected complete 4 KiB pages, records the missing
+ranges in an integrity-protected durable sidecar, and fetches a missing page
+from the pinned bootstrap revision before the pager can observe its bytes.
+Concurrent faults are coalesced, `SegmentSize` controls the fetch segment, and
+`Prefetch` opts into fetching the rest of that segment. The bootstrap marker,
+metadata, and page-state sidecar are durable before the sparse database becomes
+visible. A physical partial replica has one process-exclusive materializer, and
+write-ahead mutation intents make an interrupted local page write recoverable
+without treating sparse zeroes as data. Before an ordinary sync advances the
+revision, Ahtola pushes tracked local changes, completes the pinned image, and
+transitions back to the normal full-file publication path.
+
+`QueryPages(...)` sends the query as Turso's `server_query_selector`
+(`PullUpdatesReqProtoBody` tag 7) on the single bootstrap request only, never
+together with a page selector and never chunked — the server, not the client,
+decides which pages the query touches, so `PullBytesThreshold` is rejected with
+it. The returned page set may be unordered and non-contiguous, `db_size` still
+describes the whole database, and page 1 (the SQLite header page) is mandatory;
+duplicate, out-of-range, wrong-sized, or header-less responses fail closed
+without publishing anything. After bootstrap the query is never persisted or
+resent: missing pages fault by page id against the pinned revision.
+
+Two caveats. **The remote must implement query selection.** Turso's vendored
+local dev server ignores `server_query_selector` by design, so a query
+bootstrap against it silently degrades to a full-database response; only a
+server that honours tag 7 produces a genuinely partial image. **Sidecar size
+scales with scatter.** The page-state sidecar stores materialized pages as a
+run list, so a worst-case scattered selection (for example every other page)
+degenerates to one `(start, count)` pair per page. That is bounded and durable
+but noticeably larger than a prefix image's single run; a bitmap-backed sidecar
+would bound it better and is not implemented.
 
 Embedded replicas support `DbBatch` through both facades. Enum parameters bind
 as their underlying SQLite integer value. Extra parameters that are not

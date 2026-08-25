@@ -298,6 +298,33 @@ public enum VdbeOpcode
     VCommit = 105,
     /// <summary>Rollback a managed virtual-table transaction.</summary>
     VRollback = 106,
+
+    /// <summary>Create the state of a managed index method (Turso <c>IndexMethodCreate</c>, insn.rs:1437).</summary>
+    IndexMethodCreate = 107,
+
+    /// <summary>Destroy the state of a managed index method (Turso <c>IndexMethodDestroy</c>, insn.rs:1442).</summary>
+    IndexMethodDestroy = 108,
+
+    /// <summary>Compact the state of a managed index method (Turso <c>IndexMethodOptimize</c>, insn.rs:1447).</summary>
+    IndexMethodOptimize = 109,
+
+    /// <summary>Start a managed index-method query pattern (Turso <c>IndexMethodQuery</c>, insn.rs:1452).</summary>
+    IndexMethodQuery = 110,
+
+    /// <summary>Advance a managed index-method cursor (Ahtola: Turso folds advance into the query cursor).</summary>
+    IndexMethodNext = 111,
+
+    /// <summary>Read a managed index-method result column; column 0 is the method score.</summary>
+    IndexMethodColumn = 112,
+
+    /// <summary>Load the current managed index-method result's base rowid into a register.</summary>
+    IndexMethodRowId = 113,
+
+    /// <summary>Apply one base-row insert to a managed index method.</summary>
+    IndexMethodInsert = 114,
+
+    /// <summary>Apply one base-row delete to a managed index method.</summary>
+    IndexMethodDelete = 115,
 }
 
 /// <summary>Key-order seek comparison used by SeekGE/GT/LE/LT and IdxGE/GT/LE/LT.</summary>
@@ -1642,6 +1669,80 @@ public sealed record VCommitInstruction(Cursor Cursor) : VdbeInstruction
 public sealed record VRollbackInstruction(Cursor Cursor) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.VRollback;
+}
+
+/// <summary>
+/// The statically bound managed index method a method-index instruction operates on. Binding the
+/// attachment and its base-row source into the instruction keeps the interpreter free of any global
+/// lookup and keeps the opcodes reflection-free.
+/// </summary>
+internal sealed record VdbeIndexMethodBinding(
+    string MethodName,
+    string IndexName,
+    Indexing.ManagedIndexMethodAttachment Attachment,
+    Indexing.IManagedIndexSource Source);
+
+/// <summary>Allocates method state for a freshly created method index (Turso <c>IndexMethodCreate</c>).</summary>
+internal sealed record IndexMethodCreateInstruction(Cursor Cursor, VdbeIndexMethodBinding Binding) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexMethodCreate;
+}
+
+/// <summary>Releases all method state for a dropped method index (Turso <c>IndexMethodDestroy</c>).</summary>
+internal sealed record IndexMethodDestroyInstruction(Cursor Cursor, VdbeIndexMethodBinding Binding) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexMethodDestroy;
+}
+
+/// <summary>Compacts method state (Turso <c>IndexMethodOptimize</c>).</summary>
+internal sealed record IndexMethodOptimizeInstruction(Cursor Cursor, VdbeIndexMethodBinding Binding) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexMethodOptimize;
+}
+
+/// <summary>
+/// Starts one declared query pattern on a method cursor, branching to
+/// <paramref name="EmptyTarget"/> when the method reports no results.
+/// </summary>
+internal sealed record IndexMethodQueryInstruction(
+    Cursor Cursor,
+    VdbeIndexMethodBinding Binding,
+    int PatternIndex,
+    RegisterRange Arguments,
+    ProgramCounter EmptyTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexMethodQuery;
+}
+
+/// <summary>Advances a method cursor and loops while it has another result.</summary>
+internal sealed record IndexMethodNextInstruction(Cursor Cursor, ProgramCounter LoopTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexMethodNext;
+}
+
+/// <summary>Copies one method result column into a register. Column 0 is the method score.</summary>
+internal sealed record IndexMethodColumnInstruction(Cursor Cursor, int ColumnIndex, Register Destination)
+    : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexMethodColumn;
+}
+
+/// <summary>Loads the current method result's base-table rowid so the program can seek the base row.</summary>
+internal sealed record IndexMethodRowIdInstruction(Cursor Cursor, Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexMethodRowId;
+}
+
+/// <summary>Applies one base-row insert: index columns in declaration order, rowid last.</summary>
+internal sealed record IndexMethodInsertInstruction(Cursor Cursor, RegisterRange Values) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexMethodInsert;
+}
+
+/// <summary>Applies one base-row delete with the same layout as <see cref="IndexMethodInsertInstruction"/>.</summary>
+internal sealed record IndexMethodDeleteInstruction(Cursor Cursor, RegisterRange Values) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexMethodDelete;
 }
 
 public sealed record CloseCursorInstruction(Cursor Cursor) : VdbeInstruction
@@ -3010,6 +3111,91 @@ public sealed class VdbeProgram
                     openCursors[openWrite.Cursor.Index] = true;
                     cursorColumnCounts[openWrite.Cursor.Index] = openWrite.ColumnCount;
                     break;
+                case IndexMethodCreateInstruction methodCreate:
+                    ValidateCursor(methodCreate.Cursor, instructionIndex);
+                    ValidateIndexMethodBinding(methodCreate.Binding, instructionIndex);
+                    if (openCursors[methodCreate.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {methodCreate.Cursor.Index} twice.");
+                    }
+
+                    openCursors[methodCreate.Cursor.Index] = true;
+                    break;
+                case IndexMethodDestroyInstruction methodDestroy:
+                    ValidateCursor(methodDestroy.Cursor, instructionIndex);
+                    ValidateIndexMethodBinding(methodDestroy.Binding, instructionIndex);
+                    if (openCursors[methodDestroy.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {methodDestroy.Cursor.Index} twice.");
+                    }
+
+                    openCursors[methodDestroy.Cursor.Index] = true;
+                    break;
+                case IndexMethodOptimizeInstruction methodOptimize:
+                    ValidateCursor(methodOptimize.Cursor, instructionIndex);
+                    ValidateIndexMethodBinding(methodOptimize.Binding, instructionIndex);
+                    if (openCursors[methodOptimize.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {methodOptimize.Cursor.Index} twice.");
+                    }
+
+                    openCursors[methodOptimize.Cursor.Index] = true;
+                    break;
+                case IndexMethodQueryInstruction methodQuery:
+                    ValidateCursor(methodQuery.Cursor, instructionIndex);
+                    ValidateIndexMethodBinding(methodQuery.Binding, instructionIndex);
+                    ValidateRegisterRange(methodQuery.Arguments, instructionIndex);
+                    ValidateJumpTarget(methodQuery.EmptyTarget, instructionIndex);
+                    if (methodQuery.PatternIndex < 0
+                        || methodQuery.PatternIndex >= methodQuery.Binding.Attachment.Definition.Patterns.Count)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} names an undeclared index-method pattern {methodQuery.PatternIndex}.");
+                    }
+
+                    openCursors[methodQuery.Cursor.Index] = true;
+                    break;
+                case IndexMethodNextInstruction methodNext:
+                    ValidateOpenCursor(methodNext.Cursor, openCursors, instructionIndex);
+                    ValidateJumpTarget(methodNext.LoopTarget, instructionIndex);
+                    break;
+                case IndexMethodColumnInstruction methodColumn:
+                    ValidateOpenCursor(methodColumn.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(methodColumn.Destination, instructionIndex);
+                    if (methodColumn.ColumnIndex < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} reads a negative index-method column.");
+                    }
+
+                    break;
+                case IndexMethodRowIdInstruction methodRowId:
+                    ValidateOpenCursor(methodRowId.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(methodRowId.Destination, instructionIndex);
+                    break;
+                case IndexMethodInsertInstruction methodInsert:
+                    ValidateOpenCursor(methodInsert.Cursor, openCursors, instructionIndex);
+                    ValidateRegisterRange(methodInsert.Values, instructionIndex);
+                    if (methodInsert.Values.Count < 2)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} IndexMethodInsert requires at least one column and a rowid.");
+                    }
+
+                    break;
+                case IndexMethodDeleteInstruction methodDelete:
+                    ValidateOpenCursor(methodDelete.Cursor, openCursors, instructionIndex);
+                    ValidateRegisterRange(methodDelete.Values, instructionIndex);
+                    if (methodDelete.Values.Count < 2)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} IndexMethodDelete requires at least one column and a rowid.");
+                    }
+
+                    break;
                 case VOpenInstruction vOpen:
                     ValidateCursor(vOpen.Cursor, instructionIndex);
                     if (openCursors[vOpen.Cursor.Index])
@@ -3017,6 +3203,7 @@ public sealed class VdbeProgram
                         throw new VdbeProgramValidationException(
                             $"VDBE instruction {instructionIndex} opens cursor {vOpen.Cursor.Index} twice.");
                     }
+
                     openCursors[vOpen.Cursor.Index] = true;
                     break;
                 case VFilterInstruction vFilter:
@@ -3811,6 +3998,15 @@ public sealed class VdbeProgram
         {
             throw new VdbeProgramValidationException(
                 $"VDBE instruction {instructionIndex} references register {register.Index}, but the program has {RegisterCount} registers.");
+        }
+    }
+
+    private static void ValidateIndexMethodBinding(VdbeIndexMethodBinding? binding, int instructionIndex)
+    {
+        if (binding is null || binding.Attachment is null || binding.Source is null)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references a null index-method binding.");
         }
     }
 

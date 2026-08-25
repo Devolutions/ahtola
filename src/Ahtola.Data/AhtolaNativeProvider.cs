@@ -1,20 +1,53 @@
-using System.Reflection;
-using System.Runtime.Loader;
-
 namespace Ahtola;
 
 /// <summary>
 /// Registers the optional native local-provider implementation.
 /// </summary>
+/// <remarks>
+/// <para>
+/// The companion package registers itself by calling <see cref="Register"/> — normally from a
+/// <c>[ModuleInitializer]</c> in the companion assembly, or explicitly from application startup.
+/// Nothing here probes for the companion by name: assembly/type/method lookups are invisible to
+/// the trimmer and to NativeAOT, so this type stays statically analyzable and simply fails closed
+/// when no factory has been registered.
+/// </para>
+/// <para>
+/// <b>Compatibility.</b> Earlier versions discovered the companion by loading
+/// <c>Turso.Data.Native</c> reflectively and invoking its
+/// <c>NativeProviderRegistration.Register</c>. A companion built for that behavior never calls
+/// <see cref="Register"/> itself, so it is now never activated and <c>Local Provider=Native</c>
+/// fails closed with <see cref="NotSupportedException"/> even when the package is installed. Such
+/// companions must ship a release that calls <see cref="Register"/> from a
+/// <c>[ModuleInitializer]</c>, or instruct consumers to call it explicitly during startup.
+/// </para>
+/// </remarks>
 public static class AhtolaNativeProvider
 {
-    private const string NativeProviderAssemblyName = "Turso.Data.Native";
-    private const string NativeProviderRegistrationTypeName = "Turso.Data.Native.NativeProviderRegistration";
+    /// <summary>
+    /// Assembly that supplies the optional native local provider. Reported in the failure message
+    /// so the diagnostic still names the companion; it is never loaded reflectively from here.
+    /// </summary>
+    internal const string NativeProviderAssemblyName = "Turso.Data.Native";
+
+    /// <summary>
+    /// Message used when <c>Provider=Native</c> is requested without a registered factory.
+    /// </summary>
+    internal const string MissingFactoryMessage =
+        "Local Provider=Native requires the Turso.Data.Sqlite.Native companion package. " +
+        "Add a matching PackageReference, and use a companion version that calls " +
+        "AhtolaNativeProvider.Register(factory) from a module initializer or from application " +
+        "startup: this provider never loads a companion by assembly name.";
+
     private static AhtolaNativeProviderFactory? s_factory;
 
     /// <summary>
     /// Registers the native local-provider factory supplied by the companion package.
     /// </summary>
+    /// <remarks>
+    /// Call this from a <c>[ModuleInitializer]</c> in the companion assembly so the registration
+    /// happens before the first connection is opened, or explicitly during application startup.
+    /// It is the only activation path: nothing is discovered by assembly name.
+    /// </remarks>
     public static void Register(AhtolaNativeProviderFactory factory)
     {
         ArgumentNullException.ThrowIfNull(factory);
@@ -27,38 +60,18 @@ public static class AhtolaNativeProvider
         }
     }
 
+    /// <summary>
+    /// Gets the registered native local-provider factory, or <c>null</c> when the companion
+    /// package has not registered one.
+    /// </summary>
+    internal static AhtolaNativeProviderFactory? Current => Volatile.Read(ref s_factory);
+
     internal static AhtolaNativeDatabase OpenDatabase(
         string path,
         AhtolaEncryptionCipher? cipher,
         string? encryptionKey)
-    {
-        var factory = Volatile.Read(ref s_factory);
-        if (factory is null)
-        {
-            try
-            {
-                var loadContext = AssemblyLoadContext.GetLoadContext(typeof(AhtolaNativeProvider).Assembly);
-                var assembly = loadContext?.LoadFromAssemblyName(new AssemblyName(NativeProviderAssemblyName))
-                    ?? Assembly.Load(new AssemblyName(NativeProviderAssemblyName));
-                var registrationType = assembly.GetType(NativeProviderRegistrationTypeName, throwOnError: true)!;
-                var register = registrationType.GetMethod(
-                    "Register",
-                    BindingFlags.Public | BindingFlags.Static)
-                    ?? throw new MissingMethodException(NativeProviderRegistrationTypeName, "Register");
-                register.Invoke(null, null);
-            }
-            catch (FileNotFoundException)
-            {
-            }
-
-            factory = Volatile.Read(ref s_factory);
-        }
-
-        return factory?.OpenDatabase(path, cipher, encryptionKey)
-            ?? throw new NotSupportedException(
-                "Local Provider=Native requires the Turso.Data.Sqlite.Native companion package. " +
-                "Add a matching PackageReference to use the native Ahtola SDK.");
-    }
+        => (Current ?? throw new NotSupportedException(MissingFactoryMessage))
+            .OpenDatabase(path, cipher, encryptionKey);
 }
 
 /// <summary>

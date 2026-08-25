@@ -125,7 +125,8 @@ try {
             $env:AHTOLA_BROWSER_EXECUTABLE = $BrowserExecutable
         }
         if ($BrowserEngine -eq 'chromium') {
-            & node $probeScript $uri 'PASS:capabilities=True;storage=True;crypto=True;ado=42;ef=84;persistent-ado=126;persistent-ef=168;persistent-core=210;persistent-features=546;browser-memory=504;reserved-path-rejected=True;worker-isolation=3;persistent-blob=01020908;persistent-backup=336;persistent-inbound-backup=378;persistent-encrypted=420;encrypted-maintenance=9368;persistent-encrypted-password=462;encrypted-wrong-key-rejected=True;encrypted-cipher-mismatch-rejected=True'
+            $expectedStatus = 'PASS:capabilities=True;storage=True;crypto=True;ado=42;persistent-ado=126;persistent-core=210;persistent-features=546;browser-memory=504;reserved-path-rejected=True;worker-isolation=3;persistent-blob=01020908;persistent-backup=336;persistent-inbound-backup=378;persistent-encrypted=420;encrypted-maintenance=9368;persistent-encrypted-password=462;encrypted-wrong-key-rejected=True;encrypted-cipher-mismatch-rejected=True;sync-read-mirror=True'
+            & node $probeScript $uri $expectedStatus
         } else {
             & node $playwrightProbeScript $BrowserEngine $uri 'PASS:'
         }

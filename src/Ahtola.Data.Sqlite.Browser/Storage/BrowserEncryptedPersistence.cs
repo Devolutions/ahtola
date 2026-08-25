@@ -149,6 +149,9 @@ internal sealed class BrowserLoadPlan(
 /// </remarks>
 internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pages) : IAsyncDisposable
 {
+    /// <summary>The AHTLA cipher this persistence layer writes.</summary>
+    internal Core.Storage.AhtolaEncryptionCipher Cipher => pages.Cipher;
+
     private const int WalHeaderSize = SqliteWalHeader.Size;
     private const int WalFrameHeaderSize = SqliteWalFrameHeader.Size;
     private const int RoleProbeLength = 16;

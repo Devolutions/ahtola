@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using Ahtola.Core;
 using Ahtola.Core.Storage;
@@ -11,27 +12,42 @@ namespace Ahtola;
 /// <see cref="AhtolaConnection"/> opens any other encrypted managed database -- reusing the
 /// storage layer's existing encrypted-header and reserved-byte validation instead of
 /// duplicating it. Mirrors Turso's <c>remote_encryption_key</c> plumbing in
-/// <c>database_sync_engine.rs</c>: only the AES-GCM cipher family the managed engine actually
-/// implements (<see cref="AhtolaEncryptionCipher.Aes128Gcm"/>/<see cref="AhtolaEncryptionCipher.Aes256Gcm"/>)
-/// is supported; every other remote cipher fails closed rather than being silently accepted or
-/// weakened.
+/// <c>database_sync_engine.rs</c>: every cipher that Turso format version 0 assigns an on-disk
+/// cipher id to (the two AES-GCM variants plus the six AEGIS variants) is supported, and every
+/// other remote cipher fails closed rather than being silently accepted or weakened.
 /// </summary>
 internal static class ManagedReplicaEncryption
 {
     /// <summary>
-    /// Throws <see cref="NotSupportedException"/> unless <paramref name="cipher"/> is one of the
-    /// AES-GCM variants the managed storage engine implements. Called eagerly from
+    /// Throws <see cref="NotSupportedException"/> unless <paramref name="cipher"/> has an
+    /// on-disk cipher id in Turso format version 0. Called eagerly from
     /// <see cref="ManagedReplicaSupportMatrix.ValidateOptions"/> so an unsupported cipher fails
     /// before any network request, not partway through a bootstrap.
     /// </summary>
+    /// <remarks>
+    /// <see cref="AhtolaRemoteEncryptionCipher.ChaCha20Poly1305"/> is deliberately excluded.
+    /// Turso only ever sends that name to Turso Cloud, which performs the crypto server-side; it
+    /// has no cipher id, no page-1 header byte, and no page framing anywhere in the pinned Rust
+    /// engine. A managed embedded replica has to decode pages locally, so accepting it would mean
+    /// inventing a wire format that no Turso build could read.
+    /// </remarks>
     public static void EnsureSupportedCipher(AhtolaRemoteEncryptionCipher cipher)
     {
-        if (cipher is not (AhtolaRemoteEncryptionCipher.Aes128Gcm or AhtolaRemoteEncryptionCipher.Aes256Gcm))
+        if (TryMapToStorageCipher(cipher, out _))
+            return;
+
+        if (cipher == AhtolaRemoteEncryptionCipher.ChaCha20Poly1305)
         {
             throw new NotSupportedException(
-                $"Managed embedded replicas support remote encryption ciphers Aes128Gcm and Aes256Gcm only; "
-                + $"'{cipher}' is not implemented by the managed storage engine.");
+                "Turso encrypted-page format version 0 defines no on-disk cipher id for ChaCha20-Poly1305; "
+                + "it is a Turso Cloud server-side cipher only. A managed embedded replica decrypts pages "
+                + "locally, so it cannot open a database configured with it.");
         }
+
+        throw new NotSupportedException(
+            $"Managed embedded replicas support the remote encryption ciphers that Turso format version 0 "
+            + $"assigns a cipher id to (Aes128Gcm, Aes256Gcm, Aegis256, Aegis256X2, Aegis256X4, Aegis128L, "
+            + $"Aegis128X2, Aegis128X4); '{cipher}' is not one of them.");
     }
 
     /// <summary>
@@ -43,6 +59,8 @@ internal static class ManagedReplicaEncryption
     {
         ArgumentNullException.ThrowIfNull(remoteEncryption);
         EnsureSupportedCipher(remoteEncryption.Cipher);
+        if (!TryMapToStorageCipher(remoteEncryption.Cipher, out var storageCipher))
+            throw new UnreachableException("EnsureSupportedCipher already rejected unmapped ciphers.");
 
         byte[] key;
         try
@@ -57,14 +75,53 @@ internal static class ManagedReplicaEncryption
 
         try
         {
-            // AhtolaRemoteEncryptionCipher.Aes128Gcm/Aes256Gcm share their names with
-            // AhtolaEncryptionCipher's members, so the Enum-accepting constructor resolves them
-            // directly; any other (already-rejected) cipher would throw there too as a backstop.
-            return new AhtolaEncryptionOptions(remoteEncryption.Cipher, key);
+            return new AhtolaEncryptionOptions(storageCipher, key);
         }
         finally
         {
             CryptographicOperations.ZeroMemory(key);
+        }
+    }
+
+    /// <summary>
+    /// Maps the Cloud cipher enumeration onto the storage cipher whose numeric value is the
+    /// on-disk cipher id. The mapping is explicit rather than name-based because the two
+    /// enumerations spell their AEGIS members differently (<c>Aegis128L</c> versus
+    /// <c>Aegis128l</c>), so a <see cref="Enum.ToString()"/> match would be brittle.
+    /// </summary>
+    internal static bool TryMapToStorageCipher(
+        AhtolaRemoteEncryptionCipher cipher,
+        out Core.Storage.AhtolaEncryptionCipher storageCipher)
+    {
+        switch (cipher)
+        {
+            case AhtolaRemoteEncryptionCipher.Aes128Gcm:
+                storageCipher = Core.Storage.AhtolaEncryptionCipher.Aes128Gcm;
+                return true;
+            case AhtolaRemoteEncryptionCipher.Aes256Gcm:
+                storageCipher = Core.Storage.AhtolaEncryptionCipher.Aes256Gcm;
+                return true;
+            case AhtolaRemoteEncryptionCipher.Aegis256:
+                storageCipher = Core.Storage.AhtolaEncryptionCipher.Aegis256;
+                return true;
+            case AhtolaRemoteEncryptionCipher.Aegis256X2:
+                storageCipher = Core.Storage.AhtolaEncryptionCipher.Aegis256X2;
+                return true;
+            case AhtolaRemoteEncryptionCipher.Aegis256X4:
+                storageCipher = Core.Storage.AhtolaEncryptionCipher.Aegis256X4;
+                return true;
+            case AhtolaRemoteEncryptionCipher.Aegis128L:
+                storageCipher = Core.Storage.AhtolaEncryptionCipher.Aegis128L;
+                return true;
+            case AhtolaRemoteEncryptionCipher.Aegis128X2:
+                storageCipher = Core.Storage.AhtolaEncryptionCipher.Aegis128X2;
+                return true;
+            case AhtolaRemoteEncryptionCipher.Aegis128X4:
+                storageCipher = Core.Storage.AhtolaEncryptionCipher.Aegis128X4;
+                return true;
+            default:
+                storageCipher = default;
+                return false;
         }
     }
 

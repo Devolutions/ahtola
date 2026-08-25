@@ -20,33 +20,40 @@ public static class AhtolaBrowserCryptoParameters
     /// <summary>The nonce size stored in every AHTLA AES-GCM page.</summary>
     public const int AesGcmNonceSize = 12;
 
-    /// <summary>The authentication tag size stored in every AHTLA AES-GCM page.</summary>
+    /// <summary>The authentication tag size stored in every AHTLA page.</summary>
     public const int AesGcmTagSize = 16;
 
+    /// <summary>
+    /// Whether <paramref name="cipher"/> is served by Web Crypto. SubtleCrypto
+    /// implements AES-GCM only, so every AEGIS variant runs through the
+    /// pure-managed core instead.
+    /// </summary>
+    internal static bool UsesWebCrypto(AhtolaEncryptionCipher cipher)
+        => cipher is AhtolaEncryptionCipher.Aes128Gcm or AhtolaEncryptionCipher.Aes256Gcm;
+
     internal static int GetKeySize(AhtolaEncryptionCipher cipher)
-        => cipher switch
-        {
-            AhtolaEncryptionCipher.Aes128Gcm => 16,
-            AhtolaEncryptionCipher.Aes256Gcm => 32,
-            _ => throw new ArgumentOutOfRangeException(
-                nameof(cipher),
-                cipher,
-                "Browser Web Crypto supports only AHTLA AES-128-GCM and AES-256-GCM."),
-        };
+        => Core.Storage.AhtolaEncryptedPageFormat.GetParameters(ToStorageCipher(cipher)).KeySize;
 
     /// <summary>
     /// Maps the provider-level cipher enum onto the storage cipher whose numeric
     /// value is written into the AHTLA page 1 header. The two enums do not share
-    /// numeric values, so this must always convert by name.
+    /// numeric values, so this must always convert explicitly.
     /// </summary>
     internal static Core.Storage.AhtolaEncryptionCipher ToStorageCipher(AhtolaEncryptionCipher cipher)
         => cipher switch
         {
             AhtolaEncryptionCipher.Aes128Gcm => Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
             AhtolaEncryptionCipher.Aes256Gcm => Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
+            AhtolaEncryptionCipher.Aegis256 => Core.Storage.AhtolaEncryptionCipher.Aegis256,
+            AhtolaEncryptionCipher.Aegis256x2 => Core.Storage.AhtolaEncryptionCipher.Aegis256X2,
+            AhtolaEncryptionCipher.Aegis256x4 => Core.Storage.AhtolaEncryptionCipher.Aegis256X4,
+            AhtolaEncryptionCipher.Aegis128l => Core.Storage.AhtolaEncryptionCipher.Aegis128L,
+            AhtolaEncryptionCipher.Aegis128x2 => Core.Storage.AhtolaEncryptionCipher.Aegis128X2,
+            AhtolaEncryptionCipher.Aegis128x4 => Core.Storage.AhtolaEncryptionCipher.Aegis128X4,
             _ => throw new ArgumentOutOfRangeException(
                 nameof(cipher),
                 cipher,
-                "Browser Web Crypto supports only AHTLA AES-128-GCM and AES-256-GCM."),
+                "The browser package supports Ahtola format version 0 cipher IDs 1 through 8 only; "
+                + "ChaCha20-Poly1305 is a Turso Cloud server-side cipher with no on-disk cipher id."),
         };
 }

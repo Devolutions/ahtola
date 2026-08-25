@@ -36,4 +36,12 @@ values. Results that are NaN under Turso's operation rules become SQL `NULL`,
 matching SQLite's real-value behavior.
 
 The implementation is scalar managed code and is NativeAOT/trimming safe.
-Vector indexes and Turso custom index methods are not implemented.
+
+A dense vector index is available as `CREATE INDEX … USING vector (col) WITH (…)`, built on the
+managed index-method foundation and documented in
+[managed-vector-index.md](managed-vector-index.md). It answers
+`ORDER BY vector_distance_*(col, ?) LIMIT n` exactly — the same rows, in the same order, with the
+same distance values as the unindexed query — for the `float32`, `float64`, `float8` and `float1bit`
+encodings under the `l2`, `cosine` and `dot` metrics. Sparse vectors and `vector_distance_jaccard`
+have no index support and are rejected at `CREATE INDEX`; they still work through the scalar
+functions.

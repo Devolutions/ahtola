@@ -9,6 +9,26 @@ namespace Ahtola.Data.Sqlite.Browser;
 /// <summary>
 /// Provides AHTLA-compatible PBKDF2-HMAC-SHA256 and AES-GCM through browser Web Crypto.
 /// </summary>
+/// <remarks>
+/// <para>
+/// This service is deliberately Web Crypto only. SubtleCrypto implements
+/// <c>AES-GCM</c> and nothing else, so every member here is specified in terms of
+/// AES-GCM's fixed 12-byte nonce and 16-byte tag, and the key is imported as a
+/// non-extractable <c>AES-GCM</c> JavaScript key. It therefore accepts only
+/// <see cref="AhtolaEncryptionCipher.Aes128Gcm"/> and
+/// <see cref="AhtolaEncryptionCipher.Aes256Gcm"/>.
+/// </para>
+/// <para>
+/// The AEGIS ciphers (Ahtola cipher IDs 3 through 8) have no Web Crypto
+/// implementation and use wider nonces, so they are served by the pure-managed
+/// <see cref="Storage.AhtolaManagedAegisPageCipher"/> instead. Both are selected
+/// by <see cref="Storage.AhtolaBrowserPageCipherFactory"/>, which routes on
+/// <see cref="AhtolaBrowserCryptoParameters.UsesWebCrypto"/>; nothing in the
+/// package reaches this type with an AEGIS cipher. Passing one is rejected
+/// rather than silently downgraded, because a service that reported AEGIS while
+/// producing AES-GCM bytes would be a cipher-confusion hazard.
+/// </para>
+/// </remarks>
 [SupportedOSPlatform("browser")]
 public sealed class AhtolaBrowserCryptoService : IDisposable, IAsyncDisposable
 {
@@ -20,7 +40,10 @@ public sealed class AhtolaBrowserCryptoService : IDisposable, IAsyncDisposable
         _keyHandle = keyHandle;
     }
 
-    /// <summary>The AHTLA AES-GCM cipher represented by this service.</summary>
+    /// <summary>
+    /// The AHTLA cipher represented by this service. Always an AES-GCM cipher,
+    /// and always the algorithm the imported Web Crypto key actually runs.
+    /// </summary>
     public AhtolaEncryptionCipher Cipher { get; }
 
     /// <summary>
@@ -40,12 +63,38 @@ public sealed class AhtolaBrowserCryptoService : IDisposable, IAsyncDisposable
         return new AhtolaBrowserCryptoService(AhtolaEncryptionCipher.Aes256Gcm, handle);
     }
 
-    /// <summary>Imports an exact AES-128 or AES-256 key as a non-extractable Web Crypto key.</summary>
+    /// <summary>
+    /// Imports an exact AES-128 or AES-256 key as a non-extractable Web Crypto key.
+    /// </summary>
+    /// <param name="cipher">
+    /// Must be <see cref="AhtolaEncryptionCipher.Aes128Gcm"/> or
+    /// <see cref="AhtolaEncryptionCipher.Aes256Gcm"/>. The AEGIS ciphers are
+    /// rejected: Web Crypto cannot run them, and importing an AES-GCM key while
+    /// reporting AEGIS would make <see cref="Cipher"/> disagree with the bytes
+    /// this service produces. Use
+    /// <see cref="Storage.AhtolaBrowserPageCipherFactory"/> (or
+    /// <see cref="AhtolaBrowserEncryptionOptions.CreateManagedAegisPageCipher"/>)
+    /// for those.
+    /// </param>
+    /// <param name="key">Exactly <c>cipher</c>'s key size in bytes.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="cipher"/> is not implemented by Web Crypto, or is not an
+    /// Ahtola format version 0 cipher at all.
+    /// </exception>
     public static async ValueTask<AhtolaBrowserCryptoService> CreateAsync(
         AhtolaEncryptionCipher cipher,
         ReadOnlyMemory<byte> key)
     {
         var requiredKeySize = AhtolaBrowserCryptoParameters.GetKeySize(cipher);
+        if (!AhtolaBrowserCryptoParameters.UsesWebCrypto(cipher))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(cipher),
+                cipher,
+                $"{nameof(AhtolaBrowserCryptoService)} is backed by Web Crypto, which implements AES-GCM only, "
+                + $"so it cannot represent '{cipher}'. Use the pure-managed AEGIS page cipher instead.");
+        }
+
         if (key.Length != requiredKeySize)
         {
             throw new ArgumentException(

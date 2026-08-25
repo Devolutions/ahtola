@@ -55,6 +55,7 @@ public sealed class ResumableStatement : IDisposable
     private readonly WindowBufferRuntime?[] _windowBuffers;
     private readonly EphemeralTableRuntime?[] _ephemeralTables;
     private readonly ManagedVirtualTableCursor?[] _virtualCursors;
+    private readonly Indexing.ManagedIndexMethodCursor?[] _indexMethodCursors;
     private readonly IReadOnlyList<VdbeCursorSource?>? _cursorSources;
     private readonly IReadOnlyList<VdbeWriteTarget?>? _writeTargets;
     private readonly IReadOnlyList<VdbeVirtualTableBinding?>? _virtualTableBindings;
@@ -160,6 +161,7 @@ public sealed class ResumableStatement : IDisposable
         _windowBuffers = new WindowBufferRuntime?[program.WindowBufferCount];
         _ephemeralTables = new EphemeralTableRuntime?[program.CursorCount];
         _virtualCursors = new ManagedVirtualTableCursor?[program.CursorCount];
+        _indexMethodCursors = new Indexing.ManagedIndexMethodCursor?[program.CursorCount];
         _cursorSources = cursorSources;
         _writeTargets = writeTargets;
         _virtualTableBindings = virtualTableBindings;
@@ -476,6 +478,79 @@ public sealed class ResumableStatement : IDisposable
                             AdvanceInstructionPointer();
                         else
                             _instructionPointer = vFilter.EmptyTarget;
+                        break;
+                    }
+                case IndexMethodCreateInstruction methodCreate:
+                    {
+                        var cursor = OpenIndexMethodCursor(methodCreate.Cursor, methodCreate.Binding);
+                        cursor.Create();
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case IndexMethodDestroyInstruction methodDestroy:
+                    {
+                        var cursor = OpenIndexMethodCursor(methodDestroy.Cursor, methodDestroy.Binding);
+                        cursor.Destroy();
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case IndexMethodOptimizeInstruction methodOptimize:
+                    {
+                        var cursor = OpenIndexMethodCursor(methodOptimize.Cursor, methodOptimize.Binding);
+                        cursor.OpenWrite();
+                        cursor.Optimize();
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case IndexMethodQueryInstruction methodQuery:
+                    {
+                        var cursor = OpenIndexMethodCursor(methodQuery.Cursor, methodQuery.Binding);
+                        cursor.OpenRead();
+                        var arguments = ReadRegisters(methodQuery.Arguments);
+                        var positioned = cursor.QueryStart(methodQuery.PatternIndex, arguments.ToArray());
+                        if (positioned)
+                            AdvanceInstructionPointer();
+                        else
+                            _instructionPointer = methodQuery.EmptyTarget;
+                        break;
+                    }
+                case IndexMethodNextInstruction methodNext:
+                    {
+                        if (RequireIndexMethodCursor(methodNext.Cursor).QueryNext())
+                            _instructionPointer = methodNext.LoopTarget;
+                        else
+                            AdvanceInstructionPointer();
+                        break;
+                    }
+                case IndexMethodColumnInstruction methodColumn:
+                    {
+                        _registers[methodColumn.Destination.Index] =
+                            RequireIndexMethodCursor(methodColumn.Cursor).Column(methodColumn.ColumnIndex);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case IndexMethodRowIdInstruction methodRowId:
+                    {
+                        var rowId = RequireIndexMethodCursor(methodRowId.Cursor).RowId();
+                        _registers[methodRowId.Destination.Index] =
+                            rowId is { } value ? SqlValue.Integer(value) : SqlValue.Null;
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case IndexMethodInsertInstruction methodInsert:
+                    {
+                        var cursor = RequireIndexMethodCursor(methodInsert.Cursor);
+                        cursor.OpenWrite();
+                        cursor.Insert(ReadRegisters(methodInsert.Values).ToArray());
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case IndexMethodDeleteInstruction methodDelete:
+                    {
+                        var cursor = RequireIndexMethodCursor(methodDelete.Cursor);
+                        cursor.OpenWrite();
+                        cursor.Delete(ReadRegisters(methodDelete.Values).ToArray());
+                        AdvanceInstructionPointer();
                         break;
                     }
                 case FilterRowIdInstruction filterRowId:
@@ -868,21 +943,21 @@ public sealed class ResumableStatement : IDisposable
                         break;
                     }
                 case VBeginInstruction vBegin:
-                        RequireVirtualTable(vBegin.Cursor).Begin();
-                        AdvanceInstructionPointer();
-                        break;
+                    RequireVirtualTable(vBegin.Cursor).Begin();
+                    AdvanceInstructionPointer();
+                    break;
                 case VSyncInstruction vSync:
-                        RequireVirtualTable(vSync.Cursor).Sync();
-                        AdvanceInstructionPointer();
-                        break;
+                    RequireVirtualTable(vSync.Cursor).Sync();
+                    AdvanceInstructionPointer();
+                    break;
                 case VCommitInstruction vCommit:
-                        RequireVirtualTable(vCommit.Cursor).Commit();
-                        AdvanceInstructionPointer();
-                        break;
+                    RequireVirtualTable(vCommit.Cursor).Commit();
+                    AdvanceInstructionPointer();
+                    break;
                 case VRollbackInstruction vRollback:
-                        RequireVirtualTable(vRollback.Cursor).Rollback();
-                        AdvanceInstructionPointer();
-                        break;
+                    RequireVirtualTable(vRollback.Cursor).Rollback();
+                    AdvanceInstructionPointer();
+                    break;
                 case ProgramInstruction program:
                     if (ExecuteSubprogram(program, cancellationToken))
                         return ResumableStatementStepResult.Yielded;
@@ -1594,6 +1669,8 @@ public sealed class ResumableStatement : IDisposable
         _openCursors[cursor.Index] = false;
         _virtualCursors[cursor.Index]?.Dispose();
         _virtualCursors[cursor.Index] = null;
+        _indexMethodCursors[cursor.Index]?.Dispose();
+        _indexMethodCursors[cursor.Index] = null;
     }
 
     private bool ExecuteSubprogram(ProgramInstruction instruction, CancellationToken cancellationToken)
@@ -1714,6 +1791,8 @@ public sealed class ResumableStatement : IDisposable
         {
             _virtualCursors[index]?.Dispose();
             _virtualCursors[index] = null;
+            _indexMethodCursors[index]?.Dispose();
+            _indexMethodCursors[index] = null;
         }
     }
 
@@ -1829,6 +1908,21 @@ public sealed class ResumableStatement : IDisposable
         => _virtualCursors[cursor.Index]
             ?? throw new InvalidOperationException(
                 $"Cursor {cursor.Index} is not an open managed virtual-table cursor.");
+
+    private Indexing.ManagedIndexMethodCursor OpenIndexMethodCursor(Cursor cursor, VdbeIndexMethodBinding binding)
+    {
+        if (_indexMethodCursors[cursor.Index] is { } existing)
+            return existing;
+
+        var opened = binding.Attachment.Open(binding.Source);
+        _indexMethodCursors[cursor.Index] = opened;
+        return opened;
+    }
+
+    private Indexing.ManagedIndexMethodCursor RequireIndexMethodCursor(Cursor cursor)
+        => _indexMethodCursors[cursor.Index]
+            ?? throw new InvalidOperationException(
+                $"Cursor {cursor.Index} is not an open managed index-method cursor.");
 
     // A cursor's iteration length comes from its write target (INSERT value rows or
     // scanned UPDATE/DELETE rows) or, failing that, its read source. Streaming join

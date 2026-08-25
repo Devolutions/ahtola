@@ -8,6 +8,11 @@ namespace Ahtola.Data.Sqlite.Browser.Storage;
 /// Bridges <see cref="AhtolaBrowserCryptoService"/> (Web Crypto) to the
 /// asynchronous page cipher used by encrypted OPFS persistence.
 /// </summary>
+/// <remarks>
+/// Web Crypto only exposes AES-GCM, so this adapter only ever backs cipher IDs 1
+/// and 2. AEGIS databases go through <see cref="AhtolaManagedAegisPageCipher"/>,
+/// which runs the same pure-managed core the desktop engine uses.
+/// </remarks>
 [SupportedOSPlatform("browser")]
 internal sealed class AhtolaBrowserWebCryptoPageCipher(AhtolaBrowserCryptoService service)
     : IAhtolaAsyncPageCipher
@@ -62,20 +67,22 @@ internal sealed class AhtolaBrowserWebCryptoPageCipher(AhtolaBrowserCryptoServic
 
 /// <summary>
 /// Encrypts and decrypts complete SQLite pages in Ahtola's AHTLA version 0
-/// format using an asynchronous AES-GCM primitive.
+/// format using an asynchronous AEAD primitive.
 /// </summary>
 /// <remarks>
-/// The produced bytes are identical to the desktop
-/// <c>AhtolaPageEncryption</c> output: page 1 keeps a visible 100-byte header
-/// beginning with the AHTLA magic and authenticates it as associated data,
-/// every page stores a 16-byte tag followed by a 12-byte nonce in the
-/// <see cref="AhtolaEncryptedPageFormat.MetadataSize"/> reserved bytes, and no
-/// other page carries associated data.
+/// The produced bytes are identical to the desktop <c>AhtolaPageEncryption</c>
+/// output: page 1 keeps a visible 100-byte header beginning with the AHTLA magic
+/// and authenticates it as associated data, every page stores a 16-byte tag
+/// followed by the cipher's nonce in the reserved bytes, and no other page
+/// carries associated data.
 /// </remarks>
 internal sealed class AhtolaAsyncPageTransformer(IAhtolaAsyncPageCipher cipher) : IAsyncDisposable
 {
-    /// <summary>Reserved bytes every encrypted page requires.</summary>
-    internal const int ReservedBytes = AhtolaEncryptedPageFormat.MetadataSize;
+    private readonly AhtolaCipherParameters _parameters =
+        AhtolaEncryptedPageFormat.GetParameters(cipher.Cipher);
+
+    /// <summary>Reserved bytes every encrypted page requires for this cipher.</summary>
+    internal int ReservedBytes => _parameters.MetadataSize;
 
     /// <summary>The AHTLA cipher id recorded in encrypted page 1 headers.</summary>
     internal Core.Storage.AhtolaEncryptionCipher Cipher => cipher.Cipher;
@@ -102,14 +109,14 @@ internal sealed class AhtolaAsyncPageTransformer(IAhtolaAsyncPageCipher cipher) 
         CancellationToken cancellationToken)
     {
         var pageSize = ValidatePage(page.Length, pageNumber);
-        AhtolaEncryptedPageFormat.ValidatePlaintextReservedBytes(page.Span, pageNumber);
+        AhtolaEncryptedPageFormat.ValidatePlaintextReservedBytes(page.Span, pageNumber, _parameters);
 
         var encrypted = new byte[pageSize];
         if (pageNumber == 1)
             AhtolaEncryptedPageFormat.WriteEncryptedHeaderPrefix(encrypted, page.Span, Cipher);
 
-        var regions = AhtolaEncryptedPageFormat.Describe(pageSize, pageNumber);
-        var nonce = new byte[AhtolaEncryptedPageFormat.NonceSize];
+        var regions = AhtolaEncryptedPageFormat.Describe(pageSize, pageNumber, _parameters);
+        var nonce = new byte[regions.NonceLength];
         RandomNumberGenerator.Fill(nonce);
         nonce.CopyTo(encrypted.AsSpan(regions.NonceOffset));
 
@@ -124,10 +131,10 @@ internal sealed class AhtolaAsyncPageTransformer(IAhtolaAsyncPageCipher cipher) 
             .ConfigureAwait(false);
 
         if (result.Ciphertext.Length != regions.PayloadLength
-            || result.Tag.Length != AhtolaEncryptedPageFormat.TagSize)
+            || result.Tag.Length != regions.TagLength)
         {
             throw new CryptographicException(
-                "The asynchronous AES-GCM provider returned an unexpected ciphertext or tag length.");
+                "The asynchronous AEAD provider returned an unexpected ciphertext or tag length.");
         }
 
         result.Ciphertext.CopyTo(encrypted.AsSpan(regions.PayloadOffset));
@@ -149,15 +156,15 @@ internal sealed class AhtolaAsyncPageTransformer(IAhtolaAsyncPageCipher cipher) 
         if (pageNumber == 1)
             AhtolaEncryptedPageFormat.RestorePlaintextHeaderPrefix(plaintext, encryptedPage.Span);
 
-        var regions = AhtolaEncryptedPageFormat.Describe(pageSize, pageNumber);
+        var regions = AhtolaEncryptedPageFormat.Describe(pageSize, pageNumber, _parameters);
         byte[] payload;
         try
         {
             payload = await cipher
                 .DecryptAsync(
                     encryptedPage.Slice(regions.PayloadOffset, regions.PayloadLength),
-                    encryptedPage.Slice(regions.TagOffset, AhtolaEncryptedPageFormat.TagSize),
-                    encryptedPage.Slice(regions.NonceOffset, AhtolaEncryptedPageFormat.NonceSize),
+                    encryptedPage.Slice(regions.TagOffset, regions.TagLength),
+                    encryptedPage.Slice(regions.NonceOffset, regions.NonceLength),
                     encryptedPage.Slice(regions.AssociatedDataOffset, regions.AssociatedDataLength),
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -181,12 +188,12 @@ internal sealed class AhtolaAsyncPageTransformer(IAhtolaAsyncPageCipher cipher) 
         }
     }
 
-    private static int ValidatePage(int length, uint pageNumber)
+    private int ValidatePage(int length, uint pageNumber)
     {
         if (pageNumber == 0)
             throw new ArgumentOutOfRangeException(nameof(pageNumber), "SQLite page numbers are 1-based.");
         _ = SqlitePageSize.Encode(length);
-        AhtolaEncryptedPageFormat.ValidatePageSize(length);
+        AhtolaEncryptedPageFormat.ValidatePageSize(length, _parameters);
         return length;
     }
 

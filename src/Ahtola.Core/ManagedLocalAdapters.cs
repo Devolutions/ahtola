@@ -118,6 +118,26 @@ internal interface IManagedDatabaseFactory
 
     bool IsSharedMemory => false;
 
+    /// <summary>
+    /// Whether a connection opened from this factory may execute provably
+    /// read-only statements synchronously.
+    /// </summary>
+    /// <remarks>
+    /// A factory that opens its database asynchronously normally forces every
+    /// command onto the asynchronous path. A factory that has materialized the
+    /// whole database into managed memory during that asynchronous open can opt
+    /// in here, which lets the provider serve reads without crossing an
+    /// asynchronous storage boundary. Mutations, transactions, and anything the
+    /// provider cannot prove read-only stay asynchronous regardless.
+    /// </remarks>
+    bool SupportsSynchronousReads => false;
+
+    /// <summary>
+    /// Whether durable work is still owed to the backing store, which makes
+    /// synchronous teardown unsafe even when synchronous reads are allowed.
+    /// </summary>
+    bool HasPendingDurableWork => false;
+
     ValueTask<IManagedDatabaseAdapter> OpenDatabaseAsync(
         CancellationToken cancellationToken = default);
 }

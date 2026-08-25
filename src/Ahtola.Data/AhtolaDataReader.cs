@@ -2,6 +2,7 @@ using System.Collections;
 using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text;
 using Ahtola.Core;
@@ -18,6 +19,8 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
     private readonly Action _completionCallback;
     private readonly Action _failureCallback;
     private readonly Action _closeCallback;
+    private readonly BrowserSynchronousAuthorization _synchronousAuthorization;
+    private readonly string _commandTextSnapshot;
     private IDisposable? _replicaOperation;
     private string?[]? _declaredColumnTypes;
     private bool _isClosed;
@@ -117,6 +120,12 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         _failureCallback = failureCallback;
         _closeCallback = closeCallback;
         _replicaOperation = replicaOperation;
+
+        // Prove synchronous authorization once, here, against the SQL that was prepared and
+        // executed. Consulting the command later would read whatever CommandText happens to hold
+        // by then, which a caller can change between obtaining the reader and stepping it.
+        _synchronousAuthorization = command.CaptureSynchronousAuthorization();
+        _commandTextSnapshot = command.CommandText;
         ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
@@ -199,6 +208,8 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
         return ReadValue(ordinal).Real;
     }
 
+    [return: DynamicallyAccessedMembers(
+        DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     public override Type GetFieldType(int ordinal)
     {
         if (!_hasCurrentRow)
@@ -232,7 +243,7 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
     {
         _declaredColumnTypes ??= AhtolaSchemaCollections.GetDeclaredColumnTypes(
             _connection,
-            _command.CommandText,
+            _commandTextSnapshot,
             GetFieldCount(),
             GetName);
 
@@ -344,10 +355,9 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
     public override DataTable GetSchemaTable()
         => AhtolaSchemaCollections.BuildReaderSchemaTable(
             _connection,
-            _command.CommandText,
+            _commandTextSnapshot,
             FieldCount,
-            GetName,
-            GetFieldType);
+            this);
 
     public override object this[int ordinal] => GetValue(ordinal)!;
 
@@ -421,11 +431,8 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing && !_isClosed && _command.RequiresAsyncExecution)
-        {
-            throw new PlatformNotSupportedException(
-                "Synchronous reader disposal is not supported by the browser database source. Use DisposeAsync.");
-        }
+        if (disposing && !_isClosed)
+            _synchronousAuthorization.ThrowIfReaderDisposalRejected();
 
         if (disposing)
             CloseCore(closeConnection: true);
@@ -733,14 +740,7 @@ public class AhtolaDataReader : DbDataReader, IConnectionOwnedReader
     }
 
     private void ThrowIfSynchronousBrowserOperation()
-    {
-        if (_command.RequiresAsyncExecution)
-        {
-            throw new PlatformNotSupportedException(
-                "Synchronous reader iteration is not supported by the browser database source. "
-                + "Use ReadAsync or NextResultAsync.");
-        }
-    }
+        => _synchronousAuthorization.ThrowIfReaderIterationRejected();
 
     private void ValidateOrdinal(int ordinal)
     {

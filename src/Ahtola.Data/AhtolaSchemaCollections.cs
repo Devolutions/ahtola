@@ -557,16 +557,25 @@ internal static class AhtolaSchemaCollections
     /// <paramref name="commandText"/>. The column set matches the facade reader so that
     /// <see cref="DbCommandBuilder"/> behaves identically on both ADO.NET surfaces.
     /// </summary>
+    /// <remarks>
+    /// The reader is passed in rather than a field-type accessor delegate. A
+    /// <c>Func&lt;int, Type&gt;</c> drops the <see cref="DynamicallyAccessedMembersAttribute"/> that
+    /// <see cref="DbDataReader.GetFieldType(int)"/> declares on its return value (IL2072 here,
+    /// IL2111 at the method-group conversion), and a custom delegate that re-declares the
+    /// annotation moves the problem rather than solving it: the compiler-generated
+    /// <c>Invoke</c> cannot prove its return value satisfies the annotation, which NativeAOT
+    /// reports as IL2063. Calling <see cref="DbDataReader.GetFieldType(int)"/> directly keeps the
+    /// annotated contract intact with no delegate in the middle.
+    /// </remarks>
     internal static DataTable BuildReaderSchemaTable(
         DbConnection? connection,
         ReaderSchemaSource? cachedSource,
         string? commandText,
         int fieldCount,
-        Func<int, string> getName,
-        Func<int, Type> getFieldType)
+        DbDataReader reader)
     {
         var schema = CreateReaderSchemaTable();
-        var hasSource = TryGetSelectSource(commandText, fieldCount, getName, out var tableName, out var selections);
+        var hasSource = TryGetSelectSource(commandText, fieldCount, reader.GetName, out var tableName, out var selections);
         Dictionary<string, ReaderSchemaColumn> tableColumns;
         if (hasSource && cachedSource is not null
             && cachedSource.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
@@ -582,7 +591,7 @@ internal static class AhtolaSchemaCollections
 
         for (var i = 0; i < fieldCount; i++)
         {
-            var columnName = getName(i);
+            var columnName = reader.GetName(i);
             var selection = i < selections.Count ? selections[i] : columnName;
             var baseColumnName = ResolveBaseColumnName(selection, columnName, tableColumns);
             ReaderSchemaColumn? info = baseColumnName is not null
@@ -592,8 +601,8 @@ internal static class AhtolaSchemaCollections
 
             var declaredType = info?.TypeName ?? string.Empty;
             var dataType = info is not null
-                ? GetClrTypeFromDeclaredType(declaredType, getFieldType(i))
-                : getFieldType(i);
+                ? GetClrTypeFromDeclaredType(declaredType, reader.GetFieldType(i))
+                : reader.GetFieldType(i);
             var dataTypeName = info is not null
                 ? StripTypeLength(declaredType)
                 : GetDeclaredTypeFromClrType(dataType);
@@ -631,9 +640,8 @@ internal static class AhtolaSchemaCollections
         DbConnection? connection,
         string? commandText,
         int fieldCount,
-        Func<int, string> getName,
-        Func<int, Type> getFieldType)
-        => BuildReaderSchemaTable(connection, null, commandText, fieldCount, getName, getFieldType);
+        DbDataReader reader)
+        => BuildReaderSchemaTable(connection, null, commandText, fieldCount, reader);
 
     internal static bool TryGetReaderSchemaTableName(string? commandText, out string tableName)
     {
@@ -780,7 +788,13 @@ internal static class AhtolaSchemaCollections
     /// <summary>
     /// Maps a declared SQLite type to its CLR type using SQLite's affinity rules.
     /// </summary>
-    internal static Type GetClrTypeFromDeclaredTypeName(string declaredType, Type fallback)
+    [return: DynamicallyAccessedMembers(
+        DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
+    internal static Type GetClrTypeFromDeclaredTypeName(
+        string declaredType,
+        [DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
+        Type fallback)
         => GetClrTypeFromDeclaredType(declaredType, fallback);
 
     private static DataTable CreateReaderSchemaTable()
@@ -798,7 +812,7 @@ internal static class AhtolaSchemaCollections
         schema.Columns.Add(SchemaTableColumn.BaseColumnName, typeof(string));
         schema.Columns.Add(SchemaTableColumn.BaseSchemaName, typeof(string));
         schema.Columns.Add(SchemaTableColumn.BaseTableName, typeof(string));
-        schema.Columns.Add(SchemaTableColumn.DataType, typeof(Type));
+        schema.Columns.Add(CreateClrTypeColumn());
         schema.Columns.Add("DataTypeName", typeof(string));
         schema.Columns.Add(SchemaTableColumn.AllowDBNull, typeof(bool));
         schema.Columns.Add(SchemaTableColumn.IsAliased, typeof(bool));
@@ -807,6 +821,55 @@ internal static class AhtolaSchemaCollections
         schema.Columns.Add(SchemaTableColumn.IsLong, typeof(bool));
         schema.Columns.Add(SchemaTableColumn.ProviderType, typeof(int));
         return schema;
+    }
+
+    /// <summary>
+    /// Creates the schema table's <see cref="SchemaTableColumn.DataType"/> column, declared as
+    /// <c>typeof(Type)</c> exactly like every other ADO.NET provider, so that
+    /// <c>schemaTable.Columns[SchemaTableColumn.DataType].DataType == typeof(Type)</c> holds and
+    /// <see cref="DbDataAdapter"/>/<see cref="DbCommandBuilder"/> see the metadata they expect.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The column is borrowed from the schema table <see cref="DataTableReader"/> builds rather
+    /// than constructed here, and that indirection is the whole point.
+    /// <see cref="DataColumn.DataType"/> is annotated
+    /// <c>[DynamicallyAccessedMembers(PublicFields | PublicProperties)]</c>, so handing it
+    /// <c>typeof(Type)</c> from our own code asks the trimmer to keep <see cref="System.Type"/>'s
+    /// public property surface reflection-visible; one of those properties,
+    /// <c>Type.TypeInitializer</c>, declares its own requirement on <c>this</c>, which the trimmer
+    /// reports as IL2111. Every direct route hits it — the annotation is on the property, so the
+    /// setter, all three <see cref="DataColumn"/> constructors, both <c>DataColumnCollection.Add</c>
+    /// overloads and even the private backing field are covered, and rooting with
+    /// <c>DynamicDependency</c> or a trimmer descriptor does not change the diagnostic.
+    /// </para>
+    /// <para>
+    /// <see cref="DataTableReader.GetSchemaTable"/> builds the standard ADO.NET schema-table
+    /// layout entirely inside <c>System.Data.Common</c>, where that annotation flow is already
+    /// satisfied, and its <c>DataType</c> column is a genuine <c>typeof(Type)</c> column. Taking
+    /// that column and re-parenting it needs only the unannotated
+    /// <see cref="DataColumnCollection.Remove(DataColumn)"/>/<see cref="DataColumnCollection.Add(DataColumn)"/>
+    /// pair, so the result is the correct ADO metadata with no reflection demand, no suppression
+    /// and no trim warning.
+    /// </para>
+    /// </remarks>
+    internal static DataColumn CreateClrTypeColumn()
+    {
+        using var probe = new DataTable();
+        probe.Columns.Add("probe", typeof(int));
+        using var probeReader = probe.CreateDataReader();
+        var prototype = probeReader.GetSchemaTable()
+            ?? throw new InvalidOperationException(
+                "DataTableReader did not produce a schema table to source the DataType column from.");
+        var column = prototype.Columns[SchemaTableColumn.DataType]
+            ?? throw new InvalidOperationException(
+                "The DataTableReader schema table has no DataType column.");
+
+        prototype.Columns.Remove(column);
+        column.AllowDBNull = true;
+        column.ReadOnly = false;
+        column.Unique = false;
+        return column;
     }
 
     private static bool TryGetSelectSource(

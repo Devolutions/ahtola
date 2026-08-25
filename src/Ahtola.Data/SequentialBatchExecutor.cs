@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Ahtola;
 
@@ -155,6 +156,7 @@ internal static class SequentialBatchExecutor
         var total = 0;
         try
         {
+            ThrowIfSynchronousBrowserBatchRejected(commands);
             foreach (var entry in commands)
             {
                 execution.Token.ThrowIfCancellationRequested();
@@ -226,6 +228,10 @@ internal static class SequentialBatchExecutor
         DbDataReader? reader = null;
         try
         {
+            // Fail closed before the first command runs: a batch that is not provably read-only
+            // end to end must never execute even its leading SELECT synchronously, or a browser
+            // caller would get a partially applied batch it cannot finish.
+            ThrowIfSynchronousBrowserBatchRejected(commands);
             var first = commands[0];
             first.PrepareForExecution();
             execution.SetActiveCommand(first.Command);
@@ -244,6 +250,47 @@ internal static class SequentialBatchExecutor
             }
             throw;
         }
+    }
+
+    /// <summary>
+    /// Refuses a synchronous batch on an asynchronous-only connection unless every command in it
+    /// was proven read-only. A fully proven batch is served from the managed in-memory mirror and
+    /// needs no durable-store crossing, so it stays synchronous.
+    /// </summary>
+    internal static void ThrowIfSynchronousBrowserBatchRejected(
+        IReadOnlyList<SequentialBatchCommand> commands)
+    {
+        if (commands.Count == 0)
+            return;
+        if (commands[0].Command.Connection is not IAsyncExecutionConnection { RequiresAsyncExecution: true })
+            return;
+        if (CaptureAggregateAuthorization(commands).AllowsSynchronousExecution)
+            return;
+
+        throw new PlatformNotSupportedException(
+            "Synchronous batch execution requires every command in the batch to be proven "
+            + "read-only ("
+            + BrowserSynchronousExecutionContract.ProvenReadOnlyShapes
+            + "). Use the corresponding asynchronous API.");
+    }
+
+    /// <summary>
+    /// Folds every batch command's synchronous-execution decision into one, classifying each
+    /// command's text exactly once.
+    /// </summary>
+    internal static BrowserSynchronousAuthorization CaptureAggregateAuthorization(
+        IReadOnlyList<SequentialBatchCommand> commands)
+    {
+        var authorization = BrowserSynchronousAuthorization.Allowed;
+        foreach (var entry in commands)
+        {
+            authorization = authorization.And(
+                BrowserSynchronousAuthorization.Capture(
+                    entry.Command.Connection as IBrowserSynchronousExecutionPolicy,
+                    entry.Command.CommandText));
+        }
+
+        return authorization;
     }
 
     internal static async Task<DbDataReader> ExecuteReaderAsync(
@@ -378,6 +425,7 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
     private readonly CommandBehavior _behavior;
     private readonly DbConnection? _connection;
     private readonly ILocalReaderConnection? _readerConnection;
+    private readonly BrowserSynchronousAuthorization _synchronousAuthorization;
     private int _commandIndex;
     private DbDataReader? _reader;
     private int _recordsAffected = -1;
@@ -396,6 +444,13 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
         _reader = reader;
         _behavior = behavior;
         _connection = commands[0].Command.Connection;
+
+        // Classify the whole batch exactly once, from the command texts that are about to be
+        // executed. A batch may be driven synchronously only when *every* command is provably
+        // read-only, so one unproven command still fails closed — but a batch of proven reads is
+        // served from the managed mirror and needs no OPFS crossing, so refusing it outright
+        // would be wrong. Folding here also keeps the classifier off the per-row path.
+        _synchronousAuthorization = SequentialBatchExecutor.CaptureAggregateAuthorization(commands);
         if (completeInitialResult)
             CompleteCurrentWithoutResultSet();
         _readerConnection = _connection as ILocalReaderConnection;
@@ -483,6 +538,8 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
 
     public override IEnumerator GetEnumerator() => Current.GetEnumerator();
 
+    [return: DynamicallyAccessedMembers(
+        DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     public override Type GetFieldType(int ordinal) => Current.GetFieldType(ordinal);
 
     public override T GetFieldValue<T>(int ordinal) => Current.GetFieldValue<T>(ordinal);
@@ -518,6 +575,7 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
     public override bool Read()
     {
         EnsureOpen();
+        ThrowIfSynchronousBrowserOperation();
         if (_finished)
             return false;
 
@@ -540,6 +598,7 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
     public override bool NextResult()
     {
         EnsureOpen();
+        ThrowIfSynchronousBrowserOperation();
         if (_finished)
             return false;
 
@@ -940,14 +999,25 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
             throw new InvalidOperationException("The batch data reader is closed.");
     }
 
+    /// <summary>
+    /// Refuses a synchronous batch-reader operation unless every command in the batch was proven
+    /// read-only when the batch was executed. A proven read-only batch is served entirely from the
+    /// managed in-memory mirror, so it may be iterated, closed and disposed synchronously; any
+    /// mixed or unproven batch still owes the persistent store durable work and fails closed
+    /// before a single step happens.
+    /// </summary>
     private void ThrowIfSynchronousBrowserOperation()
     {
-        if (_connection is IAsyncExecutionConnection { RequiresAsyncExecution: true })
-        {
-            throw new PlatformNotSupportedException(
-                "Synchronous batch reader operations are not supported by the browser database source. "
-                + "Use the corresponding asynchronous API.");
-        }
+        if (_connection is not IAsyncExecutionConnection { RequiresAsyncExecution: true })
+            return;
+        if (_synchronousAuthorization.AllowsSynchronousExecution)
+            return;
+
+        throw new PlatformNotSupportedException(
+            "Synchronous batch reader operations require every command in the batch to be proven "
+            + "read-only ("
+            + BrowserSynchronousExecutionContract.ProvenReadOnlyShapes
+            + "). Use the corresponding asynchronous API.");
     }
 
     private static CommandBehavior WithoutCloseConnection(CommandBehavior behavior)

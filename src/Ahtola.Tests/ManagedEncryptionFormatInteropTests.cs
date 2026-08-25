@@ -11,12 +11,19 @@ public sealed class ManagedEncryptionFormatInteropTests
     private const string Aes128Key = "000102030405060708090A0B0C0D0E0F";
     private const string Aes256Key = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
 
-    [TestCase(StorageCipher.Aes128Gcm, Aes128Key, 1)]
-    [TestCase(StorageCipher.Aes256Gcm, Aes256Key, 2)]
-    public void ManagedWriterUsesAhtolaFormatVersionZeroAndExactAesCipherIds(
+    [TestCase(StorageCipher.Aes128Gcm, Aes128Key, 1, 28)]
+    [TestCase(StorageCipher.Aes256Gcm, Aes256Key, 2, 28)]
+    [TestCase(StorageCipher.Aegis256, Aes256Key, 3, 48)]
+    [TestCase(StorageCipher.Aegis256X2, Aes256Key, 4, 48)]
+    [TestCase(StorageCipher.Aegis256X4, Aes256Key, 5, 48)]
+    [TestCase(StorageCipher.Aegis128L, Aes128Key, 6, 32)]
+    [TestCase(StorageCipher.Aegis128X2, Aes128Key, 7, 32)]
+    [TestCase(StorageCipher.Aegis128X4, Aes128Key, 8, 32)]
+    public void ManagedWriterUsesAhtolaFormatVersionZeroAndExactTursoCipherIds(
         StorageCipher cipher,
         string key,
-        byte cipherId)
+        byte cipherId,
+        byte reservedBytes)
     {
         var fileSystem = new InMemoryFileSystem();
         using var encryption = AhtolaEncryptionOptions.FromHex(cipher, key);
@@ -29,10 +36,10 @@ public sealed class ManagedEncryptionFormatInteropTests
         firstPage[5].Should().Be(0);
         firstPage[6].Should().Be(cipherId);
         firstPage.AsSpan(7, 9).ToArray().Should().OnlyContain(value => value == 0);
-        firstPage[20].Should().Be(28, "AES-GCM reserves a 16-byte tag and 12-byte nonce");
+        firstPage[20].Should().Be(reservedBytes, "the frame reserves a 16-byte tag plus this cipher's nonce");
 
         using var reopened = SqlitePageStore.Open(fileSystem, "format.db", encryption: encryption);
-        reopened.Header.ReservedSpace.Should().Be(28);
+        reopened.Header.ReservedSpace.Should().Be(reservedBytes);
     }
 
     [Test]
@@ -52,14 +59,9 @@ public sealed class ManagedEncryptionFormatInteropTests
     }
 
     [TestCase(0, "none")]
-    [TestCase(3, "AEGIS-256")]
-    [TestCase(4, "AEGIS-256X2")]
-    [TestCase(5, "AEGIS-256X4")]
-    [TestCase(6, "AEGIS-128L")]
-    [TestCase(7, "AEGIS-128X2")]
-    [TestCase(8, "AEGIS-128X4")]
     [TestCase(9, "unknown")]
-    public void ManagedReaderRejectsEveryNonAesCipherIdWithoutInference(byte cipherId, string cipherName)
+    [TestCase(255, "unknown")]
+    public void ManagedReaderRejectsCipherIdsOutsideFormatVersionZeroWithoutInference(byte cipherId, string cipherName)
     {
         var (fileSystem, encryption) = CreateEncryptedStore();
         using (encryption)
@@ -70,8 +72,29 @@ public sealed class ManagedEncryptionFormatInteropTests
                 () => SqlitePageStore.Open(fileSystem, "format.db", encryption: encryption))!
                 .Message.Should().Be(
                     $"Encrypted database uses Ahtola cipher ID {cipherId} ({cipherName}); managed storage supports "
-                    + "only cipher ID 1 (AES-128-GCM) and cipher ID 2 (AES-256-GCM) for format version 0 "
+                    + "only cipher IDs 1 through 8 for format version 0 "
                     + "and will not infer or fall back to another cipher.");
+        }
+    }
+
+    [TestCase(3, "AEGIS-256")]
+    [TestCase(4, "AEGIS-256X2")]
+    [TestCase(5, "AEGIS-256X4")]
+    [TestCase(6, "AEGIS-128L")]
+    [TestCase(7, "AEGIS-128X2")]
+    [TestCase(8, "AEGIS-128X4")]
+    public void ManagedReaderRejectsEveryCipherIdItWasNotConfiguredForWithoutInference(byte cipherId, string cipherName)
+    {
+        var (fileSystem, encryption) = CreateEncryptedStore();
+        using (encryption)
+        {
+            MutateByte(fileSystem, "format.db", 6, cipherId);
+
+            Assert.Throws<InvalidDataException>(
+                () => SqlitePageStore.Open(fileSystem, "format.db", encryption: encryption))!
+                .Message.Should().Be(
+                    $"Encrypted database uses Ahtola cipher ID {cipherId} ({cipherName}), but the supplied options "
+                    + "specify cipher ID 2 (AES-256-GCM); cipher fallback is not permitted.");
         }
     }
 
@@ -247,38 +270,86 @@ public sealed class ManagedEncryptionFormatInteropTests
         }
     }
 
-    [TestCase("AEGIS256")]
-    [TestCase("AEGIS256X2")]
-    [TestCase("AEGIS256X4")]
-    [TestCase("AEGIS128L")]
-    [TestCase("AEGIS128X2")]
-    [TestCase("AEGIS128X4")]
-    public void ManagedConnectionRejectsUnimplementedCipherNamesAtConfigurationBoundary(string cipher)
+    [TestCase("AEGIS256", Aes256Key)]
+    [TestCase("AEGIS256X2", Aes256Key)]
+    [TestCase("AEGIS256X4", Aes256Key)]
+    [TestCase("aegis-256x4", Aes256Key)]
+    [TestCase("AEGIS128L", Aes128Key)]
+    [TestCase("AEGIS128X2", Aes128Key)]
+    [TestCase("AEGIS128X4", Aes128Key)]
+    [TestCase("aegis_128x4", Aes128Key)]
+    public void ManagedConnectionRoundTripsEveryFormatVersionZeroCipherName(string cipher, string key)
+    {
+        var path = CreateDatabasePath("cipher-names");
+        try
+        {
+            var connectionString = CreateConnectionString(path, cipher, key);
+            using (var connection = new SqliteConnection(connectionString))
+            {
+                connection.Open();
+                connection.ExecuteNonQuery("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('aegis');");
+            }
+
+            using (var reopened = new SqliteConnection(connectionString))
+            {
+                reopened.Open();
+                reopened.ExecuteScalar<string>("SELECT value FROM data;").Should().Be("aegis");
+            }
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
+    [TestCase("AEGIS256", Aes256Key)]
+    [TestCase("AEGIS128L", Aes128Key)]
+    public void AhtolaManagedConnectionRoundTripsEveryFormatVersionZeroCipherName(string cipher, string key)
+    {
+        var path = CreateDatabasePath("ahtola-cipher-names");
+        try
+        {
+            var connectionString = CreateConnectionString(path, cipher, key);
+            using (var connection = new global::Ahtola.AhtolaConnection(connectionString))
+            {
+                connection.Open();
+                using (var create = connection.CreateCommand())
+                {
+                    create.CommandText = "CREATE TABLE data(value TEXT);";
+                    create.ExecuteNonQuery();
+                }
+
+                using var insert = connection.CreateCommand();
+                insert.CommandText = "INSERT INTO data VALUES ('aegis');";
+                insert.ExecuteNonQuery();
+            }
+
+            using (var reopened = new global::Ahtola.AhtolaConnection(connectionString))
+            {
+                reopened.Open();
+                using var command = reopened.CreateCommand();
+                command.CommandText = "SELECT value FROM data;";
+                command.ExecuteScalar().Should().Be("aegis");
+            }
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
+    [TestCase("chacha20poly1305")]
+    [TestCase("aes192gcm")]
+    public void ManagedConnectionRejectsCipherNamesWithNoOnDiskCipherId(string cipher)
     {
         using var connection = new SqliteConnection(
             $"Data Source=test.db;Local Provider=Managed;Encryption Cipher={cipher};Encryption Key={Aes256Key}");
 
         Assert.Throws<NotSupportedException>(() => connection.Open())!
             .Message.Should().Be(
-                "Local Provider=Managed supports only Ahtola encrypted format version 0 with "
-                + "AES128GCM (cipher ID 1) or AES256GCM (cipher ID 2); cipher fallback is not permitted.");
-    }
-
-    [TestCase("AEGIS256")]
-    [TestCase("AEGIS256X2")]
-    [TestCase("AEGIS256X4")]
-    [TestCase("AEGIS128L")]
-    [TestCase("AEGIS128X2")]
-    [TestCase("AEGIS128X4")]
-    public void AhtolaManagedConnectionRejectsUnimplementedCipherNamesAtConfigurationBoundary(string cipher)
-    {
-        using var connection = new global::Ahtola.AhtolaConnection(
-            $"Data Source=test.db;Local Provider=Managed;Encryption Cipher={cipher};Encryption Key={Aes256Key}");
-
-        Assert.Throws<NotSupportedException>(() => connection.Open())!
-            .Message.Should().Be(
-                "Local Provider=Managed supports only Ahtola encrypted format version 0 with "
-                + "AES128GCM (cipher ID 1) or AES256GCM (cipher ID 2); cipher fallback is not permitted.");
+                "Local Provider=Managed supports only Ahtola encrypted format version 0 cipher IDs 1 through 8 "
+                + "(AES128GCM, AES256GCM, AEGIS256, AEGIS256X2, AEGIS256X4, AEGIS128L, AEGIS128X2, AEGIS128X4); "
+                + "cipher fallback is not permitted.");
     }
 
     private static (InMemoryFileSystem FileSystem, AhtolaEncryptionOptions Encryption) CreateEncryptedStore()

@@ -184,6 +184,26 @@ internal interface IPageCodecSource
 }
 
 /// <summary>
+/// Optional capability that lets a storage backend refuse Turso MVCC before the
+/// engine persists journal-mode header 255 or produces a single logical-log frame.
+/// </summary>
+/// <remarks>
+/// Backends that encrypt out of band — the browser mirror encrypts on its way to
+/// OPFS rather than through <see cref="AhtolaEncryptionFileSystem"/> — are
+/// invisible to the core's own logical-log encryption check, so they declare the
+/// restriction here instead. Implementations must be able to answer without any
+/// I/O, because the engine asks at the <c>PRAGMA journal_mode</c> boundary.
+/// </remarks>
+internal interface IMvccJournalModePolicy
+{
+    /// <summary>
+    /// <see langword="null"/> when this backend can host an MVCC logical log,
+    /// otherwise the fail-closed reason reported to the caller.
+    /// </summary>
+    string? DescribeMvccUnsupportedReason();
+}
+
+/// <summary>
 /// Optional capability for proving that two file-backed databases cannot
 /// alias the same underlying file during a managed snapshot copy.
 /// </summary>

@@ -78,8 +78,12 @@ internal static class EmbeddedIndexFactory
             columns,
             Where: statement.Where,
             WhereSql: statement.WhereSql,
-            Sql: statement.Sql);
+            Sql: statement.Sql,
+            Method: statement.Method,
+            MethodParameters: statement.MethodParameters);
         IndexExpressionSemantics.ValidateDefinition(tableName, table, definition);
+        if (definition.IsMethodIndex)
+            ManagedIndexMethodSemantics.ValidateDefinition(tableName, table, definition);
         return definition;
     }
 }
@@ -107,8 +111,14 @@ internal static class IndexSqlFormatter
             : " WHERE " + (index.WhereSql
                 ?? throw new EmbeddedSqlException(
                     $"Partial index '{index.Name}' has an unreconstructable WHERE predicate."));
-        return $"CREATE {unique}INDEX {SqlIdentifierFormatter.QuoteIfNeeded(index.Name)} ON {SqlIdentifierFormatter.QuoteIfNeeded(tableName)} "
-            + $"({string.Join(", ", terms)}){where}";
+        var using_ = index.Method is null
+            ? string.Empty
+            : " USING " + SqlIdentifierFormatter.QuoteIfNeeded(index.Method);
+        var with = index.Method is null || index.MethodParameters is not { Count: > 0 }
+            ? string.Empty
+            : " WITH (" + Indexing.ManagedIndexMethodParameterFormatter.Format(index.MethodParameters) + ")";
+        return $"CREATE {unique}INDEX {SqlIdentifierFormatter.QuoteIfNeeded(index.Name)} ON {SqlIdentifierFormatter.QuoteIfNeeded(tableName)}{using_} "
+            + $"({string.Join(", ", terms)}){with}{where}";
     }
 
     private static string QuoteIdentifier(string identifier)
@@ -138,6 +148,8 @@ internal static class IndexExpressionSemantics
         var reconstructed = EmbeddedIndexFactory.Create(tableName, table, statement);
         if (index.Unique != reconstructed.Unique
             || index.Columns.Count != reconstructed.Columns.Count
+            || !string.Equals(index.Method, reconstructed.Method, StringComparison.OrdinalIgnoreCase)
+            || !MethodParametersEqual(index.MethodParameters, reconstructed.MethodParameters)
             || !ExpressionsEqual(index.Where, reconstructed.Where))
         {
             throw new EmbeddedSqlException($"Index '{index.Name}' cannot be reconstructed losslessly.");
@@ -244,6 +256,27 @@ internal static class IndexExpressionSemantics
         => term.Collation
             ?? (term.IsExpression ? null : table.ColumnDefinitions[term.ColumnIndex].Collation)
             ?? "BINARY";
+
+    internal static bool MethodParametersEqual(
+        IReadOnlyList<Indexing.ManagedIndexMethodParameter>? left,
+        IReadOnlyList<Indexing.ManagedIndexMethodParameter>? right)
+    {
+        if ((left is null || left.Count == 0) && (right is null || right.Count == 0))
+            return true;
+        if (left is null || right is null || left.Count != right.Count)
+            return false;
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (!string.Equals(left[index].Name, right[index].Name, StringComparison.OrdinalIgnoreCase)
+                || !left[index].Value.Equals(right[index].Value))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     public static bool ExpressionsEqual(Expression? left, Expression? right)
     {

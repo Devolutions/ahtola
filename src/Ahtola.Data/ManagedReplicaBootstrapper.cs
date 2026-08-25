@@ -109,6 +109,7 @@ internal static class ManagedReplicaBootstrapper
         var databaseInstalled = false;
         var metadataInstalled = false;
         var stateInstalled = false;
+        var requiresCatchUp = false;
         try
         {
             var download = await DownloadDatabaseAsync(options, stagingPath, cancellationToken).ConfigureAwait(false);
@@ -179,13 +180,31 @@ internal static class ManagedReplicaBootstrapper
 
                 ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapDatabasePublished);
                 cancellationToken.ThrowIfCancellationRequested();
-                publication.MarkComplete(download.IsPartial);
+
+                // An MVCC-logical bootstrap ships a raw page image of the last durable generation
+                // base (the server deliberately never checkpoints for a bootstrap), so it is not
+                // yet safe to serve: it still owes the mandatory logical catch-up that brings it
+                // current. Record that obligation durably, as part of the very same publication
+                // that installed the base, so a crash before the catch-up runs is detected and
+                // retried by the next open instead of silently exposing a stale replica forever.
+                requiresCatchUp = download.Protocol == RemotePullProtocol.MvccLogical;
+                publication.MarkComplete(download.IsPartial, requiresCatchUp);
             }
             catch
             {
                 if (databaseInstalled || metadataInstalled || stateInstalled)
                     DeletePublishedReplicaFiles(options.Path);
                 throw;
+            }
+
+            if (requiresCatchUp)
+            {
+                // Deliberately outside the compensating catch above: everything this bootstrap
+                // owes is now durable, and the state it leaves behind (installed pair + recorded
+                // catch-up obligation) is exactly what a crash here would leave. Tests interrupt
+                // at this boundary to prove the next open resumes rather than re-downloads.
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.BootstrapCatchUpRequirementPublished);
             }
         }
         finally
@@ -717,6 +736,55 @@ internal static class ManagedReplicaBootstrapper
         IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
         IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
         CancellationToken cancellationToken)
+        => (await CheckForUpdatesAsync(
+                options,
+                metadata,
+                syncOptions,
+                pendingLocalChanges,
+                acknowledgedLocalChanges,
+                quarantinedSequences: null,
+                cancellationToken)
+            .ConfigureAwait(false)).Result;
+
+    /// <summary>
+    /// The outcome of one pull-and-apply cycle: the public sync result plus how many pending local
+    /// journal entries the apply actually replayed onto the newly built base. The replay count is
+    /// what a conflict rebase reports as <see cref="AhtolaReplicaConflictResolutionResult.RebasedChangeCount"/>,
+    /// so it must be the number of entries the apply really rebased -- never a count computed by
+    /// the caller before the apply decided whether (and how) to run.
+    /// </summary>
+    internal readonly record struct ManagedReplicaPullOutcome(
+        AhtolaSyncResult Result,
+        int ReplayedLocalChangeCount);
+
+    /// <summary>
+    /// Pulls and applies remote changes, optionally holding back a quarantined subset of the
+    /// pending local changes from replay.
+    /// </summary>
+    /// <param name="options">Replica connection options.</param>
+    /// <param name="metadata">The durable metadata this pull is negotiated against.</param>
+    /// <param name="syncOptions">Per-call synchronization options.</param>
+    /// <param name="pendingLocalChanges">
+    /// Every local change still awaiting push, exactly as the journal holds it. Used verbatim as
+    /// the staleness baseline in <see cref="TryUseCurrentLocalStateAsPullBase"/>.
+    /// </param>
+    /// <param name="acknowledgedLocalChanges">Already-pushed changes retained for base rebuilds.</param>
+    /// <param name="quarantinedSequences">
+    /// Journal sequences that are still durably pending but must never be replayed onto the newly
+    /// pulled base — the unresolved half of an open push conflict (see
+    /// <see cref="ManagedReplicaConflictState"/>). They stay part of
+    /// <paramref name="pendingLocalChanges"/> for the staleness comparison (which must keep seeing
+    /// the journal exactly as it is on disk, or the retry loop could never converge), but are
+    /// filtered out of the set handed to the replay path so the remote value wins for the rows
+    /// they touch.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the pull.</param>
+    internal static async Task<ManagedReplicaPullOutcome> CheckForUpdatesAsync(
+        AhtolaReplicaOptions options, ManagedReplicaMetadata metadata, AhtolaSyncOptions syncOptions,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+        IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
+        IReadOnlySet<long>? quarantinedSequences,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(pendingLocalChanges);
         ArgumentNullException.ThrowIfNull(acknowledgedLocalChanges);
@@ -820,23 +888,41 @@ internal static class ManagedReplicaBootstrapper
                 // it and must never be applied; retry the whole pull against the now-current base
                 // instead of silently regressing metadata or discarding an intervening local change.
                 if (!TryUseCurrentLocalStateAsPullBase(
-                        options.Path, metadata, pendingLocalChanges,
-                        out var freshLogicalMetadata, out var freshLogicalPendingLocalChanges))
+                        options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
+                        out var freshLogicalMetadata,
+                        out var freshLogicalPendingLocalChanges,
+                        out var freshLogicalAcknowledgedLocalChanges))
                 {
                     metadata = freshLogicalMetadata;
                     pendingLocalChanges = freshLogicalPendingLocalChanges;
+                    acknowledgedLocalChanges = freshLogicalAcknowledgedLocalChanges;
                     continue;
                 }
 
-                var (outcome, statistics) = await ApplyLogicalUpdatesAsync(
-                    options, metadata, header, body, syncOptions, pendingLocalChanges, acknowledgedLocalChanges,
-                    payload.Length, reader.BytesRead + body.Length, effectiveToken)
+                var (outcome, statistics, replayed) = await ApplyLogicalUpdatesAsync(
+                    options, metadata, header, body, syncOptions,
+                    SelectReplayableLocalChanges(pendingLocalChanges, quarantinedSequences),
+                    acknowledgedLocalChanges,
+                    payload.Length, reader.BytesRead + body.Length,
+                    quarantinedSequences is { Count: > 0 },
+                    effectiveToken)
                     .ConfigureAwait(false);
-                return new AhtolaSyncResult(outcome, statistics);
+                return new ManagedReplicaPullOutcome(new AhtolaSyncResult(outcome, statistics), replayed);
             }
 
             // Pages stream (Incremental or ReplaceBase for a page-protocol remote, or a protocol-2
             // remote using Pages+ReplaceBase for a validated full atomic replacement).
+            if (quarantinedSequences is { Count: > 0 })
+            {
+                // A raw page stream has no per-operation replay mechanism at all: it either
+                // rejects every pending local change (Incremental) or replays all of them onto a
+                // whole new snapshot (ReplaceBase). Neither can honor a quarantine, so a conflict
+                // rebase over the page protocol fails closed instead of guessing.
+                throw new NotSupportedException(
+                    "Managed embedded replica cannot rebase an unresolved push conflict over a page-based "
+                    + "pull response; the page protocol has no way to hold back the conflicting changes. "
+                    + "Resolve or discard the conflicting changes explicitly instead.");
+            }
             var pages = new List<PullPage>();
             while (await reader.ReadAsync(MaxPageMessageLength, effectiveToken).ConfigureAwait(false) is { } page)
             {
@@ -845,8 +931,10 @@ internal static class ManagedReplicaBootstrapper
             if (pages.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
             {
                 syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
-                return new AhtolaSyncResult(AhtolaSyncOutcome.UpToDate,
-                    new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, metadata.Revision));
+                return new ManagedReplicaPullOutcome(
+                    new AhtolaSyncResult(AhtolaSyncOutcome.UpToDate,
+                        new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, metadata.Revision)),
+                    ReplayedLocalChangeCount: 0);
             }
 
             if (pages.Count == 0)
@@ -898,11 +986,14 @@ internal static class ManagedReplicaBootstrapper
                 // stale ReplaceBase response could overwrite local state that a concurrent caller
                 // already advanced past it. Retry against the current base instead of applying it.
                 if (!TryUseCurrentLocalStateAsPullBase(
-                        options.Path, metadata, pendingLocalChanges,
-                        out var freshPagesMetadata, out var freshPagesPendingLocalChanges))
+                        options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
+                        out var freshPagesMetadata,
+                        out var freshPagesPendingLocalChanges,
+                        out var freshPagesAcknowledgedLocalChanges))
                 {
                     metadata = freshPagesMetadata;
                     pendingLocalChanges = freshPagesPendingLocalChanges;
+                    acknowledgedLocalChanges = freshPagesAcknowledgedLocalChanges;
                     continue;
                 }
 
@@ -929,41 +1020,85 @@ internal static class ManagedReplicaBootstrapper
                 .ConfigureAwait(false);
             syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
             syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
-            return new AhtolaSyncResult(AhtolaSyncOutcome.RemoteChangesApplied,
-                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, header.Revision));
+            return new ManagedReplicaPullOutcome(
+                new AhtolaSyncResult(AhtolaSyncOutcome.RemoteChangesApplied,
+                    new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, header.Revision)),
+                ReplayedLocalChangeCount: 0);
         }
     }
 
     /// <summary>
-    /// Reloads the durable local state (metadata revision and pending-push change journal) from
-    /// disk while the apply lease for this pull is held, and compares it against the snapshot
-    /// (<paramref name="requestBaseMetadata"/>, <paramref name="requestBasePendingLocalChanges"/>)
-    /// the in-flight request and response were actually built from -- both captured before the
-    /// network round trip and the wait for the lease, entirely outside its scope by design (see
+    /// Reloads the durable local state (metadata revision, recorded journal base, the pending-push
+    /// change journal, and the acknowledged journal history) from disk while the apply lease for
+    /// this pull is held, and compares it against the snapshot
+    /// (<paramref name="requestBaseMetadata"/>, <paramref name="requestBasePendingLocalChanges"/>,
+    /// <paramref name="requestBaseAcknowledgedLocalChanges"/>) the in-flight request and response
+    /// were actually built from -- all captured before the network round trip and the wait for the
+    /// lease, entirely outside its scope by design (see
     /// <see cref="ManagedReplicaApplyLock"/>). Returns false when local state already moved past
     /// that base: another writer (a concurrent sync/bootstrap-catch-up racing through this same
-    /// lock, or -- today, before the cross-process OS lock lands -- another process) already
-    /// committed its own apply, or a new local change was journaled or acknowledged, while this
-    /// call waited. Applying a response negotiated against a base that no longer exists would
-    /// silently regress metadata (rewind <see cref="ManagedReplicaMetadata.Revision"/>) or discard
-    /// the intervening local change instead of reconciling it, so callers must discard the
-    /// in-flight response and retry the whole pull against <paramref name="freshMetadata"/> and
-    /// <paramref name="freshPendingLocalChanges"/> instead.
+    /// lock, a differently-aliased path to the same physical replica, or another process) already
+    /// committed its own apply, or a new local change was journaled, acknowledged, or discarded,
+    /// while this call waited. Applying a response negotiated against a base that no longer exists
+    /// would silently regress metadata (rewind <see cref="ManagedReplicaMetadata.Revision"/>) or
+    /// discard the intervening local change instead of reconciling it, so callers must discard the
+    /// in-flight response and retry the whole pull against <paramref name="freshMetadata"/>,
+    /// <paramref name="freshPendingLocalChanges"/>, and
+    /// <paramref name="freshAcknowledgedLocalChanges"/> instead.
     /// </summary>
     private static bool TryUseCurrentLocalStateAsPullBase(
         string databasePath,
         ManagedReplicaMetadata requestBaseMetadata,
         IReadOnlyList<ReplicaLocalChange> requestBasePendingLocalChanges,
+        IReadOnlyList<ReplicaLocalChange> requestBaseAcknowledgedLocalChanges,
         out ManagedReplicaMetadata freshMetadata,
-        out IReadOnlyList<ReplicaLocalChange> freshPendingLocalChanges)
+        out IReadOnlyList<ReplicaLocalChange> freshPendingLocalChanges,
+        out IReadOnlyList<ReplicaLocalChange> freshAcknowledgedLocalChanges)
     {
         freshMetadata = LoadMetadata(databasePath)
             ?? throw new NotSupportedException(
                 "Managed embedded replica metadata was removed while an update was in flight.");
-        freshPendingLocalChanges = ManagedReplicaChangeJournal.Open(databasePath).ReadBatch(int.MaxValue).Changes;
+        var journal = ManagedReplicaChangeJournal.Open(databasePath);
+        freshPendingLocalChanges = journal.ReadBatch(int.MaxValue).Changes;
+
+        // The acknowledged history is re-read against the freshly loaded base, exactly as the
+        // caller originally derived it. Refreshing only metadata and the pending set would leave
+        // a stale acknowledged snapshot in play: a concurrent push that acknowledged more changes
+        // (or an alias/second process that advanced the base) would then have its writes dropped
+        // from the base rebuild instead of being replayed onto it.
+        freshAcknowledgedLocalChanges = freshMetadata.JournalBaseWatermark > 0
+            ? journal.ReadAcknowledged(freshMetadata.JournalBaseWatermark)
+            : [];
 
         return string.Equals(freshMetadata.Revision, requestBaseMetadata.Revision, StringComparison.Ordinal)
-            && HaveSamePendingLocalChangeSequence(requestBasePendingLocalChanges, freshPendingLocalChanges);
+            && freshMetadata.JournalBaseWatermark == requestBaseMetadata.JournalBaseWatermark
+            && HaveSamePendingLocalChangeSequence(requestBasePendingLocalChanges, freshPendingLocalChanges)
+            && HaveSamePendingLocalChangeSequence(
+                requestBaseAcknowledgedLocalChanges,
+                freshAcknowledgedLocalChanges);
+    }
+
+    /// <summary>
+    /// Removes the quarantined subset from a pending-local-change snapshot. The removed entries
+    /// stay durably journaled; they are simply never replayed onto the freshly pulled base, so
+    /// the remote value wins for the rows they touch and the local change survives only as
+    /// immutable evidence for explicit resolution.
+    /// </summary>
+    private static IReadOnlyList<ReplicaLocalChange> SelectReplayableLocalChanges(
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+        IReadOnlySet<long>? quarantinedSequences)
+    {
+        if (quarantinedSequences is not { Count: > 0 })
+            return pendingLocalChanges;
+
+        var replayable = new List<ReplicaLocalChange>(pendingLocalChanges.Count);
+        foreach (var change in pendingLocalChanges)
+        {
+            if (!quarantinedSequences.Contains(change.Sequence))
+                replayable.Add(change);
+        }
+
+        return replayable;
     }
 
     /// <summary>
@@ -1011,7 +1146,8 @@ internal static class ManagedReplicaBootstrapper
     /// on disk in that case, so the previously recorded fingerprint/table map remain valid as-is
     /// and no compensation is needed.
     /// </remarks>
-    private static async Task<(AhtolaSyncOutcome Outcome, AhtolaSyncStatistics Statistics)> ApplyLogicalUpdatesAsync(
+    private static async Task<(AhtolaSyncOutcome Outcome, AhtolaSyncStatistics Statistics, int ReplayedLocalChangeCount)>
+        ApplyLogicalUpdatesAsync(
         AhtolaReplicaOptions options,
         ManagedReplicaMetadata metadata,
         PullHeader header,
@@ -1021,6 +1157,7 @@ internal static class ManagedReplicaBootstrapper
         IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
         long networkSentBytes,
         long networkReceivedBytes,
+        bool quarantineActive,
         CancellationToken cancellationToken)
     {
         IReadOnlyList<ManagedReplicaLogicalTxn> transactions;
@@ -1038,14 +1175,33 @@ internal static class ManagedReplicaBootstrapper
                 "The pull-updates response is missing MVCC logical-log metadata for a non-empty logical stream.");
         }
 
-        if (transactions.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
+        if (transactions.Count == 0
+            && !quarantineActive
+            && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
         {
+            // Nothing to apply and nothing quarantined: the local image is already exactly what
+            // this revision describes. A quarantine deliberately does NOT take this shortcut -- see
+            // below.
             syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
             return (AhtolaSyncOutcome.UpToDate,
-                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, metadata.Revision));
+                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, metadata.Revision),
+                0);
         }
-        if (pendingLocalChanges.Count != 0)
+        if (pendingLocalChanges.Count != 0 || quarantineActive)
         {
+            // The protected path rebuilds the local image from the durable remote base snapshot
+            // and replays only the changes handed to it. That is exactly the semantics a conflict
+            // rebase needs, and it is taken even when every pending change is quarantined (so the
+            // replay set is empty): otherwise resolving the same conflict twice would leave
+            // different database content depending on whether any eligible entry happened to
+            // exist, and the quarantined writes the server rejected would silently stay
+            // materialized in-place.
+            //
+            // It is also taken when the pull produced no transactions AND the revision did not
+            // move. That combination is the ordinary shape of a rebase against an already-current
+            // remote: the remote has nothing new to send, but the quarantined local writes are
+            // still materialized in the local image and must be rolled off it by rebuilding from
+            // the remote base. Returning UpToDate there would report a rebase that never happened.
             return ApplyLogicalUpdatesWithProtectedPending(
                 options,
                 metadata,
@@ -1224,10 +1380,11 @@ internal static class ManagedReplicaBootstrapper
 
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
         return (AhtolaSyncOutcome.RemoteChangesApplied,
-            new AhtolaSyncStatistics(operationCount, 0, 0, DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, header.Revision));
+            new AhtolaSyncStatistics(operationCount, 0, 0, DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, header.Revision),
+            0);
     }
 
-    private static (AhtolaSyncOutcome Outcome, AhtolaSyncStatistics Statistics)
+    private static (AhtolaSyncOutcome Outcome, AhtolaSyncStatistics Statistics, int ReplayedLocalChangeCount)
         ApplyLogicalUpdatesWithProtectedPending(
             AhtolaReplicaOptions options,
             ManagedReplicaMetadata metadata,
@@ -1254,12 +1411,33 @@ internal static class ManagedReplicaBootstrapper
         var token = Guid.NewGuid().ToString("N");
         var originalPath = Path.Combine(directory, $".{Path.GetFileName(options.Path)}.logical-base-{token}.tmp");
         var committedPath = Path.Combine(directory, $".{Path.GetFileName(options.Path)}.logical-local-{token}.tmp");
+        var remoteBasePath = Path.Combine(directory, $".{Path.GetFileName(options.Path)}.logical-remote-{token}.tmp");
         long operationCount;
         IReadOnlyDictionary<ulong, string> tableNamesByStableId;
         try
         {
+            var previousRemoteBasePath = ResolveRemoteBaseSnapshot(options.Path, metadata);
+
+            // The remote base is the image the server would produce for this client: the previous
+            // remote base advanced by the changes the server has already acknowledged and by this
+            // pull's remote transactions -- and nothing else. It is built in its own file, before
+            // any pending local replay touches anything, because the *next* protected rebase copies
+            // it and replays the still-pending journal onto it. Publishing an image that already
+            // contained that pending replay made every subsequent rebase apply the same local
+            // statements a second time, which duplicated rows and turned an ordinary re-sync into a
+            // constraint violation on any table with a uniqueness guarantee.
+            File.Copy(previousRemoteBasePath, remoteBasePath, overwrite: false);
+            BuildRemoteBaseImage(
+                remoteBasePath,
+                metadata,
+                transactions,
+                acknowledgedLocalChanges,
+                pendingAddColumns,
+                cancellationToken);
+            ValidateStagedDatabase(remoteBasePath, options.RemoteEncryption);
+
             File.Copy(
-                ResolveRemoteBaseSnapshot(options.Path, metadata),
+                previousRemoteBasePath,
                 originalPath,
                 overwrite: false);
             using (var database = ManagedDatabaseAdapter.Open(originalPath))
@@ -1336,9 +1514,8 @@ internal static class ManagedReplicaBootstrapper
                 TableNamesByStableId = tableNamesByStableId,
                 RevertState = null,
                 JournalBaseWatermark = AdvanceJournalBaseWatermark(metadata, acknowledgedLocalChanges),
-                RemoteBaseSha256 = ComputeDatabaseFingerprint(originalPath),
             };
-            var publishedRemoteBase = PublishRemoteBaseSnapshot(options.Path, metadata, originalPath);
+            var publishedRemoteBase = PublishRemoteBaseSnapshot(options.Path, metadata, remoteBasePath);
             protectedMetadata = protectedMetadata with { RemoteBaseSha256 = publishedRemoteBase };
             _ = ManagedReplicaRevertWal.PublishProtectedSnapshots(
                 options.Path,
@@ -1354,6 +1531,8 @@ internal static class ManagedReplicaBootstrapper
             DeleteStagingSidecars(originalPath);
             DeleteIfExists(committedPath);
             DeleteStagingSidecars(committedPath);
+            DeleteIfExists(remoteBasePath);
+            DeleteStagingSidecars(remoteBasePath);
         }
 
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
@@ -1368,7 +1547,59 @@ internal static class ManagedReplicaBootstrapper
                 null,
                 networkSentBytes,
                 networkReceivedBytes,
-                header.Revision));
+                header.Revision),
+            // Exactly the pending entries this apply actually replayed onto the rebuilt base --
+            // the quarantined subset was already filtered out by the caller, so this is the number
+            // a conflict rebase is entitled to report as rebased.
+            pendingLocalChanges.Count);
+    }
+
+    /// <summary>
+    /// Advances a copy of the previous remote-base snapshot to the image the server would hold for
+    /// this client: the changes it has already acknowledged, then this pull's remote transactions.
+    /// </summary>
+    /// <remarks>
+    /// Nothing still pending push is replayed here, by design. The published remote base is the
+    /// starting point every later protected rebase copies before it replays the journal, so an
+    /// image that already carried pending local statements would replay them twice. It is also the
+    /// image whose fingerprint the metadata records, so the two are produced from exactly this one
+    /// file and can never disagree.
+    /// </remarks>
+    private static void BuildRemoteBaseImage(
+        string remoteBasePath,
+        ManagedReplicaMetadata metadata,
+        IReadOnlyList<ManagedReplicaLogicalTxn> transactions,
+        IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
+        IReadOnlyList<ManagedReplicaPendingAddColumn> pendingAddColumns,
+        CancellationToken cancellationToken)
+    {
+        using var database = ManagedDatabaseAdapter.Open(remoteBasePath);
+        var connection = database.Connect();
+        ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
+        try
+        {
+            ManagedReplicaLogicalReplayer.ReplayPendingLocalStatements(
+                connection,
+                acknowledgedLocalChanges,
+                cancellationToken);
+            _ = ManagedReplicaLogicalReplayer.Apply(
+                connection,
+                transactions,
+                metadata.TableNamesByStableId,
+                metadata.ClientId,
+                cancellationToken,
+                pendingAddColumns);
+            ExecuteNonQuery(connection, "COMMIT");
+        }
+        catch
+        {
+            TryExecuteNonQuery(connection, "ROLLBACK");
+            throw;
+        }
+
+        // Fold the WAL back into the main file so the fingerprint the metadata records, and the
+        // bytes a later rebase copies, are the same complete image.
+        ExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
     }
 
     /// <summary>
@@ -1604,6 +1835,26 @@ internal static class ManagedReplicaBootstrapper
             $".{Path.GetFileName(metadataPath)}.materialized-{Guid.NewGuid():N}.tmp");
         try
         {
+            // The remote-base snapshot taken at bootstrap is a copy of the SPARSE image, so the
+            // moment this replica becomes fully materialized that snapshot no longer describes
+            // the base the metadata is about to fingerprint. Republish it from the completed
+            // image FIRST, using the same three-step ordering every other base publication uses
+            // (stage+replace, then metadata, then retire the superseded copy), so the recorded
+            // hash and the snapshot bytes agree after a crash at any point:
+            //   * crash after the replace, before metadata -> metadata still names the sparse
+            //     hash, which the retained '.previous' copy still matches, so the old base is
+            //     resolved and the completion is simply retried;
+            //   * crash after metadata, before the retirement -> metadata names the full hash,
+            //     which the active snapshot matches, and the stale '.previous' is dropped by the
+            //     next publication's normalization.
+            // Without this, metadata would durably claim a full-image base hash while the file on
+            // disk still held sparse bytes, and the next process to need the base for a conflict
+            // rebase would fail its integrity check with no way back.
+            var remoteBaseSha256 = PublishRemoteBaseSnapshot(options.Path, metadata, options.Path);
+            ManagedReplicaFaultInjection.Hit(
+                ManagedReplicaDurableBoundary.PartialImageBaseSnapshotPublished);
+            cancellationToken.ThrowIfCancellationRequested();
+
             await WriteMetadataAsync(
                     stagingPath,
                     metadataPath,
@@ -1613,11 +1864,22 @@ internal static class ManagedReplicaBootstrapper
                     metadata.TableNamesByStableId,
                     cancellationToken,
                     replaceExisting: true,
-                    clientId: metadata.ClientId)
+                    clientId: metadata.ClientId,
+                    revertState: metadata.RevertState,
+                    journalBaseWatermark: metadata.JournalBaseWatermark,
+                    remoteBaseSha256: remoteBaseSha256)
                 .ConfigureAwait(false);
+            ManagedReplicaFaultInjection.Hit(
+                ManagedReplicaDurableBoundary.PartialImageMetadataPublished);
+
+            CompleteRemoteBaseSnapshotPublication(options.Path);
             MarkBootstrapPublicationFull(options.Path);
             DeleteIfExists(statePath);
-            return metadata with { DatabaseSha256 = fingerprint };
+            return metadata with
+            {
+                DatabaseSha256 = fingerprint,
+                RemoteBaseSha256 = remoteBaseSha256,
+            };
         }
         finally
         {
@@ -1835,7 +2097,15 @@ internal static class ManagedReplicaBootstrapper
         using var client = options.HttpPolicy.CreateHttpClient(options.RemoteEncryption is not null);
         client.Timeout = Timeout.InfiniteTimeSpan;
         var authToken = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
-        var chunkPages = options.PullBytesThreshold is { } threshold
+        var querySelector = GetBootstrapQuerySelector(options.PartialBootstrap);
+
+        // Query bootstrap is never chunked. The server -- not the client -- decides which pages the
+        // query touches, so the client cannot compute page-range sub-requests, and Turso's own
+        // client forces chunk_pages = None whenever a query selector is present
+        // (database_sync_operations.rs::bootstrap_db_file_v1). AhtolaReplicaOptions.Validate()
+        // already rejects PullBytesThreshold together with Query; this keeps the intent explicit
+        // rather than relying on that guard alone.
+        var chunkPages = querySelector is null && options.PullBytesThreshold is { } threshold
             ? Math.Min(checked((ulong)((threshold - 1) / PageSize + 1)), uint.MaxValue)
             : (ulong?)null;
         var prefixPageCount = GetPrefixPageCount(options.PartialBootstrap);
@@ -1856,7 +2126,8 @@ internal static class ManagedReplicaBootstrapper
             bufferSize: PageSize,
             FileOptions.Asynchronous | FileOptions.WriteThrough))
         {
-            var firstSelector = firstRequestPages is { } requestedPages
+            // Field 5 and field 7 are mutually exclusive; a query bootstrap sends the query alone.
+            var firstSelector = querySelector is null && firstRequestPages is { } requestedPages
                 ? CreatePageRangeSelector(0, checked((uint)requestedPages))
                 : [];
             var header = await PullBootstrapChunkAsync(
@@ -1867,10 +2138,12 @@ internal static class ManagedReplicaBootstrapper
                     CreateBootstrapPullRequest(
                         serverRevision: null,
                         options.LongPollTimeout,
-                        firstSelector),
+                        firstSelector,
+                        querySelector),
                     expectedHeader: null,
                     requestedStart: 0,
-                    requestedEnd: firstRequestPages,
+                    requestedEnd: querySelector is null ? firstRequestPages : null,
+                    serverSelectsPages: querySelector is not null,
                     materializedPageIds: materializedPageIds,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -1898,6 +2171,7 @@ internal static class ManagedReplicaBootstrapper
                             header,
                             start,
                             end,
+                            serverSelectsPages: false,
                             materializedPageIds,
                             cancellationToken)
                         .ConfigureAwait(false);
@@ -1907,15 +2181,45 @@ internal static class ManagedReplicaBootstrapper
 
             await staging.FlushAsync(cancellationToken).ConfigureAwait(false);
             staging.Flush(flushToDisk: true);
+
+            bool isPartial;
+            if (querySelector is not null)
+            {
+                // A query-selected page set is arbitrary, unordered and generally non-contiguous, so
+                // completeness is distinct-page coverage of the server-declared database size, not a
+                // prefix cutoff. Duplicates were already rejected while streaming, so the distinct
+                // count can never exceed DatabasePages.
+                if (!materializedPageIds.Contains(0))
+                {
+                    throw new InvalidDataException(
+                        "A query-selected bootstrap response must contain SQLite page 1, which carries the database header.");
+                }
+
+                isPartial = (ulong)materializedPageIds.Count < header.DatabasePages;
+            }
+            else
+            {
+                isPartial = selectedPageCount < header.DatabasePages;
+            }
+
             return new InitialDownload(
                 header.Revision,
                 header.Protocol,
                 header.DatabasePages,
                 materializedPageIds.Order().ToArray(),
-                selectedPageCount < header.DatabasePages);
+                isPartial);
         }
     }
 
+    /// <summary>
+    /// Streams one bootstrap page response into <paramref name="staging"/>. When
+    /// <c>serverSelectsPages</c> is <see langword="true"/> the client asked the server to choose the
+    /// page set (query bootstrap): any subset of <c>[0, db_size)</c> is legal, in any order,
+    /// contiguous or not, and the response is not required to carry a predetermined number of pages.
+    /// When it is <see langword="false"/> the client requested a specific contiguous page range and
+    /// the response must contain exactly that range, each page once. Page size, duplicate page ids
+    /// and out-of-range page ids fail closed in both modes.
+    /// </summary>
     private static async Task<PullHeader> PullBootstrapChunkAsync(
         HttpClient client,
         AhtolaReplicaOptions options,
@@ -1925,6 +2229,7 @@ internal static class ManagedReplicaBootstrapper
         PullHeader? expectedHeader,
         ulong requestedStart,
         ulong? requestedEnd,
+        bool serverSelectsPages,
         HashSet<ulong> materializedPageIds,
         CancellationToken cancellationToken)
     {
@@ -1982,11 +2287,12 @@ internal static class ManagedReplicaBootstrapper
             staging.SetLength(checked((long)header.DatabasePages * PageSize));
 
         var expectedEnd = Math.Min(requestedEnd ?? header.DatabasePages, header.DatabasePages);
+        var acceptedStart = serverSelectsPages ? 0 : requestedStart;
         var receivedPages = new HashSet<ulong>();
         while (await reader.ReadAsync(MaxPageMessageLength, effectiveCancellationToken).ConfigureAwait(false) is { } pagePayload)
         {
             var page = ParsePage(pagePayload);
-            if (page.PageId < requestedStart || page.PageId >= expectedEnd)
+            if (page.PageId < acceptedStart || page.PageId >= expectedEnd)
                 throw new InvalidDataException("The pull-updates response contains a page outside the requested bootstrap range.");
             if (!receivedPages.Add(page.PageId))
                 throw new InvalidDataException("The pull-updates response contains a duplicate page.");
@@ -1996,7 +2302,7 @@ internal static class ManagedReplicaBootstrapper
             await staging.WriteAsync(page.Data, effectiveCancellationToken).ConfigureAwait(false);
         }
 
-        if ((ulong)receivedPages.Count != expectedEnd - requestedStart)
+        if (!serverSelectsPages && (ulong)receivedPages.Count != expectedEnd - requestedStart)
         {
             throw new InvalidDataException(
                 "The pull-updates response did not contain every requested database page exactly once.");
@@ -2510,13 +2816,15 @@ internal static class ManagedReplicaBootstrapper
     private static byte[] CreateBootstrapPullRequest(
         string? serverRevision,
         TimeSpan? longPollTimeout,
-        byte[] serverPagesSelector)
+        byte[] serverPagesSelector,
+        string? serverQuerySelector = null)
         => CreatePullRequest(
             serverRevision,
             clientRevision: null,
             longPollTimeout,
             requestLogicalProtocol: false,
-            serverPagesSelector);
+            serverPagesSelector,
+            serverQuerySelector);
 
     /// <summary>
     /// Builds a <c>PullUpdatesReqProtoBody</c> request. Tag 1 (<c>encoding</c>) is explicitly
@@ -2538,21 +2846,42 @@ internal static class ManagedReplicaBootstrapper
             clientRevision,
             longPollTimeout,
             requestLogicalProtocol,
-            serverPagesSelector: []);
+            serverPagesSelector: [],
+            serverQuerySelector: null);
     }
 
+    /// <summary>
+    /// Emits tag 5 (<c>server_pages_selector</c>, portable RoaringBitmap bytes) and tag 7
+    /// (<c>server_query_selector</c>, UTF-8 string) of Turso's <c>PullUpdatesReqProtoBody</c>
+    /// (<c>turso-src/sync/engine/src/server_proto.rs</c>). The two selectors are mutually
+    /// exclusive on the wire: Turso's own client sends the query alone on the single bootstrap
+    /// request (<c>database_sync_operations.rs::bootstrap_db_file_v1</c> passes an empty first
+    /// selector whenever a query is present) and afterwards addresses pages only by id. Combining
+    /// them would leave the selected page set ambiguous, so it fails closed here.
+    /// </summary>
     private static byte[] CreatePullRequest(
         string? serverRevision,
         string? clientRevision,
         TimeSpan? longPollTimeout,
         bool requestLogicalProtocol,
-        byte[] serverPagesSelector)
+        byte[] serverPagesSelector,
+        string? serverQuerySelector)
     {
+        var querySelector = string.IsNullOrEmpty(serverQuerySelector)
+            ? null
+            : StrictUtf8.GetBytes(serverQuerySelector);
+        if (querySelector is not null && serverPagesSelector.Length != 0)
+        {
+            throw new InvalidOperationException(
+                "A pull-updates request cannot carry both a server page selector and a server query selector.");
+        }
+
         var request = new List<byte>(
             (serverRevision?.Length ?? 0)
             + (clientRevision?.Length ?? 0)
             + serverPagesSelector.Length
-            + 18);
+            + (querySelector?.Length ?? 0)
+            + 23);
         WriteVarint(request, 1u << 3);
         WriteVarint(request, 0); // PageUpdatesEncodingReq::Raw
         if (!string.IsNullOrEmpty(serverRevision))
@@ -2580,6 +2909,12 @@ internal static class ManagedReplicaBootstrapper
             WriteVarint(request, checked((ulong)serverPagesSelector.Length));
             request.AddRange(serverPagesSelector);
         }
+        if (querySelector is not null)
+        {
+            WriteVarint(request, 7u << 3 | 2);
+            WriteVarint(request, checked((ulong)querySelector.Length));
+            request.AddRange(querySelector);
+        }
         if (requestLogicalProtocol)
         {
             WriteVarint(request, 8u << 3);
@@ -2591,6 +2926,18 @@ internal static class ManagedReplicaBootstrapper
     private static uint? GetPrefixPageCount(AhtolaPartialBootstrapOptions? partialBootstrap)
         => partialBootstrap?.Kind == AhtolaPartialBootstrapKind.Prefix
             ? checked((uint)(partialBootstrap.PrefixLength / PageSize))
+            : null;
+
+    /// <summary>
+    /// Returns the server-side bootstrap query for a query-selected partial bootstrap, or
+    /// <see langword="null"/> for every other mode. The query is only ever used to build the one
+    /// bootstrap request: it is never persisted in the replica metadata or the page-state sidecar,
+    /// and later missing-page faults address the pinned revision by page id instead
+    /// (<see cref="CreateTargetedPagePullRequest"/>).
+    /// </summary>
+    private static string? GetBootstrapQuerySelector(AhtolaPartialBootstrapOptions? partialBootstrap)
+        => partialBootstrap?.Kind == AhtolaPartialBootstrapKind.Query
+            ? partialBootstrap.Query
             : null;
 
     private static byte[] CreateTargetedPagePullRequest(
@@ -2795,7 +3142,8 @@ internal static class ManagedReplicaBootstrapper
             return new BootstrapPublicationInfo(
                 MarkerExists: false,
                 IsComplete: true,
-                RequiresPageState: false);
+                RequiresPageState: false,
+                RequiresCatchUp: false);
 
         try
         {
@@ -2809,7 +3157,10 @@ internal static class ManagedReplicaBootstrapper
                 MarkerExists: true,
                 IsComplete: status is BootstrapPublicationStatus.Complete
                     or BootstrapPublicationStatus.CompletePartial,
-                RequiresPageState: status == BootstrapPublicationStatus.CompletePartial);
+                RequiresPageState: status is BootstrapPublicationStatus.CompletePartial
+                    or BootstrapPublicationStatus.CatchUpRequiredPartial,
+                RequiresCatchUp: status is BootstrapPublicationStatus.CatchUpRequired
+                    or BootstrapPublicationStatus.CatchUpRequiredPartial);
         }
         catch (IOException)
         {
@@ -2818,12 +3169,71 @@ internal static class ManagedReplicaBootstrapper
             return new BootstrapPublicationInfo(
                 MarkerExists: true,
                 IsComplete: false,
-                RequiresPageState: false);
+                RequiresPageState: false,
+                RequiresCatchUp: false);
         }
     }
 
     internal static bool IsBootstrapPublicationComplete(string databasePath)
         => GetBootstrapPublicationInfo(databasePath).IsComplete;
+
+    /// <summary>
+    /// Reports whether <paramref name="databasePath"/> holds a durably installed bootstrap that
+    /// still owes its mandatory logical catch-up <em>and</em> has every artifact that resuming the
+    /// catch-up depends on.
+    /// </summary>
+    /// <remarks>
+    /// The marker alone is not sufficient evidence. A failed catch-up's rollback
+    /// (<see cref="DeleteBootstrappedReplicaFiles"/>) deletes the sidecars before the marker, so an
+    /// interruption part-way through leaves the obligation recorded next to an already-dismantled
+    /// replica. Resuming that would run a catch-up against metadata that no longer exists and wedge
+    /// the path permanently, since nothing else ever clears the marker. This predicate is
+    /// deliberately the same artifact test <c>BootstrapPublication.Acquire</c> uses to decide the
+    /// state needs recovery, so the two can never disagree: when it says no, the caller falls
+    /// through to a bootstrap, whose own recovery removes the residue and reinstalls cleanly.
+    /// </remarks>
+    internal static bool CanResumeRequiredCatchUp(string databasePath)
+    {
+        var publication = GetBootstrapPublicationInfo(databasePath);
+        if (!publication.RequiresCatchUp)
+            return false;
+
+        return File.Exists(databasePath)
+            && File.Exists(databasePath + MetadataSuffix)
+            && (!publication.RequiresPageState
+                || File.Exists(
+                    databasePath + ManagedReplicaPageMaterializingFileSystem.StateSuffix));
+    }
+
+    /// <summary>
+    /// Retires the completion marker of a bootstrap that owed a mandatory post-bootstrap logical
+    /// catch-up, making the replica exposable. Called only once that catch-up's own metadata is
+    /// durable, so the exposability gate can never open over a never-caught-up base image.
+    /// </summary>
+    /// <remarks>
+    /// Idempotent by design: a crash between the catch-up's durable metadata and this retirement
+    /// leaves the marker asserting an obligation that has, in fact, already been satisfied. The
+    /// next open simply repeats the (now no-op, same-revision) catch-up pull and retires the
+    /// marker then, so recovery never depends on distinguishing the two cases.
+    /// </remarks>
+    internal static void RetireRequiredCatchUp(string databasePath)
+    {
+        using var publication = BootstrapPublication.Acquire(databasePath);
+        if (publication.Status is not (BootstrapPublicationStatus.CatchUpRequired
+            or BootstrapPublicationStatus.CatchUpRequiredPartial))
+        {
+            return;
+        }
+
+        if (publication.RequiresRecovery)
+        {
+            throw new InvalidDataException(
+                "Managed replica bootstrap state became inconsistent while completing its catch-up.");
+        }
+
+        publication.MarkComplete(
+            isPartial: publication.Status == BootstrapPublicationStatus.CatchUpRequiredPartial);
+    }
 
     private static void MarkBootstrapPublicationFull(string databasePath)
     {
@@ -2834,7 +3244,12 @@ internal static class ManagedReplicaBootstrapper
                 "Managed replica bootstrap state became inconsistent while completing its partial image.");
         }
 
-        publication.MarkComplete(isPartial: false);
+        // Completing the sparse image says nothing about a still-owed catch-up: carry that
+        // obligation forward, or the replica would become exposable one publication too early.
+        publication.MarkComplete(
+            isPartial: false,
+            requiresCatchUp: publication.Status is BootstrapPublicationStatus.CatchUpRequired
+                or BootstrapPublicationStatus.CatchUpRequiredPartial);
     }
 
     private static void DeleteStagingSidecars(string path)
@@ -2999,7 +3414,11 @@ internal static class ManagedReplicaBootstrapper
         var pageStateExists = File.Exists(
             databasePath + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
         var publication = GetBootstrapPublicationInfo(databasePath);
-        if (!publication.IsComplete
+        // A replica that only owes its mandatory post-bootstrap catch-up is locally present and
+        // self-consistent -- every artifact it claims exists -- it is simply not exposable until
+        // the next open finishes that catch-up. Reporting it as inconsistent would misdirect
+        // callers into deleting a perfectly recoverable replica.
+        if (!publication.IsComplete && !publication.RequiresCatchUp
             || publication.MarkerExists && !metadataExists
             || publication.RequiresPageState && !pageStateExists)
             return ManagedReplicaLocalState.Inconsistent;
@@ -3016,11 +3435,18 @@ internal static class ManagedReplicaBootstrapper
 
     /// <summary>Every local filesystem artifact a managed embedded replica may have written
     /// alongside <paramref name="databasePath"/>: the database file itself, SQLite's own
-    /// -wal/-shm/-journal siblings, the bootstrap/sync metadata sidecar, and the local change
-    /// journal used to buffer writes between pushes. Callers that need to fully remove a
+    /// -wal/-shm/-journal siblings, the bootstrap/sync metadata sidecar, the local change
+    /// journal used to buffer writes between pushes, and the push-conflict marker that blocks
+    /// synchronization while an unresolved conflict is open. Callers that need to fully remove a
     /// replica's local footprint (e.g. EF's DatabaseCreator.Delete) must delete this whole set,
     /// not just the primary database file, or a later bootstrap will find a stale, inconsistent
     /// partial state.</summary>
+    /// <remarks>
+    /// The physical-identity lock carriers live in a shared lock directory rather than beside the
+    /// database, so they are resolved here (while the database still exists and its identity is
+    /// still readable) instead of being derived textually. A carrier whose identity can no longer
+    /// be proven is simply omitted: enumeration describes a footprint, it never fails.
+    /// </remarks>
     internal static IReadOnlyList<string> GetLocalArtifactPaths(string databasePath) =>
     [
         databasePath,
@@ -3035,8 +3461,20 @@ internal static class ManagedReplicaBootstrapper
         databasePath + ManagedReplicaPageMaterializingFileSystem.StateSuffix,
         databasePath + ManagedReplicaPageMaterializingFileSystem.OwnershipLockSuffix,
         databasePath + ManagedReplicaChangeJournal.Suffix,
+        databasePath + ManagedReplicaChangeJournal.StagingSuffix,
+        .. ManagedReplicaConflictState.GetArtifactPaths(databasePath),
         databasePath + ManagedReplicaApplyLock.CarrierSuffix,
+        .. GetLockCarrierPaths(databasePath),
     ];
+
+    private static IEnumerable<string> GetLockCarrierPaths(string databasePath)
+    {
+        foreach (var kind in new[] { ManagedReplicaLockCarrier.ApplyKind, ManagedReplicaLockCarrier.JournalKind })
+        {
+            if (ManagedReplicaLockCarrier.TryResolve(databasePath, kind) is { } carrier)
+                yield return carrier;
+        }
+    }
 
     /// <summary>
     /// Rejects a non-empty logical apply while a pending local schema change cannot be rebased.
@@ -3167,6 +3605,17 @@ internal static class ManagedReplicaBootstrapper
         destination.Flush(flushToDisk: true);
     }
 
+    /// <summary>
+    /// Advances the recorded journal base past every acknowledged change handed in. The
+    /// acknowledged history is allowed to contain holes: an explicit, data-loss-acknowledged
+    /// conflict discard removes a sequence from retention, and the journal's acknowledgement
+    /// watermark can later move past that hole. <see cref="ManagedReplicaChangeJournal.Open"/>
+    /// already proves, for the file as a whole, that every gap between the retention base and the
+    /// assigned high-water mark is a durably recorded discard, so the only thing left to enforce
+    /// here is that the caller handed in a strictly ascending run that starts at or after the
+    /// recorded base. A run that starts below the base, or that is not ascending, means the caller
+    /// mixed histories and must fail closed.
+    /// </summary>
     private static long AdvanceJournalBaseWatermark(
         ManagedReplicaMetadata metadata,
         IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges)
@@ -3175,13 +3624,21 @@ internal static class ManagedReplicaBootstrapper
             return metadata.JournalBaseWatermark;
         var first = acknowledgedLocalChanges[0].Sequence;
         var last = acknowledgedLocalChanges[^1].Sequence;
-        if (first != metadata.JournalBaseWatermark
-            || last < first
-            || acknowledgedLocalChanges.Count != last - first + 1)
+        if (first < metadata.JournalBaseWatermark || last < first)
         {
             throw new InvalidDataException(
                 "Managed replica acknowledged journal history is not contiguous with its recorded base.");
         }
+
+        for (var i = 1; i < acknowledgedLocalChanges.Count; i++)
+        {
+            if (acknowledgedLocalChanges[i].Sequence <= acknowledgedLocalChanges[i - 1].Sequence)
+            {
+                throw new InvalidDataException(
+                    "Managed replica acknowledged journal history is not ordered.");
+            }
+        }
+
         return checked(last + 1);
     }
 
@@ -3210,17 +3667,49 @@ internal static class ManagedReplicaBootstrapper
         internal string RemoteBaseSha256 { get; init; } = string.Empty;
     }
 
+    /// <summary>
+    /// A bootstrap publication marker's decoded meaning. <see cref="IsComplete"/> is the single
+    /// exposability gate: it is <see langword="false"/> for as long as any durable obligation
+    /// (an unfinished install, or an owed post-bootstrap logical catch-up) is still outstanding.
+    /// <see cref="RequiresCatchUp"/> distinguishes the second case, which — unlike an unfinished
+    /// install — must be repaired by finishing the catch-up rather than by discarding the
+    /// already-durable (database, metadata) pair.
+    /// </summary>
     internal readonly record struct BootstrapPublicationInfo(
         bool MarkerExists,
         bool IsComplete,
-        bool RequiresPageState);
+        bool RequiresPageState,
+        bool RequiresCatchUp);
 
+    /// <summary>
+    /// The durable bootstrap publication state machine. Statuses are appended (never rewritten)
+    /// as fixed-length records, so the value read back is the last one appended and older
+    /// prefixes stay byte-identical and readable.
+    /// </summary>
+    /// <remarks>
+    /// <para>Transitions:</para>
+    /// <para><c>Empty -&gt; InProgress</c> when an install begins.</para>
+    /// <para><c>InProgress -&gt; Complete|CompletePartial</c> when a page-protocol bootstrap has
+    /// installed everything it owes; the replica is immediately exposable.</para>
+    /// <para><c>InProgress -&gt; CatchUpRequired|CatchUpRequiredPartial</c> when an MVCC-logical
+    /// bootstrap has installed its base image. The base image is the last durable generation base
+    /// (the server deliberately never checkpoints for a bootstrap), so the replica still owes a
+    /// mandatory logical catch-up and is NOT exposable yet. Crashing here is recoverable: the
+    /// next open sees the owed catch-up and finishes it instead of serving stale data forever.</para>
+    /// <para><c>CatchUpRequiredPartial -&gt; CatchUpRequired</c> when the sparse image is fully
+    /// materialized while the catch-up is still owed.</para>
+    /// <para><c>CatchUpRequired|CatchUpRequiredPartial -&gt; Complete|CompletePartial</c> once the
+    /// catch-up's own metadata is durable — the completion-marker retirement that finally makes
+    /// the replica exposable.</para>
+    /// </remarks>
     private enum BootstrapPublicationStatus
     {
         Empty,
         InProgress,
         Complete,
         CompletePartial,
+        CatchUpRequired,
+        CatchUpRequiredPartial,
     }
 
     private sealed class BootstrapPublication : IDisposable
@@ -3269,13 +3758,22 @@ internal static class ManagedReplicaBootstrapper
                 var metadataExists = File.Exists(databasePath + MetadataSuffix);
                 var pageStateExists = File.Exists(
                     databasePath + ManagedReplicaPageMaterializingFileSystem.StateSuffix);
-                var requiresRecovery = status == BootstrapPublicationStatus.InProgress
-                    || status == BootstrapPublicationStatus.Complete
-                    && (!databaseExists || !metadataExists)
-                    || status == BootstrapPublicationStatus.CompletePartial
-                    && (!databaseExists || !metadataExists || !pageStateExists)
-                    || status == BootstrapPublicationStatus.Empty
-                    && (databaseExists || metadataExists || pageStateExists);
+                var installedPair = databaseExists && metadataExists;
+                // CatchUpRequired* carry exactly the same durable-artifact obligations as their
+                // Complete* counterparts: only the still-owed catch-up separates them, and that is
+                // repaired by finishing the catch-up, never by discarding the installed pair.
+                var requiresRecovery = status switch
+                {
+                    BootstrapPublicationStatus.InProgress => true,
+                    BootstrapPublicationStatus.Complete
+                        or BootstrapPublicationStatus.CatchUpRequired => !installedPair,
+                    BootstrapPublicationStatus.CompletePartial
+                        or BootstrapPublicationStatus.CatchUpRequiredPartial =>
+                            !installedPair || !pageStateExists,
+                    BootstrapPublicationStatus.Empty =>
+                        databaseExists || metadataExists || pageStateExists,
+                    _ => true,
+                };
                 var publication = new BootstrapPublication(stream, status, requiresRecovery);
                 stream = null;
                 return publication;
@@ -3299,13 +3797,23 @@ internal static class ManagedReplicaBootstrapper
             WriteStatus(BootstrapPublicationStatus.InProgress);
         }
 
-        internal void MarkComplete(bool isPartial)
+        /// <summary>
+        /// Appends the terminal status for an install. When <paramref name="requiresCatchUp"/> is
+        /// <see langword="true"/> the replica is durably installed but still owes its mandatory
+        /// post-bootstrap logical catch-up, so the recorded status deliberately does NOT make it
+        /// exposable; <see cref="RetireRequiredCatchUp"/> performs that final transition once the
+        /// catch-up's own metadata is durable.
+        /// </summary>
+        internal void MarkComplete(bool isPartial, bool requiresCatchUp = false)
         {
             ThrowIfDisposed();
-            WriteStatus(
-                isPartial
-                    ? BootstrapPublicationStatus.CompletePartial
-                    : BootstrapPublicationStatus.Complete);
+            WriteStatus((isPartial, requiresCatchUp) switch
+            {
+                (true, true) => BootstrapPublicationStatus.CatchUpRequiredPartial,
+                (true, false) => BootstrapPublicationStatus.CompletePartial,
+                (false, true) => BootstrapPublicationStatus.CatchUpRequired,
+                (false, false) => BootstrapPublicationStatus.Complete,
+            });
         }
 
         internal static BootstrapPublicationStatus ReadStatus(Stream stream)
@@ -3329,7 +3837,9 @@ internal static class ManagedReplicaBootstrapper
                 var parsed = BinaryPrimitives.ReadInt32LittleEndian(record.AsSpan(8));
                 if (parsed is not ((int)BootstrapPublicationStatus.InProgress)
                     and not ((int)BootstrapPublicationStatus.Complete)
-                    and not ((int)BootstrapPublicationStatus.CompletePartial))
+                    and not ((int)BootstrapPublicationStatus.CompletePartial)
+                    and not ((int)BootstrapPublicationStatus.CatchUpRequired)
+                    and not ((int)BootstrapPublicationStatus.CatchUpRequiredPartial))
                 {
                     throw new InvalidDataException("Managed replica bootstrap state has an invalid status.");
                 }

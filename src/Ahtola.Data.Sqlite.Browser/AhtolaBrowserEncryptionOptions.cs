@@ -56,7 +56,7 @@ public sealed class AhtolaBrowserEncryptionOptions : IDisposable
             isPasswordDerived: true);
     }
 
-    /// <summary>Uses an exact AES-128 or AES-256 key.</summary>
+    /// <summary>Uses an exact key for any Ahtola format version 0 cipher.</summary>
     public static AhtolaBrowserEncryptionOptions FromKey(
         AhtolaEncryptionCipher cipher,
         ReadOnlySpan<byte> key)
@@ -72,7 +72,7 @@ public sealed class AhtolaBrowserEncryptionOptions : IDisposable
         return new AhtolaBrowserEncryptionOptions(cipher, key.ToArray(), isPasswordDerived: false);
     }
 
-    /// <summary>Uses an exact AES-128 or AES-256 key in Ahtola's hexadecimal representation.</summary>
+    /// <summary>Uses an exact key in Ahtola's hexadecimal representation.</summary>
     public static AhtolaBrowserEncryptionOptions FromHex(AhtolaEncryptionCipher cipher, string hexKey)
     {
         ArgumentException.ThrowIfNullOrEmpty(hexKey);
@@ -114,11 +114,19 @@ public sealed class AhtolaBrowserEncryptionOptions : IDisposable
     /// <summary>
     /// Creates the Web Crypto key handle for this configuration. The caller owns
     /// the returned service and must dispose it to release the JavaScript key.
+    /// Only valid for the AES-GCM ciphers; AEGIS goes through
+    /// <see cref="CreateManagedAegisPageCipher"/>.
     /// </summary>
     [System.Runtime.Versioning.SupportedOSPlatform("browser")]
     internal async ValueTask<AhtolaBrowserCryptoService> CreateCryptoServiceAsync()
     {
         var secret = _secret ?? throw new ObjectDisposedException(nameof(AhtolaBrowserEncryptionOptions));
+        if (!AhtolaBrowserCryptoParameters.UsesWebCrypto(Cipher))
+        {
+            throw new InvalidOperationException(
+                $"{Cipher} is not implemented by Web Crypto; use the managed AEGIS page cipher instead.");
+        }
+
         if (!IsPasswordDerived)
             return await AhtolaBrowserCryptoService.CreateAsync(Cipher, secret).ConfigureAwait(false);
 
@@ -126,5 +134,23 @@ public sealed class AhtolaBrowserEncryptionOptions : IDisposable
         // transient managed copy is unavoidable; it is not retained here.
         var password = Encoding.UTF8.GetString(secret);
         return await AhtolaBrowserCryptoService.CreateFromPasswordAsync(password).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Creates the pure-managed AEGIS page cipher. Passphrase-derived keys always
+    /// use AES-256-GCM, so this is only reachable with an explicit key.
+    /// </summary>
+    internal Storage.AhtolaManagedAegisPageCipher CreateManagedAegisPageCipher()
+    {
+        var secret = _secret ?? throw new ObjectDisposedException(nameof(AhtolaBrowserEncryptionOptions));
+        if (IsPasswordDerived)
+        {
+            throw new InvalidOperationException(
+                "Passphrase-derived browser keys use Ahtola.Password.v1, which produces an AES-256-GCM key.");
+        }
+
+        return new Storage.AhtolaManagedAegisPageCipher(
+            AhtolaBrowserCryptoParameters.ToStorageCipher(Cipher),
+            secret);
     }
 }

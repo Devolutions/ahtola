@@ -264,6 +264,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private readonly Dictionary<(string Name, int Arity), Func<IReadOnlyList<SqlValue>, SqlValue>> _scalarFunctions = new();
     private readonly Dictionary<(string Name, int Arity), ManagedAggregateFunction> _aggregateFunctions = new();
     private readonly Dictionary<string, Func<string, string, int>> _collations = new(StringComparer.OrdinalIgnoreCase);
+    private bool _hasScalarFunctions;
+    private bool _hasCustomCollations;
     private EmbeddedFileStore? _fileStore;
     private readonly string _databasePath = string.Empty;
     private readonly IFileSystem? _fileSystem;
@@ -643,6 +645,46 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeExecutionOptions? VdbeExecutionOptions = null)
     {
         /// <summary>
+        /// Per-statement cache of opened managed index-method scan state. Derived contexts created
+        /// with <c>with</c> share the same cache instance, so one statement refreshes each method
+        /// index at most once no matter how many rows evaluate <c>fts_score</c>.
+        /// </summary>
+        internal ManagedIndexMethodScanCache MethodIndexCache { get; } = new();
+
+        /// <summary>
+        /// Maps each scanned source's qualifier (its alias, or its table name when it has none) to
+        /// the base table it came from. This is only the fallback for callers that have no row to
+        /// ask — EXPLAIN, for example. Rows carry their own source identity, which is what makes an
+        /// alias reused by a nested subquery harmless.
+        /// </summary>
+        internal Dictionary<string, (string TableName, EmbeddedTable Table)> MethodIndexSourceBindings { get; }
+            = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Qualifiers this statement has seen bound to more than one table. The registry refuses to
+        /// answer for them rather than returning whichever scan ran last.
+        /// </summary>
+        internal HashSet<string> AmbiguousMethodIndexSources { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Records a scanned source so scalar method functions can bind to it later.</summary>
+        internal void RegisterMethodIndexSource(string qualifier, string tableName, EmbeddedTable table)
+        {
+            if (!table.HasMethodIndexes)
+                return;
+
+            if (MethodIndexSourceBindings.TryGetValue(qualifier, out var existing)
+                && !ReferenceEquals(existing.Table, table))
+            {
+                // Two different tables under one name in a single statement. The registry cannot
+                // tell them apart, so it stops answering for that name; a caller with a row still
+                // resolves correctly through the row's own binding.
+                AmbiguousMethodIndexSources.Add(qualifier);
+                return;
+            }
+
+            MethodIndexSourceBindings[qualifier] = (tableName, table);
+        }
+        /// <summary>
         /// Row-loop checkpoint. It honors cooperative cancellation exactly as before and
         /// additionally drives the connection's progress handler, which can interrupt the
         /// statement. Trigger and subquery contexts are derived with <c>with</c> expressions,
@@ -736,6 +778,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             if (recordChangeDataCapture)
                 ChangeDataCapture?.RecordRow(this, operation, tableName, table, rowId, before, after);
+
+            // Feed incremental method-index maintenance. This is the one place every DML path
+            // funnels through — plain INSERT/UPDATE/DELETE, REPLACE and UPSERT conflict resolution,
+            // trigger bodies, and foreign-key cascade actions — so a method index sees every row a
+            // statement touched without walking the whole table. The journal proves completeness
+            // itself: anything that mutates rows without reaching here forces a full rebuild rather
+            // than a stale answer.
+            table.RecordMethodIndexMutation(rowId);
 
             if (!reportUpdateHook || Hooks?.RowChanged is not { } rowChanged || !table.HasRowid)
                 return;
@@ -975,7 +1025,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 key.LexicalCteCount);
     }
 
-    internal readonly record struct TransientLookupKey(EmbeddedTable Table, int ColumnOrdinal, string Collation);
+    // The comparison affinity SQLite applies to the *scanned column* is part of the bucket's
+    // identity: `t.text_col = <integer expression>` buckets the column's stored text under its
+    // numeric value, while `t.text_col = <text expression>` buckets it verbatim. Two probes
+    // that disagree on that conversion must not share a cached index.
+    internal readonly record struct TransientLookupKey(
+        EmbeddedTable Table,
+        int ColumnOrdinal,
+        string Collation,
+        bool ColumnConvertsTextToNumeric,
+        bool ColumnConvertsNumericToText);
 
     internal sealed class TransientLookup
     {
@@ -1272,6 +1331,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         lock (_gate)
         {
             _scalarFunctions[(name.ToUpperInvariant(), arity)] = function;
+            _hasScalarFunctions = true;
         }
     }
 
@@ -1284,7 +1344,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         lock (_gate)
         {
-            return _scalarFunctions.Remove((name.ToUpperInvariant(), arity));
+            var removed = _scalarFunctions.Remove((name.ToUpperInvariant(), arity));
+            _hasScalarFunctions = _scalarFunctions.Count != 0;
+            return removed;
         }
     }
 
@@ -1302,6 +1364,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             foreach (var key in keys)
                 _scalarFunctions.Remove(key);
 
+            _hasScalarFunctions = _scalarFunctions.Count != 0;
             return keys.Length;
         }
     }
@@ -1353,6 +1416,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         lock (_gate)
         {
             _collations[name.ToUpperInvariant()] = compare;
+            _hasCustomCollations = true;
         }
     }
 
@@ -1363,7 +1427,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         lock (_gate)
         {
-            return _collations.Remove(name.ToUpperInvariant());
+            var removed = _collations.Remove(name.ToUpperInvariant());
+            _hasCustomCollations = _collations.Count != 0;
+            return removed;
         }
     }
 
@@ -2205,6 +2271,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
         synchronousMode.Validate(nameof(synchronousMode));
+
+        // Give every published method index its PreCommit hook before anything is durable, so a
+        // method that keeps hot state outside its posting set flushes it inside the same pager/WAL
+        // transaction that writes the catalog. A throw here aborts the commit, which is the correct
+        // outcome: the transaction rolls back and no half-flushed method state survives.
+        RunMethodIndexPreCommit(catalog);
+
         lock (_gate)
         {
             if (_readOnly)
@@ -2237,6 +2310,36 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             _fileStore.SetSynchronousMode(synchronousMode);
             PersistFileCatalog(publishCatalog, pragmaHeader, forceFullRewrite, busyTimeout);
+        }
+    }
+
+    /// <summary>
+    /// Runs each published method index's <c>PreCommit</c> hook, and brings its derived state up to
+    /// date with the rows the transaction is about to make durable.
+    /// </summary>
+    /// <remarks>
+    /// This is the transaction-lifecycle counterpart to the mutation journal: DML records what
+    /// changed, and commit is the point at which every method is given the chance to fold those
+    /// changes in and flush anything it holds outside its posting set. Doing it here rather than per
+    /// row keeps bulk DML linear while still guaranteeing that nothing method-visible is left
+    /// pending across a commit boundary.
+    /// </remarks>
+    private static void RunMethodIndexPreCommit(SchemaCatalog catalog)
+    {
+        foreach (var (tableName, table) in catalog.Tables)
+        {
+            if (!table.HasPublishedMethodAttachments)
+                continue;
+
+            foreach (var index in table.Indexes)
+            {
+                if (!index.IsMethodIndex || !table.TryGetMethodAttachment(index, out var attachment))
+                    continue;
+
+                using var cursor = attachment.Open(new EmbeddedTableIndexSource(table));
+                cursor.OpenRead();
+                cursor.PreCommit();
+            }
         }
     }
 
@@ -2581,6 +2684,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         string databasePath,
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
     {
+        MvccLogicalLog.ThrowIfMvccUnsupported(fileSystem);
         return EmbeddedMvStoreRegistry.GetOrCreate(fileSystem, databasePath, () =>
         {
             var logicalLog = MvccLogicalLog.CreateOrOpen(
@@ -2769,6 +2873,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException("cannot change journal mode while a blob handle is active");
         if (_mvStore is not null)
             return SqliteJournalMode.Mvcc;
+
+        // Fail closed before header 255 is persisted: a durable MVCC database
+        // whose cipher cannot frame a logical-log chunk must never exist, and a
+        // half-switched pager would strand the database in a mode it can read
+        // but never commit in.
+        if (_fileStore is not null && _fileSystem is not null && !string.IsNullOrEmpty(_databasePath))
+            MvccLogicalLog.ThrowIfMvccUnsupported(_fileSystem);
 
         // Persist header version 255 and ensure WAL page storage (Turso).
         if (_fileStore is not null
@@ -5049,6 +5160,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (definition.Unique)
             ValidateUniqueIndex(statement.TableName, table, definition, table.Rows);
 
+        if (definition.IsMethodIndex)
+        {
+            // Attach eagerly so an unknown method, a bad column shape or an unknown WITH key fails
+            // the CREATE rather than the first query. The index is published into the table only
+            // after the derived state built successfully, and the attachment cache is cleaned up on
+            // every failure path so a thrown CREATE leaves nothing behind for the next statement to
+            // find.
+            ManagedIndexMethodSemantics.Forget(table, definition.Name);
+            try
+            {
+                var attachment = ManagedIndexMethodSemantics.GetAttachment(statement.TableName, table, definition);
+                Indexing.ManagedIndexMethodMvcc.Ensure(attachment.Definition, IsMvccEnabled, forWrite: true);
+                using var cursor = attachment.Open(new EmbeddedTableIndexSource(table));
+                cursor.Create();
+            }
+            catch
+            {
+                ManagedIndexMethodSemantics.Forget(table, definition.Name);
+                throw;
+            }
+        }
+
         EnforceMaxPageCountForCatalogChange(1);
         table.Indexes.Add(definition);
         return new ExecutionResult([], [], 0, true);
@@ -5114,12 +5247,27 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             IndexExpressionSemantics.ValidateDefinition(tableName, table, index);
             IndexExpressionSemantics.ValidateRoundTrip(tableName, table, index);
+            if (!index.IsMethodIndex)
+                continue;
+
+            // REINDEX drops all derived method state and rebuilds it from the base rows in the same
+            // statement transaction, so a partially built index can never survive a rollback. The
+            // rebuild itself happens on a detached posting set that is published only on success,
+            // so a REINDEX that throws leaves the previously published state intact and queryable.
+            var attachment = ManagedIndexMethodSemantics.GetAttachment(tableName, table, index);
+            Indexing.ManagedIndexMethodMvcc.Ensure(attachment.Definition, IsMvccEnabled, forWrite: true);
+            using var cursor = attachment.Open(new EmbeddedTableIndexSource(table));
+            cursor.Rebuild();
         }
+
+        var rebuiltMethodIndex = selected.Any(static entry => entry.Index.IsMethodIndex);
 
         // The file writer's unchanged-schema full rewrite rebuilds every index tree in one
         // pager transaction. In-memory catalogs have no physical index image to rebuild.
         return _fileStore is null
-            ? ExecutionResult.Empty
+            ? rebuiltMethodIndex
+                ? new ExecutionResult([], [], 0, Changed: true)
+                : ExecutionResult.Empty
             : new ExecutionResult(
                 [],
                 [],
@@ -5463,6 +5611,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
 
             table.Indexes.Remove(index);
+            if (index.IsMethodIndex)
+            {
+                // Give the method its Destroy hook before the attachment is forgotten, so anything
+                // it owns is released rather than orphaned.
+                ManagedIndexMethodSemantics.Forget(table, index.Name, destroy: true);
+            }
+
             return new ExecutionResult([], [], 0, true);
         }
 
@@ -7235,7 +7390,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return;
             case JoinTableSource join:
                 AppendSchemaRowidBindings(join.Left, context, values, qualifiedColumns);
-                AppendSchemaRowidBindings(join.Right, context, values, qualifiedColumns);
+                if (!join.Kind.ProducesLeftShapeOnly())
+                    AppendSchemaRowidBindings(join.Right, context, values, qualifiedColumns);
                 return;
         }
     }
@@ -7280,7 +7436,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         cancellationToken,
                         nestedGroupByScope);
                 ValidateExpressionSchema(
-                    select.Where,
+                    // SQLite lets a bare WHERE name fall back to a projection alias of the same
+                    // SELECT when it names no source column. ExecuteSelectStatement applies that
+                    // fallback (ResolveSelectBindings) before validating the statement it is
+                    // about to run, but a *nested* SELECT — a derived table, a view body, a
+                    // scalar subquery — is validated straight from the parsed AST, so the same
+                    // fallback has to be applied here or `(SELECT a AS x FROM t WHERE x > 0)`
+                    // is rejected as "no such column: x".
+                    select.Where is null
+                        ? null
+                        : RewriteColumnReferences(
+                            select.Where,
+                            column => ResolveWhereAliasFallback(
+                                column,
+                                select.Projections,
+                                outputColumns,
+                                rawOutputColumns,
+                                outerRow)),
                     row,
                     context,
                     cancellationToken,
@@ -15015,7 +15187,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ValidateGroupByCollations(select.GroupBy);
         ValidateOrderByAggregateMisuse(select);
         ValidateJoinStructure(select);
-        var canUseCompiledRoute = CanUseCompiledSelectRoute(select, context, outerRow);
+        // Pure AST rewrite stage. It runs after every prepare-time validation so a rewritten
+        // shape can never suppress a diagnostic the original statement produces, and before
+        // planning so both the bytecode route and the evaluator see the rewritten form.
+        select = RewriteSelectSubqueries(select, context, outerRow);
+        var canUseCompiledRoute = CanUseCompiledSelectRoute(select, context, outerRow)
+            && !SourceContainsSemiOrAntiJoin(select.Source);
         CompiledSelect? compiled = null;
         if (canUseCompiledRoute)
         {
@@ -15075,6 +15252,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
         => (!context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
             && !CanStreamProjectionRows(select, context, outerRow);
 
+    // True when any node of the FROM tree is one of the internal semi/anti joins introduced by
+    // the correlated-subquery rewrite. Those have no bytecode lowering, so the whole select
+    // stays on the evaluator.
+    private static bool SourceContainsSemiOrAntiJoin(TableSource? source)
+        => source is JoinTableSource join
+            && (join.Kind.ProducesLeftShapeOnly()
+                || SourceContainsSemiOrAntiJoin(join.Left)
+                || SourceContainsSemiOrAntiJoin(join.Right));
+
     private bool IsAggregateSelect(SelectStatement select) =>
         select.GroupBy.Count > 0
         || select.Projections.Any(projection => ContainsAggregate(projection.Expression))
@@ -15091,6 +15277,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         select = ConsumeTursoFullOuterDuplicateEquijoinWhere(select);
         select = ResolveNamedWindows(select);
         context = EnterCollationSource(context, select.Source);
+
+        // A statement the optimizer can serve from a managed index method stays on the evaluator,
+        // which is the only path that runs a method cursor. Without this the bytecode compiler would
+        // silently take ORDER BY shapes that EXPLAIN QUERY PLAN had already reported as method
+        // scans, so the advertised plan and the executed plan would disagree — and the method's
+        // ranking pushdown would never actually run.
+        if (ShouldDeferSelectToMethodIndexPlan(select, context))
+        {
+            compiled = null!;
+            return false;
+        }
 
         // A SELECT carrying LIMIT/OFFSET lowers only when its LIMIT/OFFSET-free base is a
         // gate-able route. Direct scans (including direct DISTINCT, whose de-duplication the gate
@@ -17555,8 +17752,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        if (!TryBuildCompiledJoinSource(
-                select.Source,
+        if (!TryBuildCostOrderedJoinSource(
+                select,
                 parameters,
                 context,
                 outerRow,
@@ -17646,7 +17843,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 outputColumns,
                 rawOutputColumns,
                 select.Source,
-                context);
+                context,
+                source.PhysicalSource);
             if (collations.Any(collation => !IsStreamingSafeDistinctCollation(collation)))
                 return false;
             distinctEquality = (left, right) => RowsEqual(left, right, collations);
@@ -17688,8 +17886,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        if (!TryBuildCompiledJoinSource(
-                select.Source!,
+        if (!TryBuildCostOrderedJoinSource(
+                select,
                 parameters,
                 context,
                 outerRow,
@@ -18013,8 +18211,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context,
         SourceRow? outerRow,
-        out CompiledJoinSource compiled)
+        out CompiledJoinSource compiled,
+        IReadOnlyDictionary<JoinTableSource, bool>? hashBuildRightOverrides = null)
     {
+        // The bytecode join operator has no semi/anti lowering: VdbeJoinKind only models the
+        // four SQL join types. Decline so the rewritten select stays on the evaluator, which
+        // implements the semi/anti loop in GetSemiOrAntiJoinRows.
+        if (source is JoinTableSource { Kind: JoinKind.Semi or JoinKind.Anti })
+        {
+            compiled = null!;
+            return false;
+        }
+
         if (source is NamedTableSource)
         {
             var target = ResolveScanTarget(source, context);
@@ -18046,7 +18254,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 leafColumnDefinitions,
                 leafQualifiedColumnDefinitions,
                 BuildOutputColumns(target.Qualifier, target.Columns),
-                BuildOutputColumns(target.Qualifier, target.Columns));
+                BuildOutputColumns(target.Qualifier, target.Columns),
+                [target.Qualifier]);
             return true;
         }
 
@@ -18060,13 +18269,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 parameters,
                 context,
                 outerRow,
-                out var left)
+                out var left,
+                hashBuildRightOverrides)
             || !TryBuildCompiledJoinSource(
                 join.Right,
                 parameters,
                 context,
                 outerRow,
-                out var right))
+                out var right,
+                hashBuildRightOverrides))
         {
             compiled = null!;
             return false;
@@ -18142,6 +18353,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             JoinKind.Left => VdbeJoinKind.Left,
             JoinKind.Right => VdbeJoinKind.Right,
             JoinKind.Full => VdbeJoinKind.Full,
+            // Semi/anti joins have no bytecode lowering; TryBuildCompiledJoinSource declines
+            // them before this point, and CanUseCompiledSelectRoute declines the whole select.
             _ => throw new InvalidOperationException($"Unknown join kind {join.Kind}."),
         };
         var equiProbe = TryCreateCompiledJoinEquiProbe(join, context);
@@ -18150,15 +18363,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var hashBuildRight = true;
         if (kind is VdbeJoinKind.Inner && equiProbe is not null)
         {
-            var leftEstimate = EstimateJoinNodeRows(left.Plan, context);
-            var rightEstimate = EstimateJoinNodeRows(right.Plan, context);
-            // Only flip when both sides have real sqlite_stat1 estimates (not the unknown sentinel).
-            const long knownCap = long.MaxValue / 16;
-            if (leftEstimate < knownCap
-                && rightEstimate < knownCap
-                && leftEstimate < rightEstimate)
+            // A node the cost-based join-order stage synthesized carries its own build-side
+            // decision, scored against the executable shapes in JoinCostModel.EstimateStepCost.
+            // Everything else keeps the local size heuristic.
+            if (hashBuildRightOverrides is not null
+                && hashBuildRightOverrides.TryGetValue(join, out var chosen))
             {
-                hashBuildRight = false;
+                hashBuildRight = chosen;
+            }
+            else
+            {
+                var leftEstimate = EstimateJoinNodeRows(left.Plan, context);
+                var rightEstimate = EstimateJoinNodeRows(right.Plan, context);
+                // Only flip when both sides have real sqlite_stat1 estimates (not the unknown sentinel).
+                const long knownCap = long.MaxValue / 16;
+                if (leftEstimate < knownCap
+                    && rightEstimate < knownCap
+                    && leftEstimate < rightEstimate)
+                {
+                    hashBuildRight = false;
+                }
             }
         }
 
@@ -18169,11 +18393,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
             join.Condition is null && joinPairs.Count == 0 ? null : condition,
             equiProbe,
             hashBuildRight);
-        var description = equiProbe is null
+        var scanOrder = left.ScanOrder.Concat(right.ScanOrder).ToArray();
+        var shape = equiProbe is null
             ? $"{plan.SourceCount}-way {kind.ToString().ToUpperInvariant()} join"
             : hashBuildRight
                 ? $"{plan.SourceCount}-way {kind.ToString().ToUpperInvariant()} equijoin hash-build right"
                 : $"{plan.SourceCount}-way {kind.ToString().ToUpperInvariant()} equijoin hash-build left";
+        // The scan order makes the chosen join order visible to EXPLAIN, which otherwise reports
+        // only one OpenJoinCursor for the whole materialized plan.
+        var description = $"{shape} [scan order: {string.Join(", ", scanOrder)}]";
         compiled = new CompiledJoinSource(
             plan,
             description,
@@ -18183,7 +18411,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             columnDefinitions,
             qualifiedColumnDefinitions,
             outputColumns,
-            rawOutputColumns);
+            rawOutputColumns,
+            scanOrder);
         return true;
     }
 
@@ -18295,7 +18524,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyList<EmbeddedColumn?> columnDefinitions,
         IReadOnlyDictionary<string, EmbeddedColumn> qualifiedColumnDefinitions,
         IReadOnlyList<OutputColumn> outputColumns,
-        IReadOnlyList<OutputColumn> rawOutputColumns)
+        IReadOnlyList<OutputColumn> rawOutputColumns,
+        IReadOnlyList<string> scanOrder)
     {
         public VdbeJoinPlanNode Plan { get; } = plan;
 
@@ -18315,6 +18545,44 @@ public sealed partial class EmbeddedDatabase : IDisposable
         public IReadOnlyList<OutputColumn> OutputColumns { get; } = outputColumns;
 
         public IReadOnlyList<OutputColumn> RawOutputColumns { get; } = rawOutputColumns;
+
+        /// <summary>
+        /// The FROM tree whose physical slot layout <see cref="OutputColumns"/> /
+        /// <see cref="RawOutputColumns"/> index into. It differs from the statement's own
+        /// <c>Source</c> only after a cost-based join reorder, where the projection metadata is
+        /// re-pointed at the permuted layout while keeping FROM list order. Metadata lookups
+        /// that navigate a join tree <em>by index</em> — declared collation, column definition —
+        /// must use this tree, not the statement's.
+        /// </summary>
+        public TableSource? PhysicalSource { get; private init; }
+
+        /// <summary>Leaf qualifiers in physical left-to-right execution order.</summary>
+        public IReadOnlyList<string> ScanOrder { get; } = scanOrder;
+
+        /// <summary>
+        /// Returns the same plan with its projection metadata replaced. Used after a cost-based
+        /// join reorder so <c>SELECT *</c> and qualified stars keep FROM-clause column order
+        /// while the row values stay in physical order. <paramref name="physicalSource"/> is the
+        /// reordered FROM tree the replaced indexes address.
+        /// </summary>
+        public CompiledJoinSource WithProjectionColumns(
+            IReadOnlyList<OutputColumn> projectedOutputColumns,
+            IReadOnlyList<OutputColumn> projectedRawOutputColumns,
+            TableSource physicalSource)
+            => new(
+                Plan,
+                Description,
+                Columns,
+                QualifiedColumns,
+                QualifiedRowIdIndices,
+                ColumnDefinitions,
+                QualifiedColumnDefinitions,
+                projectedOutputColumns,
+                projectedRawOutputColumns,
+                ScanOrder)
+            {
+                PhysicalSource = physicalSource,
+            };
 
         public int SourceCount => Plan.SourceCount;
 
@@ -21684,6 +21952,21 @@ out bool hasReturning)
     {
         var compilationContext = EnsureAutoIncrementStatementState(context);
         ValidateStatementIndexDirectives(statement.Inner, compilationContext);
+        if (statement.Inner is SelectStatement methodIndexSelect
+            && TryPlanMethodIndexScanForSelect(methodIndexSelect, compilationContext, out var methodPlan))
+        {
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    [
+                        SqlValue.Integer(1),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text(FormatMethodIndexExplainDetail(methodPlan)),
+                    ],
+                ],
+                0);
+        }
         if (statement.Inner is SelectStatement plannedSelect
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
         {
@@ -23781,7 +24064,13 @@ out bool hasReturning)
                         sourceLimit,
                         outerRow,
                         statement.Where,
-                        resolvedOrderBy));
+                        resolvedOrderBy,
+                        // A ranking pushdown needs the statement's own LIMIT even when the generic
+                        // scan cannot use one, because the method is what produces the ordering.
+                        ReadMethodIndexLimit(statement),
+                        // Only this call site knows the whole statement, so it is the only one that
+                        // can prove a method may return just the rows its pushed-down LIMIT keeps.
+                        AllowsMethodIndexRowTruncation(statement)));
         var selectedRows = new List<SourceRow>();
         foreach (var row in source.Rows)
         {
@@ -24234,13 +24523,28 @@ out bool hasReturning)
         }
     }
 
+    /// <summary>
+    /// The declared collation of each visible result column, in SQL-visible projection order.
+    /// <para>
+    /// <paramref name="source"/> is the FROM tree used for <em>name-based</em> resolution (an
+    /// explicit COLLATE, a bare column reference) — always the statement's own source, so a name
+    /// means what the SQL text says. <paramref name="physicalSource"/> is the FROM tree the
+    /// <paramref name="outputColumns"/> indexes address when it differs: star expansion resolves
+    /// a column's declared collation by walking the join tree <em>by index</em>, so after a
+    /// cost-based join reorder that walk has to follow the permuted tree or it lands on a
+    /// different table's column and reports the wrong collation — silently turning a
+    /// NOCASE/RTRIM DISTINCT into a BINARY one.
+    /// </para>
+    /// </summary>
     private static IReadOnlyList<string?> GetDistinctProjectionCollations(
         IReadOnlyList<Projection> projections,
         IReadOnlyList<OutputColumn> outputColumns,
         IReadOnlyList<OutputColumn> rawOutputColumns,
         TableSource? source,
-        QueryContext context)
+        QueryContext context,
+        TableSource? physicalSource = null)
     {
+        var indexedSource = physicalSource ?? source;
         var collations = new List<string?>();
         foreach (var projection in projections)
         {
@@ -24249,7 +24553,7 @@ out bool hasReturning)
                 case StarExpression:
                     collations.AddRange(outputColumns.Select(column =>
                         NormalizeDeclaredCollation(
-                            GetDeclaredOutputColumnCollation(source, column, context))));
+                            GetDeclaredOutputColumnCollation(indexedSource, column, context))));
                     break;
                 case QualifiedStarExpression qualifiedStar:
                     foreach (var raw in rawOutputColumns.Where(raw =>
@@ -24259,7 +24563,7 @@ out bool hasReturning)
                             string.Equals(column.Qualifier, qualifiedStar.Qualifier, StringComparison.OrdinalIgnoreCase)
                             && column.Index == raw.Index) ?? raw;
                         collations.Add(NormalizeDeclaredCollation(
-                            GetDeclaredOutputColumnCollation(source, output, context)));
+                            GetDeclaredOutputColumnCollation(indexedSource, output, context)));
                     }
 
                     break;
@@ -26442,9 +26746,11 @@ out bool hasReturning)
             TableValuedFunctionSource function
                 => [.. TableValuedFunctionRegistry.Resolve(function.Name).Schema.AllColumns],
             DerivedTableSource derived => DescribeQuery(derived.Query, context),
-            JoinTableSource join => GetSourceColumns(join.Left, context)
-                .Concat(GetSourceColumns(join.Right, context))
-                .ToArray(),
+            JoinTableSource join => join.Kind.ProducesLeftShapeOnly()
+                ? GetSourceColumns(join.Left, context)
+                : GetSourceColumns(join.Left, context)
+                    .Concat(GetSourceColumns(join.Right, context))
+                    .ToArray(),
             _ => throw new EmbeddedSqlException($"Unsupported table source {source.GetType().Name}."),
         };
     }
@@ -26501,6 +26807,9 @@ out bool hasReturning)
         if (source is not JoinTableSource join)
             return GetOutputColumns(source, context);
 
+        if (join.Kind.ProducesLeftShapeOnly())
+            return GetRawOutputColumns(join.Left, context);
+
         var left = GetRawOutputColumns(join.Left, context);
         var leftWidth = GetSourceColumns(join.Left, context).Length;
         var right = GetRawOutputColumns(join.Right, context);
@@ -26518,6 +26827,11 @@ out bool hasReturning)
 
     private static IReadOnlyList<OutputColumn> GetJoinOutputColumns(JoinTableSource join, QueryContext context)
     {
+        // A semi/anti join answers "does a matching right row exist"; the right side never
+        // contributes an output column, so the join's shape is exactly the left side's.
+        if (join.Kind.ProducesLeftShapeOnly())
+            return GetOutputColumns(join.Left, context);
+
         var left = GetOutputColumns(join.Left, context);
         var right = GetOutputColumns(join.Right, context);
         var leftWidth = GetSourceColumns(join.Left, context).Length;
@@ -26661,7 +26975,9 @@ out bool hasReturning)
         long? maximumRows,
         SourceRow? outerRow,
         Expression? sourcePredicate = null,
-        IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
+        IReadOnlyList<OrderByTerm>? sourceOrderBy = null,
+        long? sourceMethodLimit = null,
+        bool sourceAllowsMethodTruncation = false)
     {
         if (source is null)
             return new SourceData([], [new SourceRow([], [], Parent: outerRow)]);
@@ -26690,6 +27006,15 @@ out bool hasReturning)
                         where: null),
                     context,
                     outerRow),
+            NamedTableSource named when TryPlanMethodIndexScan(
+                    named,
+                    context,
+                    sourcePredicate,
+                    sourceOrderBy,
+                    sourceMethodLimit ?? maximumRows,
+                    out var methodIndexPlan,
+                    sourceAllowsMethodTruncation)
+                => GetMethodIndexRows(methodIndexPlan, parameters, context, maximumRows, outerRow),
             NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare)
                 => GetSourceRows(bare, parameters, context, maximumRows, outerRow),
             NamedTableSource named => GetNamedTableRows(named, context, maximumRows, outerRow),
@@ -26764,9 +27089,14 @@ out bool hasReturning)
         // the join: INNER (and CROSS, which parses as INNER) may push both sides, LEFT may
         // push only its left side, RIGHT only its right side, and FULL neither. Pushing a
         // conjunct into the null-supplying side would drop the padded rows and silently turn
-        // the outer join into an inner one. The full WHERE is re-applied to the join output,
-        // so a pushed conjunct is at worst a harmless duplicate.
-        var leftPush = source.Kind is JoinKind.Inner or JoinKind.Left ? leftPredicate : null;
+        // the outer join into an inner one. A semi/anti join preserves (a subset of) its left
+        // rows and never emits right columns, so its left side may be pre-filtered while its
+        // right side may not: dropping right rows would flip an EXISTS/NOT EXISTS answer.
+        // The full WHERE is re-applied to the join output, so a pushed conjunct is at worst a
+        // harmless duplicate.
+        var leftPush = source.Kind is JoinKind.Inner or JoinKind.Left or JoinKind.Semi or JoinKind.Anti
+            ? leftPredicate
+            : null;
         var rightPush = source.Kind is JoinKind.Inner or JoinKind.Right ? rightPredicate : null;
         return leftPush is null && rightPush is null
             ? GetJoinRows(source, parameters, context, maximumRows, outerRow, sourceOrderBy: sourceOrderBy)
@@ -26992,7 +27322,7 @@ out bool hasReturning)
             || IsCommonTableExpression(named, context)
             || context.Views?.ContainsKey(named.Name) == true
             || !context.Tables.TryGetValue(named.Name, out var table)
-            || !TryCreateTransientEqualityLookup(named, table, predicate, context, out var lookup))
+            || !TryCreateTransientEqualityLookup(named, table, predicate, context, outerRow, out var lookup))
         {
             return null;
         }
@@ -27004,20 +27334,25 @@ out bool hasReturning)
             return new SourceData(table.Columns, []);
         }
 
-        var affinity = GetJoinKeyAffinity(lookup.ColumnDefinition);
-        var normalized = affinity is null
-            ? probeValue
-            : EmbeddedTable.ApplyColumnAffinity(affinity.Value, probeValue);
+        // Both sides are canonicalized with exactly the conversion SQLite's comparison affinity
+        // rules apply to that side, so the bucket a value lands in is the bucket the evaluator's
+        // `=` would agree with. Applying the scanned column's affinity to the probe instead
+        // would silently answer "no row" for `INTEGER 7 = TEXT '007'`.
         var key = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
-            normalized,
-            convertTextToNumeric: false,
-            convertNumericToText: false,
+            probeValue,
+            lookup.ValueConvertsTextToNumeric,
+            lookup.ValueConvertsNumericToText,
             lookup.Collation);
         if (key is null)
             return new SourceData(table.Columns, []);
 
         var lookups = statementState.TransientLookups;
-        var cacheKey = new TransientLookupKey(table, lookup.ColumnOrdinal, lookup.Collation);
+        var cacheKey = new TransientLookupKey(
+            table,
+            lookup.ColumnOrdinal,
+            lookup.Collation,
+            lookup.ColumnConvertsTextToNumeric,
+            lookup.ColumnConvertsNumericToText);
         if (!lookups.TryGetValue(cacheKey, out var transient))
         {
             transient = new TransientLookup();
@@ -27032,8 +27367,8 @@ out bool hasReturning)
                 context.CheckInterrupt();
                 var segment = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
                     table.Rows[position][lookup.ColumnOrdinal],
-                    convertTextToNumeric: false,
-                    convertNumericToText: false,
+                    lookup.ColumnConvertsTextToNumeric,
+                    lookup.ColumnConvertsNumericToText,
                     lookup.Collation);
                 if (segment is null)
                     continue;
@@ -27077,17 +27412,24 @@ out bool hasReturning)
 
     private sealed record TransientEqualityLookup(
         int ColumnOrdinal,
-        EmbeddedColumn? ColumnDefinition,
         string Collation,
+        bool ColumnConvertsTextToNumeric,
+        bool ColumnConvertsNumericToText,
+        bool ValueConvertsTextToNumeric,
+        bool ValueConvertsNumericToText,
         Expression ValueExpression);
 
     // Finds the first AND-conjunct of <paramref name="predicate"/> that equates a column of
-    // the scanned table to a scan-constant expression, with a hashable collation.
+    // the scanned table to a scan-constant expression, with a hashable collation and a
+    // comparison whose affinity conversions are known on both sides. A conjunct that fails any
+    // of those checks is skipped rather than fatal: another conjunct may still be probeable,
+    // and a predicate with none simply scans.
     private bool TryCreateTransientEqualityLookup(
         NamedTableSource source,
         EmbeddedTable table,
         Expression predicate,
         QueryContext context,
+        SourceRow? outerRow,
         [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TransientEqualityLookup? lookup)
     {
         var outputColumns = GetOutputColumns(source, context);
@@ -27104,8 +27446,24 @@ out bool hasReturning)
             }
 
             if (conjunct is BinaryExpression { Operator: BinaryOperator.Equal } equal
-                && (TryMatchTransientEquality(equal.Left, equal.Right, source, table, outputColumns, out lookup)
-                    || TryMatchTransientEquality(equal.Right, equal.Left, source, table, outputColumns, out lookup)))
+                && (TryMatchTransientEquality(
+                        equal.Left,
+                        equal.Right,
+                        columnSideIsLeftOperand: true,
+                        source,
+                        table,
+                        outputColumns,
+                        outerRow,
+                        out lookup)
+                    || TryMatchTransientEquality(
+                        equal.Right,
+                        equal.Left,
+                        columnSideIsLeftOperand: false,
+                        source,
+                        table,
+                        outputColumns,
+                        outerRow,
+                        out lookup)))
             {
                 return true;
             }
@@ -27118,9 +27476,11 @@ out bool hasReturning)
     private bool TryMatchTransientEquality(
         Expression columnSide,
         Expression valueSide,
+        bool columnSideIsLeftOperand,
         NamedTableSource source,
         EmbeddedTable table,
         IReadOnlyList<OutputColumn> outputColumns,
+        SourceRow? outerRow,
         [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TransientEqualityLookup? lookup)
     {
         lookup = null;
@@ -27154,10 +27514,39 @@ out bool hasReturning)
             return false;
         }
 
-        var collation = explicitCollation
-            ?? valueCollation
-            ?? table.ColumnDefinitions[ordinal].Collation
+        // The other operand contributes both an affinity and a declared collation to the
+        // comparison. Neither can be guessed: probing under the scanned column's own affinity
+        // and collation is what made `INTEGER 7 = TEXT '007'` and `NOCASE = BINARY` answer
+        // "no such row" where SQLite answers "match".
+        if (!TryDescribeTransientValueSide(
+                valueSide,
+                outerRow,
+                out var valueAffinity,
+                out var valueDeclaredCollation))
+        {
+            return false;
+        }
+
+        var columnDefinition = table.ColumnDefinitions[ordinal];
+        var columnAffinity = GetJoinKeyAffinity(columnDefinition);
+
+        // SQLite resolves the collating sequence by operand order, not by which side happens to
+        // be the scanned column: explicit COLLATE first (left wins), then the left operand's
+        // declared collation, then the right operand's (datatype3.html section 7.1).
+        var leftExplicit = columnSideIsLeftOperand ? explicitCollation : valueCollation;
+        var rightExplicit = columnSideIsLeftOperand ? valueCollation : explicitCollation;
+        // A column always carries a collating sequence (BINARY when none is declared), and the
+        // left operand's wins over the right one's. A non-column operand carries none at all,
+        // which is why the value side reports null rather than "BINARY".
+        var columnDeclared = NormalizeDeclaredCollation(columnDefinition.Collation);
+        var leftDeclared = columnSideIsLeftOperand ? columnDeclared : valueDeclaredCollation;
+        var rightDeclared = columnSideIsLeftOperand ? valueDeclaredCollation : columnDeclared;
+        var collation = leftExplicit
+            ?? rightExplicit
+            ?? leftDeclared
+            ?? rightDeclared
             ?? "BINARY";
+
         // Hashing assumes built-in collation semantics; a registered override (or any
         // custom collation) compares differently, so leave those rows on the evaluator.
         if (!IsHashableJoinKeyCollation(collation) || IsUnsafeCompiledCollation(collation))
@@ -27165,10 +27554,113 @@ out bool hasReturning)
 
         lookup = new TransientEqualityLookup(
             ordinal,
-            table.ColumnDefinitions[ordinal],
             collation.ToUpperInvariant(),
+            // Comparison affinity, mirroring TryCreateCompiledJoinEquiProbe: a numeric operand
+            // pulls a non-numeric one to numeric, and a TEXT operand pulls an affinity-less one
+            // to text. Whichever side SQLite converts is the side the hash converts. "No
+            // affinity" covers both BLOB affinity and a column this engine has no definition
+            // for (a STRICT ANY column, for one).
+            ColumnConvertsTextToNumeric: IsNumericAffinity(valueAffinity) && !IsNumericAffinity(columnAffinity),
+            ColumnConvertsNumericToText: valueAffinity == ColumnAffinity.Text && HasNoComparisonAffinity(columnAffinity),
+            ValueConvertsTextToNumeric: IsNumericAffinity(columnAffinity) && !IsNumericAffinity(valueAffinity),
+            ValueConvertsNumericToText: columnAffinity == ColumnAffinity.Text && HasNoComparisonAffinity(valueAffinity),
             valueSide);
         return true;
+    }
+
+    private static bool HasNoComparisonAffinity(ColumnAffinity? affinity)
+        => affinity is null or ColumnAffinity.Blob;
+
+    // Describes the non-scanned operand of a candidate equality: the affinity and declared
+    // collation it contributes to the comparison. Returns false when neither can be proven, so
+    // the caller declines the probe instead of guessing.
+    //
+    // SQLite gives an affinity only to a column reference and to CAST, and treats only a column
+    // reference (optionally behind unary `+` or CAST) as a collation source; every other
+    // expression - a literal, a parameter, arithmetic, concatenation - has neither
+    // (datatype3.html sections 4.2 and 7.1). CAST is declined rather than modelled: its
+    // affinity is the cast type but its collation still comes from the operand underneath.
+    private static bool TryDescribeTransientValueSide(
+        Expression valueSide,
+        SourceRow? outerRow,
+        out ColumnAffinity? affinity,
+        out string? declaredCollation)
+    {
+        affinity = null;
+        declaredCollation = null;
+
+        while (valueSide is UnaryExpression { Operator: UnaryOperator.Plus } unary)
+            valueSide = unary.Operand;
+        while (valueSide is CollationExpression collation)
+            valueSide = collation.Expression;
+
+        switch (valueSide)
+        {
+            case ColumnExpression { BooleanKeyword: null } column:
+                {
+                    if (outerRow?.GetColumnDefinition(column) is not { } definition)
+                        return false;
+
+                    affinity = GetJoinKeyAffinity(definition);
+                    declaredCollation = NormalizeDeclaredCollation(definition.Collation);
+                    return true;
+                }
+            case CastExpression:
+                return false;
+            default:
+                // No affinity and no collation of its own: SQLite's rules stop treating a column
+                // as a collation source (and as an affinity source) as soon as it sits under an
+                // operator, and `IsScanConstantExpression` has already proven the expression
+                // reads neither a function nor the scanned table. A `CAST` or a `COLLATE` buried
+                // inside such an expression is the one shape where that is arguable, so decline
+                // instead of reasoning about how far each one propagates.
+                return !ContainsCastOrCollate(valueSide);
+        }
+    }
+
+    private static bool ContainsCastOrCollate(Expression expression)
+    {
+        var pending = new Stack<Expression>();
+        pending.Push(expression);
+        while (pending.Count > 0)
+        {
+            switch (pending.Pop())
+            {
+                case CastExpression:
+                case CollationExpression:
+                    return true;
+                case UnaryExpression unary:
+                    pending.Push(unary.Operand);
+                    break;
+                case BinaryExpression binary:
+                    pending.Push(binary.Left);
+                    pending.Push(binary.Right);
+                    break;
+                case BetweenExpression between:
+                    pending.Push(between.Value);
+                    pending.Push(between.Lower);
+                    pending.Push(between.Upper);
+                    break;
+                case CaseExpression @case:
+                    if (@case.Operand is not null)
+                        pending.Push(@case.Operand);
+                    foreach (var clause in @case.Clauses)
+                    {
+                        pending.Push(clause.When);
+                        pending.Push(clause.Then);
+                    }
+
+                    if (@case.Else is not null)
+                        pending.Push(@case.Else);
+                    break;
+                case RowValueExpression rowValue:
+                    foreach (var value in rowValue.Values)
+                        pending.Push(value);
+                    break;
+            }
+        }
+
+        return false;
     }
 
     // Scan-constant means the expression's value cannot change between rows of this
@@ -27280,6 +27772,18 @@ out bool hasReturning)
         Expression? rightPredicate = null,
         IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
+        if (source.Kind.ProducesLeftShapeOnly())
+        {
+            return GetSemiOrAntiJoinRows(
+                source,
+                parameters,
+                context,
+                maximumRows,
+                outerRow,
+                leftPredicate,
+                sourceOrderBy);
+        }
+
         var left = GetSideSourceRows(
             source.Left,
             leftPredicate,
@@ -27382,7 +27886,10 @@ out bool hasReturning)
                         right.Columns.Length,
                         columnDefinitions),
                     QualifiedColumnDefinitions: qualifiedColumnDefinitions,
-                    AmbiguousQualifiedColumns: ambiguousQualifiedColumns);
+                    AmbiguousQualifiedColumns: ambiguousQualifiedColumns,
+                    QualifiedMethodIndexSources: CombineMethodIndexSources(
+                        GetMethodIndexSources(leftRow),
+                        GetMethodIndexSources(rightRow)));
                 if (source.Condition is not null
                     && !JoinConditionMatches(source, joinPairs, row, leftRow, rightRow, parameters, context))
                 {
@@ -27418,7 +27925,12 @@ out bool hasReturning)
                         right.Columns.Length,
                         columnDefinitions),
                     QualifiedColumnDefinitions: qualifiedColumnDefinitions,
-                    AmbiguousQualifiedColumns: ambiguousQualifiedColumns));
+                    AmbiguousQualifiedColumns: ambiguousQualifiedColumns,
+                    QualifiedMethodIndexSources: CombineMethodIndexSources(
+                        GetMethodIndexSources(leftRow),
+                        rowsForLeft.Rows.FirstOrDefault() is { } rightTemplate
+                            ? GetMethodIndexSources(rightTemplate)
+                            : [])));
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
                     return CreateResult(rows);
             }
@@ -27451,7 +27963,12 @@ out bool hasReturning)
                         right.Columns.Length,
                         columnDefinitions),
                     QualifiedColumnDefinitions: qualifiedColumnDefinitions,
-                    AmbiguousQualifiedColumns: ambiguousQualifiedColumns));
+                    AmbiguousQualifiedColumns: ambiguousQualifiedColumns,
+                    QualifiedMethodIndexSources: CombineMethodIndexSources(
+                        left.Rows.FirstOrDefault() is { } leftTemplate
+                            ? GetMethodIndexSources(leftTemplate)
+                            : [],
+                        GetMethodIndexSources(rightRow))));
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
                     return CreateResult(rows);
             }
@@ -27459,6 +27976,113 @@ out bool hasReturning)
         }
 
         return CreateResult(rows);
+    }
+
+    /// <summary>
+    /// Executes the internal semi/anti join produced by the correlated-subquery rewrite.
+    /// <para>
+    /// The right side is materialized <em>once</em> (that is the whole point of the rewrite:
+    /// the original correlated subquery re-planned and re-scanned it for every outer row), and
+    /// each left row survives when a matching right row exists (<see cref="JoinKind.Semi"/>) or
+    /// when none does (<see cref="JoinKind.Anti"/>). The output is the left rows verbatim, so a
+    /// left row is emitted at most once no matter how many right rows match — an inner join
+    /// would multiply it instead, which is exactly why Turso introduces a distinct join type
+    /// (turso-src/core/translate/optimizer/unnest.rs:331-457).
+    /// </para>
+    /// <para>
+    /// The condition is evaluated against the right row re-parented onto the current left row,
+    /// under the right side's collation scope. That is bit-for-bit the environment the original
+    /// subquery's WHERE ran in, so inner-name shadowing, correlated resolution through the outer
+    /// row chain, affinity and collation all behave identically to the un-rewritten query.
+    /// </para>
+    /// </summary>
+    private SourceData GetSemiOrAntiJoinRows(
+        JoinTableSource source,
+        SqlValue[] parameters,
+        QueryContext context,
+        long? maximumRows,
+        SourceRow? outerRow,
+        Expression? leftPredicate,
+        IReadOnlyList<OrderByTerm>? sourceOrderBy)
+    {
+        var left = GetSideSourceRows(
+            source.Left,
+            leftPredicate,
+            parameters,
+            context,
+            outerRow,
+            sourceOrderBy);
+
+        // Enter the right side's collation scope exactly as ExecuteSelect would when running the
+        // subquery this join replaced, so a comparison inside the condition resolves the same
+        // declared collation it resolved before the rewrite.
+        var innerContext = EnterCollationSource(context, source.Right);
+
+        // The un-rewritten correlated subquery reached its inner table through
+        // TryGetTransientLookupRows, which turns an `inner.col = <outer expression>` conjunct
+        // into a statement-cached hash probe. Keep using it here so the rewrite never trades a
+        // probe for a scan; the materialized row set is only built when no probe applies, and
+        // then only once for the whole join instead of once per outer row.
+        SourceData? materializedRight = null;
+
+        var keepOnMatch = source.Kind == JoinKind.Semi;
+        var rows = new List<SourceRow>();
+        foreach (var leftRow in left.Rows)
+        {
+            context.CheckInterrupt();
+            var probed = source.Condition is null
+                ? null
+                : TryGetTransientLookupRows(source.Right, source.Condition, parameters, innerContext, leftRow);
+            IReadOnlyList<SourceRow> candidates;
+            bool reparent;
+            if (probed is not null)
+            {
+                // Probed rows are already parented on this outer row.
+                candidates = probed.Rows;
+                reparent = false;
+            }
+            else
+            {
+                materializedRight ??= GetSideSourceRows(
+                    source.Right,
+                    sidePredicate: null,
+                    parameters,
+                    innerContext,
+                    outerRow,
+                    sourceOrderBy: null);
+                candidates = materializedRight.Rows;
+                reparent = true;
+            }
+
+            var matched = false;
+            foreach (var rightRow in candidates)
+            {
+                context.CheckInterrupt();
+                var probe = reparent ? rightRow with { Parent = leftRow } : rightRow;
+                if (source.Condition is not null
+                    && !IsTrue(Evaluate(source.Condition, parameters, probe, innerContext)))
+                {
+                    continue;
+                }
+
+                matched = true;
+                break;
+            }
+
+            if (matched != keepOnMatch)
+                continue;
+
+            rows.Add(leftRow);
+            if (maximumRows is not null && rows.Count >= maximumRows.Value)
+                break;
+        }
+
+        return new SourceData(
+            left.Columns,
+            rows,
+            left.Collations,
+            left.ColumnDefinitions,
+            left.OmittedVirtualTablePredicates);
     }
 
     private static IReadOnlyList<EmbeddedColumn?>? CombineColumnDefinitions(
@@ -27950,6 +28574,38 @@ out bool hasReturning)
         return rowIds;
     }
 
+    /// <summary>
+    /// Folds one row's method-index source bindings into a flat qualifier map, so a joined row keeps
+    /// one entry per contributing source instead of losing all but the last.
+    /// </summary>
+    private static Dictionary<string, MethodIndexSourceBinding> GetMethodIndexSources(SourceRow row)
+    {
+        var sources = new Dictionary<string, MethodIndexSourceBinding>(StringComparer.OrdinalIgnoreCase);
+        if (row.QualifiedMethodIndexSources is not null)
+        {
+            foreach (var (qualifier, binding) in row.QualifiedMethodIndexSources)
+                sources.TryAdd(qualifier, binding);
+        }
+
+        if (row.MethodIndexSource is { } own && row.RowIdQualifier is { } qualifierName)
+            sources.TryAdd(qualifierName, own);
+
+        return sources;
+    }
+
+    private static IReadOnlyDictionary<string, MethodIndexSourceBinding>? CombineMethodIndexSources(
+        Dictionary<string, MethodIndexSourceBinding> left,
+        Dictionary<string, MethodIndexSourceBinding> right)
+    {
+        if (left.Count == 0 && right.Count == 0)
+            return null;
+
+        foreach (var (qualifier, binding) in right)
+            left.TryAdd(qualifier, binding);
+
+        return left;
+    }
+
     private static IReadOnlyDictionary<string, long?> GetQualifiedRowIdPlaceholders(
         TableSource source,
         QueryContext context)
@@ -27964,9 +28620,11 @@ out bool hasReturning)
                     [named.Alias ?? named.Name] = null,
                 };
             case JoinTableSource join:
-                return CombineQualifiedRowIds(
-                    GetQualifiedRowIdPlaceholders(join.Left, context),
-                    GetQualifiedRowIdPlaceholders(join.Right, context));
+                return join.Kind.ProducesLeftShapeOnly()
+                    ? GetQualifiedRowIdPlaceholders(join.Left, context)
+                    : CombineQualifiedRowIds(
+                        GetQualifiedRowIdPlaceholders(join.Left, context),
+                        GetQualifiedRowIdPlaceholders(join.Right, context));
             default:
                 return new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
         }
@@ -28000,10 +28658,12 @@ out bool hasReturning)
             DerivedTableSource derived when derived.Alias is not null
                 => BuildQualifiedColumns(derived.Alias, DescribeQuery(derived.Query, context)),
             DerivedTableSource => new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
-            JoinTableSource join => CombineQualifiedColumns(
-                GetQualifiedColumns(join.Left, context),
-                GetQualifiedColumns(join.Right, context),
-                GetSourceColumns(join.Left, context).Length),
+            JoinTableSource join => join.Kind.ProducesLeftShapeOnly()
+                ? GetQualifiedColumns(join.Left, context)
+                : CombineQualifiedColumns(
+                    GetQualifiedColumns(join.Left, context),
+                    GetQualifiedColumns(join.Right, context),
+                    GetSourceColumns(join.Left, context).Length),
             _ => throw new EmbeddedSqlException($"Unsupported table source {source.GetType().Name}."),
         };
     }
@@ -28014,6 +28674,11 @@ out bool hasReturning)
     {
         if (source is not JoinTableSource join)
             return null;
+
+        // The right side of a semi/anti join is not in the enclosing scope, so it cannot make
+        // an outer column reference ambiguous.
+        if (join.Kind.ProducesLeftShapeOnly())
+            return GetAmbiguousQualifiedColumns(join.Left, context);
 
         var ambiguous = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (GetAmbiguousQualifiedColumns(join.Left, context) is { } leftAmbiguous)
@@ -28040,9 +28705,11 @@ out bool hasReturning)
         {
             NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table)
                 => table.ColumnDefinitions.Select(static definition => (EmbeddedColumn?)definition).ToArray(),
-            JoinTableSource join => GetSourceColumnDefinitions(join.Left, context)
-                .Concat(GetSourceColumnDefinitions(join.Right, context))
-                .ToArray(),
+            JoinTableSource join => join.Kind.ProducesLeftShapeOnly()
+                ? GetSourceColumnDefinitions(join.Left, context)
+                : GetSourceColumnDefinitions(join.Left, context)
+                    .Concat(GetSourceColumnDefinitions(join.Right, context))
+                    .ToArray(),
             _ => Enumerable.Repeat<EmbeddedColumn?>(
                     null,
                     GetSourceColumns(source, context).Length)
@@ -28062,6 +28729,9 @@ out bool hasReturning)
                     table.ColumnDefinitions);
             case JoinTableSource join:
                 {
+                    if (join.Kind.ProducesLeftShapeOnly())
+                        return GetSourceQualifiedColumnDefinitions(join.Left, context);
+
                     var definitions = new Dictionary<string, EmbeddedColumn>(
                         StringComparer.OrdinalIgnoreCase);
                     foreach (var (name, definition) in GetSourceQualifiedColumnDefinitions(join.Left, context))
@@ -28130,7 +28800,8 @@ out bool hasReturning)
     // insensitive); those names are reserved for the internal schema.
     private static bool IsReservedObjectName(string name)
         => name.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase)
-            || IsAutoIncrementSequenceBackingTable(name);
+            || IsAutoIncrementSequenceBackingTable(name)
+            || Indexing.ManagedIndexMethodNames.IsReserved(name);
 
     private static SourceData GetNamedTableRows(
         NamedTableSource source,
@@ -28143,6 +28814,10 @@ out bool hasReturning)
 
         var table = GetTable(source, context.Tables);
         var qualifier = source.Alias ?? source.Name;
+        var methodIndexSource = table.HasMethodIndexes
+            ? new MethodIndexSourceBinding(ResolveMethodIndexSourceName(source.Name), table)
+            : (MethodIndexSourceBinding?)null;
+        context.RegisterMethodIndexSource(qualifier, ResolveMethodIndexSourceName(source.Name), table);
         var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
         var qualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(
             qualifier,
@@ -28203,7 +28878,8 @@ out bool hasReturning)
                     RowId: table.HasRowid ? row.Key.Integer : null,
                     RowIdQualifier: qualifier,
                     ColumnDefinitions: table.ColumnDefinitions,
-                    QualifiedColumnDefinitions: qualifiedColumnDefinitions);
+                    QualifiedColumnDefinitions: qualifiedColumnDefinitions,
+                    MethodIndexSource: methodIndexSource);
             }
 
             return new SourceData(table.Columns, dualSourceRows);
@@ -28236,7 +28912,8 @@ out bool hasReturning)
                 RowId: table.HasRowid ? rowid : null,
                 RowIdQualifier: qualifier,
                 ColumnDefinitions: table.ColumnDefinitions,
-                QualifiedColumnDefinitions: qualifiedColumnDefinitions);
+                QualifiedColumnDefinitions: qualifiedColumnDefinitions,
+                MethodIndexSource: methodIndexSource);
         }
 
         return new SourceData(table.Columns, sourceRows);
@@ -29671,9 +30348,11 @@ out bool hasReturning)
             DerivedTableSource derived => QualifyAffinityColumns(
                 DescribeQueryAffinities(derived.Query, context, commonTableExpressions),
                 derived.Alias),
-            JoinTableSource join => GetRawSourceAffinityColumns(join.Left, context, commonTableExpressions)
-                .Concat(GetRawSourceAffinityColumns(join.Right, context, commonTableExpressions))
-                .ToArray(),
+            JoinTableSource join => join.Kind.ProducesLeftShapeOnly()
+                ? GetRawSourceAffinityColumns(join.Left, context, commonTableExpressions)
+                : GetRawSourceAffinityColumns(join.Left, context, commonTableExpressions)
+                    .Concat(GetRawSourceAffinityColumns(join.Right, context, commonTableExpressions))
+                    .ToArray(),
             _ => throw new EmbeddedSqlException($"Unsupported table source {source.GetType().Name}."),
         };
     }
@@ -31758,7 +32437,9 @@ out bool hasReturning)
                 break;
             case JoinTableSource join:
                 CollectFromSourceNames(join.Left, names);
-                CollectFromSourceNames(join.Right, names);
+                // A semi/anti join's right side is not a FROM name of the enclosing query.
+                if (!join.Kind.ProducesLeftShapeOnly())
+                    CollectFromSourceNames(join.Right, names);
                 break;
         }
     }
@@ -33892,6 +34573,14 @@ out bool hasReturning)
             "VECTOR_DISTANCE_DOT" => SqliteVectorFunctions.DistanceDot(arguments),
             "VECTOR_CONCAT" => SqliteVectorFunctions.Concat(arguments),
             "VECTOR_SLICE" => SqliteVectorFunctions.Slice(arguments),
+            "FTS_MATCH" => EvaluateFtsMatch(function, arguments, row, context),
+            "FTS_SCORE" => EvaluateFtsScore(function, arguments, row, context),
+            "FTS_HIGHLIGHT" => Search.ManagedFtsFunctions.Highlight(
+                arguments,
+                ResolveBoundFtsTokenizer(function, row, context)),
+            "FTS_SNIPPET" => Search.ManagedFtsFunctions.Snippet(
+                arguments,
+                ResolveBoundFtsTokenizer(function, row, context)),
             _ => throw new EmbeddedSqlException($"no such function: {function.Name}"),
         };
     }
@@ -49159,6 +49848,17 @@ internal sealed class EmbeddedTable
                     {
                         throw new EmbeddedSqlException($"misuse of aggregate function {function.Name}()");
                     }
+
+                    // fts_score() reads the covering index's corpus statistics, so its value for one
+                    // row depends on every other row and on which indexes exist. A CHECK constraint
+                    // evaluated during the very statement that is mutating that corpus has no
+                    // well-defined answer, so it is rejected at CREATE time the way a generated
+                    // column is.
+                    if (IsCorpusDependentMethodFunction(function.Name))
+                    {
+                        throw new EmbeddedSqlException(
+                            $"non-deterministic functions are prohibited in {context}s");
+                    }
                 }
 
                 foreach (var argument in function.Arguments)
@@ -49420,6 +50120,122 @@ internal sealed class EmbeddedTable
                 : GetAffinity(column.DeclaredType);
 
     public List<EmbeddedIndex> Indexes { get; } = [];
+
+    /// <summary>
+    /// Live attachments for this table's method indexes, keyed by index name. The cache is part of
+    /// the catalog snapshot, so a transaction, savepoint or DDL rollback discards method state along
+    /// with the rows it was derived from.
+    /// </summary>
+    /// <remarks>
+    /// Each entry also remembers the <see cref="EmbeddedIndex"/> instance it was built for. An index
+    /// dropped and recreated under the same name produces a new definition object, so a stale
+    /// attachment carrying the old <c>WITH</c> options can never be handed out for the new one.
+    /// </remarks>
+    private readonly Dictionary<string, MethodAttachmentEntry> _methodAttachments =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private Indexing.ManagedIndexMethodJournal? _methodIndexJournal;
+
+    /// <summary>True when at least one method attachment is currently published.</summary>
+    public bool HasPublishedMethodAttachments => _methodAttachments.Count > 0;
+
+    /// <summary>Returns the published attachment for an index definition, if it matches.</summary>
+    public bool TryGetMethodAttachment(
+        EmbeddedIndex index,
+        out Indexing.ManagedIndexMethodAttachment attachment)
+    {
+        if (_methodAttachments.TryGetValue(index.Name, out var entry) && ReferenceEquals(entry.Index, index))
+        {
+            attachment = entry.Attachment;
+            return true;
+        }
+
+        attachment = null!;
+        return false;
+    }
+
+    /// <summary>Returns the published attachment for an index name regardless of definition identity.</summary>
+    public bool TryGetMethodAttachmentByName(
+        string indexName,
+        out Indexing.ManagedIndexMethodAttachment attachment)
+    {
+        if (_methodAttachments.TryGetValue(indexName, out var entry))
+        {
+            attachment = entry.Attachment;
+            return true;
+        }
+
+        attachment = null!;
+        return false;
+    }
+
+    /// <summary>Publishes a fully constructed attachment and starts journaling mutations for it.</summary>
+    public void PublishMethodAttachment(EmbeddedIndex index, Indexing.ManagedIndexMethodAttachment attachment)
+    {
+        _methodAttachments[index.Name] = new MethodAttachmentEntry(index, attachment);
+        _methodIndexJournal ??= new Indexing.ManagedIndexMethodJournal(Rows.Revision);
+    }
+
+    /// <summary>Forgets one attachment; the next use re-derives it from the base rows.</summary>
+    public void ForgetMethodAttachment(string indexName)
+    {
+        _methodAttachments.Remove(indexName);
+        if (_methodAttachments.Count == 0)
+            _methodIndexJournal = null;
+    }
+
+    /// <summary>
+    /// Records one reported row mutation for incremental method maintenance. No-op until a method
+    /// attachment is published, because nothing derives from the rows before then.
+    /// </summary>
+    public void RecordMethodIndexMutation(long rowId)
+        => _methodIndexJournal?.Record(rowId, Rows.Revision);
+
+    /// <summary>The rowids touched since a revision, or null when the range cannot be proven complete.</summary>
+    public Indexing.ManagedIndexSourceDelta? TryGetMethodIndexDelta(long sinceRevision)
+        => _methodIndexJournal?.TryGetDelta(sinceRevision, Rows.Revision);
+
+    /// <summary>Re-establishes the journal baseline after a method rebuilt from the base rows.</summary>
+    public void ResetMethodIndexJournalBaseline(long revision)
+        => _methodIndexJournal?.ResetBaseline(revision);
+
+    private readonly record struct MethodAttachmentEntry(
+        EmbeddedIndex Index,
+        Indexing.ManagedIndexMethodAttachment Attachment);
+
+    /// <summary>True when any index on this table is served by a managed index method.</summary>
+    public bool HasMethodIndexes
+    {
+        get
+        {
+            foreach (var index in Indexes)
+            {
+                if (index.IsMethodIndex)
+                    return true;
+            }
+
+            return false;
+        }
+    }
+
+    private void CopyMethodAttachmentsTo(EmbeddedTable clone)
+    {
+        // Forked attachments carry no derived state and no journal: a snapshot that is later
+        // restored must rebuild from the rows it restored, never replay a delta recorded against
+        // rows that no longer exist.
+        foreach (var (name, entry) in _methodAttachments)
+        {
+            var forkedIndex = clone.Indexes.FirstOrDefault(
+                candidate => string.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (forkedIndex is null)
+                continue;
+
+            clone._methodAttachments[name] = new MethodAttachmentEntry(forkedIndex, entry.Attachment.Fork());
+        }
+
+        if (clone._methodAttachments.Count > 0)
+            clone._methodIndexJournal = new Indexing.ManagedIndexMethodJournal(clone.Rows.Revision);
+    }
 
     public int GetColumnIndex(string name)
     {
@@ -49783,6 +50599,13 @@ internal sealed class EmbeddedTable
 
         return SqliteBuiltinFunctions.IsDeterministic(function.Name);
     }
+
+    /// <summary>
+    /// True for a method-index SQL function whose result depends on the indexed corpus and on the
+    /// covering index's configuration rather than only on its arguments.
+    /// </summary>
+    internal static bool IsCorpusDependentMethodFunction(string name)
+        => string.Equals(name, "fts_score", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsDeterministicGenerationFunction(FunctionExpression function)
         => IsDeterministicSchemaFunction(function);
@@ -50521,6 +51344,7 @@ internal sealed class EmbeddedTable
         clone.RowIds.AddRange(RowIds);
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
+        CopyMethodAttachmentsTo(clone);
         return clone;
     }
 
@@ -50559,6 +51383,7 @@ internal sealed class EmbeddedTable
         clone.RowIds.AddRange(RowIds);
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
+        CopyMethodAttachmentsTo(clone);
         return clone;
 
         IReadOnlyList<CheckConstraint> RewriteChecks(IReadOnlyList<CheckConstraint> checks)
@@ -50615,6 +51440,7 @@ internal sealed class EmbeddedTable
         clone.RowIds.AddRange(RowIds);
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
+        CopyMethodAttachmentsTo(clone);
         return clone;
     }
 
@@ -51093,6 +51919,12 @@ internal sealed record OutputColumn(
     // apart from "the same name contributed by two distinct FROM sources" (ambiguous).
     object? Origin = null);
 
+/// <summary>
+/// The base table one scanned source came from, carried on the rows it produced so a scalar method
+/// function can bind to the source's identity rather than to its name.
+/// </summary>
+internal readonly record struct MethodIndexSourceBinding(string TableName, EmbeddedTable Table);
+
 internal sealed record SourceRow(
     string[] Columns,
     SqlValue[] Values,
@@ -51104,10 +51936,52 @@ internal sealed record SourceRow(
     IReadOnlyDictionary<string, long?>? QualifiedRowIds = null,
     IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null,
     IReadOnlyDictionary<string, EmbeddedColumn>? QualifiedColumnDefinitions = null,
-    IReadOnlySet<string>? AmbiguousQualifiedColumns = null)
+    IReadOnlySet<string>? AmbiguousQualifiedColumns = null,
+    MethodIndexSourceBinding? MethodIndexSource = null,
+    IReadOnlyDictionary<string, MethodIndexSourceBinding>? QualifiedMethodIndexSources = null)
 {
     public SqlValue GetValue(string name)
         => GetValue(name, allowQualifiedLookup: true);
+
+    /// <summary>
+    /// The base table the source identified by <paramref name="qualifier"/> was scanned from, or
+    /// null when this row carries no such source.
+    /// </summary>
+    /// <remarks>
+    /// This is what a scalar method function binds to. Resolving the alias through a
+    /// statement-wide registry instead meant that a nested subquery reusing an outer alias for a
+    /// different table silently rebound the outer call: the inner scan registered its own table
+    /// under the same name, and every later evaluation of the outer projection scored against it.
+    /// The row itself is the only thing that always knows which source produced it, so the binding
+    /// travels with the row — through joins, through the outer-row chain, and past any number of
+    /// nested queries that happen to reuse the name.
+    /// </remarks>
+    public MethodIndexSourceBinding? GetMethodIndexSourceForQualifier(string qualifier)
+    {
+        if (QualifiedMethodIndexSources is { } qualified && qualified.TryGetValue(qualifier, out var bound))
+            return bound;
+
+        return MethodIndexSource is { } own
+            && RowIdQualifier is { } owner
+            && string.Equals(owner, qualifier, StringComparison.OrdinalIgnoreCase)
+                ? own
+                : Parent?.GetMethodIndexSourceForQualifier(qualifier);
+    }
+
+    /// <summary>
+    /// The rowid of the source identified by <paramref name="qualifier"/>, or null when this row
+    /// carries no rowid for it. Joined rows keep one entry per source, so a scalar function bound to
+    /// one source never reads another source's rowid.
+    /// </summary>
+    public long? GetRowIdForQualifier(string qualifier)
+    {
+        if (QualifiedRowIds is { } qualified && qualified.TryGetValue(qualifier, out var rowId))
+            return rowId;
+
+        return RowIdQualifier is { } owner && string.Equals(owner, qualifier, StringComparison.OrdinalIgnoreCase)
+            ? RowId
+            : Parent?.GetRowIdForQualifier(qualifier);
+    }
 
     public SqlValue GetValue(ColumnExpression column)
     {

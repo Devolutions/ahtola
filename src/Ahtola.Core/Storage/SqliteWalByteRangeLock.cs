@@ -780,7 +780,7 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
         if (OperatingSystem.IsMacOS())
         {
             if (Native.StatMac(path, out var information) != 0)
-                ThrowNativeIOException("stat", Marshal.GetLastPInvokeError());
+                ThrowPathStatFailure(path, Marshal.GetLastPInvokeError());
 
             return new SqliteWalSharedMemoryCarrierIdentity(
                 unchecked((ulong)(uint)information.Device),
@@ -814,17 +814,63 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
             return FromHandle(handle);
         }
 
-        // POSIX open() succeeds on a directory with read-only access alone (the caller simply
-        // cannot read() bytes from the resulting descriptor), so the ordinary file-handle path
-        // that FromPath uses already works unchanged here.
-        using var posixHandle = System.IO.File.OpenHandle(
-            directoryPath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete,
-            FileOptions.None);
-        return FromHandle(posixHandle);
+        // POSIX open() does succeed on a directory, but File.OpenHandle deliberately refuses to
+        // hand one back: it fstats the descriptor it just opened and throws
+        // UnauthorizedAccessException for anything that is a directory. A directory's identity on
+        // Unix therefore has to come from a path-based stat rather than from a handle -- which is
+        // also exactly how FromPath already resolves a file on macOS.
+        if (OperatingSystem.IsMacOS())
+        {
+            if (Native.StatMac(directoryPath, out var macInformation) != 0)
+                ThrowDirectoryStatFailure(directoryPath, Marshal.GetLastPInvokeError());
+
+            return new SqliteWalSharedMemoryCarrierIdentity(
+                unchecked((ulong)(uint)macInformation.Device),
+                macInformation.Inode);
+        }
+
+        if (OperatingSystem.IsLinux() && Environment.Is64BitProcess)
+        {
+            if (Native.StatLinux(directoryPath, out var linuxInformation) != 0)
+                ThrowDirectoryStatFailure(directoryPath, Marshal.GetLastPInvokeError());
+
+            return new SqliteWalSharedMemoryCarrierIdentity(linuxInformation.Device, linuxInformation.Inode);
+        }
+
+        throw new PlatformNotSupportedException(
+            "SQLite WAL shared-memory carrier identity is supported only on Windows, 64-bit Linux, and macOS.");
     }
+
+    /// <summary>
+    /// Reports a failed directory stat the way the managed file APIs would, so callers can keep
+    /// distinguishing "this parent directory does not exist (yet)" -- an expected state during a
+    /// first bootstrap -- from a genuine I/O failure.
+    /// </summary>
+    private static void ThrowDirectoryStatFailure(string directoryPath, int error)
+    {
+        if (error is NoSuchFileOrDirectory or NotADirectory)
+            throw new DirectoryNotFoundException($"Could not find a part of the path '{directoryPath}'.");
+
+        ThrowNativeIOException("stat", error);
+    }
+
+    /// <summary>
+    /// The file-oriented counterpart of <see cref="ThrowDirectoryStatFailure"/>: a caller probing
+    /// whether a database file exists yet must see the same <see cref="FileNotFoundException"/> the
+    /// handle-based path on Linux and Windows raises, not a generic I/O failure.
+    /// </summary>
+    private static void ThrowPathStatFailure(string path, int error)
+    {
+        if (error == NoSuchFileOrDirectory)
+            throw new FileNotFoundException($"Could not find file '{path}'.", path);
+        if (error == NotADirectory)
+            throw new DirectoryNotFoundException($"Could not find a part of the path '{path}'.");
+
+        ThrowNativeIOException("stat", error);
+    }
+
+    private const int NoSuchFileOrDirectory = 2; // ENOENT, identical on Linux and macOS.
+    private const int NotADirectory = 20; // ENOTDIR, identical on Linux and macOS.
 
     internal static SqliteWalSharedMemoryCarrierIdentity FromHandle(SafeFileHandle handle)
     {
@@ -960,6 +1006,21 @@ internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulo
         internal static partial int StatMac(
             string path,
             out MacFileStatus information);
+
+        /// <summary>
+        /// Path-based <c>stat</c> for 64-bit Linux, used for directories: <c>fstat</c> needs a
+        /// descriptor, and <see cref="System.IO.File.OpenHandle"/> refuses to produce one for a
+        /// directory on Unix.
+        /// </summary>
+        [LibraryImport(
+            "libc",
+            EntryPoint = "stat",
+            StringMarshalling = StringMarshalling.Utf8,
+            SetLastError = true)]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        internal static partial int StatLinux(
+            string path,
+            out LinuxFileStatus information);
 
         /// <summary>
         /// Opens a directory for metadata-only access on Windows. <see cref="System.IO.File.OpenHandle"/>

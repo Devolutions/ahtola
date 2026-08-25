@@ -348,10 +348,10 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 122 | `OpenWrite` | direct | OpenWriteCursor |  |
 | 123 | `Copy` | direct | Copy |  |
 | 124 | `CreateBtree` | bydesign | — (DDL tree-walked) | `vdbe-ddl-executed-by-treewalker` |
-| 125 | `IndexMethodCreate` | missing | — | `vdbe-index-method-opcodes` |
-| 126 | `IndexMethodDestroy` | missing | — | `vdbe-index-method-opcodes` |
-| 127 | `IndexMethodOptimize` | missing | — | `vdbe-index-method-opcodes` |
-| 128 | `IndexMethodQuery` | missing | — | `vdbe-index-method-opcodes` |
+| 125 | `IndexMethodCreate` | ported (107) | `IndexMethodCreateInstruction` | `vdbe-index-method-opcodes` |
+| 126 | `IndexMethodDestroy` | ported (108) | `IndexMethodDestroyInstruction` | `vdbe-index-method-opcodes` |
+| 127 | `IndexMethodOptimize` | ported (109) | `IndexMethodOptimizeInstruction` | `vdbe-index-method-opcodes` |
+| 128 | `IndexMethodQuery` | ported (110) | `IndexMethodQueryInstruction` (+ Ahtola-only Next/Column/RowId/Insert/Delete 111-115) | `vdbe-index-method-opcodes` |
 | 129 | `ClearBtree` | bydesign | — (DDL tree-walked) | `vdbe-ddl-executed-by-treewalker` |
 | 130 | `Destroy` | bydesign | — (DDL tree-walked) | `vdbe-ddl-executed-by-treewalker` |
 | 131 | `ResetSorter` | missing | — | `vdbe-misc-cursor-opcodes` |
@@ -459,7 +459,7 @@ Status totals: bydesign 25, consolidated 40, direct 26, divergent 10, missing 10
 | `vdbe-deferred-seek` | missing | s3-perf | M | 0 | 0 | DeferredSeek lets an index scan postpone the table-btree seek until a column outside the index is actually read (covering-index fast path); SeekEnd positions a cursor pas… |
 | `vdbe-ext-window-buffer-family` | extension | s4-intentional | S | 0 | 0 | Ahtola-only buffered-window evaluation: the whole partition is buffered, then computed in one pass, enabling forward-looking and peer-relative frames cleanly. Semanticall… |
 | `vdbe-ext-worktable-and-gate-families` | extension | s4-intentional | S | 0 | 0 | Ahtola's higher-level opcode families: FIFO recursive work tables (recursive CTE), streaming join cursor, and gate opcodes that fuse what Turso does with primitive jump/c… |
-| `vdbe-index-method-opcodes` | missing | s2-capability | M | 0 | 0 | Turso's pluggable index-method family (custom index types queried through dedicated cursor machinery; op_column has a CursorType::IndexMethod arm). No Ahtola counterpart;… |
+| `vdbe-index-method-opcodes` | partial | s4-intentional | M | 0 | 0 | Ported 2026-08-24 as a managed index-method foundation plus opcodes 107-115 (`IndexMethodCreate/Destroy/Optimize/Query` + Ahtola-only `Next/Column/RowId/Insert/Delete`); no existing opcode renumbered. See docs/managed-index-methods.md. |
 | `vdbe-integrity-check-opcode` | missing | s2-capability | M | 0 | 0 | PRAGMA integrity_check/quick_check needs the opcode-driven btree walk; Ahtola has no integrity checker. Pairs with the parser-layer pragma catch-all gap. |
 | `vdbe-materialized-view-opcodes` | missing | s4-intentional | L | 0 | 0 | Turso's incremental-materialized-view extension: CREATE MATERIALIZED VIEW, dependent-view capture in DML opcodes, MV cursor types. Parser layer confirms no Ahtola grammar… |
 | `vdbe-misc-cursor-opcodes` | missing | s3-perf | S | 0 | 0 | Micro-opcodes: ResetSorter (re-drain a sorter for correlated subqueries without rebuilding), AggValue (read aggregate mid-iteration), OpenDup (cheap cursor clone), Column… |
@@ -498,9 +498,14 @@ Highest-impact entries:
   statements and same-file ATTACH are unsupported/limited — by design for the
   managed single-file model, but it gates a large DDL-test surface. Read-only
   main/temp base-table joins are supported from a connection-local snapshot.
-- **Planner** (s3): no subquery flattening (63 mapped), no decorrelation
-  (25), no join-order optimization, no ORDER BY elision from indexes (17),
-  no partial (18) or expression (19) indexes.
+- **Planner** (s3): FROM-derived-table flattening and correlated
+  EXISTS/NOT EXISTS/IN unnesting into semi/anti joins **are now implemented**
+  (see `compile-no-subquery-flattening`,
+  `compile-correlated-exists-in-semi-anti-join` and section 4.1); still open are
+  aggregate-subquery decorrelation
+  (`compile-no-aggregate-subquery-decorrelation`), join-order optimization,
+  ORDER BY elision from indexes (17), and partial (18) / expression (19)
+  index planning.
 - **CTE/DML shapes** (s2): recursive CTEs limited to a single term (27),
   no DML inside CTEs, materialization hints restricted (22).
 - **`compile-reindex-statement`** (s2, S effort): REINDEX not compiled —
@@ -510,13 +515,15 @@ Highest-impact entries:
 | --- | --- | --- | --- | ---: | ---: | --- |
 | `compile-select-alias-visibility` | divergent | s1-correctness | M | 66 | 9 | SELECT-list aliases are not visible in GROUP BY/HAVING/JOIN-USING contexts ("no such column: cnt/total/key"); ambiguous-column errors also misreport which name is ambiguo… |
 | `compile-attach-cross-database-support` | partial | s2-capability | L | 65 | 8 | Managed ATTACH supports file-backed attachments and independent connection-owned `:memory:` attachments. Read-only main/temp base-table queries share a connection-local snapshot, while attached-database statements and cross-schema writes remain rejected. Blocks the entire 4… |
-| `compile-no-subquery-flattening` | missing | s3-perf | L | 63 | 0 | SQLite/Turso can flatten many `FROM (SELECT ...)` derived-table subqueries into the outer query when safe (no aggregates/DISTINCT/LIMIT conflicts), avoiding a materializa… |
+| `compile-no-subquery-flattening` | parity | s3-perf | L | 63 | 0 | Closed 2026-08-23: `EmbeddedDatabase.SubqueryRewrites.cs` flattens a FROM-clause derived table that is the whole FROM clause when its SELECT adds no DISTINCT/GROUP BY/HAVING/window/ORDER BY/LIMIT/OFFSET, no aggregate/window/subquery projection, no subtype-sensitive projection (a function call or a `->`/`->>` JSON operator, which guards SQLite's JSON-subtype strip at the co-routine boundary), no reference qualified by a name the hoisted inner FROM clause would shadow, no star projection over a `USING`/`NATURAL` join a `RIGHT`/`FULL` join can NULL-extend, and no ambiguous or non-deterministically duplicated column. The hoisted inner WHERE is re-bound against the inner projection aliases before it moves. See section 4.1. |
 | `compile-attach-same-file-not-supported` | missing | s4-intentional | S | 61 | 2 | Independent `:memory:` attachments are connection-owned, but attaching an existing managed in-memory database or an already-open file identity remains unsupported by design (… |
 | `compile-window-function-tie-break-ordering-diverges` | divergent | s1-correctness | M | 54 | 6 | Multiple DENSE_RANK/RANK conformance cases show different peer-grouping outcomes (which rows tie for the same rank) versus SQLite/Turso when collation (NOCASE), cross-typ… |
 | `compile-alter-rename-trigger-body-not-rebound` | missing | s1-correctness | M | 44 | 6 | After `ALTER TABLE t1 RENAME TO t2`, six conformance cases show existing triggers referencing the old table name inside their body (e.g. `INSERT INTO t1 ...` in a trigger… |
 | `compile-affinity-rules-diverge-in-subquery-and-compound-contexts` | divergent | s1-correctness | M | 28 | 8 | A cluster of affinity.sqltest failures shows Ahtola computing a different column affinity than SQLite/Turso specifically when the affinity-bearing column flows through a… |
 | `compile-recursive-cte-single-term-only` | partial | s2-capability | M | 27 | 2 | RecursiveCteProgramBuilder explicitly documents its scope as "the well-defined linear recursion (a single recursive transform)" and states "Multiple distinct recursive te… |
-| `compile-scalar-subquery-not-decorrelated` | missing | s3-perf | M | 25 | 0 | Turso's subquery.rs distinguishes correlated from uncorrelated subqueries and hoists uncorrelated ones to evaluate once instead of once per outer row. Ahtola recomputes s… |
+| `compile-scalar-subquery-not-decorrelated` | parity | s3-perf | M | 25 | 0 | Uncorrelated subqueries memoize once per statement (SubqueryMemoizationReproTests). Correlated EXISTS/NOT EXISTS/IN now unnest into semi/anti joins — see `compile-correlated-exists-in-semi-anti-join`. Correlated *aggregate* subqueries stay per-row: `compile-no-aggregate-subquery-decorrelation`. |
+| `compile-correlated-exists-in-semi-anti-join` | parity | s3-perf | M | 0 | 0 | Closed 2026-08-23: a top-level conjunctive correlated `EXISTS` / `NOT EXISTS` / direct positive `IN` over a single base table unnests into the internal `JoinKind.Semi` / `JoinKind.Anti` join, scanning the inner table once per statement. Declines when a multi-conjunct WHERE holds any term that can raise (AND short-circuits, so a join would hide or invent an error) and when an `IN`'s operands or inner WHERE can raise. Ports `try_rewrite_exists` / `try_rewrite_in` / `rewrite_as_semi_or_anti_join` from turso-src v0.8.0-pre.7 `core/translate/optimizer/unnest.rs`. See section 4.1 for the exact accepted and excluded shapes. |
+| `compile-no-aggregate-subquery-decorrelation` | missing | s3-perf | L | 0 | 0 | Not ported: Turso's `try_rewrite_single_value_aggregate` turns `o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)` into a grouped LEFT JOIN (group-first) or a join-then-`GROUP BY o.rowid` (join-first). Both need a synthesized derived table with `GROUP BY`, empty-input value analysis (`count`→0, `total`→0.0, else NULL), overflow/failure analysis for unused keys, and a rowid-based grouping key. Ahtola evaluates such subqueries once per outer row. |
 | `compile-cte-dml-and-materialization-restrictions` | partial | s2-capability | M | 22 | 5 | CTE use inside DML is artificially restricted ("every CTE must contribute"); expression-CTE materialization semantics diverge. |
 | `compile-select-compiler-single-table-fast-paths-only` | divergent | s4-intentional | S | 20 | 0 | SelectStatementCompiler is architected as a set of narrow, provably-correct single-table fast paths (plain scan, backward/descending scan, indexed seek with bounds) with… |
 | `compile-collation-propagation-through-subquery` | divergent | s1-correctness | M | 19 | 5 | Column collation is lost across subquery boundaries and compound arms, flipping NOCASE comparisons and window peer groups. |
@@ -546,6 +553,235 @@ Highest-impact entries:
 | `compile-recursive-cte-fifo-only-no-cost-model` | divergent | s4-intentional | S | 0 | 0 | RecursiveCteProgramBuilder documents a fixed breadth-first (FIFO) generation order for the recursive worktable, always surfacing the anchor generation first then children… |
 | `compile-select-compiler-no-multi-table-covering-index` | missing | s3-perf | M | 0 | 0 | Every indexed-seek fast path in SelectStatementCompiler still opens the base table cursor and reads projected columns from it after seeking by rowid (`ColumnInstruction(s… |
 | `compile-trigger-new-not-visible-in-upsert-clause` | missing | s2-capability | M | 0 | 3 | When a trigger body contains an INSERT ... ON CONFLICT DO UPDATE SET x = NEW.col statement, Ahtola fails with "no such table: NEW" -- the trigger's NEW/OLD pseudo-table b… |
+
+### 4.1 Subquery rewrite stage (`EmbeddedDatabase.SubqueryRewrites.cs`)
+
+A pure AST rewrite stage runs inside `ExecuteSelectStatement`, **after** every
+prepare-time validation (`ValidateQuerySchema`, `ValidateJoinStructure`, …) and
+before planning. Running after validation is what makes it safe: a rewrite can
+never suppress a `no such column` diagnostic or invent scope, because the
+diagnostic is always produced from the original statement. For the same reason
+the stage is disabled inside trigger bodies, where that validation is skipped.
+`EXPLAIN` and `EXPLAIN QUERY PLAN` use their own routes and therefore describe
+the **un-rewritten** statement; `EmbeddedDatabase.RewriteDiagnostics` (internal)
+is the execution-side evidence used by `SubqueryRewriteTests`.
+
+**Rewrite 1 — FROM-derived-table flattening.** `SELECT … FROM (SELECT p FROM s
+WHERE a) [AS d] WHERE b` becomes `SELECT … FROM s WHERE a' AND b'`, substituting
+each reference to a `d` column with the inner projection that produced it. It is
+applied repeatedly until it reaches a fixed point, so nested derived tables
+collapse in one statement.
+
+The hoisted inner WHERE (`a'`) is **re-bound before it moves**. SQLite resolves a
+bare WHERE name canonical-first — source column, then enclosing correlated row,
+then a projection alias of the *same* SELECT — and only the third of those
+changes under the hoist, because the enclosing SELECT has a different alias list.
+So `SELECT a AS x FROM t WHERE x > 0` has its `x` replaced by `a` at rewrite
+time; copying the clause verbatim would instead read the enclosing SELECT's `x`
+(`SELECT -x AS x FROM (…)` would filter on `-a > 0`) or fail to resolve at all.
+The substitution spends the same non-deterministic-duplication budget as a
+reference from the enclosing clauses. The same fallback is applied when a nested
+SELECT is schema-validated, so `(SELECT a AS x FROM t WHERE x > 0)` is accepted
+as a derived table, a view body or a scalar subquery exactly as it is at the top
+level.
+
+*Accepted only when all of these hold.* The derived table is the entire FROM
+clause (not an arm of a join). The inner SELECT has no `DISTINCT`, `GROUP BY`,
+`HAVING`, named window, `ORDER BY`, `LIMIT` or `OFFSET`; no aggregate, window
+function or subquery in its projections; **no subtype-sensitive expression** in
+its projections — a function call or a `->` / `->>` JSON operator, the only
+things that can produce or carry a JSON subtype, which SQLite strips at the
+FROM-clause co-routine boundary (see
+`conformance/sqlite-sqltests/json/json_subtype_strip.sqltest`); and no aggregate
+or window function in its WHERE. Its visible column names must be unique. The
+enclosing SELECT must have no window function or named window, and no nested
+subquery that could bind a reference to the derived table. **No reference
+anywhere in the enclosing SELECT — clauses or nested subqueries — may be
+qualified by a name the inner FROM clause would bring into scope**: hoisting
+`(SELECT v AS w FROM u AS x) AS d` out of a subquery that correlates to an
+enclosing `t AS x` would silently re-point `x.v` at the hoisted table. A bare
+inner-WHERE name that resolves to none of the three scopes above (a `rowid`
+alias, or a reference the derived table itself rejects) declines the rewrite when
+the enclosing projection list aliases that same name, since the enclosing alias
+would capture it. **A star projection over a `USING`/`NATURAL` join whose left
+side can be `NULL`-extended declines**: such a join publishes
+`COALESCE(left, right)` for each joined name, both `*` and `t.*` report that
+coalesced value, and the star expansion can only re-express it as the raw left
+column — exact under `INNER`/`LEFT`, where an unmatched left value is `NULL` on
+both sides anyway, but wrong under `RIGHT`/`FULL`, where the left slot is
+`NULL`-padded precisely where the coalesced column must report the surviving
+right value. A projection that names the joined column directly (`SELECT k, …`)
+keeps flattening, because it stays an unqualified reference that still resolves
+through the coalesced column, and so does a hand-written `a.k`, which means the
+raw slot in SQLite too. A non-deterministic inner projection (including
+`CURRENT_TIMESTAMP` and any application-registered function) may be substituted
+at most once in total. A `WITH` body is never flattened, so a `MATERIALIZED` or
+multi-use CTE is never duplicated.
+
+**Rewrite 2 — correlated `EXISTS` / `NOT EXISTS` / `IN` → semi/anti join.** Each
+eligible top-level conjunct of the WHERE clause becomes a
+`JoinKind.Semi` (positive `EXISTS`, positive `IN`) or `JoinKind.Anti`
+(`NOT EXISTS`) join whose right side is the subquery's table and whose condition
+is the subquery's WHERE (plus, for `IN`, one synthesized `left = projection`
+equality). These joins project **only the left row shape** and emit each left row
+at most once — an inner join would multiply an outer row by its number of inner
+matches. The condition is evaluated against the inner row re-parented onto the
+current outer row under the inner side's collation scope, which is exactly the
+environment the original subquery's WHERE ran in, so inner-name shadowing,
+correlated resolution, affinity and collation are unchanged.
+
+*Accepted only when all of these hold.* The conjunct is at the top level of the
+WHERE clause (never under `OR`) and is not `NOT IN`. **When the WHERE clause has
+more than one top-level conjunct, no conjunct may be able to raise on its
+input.** `AND` stops at the first false, so a WHERE clause is also an error
+guard: a join runs before every remaining WHERE term and for every outer row, so
+moving a subquery out of `WHERE json_extract(o.j,'$.a') = 1 AND EXISTS (…)`
+would hide the malformed-JSON error, and moving it out of
+`WHERE o.k = 1 AND EXISTS (… json_extract(o.j,'$.a') …)` would invent one. A
+single conjunct has nothing to short-circuit against and is always safe. The
+enclosing FROM clause contains no outer join. The subquery reads exactly one
+ordinary base table (no join, derived table, CTE, view, virtual table,
+table-valued function, compound or `VALUES` body); has no `DISTINCT`,
+`GROUP BY`, `HAVING`, `ORDER BY`, named window, `LIMIT` or `OFFSET`; has no
+aggregate or window function; and its WHERE is non-null, subquery-free and free
+of non-deterministic calls. Every WHERE conjunct that reaches out of the
+subquery must be a plain `=` with all inner references on one side and all outer
+references on the other, and at least one must do so (an uncorrelated subquery
+already evaluates once per statement through the subquery memo, so a join would
+be a regression). For an anti-join, every conjunct must also read the inner
+table. For `IN`, the subquery must have exactly one non-star projection and
+neither operand of the synthesized equality **nor the subquery's own WHERE** may
+be able to raise — `IN` scans its subquery to completion, so
+`1 IN (SELECT v FROM t WHERE json_extract(t.j,'$.a') IS NOT NULL)` must still
+fail on a malformed row *after* the matching one, which a first-match loop would
+never reach (`unnest.rs:291-314`). An `EXISTS` whose select list binds a
+parameter declines.
+
+*Probe parity.* The semi/anti loop reuses the same statement-cached transient
+hash probe the un-rewritten correlated subquery used, so the rewrite never
+trades a probe for a nested scan. The probe canonicalizes each side of the
+equality under exactly the comparison affinity and collating sequence SQLite
+would apply — a numeric operand pulls a non-numeric one to numeric, a `TEXT`
+operand pulls an affinity-less one to text, and the collating sequence follows
+operand order (explicit `COLLATE` first, then the *left* operand's declared
+collation). When either side's affinity or collation cannot be proven — an
+unresolvable column, a `CAST`, a custom collation — that conjunct is skipped and
+the scan simply runs unpruned.
+
+**Deliberately not ported.** `unnest.rs`'s aggregate decorrelation
+(`try_rewrite_single_value_aggregate`, group-first and join-first) is tracked as
+`compile-no-aggregate-subquery-decorrelation`.
+
+**Stage interaction.** The two rewrites run in sequence (flattening first, to a
+fixed point, then unnesting) but rarely both fire on one statement: a correlated
+`EXISTS`/`IN` that references the derived table is exactly the nested-subquery
+case flattening declines. Unnesting then uses the un-flattened derived table as
+the semi-join's outer side, so one stage declining never blocks the other.
+
+### 4.2 Cost-based N-way join ordering (`EmbeddedDatabase.JoinOrderRewrites.cs`)
+
+A second pure AST rewrite runs immediately before `TryBuildCompiledJoinSource`
+in the general N-way select and aggregate routes. It flattens each **maximal
+plain-INNER run** of the FROM tree into a segment of freely permutable members
+plus a pool of ON conjuncts, chooses an order and a physical shape per step with
+a ported subset of Turso's cost model, and re-synthesizes a left-deep
+`JoinTableSource` tree with each conjunct attached at the first step where it
+becomes evaluable. Everything downstream — `TryBuildCompiledJoinSource`,
+`VdbeJoinOperatorPlan`, `VdbeJoinScanPlan`, `VdbeJoinEquiProbe` — is unchanged;
+the optimizer is a plan rewrite, not an engine rewrite.
+
+**Barriers are partition walls, not ordering hints.** A join node freezes its
+whole subtree into one opaque member when it is `LEFT`/`RIGHT`/`FULL`,
+`NATURAL`, or carries `USING`; a `Semi`/`Anti` node anywhere declines the whole
+rewrite. Barrier members never interleave with their siblings and never donate
+predicates to the surrounding segment, while a reorderable region *inside* a
+barrier is still optimized independently. This is deliberately stricter than
+Turso's `required_lhs_by_table` / `left_join_illegal_map` legality bitmask
+(`join.rs:1258-1324`), which allows partial interleaving around an outer join:
+that scheme only pays for itself together with per-table access-method search,
+which needs index-seek join leaves this engine does not have. Every other
+decline — an unresolvable or ambiguous column reference, a correlated predicate,
+a member with no `sqlite_stat1` row, a source the compiled join builder cannot
+lower, or a synthesized tree the compiled-join validator later rejects — falls
+back to the untouched FROM tree.
+
+**Enumeration.** Segments of at most `JoinOrderEnumerator.DynamicProgrammingMemberCap`
+(8) members use a System-R subset dynamic program over `(subsetMask, lastMember)`
+states, ported from `join.rs:1090-1566`; wider segments (up to 32) use the
+linear greedy build-up of `compute_greedy_join_order` (`join.rs:1579`). The DP
+seeds its pruning bound from the FROM-order plan (`join.rs:1138-1155`) and
+tightens it whenever a complete plan improves on it. Each state keeps a Pareto
+frontier over `(cost, cardinality)` rather than a single plan, mirroring
+`join.rs:1210-1216`; because a completion's cost is monotone in both dimensions,
+discarding only dominated partial plans cannot discard the optimum, and
+`JoinOrderOptimizerTests.DynamicProgrammingFindsTheBruteForceOptimum`
+cross-checks that against every permutation for 2–7 members.
+
+*Determinism.* The memo is a flat array and every loop walks masks and members
+in increasing numeric order, so no hash-table enumeration order can reach the
+result. Exact cost ties are broken by the lexicographically smallest member
+order, which makes the unmodified FROM order the winner of any tie.
+
+**Cost model** (`Compilation/JoinOrdering/JoinCostModel.cs`). `estimate_scan_cost`
+(`cost.rs:120-135`) and `estimate_hash_join_cost` (`access_method.rs:1200-1235`)
+are ported with the `CostModelParams` constants of `cost_params.rs:103-141`.
+Two deliberate deviations, both documented in code:
+- `estimate_index_cost` (`cost.rs:171`) is **not** ported. Every join input is a
+  full scan of a materialized cursor source, so awarding a per-seek discount
+  would model an access path the executor cannot produce.
+- The grace-hash spill term is replaced by an explicit buffering charge on
+  whichever side is materialized into the operator's list. The managed operator
+  has no memory budget to spill against, and without that charge the ported
+  constants would rank a large build side as cheap, because `hash_lookup_cost`
+  exceeds `hash_insert_cost`.
+
+Index statistics still participate where they describe the *data* rather than the
+access path: the expected rows matching one key value come from a rowid-alias or
+unique-index guarantee, else from `sqlite_stat1`'s per-index leading average,
+else from `sel_eq_unindexed`. That figure is equally valid for a hash probe.
+
+**Shape selection.** Each step is scored against the three shapes the executor
+can run — nested-loop cross scan, hash-build-right, hash-build-left — and the
+winner is threaded back into `TryBuildCompiledJoinSource` as a per-node override
+of the existing `hashBuildRight` flag. Steps with no usable equality key have
+only one executable shape and are costed as the full comparison product.
+
+**WHERE accounting.** Comparison conjuncts of the statement's WHERE clause that
+reference exactly one member and compare it against a literal or parameter are
+also attached as ON conditions, but **only for a segment that is the entire FROM
+clause**. ON and WHERE are interchangeable for an INNER join, and at the root no
+enclosing outer join can null-extend the filtered columns. Restricting the shape
+to function-free comparisons keeps the duplicate evaluation the surviving WHERE
+performs unobservable. Nothing else about the WHERE clause is modelled, so a
+selective filter on a nested segment biases no decision.
+
+**Projection order is preserved.** Reordering permutes the physical value slots
+of a joined row, so the rewrite also returns a slot map and the caller re-points
+the statement's output columns through it. The output-column *list order* always
+stays in FROM order, which is what keeps `SELECT *`, `t.*` and unqualified column
+references identical to the un-reordered plan even when execution order changes.
+The remapped metadata travels together with the **reordered** FROM tree
+(`CompiledJoinSource.PhysicalSource`), because every lookup that navigates a join
+tree *by index* has to follow the same layout the indexes address. `SELECT
+DISTINCT` is the case that makes this observable: its per-column equality
+collations are read off the star-expanded output columns, so resolving a remapped
+index against the original FROM tree lands on a different table's column and
+reports its collation instead — silently downgrading a `NOCASE`/`RTRIM` column to
+`BINARY` and emitting rows that are duplicates under the declared collation.
+Name-based resolution (an explicit `COLLATE`, a bare column reference) still uses
+the statement's own source, so a name always means what the SQL text says.
+
+**Evidence.** The join cursor's `EXPLAIN` p4 text now carries the chosen leaf
+order (`… [scan order: seed, big, small]`) alongside the existing hash-build
+side, and `EmbeddedDatabase.JoinOrderDiagnostics` (internal) counts segments
+considered/reordered, DP vs greedy plans, declines and pushed WHERE terms.
+
+**Residual gaps.** Index-seek join leaves, STAT4 histograms, bloom filters and
+auto-indexes for joins are still open; see `compile-nway-join-not-index-driven`,
+`compile-no-access-method-selection`, `vdbe-bloom-filter-opcodes` and
+`vdbe-autoindex-for-joins`. The two-table unadorned INNER route
+(`TryCompileJoinSelect`) keeps its own binary stat1 swap and is not routed
+through the enumerator.
 
 ## 5. Parser / dialect layer
 22 entries — the smallest gap *per failure-line* ratio in the inventory, which
@@ -620,7 +856,7 @@ than absent subsystems.
 | `func-array-postgres-family` | missing | s3-perf | L | 0 | 0 | Postgres-style ARRAY(...)/array_element/array_append/etc. scalar family, always compiled (not behind a cargo feature flag) but not part of stock SQLite semantics and not… |
 | `func-extension-format-btrim` | extension | s4-intentional | S | 0 | 0 | FORMAT (an alias for PRINTF, matching real SQLite's built-in but not present as a distinct entry in Turso's from_str dispatch table) and BTRIM (Postgres-style alias for T… |
 | `func-extension-uuid-family` | extension | s4-intentional | S | 0 | 0 | Ahtola registers a full UUID v4/v7 generation family (text and blob forms, plus gen_random_uuid() for Postgres compatibility) that has no counterpart anywhere in turso-sr… |
-| `func-fts-scalar-family` | missing | s3-perf | L | 0 | 0 | A managed `fts5` virtual-table subset now exists, but Turso/SQLite FTS scalar helpers, ranking, snippets, and auxiliary-function surfaces remain unimplemented. |
+| `func-fts-scalar-family` | partial | s3-perf | L | 0 | 0 | Closed 2026-08-24: `fts_match` (row-local, deterministic), `fts_score` (corpus- and configuration-dependent BM25 with per-column weights and rowid tie-break — registered **non-deterministic**, so it is rejected in index expressions, partial index WHERE clauses, generated columns and CHECK constraints), `fts_highlight`, and `fts_snippet` ship as builtin scalars over a pure-managed inverted index (no Tantivy). All four bind by resolved source identity and are suppressed by a shadowing connection callback. FTS5-specific auxiliary functions and command syntax remain out of scope. |
 | `func-gcd-lcm-missing` | missing | s3-perf | S | 0 | 0 | gcd()/lcm() (Turso/SQLite-3.41+-style math helpers) have no hits anywhere in src/Ahtola.Core or Ahtola.Core/EmbeddedDatabase.MathFunctions.cs. Not covered by the vendored… |
 | `func-numeric-boolean-ip-helpers-missing` | missing | s4-intentional | M | 0 | 0 | Internal-flavored helper functions supporting Turso's typed BOOLEAN/NUMERIC column extensions and validated IP address type; no SQLite equivalent and no corpus coverage.… |
 | `func-octet-length-missing` | missing | s1-correctness | S | 0 | 0 | octet_length is absent from SqliteBuiltinFunctions.Names and from EmbeddedDatabase.StringFunctions.cs / EmbeddedDatabase.cs (no case-insensitive hit for 'octet' anywhere… |
@@ -630,7 +866,7 @@ than absent subsystems.
 | `func-struct-union-experimental` | missing | s4-intentional | L | 0 | 0 | Experimental typed STRUCT/UNION column support in Turso (struct_pack/struct_extract/union_value/union_tag/union_extract), unrelated to SQLite's dynamic typing model. No c… |
 | `func-test-nondet-counter-missing` | missing | s3-perf | S | 0 | 2 | test_nondet_counter() is a Turso test-only helper (feature-gated) used by the vendored sqltest corpus to probe nondeterministic-function dedup/caching behavior in window… |
 | `func-unistr-family-missing` | missing | s2-capability | M | 0 | 0 | unistr()/unistr_quote() (Postgres-style Unicode escape decoding/encoding) are absent from SqliteBuiltinFunctions.Names and EmbeddedDatabase.StringFunctions.cs; the only '… |
-| `func-vector-family` | parity | s2-capability | L | 0 | 0 | Pure-managed scalar parity now covers Turso's dense float32/float64, sparse float32, 1-bit, and 8-bit encodings plus vector construction/extraction, concat/slice, and cosine/L2/Jaccard/dot distance. Vector indexes and custom index methods remain intentionally out of scope. |
+| `func-vector-family` | parity | s2-capability | L | 0 | 0 | Pure-managed scalar parity now covers Turso's dense float32/float64, sparse float32, 1-bit, and 8-bit encodings plus vector construction/extraction, concat/slice, and cosine/L2/Jaccard/dot distance. A dense vector index method (`USING vector`) now serves exact KNN over float32/float64/float8/float1bit under l2/cosine/dot; sparse vectors and jaccard indexing remain out of scope and are rejected at CREATE INDEX. |
 
 ## 7. Storage / pager / WAL / b-tree layer
 20 entries, 32 mapped lines, and the **only layer with closed parity entries**
@@ -649,7 +885,10 @@ checksums all match. The open gaps are **behavioral, not format**:
   is intentionally out of scope (s4).
 - **Freelist / incremental vacuum**: freelist management is partial;
   incremental vacuum not implemented.
-- One `extension` entry: page/WAL **encryption** is Ahtola-only.
+- One `extension` entry: page/WAL **encryption** is Ahtola-only in its framing
+  entry point, though the cipher set and page layout are full Turso format
+  version 0 parity (all eight cipher ids). See
+  [`page-encryption-contract.md`](page-encryption-contract.md).
 
 | ID | Kind | Severity | Effort | Mapped fails | Cited | Summary |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -662,7 +901,8 @@ checksums all match. The open gaps are **behavioral, not format**:
 | `storage-byte-range-shm-locks-partial-scope` | partial | s2-capability | M | 0 | 1 | SqliteWalByteRangeLock/SqliteWalSharedMemoryLocks implement the -shm byte-range lock offsets for the primary main-database WAL (read marks, write lock, checkpoint lock),… |
 | `storage-checkpoint-modes-implemented` | parity | s4-intentional | S | 0 | 0 | Not a gap -- included for completeness of the checkpoint-mode audit. Ahtola's SqliteWalCheckpointMode enum (Passive/Full/Restart/Truncate) mirrors Turso's CheckpointMode… |
 | `storage-database-rs-no-direct-analog` | divergent | s4-intentional | S | 0 | 0 | Turso's database.rs centralizes database-open orchestration (header validation, encoding checks, initial page-1 bootstrap for new files) as its own module; Ahtola spreads… |
-| `storage-encryption-extension` | extension | s4-intentional | S | 0 | 0 | Intentional Ahtola extension per task context (kind=extension, s4-intentional). Turso's encryption.rs supports the same class of AEAD ciphers (AES-GCM, AEGIS-*) with a 'T… |
+| `storage-encryption-extension` | extension | s4-intentional | S | 0 | 0 | Full cipher parity with Turso format version 0. Ahtola implements all eight on-disk cipher ids: 1-2 AES-128/256-GCM via the BCL, and 3-8 AEGIS-256/256X2/256X4/128L/128X2/128X4 via a pure-managed AEGIS core validated against the CFRG `draft-irtf-cfrg-aegis-aead` specification vectors. Key/nonce/tag sizes, the `ciphertext‖tag‖nonce` frame, the page-1 associated data and the 28/32/48 reserved-byte counts match `encryption.rs`; only the 5-byte magic (`AHTLA` vs `Turso`) remains an intentional divergence. See [`page-encryption-contract.md`](page-encryption-contract.md). |
+| `storage-encryption-chacha-remote-only` | intentional-divergence | s4-intentional | S | 0 | 0 | ChaCha20-Poly1305 has no `CipherMode` member, no cipher id and no page framing in Turso; it is a Turso Cloud server-side cipher whose key travels in the `x-turso-encryption-key` header. Ahtola keeps it as an accepted remote descriptor (28 reserved bytes) but fails closed for managed embedded replicas, which must decode pages locally. Assigning it a local cipher id would collide with a future upstream assignment. |
 | `storage-freelist-write-path-vacuum-only` | partial | s2-capability | M | 0 | 0 | SqliteFreelist.cs correctly parses and can construct trunk/leaf freelist pages, but per its own doc comment it is used only by 'managed file rewrites' (i.e. VACUUM-style… |
 | `storage-no-btree-balancing` | missing | s1-correctness | L | 0 | 0 | SqliteBtreeSplitMutation's own doc comment states it 'can replace existing pages or append new pages, but never shrinks, rebalances, or reclaims pages.' Turso implements… |
 | `storage-no-buffer-pool-arena` | missing | s3-perf | M | 0 | 0 | Turso maintains a dedicated arena-based BufferPool that recycles fixed-size page/WAL-frame buffers to avoid per-page heap allocation churn under concurrent I/O. Ahtola ha… |
@@ -729,11 +969,11 @@ while staged, before either the database or its replica metadata is published.
 | Capability / option | Status | Managed behavior |
 | --- | --- | --- |
 | Complete raw 4 KiB page stream, legacy/unspecified or v1 `Pages` protocol | **Qualified** | The bootstrapper requests raw pages, requires every selected 4 KiB `PageData` chunk exactly once, stages and validates the SQLite header, then atomically publishes it. Incremental raw page sets follow the existing staged path after a partial image is completed. |
-| Remote encryption (`RemoteEncryption`) | **Explicitly rejected** | No encrypted page decoder or encrypted local image support is present in the managed replica. This is distinct from encrypted **remote SQL** connections. |
+| Remote encryption (`RemoteEncryption`) | **Supported for every on-disk cipher id** | Bootstrap, pull and reopen decode encrypted page streams locally for all eight Turso format version 0 ciphers (AES-128/256-GCM and the six AEGIS variants), reusing the storage layer's encrypted-header and reserved-byte validation. The base64 key is forwarded as `x-turso-encryption-key`. `ChaCha20Poly1305` fails closed: Turso assigns it no on-disk cipher id, so there is nothing to decode locally. This is distinct from encrypted **remote SQL** connections. |
 | Partial prefix bootstrap (`PartialBootstrap.Prefix`) | **Supported** | The initial request carries Turso's tag-5 portable RoaringBitmap selector for complete 4 KiB pages in the requested prefix. Missing pages are tracked durably and fetched from the pinned revision before pager reads can observe them. |
-| Query bootstrap (`QueryPages`) | **Explicitly rejected** | Server-side query-selected page sets are not implemented; validation rejects this mode before network or local-state mutation. |
+| Query bootstrap (`QueryPages`) | **Supported** | The single bootstrap request carries Turso's tag-7 `server_query_selector` string alone (never with the tag-5 page selector, never chunked). The server-selected page set may be unordered and non-contiguous; the client validates bounds, exact page size, duplicates, and the mandatory SQLite header page, computes partial/full status from distinct page coverage, and then reuses the same durable sidecar and lazy page faults as prefix bootstrap. Requires a remote that implements query selection: Turso's vendored dev server ignores tag 7 by design. |
 | Lazy segments (`SegmentSize`, `Prefetch`) | **Supported** | Missing-page faults coalesce across connections. The segment size is persisted with the page state, and optional segment prefetch remains an optimization that cannot turn a failed fetch into zero-filled data. |
-| Chunked bootstrap (`PullBytesThreshold`) | **Explicitly rejected** | Client-controlled chunking of the initial pull is not implemented; prefix bootstrap and later targeted page faults use their own selectors. |
+| Chunked bootstrap (`PullBytesThreshold`) | **Supported for client-selected page sets** | A byte threshold is converted into bounded page-range requests, each pinned to the first response's revision and shape. It is rejected outright with query bootstrap: the server, not the client, chooses the query page set, so there is nothing to split across round trips (Turso forces `chunk_pages = None` for the same reason). |
 | zstd/compressed page sets | **Explicitly rejected** | The response must declare raw encoding and each page payload must be exactly 4 KiB. |
 | MVCC logical streams / `MvccLogical` protocol | **Qualified (pull-only)** | After raw bootstrap, the client requests `mvcc_logical_log`, validates the complete `lml3` body and CRC chain, replays header/schema/row operations in one transaction, filters this client's transactions, and advances metadata only after durable publication. Pending deletes use v4 journal before-images to rebase by declared primary key. Pending additive `ALTER TABLE ... ADD COLUMN` is rebased across remote refresh/row ops; legacy journals without a before-image and destructive schema changes fail closed until pushed. |
 | Protocol-2 page fallback | **Qualified for validated full replacement** | `Pages + ReplaceBase` checkpoints/removes safe sidecars and atomically installs every page, then replays still-unpushed journal SQL onto the snapshot before metadata publication. Incremental page fallback still requires a provably unchanged page base and rejects pending local changes or WAL divergence. |
@@ -752,15 +992,15 @@ qualified subset in the matrix above.
 | --- | --- | --- | --- | ---: | ---: | --- |
 | `sync-no-cdc-capture-pragma` | divergent | s2-capability | L | 0 | 0 | Ahtola implements the public pinned-Turso `capture_data_changes_conn` V1/V2 table surface, but its managed replica intentionally continues to capture committed local changes in the private `<db>.ahtola-replica-journal`. Public CDC is not yet consumed by replica push/pull or logical replay. |
 | `sync-checkpoint-mode-mismatch-vs-managed-storage` | divergent | s2-capability | M | 0 | 0 | Turso's sync checkpoint explicitly composes Passive (checkpoint only the already-synced WAL prefix, tracked by a watermark) followed by Truncate (once fully synced) to ke… |
-| `sync-conflict-error-surfaced-not-handled` | partial | s2-capability | M | 0 | 0 | `AhtolaReplicaPushFailure.Classify` now maps every push failure to a stable `AhtolaReplicaPushFailureKind` (Conflict/TransientTransport/InvalidLocalState) at the push response boundary, mirroring Turso's conflict-vs-transient split; automatic rebase-before-retry and revert-WAL rollback remain unported. |
+| `sync-conflict-error-surfaced-not-handled` | extension | s2-capability | M | 0 | 0 | **Closed as an Ahtola managed extension, not a port.** `AhtolaReplicaPushFailure.Classify` maps every push failure to a stable `AhtolaReplicaPushFailureKind` (Conflict/TransientTransport/InvalidLocalState) at the push response boundary, mirroring Turso's conflict-vs-transient split. A typed conflict now also durably records a `<db>.ahtola-replica-conflict` marker naming the exact rejected batch (first sequence, watermark, reported sequence) and the conservatively classified unresolved subset; explicit, manual, and automatic sync then fail closed with `AhtolaReplicaConflictPendingException` rather than re-pushing a rejected batch. `AhtolaConnection.InspectReplicaConflictAsync`/`ResolveReplicaConflictAsync` expose the two explicit resolutions — `PullAndRebaseEligible` (pull a fresh logical base and replay only provably eligible journaled changes through the existing transactional logical replay and compensation, keeping the marker while anything stays quarantined) and `DiscardUnresolvedChanges` (data-loss-acknowledged journal removal that never advances the remote-ack watermark). Turso upstream (`turso-src/sync/engine/src/database_sync_operations.rs`, `wal_push`) still surfaces a push conflict terminally as `Error::DatabaseSyncEngineConflict` and never rebases, so there is no upstream classification or resolution policy to mirror. Schema conflicts, `Unknown` conflicts, stale sequence references, same-row chains, and page-protocol replicas remain manual by design. Contract: `docs/replica-conflict-resolution.md`. |
 | `sync-connection-pooling-no-replica-awareness` | partial | s3-perf | M | 0 | 0 | Turso's engine has a wait_changes_from_remote long-poll loop that lets a replica connection block until the server reports new changes, enabling push-driven refresh inste… |
 | `sync-ef-core-provider-no-sync-surface` | closed | s3-perf | M | 0 | 0 | `UseAhtola` accepts direct Turso/Hrana and `Replica Path` connection strings. EF queries, CRUD, migrations, creator operations, and transactions route through the remote/replica-capable SQLite facade; explicit sync remains on the underlying `SqliteConnection`. |
-| `sync-http-pipeline-v2-only-no-v3-websocket` | partial | s2-capability | M | 0 | 0 | Ahtola's remote client is hard-coded to the '/v2/pipeline' HTTP endpoint with a JSON baton-session pipeline; there is no WebSocket transport and no wal_push/pull_updates… |
-| `sync-native-provider-companion-intentional` | extension | s4-intentional | S | 0 | 0 | AhtolaNativeProvider's dynamic-load-by-name pattern for an optional 'Turso.Data.Native' companion (used for Local Provider=Native) exists purely as an extension point for… |
-| `sync-no-embedded-sync-engine-port` | partial | s2-capability | L | 0 | 0 | The managed provider now implements raw bootstrap/page pulls, partial prefix selection with durable lazy page faults, pull-only MVCC logical replay, durable local push journaling, protocol metadata, and atomic publication. Query-selected bootstrap, zstd, remote encryption, and Turso's complete conflict/checkpoint policy remain outside the managed subset. |
+| `sync-http-pipeline-v2-only-no-v3-websocket` | closed | s4-intentional | M | 0 | 0 | `http`/`https`/`libsql`/`turso` use the Hrana HTTP pipeline (v3 with v2 fallback); `ws`/`wss` open a persistent Hrana WebSocket connection with hrana3/hrana2/hrana1 subprotocol negotiation, request-id multiplexing, v3 cursor paging and bounded reconnect. Targets the legacy libSQL/sqld Hrana WS server — the pinned Turso engine has no native Hrana WS server and maps ws/wss to its HTTP endpoint. wal_push/pull_updates stay with the unported sync engine entries. |
+| `sync-native-provider-companion-intentional` | extension | s4-intentional | S | 0 | 0 | AhtolaNativeProvider's explicit `Register(factory)` hook for an optional 'Turso.Data.Native' companion (used for Local Provider=Native) exists purely as an extension point for… |
+| `sync-no-embedded-sync-engine-port` | partial | s2-capability | L | 0 | 0 | The managed provider now implements raw bootstrap/page pulls, partial prefix and server-side query selection with durable lazy page faults, pull-only MVCC logical replay, durable local push journaling, protocol metadata, and atomic publication. zstd, remote encryption, and Turso's complete conflict/checkpoint policy remain outside the managed subset. |
 | `sync-no-mvcc-logical-log-replay` | closed | s2-capability | L | 0 | 0 | The managed pull path decodes Turso v0.7.2 portable `lml3` transactions, validates range/frame CRCs and bounds, replays header/schema/row changes atomically, persists protocol/table maps, filters client echoes, and compensates post-commit metadata failures. |
-| `sync-no-page-protocol-pull-decode` | partial | s2-capability | M | 0 | 0 | Raw 4-KiB page bootstrap/incremental streams and protocol-2 full ReplaceBase fallback are decoded and atomically published. Prefix and targeted missing-page selectors use Turso's portable RoaringBitmap page-selector protocol; zstd remains explicitly rejected. |
-| `sync-no-partial-sync-lazy-page-storage` | closed | s2-capability | L | 0 | 0 | Incomplete prefix images publish only after their bootstrap marker, metadata, and integrity-protected page-state sidecar are durable. Pager reads coalesce targeted pulls pinned to the bootstrap revision, validate page identity and size before durable publication, support optional segment prefetch, persist across reopen, and use write-ahead mutation intents plus process-exclusive physical ownership. Tracked local changes are pushed before the pinned image is completed for ordinary revision-advancing sync. |
+| `sync-no-page-protocol-pull-decode` | partial | s2-capability | M | 0 | 0 | Raw 4-KiB page bootstrap/incremental streams and protocol-2 full ReplaceBase fallback are decoded and atomically published. Prefix and targeted missing-page selectors use Turso's portable RoaringBitmap page-selector protocol (tag 5); query bootstrap emits the tag-7 `server_query_selector` string alone on the one bootstrap request. zstd remains explicitly rejected. |
+| `sync-no-partial-sync-lazy-page-storage` | closed | s2-capability | L | 0 | 0 | Incomplete prefix and query-selected images publish only after their bootstrap marker, metadata, and integrity-protected page-state sidecar are durable. The sidecar stores arbitrary unordered/non-contiguous page sets as a run list, so worst-case scattered query selections cost one run per page. Pager reads coalesce targeted pulls pinned to the bootstrap revision, validate page identity and size before durable publication, support optional segment prefetch, persist across reopen, and use write-ahead mutation intents plus process-exclusive physical ownership. Tracked local changes are pushed before the pinned image is completed for ordinary revision-advancing sync. |
 | `sync-no-revert-db-checkpoint-safety` | partial | s1-correctness | L | 0 | 0 | Managed ReplaceBase checkpointing now durably publishes an integrity-checked `<db>-wal-revert` plus source-WAL watermark metadata before overwriting or truncating rollback-relevant frames. The sidecar contains both the exact pre-checkpoint bytes and the committed checkpoint image: interrupted publication resumes from the committed image, while only a typed push conflict restores the pre-checkpoint bytes. Missing/corrupt recovery state fails closed and pending journal entries remain durable. Turso's reusable passive-prefix/history checkpoint policy remains tracked by `sync-checkpoint-mode-mismatch-vs-managed-storage`. |
 | `sync-partial-encryption-mutual-exclusion-unenforced` | divergent | s1-correctness | S | 0 | 0 | Turso hard-errors when partial-sync + remote-encryption + MVCC-logical-pull are combined incompatibly. Ahtola's AhtolaReplicaOptions.Validate() checks PartialBootstrap/Bo… |
 | `sync-remote-encryption-header-not-wired-for-remote-client` | missing | s2-capability | S | 0 | 0 | AhtolaRemoteEncryptionOptions models the cipher/base64 key surface used to compute reserved-bytes for encrypted Turso Cloud databases (consumed by the not-yet-existing re… |
@@ -782,8 +1022,8 @@ implementation order within those entries.
 | 1 | Request raw page encoding explicitly | `sync-no-page-protocol-pull-decode` | — | Initial and incremental pulls negotiate raw pages; an unexpected zstd response still fails before publication. |
 | 2 | Wire remote-encrypted bootstrap | `sync-remote-encryption-header-not-wired-for-remote-client`, `sync-partial-encryption-mutual-exclusion-unenforced` | — | Reserved-byte/header semantics match the remote cipher and incompatible logical/partial combinations fail before creating replica state. |
 | 3 | Add eager chunked bootstrap | `sync-no-partial-sync-lazy-page-storage` | — | A byte threshold produces bounded page-range requests whose final staged image is byte-identical to one-shot bootstrap. |
-| 4 | Implement eager prefix bootstrap | `sync-no-partial-sync-lazy-page-storage` | — | Prefix selection changes the requested page range; unsupported query selection is rejected rather than silently expanded to a full pull. |
-| 5 | Fault missing pages on demand | `sync-no-partial-sync-lazy-page-storage` | Prefix bootstrap | A materialization map drives one targeted pull per missing page/segment and never exposes an uninitialized page to the pager. |
+| 4 | Implement eager prefix bootstrap | `sync-no-partial-sync-lazy-page-storage` | — | Prefix selection changes the requested page range; query selection sends Turso's tag-7 `server_query_selector` alone on one unchunked round trip and installs whatever unordered/non-contiguous page set the server returns, rather than silently expanding to a full pull. |
+| 5 | Fault missing pages on demand | `sync-no-partial-sync-lazy-page-storage` | Prefix bootstrap | A materialization map drives one targeted pull per missing page/segment and never exposes an uninitialized page to the pager. Faults address page ids against the pinned bootstrap revision, so a query bootstrap's text is never persisted or resent. |
 | 6 | Type push conflicts | `sync-conflict-error-surfaced-not-handled` | — | Remote divergence is distinguishable from retryable transport failure without acknowledging or dropping pending journal entries. |
 | 7 | Capture and restore a revert WAL | `sync-no-revert-db-checkpoint-safety`, `sync-checkpoint-mode-mismatch-vs-managed-storage` | Typed push conflicts | Pre-checkpoint page images and a durable watermark restore exactly after a confirmed conflict; missing or corrupt recovery state fails closed. |
 | 8 | Project the replica journal through CDC | `sync-no-cdc-capture-pragma` | — | Public CDC can read the same ordered pending before/after images used for push without dual-writing or treating external CDC rows as trusted push input. |
@@ -948,9 +1188,100 @@ aggregates because the EF Core provider depends on them).
 | **Ladder P4 — VDBE DML/FK emission** | 2026-03-26 | P4-A/B Seek + OpenEphemeral; P4-C `DmlCompileOptions`/FkCheck epilogue, shared `VdbeTransactionContext`, FK-on INSERT/UPDATE compile routing (DELETE stays evaluator for parent actions). Tests: `VdbeDmlFkEmissionTests`. | 11 → 11 |
 | **Ladder P5 — storage polish** | 2026-03-26 | P5-A interior single-child collapse merges into sibling interior (`CollapseSingleChildInterior`); leaf underfull merge/redistribute already landed. P5-B three-way multi-sibling balance deferred. P5-C dirty spill N/A (clean cache). P5-D auto_vacuum/incremental_vacuum no-op honesty tests. `storage-no-btree-balancing` notes updated. | 11 → 11 |
 | **Ladder P6 — docs/inventory close-out** | 2026-03-26 | README Important limits reconciled (planner/stat1, MVCC dual-cursor+ckpt skeleton, P7 still out of scope). Inventory 211 closed · 0 open; ladder waves P0–P5 recorded. No P7 (vtab/FTS/sync/typed values/sequences) without product decision. | 11 → 11 |
+| **F3 — explicit replica conflict resolution** | 2026-08-23 | `sync-conflict-error-surfaced-not-handled` moves `partial → closed`, but as an **Ahtola managed extension rather than a port**: Turso upstream still ends a push conflict terminally (`turso-src/sync/engine/src/database_sync_operations.rs`, `wal_push` → `Error::DatabaseSyncEngineConflict`) and has no rebase, classification, or resolution policy to mirror. Ahtola adds a durable `<db>.ahtola-replica-conflict` marker (written after the revert-WAL restore, before the typed exception reaches the caller), a pure conservative classifier, a fail-closed guard on explicit/manual/automatic sync (`AhtolaReplicaConflictPendingException`), and two explicit resolutions on `AhtolaConnection`: `PullAndRebaseEligible` and `DiscardUnresolvedChanges`. **Residuals kept manual by design:** `Unknown` conflict kind, any schema conflict, quarantined DDL, same-row chains, stale/foreign sequence references, and page-protocol replicas — none of these are auto-resolved, and the marker is never removed while anything stays quarantined. | 11 → 11 |
 
 Small gaps between wave boundaries (e.g. 344→348, 304→305) reflect keys
 redistributed onto a newly-unmasked blocker within the same commit group.
+
+### F4 — managed index methods and full-text search (2026-08-24)
+
+`managed-index-methods-fts` adds a Turso-shaped, statically registered index-method
+foundation and the first method, `fts`. It closes `vdbe-index-method-opcodes` and
+`func-fts-scalar-family` and records the new
+`index-method-fts-persistence-divergence` entry.
+
+**What landed.** `CREATE INDEX … USING fts (cols) WITH (…)` with the full Turso
+rejection matrix; the `ManagedIndexMethod`/`Attachment`/`Cursor`/`Definition`/
+`CostEstimate` foundation with explicit MVCC capability declaration; VDBE opcodes
+107–115 appended without renumbering; planner pattern matching with cost comparison,
+rowid seek-back, ORDER BY score and LIMIT pushdown, and `EXPLAIN QUERY PLAN`
+evidence; and a pure-managed inverted index with positions, column masks, boolean/
+phrase/prefix/`NEAR`/column-filter/anchor queries, deterministic BM25 with column
+weights, tombstones and compaction, plus `fts_match`, `fts_score`, `fts_highlight`
+and `fts_snippet`.
+
+**Honest residuals.**
+
+- The persistence representation is **not** interoperable and **not** an FTS5
+  shadow-table layout. A method index is a real `sqlite_schema` index row with a
+  real rootpage and an ordinary SQLite index b-tree (no page/cell/WAL format
+  change), plus a versioned state header in a trailing SQL comment; the postings
+  themselves are derived state rebuilt from the base rows. Stock `sqlite3` cannot
+  parse `CREATE INDEX … USING fts` and reports a malformed schema for that row —
+  the same as it would for Turso. See docs/managed-index-methods.md.
+- Under the concurrent MVCC overlay the planner deliberately falls back to an
+  ordinary scan (the overlay row set differs from the base snapshot the derived
+  state is built from); the scalar path still answers correctly.
+- Ranking diverges from Turso's Tantivy scorer by construction; phrase and `NEAR`
+  hits are attributed to the heaviest selected column.
+- `managed-vector-index` is now implemented as `CREATE INDEX … USING vector`. It
+  is **not** a port of Turso's `toy_vector_sparse_ivf`, which is a jaccard-only
+  sparse component inverted index pruned by three unbounded heuristics with no
+  recall bound. Ahtola's method is an IVF-Flat with an exactness certificate:
+  it prunes a list only when a proven inequality (triangle inequality for L2,
+  angular for cosine, Cauchy–Schwarz for dot, exact Hamming for float1bit) says
+  no member of it can enter the top-k, and otherwise reads more, degrading to a
+  full scan rather than to a wrong answer. Honest limits: sparse vectors and
+  `jaccard` are rejected at CREATE INDEX, `exact = 0` is rejected, a single
+  invalid or NULL indexed value disables the plan (because the scalar form of the
+  query raises on that row), and data with no exploitable cluster structure prices
+  the index out instead of silently becoming approximate. See
+  docs/managed-vector-index.md.
+
+**Review follow-up (2026-08-24).** A managed FTS / index-method review found sixteen
+defects, all now closed with regression coverage in
+`ManagedIndexMethodReviewRegressionTests`, `ManagedIndexMethodTransactionTests` and
+`ManagedIndexMethodGenericFoundationTests`. The substantive behavior changes:
+
+- Postings are **generation stamped**, so an upserted or reused rowid retires its
+  previous terms immediately rather than only at compaction. Tokenization is staged
+  before any index state is mutated, so a rejected document leaves the index whole.
+- A ranking-only plan (`ScoreOrdered`, `Knn`) now **retains every base row** it did
+  not rank, and is priced accordingly — so an unlimited `ORDER BY fts_score(…) DESC`
+  correctly loses to the scan instead of silently dropping zero-score rows.
+- Scalar `fts_*` calls bind by **resolved source identity**, never by column-name
+  similarity, so an unrelated table's index cannot change scalar behavior and joined
+  rows score against their own source.
+- A connection scalar callback that shadows `fts_match`/`fts_score`/`fts_highlight`/
+  `fts_snippet` suppresses method planning and index-aware scalar behavior.
+- `fts_score` is registered **non-deterministic** and rejected in index expressions,
+  partial index `WHERE` clauses, generated columns and `CHECK` constraints.
+- Attachments are cached only after publication and dropped on every failure;
+  `REINDEX`/`Optimize` build detached and publish atomically; `DROP INDEX` runs
+  `Destroy`.
+- State envelopes are decoded only after the declaration is proven to be a
+  `USING`-method index, are length-bounded before the base64 decode allocates, and
+  validate every field (version, tokenizer, gram bounds, `detail`, `columnsize`,
+  weights).
+- `detail`/`columnsize` are honored on both the indexed and scalar paths; gram
+  options are accepted only for `ngram`.
+- Folding preserves exact source offsets across combining marks and surrogate pairs,
+  and highlight/snippet spans are merged so overlapping grams reproduce the source.
+- Prefix expansion limits count live terms only.
+- Maintenance is **revision aware**: `RowStore.Revision` plus a per-table mutation
+  journal fed by `ReportRowChange` makes an unchanged table `O(1)` and a small DML
+  `O(changed rows)`; a cold cursor prices the rebuild it will be forced to do.
+- Keyword boundaries agree with the tokenizer (underscores included) and bare terms
+  are normalized through the configured tokenizer.
+- Method cursors participate in the real transaction lifecycle: every DML shape
+  (including trigger bodies and FK cascades) maintains the index, `PreCommit` runs
+  inside the commit, and rollback/savepoint restore leaves no method-visible state.
+- The foundation is now genuinely **method generic**: a generic result-row contract,
+  per-method planner adapters (including KNN hooks), an arbitrary `SqlValue`
+  argument, and no FTS casts outside the FTS implementation. A fake non-FTS KNN
+  method plans and executes end to end as proof.
+- A `SELECT` with a viable method plan is no longer lowered to bytecode, so the plan
+  `EXPLAIN QUERY PLAN` advertises is the plan that executes.
 
 **Current residual (honest, not scoreboard).** Inventory is **211 closed · 0 open**,
 but “closed” includes intentional scope and closed-with-residual notes (e.g.

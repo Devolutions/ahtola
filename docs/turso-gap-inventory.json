@@ -15,39 +15,40 @@
     },
     "conformance_ground_truth": "src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt (606 failure lines at analysis time)",
     "current_conformance_expected_failures": 11,
-    "last_reconciled": "2026-08-20",
-    "entry_count": 211,
+    "last_reconciled": "2026-08-24",
+    "entry_count": 216,
     "counts": {
       "by_layer": {
+        "compilation": 68,
         "functions": 26,
-        "parser": 29,
-        "vdbe": 38,
         "mvcc": 14,
-        "compilation": 66,
+        "parser": 29,
+        "storage": 22,
         "sync": 18,
-        "storage": 20
+        "vdbe": 38
       },
       "by_kind": {
-        "extension": 8,
-        "missing": 76,
-        "partial": 3,
         "divergent": 71,
-        "parity": 53
+        "extension": 9,
+        "intentional-divergence": 1,
+        "missing": 74,
+        "parity": 54,
+        "partial": 6
       },
       "by_severity": {
-        "s2-capability": 89,
-        "s4-intentional": 53,
-        "s1-correctness": 38,
-        "s3-perf": 31
+        "s1-correctness": 39,
+        "s2-capability": 88,
+        "s3-perf": 33,
+        "s4-intentional": 55
       },
       "by_effort": {
-        "S": 99,
-        "M": 75,
-        "L": 37
+        "L": 39,
+        "M": 76,
+        "S": 100
       },
       "by_status": {
-        "closed": 211,
-        "open": 0
+        "closed": 214,
+        "open": 1
       }
     },
     "schema": {
@@ -103,13 +104,13 @@
     {
       "id": "vdbe-index-method-opcodes",
       "layer": "vdbe",
-      "kind": "missing",
+      "kind": "partial",
       "turso_ref": "turso-src/core/vdbe/insn.rs::Insn::IndexMethodCreate, IndexMethodDestroy, IndexMethodOptimize, IndexMethodQuery",
-      "ahtola_ref": "none",
-      "severity": "s2-capability",
+      "ahtola_ref": "src/Ahtola.Core/Indexing/ManagedIndexMethods.cs; src/Ahtola.Core/Execution/VdbeProgram.cs::IndexMethod*Instruction; src/Ahtola.Core/Execution/ResumableStatement.cs; src/Ahtola.Core/Execution/VdbeExplain.cs",
+      "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as an unadopted pluggable-index extension. Ahtola secondary indexes are conventional b-trees by design; no index-method SQL surface is advertised.",
+      "notes": "Reopened and re-closed 2026-08-24 by managed-index-methods-fts. Ahtola now ships a managed index-method foundation (src/Ahtola.Core/Indexing/ManagedIndexMethods.cs) plus appended opcodes IndexMethodCreate=107, IndexMethodDestroy=108, IndexMethodOptimize=109, IndexMethodQuery=110 and the Ahtola-only IndexMethodNext=111, IndexMethodColumn=112, IndexMethodRowId=113, IndexMethodInsert=114, IndexMethodDelete=115. No existing opcode was renumbered (VRollback stays 106). Instructions, program validation, EXPLAIN rendering and resumable dispatch are covered by VdbeIndexMethodOpcodeTests. See docs/managed-index-methods.md. Review follow-up 2026-08-24: postings are generation stamped (an upserted or reused rowid retires its previous terms immediately); ranking-only plans retain every unranked base row and are priced accordingly; attachments are published only on success and dropped on every failure; REINDEX/Optimize build detached and publish atomically; DROP INDEX runs Destroy; state envelopes are decoded only for USING-method declarations, length-bounded before the base64 decode allocates, and fully field-validated; detail/columnsize/gram options are implemented or rejected; folding preserves exact source offsets across combining marks and surrogate pairs; prefix limits count live terms only; maintenance is revision-aware through RowStore.Revision plus a per-table mutation journal fed by ReportRowChange, with PreCommit run inside the commit; and the foundation is method generic (generic result rows, per-method planner adapters with KNN hooks, arbitrary SqlValue arguments, no FTS casts in the core), proven by a non-FTS KNN method that plans and executes end to end.",
       "status": "closed"
     },
     {
@@ -521,12 +522,12 @@
       "id": "compile-no-cost-based-join-ordering",
       "layer": "compilation",
       "kind": "missing",
-      "turso_ref": "turso-src/core/translate/optimizer/join.rs::optimize_join_order (System R style DP), turso-src/core/translate/optimizer/mod.rs::optimize_plan",
-      "ahtola_ref": "src/Ahtola.Core/Execution/VdbeProgram.cs::VdbeJoinPlan/VdbeJoinOperatorPlan (left-deep, literal-order only)",
+      "turso_ref": "turso-src/core/translate/optimizer/join.rs:1090-1566 (compute_best_join_order_with_context), join.rs:1569-1579 (GREEDY_JOIN_THRESHOLD, compute_greedy_join_order), optimizer/cost.rs:120-135, optimizer/cost_params.rs:103-141, optimizer/access_method.rs:1200-1235",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.JoinOrderRewrites.cs; src/Ahtola.Core/Compilation/JoinOrdering/JoinOrderEnumerator.cs; src/Ahtola.Core/Compilation/JoinOrdering/JoinCostModel.cs",
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional FROM-order join planner with equijoin hashing; residual ladder P3 (2026-03) added sqlite_stat1-driven cost gates without full System-R DP. After ANALYZE: (1) two-table INNER nested-loop may place the smaller estimated table as outer (LEFT OUTER keeps SQL left outer); (2) N-way INNER equijoin hash may build the smaller side (hash-build left|right in OpenJoinCursor p4). OUTER joins never hash-build left. Full DP join reordering, AND multi-index intersection, and broader cardinality models remain deferred. Evidence: PlannerStat1JoinCostTests + join routing suites.",
+      "notes": "Closed 2026-08-23 by the cost-based N-way join-order stage (src/Ahtola.Core/EmbeddedDatabase.JoinOrderRewrites.cs + src/Ahtola.Core/Compilation/JoinOrdering/*). Maximal plain-INNER segments of the FROM tree are flattened into freely permutable members plus a pooled ON-conjunct set, ordered by a System-R subset DP over (subsetMask, lastMember) for up to 8 members (port of join.rs:1090-1566, identity-seeded cost_upper_bound pruning, Pareto frontier per state) and by the greedy build-up of join.rs:1579 above that, then re-synthesized left-deep with each conjunct attached at its first evaluable step. Cost model ports estimate_scan_cost (cost.rs:120-135), estimate_hash_join_cost (access_method.rs:1200-1235) and the cost_params.rs:103-141 constants; per-step shape is chosen among the three executable shapes (nested-loop cross scan, hash-build-right, hash-build-left) and threaded back into TryBuildCompiledJoinSource. LEFT/RIGHT/FULL/NATURAL/USING freeze their subtree as one opaque member and semi/anti decline the whole rewrite; missing sqlite_stat1, unresolvable or ambiguous columns, and any later validator rejection fall back to the untouched FROM order. Ties break on the lexicographically smallest order, which is the FROM order. Projection order is preserved through an explicit slot map, so SELECT */t.*/bare columns are unchanged by a physical reorder. Evidence: JoinOrderOptimizerTests (incl. a DP-vs-brute-force permutation oracle), PlannerStat1JoinCostTests, EXPLAIN 'scan order:' text, EmbeddedDatabase.JoinOrderDiagnostics. RESIDUAL (still open, tracked separately): index-seek join leaves and per-table access-method search (compile-nway-join-not-index-driven, compile-no-access-method-selection); STAT4 histograms (no STAT4 storage exists, only sqlite_stat1 N + leading averages); bloom filters and auto-indexes for joins (vdbe-bloom-filter-opcodes, vdbe-autoindex-for-joins); Turso's required_lhs_by_table interleaving around outer joins (strict barriers instead); general WHERE-term decomposition beyond single-member root-segment comparison pushdown; the two-table unadorned INNER route keeps its own binary stat1 swap.",
       "status": "closed"
     },
     {
@@ -568,13 +569,13 @@
     {
       "id": "compile-nway-join-not-index-driven",
       "layer": "compilation",
-      "kind": "divergent",
-      "turso_ref": "turso-src/core/translate/select.rs (join emission uses per-node OpenRead/Seek via chosen access method)",
-      "ahtola_ref": "src/Ahtola.Core/Execution/VdbeProgram.cs::VdbeJoinOperatorPlan.Enumerate (lines ~793-845)",
+      "kind": "partial",
+      "turso_ref": "turso-src/core/translate/optimizer/cost.rs:171-236 (estimate_index_cost), turso-src/core/translate/optimizer/access_method.rs (per-table access method search)",
+      "ahtola_ref": "src/Ahtola.Core/Execution/VdbeProgram.cs::VdbeJoinScanPlan (full scan only); src/Ahtola.Core/Compilation/JoinOrdering/JoinCostModel.cs (no index-seek term)",
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 for the managed equijoin path. VdbeJoinOperatorPlan attaches VdbeJoinEquiProbe (same canonical keys as EquiJoinHashIndex) so equality ON only probes matching right buckets; multi-way compiled description becomes 'equijoin'. Evidence: JoinOpcodeExecutionTests.EquiJoinProbeFiltersRightCandidatesBeforeCondition. Residual: true per-left durable index btree Seek nested-loop and JoinProgramBuilder opcode-level seeks remain optional; non-equality joins stay nested-loop.",
+      "notes": "Partially closed. 2026-08-06 added VdbeJoinEquiProbe so an equality ON only probes matching right buckets. 2026-08-23 added cost-based ordering and per-step physical-shape selection for arbitrary-N plain-INNER segments (see compile-no-cost-based-join-ordering), so the join order and the hash build side are now chosen by a ported cost model rather than by FROM position. RESIDUAL, EXPLICITLY OPEN: VdbeJoinScanPlan is still always a full scan of a materialized cursor source -- there is no outer-row-bound index-seek join leaf, so cost.rs::estimate_index_cost is deliberately NOT ported and no seek discount is ever assigned. Closing it needs a new VdbeJoinPlanNode that seeks a durable index per outer row plus constraint plumbing into the enumerator; non-equality joins would stay nested-loop.",
       "status": "closed"
     },
     {
@@ -605,12 +606,12 @@
       "id": "compile-no-subquery-flattening",
       "layer": "compilation",
       "kind": "parity",
-      "turso_ref": "turso-src/core/translate/subquery.rs, planner.rs (FROM-clause subquery flattening / pull-up into the outer query)",
-      "ahtola_ref": "none (subqueries are always compiled as independently executed/materialized nested queries; see EmbeddedDatabase.cs::MaterializeSubqueryResult line ~23552)",
+      "turso_ref": "turso-src/core/translate/optimizer/unnest.rs (v0.8.0-pre.7); SQLite flattenSubquery()",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.SubqueryRewrites.cs::TryFlattenFromSubquery",
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 because the original premise was stale. Pinned Turso also retains FROM-clause subqueries and recursively optimizes them rather than syntactically flattening them. Ahtola's remaining costed materialized-subquery access gap is tracked by compile-no-access-method-selection.",
+      "notes": "Re-opened and closed again 2026-08-23. A pure AST stage now flattens a FROM-clause derived table that is the entire FROM clause, repeatedly until a fixed point. The hoisted inner WHERE is re-bound first, so a bare name that resolved to an inner projection alias (SELECT a AS x FROM t WHERE x > 0) is substituted rather than re-exposed to the enclosing SELECT's alias list; nested-SELECT schema validation applies the same WHERE alias fallback. Excluded: DISTINCT, GROUP BY/HAVING, window/named window, ORDER BY, LIMIT/OFFSET, aggregate/window/subquery projections, subtype-sensitive projections (any function call or -> / ->> JSON operator, which preserves SQLite's JSON-subtype strip at the co-routine boundary), duplicate visible column names, outer window functions, nested subqueries that reference the derived table, any reference in the enclosing SELECT qualified by a name the hoisted inner FROM clause would bring into scope (which would re-point a correlated reference at the hoisted source), a bare inner-WHERE name that resolves in no scope while the enclosing projection list aliases it, star projections over a USING/NATURAL join whose left side a RIGHT/FULL join can NULL-extend (the coalesced output column cannot be re-expressed as a raw left column there), WITH bodies (so MATERIALIZED / multi-use CTEs are never duplicated), and non-deterministic projections referenced more than once. Evidence: src/Ahtola.Tests/SubqueryRewriteTests.cs and EmbeddedDatabase.RewriteDiagnostics.",
       "status": "closed"
     },
     {
@@ -622,7 +623,7 @@
       "severity": "s3-perf",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as implemented. Deterministic uncorrelated subqueries are memoized once per statement and invalidated on table revisions; SubqueryMemoizationReproTests proves once-per-statement evaluation, including nested uncorrelated subqueries.",
+      "notes": "Closed 2026-08-06 for the uncorrelated case (statement-scoped memoization proven by SubqueryMemoizationReproTests). Extended 2026-08-23: correlated EXISTS / NOT EXISTS / direct IN now unnest into semi/anti joins (compile-correlated-exists-in-semi-anti-join). Correlated aggregate subqueries are still evaluated per outer row and are tracked by compile-no-aggregate-subquery-decorrelation.",
       "status": "closed"
     },
     {
@@ -1719,19 +1720,19 @@
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as an unadopted Turso embedding extension. vector/vector32/vector_distance_* have no managed implementation; ManagedAdvancedFeatureBoundaryTests locks 'no such function: vector32'. Out of scope for pure-managed SQLite classic surface; do not port core/vector without an explicit product decision.",
+      "notes": "Closed 2026-08-06 as an unadopted Turso embedding extension. vector/vector32/vector_distance_* have no managed implementation; ManagedAdvancedFeatureBoundaryTests locks 'no such function: vector32'. Out of scope for pure-managed SQLite classic surface; do not port core/vector without an explicit product decision. Reconciled 2026-08-24 by managed-vector-index: the scalar family shipped earlier, and a dense vector index method (USING vector) now serves exact KNN over float32/float64/float8/float1bit under l2/cosine/dot. Sparse-vector and jaccard indexing remain unimplemented and are rejected at CREATE INDEX; see index-method-vector-ivf-divergence.",
       "status": "closed"
     },
     {
       "id": "func-fts-scalar-family",
       "layer": "functions",
-      "kind": "missing",
+      "kind": "partial",
       "turso_ref": "turso-src/core/function.rs::FtsFunc::Score (\"fts_score\"), FtsFunc::Match (\"fts_match\"), FtsFunc::Highlight (\"fts_highlight\")",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Core/Search/ManagedFtsFunctions.cs; src/Ahtola.Core/Search/ManagedFtsSearchIndex.cs; src/Ahtola.Core/SqliteBuiltinFunctions.cs::Names",
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "A managed fts5 virtual-table subset now exists, but the Turso/SQLite FTS scalar, ranking, snippet, and auxiliary-function surfaces remain unimplemented. The managed virtual-table/parser surface is tracked separately by parser-create-virtual-table-not-parsed and vdbe-virtual-table-opcodes.",
+      "notes": "Reopened and re-closed 2026-08-24 by managed-index-methods-fts, then hardened the same day by the managed FTS/index-method review. fts_match, fts_score, fts_highlight and fts_snippet ship as builtin scalars backed by a pure-managed inverted index; there is no Tantivy and no native code. All four bind by resolved source identity (qualifier plus the row's own rowid), never by column-name similarity, so an unrelated table's index cannot change scalar behavior and joined rows score against their own source. A connection scalar callback that shadows any of the four suppresses method planning and index-aware scalar behavior entirely. fts_score is corpus- and configuration-dependent, so it is registered non-deterministic and rejected in index expressions, partial index WHERE clauses, generated columns and CHECK constraints; the other three remain pure functions of their arguments. The covering index's tokenizer, detail and columnsize settings are applied on the scalar path too, so a construct the index cannot answer fails identically on both paths. See docs/managed-index-methods.md.",
       "status": "closed"
     },
     {
@@ -2188,7 +2189,19 @@
       "severity": "s4-intentional",
       "effort": "S",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as an intentional extension. Ahtola implements page-level encryption through IFileSystem with an Ahtola-specific header rather than Turso's on-disk cipher-id marker, so encryption works transparently over physical and in-memory file systems. AEGIS-128X2/X4 and AEGIS-256X2/X4 remain intentionally out of scope.",
+      "notes": "Closed 2026-08-23 as full parity. Ahtola implements every Turso format version 0 page cipher: ids 1-2 (AES-128/256-GCM, via System.Security.Cryptography.AesGcm) and ids 3-8 (AEGIS-256, AEGIS-256X2, AEGIS-256X4, AEGIS-128L, AEGIS-128X2, AEGIS-128X4, via a pure-managed AEGIS core in src/Ahtola.Core/Storage/Crypto). Key/nonce/tag sizes, the ciphertext||tag||nonce frame, the page-1 header and its associated data, and the reserved-byte counts (28/32/48) match encryption.rs exactly; only the 5-byte magic differs (AHTLA vs Turso), which is the pre-existing intentional extension. The AEGIS implementations are validated against the CFRG draft-irtf-cfrg-aegis-aead specification vectors (see src/Ahtola.Tests/AegisKnownAnswerTests.cs) on both the AES-instruction path and the constant-time bitsliced software path. ChaCha20-Poly1305 is deliberately NOT given a page framing: Turso assigns it no cipher id and never writes it to disk, so it stays a Turso Cloud server-side remote descriptor only (see storage-encryption-chacha-remote-only).",
+      "status": "closed"
+    },
+    {
+      "id": "storage-encryption-chacha-remote-only",
+      "layer": "storage",
+      "kind": "intentional-divergence",
+      "turso_ref": "turso-src/bindings/rust/src/sync.rs (EncryptionCipher::ChaCha20Poly1305 reserved_bytes/name), turso-src/sync/engine/src/database_sync_operations.rs (x-turso-encryption-key header)",
+      "ahtola_ref": "src/Ahtola.Data/ManagedReplicaEncryption.cs::EnsureSupportedCipher, src/Ahtola.Data/AhtolaSyncOptions.cs::AhtolaRemoteEncryptionCipher",
+      "severity": "s4-intentional",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "ChaCha20-Poly1305 exists in Turso only as a Turso Cloud server-side cipher name: it has no CipherMode member, no cipher_id, no page-1 header byte and no page framing anywhere in core/storage/encryption.rs. Its 28 reserved bytes are implied by reserved_bytes() and the key travels to the server in the x-turso-encryption-key header, where the server performs the crypto. Ahtola therefore keeps it as an accepted remote descriptor (ReservedBytes 28, NativeName chacha20poly1305) but fails closed in ManagedReplicaEncryption, because a managed embedded replica must decode pages locally and inventing an on-disk framing would produce files no Turso build can read. Do not assign it a cipher id: any value chosen here would collide with a future upstream assignment.",
       "status": "closed"
     },
     {
@@ -2542,19 +2555,19 @@
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Updated 2026-08-23: the managed request writer now emits PullUpdatesReqProtoBody tag 7 (server_query_selector, UTF-8 string) for query bootstrap, mutually exclusive with tag 5 (server_pages_selector) and only on the single bootstrap request; zstd stays rejected.",
       "status": "closed"
     },
     {
       "id": "sync-conflict-error-surfaced-not-handled",
       "layer": "sync",
-      "kind": "partial",
+      "kind": "extension",
       "turso_ref": "turso-src/sync/engine/src/errors.rs::Error::DatabaseSyncEngineConflict, turso-src/sync/engine/src/database_sync_operations.rs (status==\"conflict\" -> DatabaseSyncEngineConflict, wal_push conflict handling)",
-      "ahtola_ref": "src/Ahtola.Data/AhtolaReplicaPushFailureKind.cs (AhtolaReplicaPushFailureKind, AhtolaReplicaPushFailure.Classify), src/Ahtola.Data/AhtolaReplicaConflictException.cs, src/Ahtola.Data/AhtolaRemoteClient.cs (CreateRemoteError/SendPipelineAsync/PushReplicaChangesAsync push response boundary), src/Ahtola.Data/AhtolaConnection.cs (IsTransientAutomaticSyncFailure)",
+      "ahtola_ref": "src/Ahtola.Data/AhtolaReplicaPushFailureKind.cs (AhtolaReplicaPushFailureKind, AhtolaReplicaPushFailure.Classify), src/Ahtola.Data/AhtolaReplicaConflictException.cs, src/Ahtola.Data/AhtolaReplicaConflictResolution.cs (public inspect/resolve surface), src/Ahtola.Data/ManagedReplicaConflictState.cs (durable .ahtola-replica-conflict marker), src/Ahtola.Data/ManagedReplicaConflictClassifier.cs (pure conservative classifier), src/Ahtola.Data/ManagedReplicaChangeJournal.cs (DiscardUnacknowledged, format v6), src/Ahtola.Data/ManagedReplicaConnectionHost.cs (RecordPushConflict, ThrowIfReplicaConflictIsPending, Inspect/Resolve), src/Ahtola.Data/AhtolaRemoteClient.cs (push response boundary), src/Ahtola.Data/AhtolaConnection.cs (InspectReplicaConflictAsync, ResolveReplicaConflictAsync, IsTransientAutomaticSyncFailure), docs/replica-conflict-resolution.md",
       "severity": "s2-capability",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Updated 2026-08-20: this is managed-native work independent of the missing Turso.Data.Sync companion, so it is pulled out of the s4-intentional companion bucket. The managed push boundary now classifies every push failure into a stable public AhtolaReplicaPushFailureKind (Conflict/TransientTransport/InvalidLocalState) via AhtolaReplicaPushFailure.Classify, mirroring Turso's status==\"conflict\" -> DatabaseSyncEngineConflict split from retryable transport failures. AhtolaReplicaConflictException always carries Conflict; non-conflict remote SQL/shape errors and local-invariant violations carry InvalidLocalState; transport-layer failures (timeouts, no HTTP response, 5xx/429) carry TransientTransport. The local push journal/metadata are retained (never acked/dropped) on any classification. Still missing: automatic rebase-before-retry orchestration and any future revert-WAL rollback (tracked separately by sync-no-revert-db-checkpoint-safety) — callers today can react to the classification but Ahtola does not yet resolve the conflict for them.",
+      "notes": "Updated 2026-08-23: closed, but as an AHTOLA MANAGED EXTENSION rather than a port. Turso upstream still ends a push conflict terminally (sync/engine/src/database_sync_operations.rs, wal_push -> Error::DatabaseSyncEngineConflict) and has no rebase, classification, or resolution policy to mirror, so nothing below claims upstream parity. The managed push boundary classifies every push failure into a stable public AhtolaReplicaPushFailureKind (Conflict/TransientTransport/InvalidLocalState), mirroring Turso's status==\"conflict\" split from retryable transport failures. On a typed conflict the host now also durably records a <db>.ahtola-replica-conflict marker naming the exact rejected batch (first sequence, watermark, server-reported sequence) plus the conservatively classified unresolved subset - written AFTER the revert-WAL restore and BEFORE the typed exception reaches the caller, so a crash in between leaves no marker and the existing revert-phase recovery still applies. While the marker exists, explicit SyncAsync, post-open catch-up, and automatic sync all fail closed with AhtolaReplicaConflictPendingException instead of re-pushing a rejected batch. AhtolaConnection.InspectReplicaConflictAsync returns an immutable classification report; ResolveReplicaConflictAsync applies PullAndRebaseEligible (pull a fresh logical base and replay only provably eligible journaled changes through the existing transactional logical replay, apply lease, and artifact-backup compensation; the marker is RETAINED while anything stays quarantined) or DiscardUnresolvedChanges (explicit AcknowledgeDataLoss; removes only the unresolved journal entries and never advances the remote-ack watermark, so a discard stays distinguishable from a remote-confirmed push - journal format bumped to v6 for that). RESIDUALS KEPT MANUAL BY DESIGN, not oversights: AhtolaReplicaConflictKind.Unknown (whole batch), any schema conflict or quarantined DDL, same-(database,table,rowid) writes, causal chains after an undecided write, stale/foreign reported sequences, and page-protocol replicas (raw pages cannot rebase journaled SQL nor hold a quarantined subset back). Revert-WAL capture/restore itself remains tracked by sync-no-revert-db-checkpoint-safety.",
       "status": "closed"
     },
     {
@@ -2610,11 +2623,11 @@
       "layer": "sync",
       "kind": "divergent",
       "turso_ref": "turso-src/sync/engine/src/database_sync_operations.rs (ENCRYPTION_KEY_HEADER, wal_push HTTP calls), turso-src/sync/engine/src/database_sync_engine.rs (bootstrap_db HTTP round trips)",
-      "ahtola_ref": "src/Ahtola.Data/AhtolaRemoteClient.cs::CreatePipelineUri (\"/v2/pipeline\")",
+      "ahtola_ref": "src/Ahtola.Data/AhtolaRemoteClient.cs::CreateProtocolUri (/v3/pipeline, /v3/cursor, /v2/pipeline fallback), src/Ahtola.Data/Hrana/AhtolaHranaWebSocketTransport.cs, src/Ahtola.Data/Hrana/AhtolaHranaWebSocketConnection.cs",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "F2.40 (2026-08-10): cleared partial; deliberate remote Hrana /v2/pipeline scope (divergent from full sync engine v3/websocket). Closed 2026-08-06 as the deliberate remote-Hrana scope. The ADO remote client targets Turso's pinned /v2/pipeline Execute/Batch surface; WebSocket/v3 and wal_push/pull_updates belong to the separate unported embedded sync engine entries.",
+      "notes": "2026-08-23: ws/wss data sources now open a persistent Hrana WebSocket connection (hello/hello_ok, request/response_ok/response_error, open/close stream, execute, batch, store_sql, close_sql, sequence, describe, open/fetch/close cursor, get_autocommit) with subprotocol negotiation across hrana3/hrana2/hrana1, request-id multiplexing, bounded reconnect and fail-closed protocol handling; http/https/libsql/turso keep the unchanged v3-with-v2-fallback HTTP pipeline. This targets the legacy libSQL/sqld Hrana WebSocket server: the pinned Turso engine has no native Hrana WebSocket server and maps ws/wss onto its HTTP pipeline endpoint. Remote encryption stays https-only because the official hello message has no encryption-key field, and wal_push/pull_updates remain with the separate unported embedded sync engine entries. F2.40 (2026-08-10): cleared partial; closed 2026-08-06 as the deliberate remote-Hrana scope.",
       "status": "closed"
     },
     {
@@ -2638,7 +2651,7 @@
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Updated 2026-08-23: the managed replica now also supports Query selection (AhtolaPartialBootstrapOptions.QueryPages) end to end, reusing the same arbitrary-range sidecar, lazy materializer, coalescing, ownership and publication ordering as Prefix. Residuals: it requires a remote that honours Turso's server_query_selector (the vendored dev server ignores tag 7 by design, so all coverage is fake-server based), and the run-list sidecar costs one run per page for worst-case scattered selections.",
       "status": "closed"
     },
     {
@@ -2670,11 +2683,11 @@
       "layer": "sync",
       "kind": "extension",
       "turso_ref": "turso-src/sync/sdk-kit/src/capi.rs, bindings.rs (native C ABI surface backing SDK embedding, incl. non-sync native engine access)",
-      "ahtola_ref": "src/Ahtola.Data/AhtolaNativeProvider.cs::AhtolaNativeProvider (loads optional \"Turso.Data.Native\" assembly, fails closed)",
+      "ahtola_ref": "src/Ahtola.Data/AhtolaNativeProvider.cs::AhtolaNativeProvider (explicit Register(factory) hook for the optional \"Turso.Data.Native\" companion, fails closed)",
       "severity": "s4-intentional",
       "effort": "S",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional. AhtolaNativeProvider's load-by-name hook for an optional, non-shipped 'Turso.Data.Native' companion is only an extension point and fails closed when absent. The pure-managed repo does not ship that companion.",
+      "notes": "Closed 2026-08-06 as intentional. AhtolaNativeProvider's Register(factory) hook for an optional, non-shipped 'Turso.Data.Native' companion is only an extension point and fails closed when absent. The pure-managed repo does not ship that companion. Updated 2026-08-25: the former Assembly.Load/GetType/GetMethod probe was replaced by explicit registration (the SqliteNativeProvider model) because reflective load-by-name is invisible to the trimmer and to NativeAOT.",
       "status": "closed"
     },
     {
@@ -3099,6 +3112,54 @@
         "foreign_keys.sqltest::fk-alter-table-add-column-enforced"
       ],
       "notes": "Closed 2026-08-08. ALTER TABLE ADD COLUMN previously rejected every column-level REFERENCES clause even though the table constructor and DML foreign-key validator already supported the resulting metadata. AddColumn now refreshes the live foreign-key projection after adding the column, so both the current table and its reconstructed catalog retain the new constraint. ManagedForeignKeyFileCatalogDurabilityTests.AddedColumnForeignKeyEnforcesBeforeAndAfterReopen covers valid, NULL, invalid, and reopened child values.",
+      "status": "closed"
+    },
+    {
+      "id": "compile-correlated-exists-in-semi-anti-join",
+      "layer": "compilation",
+      "kind": "parity",
+      "turso_ref": "turso-src/core/translate/optimizer/unnest.rs::try_rewrite_exists / try_rewrite_in / rewrite_as_semi_or_anti_join / can_rewrite_as_semi_join (v0.8.0-pre.7)",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.SubqueryRewrites.cs::RewriteCorrelatedSubqueriesAsJoins; JoinKind.Semi/JoinKind.Anti in src/Ahtola.Core/Parsing/SqlAst.cs; src/Ahtola.Core/EmbeddedDatabase.cs::GetSemiOrAntiJoinRows",
+      "severity": "s3-perf",
+      "effort": "M",
+      "conformance_links": [],
+      "notes": "Closed 2026-08-23. A top-level conjunctive correlated EXISTS / NOT EXISTS / direct positive IN over a single ordinary base table becomes an internal semi or anti join, so the inner table is materialized once per statement instead of being re-planned per outer row. The join projects only the left row shape and emits each left row at most once, so duplicate inner matches never multiply outer rows. It reuses the correlated subquery's statement-cached transient hash probe, which canonicalizes both sides of an equality under exactly the comparison affinity and collating sequence SQLite applies (numeric pulls non-numeric to numeric, TEXT pulls affinity-less to text, and the collating sequence follows operand order) and declines to prune when either side cannot be proven. Excluded: NOT IN, any subquery under OR, an outer join anywhere in the enclosing FROM clause, uncorrelated subqueries (already memoized), a WHERE clause with more than one top-level conjunct where any conjunct can raise on its input (AND short-circuits, so a join would either hide or invent an error), a subquery with DISTINCT/GROUP BY/HAVING/ORDER BY/window/LIMIT/OFFSET/aggregate, a joined/derived/CTE/view/virtual/table-valued or compound inner source, a null or subquery-bearing or non-deterministic inner WHERE, a correlation predicate that is not a plain inner=outer equality, an anti-join term that never reads the inner table, an IN whose operands or whose own inner WHERE can raise (IN scans its subquery to completion, so an error in a row after the first match must still surface), and an EXISTS whose select list binds a parameter. Bytecode lowering declines these joins (no VdbeJoinKind counterpart), so the rewritten select runs on the evaluator. EXPLAIN / EXPLAIN QUERY PLAN describe the un-rewritten statement. Evidence: src/Ahtola.Tests/SubqueryRewriteTests.cs.",
+      "status": "closed"
+    },
+    {
+      "id": "compile-no-aggregate-subquery-decorrelation",
+      "layer": "compilation",
+      "kind": "missing",
+      "turso_ref": "turso-src/core/translate/optimizer/unnest.rs::try_rewrite_single_value_aggregate / rewrite_aggregate_as_join_then_group / aggregate_can_run_for_unused_rows (v0.8.0-pre.7)",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.SubqueryRewrites.cs (deliberately out of scope); correlated aggregate subqueries stay on the per-row ExecuteSubquery path",
+      "severity": "s3-perf",
+      "effort": "L",
+      "conformance_links": [],
+      "notes": "Open. Turso rewrites `o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)` either group-first (LEFT JOIN a `GROUP BY key` derived table) or join-first (LEFT JOIN then `GROUP BY o.rowid` with the comparison moved to HAVING). Porting needs a synthesized grouped derived table, empty-input value analysis (count -> 0, total -> 0.0, otherwise NULL), a can-this-expression-fail analysis so group-first never computes an aggregate for a key no outer row asks for, comparison-compatibility checks between the grouping and joining keys (collation and numeric/text conversion), and a rowid-based grouping key for join-first. None of that is implemented; such subqueries evaluate once per outer row.",
+      "status": "open"
+    },
+    {
+      "id": "index-method-fts-persistence-divergence",
+      "layer": "storage",
+      "kind": "divergent",
+      "turso_ref": "turso-src/core/index_method/fts.rs:1856-1905 (Tantivy chunk-blob backing table + backing_btree index)",
+      "ahtola_ref": "docs/managed-index-methods.md; src/Ahtola.Core/Indexing/ManagedIndexMethodStateSql.cs; src/Ahtola.Core/Search/ManagedFtsSearchIndex.cs",
+      "severity": "s4-intentional",
+      "effort": "L",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-08-24 by managed-index-methods-fts as a recorded divergence. A method index is a real sqlite_schema 'index' row with a real rootpage and an ordinary SQLite index b-tree; no page, cell or WAL format changed. A versioned state header rides in a trailing SQL comment on the index's sql text (the same mechanism already shipped for managed virtual tables), and the inverted index (terms, term frequencies, positions, column masks, tombstones) is DERIVED state rebuilt from the base rows inside the catalog snapshot, so rollback/savepoint/crash/VACUUM correctness is inherited. Ahtola does NOT synthesize FTS5 shadow tables and the file is NOT interoperable: stock sqlite3 cannot parse CREATE INDEX ... USING fts and reports a malformed schema for that row, exactly as it would for Turso. Do not describe this layout as SQLite-compatible. Review follow-up 2026-08-24: postings are generation stamped (an upserted or reused rowid retires its previous terms immediately); ranking-only plans retain every unranked base row and are priced accordingly; attachments are published only on success and dropped on every failure; REINDEX/Optimize build detached and publish atomically; DROP INDEX runs Destroy; state envelopes are decoded only for USING-method declarations, length-bounded before the base64 decode allocates, and fully field-validated; detail/columnsize/gram options are implemented or rejected; folding preserves exact source offsets across combining marks and surrogate pairs; prefix limits count live terms only; maintenance is revision-aware through RowStore.Revision plus a per-table mutation journal fed by ReportRowChange, with PreCommit run inside the commit; and the foundation is method generic (generic result rows, per-method planner adapters with KNN hooks, arbitrary SqlValue arguments, no FTS casts in the core), proven by a non-FTS KNN method that plans and executes end to end.",
+      "status": "closed"
+    },
+    {
+      "id": "index-method-vector-ivf-divergence",
+      "layer": "storage",
+      "kind": "divergent",
+      "turso_ref": "turso-src/core/index_method/toy_vector_sparse_ivf.rs (sparse component inverted index, jaccard only, delta/scan_portion/scan_order heuristics); turso-src/core/index_method/mod.rs",
+      "ahtola_ref": "docs/managed-vector-index.md; src/Ahtola.Core/Vectors/ManagedVectorIndexMethod.cs; src/Ahtola.Core/Vectors/ManagedVectorIvfIndex.cs; src/Ahtola.Core/Vectors/ManagedVectorGeometry.cs; src/Ahtola.Core/Vectors/ManagedVectorTraining.cs; src/Ahtola.Core/Vectors/ManagedVectorRandom.cs; src/Ahtola.Core/Vectors/ManagedVectorIndexState.cs; src/Ahtola.Core/Vectors/ManagedVectorPlannerAdapter.cs; src/Ahtola.Core/SqliteVectorFunctions.Indexing.cs",
+      "severity": "s4-intentional",
+      "effort": "L",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-08-24 by managed-vector-index as a recorded divergence. Ahtola ships CREATE INDEX ... USING vector on the managed index-method foundation, but it is NOT a port of Turso's toy_vector_sparse_ivf: that file is a jaccard-only sparse component inverted index over vector32_sparse columns, backed by two real b-trees Ahtola has no per-statement write API for, and pruned by three unbounded heuristics (delta, scan_portion, scan_order) with no recall bound, no k-means, no centroids, no training, no rebuild/optimize, no versioned state and no cost model. Ahtola's method is an Ahtola-designed IVF-Flat with an exactness certificate: k-means centroids are durable in the versioned catalog state envelope, assignments/postings/radii are derived from the base rows, and a list is skipped only when a proven inequality (triangle inequality for l2, angular for cosine, Cauchy-Schwarz for dot, exact integer Hamming for float1bit), widened by a floating-point slack sized to the reported distance's accumulation width, shows no member of it can enter the top-k; otherwise more lists are probed, degrading to a full scan rather than to a wrong answer. What is carried over from Turso is the method/attachment/cursor shape from index_method/mod.rs, results_materialized=true, TransactionalBackingStore, and the 'ORDER BY distance LIMIT ?' query shape in both argument orders. Honest limits: sparse vectors and metric='jaccard' are rejected at CREATE INDEX rather than silently downgraded; exact=0 (approximate mode) is rejected, so no configuration returns a different row set than the unindexed query; a single NULL or otherwise invalid indexed value declines the plan entirely, because the scalar form of the query raises on that row and an index that skipped it would turn an error into a result set; and data with no exploitable cluster structure re-prices the index out of the plan (the cost model measures reranked rows, not probes) instead of becoming approximate. Supported: float32/float64/float8/float1bit encodings under l2/cosine/dot, minus l2-over-float1bit which the scalar evaluator does not define. See docs/managed-vector-index.md.",
       "status": "closed"
     }
   ]
