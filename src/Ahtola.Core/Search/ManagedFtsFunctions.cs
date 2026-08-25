@@ -441,6 +441,14 @@ internal static class ManagedFtsFunctions
                     CollectPhraseSpans(lookup, phrase, destination);
                 return;
             case ManagedFtsNearNode near:
+                foreach (var phrase in near.Phrases)
+                {
+                    if (phrase.IsPrefix && ++prefixTerms > ManagedFtsLimits.MaxHighlightPrefixTerms)
+                    {
+                        throw new EmbeddedSqlException(
+                            $"fts highlight query uses more than {ManagedFtsLimits.MaxHighlightPrefixTerms} prefix terms");
+                    }
+                }
                 if (AppliesToColumn(near.Column, columnName))
                     CollectNearSpans(lookup, near, destination);
                 return;
@@ -467,9 +475,30 @@ internal static class ManagedFtsFunctions
         if (phrase.Terms.Count == 0)
             return;
 
-        foreach (var first in lookup.Get(phrase.Terms[0]))
+        foreach (var match in FindPhraseMatches(
+                     lookup,
+                     new ManagedFtsNearPhrase(phrase.Terms, phrase.IsPrefix),
+                     phrase.AnchoredAtStart))
         {
-            if (phrase.AnchoredAtStart && first.Position != 0)
+            AddMatchSpan(destination, match.Span.Start, match.Span.End);
+        }
+    }
+
+    private static List<PhraseMatch> FindPhraseMatches(
+        Fts5TokenLookup lookup,
+        ManagedFtsNearPhrase phrase,
+        bool anchoredAtStart)
+    {
+        if (phrase.Terms.Count == 0)
+            return [];
+
+        var matches = new List<PhraseMatch>();
+        var firstOccurrences = phrase.Terms.Count == 1 && phrase.IsPrefix
+            ? lookup.GetPrefix(phrase.Terms[0])
+            : lookup.Get(phrase.Terms[0]);
+        foreach (var first in firstOccurrences)
+        {
+            if (anchoredAtStart && first.Position != 0)
                 continue;
 
             var end = first.Offset + first.Length;
@@ -490,8 +519,15 @@ internal static class ManagedFtsFunctions
             }
 
             if (matched)
-                AddMatchSpan(destination, first.Offset, end);
+            {
+                matches.Add(new PhraseMatch(
+                    first.Position,
+                    checked(first.Position + phrase.Terms.Count - 1),
+                    new MatchSpan(first.Offset, end)));
+            }
         }
+
+        return matches;
     }
 
     private static void CollectNearSpans(
@@ -499,36 +535,146 @@ internal static class ManagedFtsFunctions
         ManagedFtsNearNode near,
         List<MatchSpan> destination)
     {
-        if (near.Terms.Count == 0)
+        if (near.Phrases.Count == 0)
             return;
 
-        var distance = near.SqliteDistance
-            ? checked(near.Distance + 1)
-            : near.Distance;
-        foreach (var anchor in lookup.Get(near.Terms[0]))
+        var phraseMatches = near.Phrases
+            .Select(phrase => FindPhraseMatches(lookup, phrase, anchoredAtStart: false))
+            .ToArray();
+        if (phraseMatches.Any(static matches => matches.Count == 0))
+            return;
+
+        if (!near.SqliteDistance)
         {
-            var occurrences = new ManagedFtsToken[near.Terms.Count];
-            occurrences[0] = anchor;
-            var matched = true;
-            for (var index = 1; index < near.Terms.Count; index++)
+            foreach (var anchor in phraseMatches[0])
             {
-                if (!lookup.TryGetInRange(
-                        near.Terms[index],
-                        Math.Max(0, anchor.Position - distance),
-                        anchor.Position + distance,
-                        out occurrences[index]))
+                var occurrences = new PhraseMatch[near.Phrases.Count];
+                occurrences[0] = anchor;
+                var matched = true;
+                for (var index = 1; index < phraseMatches.Length; index++)
                 {
-                    matched = false;
-                    break;
+                    var found = phraseMatches[index].FirstOrDefault(
+                        candidate => Math.Abs(candidate.EndPosition - anchor.EndPosition) <= near.Distance);
+                    if (found == default)
+                    {
+                        matched = false;
+                        break;
+                    }
+
+                    occurrences[index] = found;
                 }
+
+                if (!matched)
+                    continue;
+                foreach (var occurrence in occurrences)
+                    AddMatchSpan(destination, occurrence.Span.Start, occurrence.Span.End);
             }
 
-            if (!matched)
+            return;
+        }
+
+        var maximumStarts = phraseMatches
+            .SelectMany(static matches => matches)
+            .Select(static match => match.StartPosition)
+            .Distinct()
+            .Order()
+            .ToArray();
+        var participatingRanges = Enumerable
+            .Range(0, phraseMatches.Length)
+            .Select(static _ => new List<PhraseMatchRange>())
+            .ToArray();
+        foreach (var maximumStart in maximumStarts)
+        {
+            var ranges = new PhraseMatchRange[phraseMatches.Length];
+            var matches = true;
+            for (var phraseIndex = 0; phraseIndex < phraseMatches.Length; phraseIndex++)
+            {
+                var minimumStart = Math.Max(
+                    0L,
+                    (long)maximumStart - near.Distance - near.Phrases[phraseIndex].Terms.Count);
+                var first = LowerBoundByStart(phraseMatches[phraseIndex], minimumStart);
+                var end = UpperBoundByStart(phraseMatches[phraseIndex], maximumStart);
+                if (first == end)
+                {
+                    matches = false;
+                    break;
+                }
+
+                ranges[phraseIndex] = new PhraseMatchRange(first, end);
+            }
+
+            if (!matches)
                 continue;
-            foreach (var token in occurrences)
-                AddMatchSpan(destination, token.Offset, token.Offset + token.Length);
+
+            for (var phraseIndex = 0; phraseIndex < phraseMatches.Length; phraseIndex++)
+                AddPhraseMatchRange(participatingRanges[phraseIndex], ranges[phraseIndex]);
+        }
+
+        for (var phraseIndex = 0; phraseIndex < phraseMatches.Length; phraseIndex++)
+        {
+            foreach (var range in participatingRanges[phraseIndex])
+            {
+                for (var index = range.Start; index < range.End; index++)
+                {
+                    var match = phraseMatches[phraseIndex][index];
+                    AddMatchSpan(destination, match.Span.Start, match.Span.End);
+                }
+            }
         }
     }
+
+    private static int LowerBoundByStart(IReadOnlyList<PhraseMatch> matches, long target)
+    {
+        var low = 0;
+        var high = matches.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) >> 1);
+            if (matches[middle].StartPosition < target)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        return low;
+    }
+
+    private static int UpperBoundByStart(IReadOnlyList<PhraseMatch> matches, int target)
+    {
+        var low = 0;
+        var high = matches.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) >> 1);
+            if (matches[middle].StartPosition <= target)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        return low;
+    }
+
+    private static void AddPhraseMatchRange(
+        List<PhraseMatchRange> ranges,
+        PhraseMatchRange next)
+    {
+        if (ranges.Count == 0 || next.Start > ranges[^1].End)
+        {
+            ranges.Add(next);
+            return;
+        }
+
+        var previous = ranges[^1];
+        ranges[^1] = new PhraseMatchRange(previous.Start, Math.Max(previous.End, next.End));
+    }
+
+    private readonly record struct PhraseMatch(
+        int StartPosition,
+        int EndPosition,
+        MatchSpan Span);
+
+    private readonly record struct PhraseMatchRange(int Start, int End);
 
     private static void AddMatchSpan(List<MatchSpan> destination, int start, int end)
     {
@@ -590,6 +736,13 @@ internal static class ManagedFtsFunctions
         public IReadOnlyList<ManagedFtsToken> Get(string term)
             => _byTerm.TryGetValue(term, out var occurrences) ? occurrences : [];
 
+        public IReadOnlyList<ManagedFtsToken> GetPrefix(string prefix)
+            => _byPosition.Values
+                .Where(token => token.Text.StartsWith(prefix, StringComparison.Ordinal))
+                .OrderBy(static token => token.Position)
+                .ThenBy(static token => token.Offset)
+                .ToArray();
+
         public bool TryGetAtPosition(string term, int position, out ManagedFtsToken token)
         {
             if (!_byTerm.TryGetValue(term, out var occurrences))
@@ -631,34 +784,6 @@ internal static class ManagedFtsFunctions
             return false;
         }
 
-        public bool TryGetInRange(string term, int minimum, int maximum, out ManagedFtsToken token)
-        {
-            if (!_byTerm.TryGetValue(term, out var occurrences))
-            {
-                token = null!;
-                return false;
-            }
-
-            var low = 0;
-            var high = occurrences.Count;
-            while (low < high)
-            {
-                var middle = low + ((high - low) >> 1);
-                if (occurrences[middle].Position < minimum)
-                    low = middle + 1;
-                else
-                    high = middle;
-            }
-
-            if (low < occurrences.Count && occurrences[low].Position <= maximum)
-            {
-                token = occurrences[low];
-                return true;
-            }
-
-            token = null!;
-            return false;
-        }
     }
 
     private static ManagedFtsSearchIndex BuildSingleDocumentIndex(

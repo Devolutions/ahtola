@@ -59,8 +59,11 @@ tables require SQLite's shadow-table/trigger contracts and are not represented
 by Ahtola's private payload.
 
 MATCH supports bounded FTS5 term, phrase, quoted-phrase prefix, binary
-`NOT`, column-filter, initial-token anchor, and `NEAR(term ..., distance)`
-grammar. Implicit `AND` binds more tightly than binary `NOT`, and a
+`NOT`, column-filter, initial-token anchor, and `NEAR(phrase ..., distance)`
+grammar, including prefix and quoted-phrase operands within `NEAR`. Implicit
+`AND` binds more tightly than binary `NOT`. Barewords use SQLite FTS5's
+restricted character set; reserved punctuation such as `.`, `/`, and `,`
+must be quoted. A
 `column MATCH ?` restriction intersects every explicit column filter in the
 query. BLOB content is decoded as UTF-8 for indexing and auxiliary rendering
 while the stored SQL value remains a BLOB. Both `table MATCH ?` and
@@ -81,10 +84,10 @@ including through joins and correlated outer-row chains. It is not inferred
 from a same-named ordinary column. Application-registered scalar callbacks
 still shadow these built-ins. BM25 uses SQLite's IDF floor, total-document
 length normalization, negative score convention, and per-column term weights.
-The default score is covered by stock-SQLite oracle tests; weighted
-phrase/NEAR scoring remains a deterministic approximation because the managed
-candidate currently retains aggregate phrase frequency rather than
-per-column phrase frequency.
+Terms and phrases retain per-column occurrence frequencies for weighting;
+each constituent phrase of a matching NEAR group contributes independently,
+matching stock SQLite's BM25 behavior. Default and weighted scores are covered
+by stock-SQLite oracle tests.
 
 `INSERT INTO table VALUES (...)` targets visible columns only. Explicit
 `rowid`, `_rowid_`, and `oid` inserts and updates map to VUpdate's new-rowid

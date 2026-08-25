@@ -357,9 +357,38 @@ public sealed class ManagedSearchVirtualTableTests
             "CREATE TABLE shadows(documents TEXT);",
             "INSERT INTO shadows VALUES ('ordinary');",
             "CREATE VIRTUAL TABLE near_docs USING fts5(body);",
-            "INSERT INTO near_docs(rowid, body) VALUES (1, 'one x two'), (2, 'one x x two'), (3, 'two x one');",
+            """
+            INSERT INTO near_docs(rowid, body) VALUES
+                (1, 'one x two'),
+                (2, 'one x x two'),
+                (3, 'two x one'),
+                (4, 'one two three'),
+                (5, 'one two throw'),
+                (6, 'one'),
+                (7, 'three one two');
+            """,
             "CREATE VIRTUAL TABLE phrase_docs USING fts5(body);",
             "INSERT INTO phrase_docs(rowid, body) VALUES (1, 'one two three'), (2, 'one two throw'), (3, 'one two thyme');",
+            "CREATE VIRTUAL TABLE near_scores USING fts5(a, b);",
+            """
+            INSERT INTO near_scores(rowid, a, b) VALUES
+                (1, 'one two three', ''),
+                (2, '', 'one two three'),
+                (3, 'one two x three', ''),
+                (4, '', 'one two x three'),
+                (5, 'filler', 'filler');
+            """,
+            "CREATE VIRTUAL TABLE near_edges USING fts5(body);",
+            """
+            INSERT INTO near_edges(rowid, body) VALUES
+                (1, 'a b c'),
+                (2, 'a b b'),
+                (3, 'one two three filler filler one two'),
+                (4, 'one two three filler filler filler filler'),
+                (5, 'or not near'),
+                (6, 'one three two'),
+                (7, 'one two three');
+            """,
         ];
 
         using var database = new EmbeddedDatabase();
@@ -387,6 +416,44 @@ public sealed class ManagedSearchVirtualTableTests
             "SELECT rowid FROM near_docs WHERE near_docs MATCH 'NEAR(one two,1)' ORDER BY rowid;",
             "SELECT rowid FROM near_docs WHERE near_docs MATCH 'NEAR(one x two,0)' ORDER BY rowid;",
             "SELECT rowid FROM near_docs WHERE near_docs MATCH 'NEAR(one,1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_docs WHERE near_docs MATCH 'NEAR(one one,0)' ORDER BY rowid;",
+            """
+            SELECT rowid, highlight(near_docs, 0, '[', ']')
+            FROM near_docs
+            WHERE near_docs MATCH 'NEAR("one two" three,1)'
+            ORDER BY rowid;
+            """,
+            """
+            SELECT rowid, highlight(near_docs, 0, '[', ']')
+            FROM near_docs
+            WHERE near_docs MATCH 'NEAR(three "one two",0)'
+            ORDER BY rowid;
+            """,
+            """
+            SELECT rowid, highlight(near_docs, 0, '[', ']')
+            FROM near_docs
+            WHERE near_docs MATCH 'NEAR(one tw*,1)'
+            ORDER BY rowid;
+            """,
+            """
+            SELECT rowid, highlight(near_docs, 0, '[', ']')
+            FROM near_docs
+            WHERE near_docs MATCH 'NEAR("one tw"* three,1)'
+            ORDER BY rowid;
+            """,
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(a c \"a b\",0)' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(a c \"a b\",1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(one two, 1)' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR(\"one\"\"two\" three,1)' ORDER BY rowid;",
+            """
+            SELECT rowid, highlight(near_edges, 0, '[', ']')
+            FROM near_edges
+            WHERE near_edges MATCH 'NEAR(a b,1)'
+            ORDER BY rowid;
+            """,
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'or' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'NEAR' ORDER BY rowid;",
+            "SELECT rowid FROM near_edges WHERE near_edges MATCH 'OR\U0001F4A9' ORDER BY rowid;",
             """
             SELECT rowid, highlight(phrase_docs, 0, '[', ']')
             FROM phrase_docs
@@ -404,6 +471,53 @@ public sealed class ManagedSearchVirtualTableTests
         ];
         foreach (var sql in oracleQueries)
             ReadRowsAsStrings(managed, sql).Should().Equal(ReadRowsAsStrings(stock, sql), sql);
+
+        AssertScoresMatchStock(
+            managed,
+            stock,
+            """
+            SELECT bm25(near_scores)
+            FROM near_scores
+            WHERE near_scores MATCH 'NEAR("one two" three,1)'
+            ORDER BY rowid;
+            """);
+        AssertScoresMatchStock(
+            managed,
+            stock,
+            """
+            SELECT bm25(near_scores, 10, 1)
+            FROM near_scores
+            WHERE near_scores MATCH 'NEAR("one two" three,1)'
+            ORDER BY rowid;
+            """);
+        AssertScoresMatchStock(
+            managed,
+            stock,
+            """
+            SELECT bm25(near_docs)
+            FROM near_docs
+            WHERE near_docs MATCH 'NEAR(one one,0)'
+            ORDER BY rowid;
+            """);
+        AssertScoresMatchStock(
+            managed,
+            stock,
+            """
+            SELECT bm25(near_edges)
+            FROM near_edges
+            WHERE near_edges MATCH 'NEAR("one two" three,0)'
+            ORDER BY rowid;
+            """);
+
+        foreach (var invalidBareword in new[] { "foo.bar", "foo/bar", "foo,bar" })
+        {
+            var sql =
+                $"SELECT rowid FROM near_docs WHERE near_docs MATCH '{invalidBareword}';";
+            Action managedInvalid = () => ReadRowsAsStrings(managed, sql);
+            Action stockInvalid = () => ReadRowsAsStrings(stock, sql);
+            managedInvalid.Should().Throw<EmbeddedSqlException>();
+            stockInvalid.Should().Throw<MsData.SqliteException>();
+        }
 
         foreach (var auxiliary in new[]
                  {

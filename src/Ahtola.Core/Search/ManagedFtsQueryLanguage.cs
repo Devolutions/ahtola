@@ -57,8 +57,10 @@ internal sealed record ManagedFtsPhraseNode(
     bool AnchoredAtStart)
     : ManagedFtsNode;
 
+internal sealed record ManagedFtsNearPhrase(IReadOnlyList<string> Terms, bool IsPrefix);
+
 internal sealed record ManagedFtsNearNode(
-    IReadOnlyList<string> Terms,
+    IReadOnlyList<ManagedFtsNearPhrase> Phrases,
     int Distance,
     string? Column,
     bool SqliteDistance = false)
@@ -216,14 +218,17 @@ internal sealed class ManagedFtsQueryLanguage
         }
 
         var column = TryReadColumnPrefix();
-        if (IsKeywordAtOffset("NEAR"))
+        if (IsKeywordAtOffset("NEAR")
+            && (_syntax != ManagedFtsQuerySyntax.SqliteFts5 || IsFts5NearAtOffset()))
             return ParseNear(column);
 
         var anchored = TryRead('^');
         if (TryRead('"'))
             return ParsePhrase(column, anchored);
 
-        var term = ReadWord();
+        var term = _syntax == ManagedFtsQuerySyntax.SqliteFts5
+            ? ReadFts5Bareword()
+            : ReadWord();
         if (term.Length == 0)
             throw Error("Expected an FTS term.");
 
@@ -345,7 +350,10 @@ internal sealed class ManagedFtsQueryLanguage
         if (terms.Count < 2)
             throw Error("NEAR requires at least two terms.");
 
-        return new ManagedFtsNearNode(terms, distance, column);
+        return new ManagedFtsNearNode(
+            terms.Select(static term => new ManagedFtsNearPhrase([term], IsPrefix: false)).ToArray(),
+            distance,
+            column);
     }
 
     private ManagedFtsNode ParseFts5Near(string? column)
@@ -354,7 +362,7 @@ internal sealed class ManagedFtsQueryLanguage
             throw Error("Expected '(' after NEAR.");
 
         var distance = 10;
-        var terms = new List<string>();
+        var phrases = new List<ManagedFtsNearPhrase>();
         while (true)
         {
             SkipWhitespace();
@@ -362,6 +370,7 @@ internal sealed class ManagedFtsQueryLanguage
                 break;
             if (TryRead(','))
             {
+                SkipWhitespace();
                 var digits = ReadDigits();
                 if (digits.Length == 0
                     || !int.TryParse(
@@ -379,47 +388,48 @@ internal sealed class ManagedFtsQueryLanguage
                 break;
             }
 
-            var word = ReadNearWord();
-            if (word.Length == 0)
-                throw Error("Expected an FTS term inside NEAR.");
-
-            AddNearTokens(terms, word);
+            phrases.Add(ParseFts5NearPhrase());
         }
 
-        if (terms.Count == 0)
+        if (phrases.Count == 0)
             throw Error("NEAR requires at least one term.");
 
-        return new ManagedFtsNearNode(terms, distance, column, SqliteDistance: true);
+        return new ManagedFtsNearNode(phrases, distance, column, SqliteDistance: true);
     }
 
-    private void AddNearTokens(List<string> terms, string word)
+    private ManagedFtsNearPhrase ParseFts5NearPhrase()
     {
-        var tokens = ManagedFtsTokenization.TokenizeQueryText(word, _options);
+        var phraseText = TryRead('"') ? ReadQuotedText() : ReadFts5Bareword();
+        if (phraseText.Length == 0)
+            throw Error("Expected an FTS phrase inside NEAR.");
+
+        var prefix = TryRead('*') && !_options.IsGramTokenizer;
+        if (TryRead('*'))
+            throw Error("An FTS prefix term can contain only one trailing '*'.");
+
+        var tokens = ManagedFtsTokenization.TokenizeQueryText(phraseText, _options);
         if (tokens.Count == 0)
         {
             CountTerm();
-            terms.Add(ManagedFtsTokenization.NormalizeTerm(word, _options));
-            return;
+            return new ManagedFtsNearPhrase(
+                [ManagedFtsTokenization.NormalizeTerm(phraseText, _options)],
+                prefix);
         }
 
+        var terms = new string[tokens.Count];
+        var index = 0;
         foreach (var token in tokens)
         {
             CountTerm();
-            terms.Add(token);
+            terms[index++] = token;
         }
+
+        return new ManagedFtsNearPhrase(terms, prefix);
     }
 
     private ManagedFtsNode ParsePhrase(string? column, bool anchored)
     {
-        var start = _offset;
-        while (_offset < _text.Length && _text[_offset] != '"')
-            _offset++;
-
-        if (_offset == _text.Length)
-            throw Error("Unterminated FTS phrase.");
-
-        var phraseText = _text[start.._offset];
-        _offset++;
+        var phraseText = ReadQuotedText();
 
         var prefix = TryRead('*');
         if (prefix && _syntax != ManagedFtsQuerySyntax.SqliteFts5)
@@ -497,18 +507,43 @@ internal sealed class ManagedFtsQueryLanguage
         return _text[start.._offset];
     }
 
-    private string ReadNearWord()
+    private string ReadFts5Bareword()
     {
         SkipWhitespace();
         var start = _offset;
-        while (_offset < _text.Length
-            && !char.IsWhiteSpace(_text[_offset])
-            && _text[_offset] is not ('(' or ')' or '"' or '*' or '-' or ':' or '^' or ','))
-        {
+        while (_offset < _text.Length && IsFts5BarewordCharacter(_text[_offset]))
             _offset++;
-        }
 
         return _text[start.._offset];
+    }
+
+    private string ReadQuotedText()
+    {
+        var start = _offset;
+        while (_offset < _text.Length)
+        {
+            if (_text[_offset] != '"')
+            {
+                _offset++;
+                continue;
+            }
+
+            if (_syntax == ManagedFtsQuerySyntax.SqliteFts5
+                && _offset + 1 < _text.Length
+                && _text[_offset + 1] == '"')
+            {
+                _offset += 2;
+                continue;
+            }
+
+            var phraseText = _text[start.._offset];
+            if (_syntax == ManagedFtsQuerySyntax.SqliteFts5)
+                phraseText = phraseText.Replace("\"\"", "\"", StringComparison.Ordinal);
+            _offset++;
+            return phraseText;
+        }
+
+        throw Error("Unterminated FTS phrase.");
     }
 
     private string ReadDigits()
@@ -532,9 +567,27 @@ internal sealed class ManagedFtsQueryLanguage
 
     private bool IsKeywordAtOffset(string keyword)
         => _offset + keyword.Length <= _text.Length
-            && _text.AsSpan(_offset, keyword.Length).Equals(keyword, StringComparison.OrdinalIgnoreCase)
+            && _text.AsSpan(_offset, keyword.Length).Equals(
+                keyword,
+                _syntax == ManagedFtsQuerySyntax.SqliteFts5
+                    ? StringComparison.Ordinal
+                    : StringComparison.OrdinalIgnoreCase)
             && (_offset + keyword.Length == _text.Length
-                || !IsWordChar(_text[_offset + keyword.Length]));
+                || !IsKeywordContinuation(_text[_offset + keyword.Length]));
+
+    private bool IsFts5NearAtOffset()
+    {
+        var next = _offset + "NEAR".Length;
+        while (next < _text.Length && char.IsWhiteSpace(_text[next]))
+            next++;
+
+        return next < _text.Length && _text[next] == '(';
+    }
+
+    private bool IsKeywordContinuation(char value)
+        => _syntax == ManagedFtsQuerySyntax.SqliteFts5
+            ? IsFts5BarewordCharacter(value)
+            : IsWordChar(value);
 
     /// <summary>
     /// The characters that can continue a bare term. This must agree with <see cref="ReadWord"/>
@@ -543,6 +596,12 @@ internal sealed class ManagedFtsQueryLanguage
     /// followed by <c>_A_TERM</c> instead of the single term the tokenizer will actually produce.
     /// </summary>
     private static bool IsWordChar(char value) => char.IsLetterOrDigit(value) || value == '_';
+
+    private static bool IsFts5BarewordCharacter(char value)
+        => char.IsAsciiLetterOrDigit(value)
+            || value == '_'
+            || value == '\u001A'
+            || value > '\u007F';
 
     private bool TryRead(char value)
     {
