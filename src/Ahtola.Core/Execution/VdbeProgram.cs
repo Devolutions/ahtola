@@ -900,6 +900,14 @@ public abstract class VdbeJoinPlanNode
     /// output before the first row is consumed.
     /// </summary>
     internal abstract IEnumerable<VdbeJoinRow> Enumerate(int? maximumRows);
+
+    internal virtual IEnumerable<VdbeJoinRow> Enumerate(
+        int? maximumRows,
+        VdbeJoinExecutionContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        return Enumerate(maximumRows);
+    }
 }
 
 /// <summary>A base-table leaf in a materializing join plan.</summary>
@@ -921,6 +929,11 @@ public sealed class VdbeJoinScanPlan : VdbeJoinPlanNode
     internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows) => Enumerate(maximumRows).ToList();
 
     internal override IEnumerable<VdbeJoinRow> Enumerate(int? maximumRows)
+        => Enumerate(maximumRows, VdbeJoinExecutionContext.CreateDefault());
+
+    internal override IEnumerable<VdbeJoinRow> Enumerate(
+        int? maximumRows,
+        VdbeJoinExecutionContext context)
     {
         if (Source.RowIds is not null && Source.RowIds.Count != Source.Rows.Count)
         {
@@ -933,6 +946,7 @@ public sealed class VdbeJoinScanPlan : VdbeJoinPlanNode
             : Source.Rows.Count;
         for (var index = 0; index < count; index++)
         {
+            context.ThrowIfCancellationRequested();
             var values = Source.Rows[index];
             if (values.Length != ColumnCount)
             {
@@ -1193,26 +1207,35 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
     internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows) => Enumerate(maximumRows).ToList();
 
     internal override IEnumerable<VdbeJoinRow> Enumerate(int? maximumRows)
+        => Enumerate(maximumRows, VdbeJoinExecutionContext.CreateDefault());
+
+    internal override IEnumerable<VdbeJoinRow> Enumerate(
+        int? maximumRows,
+        VdbeJoinExecutionContext context)
     {
         if (Right is VdbeJoinIndexScanPlan indexSeek)
-            return EnumerateIndexSeekRight(indexSeek, maximumRows);
+            return EnumerateIndexSeekRight(indexSeek, maximumRows, context);
+
+        if (EquiProbe is not null)
+            return VdbeHashJoinRuntime.Enumerate(this, maximumRows, context);
 
         // Default: materialize right once; stream left (OOM-safe for large outer × small inner).
         // INNER equijoin may flip to hash-build left when stats say left is smaller.
         if (!HashBuildRight)
-            return EnumerateHashBuildLeft(maximumRows);
-        return EnumerateHashBuildRight(maximumRows);
+            return EnumerateHashBuildLeft(maximumRows, context);
+        return EnumerateHashBuildRight(maximumRows, context);
     }
 
     private IEnumerable<VdbeJoinRow> EnumerateIndexSeekRight(
         VdbeJoinIndexScanPlan indexSeek,
-        int? maximumRows)
+        int? maximumRows,
+        VdbeJoinExecutionContext context)
     {
         if (Kind is not (VdbeJoinKind.Inner or VdbeJoinKind.Left))
             throw new InvalidOperationException("An index-seek right input requires an INNER or LEFT join.");
 
         var emitted = 0;
-        foreach (var left in Left.Enumerate(maximumRows: null))
+        foreach (var left in Left.Enumerate(maximumRows: null, context))
         {
             var matched = false;
             foreach (var right in indexSeek.Seek(left))
@@ -1238,9 +1261,11 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
         }
     }
 
-    private IEnumerable<VdbeJoinRow> EnumerateHashBuildRight(int? maximumRows)
+    private IEnumerable<VdbeJoinRow> EnumerateHashBuildRight(
+        int? maximumRows,
+        VdbeJoinExecutionContext context)
     {
-        var rightRows = Right.Enumerate(maximumRows: null).ToList();
+        var rightRows = Right.Enumerate(maximumRows: null, context).ToList();
         var rightMatched = Kind is VdbeJoinKind.Right or VdbeJoinKind.Full
             ? new bool[rightRows.Count]
             : null;
@@ -1266,8 +1291,9 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
             }
         }
 
-        foreach (var left in Left.Enumerate(maximumRows: null))
+        foreach (var left in Left.Enumerate(maximumRows: null, context))
         {
+            context.ThrowIfCancellationRequested();
             var matched = false;
             IEnumerable<int> candidateIndices;
             if (buckets is not null && EquiProbe is not null)
@@ -1321,11 +1347,13 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
         }
     }
 
-    private IEnumerable<VdbeJoinRow> EnumerateHashBuildLeft(int? maximumRows)
+    private IEnumerable<VdbeJoinRow> EnumerateHashBuildLeft(
+        int? maximumRows,
+        VdbeJoinExecutionContext context)
     {
         // INNER only: materialize left, stream right, probe left buckets. Output column order
         // stays left||right via Combine.
-        var leftRows = Left.Enumerate(maximumRows: null).ToList();
+        var leftRows = Left.Enumerate(maximumRows: null, context).ToList();
         var emitted = 0;
         Dictionary<string, List<int>>? buckets = null;
         if (EquiProbe is not null && leftRows.Count > 0)
@@ -1346,8 +1374,9 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
             }
         }
 
-        foreach (var right in Right.Enumerate(maximumRows: null))
+        foreach (var right in Right.Enumerate(maximumRows: null, context))
         {
+            context.ThrowIfCancellationRequested();
             IEnumerable<int> candidateIndices;
             if (buckets is not null && EquiProbe is not null)
             {
@@ -1445,13 +1474,17 @@ public sealed class VdbeJoinPlan
     /// row is consumed; the group-key ordinal map is built as rows arrive.
     /// </summary>
     internal IEnumerable<SqlValue[]> Enumerate()
+        => Enumerate(VdbeJoinExecutionContext.CreateDefault());
+
+    internal IEnumerable<SqlValue[]> Enumerate(VdbeJoinExecutionContext context)
     {
         var groupOrdinals = GroupKey is null
             ? null
             : new Dictionary<string, long>(StringComparer.Ordinal);
 
-        foreach (var raw in Root.Enumerate(MaximumRows))
+        foreach (var raw in Root.Enumerate(MaximumRows, context))
         {
+            context.ThrowIfCancellationRequested();
             if (Filter is not null && !Filter(raw))
                 continue;
 
@@ -1660,9 +1693,11 @@ public sealed class VdbeSubprogram
 
     internal ResumableStatement CreateRuntime(
         VdbeParameterBinding? parameterBinding,
-        VdbeExecutionOptions executionOptions)
+        VdbeExecutionOptions executionOptions,
+        VdbeExecutionMemory executionMemory)
     {
         ArgumentNullException.ThrowIfNull(executionOptions);
+        ArgumentNullException.ThrowIfNull(executionMemory);
         lock (_syncRoot)
         {
             var program = _program ?? throw new InvalidOperationException(
@@ -1675,7 +1710,8 @@ public sealed class VdbeSubprogram
                 parameterBinding,
                 sharedTransaction: null,
                 virtualTableBindings: null,
-                executionOptions: executionOptions);
+                executionOptions: executionOptions,
+                executionMemory: executionMemory);
         }
     }
 }

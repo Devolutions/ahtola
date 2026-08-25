@@ -319,9 +319,9 @@ public class SorterOpcodeExecutionTests
         DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(1, 2);
         statement.Dispose();
 
-        fileSystem.Created.Should().HaveCount(1);
+        fileSystem.Created.Should().NotBeEmpty();
         fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
-        fileSystem.FileExists(fileSystem.Created[0]).Should().BeFalse();
+        fileSystem.Created.Should().OnlyContain(path => !fileSystem.FileExists(path));
     }
 
     [Test]
