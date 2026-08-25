@@ -344,8 +344,10 @@ internal static class ManagedReplicaJournalLock
 /// <remarks>
 /// The apply and journal leases remain short and are never held across network I/O. This separate
 /// lease spans watermark verification and SQL replay so two processes cannot both observe the same
-/// pre-batch watermark and replay one non-idempotent batch concurrently. It excludes only another
-/// push flight; local commands and unrelated apply work continue to use their existing leases.
+/// pre-batch watermark and replay one non-idempotent batch concurrently. Any operation that can
+/// publish pull metadata or replace the main file takes this lease before the apply lease. That
+/// push-to-apply order prevents a file replacement from changing the physical identity used for
+/// this carrier while an older push carrier is still held.
 /// </remarks>
 internal static class ManagedReplicaPushLock
 {
