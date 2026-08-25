@@ -1,3 +1,5 @@
+using System.Runtime.ExceptionServices;
+
 namespace Ahtola.Core.Execution;
 
 /// <summary>
@@ -134,6 +136,89 @@ internal sealed class VdbeExecutionMemory(long limitBytes, VdbeExecutionMetrics 
     }
 }
 
+internal sealed class VdbeMemoryReservation : IDisposable
+{
+    private readonly VdbeExecutionMemory _memory;
+    private readonly long _bytes;
+    private bool _retained;
+
+    private VdbeMemoryReservation(VdbeExecutionMemory memory, long bytes)
+    {
+        _memory = memory;
+        _bytes = bytes;
+    }
+
+    public static VdbeMemoryReservation? TryCreate(VdbeExecutionMemory memory, long bytes)
+    {
+        ArgumentNullException.ThrowIfNull(memory);
+        ArgumentOutOfRangeException.ThrowIfNegative(bytes);
+        var reservation = new VdbeMemoryReservation(memory, bytes);
+        if (!memory.TryRetain(bytes, rows: 0))
+            return null;
+        reservation._retained = true;
+        return reservation;
+    }
+
+    public static VdbeMemoryReservation Create(VdbeExecutionMemory memory, long bytes)
+    {
+        ArgumentNullException.ThrowIfNull(memory);
+        ArgumentOutOfRangeException.ThrowIfNegative(bytes);
+        var reservation = new VdbeMemoryReservation(memory, bytes);
+        memory.RetainOrThrow(bytes, rows: 0);
+        reservation._retained = true;
+        return reservation;
+    }
+
+    public void Dispose()
+    {
+        if (!_retained)
+            return;
+        _retained = false;
+        _memory.Release(_bytes, rows: 0);
+    }
+}
+
+internal sealed class VdbePendingCleanupRegistry
+{
+    private List<IDisposable>? _pending;
+
+    public bool HasPending => _pending is { Count: > 0 };
+
+    public void Register(IDisposable cleanup)
+    {
+        ArgumentNullException.ThrowIfNull(cleanup);
+        if (!(_pending?.Contains(cleanup) ?? false))
+            (_pending ??= []).Add(cleanup);
+    }
+
+    public void Unregister(IDisposable cleanup) => _pending?.Remove(cleanup);
+
+    public void Retry()
+    {
+        if (_pending is not { Count: > 0 } pending)
+            return;
+
+        List<Exception>? failures = null;
+        for (var index = pending.Count - 1; index >= 0; index--)
+        {
+            try
+            {
+                pending[index].Dispose();
+                pending.RemoveAt(index);
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+        }
+
+        if (failures is [var failure])
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        if (failures is { Count: > 1 })
+            throw new AggregateException(failures);
+    }
+}
+
 internal static class VdbeManagedFootprint
 {
     public const long ReferenceBytes = 8;
@@ -152,7 +237,11 @@ internal static class VdbeManagedFootprint
     private const long PriorityQueueObjectBytes = 64;
     private const long PriorityQueueNodeBytes = 48;
     private const long RunReaderObjectBytes = 64;
-    private const long RunDescriptorSlotBytes = 24;
+    private const long RunDescriptorSlotBytes = 32;
+    private const long HashSpillObjectBytes = 96;
+    private const long HashPartitionObjectBytes = 32;
+    private const long TemporaryFileObjectBytes = 64;
+    private const long TemporaryFileWrapperBytes = 128;
 
     public static long EstimateSorterRow(IReadOnlyList<SqlValue> values)
     {
@@ -248,6 +337,35 @@ internal static class VdbeManagedFootprint
             + (runCount * RunReaderObjectBytes));
     }
 
+    public static long EstimateHashSpillInfrastructure(
+        string temporaryDirectory,
+        int partitionCount,
+        bool trackUnmatchedBuild)
+    {
+        ArgumentNullException.ThrowIfNull(temporaryDirectory);
+        ArgumentOutOfRangeException.ThrowIfNegative(partitionCount);
+
+        var partitionFileBytes = EstimateTemporaryFileInfrastructure(
+            temporaryDirectory.Length,
+            "hash-p000".Length);
+        var total = checked(
+            HashSpillObjectBytes
+            + EstimateArray(ReferenceBytes, partitionCount)
+            + (partitionCount * (HashPartitionObjectBytes + partitionFileBytes)));
+        if (trackUnmatchedBuild)
+        {
+            total = checked(
+                total
+                + EstimateTemporaryFileInfrastructure(
+                    temporaryDirectory.Length,
+                    "hash-build-order".Length)
+                + EstimateTemporaryFileInfrastructure(
+                    temporaryDirectory.Length,
+                    "hash-matches".Length));
+        }
+        return total;
+    }
+
     public static int GetListCapacityForCount(int currentCapacity, int requiredCount)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(currentCapacity);
@@ -289,6 +407,24 @@ internal static class VdbeManagedFootprint
         if (capacity > int.MaxValue)
             throw new OutOfMemoryException("A managed execution dictionary exceeded the supported capacity.");
         return (int)capacity;
+    }
+
+    private static long EstimateTemporaryFileInfrastructure(
+        int directoryCharacterCount,
+        int purposeCharacterCount)
+    {
+        var pathCharacterCount = checked(
+            directoryCharacterCount
+            + 1
+            + "ahtola-".Length
+            + purposeCharacterCount
+            + 1
+            + 32
+            + ".spill".Length);
+        return checked(
+            TemporaryFileObjectBytes
+            + TemporaryFileWrapperBytes
+            + EstimateString(pathCharacterCount));
     }
 
     private static long Align(long bytes) => checked((bytes + 7) & ~7L);

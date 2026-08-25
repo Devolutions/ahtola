@@ -236,6 +236,7 @@ internal static class VdbeSpillRecordCodec
         IFile file,
         ref long position,
         int count,
+        long recordEnd,
         VdbeExecutionMetrics metrics,
         CancellationToken cancellationToken)
     {
@@ -243,7 +244,7 @@ internal static class VdbeSpillRecordCodec
         for (var index = 0; index < count; index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            values[index] = ReadValue(file, ref position, metrics);
+            values[index] = ReadValue(file, ref position, recordEnd, metrics);
         }
         return values;
     }
@@ -262,9 +263,10 @@ internal static class VdbeSpillRecordCodec
     public static string ReadString(
         IFile file,
         ref long position,
+        long recordEnd,
         VdbeExecutionMetrics metrics)
     {
-        var length = ReadLength(file, ref position, metrics, "text");
+        var length = ReadLength(file, ref position, recordEnd, metrics, "text");
         var bytes = new byte[length];
         ReadExact(file, ref position, bytes, metrics);
         return Encoding.UTF8.GetString(bytes);
@@ -359,23 +361,43 @@ internal static class VdbeSpillRecordCodec
         }
     }
 
-    private static SqlValue ReadValue(IFile file, ref long position, VdbeExecutionMetrics metrics)
+    private static SqlValue ReadValue(
+        IFile file,
+        ref long position,
+        long recordEnd,
+        VdbeExecutionMetrics metrics)
     {
+        RequireRecordBytes(position, recordEnd, 1, "value tag");
         var kindByte = ReadByte(file, ref position, metrics);
         return kindByte switch
         {
             0x00 => SqlValue.Null,
-            0x01 => SqlValue.Integer(ReadInt64(file, ref position, metrics)),
-            0x02 => ReadReal(file, ref position, metrics),
-            0x03 => ReadText(file, ref position, metrics, isJson: false),
-            0x04 => ReadBlob(file, ref position, metrics),
-            0x83 => ReadText(file, ref position, metrics, isJson: true),
+            0x01 => ReadInteger(file, ref position, recordEnd, metrics),
+            0x02 => ReadReal(file, ref position, recordEnd, metrics),
+            0x03 => ReadText(file, ref position, recordEnd, metrics, isJson: false),
+            0x04 => ReadBlob(file, ref position, recordEnd, metrics),
+            0x83 => ReadText(file, ref position, recordEnd, metrics, isJson: true),
             _ => throw new InvalidDataException($"Unknown spilled value tag 0x{kindByte:X2}."),
         };
     }
 
-    private static SqlValue ReadReal(IFile file, ref long position, VdbeExecutionMetrics metrics)
+    private static SqlValue ReadInteger(
+        IFile file,
+        ref long position,
+        long recordEnd,
+        VdbeExecutionMetrics metrics)
     {
+        RequireRecordBytes(position, recordEnd, sizeof(long), "integer payload");
+        return SqlValue.Integer(ReadInt64(file, ref position, metrics));
+    }
+
+    private static SqlValue ReadReal(
+        IFile file,
+        ref long position,
+        long recordEnd,
+        VdbeExecutionMetrics metrics)
+    {
+        RequireRecordBytes(position, recordEnd, sizeof(double), "real payload");
         Span<byte> bytes = stackalloc byte[sizeof(double)];
         ReadExact(file, ref position, bytes, metrics);
         return SqlValue.Real(BinaryPrimitives.ReadDoubleLittleEndian(bytes));
@@ -384,16 +406,21 @@ internal static class VdbeSpillRecordCodec
     private static SqlValue ReadText(
         IFile file,
         ref long position,
+        long recordEnd,
         VdbeExecutionMetrics metrics,
         bool isJson)
     {
-        var text = ReadString(file, ref position, metrics);
+        var text = ReadString(file, ref position, recordEnd, metrics);
         return isJson ? SqlValue.JsonText(text) : SqlValue.Text(text);
     }
 
-    private static SqlValue ReadBlob(IFile file, ref long position, VdbeExecutionMetrics metrics)
+    private static SqlValue ReadBlob(
+        IFile file,
+        ref long position,
+        long recordEnd,
+        VdbeExecutionMetrics metrics)
     {
-        var length = ReadLength(file, ref position, metrics, "blob");
+        var length = ReadLength(file, ref position, recordEnd, metrics, "blob");
         var bytes = new byte[length];
         ReadExact(file, ref position, bytes, metrics);
         return SqlValue.Blob(bytes);
@@ -402,15 +429,33 @@ internal static class VdbeSpillRecordCodec
     private static int ReadLength(
         IFile file,
         ref long position,
+        long recordEnd,
         VdbeExecutionMetrics metrics,
         string kind)
     {
+        RequireRecordBytes(position, recordEnd, sizeof(int), $"{kind} length");
         var length = ReadInt32(file, ref position, metrics);
         if (length < 0)
             throw new InvalidDataException($"Execution spill {kind} length is negative.");
-        if (length > file.Length - position)
-            throw new EndOfStreamException($"Execution spill stream ended inside a {kind} payload.");
+        if (length > recordEnd - position)
+        {
+            throw new InvalidDataException(
+                $"Execution spill {kind} payload crosses its enclosing record boundary.");
+        }
         return length;
+    }
+
+    private static void RequireRecordBytes(
+        long position,
+        long recordEnd,
+        int byteCount,
+        string kind)
+    {
+        if (position < 0 || recordEnd < position || byteCount > recordEnd - position)
+        {
+            throw new InvalidDataException(
+                $"Execution spill {kind} crosses its enclosing record boundary.");
+        }
     }
 
     private static void Write(
