@@ -238,6 +238,7 @@ internal static class VdbeManagedFootprint
     private const long PriorityQueueNodeBytes = 48;
     private const long RunReaderObjectBytes = 64;
     private const long RunDescriptorSlotBytes = 32;
+    private const long SorterSpillObjectBytes = 96;
     private const long HashSpillObjectBytes = 96;
     private const long HashPartitionObjectBytes = 32;
     private const long TemporaryFileObjectBytes = 64;
@@ -364,6 +365,21 @@ internal static class VdbeManagedFootprint
                     "hash-matches".Length));
         }
         return total;
+    }
+
+    public static long EstimateSorterSpillInfrastructure(string temporaryDirectory)
+    {
+        ArgumentNullException.ThrowIfNull(temporaryDirectory);
+        return checked(
+            SorterSpillObjectBytes
+            + ListObjectBytes
+            + EstimateRunDescriptorListStorage(
+                GetListCapacityForCount(
+                    currentCapacity: 0,
+                    requiredCount: 1))
+            + EstimateTemporaryFileInfrastructure(
+                temporaryDirectory.Length,
+                "sorter".Length));
     }
 
     public static int GetListCapacityForCount(int currentCapacity, int requiredCount)
