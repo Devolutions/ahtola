@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using AwesomeAssertions;
+using NativeSqliteConnection = Microsoft.Data.Sqlite.SqliteConnection;
 
 namespace Ahtola.Tests;
 
@@ -52,6 +53,103 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         {
             contender?.Dispose();
             DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task MainFileReplacementKeepsTheNewGenerationBehindOrdinarySqliteWriters()
+    {
+        var path = NewReplicaPath("replace-sqlite-publication-lock");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        CrossProcessReplicaRaceWorker? contender = null;
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary != ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished
+                           || contender is not null)
+                       {
+                           return;
+                       }
+
+                       contender = new CrossProcessReplicaRaceWorker(
+                           TestContext.CurrentContext.WorkDirectory,
+                           path,
+                           "sqlite-write");
+                       contender.WaitForBlockedProbe();
+                   }))
+            {
+                var result = await connection.SyncAsync(
+                    new AhtolaSyncOptions(),
+                    CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            }
+
+            contender.Should().NotBeNull();
+            contender!.ReleaseBlockedProbe();
+            contender!.WaitForCompletion();
+            ReadBootstrapMarker(connection).Should().Be(84);
+        }
+        finally
+        {
+            contender?.Dispose();
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void RepeatedMainFileReplacementDoesNotCreateGuidStagingCarriers()
+    {
+        var path = NewReplicaPath("replace-carrier-growth");
+        var lockDirectory = path + ".locks";
+        var previousLockDirectory = Environment.GetEnvironmentVariable(
+            ManagedReplicaLockCarrier.DirectoryVariable);
+        File.WriteAllBytes(path, CreateDatabaseImageWithMarker(path + ".source", 42));
+
+        try
+        {
+            Environment.SetEnvironmentVariable(
+                ManagedReplicaLockCarrier.DirectoryVariable,
+                lockDirectory);
+            for (var index = 0; index < 32; index++)
+            {
+                var stagingPath = path + $".replacement-{Guid.NewGuid():N}.tmp";
+                var backupPath = path + $".backup-{Guid.NewGuid():N}.tmp";
+                File.Copy(path, stagingPath);
+                using (var replacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
+                           path, stagingPath, CancellationToken.None))
+                {
+                    ManagedReplicaApplyLock.ReplaceMainFile(
+                        replacementLock,
+                        stagingPath,
+                        path,
+                        backupPath,
+                        static () => { });
+                }
+                File.Delete(backupPath);
+            }
+
+            Directory.Exists(lockDirectory).Should().BeFalse(
+                "private replacement paths use their database inode directly and create no named carriers");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                ManagedReplicaLockCarrier.DirectoryVariable,
+                previousLockDirectory);
+            DeleteReplicaFiles(path);
+            if (Directory.Exists(lockDirectory))
+                Directory.Delete(lockDirectory, recursive: true);
         }
     }
 
@@ -236,7 +334,31 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         var startedPath = ReadWorkerValue("AHTOLA_REPLICA_RACE_STARTED");
         var blockedPath = ReadWorkerValue("AHTOLA_REPLICA_RACE_BLOCKED");
         var completedPath = ReadWorkerValue("AHTOLA_REPLICA_RACE_COMPLETED");
+        var releasePath = ReadWorkerValue("AHTOLA_REPLICA_RACE_RELEASE");
         File.WriteAllText(startedPath, string.Empty);
+
+        if (mode == "sqlite-write")
+        {
+            try
+            {
+                ProbeOrdinarySqliteWrite(databasePath, timeoutSeconds: 1);
+                File.WriteAllText(completedPath, "sqlite-write-acquired-without-blocking");
+                return;
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException exception)
+                when (exception.SqliteErrorCode is 5 or 6)
+            {
+                File.WriteAllText(blockedPath, "blocked");
+            }
+
+            WaitForWorkerFile(
+                releasePath,
+                TimeSpan.FromSeconds(30),
+                "The ordinary SQLite writer was not released after publication.");
+            ProbeOrdinarySqliteWrite(databasePath, timeoutSeconds: 30);
+            File.WriteAllText(completedPath, mode);
+            return;
+        }
 
         if (mode == "publication")
         {
@@ -296,11 +418,26 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         File.WriteAllText(completedPath, mode);
     }
 
+    private static void ProbeOrdinarySqliteWrite(string databasePath, int timeoutSeconds)
+    {
+        using var connection = new NativeSqliteConnection(
+            $"Data Source={databasePath};Mode=ReadWrite;Default Timeout={timeoutSeconds};Pooling=False");
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "UPDATE bootstrap_marker SET value = value;";
+        command.ExecuteNonQuery().Should().Be(1);
+        transaction.Rollback();
+    }
+
     private sealed class CrossProcessReplicaRaceWorker : IDisposable
     {
         private readonly Process _worker;
+        private readonly string _startedPath;
         private readonly string _blockedPath;
         private readonly string _completedPath;
+        private readonly string _releasePath;
         private readonly string _mode;
         private readonly StringBuilder _output = new();
         private bool _completed;
@@ -312,9 +449,10 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         {
             _mode = mode;
             var token = Guid.NewGuid().ToString("N");
-            var startedPath = Path.Combine(workDirectory, $"replica-race-started-{token}");
+            _startedPath = Path.Combine(workDirectory, $"replica-race-started-{token}");
             _blockedPath = Path.Combine(workDirectory, $"replica-race-blocked-{token}");
             _completedPath = Path.Combine(workDirectory, $"replica-race-completed-{token}");
+            _releasePath = Path.Combine(workDirectory, $"replica-race-release-{token}");
             var testDirectory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
             var startInfo = new ProcessStartInfo(
                 Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
@@ -331,9 +469,10 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 + nameof(CrossProcessReplicaRaceWorkerEntryPoint));
             startInfo.Environment["AHTOLA_REPLICA_RACE_MODE"] = mode;
             startInfo.Environment["AHTOLA_REPLICA_RACE_DATABASE"] = databasePath;
-            startInfo.Environment["AHTOLA_REPLICA_RACE_STARTED"] = startedPath;
+            startInfo.Environment["AHTOLA_REPLICA_RACE_STARTED"] = _startedPath;
             startInfo.Environment["AHTOLA_REPLICA_RACE_BLOCKED"] = _blockedPath;
             startInfo.Environment["AHTOLA_REPLICA_RACE_COMPLETED"] = _completedPath;
+            startInfo.Environment["AHTOLA_REPLICA_RACE_RELEASE"] = _releasePath;
 
             _worker = Process.Start(startInfo)
                 ?? throw new InvalidOperationException("Failed to start the replica race worker.");
@@ -342,7 +481,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             _worker.BeginOutputReadLine();
             _worker.BeginErrorReadLine();
             WaitForWorkerFile(
-                startedPath,
+                _startedPath,
                 TimeSpan.FromSeconds(60),
                 "The replica race worker did not report readiness.",
                 _worker);
@@ -357,6 +496,9 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 _worker);
             File.ReadAllText(_blockedPath).Should().Be("blocked");
         }
+
+        internal void ReleaseBlockedProbe()
+            => File.WriteAllText(_releasePath, string.Empty);
 
         internal void WaitForCompletion()
         {
@@ -386,6 +528,10 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             finally
             {
                 _worker.Dispose();
+                File.Delete(_startedPath);
+                File.Delete(_blockedPath);
+                File.Delete(_completedPath);
+                File.Delete(_releasePath);
             }
         }
 

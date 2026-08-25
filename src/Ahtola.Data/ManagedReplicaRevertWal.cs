@@ -932,6 +932,7 @@ internal static class ManagedReplicaRevertWal
         var databaseStagingPath = CreateStagingPath(databasePath, "restore");
         var databaseBackupPath = CreateStagingPath(databasePath, "restore-backup");
         IDisposable? mainFileReplacementLock = null;
+        var databaseInstalled = false;
         try
         {
             using (var stream = new FileStream(
@@ -968,11 +969,12 @@ internal static class ManagedReplicaRevertWal
                 databaseStagingPath,
                 cancellationToken);
             DeleteSqliteSidecars(databasePath);
-            File.Replace(
+            ManagedReplicaApplyLock.ReplaceMainFile(
+                mainFileReplacementLock,
                 databaseStagingPath,
                 databasePath,
                 databaseBackupPath,
-                ignoreMetadataErrors: false);
+                () => databaseInstalled = true);
             if (publishedBoundary is { } published)
                 ManagedReplicaFaultInjection.Hit(published);
             cancellationToken.ThrowIfCancellationRequested();
@@ -983,9 +985,22 @@ internal static class ManagedReplicaRevertWal
         }
         catch
         {
-            mainFileReplacementLock?.Dispose();
-            DeleteIfExists(databaseStagingPath);
-            DeleteIfExists(databaseBackupPath);
+            try
+            {
+                if (databaseInstalled && File.Exists(databaseBackupPath))
+                {
+                    ManagedReplicaApplyLock.RollBackMainFile(
+                        mainFileReplacementLock,
+                        databaseBackupPath,
+                        databasePath);
+                }
+            }
+            finally
+            {
+                mainFileReplacementLock?.Dispose();
+                DeleteIfExists(databaseStagingPath);
+                DeleteIfExists(databaseBackupPath);
+            }
             throw;
         }
     }

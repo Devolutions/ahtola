@@ -305,6 +305,7 @@ internal static class ManagedReplicaApplyLock
     internal const string CarrierSuffix = ".ahtola-replica-apply-lock";
     private const long PendingByte = 0x4000_0000;
     private const long SQLiteExclusiveRangeLength = 512;
+    private static readonly TimeSpan ReplacementLockTimeout = TimeSpan.FromSeconds(30);
     private static IManagedReplicaApplyLockCoordinator _current = CrossProcessManagedReplicaApplyLockCoordinator.Instance;
 
     internal static IManagedReplicaApplyLockCoordinator Current
@@ -335,70 +336,119 @@ internal static class ManagedReplicaApplyLock
         if (!File.Exists(path))
             return null;
 
-        IAsyncDisposable? replacementPushLease = null;
-        IAsyncDisposable? replacementApplyLease = null;
-        IDisposable? mainFileLease = null;
+        IDisposable? destinationMainFileLease = null;
+        IDisposable? replacementMainFileLease = null;
         try
         {
-            // The replacement inode is still private at this point, so acquiring its push carrier
-            // after the old generation's apply carrier cannot deadlock with another participant.
-            // Retaining both replacement carriers across File.Replace guarantees that any alias
-            // which resolves the newly published inode queues behind this publication.
-            replacementPushLease = ManagedReplicaPushLock
-                .AcquireExclusiveAsync(replacementPath, cancellationToken)
-                .AsTask()
-                .GetAwaiter()
-                .GetResult();
-            replacementApplyLease = CrossProcessManagedReplicaApplyLockCoordinator.Instance
-                .AcquireExclusiveAsync(replacementPath, cancellationToken)
-                .AsTask()
-                .GetAwaiter()
-                .GetResult();
-            mainFileLease = new SqliteWalByteRangeLock(path).AcquireExclusive(
+            // The caller already owns the final path's stable push/apply carriers. Lock the two
+            // database inodes themselves as well. Unix retains both leases across rename. Windows
+            // cannot rename a byte-locked source, so replacement releases that private staging
+            // lease at the replace syscall and immediately reacquires it through the final path,
+            // while the old destination remains locked. The GUID staging path deliberately gets no
+            // named carrier of its own; creating one per replacement would leak permanent files
+            // into the shared carrier directory.
+            destinationMainFileLease = new SqliteWalByteRangeLock(path).AcquireExclusive(
+                PendingByte,
+                SQLiteExclusiveRangeLength,
+                Timeout.InfiniteTimeSpan,
+                cancellationToken);
+            replacementMainFileLease = new SqliteWalByteRangeLock(replacementPath).AcquireExclusive(
                 PendingByte,
                 SQLiteExclusiveRangeLength,
                 Timeout.InfiniteTimeSpan,
                 cancellationToken);
             return new MainFileReplacementLease(
-                mainFileLease,
-                replacementApplyLease,
-                replacementPushLease);
+                destinationMainFileLease,
+                replacementMainFileLease,
+                cancellationToken);
         }
         catch
         {
-            mainFileLease?.Dispose();
-            replacementApplyLease?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            replacementPushLease?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            replacementMainFileLease?.Dispose();
+            destinationMainFileLease?.Dispose();
             throw;
         }
     }
 
-    internal static void ReleaseMainFileLeaseForRollback(IDisposable? replacementLock)
+    internal static void ReplaceMainFile(
+        IDisposable? replacementLock,
+        string replacementPath,
+        string destinationPath,
+        string? backupPath,
+        Action replacementCompleted)
     {
         if (replacementLock is MainFileReplacementLease lease)
-            lease.ReleaseMainFileLease();
+        {
+            lease.Replace(replacementPath, destinationPath, backupPath, replacementCompleted);
+            return;
+        }
+
+        File.Replace(replacementPath, destinationPath, backupPath, ignoreMetadataErrors: false);
+        replacementCompleted();
+    }
+
+    internal static void RollBackMainFile(
+        IDisposable? replacementLock,
+        string backupPath,
+        string destinationPath)
+    {
+        if (replacementLock is MainFileReplacementLease lease)
+        {
+            lease.RollBack(backupPath, destinationPath);
+            return;
+        }
+
+        File.Replace(backupPath, destinationPath, destinationBackupFileName: null, ignoreMetadataErrors: false);
     }
 
     private sealed class MainFileReplacementLease(
-        IDisposable mainFileLease,
-        IAsyncDisposable replacementApplyLease,
-        IAsyncDisposable replacementPushLease) : IDisposable
+        IDisposable destinationMainFileLease,
+        IDisposable replacementMainFileLease,
+        CancellationToken cancellationToken) : IDisposable
     {
-        private IDisposable? _mainFileLease = mainFileLease;
-        private IAsyncDisposable? _replacementApplyLease = replacementApplyLease;
-        private IAsyncDisposable? _replacementPushLease = replacementPushLease;
+        private IDisposable? _destinationMainFileLease = destinationMainFileLease;
+        private IDisposable? _replacementMainFileLease = replacementMainFileLease;
 
         internal void ReleaseMainFileLease()
-            => Interlocked.Exchange(ref _mainFileLease, null)?.Dispose();
+            => Interlocked.Exchange(ref _destinationMainFileLease, null)?.Dispose();
+
+        internal void Replace(
+            string replacementPath,
+            string destinationPath,
+            string? backupPath,
+            Action replacementCompleted)
+        {
+            if (OperatingSystem.IsWindows())
+                Interlocked.Exchange(ref _replacementMainFileLease, null)?.Dispose();
+
+            File.Replace(replacementPath, destinationPath, backupPath, ignoreMetadataErrors: false);
+            replacementCompleted();
+            if (OperatingSystem.IsWindows())
+                _replacementMainFileLease = AcquireSqliteMainFileLease(destinationPath);
+        }
+
+        internal void RollBack(string backupPath, string destinationPath)
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                ReleaseMainFileLease();
+                Interlocked.Exchange(ref _replacementMainFileLease, null)?.Dispose();
+            }
+            File.Replace(backupPath, destinationPath, destinationBackupFileName: null, ignoreMetadataErrors: false);
+        }
 
         public void Dispose()
         {
             ReleaseMainFileLease();
-            Interlocked.Exchange(ref _replacementApplyLease, null)
-                ?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            Interlocked.Exchange(ref _replacementPushLease, null)
-                ?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            Interlocked.Exchange(ref _replacementMainFileLease, null)?.Dispose();
         }
+
+        private IDisposable AcquireSqliteMainFileLease(string path)
+            => new SqliteWalByteRangeLock(path).AcquireExclusive(
+                PendingByte,
+                SQLiteExclusiveRangeLength,
+                ReplacementLockTimeout,
+                cancellationToken);
     }
 }
 

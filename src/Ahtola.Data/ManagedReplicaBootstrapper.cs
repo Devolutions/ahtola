@@ -2157,34 +2157,21 @@ internal static class ManagedReplicaBootstrapper
             }
             if (metadata.RevertState.HasValue)
                 metadata = ManagedReplicaRevertWal.MarkRemoteApplyStarted(options.Path, metadata);
+            var tableMap = RebuildTableMapFromSchema(stagingPath, options.RemoteEncryption);
+            var installedFingerprint = ComputeDatabaseFingerprint(stagingPath);
+            var remoteBaseSha256 = PublishRemoteBaseSnapshot(options.Path, metadata, stagingPath);
             mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
                 options.Path,
                 stagingPath,
                 cancellationToken);
-            File.Replace(stagingPath, options.Path, backupPath, ignoreMetadataErrors: false);
-            databaseInstalled = true;
+            ManagedReplicaApplyLock.ReplaceMainFile(
+                mainFileReplacementLock,
+                stagingPath,
+                options.Path,
+                backupPath,
+                () => databaseInstalled = true);
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyDatabasePublished);
             cancellationToken.ThrowIfCancellationRequested();
-
-            if (header.ApplyMode == PullApplyMode.ReplaceBase && pendingLocalChanges.Count > 0)
-            {
-                using var opened = ManagedReplicaEncryption.OpenDatabase(options.Path, options.RemoteEncryption);
-                var connection = opened.Database.Connect();
-                ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
-                try
-                {
-                    ManagedReplicaLogicalReplayer.ReplayPendingLocalStatements(
-                        connection, pendingLocalChanges, cancellationToken);
-                    ExecuteNonQuery(connection, "COMMIT");
-                }
-                catch
-                {
-                    TryExecuteNonQuery(connection, "ROLLBACK");
-                    throw;
-                }
-
-                ExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
-            }
 
             // A page-based apply never decodes logical schema identity operations, so the table
             // map is rebuilt fresh from the newly-installed schema (self-healing), matching
@@ -2192,17 +2179,6 @@ internal static class ManagedReplicaBootstrapper
             // freshly detected protocol is recorded too, so a protocol-2 remote that answered this
             // particular pull with Pages (e.g. Pages+ReplaceBase) still enables a logical request
             // on the next pull rather than sticking to pages forever.
-            var remoteBaseSha256 = PublishRemoteBaseSnapshot(options.Path, metadata, options.Path);
-            var tableMap = RebuildTableMapFromSchema(options.Path, options.RemoteEncryption);
-            var installedFingerprint = ComputeDatabaseFingerprint(options.Path);
-            if (!string.Equals(
-                    ComputeDatabaseFingerprint(options.Path),
-                    installedFingerprint,
-                    StringComparison.Ordinal))
-            {
-                throw new InvalidDataException(
-                    "Managed embedded replica changed while its replacement metadata was being published.");
-            }
             await WriteMetadataAsync(
                     metadataStagingPath,
                     metadataPath,
@@ -2234,8 +2210,10 @@ internal static class ManagedReplicaBootstrapper
             // interruption must preserve that matched pair rather than restore only DB.
             if (databaseInstalled && !metadataInstalled && File.Exists(backupPath))
             {
-                ManagedReplicaApplyLock.ReleaseMainFileLeaseForRollback(mainFileReplacementLock);
-                File.Replace(backupPath, options.Path, destinationBackupFileName: null, ignoreMetadataErrors: false);
+                ManagedReplicaApplyLock.RollBackMainFile(
+                    mainFileReplacementLock,
+                    backupPath,
+                    options.Path);
             }
             throw;
         }
