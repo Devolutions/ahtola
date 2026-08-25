@@ -263,6 +263,7 @@ internal static class ManagedReplicaRevertWal
     {
         ArgumentException.ThrowIfNullOrEmpty(databasePath);
         CleanupTemporaryArtifacts(databasePath);
+        EnsurePushRecoveryComplete(metadata);
         if (metadata.RevertState is not { } state)
         {
             Retire(databasePath);
@@ -273,6 +274,17 @@ internal static class ManagedReplicaRevertWal
         throw new InvalidOperationException(
             "Managed embedded replica has a pending checkpoint recovery bundle that must be "
             + "resolved before starting another pull or checkpoint.");
+    }
+
+    internal static void EnsurePushRecoveryComplete(
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
+    {
+        if (metadata.PushState.HasValue)
+        {
+            throw new InvalidOperationException(
+                "Managed embedded replica has a pending push outcome that must be recovered "
+                + "before publishing pulled or materialized state.");
+        }
     }
 
     internal static ManagedReplicaBootstrapper.ManagedReplicaMetadata CompletePreparedCheckpoint(

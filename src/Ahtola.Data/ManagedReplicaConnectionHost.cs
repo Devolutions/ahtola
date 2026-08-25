@@ -689,7 +689,6 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         metadata = ManagedReplicaBootstrapper.EnsureLegacyRemoteBaseSnapshot(
             replicaOptions.Path,
             metadata);
-        metadata = ManagedReplicaRevertWal.PrepareSynchronization(replicaOptions.Path, metadata);
         var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0
             || _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark).Count != 0;
         var retainedMaterializer = _materializationLease?.FileSystem;
