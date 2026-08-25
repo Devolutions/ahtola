@@ -270,9 +270,14 @@ public class SorterOpcodeExecutionTests
         var fileSystem = new TrackingFileSystem();
         var options = new VdbeExecutionOptions(
             fileSystem,
-            sorterMemoryLimitBytes: 1,
+            sorterMemoryLimitBytes: 2048,
             temporaryDirectory: "sorter-byte-budget");
-        var program = SingleColumnSorterProgram(AscendingFirstColumn, 3, 1, 2);
+        var program = SingleColumnSpillSorterProgram(
+            AscendingFirstColumn,
+            bufferRowCapacity: 1,
+            3,
+            1,
+            2);
 
         using (var statement = ResumableStatement.CreateWithExecutionOptions(program, options))
         {
@@ -289,7 +294,7 @@ public class SorterOpcodeExecutionTests
     {
         var options = new VdbeExecutionOptions(
             new InMemoryFileSystem(),
-            sorterMemoryLimitBytes: 1024,
+            sorterMemoryLimitBytes: 2048,
             temporaryDirectory: "sorter-fan-in",
             sorterMergeFanIn: 2);
         var values = Enumerable.Range(1, 40).Select(static value => (long)(41 - value)).ToArray();
@@ -301,6 +306,261 @@ public class SorterOpcodeExecutionTests
     }
 
     [Test]
+    public void SizeTieredConsolidationKeepsManyRunRewriteGrowthLogarithmic()
+    {
+        const int runCount = 256;
+        const long encodedIntegerRecordBytes = 14;
+        const int maximumWritesPerRecord = 10;
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 4096,
+            temporaryDirectory: "sorter-size-tiers",
+            sorterMergeFanIn: 2,
+            metrics: metrics);
+        var values = Enumerable.Range(1, runCount)
+            .Reverse()
+            .Select(static value => (long)value)
+            .ToArray();
+        var program = SingleColumnSpillSorterProgram(
+            AscendingFirstColumn,
+            bufferRowCapacity: 1,
+            values);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+
+        DrainRows(statement)
+            .Select(row => row[0].AsInteger())
+            .Should()
+            .Equal(Enumerable.Range(1, runCount).Select(static value => (long)value));
+
+        metrics.SorterRunsWritten.Should().BeLessThanOrEqualTo((2L * runCount) - 1);
+        metrics.SpillBytesWritten.Should().BeLessThanOrEqualTo(
+            VdbeSpillRecordCodec.FileHeaderSize
+            + (runCount * encodedIntegerRecordBytes * maximumWritesPerRecord));
+        metrics.CurrentRetainedBytes.Should().Be(0);
+    }
+
+    [Test]
+    public void LargeTextAndBlobRowsRemainWithinManagedMergeBudget()
+    {
+        const long budget = 32_768;
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: budget,
+            temporaryDirectory: "sorter-large-values",
+            metrics: metrics);
+        VdbeRowComparer preserveInsertionOrder = (_, _) => 0;
+        var text = new string('x', 2048);
+        var blob = Enumerable.Range(0, 2048).Select(static value => (byte)value).ToArray();
+        var program = SingleColumnValueSpillSorterProgram(
+            preserveInsertionOrder,
+            bufferRowCapacity: 1,
+            SqlValue.Text(text),
+            SqlValue.Blob(blob));
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+
+        var rows = DrainRows(statement);
+        rows[0][0].AsText().Should().Be(text);
+        rows[1][0].AsBlob().ToArray().Should().Equal(blob);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+    }
+
+    [Test]
+    public void EncodedRowFootprintIncludesUtf8DecoderScratch()
+    {
+        var row = new[] { SqlValue.Text(new string('x', 4096)) };
+        var encodedLength = VdbeSpillRecordCodec.EstimateEncodedValuesLength(row);
+        var retainedBytes = VdbeManagedFootprint.EstimateSorterRow(row);
+        var decodedPeakBytes = VdbeManagedFootprint.EstimateSorterRowFromEncodedLength(
+            encodedLength,
+            row.Length);
+
+        decodedPeakBytes.Should().BeGreaterThanOrEqualTo(
+            retainedBytes + VdbeManagedFootprint.EstimateUtf8Scratch(4096));
+    }
+
+    [Test]
+    public void ContainerReplacementAccountsForOverlappingBackingStores()
+    {
+        var oldBytes = VdbeManagedFootprint.EstimateReferenceListStorage(4);
+        var replacementBytes = VdbeManagedFootprint.EstimateReferenceListStorage(8);
+        var metrics = new VdbeExecutionMetrics();
+        var memory = new VdbeExecutionMemory(oldBytes + replacementBytes, metrics);
+        memory.RetainOrThrow(oldBytes, rows: 0);
+
+        var reservation =
+            VdbeManagedFootprint.EstimateContainerReplacement(oldBytes, replacementBytes);
+        memory.RetainOrThrow(reservation, rows: 0);
+        metrics.PeakRetainedBytes.Should().Be(oldBytes + replacementBytes);
+
+        memory.Release(oldBytes, rows: 0);
+        metrics.CurrentRetainedBytes.Should().Be(replacementBytes);
+        memory.Release(replacementBytes, rows: 0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+    }
+
+    [Test]
+    public void DirectSpillReservesRowBeforeAllocatingInfrastructure()
+    {
+        const string temporaryDirectory = "sorter-direct-reservation";
+        var spillBytes =
+            VdbeManagedFootprint.EstimateSorterSpillInfrastructure(temporaryDirectory);
+        var value = SqlValue.Text(new string('x', 150));
+        var row = new[] { value };
+        var rowBytes = Math.Max(
+            VdbeManagedFootprint.EstimateSorterRow(row),
+            VdbeManagedFootprint.EstimateSorterRowFromEncodedLength(
+                VdbeSpillRecordCodec.EstimateEncodedValuesLength(row),
+                row.Length));
+        rowBytes.Should().BeLessThan(spillBytes);
+        checked(
+                rowBytes
+                + VdbeManagedFootprint.EstimateReferenceListStorage(4)
+                + VdbeManagedFootprint.EstimateSortWorkspace(1))
+            .Should().BeGreaterThan(spillBytes);
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: spillBytes,
+            temporaryDirectory: temporaryDirectory,
+            metrics: metrics);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnValueSpillSorterProgram(
+                AscendingFirstColumn,
+                bufferRowCapacity: 1,
+                value),
+            options);
+
+        Assert.Throws<VdbeMemoryLimitExceededException>(() => statement.StepResumable());
+
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(spillBytes);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Created.Should().BeEmpty();
+    }
+
+    [Test]
+    public void MergeFanInShrinksToFitEveryLargeRunHead()
+    {
+        const long budget = 8192;
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: budget,
+            temporaryDirectory: "sorter-accounted-heads",
+            sorterMergeFanIn: 32,
+            metrics: metrics);
+        VdbeRowComparer comparer = (left, right) =>
+            string.CompareOrdinal(left[0].AsText(), right[0].AsText());
+        var values = Enumerable.Range(1, 20)
+            .Reverse()
+            .Select(static value => SqlValue.Text($"{value:D3}-{new string('x', 512)}"))
+            .ToArray();
+        var program = SingleColumnValueSpillSorterProgram(
+            comparer,
+            bufferRowCapacity: 1,
+            values);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+
+        DrainRows(statement)
+            .Select(static row => row[0].AsText()[..3])
+            .Should()
+            .Equal(Enumerable.Range(1, 20).Select(static value => value.ToString("D3")));
+        metrics.SorterRunsWritten.Should().BeGreaterThan(values.Length);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+    }
+
+    [Test]
+    public void FailedMergeInfrastructureReservationDoesNotReleasePhantomBytes()
+    {
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 200,
+            temporaryDirectory: "sorter-merge-reservation",
+            metrics: metrics);
+        var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnSorterProgram(AscendingFirstColumn, 1),
+            options);
+
+        Assert.Throws<VdbeMemoryLimitExceededException>(() => statement.StepResumable());
+        statement.Dispose();
+
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.CurrentRetainedRows.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+    }
+
+    [Test]
+    public void SorterSpillUsesExactAvailableInfrastructureBudget()
+    {
+        const string temporaryDirectory = "sorter-exact-infrastructure";
+        var infrastructureBytes =
+            VdbeManagedFootprint.EstimateSorterSpillInfrastructure(temporaryDirectory);
+        var bufferedBytes = EstimateSingleIntegerBufferBytes();
+        var budget = checked(bufferedBytes + infrastructureBytes);
+        var metrics = new VdbeExecutionMetrics();
+        var fileSystem = new TrackingFileSystem();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory,
+            metrics: metrics);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnSpillInsertsThenHaltProgram(
+                AscendingFirstColumn,
+                bufferRowCapacity: 1,
+                2,
+                1),
+            options);
+
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Done);
+
+        metrics.PeakRetainedBytes.Should().Be(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Created.Should().ContainSingle();
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void SorterSpillBelowInfrastructureBudgetFailsBeforeCreatingFile()
+    {
+        const string temporaryDirectory = "sorter-below-infrastructure";
+        var infrastructureBytes =
+            VdbeManagedFootprint.EstimateSorterSpillInfrastructure(temporaryDirectory);
+        var bufferedBytes = EstimateSingleIntegerBufferBytes();
+        var metrics = new VdbeExecutionMetrics();
+        var fileSystem = new TrackingFileSystem();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: checked(bufferedBytes + infrastructureBytes - 1),
+            temporaryDirectory: temporaryDirectory,
+            metrics: metrics);
+        var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnSpillInsertsThenHaltProgram(
+                AscendingFirstColumn,
+                bufferRowCapacity: 1,
+                2,
+                1),
+            options);
+
+        var exception = Assert.Throws<VdbeMemoryLimitExceededException>(
+            () => statement.StepResumable());
+        exception.RequestedBytes.Should().Be(infrastructureBytes);
+        fileSystem.Created.Should().BeEmpty();
+
+        statement.Dispose();
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.CurrentRetainedRows.Should().Be(0);
+    }
+
+    [Test]
     public void SpillWriteFailureDeletesTheAllocatedIFileSystemRunOnDispose()
     {
         var faults = new DeterministicFaultInjector();
@@ -309,9 +569,13 @@ public class SorterOpcodeExecutionTests
         faults.FailNextAfter(FileSystemOperation.Open, FileSystemOperation.Write);
         var options = new VdbeExecutionOptions(
             fileSystem,
-            sorterMemoryLimitBytes: 1,
+            sorterMemoryLimitBytes: 2048,
             temporaryDirectory: "sorter-write-fault");
-        var program = SingleColumnSorterProgram(AscendingFirstColumn, 2, 1);
+        var program = SingleColumnSpillSorterProgram(
+            AscendingFirstColumn,
+            bufferRowCapacity: 1,
+            2,
+            1);
         var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
 
         Assert.Throws<IOException>(() => statement.StepResumable());
@@ -319,9 +583,84 @@ public class SorterOpcodeExecutionTests
         DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(1, 2);
         statement.Dispose();
 
-        fileSystem.Created.Should().HaveCount(1);
+        fileSystem.Created.Should().NotBeEmpty();
         fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
-        fileSystem.FileExists(fileSystem.Created[0]).Should().BeFalse();
+        fileSystem.Created.Should().OnlyContain(path => !fileSystem.FileExists(path));
+    }
+
+    [Test]
+    public void SpillOpenFailureReleasesInfrastructureAndAllowsRetry()
+    {
+        var faults = new DeterministicFaultInjector();
+        var backing = new InMemoryFileSystem(faults);
+        var fileSystem = new TrackingFileSystem(backing);
+        var metrics = new VdbeExecutionMetrics();
+        faults.FailNext(FileSystemOperation.Open);
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: 4096,
+            temporaryDirectory: "sorter-open-retry",
+            metrics: metrics);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnSpillSorterProgram(AscendingFirstColumn, 1, 2, 1),
+            options);
+
+        Assert.Throws<IOException>(() => statement.StepResumable());
+        metrics.CurrentRetainedBytes.Should().BeGreaterThan(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+
+        faults.ClearScheduled();
+        DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(1, 2);
+
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+    }
+
+    [Test]
+    public void SpillConstructionDeleteFailureRemainsRetryableForReset()
+    {
+        const string temporaryDirectory = "sorter-construction-cleanup";
+        var faults = new DeterministicFaultInjector();
+        var backing = new InMemoryFileSystem(faults);
+        var fileSystem = new TrackingFileSystem(backing);
+        var metrics = new VdbeExecutionMetrics();
+        faults.FailOnOccurrence(
+            FileSystemOperation.Write,
+            occurrence: 1,
+            message: "construction failed");
+        for (var occurrence = 1; occurrence <= 32; occurrence++)
+            faults.FailOnOccurrence(FileSystemOperation.Delete, occurrence);
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: 2048,
+            temporaryDirectory: temporaryDirectory,
+            metrics: metrics);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnSpillSorterProgram(
+                AscendingFirstColumn,
+                bufferRowCapacity: 1,
+                2,
+                1),
+            options);
+
+        Assert.Catch<Exception>(() => statement.StepResumable());
+
+        metrics.ActiveSpillFiles.Should().Be(1);
+        metrics.CurrentRetainedBytes.Should().BeGreaterThan(0);
+        fileSystem.Created.Where(backing.FileExists).Should().ContainSingle();
+
+        Assert.Catch<Exception>(() => statement.Reset());
+        metrics.CurrentRetainedBytes.Should().Be(
+            VdbeManagedFootprint.EstimateSorterSpillInfrastructure(temporaryDirectory));
+        metrics.ActiveSpillFiles.Should().Be(1);
+
+        faults.ClearScheduled();
+        statement.Reset();
+
+        metrics.ActiveSpillFiles.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        fileSystem.Created.Should().OnlyContain(path => !backing.FileExists(path));
+        DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(1, 2);
     }
 
     [Test]
@@ -336,7 +675,7 @@ public class SorterOpcodeExecutionTests
         };
         var options = new VdbeExecutionOptions(
             fileSystem,
-            sorterMemoryLimitBytes: 1024,
+            sorterMemoryLimitBytes: 2048,
             temporaryDirectory: "sorter-cancellation");
         var statement = ResumableStatement.CreateWithExecutionOptions(
             SingleColumnSpillSorterProgram(comparer, 2, 3, 2, 1),
@@ -358,10 +697,15 @@ public class SorterOpcodeExecutionTests
         faults.FailNext(FileSystemOperation.Read);
         var options = new VdbeExecutionOptions(
             fileSystem,
-            sorterMemoryLimitBytes: 1,
+            sorterMemoryLimitBytes: 2048,
             temporaryDirectory: "sorter-read-fault");
         var statement = ResumableStatement.CreateWithExecutionOptions(
-            SingleColumnSorterProgram(AscendingFirstColumn, 3, 1, 2),
+            SingleColumnSpillSorterProgram(
+                AscendingFirstColumn,
+                bufferRowCapacity: 1,
+                3,
+                1,
+                2),
             options);
 
         Assert.Throws<IOException>(() => statement.StepResumable());
@@ -501,6 +845,59 @@ public class SorterOpcodeExecutionTests
         return new VdbeProgram(registerCount: 1, cursorCount: 0, instructions, sorterCount: 1);
     }
 
+    private static VdbeProgram SingleColumnSpillInsertsThenHaltProgram(
+        VdbeRowComparer comparer,
+        int bufferRowCapacity,
+        params long[] values)
+    {
+        var instructions = new List<VdbeInstruction>
+        {
+            new OpenSorterInstruction(new Sorter(0), comparer, 1, bufferRowCapacity),
+        };
+        foreach (var value in values)
+        {
+            instructions.Add(new LoadConstantInstruction(new Register(0), SqlValue.Integer(value)));
+            instructions.Add(new SorterInsertInstruction(new Sorter(0), new RegisterRange(new Register(0), 1)));
+        }
+        instructions.Add(new HaltInstruction());
+        return new VdbeProgram(registerCount: 1, cursorCount: 0, instructions, sorterCount: 1);
+    }
+
+    private static VdbeProgram SingleColumnValueSpillInsertsThenHaltProgram(
+        VdbeRowComparer comparer,
+        int bufferRowCapacity,
+        params SqlValue[] values)
+    {
+        var instructions = new List<VdbeInstruction>
+        {
+            new OpenSorterInstruction(new Sorter(0), comparer, 1, bufferRowCapacity),
+        };
+        foreach (var value in values)
+        {
+            instructions.Add(new LoadConstantInstruction(new Register(0), value));
+            instructions.Add(new SorterInsertInstruction(new Sorter(0), new RegisterRange(new Register(0), 1)));
+        }
+        instructions.Add(new HaltInstruction());
+        return new VdbeProgram(registerCount: 1, cursorCount: 0, instructions, sorterCount: 1);
+    }
+
+    private static long EstimateSingleIntegerBufferBytes()
+    {
+        SqlValue[] row = [SqlValue.Integer(1)];
+        var rowBytes = Math.Max(
+            VdbeManagedFootprint.EstimateSorterRow(row),
+            VdbeManagedFootprint.EstimateSorterRowFromEncodedLength(
+                VdbeSpillRecordCodec.EstimateEncodedValuesLength(row),
+                row.Length));
+        var capacity = VdbeManagedFootprint.GetListCapacityForCount(
+            currentCapacity: 0,
+            requiredCount: 1);
+        return checked(
+            rowBytes
+            + VdbeManagedFootprint.EstimateReferenceListStorage(capacity)
+            + VdbeManagedFootprint.EstimateSortWorkspace(1));
+    }
+
     // Two-column variant for stability checks: the first column is the sort key, the
     // second column carries an insertion-order tag so a stable sort is observable.
     private static VdbeProgram TwoColumnStableSorterProgram(
@@ -573,6 +970,33 @@ public class SorterOpcodeExecutionTests
         instructions.Add(new CloseSorterInstruction(new Sorter(0)));
         instructions.Add(new HaltInstruction());
 
+        return new VdbeProgram(registerCount: 1, cursorCount: 0, instructions, sorterCount: 1);
+    }
+
+    private static VdbeProgram SingleColumnValueSpillSorterProgram(
+        VdbeRowComparer comparer,
+        int bufferRowCapacity,
+        params SqlValue[] values)
+    {
+        var instructions = new List<VdbeInstruction>
+        {
+            new OpenSorterInstruction(new Sorter(0), comparer, 1, bufferRowCapacity),
+        };
+        foreach (var value in values)
+        {
+            instructions.Add(new LoadConstantInstruction(new Register(0), value));
+            instructions.Add(new SorterInsertInstruction(new Sorter(0), new RegisterRange(new Register(0), 1)));
+        }
+
+        var sortAddress = instructions.Count;
+        var drainLoop = sortAddress + 1;
+        var drainDone = drainLoop + 3;
+        instructions.Add(new SorterSortInstruction(new Sorter(0), new ProgramCounter(drainDone)));
+        instructions.Add(new SorterDataInstruction(new Sorter(0), new RegisterRange(new Register(0), 1)));
+        instructions.Add(new ResultRowInstruction(new RegisterRange(new Register(0), 1)));
+        instructions.Add(new SorterNextInstruction(new Sorter(0), new ProgramCounter(drainLoop)));
+        instructions.Add(new CloseSorterInstruction(new Sorter(0)));
+        instructions.Add(new HaltInstruction());
         return new VdbeProgram(registerCount: 1, cursorCount: 0, instructions, sorterCount: 1);
     }
 
