@@ -1,7 +1,9 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using AwesomeAssertions;
 using System.Net;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 
 namespace Ahtola.Tests;
@@ -510,11 +512,297 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [Test]
+    public async Task CrossProcessAliasPullCannotEraseOrReplayACommittedPushIntent()
+    {
+        var realDirectory = Path.Combine(
+            TestContext.CurrentContext.WorkDirectory,
+            $"push-publication-real-{Guid.NewGuid():N}");
+        var aliasDirectory = Path.Combine(
+            TestContext.CurrentContext.WorkDirectory,
+            $"push-publication-alias-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(realDirectory);
+        var path = Path.Combine(realDirectory, "replica.db");
+        var aliasPath = Path.Combine(aliasDirectory, "replica.db");
+        var image = CreateJournalDatabaseImage(path + ".source");
+        var bootstrapHandler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+        ]);
+
+        try
+        {
+            try
+            {
+                Directory.CreateSymbolicLink(aliasDirectory, realDirectory);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                Assert.Ignore("Creating symbolic links is not permitted on this host.");
+            }
+            catch (PlatformNotSupportedException)
+            {
+                Assert.Ignore("Symbolic links are not supported on this host.");
+            }
+
+            using (var setup = AhtolaConnection.CreateReplica(CreateOptions(path, bootstrapHandler)))
+            {
+                setup.Open();
+                setup.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+            }
+
+            var requestMetadata = ManagedReplicaBootstrapper.LoadMetadata(aliasPath)!.Value;
+            var requestJournal = ManagedReplicaChangeJournal.Open(aliasPath);
+            var requestPending = requestJournal.ReadBatch(int.MaxValue).Changes;
+            var stalePullHandler = new DelayedPullHandler(
+                CreateLogicalPullResponse("revision-43", body: []));
+            var pullWaitingForPublication = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<AhtolaSyncResult> stalePull;
+            using var pullBoundary = ManagedReplicaFaultInjection.Push(boundary =>
+            {
+                if (boundary == ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting)
+                    pullWaitingForPublication.TrySetResult();
+            });
+            stalePull = ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                CreateOptions(aliasPath, stalePullHandler),
+                requestMetadata,
+                new AhtolaSyncOptions(),
+                requestPending,
+                acknowledgedLocalChanges: [],
+                CancellationToken.None);
+            await stalePullHandler.RequestStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+            using var worker = new CrossProcessCommittedPushWorker(
+                TestContext.CurrentContext.WorkDirectory,
+                path);
+            stalePullHandler.Release();
+            await pullWaitingForPublication.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+            stalePull.IsCompleted.Should().BeFalse(
+                "pull publication through an alias must queue behind the process holding the "
+                + "physical push-flight lease");
+            ManagedReplicaBootstrapper.LoadMetadata(aliasPath)!.Value.PushState.Should().Be(
+                new ManagedReplicaBootstrapper.ManagedReplicaPushState(0, 1, 2),
+                "the stale pull must not erase the durable evidence of the remote commit");
+
+            worker.Release();
+            var rejected = Assert.ThrowsAsync<InvalidOperationException>(() => stalePull);
+            rejected!.Message.Should().Contain("pending push outcome");
+            var interrupted = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            interrupted.Revision.Should().Be("revision-42");
+            interrupted.PushState.Should().Be(
+                new ManagedReplicaBootstrapper.ManagedReplicaPushState(0, 1, 2));
+
+            var replayCount = 0;
+            var watermarkReadCount = 0;
+            var recoveryHandler = new ReplicaPushHandler(
+                [CreateLogicalPullResponse("revision-42", body: [])],
+                request =>
+                {
+                    if (IsReplicaPushBatch(request))
+                    {
+                        replayCount++;
+                        return ReplicaPushHandler.SuccessfulBatchResponse(1);
+                    }
+
+                    watermarkReadCount++;
+                    return ReplicaPushHandler.WatermarkResponse(0, 1);
+                });
+            using var recovery = AhtolaConnection.CreateReplica(CreateOptions(path, recoveryHandler));
+            recovery.Open();
+            var result = await recovery.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            result.Statistics.CdcOperations.Should().Be(1);
+            replayCount.Should().Be(0, "the remote watermark proves the protected batch already committed");
+            watermarkReadCount.Should().Be(1);
+            recovery.ReadManagedReplicaLocalChanges(10).Changes.Should().BeEmpty();
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.PushState.Should().BeNull();
+        }
+        finally
+        {
+            if (Directory.Exists(aliasDirectory))
+                Directory.Delete(aliasDirectory);
+            DeleteReplicaFiles(path);
+            if (Directory.Exists(realDirectory))
+                Directory.Delete(realDirectory, recursive: true);
+        }
+    }
+
+    [Test]
+    [Category("ProcessWorker")]
+    [NonParallelizable]
+    public async Task CrossProcessCommittedPushIntentWorker()
+    {
+        var databasePath = Environment.GetEnvironmentVariable("AHTOLA_PUSH_INTENT_WORKER_DATABASE");
+        if (string.IsNullOrEmpty(databasePath))
+            return;
+
+        var readyPath = ReadWorkerValue("AHTOLA_PUSH_INTENT_WORKER_READY");
+        var releasePath = ReadWorkerValue("AHTOLA_PUSH_INTENT_WORKER_RELEASE");
+        var resultPath = ReadWorkerValue("AHTOLA_PUSH_INTENT_WORKER_RESULT");
+        await using var pushLease = await ManagedReplicaPushLock
+            .AcquireExclusiveAsync(databasePath, CancellationToken.None)
+            .ConfigureAwait(false);
+        await using (await ManagedReplicaApplyLock
+                         .AcquireExclusiveAsync(databasePath, CancellationToken.None)
+                         .ConfigureAwait(false))
+        {
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(databasePath)!.Value;
+            var batch = ManagedReplicaChangeJournal.Open(databasePath).ReadBatch(int.MaxValue);
+            _ = ManagedReplicaRevertWal.MarkPushStarted(
+                databasePath,
+                metadata,
+                batch,
+                sourcePullGeneration: 0);
+        }
+
+        File.WriteAllText(resultPath, "committed");
+        File.WriteAllText(readyPath, string.Empty);
+        WaitForWorkerFile(releasePath, TimeSpan.FromSeconds(30), "The push-intent worker was not released.");
+    }
+
     private static bool IsReplicaPushBatch(HttpRequestMessage request)
     {
         using var document = JsonDocument.Parse(
             request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
         return document.RootElement.GetProperty("requests")[0].TryGetProperty("batch", out _);
+    }
+
+    private static string ReadWorkerValue(string name)
+        => Environment.GetEnvironmentVariable(name)
+           ?? throw new InvalidOperationException($"The push-intent worker is missing {name}.");
+
+    private static void WaitForWorkerFile(string path, TimeSpan timeout, string message, Process? worker = null)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (!File.Exists(path))
+        {
+            if (worker is { HasExited: true })
+                Assert.Fail($"{message} The worker exited with code {worker.ExitCode}.");
+            if (stopwatch.Elapsed >= timeout)
+                Assert.Fail(message);
+            Thread.Sleep(25);
+        }
+    }
+
+    private sealed class DelayedPullHandler(byte[] response) : HttpMessageHandler
+    {
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource RequestStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal void Release() => _release.TrySetResult();
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestStarted.TrySetResult();
+            await _release.Task.WaitAsync(cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(response),
+            };
+        }
+    }
+
+    private sealed class CrossProcessCommittedPushWorker : IDisposable
+    {
+        private readonly Process _worker;
+        private readonly string _readyPath;
+        private readonly string _releasePath;
+        private readonly string _resultPath;
+        private readonly StringBuilder _output = new();
+        private bool _released;
+
+        internal CrossProcessCommittedPushWorker(string workDirectory, string databasePath)
+        {
+            var token = Guid.NewGuid().ToString("N");
+            _readyPath = Path.Combine(workDirectory, $"push-intent-ready-{token}");
+            _releasePath = Path.Combine(workDirectory, $"push-intent-release-{token}");
+            _resultPath = Path.Combine(workDirectory, $"push-intent-result-{token}");
+            var testDirectory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
+            var startInfo = new ProcessStartInfo(
+                Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+            {
+                WorkingDirectory = testDirectory.FullName,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            startInfo.ArgumentList.Add("vstest");
+            startInfo.ArgumentList.Add(Path.Combine(testDirectory.FullName, "Ahtola.Tests.dll"));
+            startInfo.ArgumentList.Add(
+                "--TestCaseFilter:FullyQualifiedName=Ahtola.Tests.ManagedEmbeddedReplicaConnectionTests."
+                + nameof(CrossProcessCommittedPushIntentWorker));
+            startInfo.Environment["AHTOLA_PUSH_INTENT_WORKER_DATABASE"] = databasePath;
+            startInfo.Environment["AHTOLA_PUSH_INTENT_WORKER_READY"] = _readyPath;
+            startInfo.Environment["AHTOLA_PUSH_INTENT_WORKER_RELEASE"] = _releasePath;
+            startInfo.Environment["AHTOLA_PUSH_INTENT_WORKER_RESULT"] = _resultPath;
+
+            _worker = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("Failed to start the committed-push worker.");
+            _worker.OutputDataReceived += AppendOutput;
+            _worker.ErrorDataReceived += AppendOutput;
+            _worker.BeginOutputReadLine();
+            _worker.BeginErrorReadLine();
+            WaitForWorkerFile(
+                _readyPath,
+                TimeSpan.FromSeconds(60),
+                "The committed-push worker did not report readiness.",
+                _worker);
+        }
+
+        internal void Release()
+        {
+            if (_released)
+                return;
+            _released = true;
+            File.WriteAllText(_releasePath, string.Empty);
+            if (!_worker.WaitForExit(TimeSpan.FromSeconds(60)))
+            {
+                _worker.Kill(entireProcessTree: true);
+                Assert.Fail(
+                    "The committed-push worker did not exit within 60 seconds:"
+                    + Environment.NewLine
+                    + _output);
+            }
+
+            _worker.WaitForExit();
+            _worker.ExitCode.Should().Be(0, $"worker output:{Environment.NewLine}{_output}");
+            File.ReadAllText(_resultPath).Should().Be("committed");
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                Release();
+            }
+            finally
+            {
+                _worker.Dispose();
+                DeleteIfExists(_readyPath);
+                DeleteIfExists(_releasePath);
+                DeleteIfExists(_resultPath);
+            }
+        }
+
+        private void AppendOutput(object sender, DataReceivedEventArgs args)
+        {
+            if (args.Data is { } line)
+                _output.AppendLine(line);
+        }
+
+        private static void DeleteIfExists(string path)
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
     }
 
     private static void CorruptPushState(string metadataPath, string corruption)

@@ -89,20 +89,25 @@ internal static class ManagedReplicaRevertWal
             cancellationToken.ThrowIfCancellationRequested();
 
             var snapshots = ReadAndValidate(databasePath, state);
-            PublishSnapshot(
-                databasePath,
-                state.CommittedDatabaseSizeInPages,
-                state.CommittedDatabaseSha256,
-                snapshots.CommittedPages,
-                snapshots.PageSize,
-                ManagedReplicaDurableBoundary.RevertCommittedRestoreStagedDatabase,
-                ManagedReplicaDurableBoundary.RevertCommittedRestoreDatabasePublished,
-                cancellationToken);
-            return TransitionPhase(
-                databasePath,
-                pending,
-                ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady,
-                ManagedReplicaDurableBoundary.RevertCommittedReadyMetadataPublished);
+            using (PublishSnapshot(
+                       databasePath,
+                       state.CommittedDatabaseSizeInPages,
+                       state.CommittedDatabaseSha256,
+                       WithPhase(
+                           pending,
+                           ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady),
+                       snapshots.CommittedPages,
+                       snapshots.PageSize,
+                       ManagedReplicaDurableBoundary.RevertCommittedRestoreStagedDatabase,
+                       ManagedReplicaDurableBoundary.RevertCommittedRestoreDatabasePublished,
+                       cancellationToken))
+            {
+                return TransitionPhase(
+                    databasePath,
+                    pending,
+                    ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady,
+                    ManagedReplicaDurableBoundary.RevertCommittedReadyMetadataPublished);
+            }
         }
         finally
         {
@@ -120,6 +125,7 @@ internal static class ManagedReplicaRevertWal
         ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
     {
         ArgumentException.ThrowIfNullOrEmpty(databasePath);
+        ManagedReplicaReplacementState.Recover(databasePath);
         CleanupTemporaryArtifacts(databasePath);
         if (metadata.RevertState is not { } state)
         {
@@ -151,20 +157,25 @@ internal static class ManagedReplicaRevertWal
                 throw new InvalidDataException("Managed embedded replica checkpoint recovery phase is invalid.");
         }
 
-        PublishSnapshot(
-            databasePath,
-            state.CommittedDatabaseSizeInPages,
-            state.CommittedDatabaseSha256,
-            snapshots.CommittedPages,
-            snapshots.PageSize,
-            ManagedReplicaDurableBoundary.RevertCommittedRestoreStagedDatabase,
-            ManagedReplicaDurableBoundary.RevertCommittedRestoreDatabasePublished,
-            CancellationToken.None);
-        return TransitionPhase(
-            databasePath,
-            metadata,
-            ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady,
-            ManagedReplicaDurableBoundary.RevertCommittedReadyMetadataPublished);
+        using (PublishSnapshot(
+                   databasePath,
+                   state.CommittedDatabaseSizeInPages,
+                   state.CommittedDatabaseSha256,
+                   WithPhase(
+                       metadata,
+                       ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady),
+                   snapshots.CommittedPages,
+                   snapshots.PageSize,
+                   ManagedReplicaDurableBoundary.RevertCommittedRestoreStagedDatabase,
+                   ManagedReplicaDurableBoundary.RevertCommittedRestoreDatabasePublished,
+                   CancellationToken.None))
+        {
+            return TransitionPhase(
+                databasePath,
+                metadata,
+                ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.CommittedReady,
+                ManagedReplicaDurableBoundary.RevertCommittedReadyMetadataPublished);
+        }
     }
 
     internal static ManagedReplicaBootstrapper.ManagedReplicaMetadata MarkRemoteApplyStarted(
@@ -243,6 +254,28 @@ internal static class ManagedReplicaRevertWal
         return updated;
     }
 
+    private static ManagedReplicaBootstrapper.ManagedReplicaMetadata WithPhase(
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
+        ManagedReplicaBootstrapper.ManagedReplicaRevertPhase phase)
+    {
+        var state = metadata.RevertState
+                    ?? throw new InvalidOperationException(
+                        "Managed embedded replica metadata has no pending checkpoint revert capture.");
+        return metadata with
+        {
+            RevertState = state with
+            {
+                Phase = phase,
+                AttemptedFirstSequence = phase == ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown
+                    ? state.AttemptedFirstSequence
+                    : 0,
+                AttemptedWatermark = phase == ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown
+                    ? state.AttemptedWatermark
+                    : 0,
+            },
+        };
+    }
+
     internal static ManagedReplicaBootstrapper.ManagedReplicaMetadata ClearPushIntent(
         string databasePath,
         ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
@@ -263,6 +296,7 @@ internal static class ManagedReplicaRevertWal
     {
         ArgumentException.ThrowIfNullOrEmpty(databasePath);
         CleanupTemporaryArtifacts(databasePath);
+        EnsurePushRecoveryComplete(metadata);
         if (metadata.RevertState is not { } state)
         {
             Retire(databasePath);
@@ -273,6 +307,32 @@ internal static class ManagedReplicaRevertWal
         throw new InvalidOperationException(
             "Managed embedded replica has a pending checkpoint recovery bundle that must be "
             + "resolved before starting another pull or checkpoint.");
+    }
+
+    internal static void ValidateSynchronizationReady(
+        string databasePath,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(databasePath);
+        EnsurePushRecoveryComplete(metadata);
+        if (metadata.RevertState is not { } state)
+            return;
+
+        _ = ReadAndValidate(databasePath, state);
+        throw new InvalidOperationException(
+            "Managed embedded replica has a pending checkpoint recovery bundle that must be "
+            + "resolved before starting another pull or checkpoint.");
+    }
+
+    internal static void EnsurePushRecoveryComplete(
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
+    {
+        if (metadata.PushState.HasValue)
+        {
+            throw new InvalidOperationException(
+                "Managed embedded replica has a pending push outcome that must be recovered "
+                + "before publishing pulled or materialized state.");
+        }
     }
 
     internal static ManagedReplicaBootstrapper.ManagedReplicaMetadata CompletePreparedCheckpoint(
@@ -782,22 +842,7 @@ internal static class ManagedReplicaRevertWal
         ManagedReplicaBootstrapper.ManagedReplicaRevertPhase phase,
         ManagedReplicaDurableBoundary boundary)
     {
-        var state = metadata.RevertState
-                    ?? throw new InvalidOperationException(
-                        "Managed embedded replica metadata has no pending checkpoint revert capture.");
-        var updated = metadata with
-        {
-            RevertState = state with
-            {
-                Phase = phase,
-                AttemptedFirstSequence = phase == ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown
-                    ? state.AttemptedFirstSequence
-                    : 0,
-                AttemptedWatermark = phase == ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown
-                    ? state.AttemptedWatermark
-                    : 0,
-            },
-        };
+        var updated = WithPhase(metadata, phase);
         WritePhaseMetadata(databasePath, updated);
         ManagedReplicaFaultInjection.Hit(boundary);
         return updated;
@@ -828,27 +873,35 @@ internal static class ManagedReplicaRevertWal
         ValidatedRevertWal frames,
         CancellationToken cancellationToken)
     {
-        PublishSnapshot(
-            databasePath,
-            state.OriginalDatabaseSizeInPages,
-            state.OriginalDatabaseSha256,
-            frames.OriginalPages,
-            frames.PageSize,
-            ManagedReplicaDurableBoundary.RevertRestoreStagedDatabase,
-            ManagedReplicaDurableBoundary.RevertRestoreDatabasePublished,
-            cancellationToken);
-
-        var restored = metadata with
+        using (PublishSnapshot(
+                   databasePath,
+                   state.OriginalDatabaseSizeInPages,
+                   state.OriginalDatabaseSha256,
+                   metadata with
+                   {
+                       DatabaseSha256 = state.OriginalDatabaseSha256,
+                       RevertState = null,
+                   },
+                   frames.OriginalPages,
+                   frames.PageSize,
+                   ManagedReplicaDurableBoundary.RevertRestoreStagedDatabase,
+                   ManagedReplicaDurableBoundary.RevertRestoreDatabasePublished,
+                   cancellationToken))
         {
-            DatabaseSha256 = state.OriginalDatabaseSha256,
-            RevertState = null,
-        };
-        ClearPendingMetadata(databasePath, restored, state.OriginalDatabaseSha256);
-        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertRestoreMetadataPublished);
-        cancellationToken.ThrowIfCancellationRequested();
+            var restored = metadata with
+            {
+                DatabaseSha256 = state.OriginalDatabaseSha256,
+                RevertState = null,
+            };
+            ClearPendingMetadata(databasePath, restored, state.OriginalDatabaseSha256);
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertRestoreMetadataPublished);
+            cancellationToken.ThrowIfCancellationRequested();
+            metadata = restored;
+        }
+
         Retire(databasePath);
         ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertRetired);
-        return restored;
+        return metadata;
     }
 
     private static string ComputeSha256(string path)
@@ -872,23 +925,17 @@ internal static class ManagedReplicaRevertWal
             DeleteIfExists(path);
     }
 
-    private static void DeleteSqliteSidecars(string databasePath)
-    {
-        DeleteIfExists(databasePath + "-wal");
-        DeleteIfExists(databasePath + "-shm");
-        DeleteIfExists(databasePath + "-journal");
-    }
-
     private static void DeleteIfExists(string path)
     {
         if (File.Exists(path))
             File.Delete(path);
     }
 
-    private static void PublishSnapshot(
+    private static IDisposable PublishSnapshot(
         string databasePath,
         uint databaseSizeInPages,
         string expectedSha256,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata replacementMetadata,
         IReadOnlyList<SqliteCheckpointRevertPage> pages,
         int pageSize,
         ManagedReplicaDurableBoundary? stagedBoundary,
@@ -896,7 +943,10 @@ internal static class ManagedReplicaRevertWal
         CancellationToken cancellationToken)
     {
         var databaseStagingPath = CreateStagingPath(databasePath, "restore");
-        var databaseBackupPath = CreateStagingPath(databasePath, "restore-backup");
+        var databaseBackupPath = ManagedReplicaReplacementState.GetBackupPath(databasePath);
+        var displacedPath = ManagedReplicaReplacementState.GetDisplacedPath(databasePath);
+        IDisposable? mainFileReplacementLock = null;
+        var databaseInstalled = false;
         try
         {
             using (var stream = new FileStream(
@@ -928,24 +978,93 @@ internal static class ManagedReplicaRevertWal
             if (stagedBoundary is { } staged)
                 ManagedReplicaFaultInjection.Hit(staged);
             cancellationToken.ThrowIfCancellationRequested();
-            using var mainFileReplacementLock =
-                ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
-                    databasePath,
-                    cancellationToken);
-            DeleteSqliteSidecars(databasePath);
-            File.Replace(
+            ManagedReplicaReplacementState.Recover(databasePath);
+            mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
+                databasePath,
+                databaseStagingPath,
+                cancellationToken);
+            ManagedReplicaReplacementState.Prepare(
+                databasePath,
+                databaseStagingPath,
+                ManagedReplicaBootstrapper.ComputeMetadataSha256(replacementMetadata),
+                mainFileReplacementLock);
+            ManagedReplicaApplyLock.ReplaceMainFile(
+                mainFileReplacementLock,
                 databaseStagingPath,
                 databasePath,
                 databaseBackupPath,
-                ignoreMetadataErrors: false);
+                () => databaseInstalled = true);
+            if (OperatingSystem.IsWindows()
+                && !string.Equals(
+                    ManagedReplicaReplacementState.ComputeDatabaseSha256(
+                        mainFileReplacementLock,
+                        databasePath),
+                    expectedSha256,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "Managed embedded replica checkpoint recovery changed during its Windows replacement lock handoff.");
+            }
             if (publishedBoundary is { } published)
                 ManagedReplicaFaultInjection.Hit(published);
             cancellationToken.ThrowIfCancellationRequested();
+            return new SnapshotPublicationLease(
+                mainFileReplacementLock,
+                databaseStagingPath,
+                databasePath);
         }
-        finally
+        catch
         {
-            DeleteIfExists(databaseStagingPath);
-            DeleteIfExists(databaseBackupPath);
+            try
+            {
+                if (databaseInstalled && File.Exists(databaseBackupPath))
+                {
+                    ManagedReplicaApplyLock.RollBackMainFile(
+                        mainFileReplacementLock,
+                        databaseBackupPath,
+                        databasePath,
+                        displacedPath,
+                        () => ManagedReplicaReplacementState.PrepareRollbackSidecars(databasePath));
+                    ManagedReplicaFaultInjection.Hit(
+                        ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored);
+                    ManagedReplicaReplacementState.CompleteRollback(
+                        databasePath,
+                        ManagedReplicaApplyLock.GetMainFileLease(
+                            mainFileReplacementLock,
+                            databasePath));
+                }
+            }
+            finally
+            {
+                mainFileReplacementLock?.Dispose();
+                DeleteIfExists(databaseStagingPath);
+            }
+            throw;
+        }
+    }
+
+    private sealed class SnapshotPublicationLease(
+        IDisposable? mainFileReplacementLock,
+        string databaseStagingPath,
+        string databasePath) : IDisposable
+    {
+        private IDisposable? _mainFileReplacementLock = mainFileReplacementLock;
+
+        public void Dispose()
+        {
+            try
+            {
+                _ = ManagedReplicaReplacementState.TryCompletePublication(
+                    databasePath,
+                    ManagedReplicaApplyLock.GetMainFileLease(
+                        _mainFileReplacementLock,
+                        databasePath));
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _mainFileReplacementLock, null)?.Dispose();
+                DeleteIfExists(databaseStagingPath);
+            }
         }
     }
 

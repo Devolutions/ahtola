@@ -445,6 +445,11 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         AhtolaReplicaOptions options,
         CancellationToken cancellationToken)
     {
+        if (ManagedReplicaReplacementState.HasArtifacts(options.Path))
+        {
+            await PrepareExistingReplicaForOpenAsync(syncEntry, options.Path, cancellationToken)
+                .ConfigureAwait(false);
+        }
         if (IsReplicaFilePresent(options.Path))
         {
             await PrepareExistingReplicaForOpenAsync(syncEntry, options.Path, cancellationToken)
@@ -463,31 +468,44 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         string databasePath,
         CancellationToken cancellationToken)
     {
+        var hasReplacementArtifacts = ManagedReplicaReplacementState.HasArtifacts(databasePath);
         var metadata = ManagedReplicaBootstrapper.LoadMetadata(databasePath);
         var hasRecoveryArtifacts = ManagedReplicaRevertWal.GetArtifactPaths(databasePath).Any(File.Exists);
         if (metadata is null)
         {
-            if (hasRecoveryArtifacts)
+            if (hasReplacementArtifacts || hasRecoveryArtifacts)
             {
                 throw new InvalidDataException(
-                    "Managed embedded replica checkpoint recovery artifacts have no matching metadata.");
+                    "Managed embedded replica recovery artifacts have no matching metadata.");
             }
             return;
         }
-        if (!metadata.Value.RevertState.HasValue && !hasRecoveryArtifacts)
+        if (!hasReplacementArtifacts
+            && !metadata.Value.RevertState.HasValue
+            && !hasRecoveryArtifacts)
             return;
 
         await syncEntry.PublishAsync(
-                cancellationToken =>
-                {
-                    var current = ManagedReplicaBootstrapper.LoadMetadata(databasePath)
-                                  ?? throw new InvalidDataException(
-                                      "Managed embedded replica checkpoint recovery metadata is missing.");
-                    _ = ManagedReplicaRevertWal.PrepareSynchronization(databasePath, current);
-                    return Task.CompletedTask;
-                },
+                token => PrepareSynchronizationWithPublicationLocksAsync(databasePath, token),
                 cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    private static async Task PrepareSynchronizationWithPublicationLocksAsync(
+        string databasePath,
+        CancellationToken cancellationToken)
+    {
+        await using var pushLease = await ManagedReplicaPushLock
+            .AcquireExclusiveAsync(databasePath, cancellationToken)
+            .ConfigureAwait(false);
+        await using var applyLease = await ManagedReplicaApplyLock
+            .AcquireExclusiveAsync(databasePath, cancellationToken)
+            .ConfigureAwait(false);
+        ManagedReplicaReplacementState.Recover(databasePath);
+        var current = ManagedReplicaBootstrapper.LoadMetadata(databasePath)
+                      ?? throw new InvalidDataException(
+                          "Managed embedded replica checkpoint recovery metadata is missing.");
+        _ = ManagedReplicaRevertWal.PrepareSynchronization(databasePath, current);
     }
 
     private static bool IsReplicaFilePresent(string path)
@@ -689,7 +707,6 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         metadata = ManagedReplicaBootstrapper.EnsureLegacyRemoteBaseSnapshot(
             replicaOptions.Path,
             metadata);
-        metadata = ManagedReplicaRevertWal.PrepareSynchronization(replicaOptions.Path, metadata);
         var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0
             || _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark).Count != 0;
         var retainedMaterializer = _materializationLease?.FileSystem;
@@ -843,23 +860,30 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var metadata = ManagedReplicaBootstrapper.LoadMetadata(_options.Path);
         if (metadata is { } value)
         {
-            if (value.RevertState is null
+            if (ManagedReplicaReplacementState.HasArtifacts(_options.Path)
                 || value.RevertState is
                 {
                     Phase: ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.Captured
                     or ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.RestoreCommitted
                     or ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.RestoreOriginal,
-                })
+                }
+                || ManagedReplicaRevertWal.GetArtifactPaths(_options.Path).Any(File.Exists))
             {
-                value = ManagedReplicaRevertWal.PrepareSynchronization(_options.Path, value);
+                PrepareSynchronizationWithPublicationLocksAsync(_options.Path, CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult();
+                value = ManagedReplicaBootstrapper.LoadMetadata(_options.Path)
+                    ?? throw new InvalidDataException(
+                        "Managed embedded replica checkpoint recovery metadata is missing.");
             }
             metadata = value;
             _metadata = value;
         }
-        else if (ManagedReplicaRevertWal.GetArtifactPaths(_options.Path).Any(File.Exists))
+        else if (ManagedReplicaReplacementState.HasArtifacts(_options.Path)
+                 || ManagedReplicaRevertWal.GetArtifactPaths(_options.Path).Any(File.Exists))
         {
             throw new InvalidDataException(
-                "Managed embedded replica checkpoint recovery artifacts have no matching metadata.");
+                "Managed embedded replica recovery artifacts have no matching metadata.");
         }
 
         var retainedLease = _materializationLease;
@@ -1415,18 +1439,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     /// authoritative, and a corrupt marker throws rather than being ignored.
     /// </summary>
     private static void ThrowIfReplicaConflictIsPending(string databasePath)
-    {
-        if (ManagedReplicaConflictState.TryRead(databasePath) is not { } state)
-            return;
-
-        throw new AhtolaReplicaConflictPendingException(
-            "Managed embedded replica has an unresolved push conflict; "
-            + $"{state.UnresolvedSequences.Count} locally journaled change(s) were rejected by the remote "
-            + "and are quarantined. Inspect the conflict and resolve or discard it explicitly before "
-            + "synchronizing again.",
-            state.ConflictKind,
-            state.UnresolvedSequences.Count);
-    }
+        => ManagedReplicaConflictState.ThrowIfPending(databasePath);
 
     /// <summary>
     /// Reads the open push conflict, if any, and classifies every change in the rejected batch.
@@ -1663,7 +1676,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                 new AhtolaSyncOptions(options?.Progress),
                 pendingLocalChanges,
                 acknowledgedLocalChanges,
-                quarantined,
+                state,
                 cancellationToken)
             .ConfigureAwait(false);
 

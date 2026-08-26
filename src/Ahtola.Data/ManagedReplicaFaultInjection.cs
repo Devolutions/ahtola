@@ -69,6 +69,12 @@ internal enum ManagedReplicaDurableBoundary
     ReplicaPushIntentRetired,
 
     /// <summary>
+    /// Hit after a pull response is fully available locally and immediately before it waits for
+    /// the push-flight lease that protects publication.
+    /// </summary>
+    ReplicaPullPublicationLockWaiting,
+
+    /// <summary>
     /// Hit immediately after the exclusive physical apply lease is acquired for an explicit
     /// conflict resolution's local publication (journal discard and marker retirement), before any
     /// irreversible work.
@@ -164,6 +170,107 @@ internal enum ManagedReplicaDurableBoundary
     RevertRestoreDatabasePublished,
     RevertRestoreMetadataPublished,
     RevertRetired,
+
+    /// <summary>
+    /// Hit after all remote pages are available and immediately before partial-image completion
+    /// waits for the push/apply publication leases.
+    /// </summary>
+    PartialImagePublicationLockWaiting,
+
+    /// <summary>
+    /// Windows-only boundary after the private replacement inode's SQLite byte-range lease is
+    /// released because ReplaceFile cannot rename a locked source, while the old destination inode
+    /// remains locked.
+    /// </summary>
+    MainFileReplacementSourceLeaseReleased,
+
+    /// <summary>
+    /// Windows-only boundary after ReplaceFile publishes the replacement inode and before its
+    /// SQLite byte-range lease is reacquired through the final path.
+    /// </summary>
+    MainFileReplacementPublishedBeforeLease,
+
+    /// <summary>
+    /// Windows-only boundary after the displaced database hash is durable but before the staged
+    /// displaced image is promoted to its final recovery path.
+    /// </summary>
+    MainFileRollbackDisplacedHashPublished,
+
+    /// <summary>
+    /// Windows-only boundary after the replacement image is durably preserved and before the
+    /// retained backup is copied over the continuously leased destination inode.
+    /// </summary>
+    MainFileRollbackDisplacedPreserved,
+
+    /// <summary>
+    /// Hit after rollback retires displaced database images but before their durable hash is retired.
+    /// </summary>
+    MainFileRollbackDisplacedRetired,
+
+    /// <summary>
+    /// Hit after replacement-generation sidecars are quarantined while both main-file leases remain held.
+    /// </summary>
+    MainFileRollbackSidecarsQuarantined,
+
+    /// <summary>
+    /// Hit after the original WAL is durably captured but before the replacement intent is published.
+    /// </summary>
+    MainFileReplacementOriginalWalCaptured,
+
+    /// <summary>
+    /// Hit after the deterministic replacement intent is durable and before the main-file swap.
+    /// </summary>
+    MainFileReplacementIntentPublished,
+
+    /// <summary>
+    /// Hit after completed publication deletes the old-image backup but before retiring the intent.
+    /// </summary>
+    MainFileReplacementBackupRetired,
+
+    /// <summary>
+    /// Hit after completed publication retires its durable replacement intent.
+    /// </summary>
+    MainFileReplacementIntentRetired,
+
+    /// <summary>
+    /// Hit after rollback restores the exact old database image but before retiring recovery state.
+    /// </summary>
+    MainFileRollbackDatabaseRestored,
+
+    /// <summary>
+    /// Windows-only boundary after rollback restores the original main-file contents under the
+    /// continuously retained destination lease.
+    /// </summary>
+    MainFileRollbackRestoredUnderLease,
+
+    /// <summary>
+    /// Windows-only boundary after the continuously leased destination is truncated for in-place
+    /// rollback and before the original backup image is copied into it.
+    /// </summary>
+    MainFileRollbackRestoreStarted,
+
+    /// <summary>
+    /// Hit after rollback restores the original database sidecar generation but before retiring
+    /// recovery state.
+    /// </summary>
+    MainFileRollbackSidecarsRestored,
+
+    /// <summary>
+    /// Hit after rollback retires its durable replacement intent and deterministic artifacts.
+    /// </summary>
+    MainFileRollbackIntentRetired,
+
+    /// <summary>
+    /// Hit when durable replacement recovery finds an intent, before it validates or mutates any
+    /// database, metadata, or replacement artifact.
+    /// </summary>
+    MainFileReplacementRecoveryStarted,
+
+    /// <summary>
+    /// Hit after cold recovery's preliminary main-file classification and before it acquires the
+    /// SQLite lease used for the authoritative classification.
+    /// </summary>
+    MainFileReplacementRecoveryClassifiedBeforeLease,
 }
 
 /// <summary>
