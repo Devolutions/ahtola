@@ -15,10 +15,11 @@ the machine-readable inventory, with stable IDs for status tracking
 time (171 entries)**; the JSON is the live tracking source of truth. Closure
 progress since analysis (waves F1–F2.18) is recorded in
 [section 11](#11-closure-progress-since-analysis), and current counts are:
-**211 entries, 182+ closed**; expected-failures file down from **606 → 0**
-lines after Phase 1 MVCC surface (`journal_mode=mvcc` + `BEGIN CONCURRENT` +
-in-process `MvStore`). Remaining MVCC depth (row-version cursors, durable
-logical log, checkpoint SM) is tracked in [`mvcc-port-contract.md`](mvcc-port-contract.md).
+**216 entries, 216 closed, 0 open**; expected-failures file down from
+**606 → 0** lines after Phase 1 MVCC surface (`journal_mode=mvcc` +
+`BEGIN CONCURRENT` + in-process `MvStore`). Remaining MVCC depth (row-version
+cursors, durable logical log, checkpoint SM) is tracked in
+[`mvcc-port-contract.md`](mvcc-port-contract.md).
 
 **Ground truth.** `src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt`
 (606 failure lines at analysis time). Every line was cross-referenced to at least
@@ -498,12 +499,13 @@ Highest-impact entries:
   statements and same-file ATTACH are unsupported/limited — by design for the
   managed single-file model, but it gates a large DDL-test surface. Read-only
   main/temp base-table joins are supported from a connection-local snapshot.
-- **Planner** (s3): FROM-derived-table flattening and correlated
-  EXISTS/NOT EXISTS/IN unnesting into semi/anti joins **are now implemented**
-  (see `compile-no-subquery-flattening`,
-  `compile-correlated-exists-in-semi-anti-join` and section 4.1); still open are
-  aggregate-subquery decorrelation
-  (`compile-no-aggregate-subquery-decorrelation`), join-order optimization,
+- **Planner** (s3): FROM-derived-table flattening, correlated
+  EXISTS/NOT EXISTS/IN unnesting into semi/anti joins, and correlated
+  single-value **aggregate decorrelation** (group-first and join-first)
+  **are now implemented** (see `compile-no-subquery-flattening`,
+  `compile-correlated-exists-in-semi-anti-join`,
+  `compile-no-aggregate-subquery-decorrelation` and section 4.1); still open in
+  the historical sense are join-order optimization (now covered by section 4.2),
   ORDER BY elision from indexes (17), and partial (18) / expression (19)
   index planning.
 - **CTE/DML shapes** (s2): recursive CTEs limited to a single term (27),
@@ -521,9 +523,9 @@ Highest-impact entries:
 | `compile-alter-rename-trigger-body-not-rebound` | missing | s1-correctness | M | 44 | 6 | After `ALTER TABLE t1 RENAME TO t2`, six conformance cases show existing triggers referencing the old table name inside their body (e.g. `INSERT INTO t1 ...` in a trigger… |
 | `compile-affinity-rules-diverge-in-subquery-and-compound-contexts` | divergent | s1-correctness | M | 28 | 8 | A cluster of affinity.sqltest failures shows Ahtola computing a different column affinity than SQLite/Turso specifically when the affinity-bearing column flows through a… |
 | `compile-recursive-cte-single-term-only` | partial | s2-capability | M | 27 | 2 | RecursiveCteProgramBuilder explicitly documents its scope as "the well-defined linear recursion (a single recursive transform)" and states "Multiple distinct recursive te… |
-| `compile-scalar-subquery-not-decorrelated` | parity | s3-perf | M | 25 | 0 | Uncorrelated subqueries memoize once per statement (SubqueryMemoizationReproTests). Correlated EXISTS/NOT EXISTS/IN now unnest into semi/anti joins — see `compile-correlated-exists-in-semi-anti-join`. Correlated *aggregate* subqueries stay per-row: `compile-no-aggregate-subquery-decorrelation`. |
+| `compile-scalar-subquery-not-decorrelated` | parity | s3-perf | M | 25 | 0 | Uncorrelated subqueries memoize once per statement (SubqueryMemoizationReproTests). Correlated EXISTS/NOT EXISTS/IN now unnest into semi/anti joins — see `compile-correlated-exists-in-semi-anti-join`. Correlated *aggregate* subqueries now decorrelate group-first or join-first — see `compile-no-aggregate-subquery-decorrelation`. Anything either rewrite declines keeps the per-outer-row path. |
 | `compile-correlated-exists-in-semi-anti-join` | parity | s3-perf | M | 0 | 0 | Closed 2026-08-23: a top-level conjunctive correlated `EXISTS` / `NOT EXISTS` / direct positive `IN` over a single base table unnests into the internal `JoinKind.Semi` / `JoinKind.Anti` join, scanning the inner table once per statement. Declines when a multi-conjunct WHERE holds any term that can raise (AND short-circuits, so a join would hide or invent an error) and when an `IN`'s operands or inner WHERE can raise. Ports `try_rewrite_exists` / `try_rewrite_in` / `rewrite_as_semi_or_anti_join` from turso-src v0.8.0-pre.7 `core/translate/optimizer/unnest.rs`. See section 4.1 for the exact accepted and excluded shapes. |
-| `compile-no-aggregate-subquery-decorrelation` | missing | s3-perf | L | 0 | 0 | Not ported: Turso's `try_rewrite_single_value_aggregate` turns `o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)` into a grouped LEFT JOIN (group-first) or a join-then-`GROUP BY o.rowid` (join-first). Both need a synthesized derived table with `GROUP BY`, empty-input value analysis (`count`→0, `total`→0.0, else NULL), overflow/failure analysis for unused keys, and a rowid-based grouping key. Ahtola evaluates such subqueries once per outer row. |
+| `compile-no-aggregate-subquery-decorrelation` | parity | s3-perf | L | 0 | 0 | Closed 2026-08-26: `EmbeddedDatabase.SubqueryRewrites.cs` ports both conservative forms of `try_rewrite_single_value_aggregate`. **Group-first** replaces a correlated single-value aggregate subquery with a LEFT JOIN against a synthesized `GROUP BY <correlation key>` derived table (one per subquery), restoring `count` → integer 0 and `total` → real 0.0 through COALESCE while null-producing aggregates read the left join's padding. It runs only when evaluating the aggregate for a key no outer row asks for cannot raise: avg/count/min/max/total only, no fallible aggregate argument, FILTER or inner WHERE term, and — Ahtola-specific — no application-registered collation on the grouping key. **Join-first** otherwise LEFT JOINs the inner table, groups by the outer rowid and moves the single whole WHERE comparison to HAVING with each aggregate guarded by `FILTER (WHERE inner.rowid IS NOT NULL)`. Correlation terms must be plain inner=outer column equalities with matching declared affinity **and** collation resolving to one outer base table. See section 4.1 for the exact accepted and excluded shapes. |
 | `compile-cte-dml-and-materialization-restrictions` | partial | s2-capability | M | 22 | 5 | CTE use inside DML is artificially restricted ("every CTE must contribute"); expression-CTE materialization semantics diverge. |
 | `compile-select-compiler-single-table-fast-paths-only` | divergent | s4-intentional | S | 20 | 0 | SelectStatementCompiler is architected as a set of narrow, provably-correct single-table fast paths (plain scan, backward/descending scan, indexed seek with bounds) with… |
 | `compile-collation-propagation-through-subquery` | divergent | s1-correctness | M | 19 | 5 | Column collation is lost across subquery boundaries and compound arms, flipping NOCASE comparisons and window peer groups. |
@@ -564,7 +566,8 @@ diagnostic is always produced from the original statement. For the same reason
 the stage is disabled inside trigger bodies, where that validation is skipped.
 `EXPLAIN` and `EXPLAIN QUERY PLAN` use their own routes and therefore describe
 the **un-rewritten** statement; `EmbeddedDatabase.RewriteDiagnostics` (internal)
-is the execution-side evidence used by `SubqueryRewriteTests`.
+is the execution-side evidence used by `SubqueryRewriteTests` and
+`AggregateSubqueryDecorrelationTests`.
 
 **Rewrite 1 — FROM-derived-table flattening.** `SELECT … FROM (SELECT p FROM s
 WHERE a) [AS d] WHERE b` becomes `SELECT … FROM s WHERE a' AND b'`, substituting
@@ -668,15 +671,122 @@ collation). When either side's affinity or collation cannot be proven — an
 unresolvable column, a `CAST`, a custom collation — that conjunct is skipped and
 the scan simply runs unpruned.
 
-**Deliberately not ported.** `unnest.rs`'s aggregate decorrelation
-(`try_rewrite_single_value_aggregate`, group-first and join-first) is tracked as
-`compile-no-aggregate-subquery-decorrelation`.
+**Rewrite 3 — correlated single-value aggregate subquery → decorrelated join.**
+Ports `try_rewrite_single_value_aggregate` and
+`rewrite_aggregate_as_join_then_group` in both of their conservative forms.
 
-**Stage interaction.** The two rewrites run in sequence (flattening first, to a
-fixed point, then unnesting) but rarely both fire on one statement: a correlated
+*Group-first* (the default) evaluates each correlation key once. Every eligible
+subquery becomes its own LEFT JOIN against a synthesized derived table
+`SELECT <aggregate expression> AS ahtola_aggregate_value,
+<key> AS ahtola_correlation_key_N … GROUP BY <key>`, whose ON condition is the
+subquery's correlation equalities written in the operand order the subquery used
+(SQLite resolves a comparison's collation from the left operand first, and the
+grouped column carries none). Because the grouped table holds exactly one row
+per distinct key and the join tests that key for equality, at most one grouped
+row can match an outer row — so the outer row count, and with it every outer
+clause, is preserved and several subqueries can decorrelate into the same
+statement. An outer row whose key matches nothing reads the left join's `NULL`
+padding, which is what `avg`/`min`/`max`/`sum` answer for an empty input;
+`count` and `total` instead answer integer `0` and real `0.0`, so those come back
+through `COALESCE`. An aggregate wrapped in NULL-propagating arithmetic,
+concatenation, `CAST`, `COLLATE` or a unary operator inherits the NULL answer;
+anything else (`count(*) + 0`, which is `0` and not NULL for an empty input)
+declines.
+
+*Group-first is only used when computing the aggregate for a key that no outer
+row asks for cannot fail.* The original subquery reads only the keys its outer
+rows ask for, so the rewrite must not be able to raise an error the statement
+never raises: `sum` can overflow, `group_concat`/`string_agg` can outgrow the
+largest SQL value, and `avg(json_extract(v,'$'))` can hit invalid JSON stored
+under an unused key. Every aggregate must therefore be `avg`, `count`, `min`,
+`max` or `total`, and no aggregate argument, aggregate `FILTER` or inner WHERE
+term may be able to raise — the same strict `expression_can_fail_on_input`
+classification the semi/anti rewrite uses. Ahtola adds the grouping key itself:
+a group is formed under the key's declared collation, so an
+application-registered sequence would run for unused keys too, and a key
+carrying one declines.
+
+*Join-first* is the fallback for a `sum`, a `group_concat` or a fallible
+aggregate input that appears as one whole WHERE comparison. The inner table is LEFT JOINed
+directly, the joined rows are grouped back to one group per outer row through
+`GROUP BY o.rowid`, and the comparison moves to `HAVING` with every aggregate
+guarded by `FILTER (WHERE i.rowid IS NOT NULL)`. The join only reaches inner
+rows whose key some outer row asks for, which is the whole point; the filter
+keeps the row a left join invents for an unmatched outer row out of the fold,
+without which `count(*)` would answer 1 where the subquery answers 0.
+
+*Accepted only when all of these hold.* The subquery has exactly one non-star
+projection containing at least one built-in aggregate; reads exactly one
+ordinary base table; has no `DISTINCT`, `GROUP BY`, `HAVING`, `ORDER BY`, named
+window, `LIMIT` or `OFFSET`; contains no nested subquery, window function or
+non-deterministic scalar call; and every column it reads belongs to that table
+*and* sits inside an aggregate's arguments or `FILTER` — a column read outside
+an aggregate would make the value depend on which row of the group the engine
+happens to keep. Ordered-set and extension aggregates decline, the latter
+because their value for an empty input is unknown. Every WHERE conjunct that
+reaches out of the subquery must be a plain `inner = outer` equality between two
+columns, and at least one must (an uncorrelated aggregate subquery already
+evaluates once per statement). Both columns must have the **same declared
+affinity and the same declared collation**: an inner `BINARY` key splits `A` and
+`a` into two groups that a `NOCASE` outer key joins to both, and a BLOB-affinity
+inner key splits `1` from `'1'` where a numeric outer key joins to both — either
+would emit the outer row twice. All correlation columns must resolve to a single
+outer base table, so the join-order rewriter cannot move the grouped table in
+front of one of them. The enclosing FROM clause contains no outer join.
+
+*Ahtola-specific conservatism.* A bare `SELECT *` in the enclosing query
+declines: this stage runs before star expansion, so the grouped table's two
+synthetic columns would be published as result columns, and expanding the star
+here would mean reimplementing SQLite's result-column naming. A qualified
+`t.*` names one source and is unaffected. Join-first additionally requires rowid
+B-tree tables on both sides whose `rowid` spelling is not shadowed by a declared
+column; no outer aggregate, `GROUP BY`, `HAVING`, `DISTINCT`, window, `ORDER
+BY`, `LIMIT` or `OFFSET` (none of them survives being pushed around the new
+grouping step); the subquery as one complete side of exactly one top-level WHERE
+comparison with no other use of its value; and every other WHERE term
+deterministic and free of correlated subqueries, because after the join those
+terms run once per joined copy of an outer row rather than once per outer row.
+A fallible inner-only WHERE term declines both routes: group-first would run it
+for unused keys, while join-first would move it into an ON condition whose
+key-first evaluation could hide an error from a non-matching row.
+
+*Name stability under join-first.* Group-first publishes two synthetic
+`ahtola_`-prefixed columns, which cannot collide with anything a statement
+already refers to. Join-first instead moves a **real** table into the enclosing
+scope, so it also checks that no name changes meaning: an *unqualified*
+reference already in the enclosing query must not name a column of the inner
+table (or a rowid spelling), and every reference the rewrite carries out of the
+subquery must be qualified by the inner table. Without those checks
+`SELECT id FROM o WHERE v > (SELECT sum(i.v) FROM i WHERE i.k = o.k)` would
+start raising "ambiguous column name", and `SELECT sum(v) …` inside the subquery
+would silently gain a second candidate. A surviving enclosing expression that
+contains another nested query also declines: an unqualified name in that query
+may fall back to the enclosing FROM scope, and moving the inner aggregate table
+there could make the name ambiguous. A surviving reference already qualified by
+the inner table's name declines too when that name is absent from the current
+FROM scope: it necessarily resolves through an outer scope today and the moved
+table would capture it.
+
+*Route evidence.* `SelectRewriteDiagnostics` counts
+`AggregateGroupFirstRewrites`, `AggregateJoinFirstRewrites` and
+`AggregateDecorrelationDeclines`, the last incremented for a correlated
+aggregate subquery that reached the stage and was rejected — so a test can prove
+an excluded shape was considered rather than never seen.
+`AggregateSubqueryDecorrelationTests` asserts them alongside a differential
+comparison against Microsoft.Data.Sqlite.
+
+**Stage interaction.** The three rewrites run in sequence: flattening first, to a
+fixed point, then `EXISTS`/`IN` unnesting, then aggregate decorrelation.
+Flattening and unnesting rarely both fire on one statement — a correlated
 `EXISTS`/`IN` that references the derived table is exactly the nested-subquery
-case flattening declines. Unnesting then uses the un-flattened derived table as
-the semi-join's outer side, so one stage declining never blocks the other.
+case flattening declines, and unnesting then uses the un-flattened derived table
+as the semi-join's outer side, so one stage declining never blocks the other.
+Aggregate decorrelation analyses every candidate against the FROM clause as it
+stands when the stage begins, before any grouped table is appended, so a second
+subquery is judged in the same scope the first one was. A statement that already
+contains an outer join declines decorrelation outright, which also means the
+join-first form (whose gates require a single outer table anyway) never sees a
+FROM clause a semi/anti join has already reshaped.
 
 ### 4.2 Cost-based N-way join ordering (`EmbeddedDatabase.JoinOrderRewrites.cs`)
 
@@ -1189,10 +1299,10 @@ conformance cases → full managed lane (3755+ tests, green) → resolved keys
 removed from `managed-sqltest-expected-failures.txt` → inventory entry flipped
 `open → closed`.
 
-**Totals.** 180 entries closed since analysis (182 including the 2 `parity`
-entries closed at analysis time); the inventory grew 171 → **211** entries as
+**Totals.** 181 entries closed since analysis (183 including the 2 `parity`
+entries closed at analysis time); the inventory grew 171 → **216** entries as
 closure work surfaced adjacent gaps that were recorded rather than folded in;
-the expected-failures file dropped **606 → 11** lines (595 cleared; lines
+the expected-failures file dropped **606 → 0** lines (all cleared; lines
 multi-map, so a cleared line may redistribute to the next blocker in its
 chain rather than disappear). One deliberate extension was recorded:
 `compile-ordered-aggregates-intentional-extension` (s4 — Ahtola keeps ordered
@@ -1340,13 +1450,46 @@ defects, all now closed with regression coverage in
 - A `SELECT` with a viable method plan is no longer lowered to bytecode, so the plan
   `EXPLAIN QUERY PLAN` advertises is the plan that executes.
 
-**Current residual (honest, not scoreboard).** Inventory is **211 closed · 0 open**,
+**Current residual (honest, not scoreboard).** Inventory is **216 closed · 0 open**,
 but “closed” includes intentional scope and closed-with-residual notes (e.g.
 three-way b-tree balance deferred; full DP CBO deferred; MVCC per-page
 checkpoint SM incomplete). Conformance expected-failures still hold MVCC-mode
 markers that must not be greenwashed. Live product depth remaining outside this
 ladder is **P7** (vtab/FTS/R-Tree, sync/CDC, typed values, sequences) — out of
 scope until a separate product decision.
+
+### F5 — correlated aggregate subquery decorrelation (2026-08-26)
+
+`compile-no-aggregate-subquery-decorrelation` — the last `open` entry in the
+inventory — moves `missing → parity`. `EmbeddedDatabase.SubqueryRewrites.cs`
+gains a third rewrite that ports both conservative forms of
+`try_rewrite_single_value_aggregate`: **group-first** (a `GROUP BY`
+correlation-key derived table LEFT JOINed onto the outer rows) and
+**join-first** (the inner table LEFT JOINed, grouped by the outer rowid, with
+the comparison moved to `HAVING` behind an aggregate `FILTER`). The exact
+accepted and excluded shapes are in section 4.1; the semantic gates ported from
+upstream are the empty-input value analysis, the unused-key failure analysis,
+the grouping-vs-join comparison-compatibility check, the single-outer-table
+restriction and the join-first outer-clause exclusions.
+
+**Honest residuals.** Three narrowings are Ahtola-specific rather than upstream
+behavior, all because this stage runs on the AST before star expansion and
+before name binding: a bare `SELECT *` in the enclosing query declines (a
+qualified `t.*` does not), a correlation key spelled as a `rowid` alias
+declines, and join-first declines when moving the inner table into the enclosing
+scope would make an unqualified name ambiguous in either direction. Everything
+else that declines matches an upstream gate. Join-first declines an outer
+`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT` exactly as upstream does, so its
+differential tests compare result multisets rather than row order.
+
+**Route evidence.** `SelectRewriteDiagnostics` gains
+`AggregateGroupFirstRewrites`, `AggregateJoinFirstRewrites` and
+`AggregateDecorrelationDeclines`; `AggregateSubqueryDecorrelationTests` asserts
+all three next to a differential comparison against Microsoft.Data.Sqlite,
+including the empty-input storage classes (`count` → INTEGER 0, `total` →
+REAL 0.0), duplicate and NULL correlation keys, multi-column correlations,
+collation/affinity compatibility, and the preserved prepare-time and runtime
+diagnostics.
 
 
 ## Appendix A — Inventory JSON schema
@@ -1401,8 +1544,8 @@ they are listed below for completeness — absence of mapped failures means
 
 ## Appendix C — Entries with zero mapped failure lines (by layer)
 
-> Historical source-evidence list from analysis time. As of F2.36 the live
-> inventory is **0 open / 211 closed**; entries below may be closed intentional
+> Historical source-evidence list from analysis time. As of F5 the live
+> inventory is **0 open / 216 closed**; entries below may be closed intentional
 > or delivered surfaces that simply had no conf corpus line.
 
 - **vdbe** (16): `vdbe-bloom-filter-opcodes`, `vdbe-virtual-table-opcodes`, `vdbe-index-method-opcodes`, `vdbe-schema-cookie-opcodes`, `vdbe-deferred-seek`, `vdbe-rowset-test`, `vdbe-record-construction-model`, `vdbe-scalar-control-opcodes`, `vdbe-integrity-check-opcode`, `vdbe-coroutine-machinery`, `vdbe-misc-cursor-opcodes`, `vdbe-typed-value-opcode-family`, `vdbe-sequence-opcode-family`, `vdbe-materialized-view-opcodes`, `vdbe-ext-window-buffer-family`, `vdbe-ext-worktable-and-gate-families`

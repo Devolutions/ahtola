@@ -14,8 +14,8 @@
       "commit_at_analysis": "7b62a3f"
     },
     "conformance_ground_truth": "src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt (606 failure lines at analysis time)",
-    "current_conformance_expected_failures": 11,
-    "last_reconciled": "2026-08-24",
+    "current_conformance_expected_failures": 0,
+    "last_reconciled": "2026-08-26",
     "entry_count": 216,
     "counts": {
       "by_layer": {
@@ -23,32 +23,32 @@
         "functions": 26,
         "mvcc": 14,
         "parser": 29,
-        "storage": 22,
+        "storage": 23,
         "sync": 18,
         "vdbe": 38
       },
       "by_kind": {
-        "divergent": 71,
+        "divergent": 72,
         "extension": 9,
         "intentional-divergence": 1,
-        "missing": 74,
-        "parity": 54,
+        "missing": 73,
+        "parity": 55,
         "partial": 6
       },
       "by_severity": {
         "s1-correctness": 39,
         "s2-capability": 88,
         "s3-perf": 33,
-        "s4-intentional": 55
+        "s4-intentional": 56
       },
       "by_effort": {
-        "L": 39,
+        "L": 40,
         "M": 76,
         "S": 100
       },
       "by_status": {
-        "closed": 214,
-        "open": 1
+        "closed": 216,
+        "open": 0
       }
     },
     "schema": {
@@ -3129,14 +3129,14 @@
     {
       "id": "compile-no-aggregate-subquery-decorrelation",
       "layer": "compilation",
-      "kind": "missing",
-      "turso_ref": "turso-src/core/translate/optimizer/unnest.rs::try_rewrite_single_value_aggregate / rewrite_aggregate_as_join_then_group / aggregate_can_run_for_unused_rows (v0.8.0-pre.7)",
-      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.SubqueryRewrites.cs (deliberately out of scope); correlated aggregate subqueries stay on the per-row ExecuteSubquery path",
+      "kind": "parity",
+      "turso_ref": "turso-src/core/translate/optimizer/unnest.rs::try_rewrite_single_value_aggregate / rewrite_aggregate_as_join_then_group / aggregate_can_run_for_unused_rows / result_on_empty_input / column_pair_compares_the_same (v0.8.0-pre.7)",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.SubqueryRewrites.cs (TryDecorrelateAggregateSubqueries / TryRewriteAggregateGroupFirst / TryRewriteAggregateJoinFirst); src/Ahtola.Tests/AggregateSubqueryDecorrelationTests.cs",
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Open. Turso rewrites `o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)` either group-first (LEFT JOIN a `GROUP BY key` derived table) or join-first (LEFT JOIN then `GROUP BY o.rowid` with the comparison moved to HAVING). Porting needs a synthesized grouped derived table, empty-input value analysis (count -> 0, total -> 0.0, otherwise NULL), a can-this-expression-fail analysis so group-first never computes an aggregate for a key no outer row asks for, comparison-compatibility checks between the grouping and joining keys (collation and numeric/text conversion), and a rowid-based grouping key for join-first. None of that is implemented; such subqueries evaluate once per outer row.",
-      "status": "open"
+      "notes": "Closed 2026-08-26: both conservative forms of `try_rewrite_single_value_aggregate` are ported into the pure AST rewrite stage. Group-first turns `o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)` into a LEFT JOIN against a synthesized `SELECT <agg> AS ahtola_aggregate_value, <key> AS ahtola_correlation_key_N ... GROUP BY <key>` derived table, one per decorrelated subquery, with the correlation equalities as the ON condition; empty-input analysis restores `count` -> integer 0 and `total` -> real 0.0 through COALESCE while the null-producing aggregates read the left join's padding directly, and NULL-propagating arithmetic/cast/collate/unary expressions over such an aggregate inherit NULL. Group-first runs only when evaluating the aggregate for a key no outer row asks for cannot raise: every aggregate must be avg/count/min/max/total, and no aggregate argument, aggregate FILTER, inner WHERE term, or (Ahtola-specific) grouping-key collation may be able to fail — the last because a registered collation would run while grouping unused keys. Otherwise join-first LEFT JOINs the inner table, groups by the outer rowid, and moves the single whole WHERE comparison to HAVING with every aggregate guarded by `FILTER (WHERE inner.rowid IS NOT NULL)` so the row a left join invents is not folded in. A fallible inner-only WHERE term declines both routes because moving it into ON could change source-order error timing on non-matching rows. Correlation terms must be plain inner=outer column equalities whose declared affinity and collation match on both sides (otherwise the grouping and the join partition the key space differently and an outer row could match two groups), must resolve to a single outer base table, and the subquery's result expression must be self-contained: one non-star projection, a built-in aggregate, no nested subquery, no window, no DISTINCT/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET, no nondeterministic scalar call, and every column read from the inner table inside an aggregate. Ahtola-specific conservatism beyond upstream: a bare `SELECT *` in the enclosing query declines (the rewrite stage runs before star expansion, so the grouped table's synthetic columns would leak into the result; `t.*` is unaffected), and an ordered-set or extension aggregate declines. Join-first additionally requires rowid B-tree tables on both sides with unshadowed rowid spellings, no outer aggregate/GROUP BY/HAVING/DISTINCT/window/ORDER BY/LIMIT/OFFSET, the subquery as one complete side of exactly one top-level WHERE comparison, every other WHERE term deterministic and free of correlated subqueries, and — because unlike group-first it moves a real table into the enclosing scope rather than two `ahtola_`-prefixed synthetic columns — that no name changes meaning: no unqualified enclosing reference may name an inner column or a rowid spelling, every reference carried out of the subquery must be inner-qualified, surviving enclosing expressions containing another nested query decline because their unqualified correlations can fall back to the enlarged FROM scope, and a surviving reference qualified by the moved table's name declines when that name currently resolves through an outer scope. Everything else declines and keeps the per-outer-row ExecuteSubquery path. Route evidence: `SelectRewriteDiagnostics.AggregateGroupFirstRewrites` / `AggregateJoinFirstRewrites` / `AggregateDecorrelationDeclines`.",
+      "status": "closed"
     },
     {
       "id": "index-method-fts-persistence-divergence",
