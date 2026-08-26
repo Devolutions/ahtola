@@ -2181,7 +2181,8 @@ internal static class ManagedReplicaBootstrapper
             ManagedReplicaReplacementState.Prepare(
                 options.Path,
                 stagingPath,
-                ComputeMetadataSha256(replacementMetadata));
+                ComputeMetadataSha256(replacementMetadata),
+                mainFileReplacementLock);
             ManagedReplicaApplyLock.ReplaceMainFile(
                 mainFileReplacementLock,
                 stagingPath,
@@ -2190,7 +2191,9 @@ internal static class ManagedReplicaBootstrapper
                 () => databaseInstalled = true);
             if (OperatingSystem.IsWindows()
                 && !string.Equals(
-                    ComputeDatabaseFingerprint(options.Path),
+                    ManagedReplicaReplacementState.ComputeDatabaseSha256(
+                        mainFileReplacementLock,
+                        options.Path),
                     installedFingerprint,
                     StringComparison.Ordinal))
             {
@@ -2229,7 +2232,11 @@ internal static class ManagedReplicaBootstrapper
             }
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyMetadataPublished);
             cancellationToken.ThrowIfCancellationRequested();
-            ManagedReplicaReplacementState.CompletePublication(options.Path);
+            ManagedReplicaReplacementState.CompletePublication(
+                options.Path,
+                ManagedReplicaApplyLock.GetMainFileLease(
+                    mainFileReplacementLock,
+                    options.Path));
         }
         catch
         {
@@ -2245,7 +2252,11 @@ internal static class ManagedReplicaBootstrapper
                     () => ManagedReplicaReplacementState.PrepareRollbackSidecars(options.Path));
                 ManagedReplicaFaultInjection.Hit(
                     ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored);
-                ManagedReplicaReplacementState.CompleteRollback(options.Path);
+                ManagedReplicaReplacementState.CompleteRollback(
+                    options.Path,
+                    ManagedReplicaApplyLock.GetMainFileLease(
+                        mainFileReplacementLock,
+                        options.Path));
             }
             throw;
         }

@@ -191,10 +191,10 @@ internal enum ManagedReplicaDurableBoundary
     MainFileReplacementPublishedBeforeLease,
 
     /// <summary>
-    /// Windows-only boundary after rollback releases both SQLite inode leases and before ReplaceFile
-    /// restores the retained backup.
+    /// Windows-only boundary after the replacement image is durably preserved and before the
+    /// retained backup is copied over the continuously leased destination inode.
     /// </summary>
-    MainFileRollbackLeasesReleased,
+    MainFileRollbackDisplacedPreserved,
 
     /// <summary>
     /// Hit after replacement-generation sidecars are quarantined while both main-file leases remain held.
@@ -227,10 +227,16 @@ internal enum ManagedReplicaDurableBoundary
     MainFileRollbackDatabaseRestored,
 
     /// <summary>
-    /// Windows-only boundary after rollback installs the original main file and before reacquiring
-    /// leases on the restored and displaced inodes.
+    /// Windows-only boundary after rollback restores the original main-file contents under the
+    /// continuously retained destination lease.
     /// </summary>
-    MainFileRollbackPublishedBeforeLease,
+    MainFileRollbackRestoredUnderLease,
+
+    /// <summary>
+    /// Windows-only boundary after the continuously leased destination is truncated for in-place
+    /// rollback and before the original backup image is copied into it.
+    /// </summary>
+    MainFileRollbackRestoreStarted,
 
     /// <summary>
     /// Hit after rollback restores the original database sidecar generation but before retiring
@@ -248,6 +254,12 @@ internal enum ManagedReplicaDurableBoundary
     /// database, metadata, or replacement artifact.
     /// </summary>
     MainFileReplacementRecoveryStarted,
+
+    /// <summary>
+    /// Hit after cold recovery's preliminary main-file classification and before it acquires the
+    /// SQLite lease used for the authoritative classification.
+    /// </summary>
+    MainFileReplacementRecoveryClassifiedBeforeLease,
 }
 
 /// <summary>

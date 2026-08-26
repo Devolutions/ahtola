@@ -249,7 +249,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                            throw new IOException("Injected replacement reacquisition failure.");
                        }
 
-                       if (boundary == ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased
+                       if (boundary == ManagedReplicaDurableBoundary.MainFileRollbackDisplacedPreserved
                            && rollbackWriter is null)
                        {
                            rollbackWriter = new CrossProcessReplicaRaceWorker(
@@ -268,9 +268,9 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                        }
                    }))
             {
-                var exception = Assert.ThrowsAsync<IOException>(
+                var syncException = Assert.ThrowsAsync<IOException>(
                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
-                exception!.Message.Should().Be("Injected automatic recovery interruption.");
+                syncException!.Message.Should().Be("Injected automatic recovery interruption.");
             }
 
             rollbackWriter.Should().NotBeNull();
@@ -350,9 +350,9 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                            }
                        }))
                 {
-                    var exception = Assert.ThrowsAsync<IOException>(
+                    var syncException = Assert.ThrowsAsync<IOException>(
                         () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
-                    exception!.Message.Should().Be("Injected automatic recovery interruption.");
+                    syncException!.Message.Should().Be("Injected automatic recovery interruption.");
                 }
             }
 
@@ -375,10 +375,10 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
-    public async Task ColdOpenRollbackPreservesCommittedRestoredGenerationWal()
+    public async Task WindowsRollbackBlocksMainMutatingWritersUntilRecoveryCompletes()
     {
         Assume.That(OperatingSystem.IsWindows(), Is.True);
-        var path = NewReplicaPath("rollback-restored-wal");
+        var path = NewReplicaPath("rollback-main-writer-guard");
         var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
         var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
         var handler = new PullUpdatesHandler(
@@ -386,65 +386,67 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             CreatePullResponse("revision-42", initialImage),
             CreatePullResponse("revision-43", updatedImage),
         ]);
-        CrossProcessReplicaRaceWorker? walWriter = null;
-        var rollbackPublished = false;
-        var rollbackReconciled = false;
+        CrossProcessReplicaRaceWorker? deleteWriter = null;
+        CrossProcessReplicaRaceWorker? checkpointWriter = null;
 
         try
         {
-            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
-            {
-                connection.Open();
-                using (ManagedReplicaFaultInjection.Push(boundary =>
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease)
                        {
-                           if (boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease)
-                           {
-                               throw new IOException("Injected replacement reacquisition failure.");
-                           }
-                           if (boundary == ManagedReplicaDurableBoundary.MainFileRollbackPublishedBeforeLease
-                               && walWriter is null)
-                           {
-                               rollbackPublished = true;
-                               walWriter = new CrossProcessReplicaRaceWorker(
-                                   TestContext.CurrentContext.WorkDirectory,
-                                   path,
-                                   "sqlite-wal-crash");
-                               walWriter.WaitForProbeState("committed");
-                               walWriter.WaitForCrashCompletion();
-                           }
-                           else if (rollbackPublished
-                                    && boundary == ManagedReplicaDurableBoundary.MainFileRollbackSidecarsRestored)
-                           {
-                               rollbackReconciled = true;
-                               throw new IOException("Injected crash after preserving the restored-generation WAL.");
-                           }
-                           else if (rollbackReconciled
-                                    && boundary == ManagedReplicaDurableBoundary.MainFileReplacementRecoveryStarted)
-                           {
-                               throw new IOException("Injected automatic recovery interruption.");
-                           }
-                       }))
-                {
-                    var exception = Assert.ThrowsAsync<IOException>(
-                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
-                    exception!.Message.Should().Be("Injected automatic recovery interruption.");
-                }
+                           throw new IOException("Injected replacement reacquisition failure.");
+                       }
+                       if (boundary == ManagedReplicaDurableBoundary.MainFileRollbackRestoredUnderLease
+                           && deleteWriter is null)
+                       {
+                           deleteWriter = new CrossProcessReplicaRaceWorker(
+                               TestContext.CurrentContext.WorkDirectory,
+                               path,
+                               "sqlite-delete-commit");
+                           checkpointWriter = new CrossProcessReplicaRaceWorker(
+                               TestContext.CurrentContext.WorkDirectory,
+                               path,
+                               "sqlite-wal-checkpoint-commit");
+                           deleteWriter.WaitForBlockedProbe();
+                           checkpointWriter.WaitForBlockedProbe();
+                       }
+                   }))
+            {
+                var exception = Assert.ThrowsAsync<IOException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                exception!.Message.Should().Be("Injected replacement reacquisition failure.");
             }
 
-            walWriter.Should().NotBeNull();
-            File.Exists(path + "-wal").Should().BeTrue();
-            File.Exists(ManagedReplicaReplacementState.GetDisplacedPath(path)).Should().BeTrue();
-            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeTrue();
+            deleteWriter.Should().NotBeNull();
+            checkpointWriter.Should().NotBeNull();
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse(
+                "rollback recovery must complete before either writer is released");
 
+            connection.Dispose();
+            deleteWriter!.ReleaseBlockedProbe();
+            deleteWriter.WaitForCompletion();
+            checkpointWriter!.ReleaseBlockedProbe();
+            checkpointWriter.WaitForCompletion();
             using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
             recovered.Open();
 
-            ReadBootstrapMarker(recovered).Should().Be(126);
-            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+            using (var command = recovered.CreateCommand())
+            {
+                command.CommandText = "SELECT value FROM rollback_delete_writer";
+                Convert.ToInt64(command.ExecuteScalar()).Should().Be(701);
+                command.CommandText = "SELECT value FROM rollback_wal_checkpoint_writer";
+                Convert.ToInt64(command.ExecuteScalar()).Should().Be(702);
+            }
         }
         finally
         {
-            walWriter?.Dispose();
+            deleteWriter?.ReleaseBlockedProbe();
+            checkpointWriter?.ReleaseBlockedProbe();
+            deleteWriter?.Dispose();
+            checkpointWriter?.Dispose();
             DeleteReplicaFiles(path);
         }
     }
@@ -495,9 +497,9 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                            }
                        }))
                 {
-                    var exception = Assert.ThrowsAsync<IOException>(
+                    var syncException = Assert.ThrowsAsync<IOException>(
                         () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
-                    exception!.Message.Should().Be("Injected automatic recovery interruption.");
+                    syncException!.Message.Should().Be("Injected automatic recovery interruption.");
                 }
             }
 
@@ -594,9 +596,10 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
-    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased))]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackDisplacedPreserved))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackSidecarsQuarantined))]
-    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackPublishedBeforeLease))]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackRestoreStarted))]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackRestoredUnderLease))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackSidecarsRestored))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackIntentRetired))]
@@ -670,6 +673,91 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public async Task ColdOpenFailsClosedForACommitAfterInterruptedInPlaceRollback()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("rollback-interrupted-external-commit");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        var forwardInterrupted = false;
+        var rollbackInterrupted = false;
+        var externalWriterCommitted = false;
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+            {
+                connection.Open();
+                using (ManagedReplicaFaultInjection.Push(boundary =>
+                       {
+                           if (!forwardInterrupted
+                               && boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease)
+                           {
+                               forwardInterrupted = true;
+                               throw new IOException("Injected forward handoff interruption.");
+                           }
+                           if (forwardInterrupted
+                               && !rollbackInterrupted
+                               && boundary == ManagedReplicaDurableBoundary.MainFileRollbackRestoreStarted)
+                           {
+                               rollbackInterrupted = true;
+                               throw new IOException("Injected interrupted in-place rollback.");
+                           }
+                           if (rollbackInterrupted
+                               && boundary == ManagedReplicaDurableBoundary.MainFileReplacementRecoveryStarted)
+                           {
+                               throw new IOException("Injected automatic recovery interruption.");
+                           }
+                       }))
+                {
+                    var exception = Assert.ThrowsAsync<IOException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                    exception!.Message.Should().Be("Injected automatic recovery interruption.");
+                }
+            }
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary
+                               != ManagedReplicaDurableBoundary.MainFileReplacementRecoveryClassifiedBeforeLease
+                           || externalWriterCommitted)
+                       {
+                           return;
+                       }
+
+                       using var writer = new NativeSqliteConnection(
+                           $"Data Source={path};Mode=ReadWriteCreate;Pooling=False");
+                       writer.Open();
+                       using var command = writer.CreateCommand();
+                       command.CommandText =
+                           "CREATE TABLE external_rollback_writer(value INTEGER);"
+                           + " INSERT INTO external_rollback_writer VALUES (126);";
+                       command.ExecuteNonQuery();
+                       externalWriterCommitted = true;
+                   }))
+            {
+                var recoveryException = Assert.Throws<InvalidDataException>(() => recovered.Open());
+                recoveryException!.Message.Should().Contain("unrecognized database image");
+            }
+
+            externalWriterCommitted.Should().BeTrue();
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeTrue();
+            File.ReadAllBytes(ManagedReplicaReplacementState.GetBackupPath(path))
+                .Should().Equal(initialImage);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public async Task SameProcessRetryRecoversAnInterruptedWindowsRollbackWithoutReenteringTheMainFileLease()
     {
         Assume.That(OperatingSystem.IsWindows(), Is.True);
@@ -698,7 +786,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                            throw new IOException("Injected forward handoff interruption.");
                        }
                        if (!rollbackInterrupted
-                           && boundary == ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased)
+                           && boundary == ManagedReplicaDurableBoundary.MainFileRollbackDisplacedPreserved)
                        {
                            rollbackInterrupted = true;
                            throw new IOException("Injected rollback interruption.");
@@ -1419,6 +1507,29 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             return;
         }
 
+        if (mode is "sqlite-delete-commit" or "sqlite-wal-checkpoint-commit")
+        {
+            try
+            {
+                CommitOrdinarySqliteMainMutation(databasePath, mode, timeoutSeconds: 1);
+                File.WriteAllText(completedPath, $"{mode}-acquired-without-blocking");
+                return;
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException exception)
+                when (exception.SqliteErrorCode is 5 or 6 or 8)
+            {
+                File.WriteAllText(blockedPath, "blocked");
+            }
+
+            WaitForWorkerFile(
+                releasePath,
+                TimeSpan.FromSeconds(30),
+                "The main-mutating SQLite writer was not released after rollback recovery.");
+            CommitOrdinarySqliteMainMutation(databasePath, mode, timeoutSeconds: 30);
+            File.WriteAllText(completedPath, mode);
+            return;
+        }
+
         if (mode == "publication")
         {
             using var probeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
@@ -1488,6 +1599,33 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         command.CommandText = "UPDATE bootstrap_marker SET value = value;";
         command.ExecuteNonQuery().Should().Be(1);
         transaction.Rollback();
+    }
+
+    private static void CommitOrdinarySqliteMainMutation(
+        string databasePath,
+        string mode,
+        int timeoutSeconds)
+    {
+        using var connection = new NativeSqliteConnection(
+            $"Data Source={databasePath};Mode=ReadWrite;Default Timeout={timeoutSeconds};Pooling=False");
+        connection.Open();
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = mode == "sqlite-delete-commit"
+                ? "PRAGMA journal_mode=DELETE;"
+                : "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1;";
+            command.ExecuteNonQuery();
+        }
+        using var transaction = connection.BeginTransaction();
+        using var mutation = connection.CreateCommand();
+        mutation.Transaction = transaction;
+        mutation.CommandText = mode == "sqlite-delete-commit"
+            ? "CREATE TABLE rollback_delete_writer(value INTEGER);"
+              + " INSERT INTO rollback_delete_writer VALUES (701);"
+            : "CREATE TABLE rollback_wal_checkpoint_writer(value INTEGER);"
+              + " INSERT INTO rollback_wal_checkpoint_writer VALUES (702);";
+        mutation.ExecuteNonQuery();
+        transaction.Commit();
     }
 
     private sealed class CrossProcessReplicaRaceWorker : IDisposable

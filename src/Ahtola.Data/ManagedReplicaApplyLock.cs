@@ -494,7 +494,7 @@ internal static class ManagedReplicaApplyLock
     internal static ValueTask<IAsyncDisposable> AcquireExclusiveAsync(string path, CancellationToken cancellationToken)
         => Current.AcquireExclusiveAsync(path, cancellationToken);
 
-    internal static IDisposable? AcquireMainFileReplacementLock(
+    internal static SqliteWalByteRangeLockLease? AcquireMainFileReplacementLock(
         string path,
         CancellationToken cancellationToken)
         => File.Exists(path)
@@ -513,8 +513,8 @@ internal static class ManagedReplicaApplyLock
         if (!File.Exists(path))
             return null;
 
-        IDisposable? destinationMainFileLease = null;
-        IDisposable? replacementMainFileLease = null;
+        SqliteWalByteRangeLockLease? destinationMainFileLease = null;
+        SqliteWalByteRangeLockLease? replacementMainFileLease = null;
         ManagedReplicaPhysicalCarrierLease? replacementPushCarrier = null;
         ManagedReplicaPhysicalCarrierLease? replacementApplyCarrier = null;
         try
@@ -536,12 +536,12 @@ internal static class ManagedReplicaApplyLock
                     ManagedReplicaLockCarrier.ApplyKind,
                     cancellationToken)
                 .AsTask().GetAwaiter().GetResult();
-            destinationMainFileLease = new SqliteWalByteRangeLock(path).AcquireExclusive(
+            destinationMainFileLease = new SqliteWalByteRangeLock(path).AcquireExclusiveWritable(
                 PendingByte,
                 SQLiteExclusiveRangeLength,
                 Timeout.InfiniteTimeSpan,
                 cancellationToken);
-            replacementMainFileLease = new SqliteWalByteRangeLock(replacementPath).AcquireExclusive(
+            replacementMainFileLease = new SqliteWalByteRangeLock(replacementPath).AcquireExclusiveWritable(
                 PendingByte,
                 SQLiteExclusiveRangeLength,
                 Timeout.InfiniteTimeSpan,
@@ -596,14 +596,31 @@ internal static class ManagedReplicaApplyLock
         File.Replace(backupPath, destinationPath, displacedPath, ignoreMetadataErrors: false);
     }
 
+    internal static SqliteWalByteRangeLockLease GetMainFileLease(
+        IDisposable? replacementLock,
+        string path)
+    {
+        var identity = SqliteWalSharedMemoryCarrierIdentity.FromPath(path);
+        if (replacementLock is SqliteWalByteRangeLockLease lease
+            && lease.CarrierIdentity == identity)
+        {
+            return lease;
+        }
+        if (replacementLock is MainFileReplacementLease replacementLease)
+            return replacementLease.GetLease(identity);
+
+        throw new InvalidOperationException(
+            "The main-file replacement lock does not own the requested database inode.");
+    }
+
     private sealed class MainFileReplacementLease(
-        IDisposable destinationMainFileLease,
-        IDisposable replacementMainFileLease,
+        SqliteWalByteRangeLockLease destinationMainFileLease,
+        SqliteWalByteRangeLockLease replacementMainFileLease,
         ManagedReplicaPhysicalCarrierLease replacementPushCarrier,
         ManagedReplicaPhysicalCarrierLease replacementApplyCarrier) : IDisposable
     {
-        private IDisposable? _destinationMainFileLease = destinationMainFileLease;
-        private IDisposable? _replacementMainFileLease = replacementMainFileLease;
+        private SqliteWalByteRangeLockLease? _destinationMainFileLease = destinationMainFileLease;
+        private SqliteWalByteRangeLockLease? _replacementMainFileLease = replacementMainFileLease;
         private ManagedReplicaPhysicalCarrierLease? _replacementPushCarrier = replacementPushCarrier;
         private ManagedReplicaPhysicalCarrierLease? _replacementApplyCarrier = replacementApplyCarrier;
 
@@ -639,47 +656,49 @@ internal static class ManagedReplicaApplyLock
             string displacedPath,
             Action beforeLeaseRelease)
         {
-            FileStream? replacementHandoffGuard = null;
             if (OperatingSystem.IsWindows() && _replacementMainFileLease is null)
             {
                 // Forward replacement may have failed while reacquiring the published inode.
                 // Reestablish exclusion before classifying and quarantining its sidecars.
                 _replacementMainFileLease = AcquireSqliteMainFileLease(destinationPath);
             }
-            try
+            if (OperatingSystem.IsWindows())
             {
-                if (OperatingSystem.IsWindows())
-                {
-                    // This read-only handle denies new write handles while permitting ReplaceFile.
-                    // It follows the replacement inode to the displaced path through the swap.
-                    replacementHandoffGuard = File.Open(
-                        destinationPath,
-                        FileMode.Open,
-                        FileAccess.Read,
-                        FileShare.Read | FileShare.Delete);
-                }
+                // Restore into the published inode while retaining both SQLite leases. Windows
+                // ReplaceFile cannot keep a deny-write handle on its source, and its source
+                // byte-range lock does not exclude writers after the replacement handoff.
                 beforeLeaseRelease();
-                if (OperatingSystem.IsWindows())
-                {
-                    ReleaseMainFileLease();
-                    Interlocked.Exchange(ref _replacementMainFileLease, null)?.Dispose();
-                    ManagedReplicaFaultInjection.Hit(
-                        ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased);
-                }
-                File.Replace(backupPath, destinationPath, displacedPath, ignoreMetadataErrors: false);
-                if (OperatingSystem.IsWindows())
-                {
-                    ManagedReplicaFaultInjection.Hit(
-                        ManagedReplicaDurableBoundary.MainFileRollbackPublishedBeforeLease);
-                    _destinationMainFileLease = AcquireSqliteMainFileLease(destinationPath);
-                    _replacementMainFileLease = replacementHandoffGuard;
-                    replacementHandoffGuard = null;
-                }
+                var destinationIdentity =
+                    SqliteWalSharedMemoryCarrierIdentity.FromPath(destinationPath);
+                var firstLease = _destinationMainFileLease
+                    ?? throw new InvalidOperationException(
+                        "The rollback destination no longer has its SQLite lease.");
+                var secondLease = _replacementMainFileLease
+                    ?? throw new InvalidOperationException(
+                        "The rollback backup no longer has its SQLite lease.");
+                var (publishedLease, backupLease) =
+                    firstLease.CarrierIdentity == destinationIdentity
+                        ? (firstLease, secondLease)
+                        : secondLease.CarrierIdentity == destinationIdentity
+                            ? (secondLease, firstLease)
+                            : throw new InvalidOperationException(
+                                "The rollback leases no longer identify the published database.");
+                ManagedReplicaReplacementState.PreserveDisplacedMainFile(
+                    destinationPath,
+                    displacedPath,
+                    publishedLease);
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.MainFileRollbackDisplacedPreserved);
+                ManagedReplicaReplacementState.RestoreMainFileInPlace(
+                    backupLease,
+                    publishedLease);
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.MainFileRollbackRestoredUnderLease);
+                return;
             }
-            finally
-            {
-                replacementHandoffGuard?.Dispose();
-            }
+
+            beforeLeaseRelease();
+            File.Replace(backupPath, destinationPath, displacedPath, ignoreMetadataErrors: false);
         }
 
         public void Dispose()
@@ -692,8 +711,26 @@ internal static class ManagedReplicaApplyLock
                 ?.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
 
-        private IDisposable AcquireSqliteMainFileLease(string path)
-            => new SqliteWalByteRangeLock(path).AcquireExclusive(
+        internal SqliteWalByteRangeLockLease GetLease(
+            SqliteWalSharedMemoryCarrierIdentity identity)
+        {
+            if (_destinationMainFileLease is { } destination
+                && destination.CarrierIdentity == identity)
+            {
+                return destination;
+            }
+            if (_replacementMainFileLease is { } replacement
+                && replacement.CarrierIdentity == identity)
+            {
+                return replacement;
+            }
+
+            throw new InvalidOperationException(
+                "The main-file replacement lock does not own the requested database inode.");
+        }
+
+        private SqliteWalByteRangeLockLease AcquireSqliteMainFileLease(string path)
+            => new SqliteWalByteRangeLock(path).AcquireExclusiveWritable(
                 PendingByte,
                 SQLiteExclusiveRangeLength,
                 Timeout.InfiniteTimeSpan,

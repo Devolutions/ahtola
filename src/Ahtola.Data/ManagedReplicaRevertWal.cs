@@ -986,7 +986,8 @@ internal static class ManagedReplicaRevertWal
             ManagedReplicaReplacementState.Prepare(
                 databasePath,
                 databaseStagingPath,
-                ManagedReplicaBootstrapper.ComputeMetadataSha256(replacementMetadata));
+                ManagedReplicaBootstrapper.ComputeMetadataSha256(replacementMetadata),
+                mainFileReplacementLock);
             ManagedReplicaApplyLock.ReplaceMainFile(
                 mainFileReplacementLock,
                 databaseStagingPath,
@@ -995,7 +996,9 @@ internal static class ManagedReplicaRevertWal
                 () => databaseInstalled = true);
             if (OperatingSystem.IsWindows()
                 && !string.Equals(
-                    ComputeSha256(databasePath),
+                    ManagedReplicaReplacementState.ComputeDatabaseSha256(
+                        mainFileReplacementLock,
+                        databasePath),
                     expectedSha256,
                     StringComparison.Ordinal))
             {
@@ -1024,7 +1027,11 @@ internal static class ManagedReplicaRevertWal
                         () => ManagedReplicaReplacementState.PrepareRollbackSidecars(databasePath));
                     ManagedReplicaFaultInjection.Hit(
                         ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored);
-                    ManagedReplicaReplacementState.CompleteRollback(databasePath);
+                    ManagedReplicaReplacementState.CompleteRollback(
+                        databasePath,
+                        ManagedReplicaApplyLock.GetMainFileLease(
+                            mainFileReplacementLock,
+                            databasePath));
                 }
             }
             finally
@@ -1047,7 +1054,11 @@ internal static class ManagedReplicaRevertWal
         {
             try
             {
-                _ = ManagedReplicaReplacementState.TryCompletePublication(databasePath);
+                _ = ManagedReplicaReplacementState.TryCompletePublication(
+                    databasePath,
+                    ManagedReplicaApplyLock.GetMainFileLease(
+                        _mainFileReplacementLock,
+                        databasePath));
             }
             finally
             {

@@ -38,6 +38,38 @@ public sealed class SqliteWalByteRangeLockTests
     }
 
     [Test]
+    public void WindowsWritableLeaseCanAccessItsOwnLockedRange()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        const long pendingByte = 0x4000_0000;
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var path = CreateLockCarrier(workDirectory);
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+                stream.SetLength(pendingByte + 512);
+
+            var locks = new SqliteWalByteRangeLock(path);
+            using var lease = locks.AcquireExclusiveWritable(
+                pendingByte,
+                length: 512,
+                TimeSpan.Zero,
+                CancellationToken.None);
+            byte[] expected = [0x41, 0x48, 0x54, 0x4f, 0x4c, 0x41];
+            lease.Write(expected, pendingByte);
+            lease.FlushToDisk();
+            var actual = new byte[expected.Length];
+
+            lease.Read(actual, pendingByte).Should().Be(expected.Length);
+            actual.Should().Equal(expected);
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
     [NonParallelizable]
     public void IndependentProcessesCanShareTheSameRange()
     {

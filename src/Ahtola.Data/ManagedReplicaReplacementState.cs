@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using Ahtola.Core.Storage;
 
 namespace Ahtola;
 
@@ -11,6 +12,10 @@ internal static class ManagedReplicaReplacementState
     internal const string IntentSuffix = ".ahtola-replica-replacement";
     internal const string BackupSuffix = ".ahtola-replica-replacement.bak";
     internal const string DisplacedSuffix = ".ahtola-replica-replacement.displaced";
+    internal const string DisplacedStagingSuffix = ".ahtola-replica-replacement.displaced-staging";
+    internal const string DisplacedSha256Suffix = ".ahtola-replica-replacement.displaced-sha256";
+    internal const string DisplacedSha256StagingSuffix =
+        ".ahtola-replica-replacement.displaced-sha256-staging";
     internal const string OriginalWalSuffix = ".ahtola-replica-replacement.original-wal";
     internal const string RollbackSidecarsPreparedSuffix = ".ahtola-replica-replacement.rollback-sidecars";
     internal const string ReplacementWalSuffix = ".ahtola-replica-replacement.replacement-wal";
@@ -36,6 +41,9 @@ internal static class ManagedReplicaReplacementState
         databasePath + StagingSuffix,
         GetBackupPath(databasePath),
         GetDisplacedPath(databasePath),
+        databasePath + DisplacedStagingSuffix,
+        databasePath + DisplacedSha256Suffix,
+        databasePath + DisplacedSha256StagingSuffix,
         GetOriginalWalPath(databasePath),
         databasePath + RollbackSidecarsPreparedSuffix,
         databasePath + ReplacementWalSuffix,
@@ -59,6 +67,17 @@ internal static class ManagedReplicaReplacementState
         string databasePath,
         string replacementPath,
         string replacementMetadataSha256)
+        => Prepare(
+            databasePath,
+            replacementPath,
+            replacementMetadataSha256,
+            replacementLock: null);
+
+    internal static void Prepare(
+        string databasePath,
+        string replacementPath,
+        string replacementMetadataSha256,
+        IDisposable? replacementLock)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(replacementPath);
@@ -93,8 +112,12 @@ internal static class ManagedReplicaReplacementState
                 ManagedReplicaDurableBoundary.MainFileReplacementOriginalWalCaptured);
         }
         var intent = new ReplacementIntent(
-            ComputeSha256(databasePath),
-            ComputeSha256(replacementPath),
+            replacementLock is null
+                ? ComputeSha256(databasePath)
+                : ComputeDatabaseSha256(replacementLock, databasePath),
+            replacementLock is null
+                ? ComputeSha256(replacementPath)
+                : ComputeDatabaseSha256(replacementLock, replacementPath),
             ComputeSha256(databasePath + ManagedReplicaBootstrapper.MetadataSuffix),
             ParseSha256(replacementMetadataSha256),
             originalWalSha256);
@@ -136,13 +159,15 @@ internal static class ManagedReplicaReplacementState
         DeleteIfExists(databasePath + "-shm");
     }
 
-    internal static void CompletePublication(string databasePath)
+    internal static void CompletePublication(
+        string databasePath,
+        SqliteWalByteRangeLockLease? databaseLease = null)
     {
         var intent = Read(databasePath);
         var metadata = ManagedReplicaBootstrapper.LoadMetadata(databasePath)
             ?? throw new InvalidDataException(
                 "Managed embedded replica replacement publication has no metadata.");
-        ValidateCurrentDatabase(databasePath, intent.ReplacementDatabaseSha256);
+        ValidateCurrentDatabase(databasePath, intent.ReplacementDatabaseSha256, databaseLease);
         ValidateReplacementMetadata(databasePath, metadata, intent);
 
         DeleteIfExists(GetBackupPath(databasePath));
@@ -151,16 +176,21 @@ internal static class ManagedReplicaReplacementState
         ManagedReplicaFaultInjection.Hit(
             ManagedReplicaDurableBoundary.MainFileReplacementBackupRetired);
         DeleteIfExists(GetDisplacedPath(databasePath));
+        DeleteIfExists(databasePath + DisplacedStagingSuffix);
+        DeleteIfExists(databasePath + DisplacedSha256Suffix);
+        DeleteIfExists(databasePath + DisplacedSha256StagingSuffix);
         DeleteIfExists(databasePath + StagingSuffix);
         DeleteIfExists(databasePath + IntentSuffix);
         ManagedReplicaFaultInjection.Hit(
             ManagedReplicaDurableBoundary.MainFileReplacementIntentRetired);
     }
 
-    internal static bool TryCompletePublication(string databasePath)
+    internal static bool TryCompletePublication(
+        string databasePath,
+        SqliteWalByteRangeLockLease? databaseLease = null)
     {
         var intent = Read(databasePath);
-        ValidateCurrentDatabase(databasePath, intent.ReplacementDatabaseSha256);
+        ValidateCurrentDatabase(databasePath, intent.ReplacementDatabaseSha256, databaseLease);
         var metadataSha256 = ComputeSha256(
             databasePath + ManagedReplicaBootstrapper.MetadataSuffix);
         if (string.Equals(metadataSha256, intent.OriginalMetadataSha256, StringComparison.Ordinal))
@@ -168,19 +198,30 @@ internal static class ManagedReplicaReplacementState
             return false;
         }
 
-        CompletePublication(databasePath);
+        CompletePublication(databasePath, databaseLease);
         return true;
     }
 
-    internal static void CompleteRollback(string databasePath)
+    internal static string ComputeDatabaseSha256(
+        IDisposable? replacementLock,
+        string databasePath)
+        => ComputeSha256(
+            ManagedReplicaApplyLock.GetMainFileLease(replacementLock, databasePath));
+
+    internal static void CompleteRollback(
+        string databasePath,
+        SqliteWalByteRangeLockLease? databaseLease = null)
     {
         var intent = Read(databasePath);
-        ValidateCurrentDatabase(databasePath, intent.OriginalDatabaseSha256);
+        ValidateCurrentDatabase(databasePath, intent.OriginalDatabaseSha256, databaseLease);
         ReconcileRollbackSidecars(databasePath, intent);
         ManagedReplicaFaultInjection.Hit(
             ManagedReplicaDurableBoundary.MainFileRollbackSidecarsRestored);
         DeleteIfExists(GetBackupPath(databasePath));
         DeleteIfExists(GetDisplacedPath(databasePath));
+        DeleteIfExists(databasePath + DisplacedStagingSuffix);
+        DeleteIfExists(databasePath + DisplacedSha256Suffix);
+        DeleteIfExists(databasePath + DisplacedSha256StagingSuffix);
         DeleteIfExists(databasePath + StagingSuffix);
         DeleteIfExists(databasePath + IntentSuffix);
         DeleteIfExists(databasePath + RollbackSidecarsPreparedSuffix);
@@ -231,10 +272,14 @@ internal static class ManagedReplicaReplacementState
         var stagingPath = databasePath + StagingSuffix;
         var backupPath = GetBackupPath(databasePath);
         var displacedPath = GetDisplacedPath(databasePath);
+        var displacedSha256Path = databasePath + DisplacedSha256Suffix;
         if (!File.Exists(intentPath))
         {
             if (File.Exists(backupPath)
-                || File.Exists(displacedPath))
+                || File.Exists(displacedPath)
+                || File.Exists(databasePath + DisplacedStagingSuffix)
+                || File.Exists(displacedSha256Path)
+                || File.Exists(databasePath + DisplacedSha256StagingSuffix))
             {
                 throw new InvalidDataException(
                     "Managed embedded replica replacement recovery found a backup without its durable intent.");
@@ -259,8 +304,16 @@ internal static class ManagedReplicaReplacementState
         }
         if (File.Exists(backupPath))
             ValidateFile(backupPath, intent.OriginalDatabaseSha256, "backup");
+        var rollbackPrepared = File.Exists(databasePath + RollbackSidecarsPreparedSuffix);
         if (File.Exists(displacedPath))
-            ValidateFile(displacedPath, intent.ReplacementDatabaseSha256, "displaced database");
+        {
+            ValidateFile(
+                displacedPath,
+                rollbackPrepared && File.Exists(displacedSha256Path)
+                    ? ReadSha256(displacedSha256Path, "displaced database")
+                    : intent.ReplacementDatabaseSha256,
+                "displaced database");
+        }
 
         var currentSha256 = ComputeSha256(databasePath);
         if (string.Equals(currentSha256, intent.OriginalDatabaseSha256, StringComparison.Ordinal))
@@ -277,7 +330,18 @@ internal static class ManagedReplicaReplacementState
                     : ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
                         databasePath,
                         CancellationToken.None);
-                CompleteRollback(databasePath);
+                var databaseLease = ManagedReplicaApplyLock.GetMainFileLease(
+                    rollbackLock,
+                    databasePath);
+                if (!string.Equals(
+                        ComputeSha256(databaseLease),
+                        intent.OriginalDatabaseSha256,
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidDataException(
+                        "Managed embedded replica replacement recovery found an unrecognized database image.");
+                }
+                CompleteRollback(databasePath, databaseLease);
             }
             finally
             {
@@ -285,23 +349,39 @@ internal static class ManagedReplicaReplacementState
             }
             return;
         }
-        if (!string.Equals(currentSha256, intent.ReplacementDatabaseSha256, StringComparison.Ordinal))
+        if (!string.Equals(currentSha256, intent.ReplacementDatabaseSha256, StringComparison.Ordinal)
+            && !rollbackPrepared)
         {
             throw new InvalidDataException(
                 "Managed embedded replica replacement recovery found an unrecognized database image.");
         }
+        ManagedReplicaFaultInjection.Hit(
+            ManagedReplicaDurableBoundary.MainFileReplacementRecoveryClassifiedBeforeLease);
 
-        var metadataChanged = !string.Equals(
-            ComputeSha256(metadataPath),
-            intent.OriginalMetadataSha256,
-            StringComparison.Ordinal);
-        if (metadataChanged)
-        {
-            CompletePublication(databasePath);
-            return;
-        }
         if (!File.Exists(backupPath))
         {
+            if (!rollbackPrepared)
+            {
+                using var publicationLock =
+                    ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
+                        databasePath,
+                        CancellationToken.None);
+                var databaseLease = ManagedReplicaApplyLock.GetMainFileLease(
+                    publicationLock,
+                    databasePath);
+                if (string.Equals(
+                        ComputeSha256(databaseLease),
+                        intent.ReplacementDatabaseSha256,
+                        StringComparison.Ordinal)
+                    && !string.Equals(
+                        ComputeSha256(metadataPath),
+                        intent.OriginalMetadataSha256,
+                        StringComparison.Ordinal))
+                {
+                    CompletePublication(databasePath, databaseLease);
+                    return;
+                }
+            }
             throw new InvalidDataException(
                 "Managed embedded replica replacement recovery cannot restore the original database because its backup is missing.");
         }
@@ -312,6 +392,40 @@ internal static class ManagedReplicaReplacementState
                 databasePath,
                 backupPath,
                 CancellationToken.None);
+            var databaseLease = ManagedReplicaApplyLock.GetMainFileLease(
+                replacementLock,
+                databasePath);
+            var backupLease = ManagedReplicaApplyLock.GetMainFileLease(
+                replacementLock,
+                backupPath);
+            if (!string.Equals(
+                    ComputeSha256(backupLease),
+                    intent.OriginalDatabaseSha256,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "Managed embedded replica replacement recovery backup is missing or corrupt.");
+            }
+            var lockedSha256 = ComputeSha256(databaseLease);
+            if (!string.Equals(
+                    lockedSha256,
+                    intent.ReplacementDatabaseSha256,
+                    StringComparison.Ordinal)
+                && (!rollbackPrepared
+                    || !IsStrictFilePrefix(databaseLease, backupLease)))
+            {
+                throw new InvalidDataException(
+                    "Managed embedded replica replacement recovery found an unrecognized database image.");
+            }
+            if (!rollbackPrepared
+                && !string.Equals(
+                    ComputeSha256(metadataPath),
+                    intent.OriginalMetadataSha256,
+                    StringComparison.Ordinal))
+            {
+                CompletePublication(databasePath, databaseLease);
+                return;
+            }
             ValidateOriginalWalState(databasePath, intent, originalDatabaseInstalled: false);
             ManagedReplicaApplyLock.RollBackMainFile(
                 replacementLock,
@@ -321,7 +435,9 @@ internal static class ManagedReplicaReplacementState
                 () => PrepareRollbackSidecars(databasePath));
             ManagedReplicaFaultInjection.Hit(
                 ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored);
-            CompleteRollback(databasePath);
+            CompleteRollback(
+                databasePath,
+                ManagedReplicaApplyLock.GetMainFileLease(replacementLock, databasePath));
         }
         finally
         {
@@ -412,8 +528,22 @@ internal static class ManagedReplicaReplacementState
             ? null
             : ParseSha256(value);
 
-    private static void ValidateCurrentDatabase(string databasePath, string expectedSha256)
-        => ValidateFile(databasePath, expectedSha256, "database");
+    private static void ValidateCurrentDatabase(
+        string databasePath,
+        string expectedSha256,
+        SqliteWalByteRangeLockLease? databaseLease = null)
+    {
+        if (databaseLease is null)
+        {
+            ValidateFile(databasePath, expectedSha256, "database");
+            return;
+        }
+        if (!string.Equals(ComputeSha256(databaseLease), expectedSha256, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                "Managed embedded replica replacement recovery database is missing or corrupt.");
+        }
+    }
 
     private static void ValidateReplacementMetadata(
         string databasePath,
@@ -592,6 +722,20 @@ internal static class ManagedReplicaReplacementState
         return Convert.ToHexString(SHA256.HashData(stream));
     }
 
+    private static string ComputeSha256(SqliteWalByteRangeLockLease lease)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[128 * 1024];
+        long offset = 0;
+        int read;
+        while ((read = lease.Read(buffer, offset)) != 0)
+        {
+            hash.AppendData(buffer, 0, read);
+            offset += read;
+        }
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
     private static void CopyFileDurably(string sourcePath, string destinationPath)
     {
         using var source = new FileStream(
@@ -608,6 +752,161 @@ internal static class ManagedReplicaReplacementState
             FileOptions.WriteThrough);
         source.CopyTo(destination);
         destination.Flush(flushToDisk: true);
+    }
+
+    internal static void PreserveDisplacedMainFile(
+        string databasePath,
+        string displacedPath,
+        SqliteWalByteRangeLockLease databaseLease)
+    {
+        var displacedSha256Path = databasePath + DisplacedSha256Suffix;
+        var displacedStagingPath = databasePath + DisplacedStagingSuffix;
+        if (File.Exists(displacedPath))
+        {
+            ValidateFile(
+                displacedPath,
+                ReadSha256(displacedSha256Path, "displaced database"),
+                "displaced database");
+            return;
+        }
+
+        if (File.Exists(displacedSha256Path))
+        {
+            ValidateFile(
+                displacedStagingPath,
+                ReadSha256(displacedSha256Path, "displaced database"),
+                "staged displaced database");
+        }
+        else
+        {
+            DeleteIfExists(displacedStagingPath);
+            CopyLeaseToFileDurably(databaseLease, displacedStagingPath);
+            WriteSha256Durably(
+                databasePath,
+                ComputeSha256(displacedStagingPath));
+        }
+        File.Move(displacedStagingPath, displacedPath, overwrite: false);
+    }
+
+    internal static void RestoreMainFileInPlace(
+        SqliteWalByteRangeLockLease backupLease,
+        SqliteWalByteRangeLockLease databaseLease)
+    {
+        databaseLease.SetLength(0);
+        ManagedReplicaFaultInjection.Hit(
+            ManagedReplicaDurableBoundary.MainFileRollbackRestoreStarted);
+        CopyLease(backupLease, databaseLease);
+        databaseLease.FlushToDisk();
+    }
+
+    private static void CopyLeaseToFileDurably(
+        SqliteWalByteRangeLockLease source,
+        string destinationPath)
+    {
+        using var destination = new FileStream(
+            destinationPath,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 128 * 1024,
+            FileOptions.WriteThrough);
+        var buffer = new byte[128 * 1024];
+        long offset = 0;
+        int read;
+        while ((read = source.Read(buffer, offset)) != 0)
+        {
+            destination.Write(buffer, 0, read);
+            offset += read;
+        }
+        destination.Flush(flushToDisk: true);
+    }
+
+    private static void CopyLease(
+        SqliteWalByteRangeLockLease source,
+        SqliteWalByteRangeLockLease destination)
+    {
+        var buffer = new byte[128 * 1024];
+        long offset = 0;
+        int read;
+        while ((read = source.Read(buffer, offset)) != 0)
+        {
+            destination.Write(buffer.AsSpan(0, read), offset);
+            offset += read;
+        }
+    }
+
+    private static bool IsStrictFilePrefix(
+        SqliteWalByteRangeLockLease candidate,
+        SqliteWalByteRangeLockLease expected)
+    {
+        var candidateBuffer = new byte[128 * 1024];
+        var expectedBuffer = new byte[candidateBuffer.Length];
+        long offset = 0;
+        int candidateRead;
+        while ((candidateRead = candidate.Read(candidateBuffer, offset)) != 0)
+        {
+            var expectedRead = expected.Read(expectedBuffer.AsSpan(0, candidateRead), offset);
+            if (expectedRead != candidateRead)
+                return false;
+            if (!candidateBuffer.AsSpan(0, candidateRead)
+                    .SequenceEqual(expectedBuffer.AsSpan(0, candidateRead)))
+            {
+                return false;
+            }
+            offset += candidateRead;
+        }
+        return expected.Read(expectedBuffer.AsSpan(0, 1), offset) != 0;
+    }
+
+    private static string ReadSha256(string path, string role)
+    {
+        string value;
+        try
+        {
+            value = File.ReadAllText(path, StrictUtf8);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidDataException(
+                $"Managed embedded replica replacement recovery {role} hash could not be read.",
+                exception);
+        }
+        try
+        {
+            return ParseSha256(value);
+        }
+        catch (InvalidDataException exception)
+        {
+            throw new InvalidDataException(
+                $"Managed embedded replica replacement recovery {role} hash is corrupt.",
+                exception);
+        }
+    }
+
+    private static void WriteSha256Durably(string databasePath, string sha256)
+    {
+        var path = databasePath + DisplacedSha256Suffix;
+        var stagingPath = databasePath + DisplacedSha256StagingSuffix;
+        DeleteIfExists(stagingPath);
+        try
+        {
+            using (var stream = new FileStream(
+                       stagingPath,
+                       FileMode.CreateNew,
+                       FileAccess.Write,
+                       FileShare.None,
+                       bufferSize: 64,
+                       FileOptions.WriteThrough))
+            {
+                stream.Write(StrictUtf8.GetBytes(sha256));
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(stagingPath, path, overwrite: false);
+        }
+        finally
+        {
+            DeleteIfExists(stagingPath);
+        }
     }
 
     private static void WriteDurableMarker(string path)
