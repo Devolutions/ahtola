@@ -672,6 +672,90 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [TestCase("sqlite-delete-commit")]
+    [TestCase("sqlite-wal-checkpoint-commit")]
+    public async Task ColdOpenRestoresRollbackWhoseDisplacedGenerationWasDurablyRecorded(
+        string writerMode)
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath($"rollback-recorded-displaced-{writerMode}");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+
+        try
+        {
+            await InterruptRollbackAfterPreservingMutatedReplacementAsync(
+                path,
+                handler,
+                writerMode);
+
+            File.ReadAllBytes(path).Should().NotEqual(updatedImage);
+            File.Exists(ManagedReplicaReplacementState.GetDisplacedPath(path)).Should().BeTrue();
+            File.Exists(path + ManagedReplicaReplacementState.DisplacedSha256Suffix).Should().BeTrue();
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            recovered.Dispose();
+            File.ReadAllBytes(path).Should().Equal(initialImage);
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ColdOpenRejectsMutationAfterDisplacedGenerationWasDurablyRecorded()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("rollback-recorded-displaced-mutation");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+
+        try
+        {
+            await InterruptRollbackAfterPreservingMutatedReplacementAsync(
+                path,
+                handler,
+                "sqlite-wal-checkpoint-commit");
+
+            using (var writer = new NativeSqliteConnection(
+                       $"Data Source={path};Mode=ReadWriteCreate;Pooling=False"))
+            {
+                writer.Open();
+                using var command = writer.CreateCommand();
+                command.CommandText =
+                    "CREATE TABLE unrelated_displaced_writer(value INTEGER);"
+                    + " INSERT INTO unrelated_displaced_writer VALUES (127);";
+                command.ExecuteNonQuery();
+            }
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            var exception = Assert.Throws<InvalidDataException>(() => recovered.Open());
+            exception!.Message.Should().Contain("unrecognized database image");
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeTrue();
+            File.ReadAllBytes(ManagedReplicaReplacementState.GetBackupPath(path))
+                .Should().Equal(initialImage);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
     [Test]
     public async Task ColdOpenFailsClosedForACommitAfterInterruptedInPlaceRollback()
     {
@@ -1628,6 +1712,59 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         transaction.Commit();
     }
 
+    private static async Task InterruptRollbackAfterPreservingMutatedReplacementAsync(
+        string path,
+        PullUpdatesHandler handler,
+        string writerMode)
+    {
+        CrossProcessReplicaRaceWorker? writer = null;
+        var replacementMutated = false;
+        var rollbackInterrupted = false;
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            connection.Open();
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary
+                               == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease
+                           && writer is null)
+                       {
+                           writer = new CrossProcessReplicaRaceWorker(
+                               TestContext.CurrentContext.WorkDirectory,
+                               path,
+                               writerMode);
+                           writer.WaitForUnblockedCompletion();
+                           replacementMutated = true;
+                       }
+                       else if (replacementMutated
+                                && !rollbackInterrupted
+                                && boundary
+                                    == ManagedReplicaDurableBoundary.MainFileRollbackDisplacedPreserved)
+                       {
+                           rollbackInterrupted = true;
+                           throw new IOException("Injected crash after preserving the displaced database.");
+                       }
+                       else if (rollbackInterrupted
+                                && boundary
+                                    == ManagedReplicaDurableBoundary.MainFileReplacementRecoveryStarted)
+                       {
+                           throw new IOException("Injected automatic recovery interruption.");
+                       }
+                   }))
+            {
+                var exception = Assert.ThrowsAsync<IOException>(
+                    () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                exception!.Message.Should().Be("Injected automatic recovery interruption.");
+            }
+        }
+        finally
+        {
+            writer?.Dispose();
+        }
+    }
+
     private sealed class CrossProcessReplicaRaceWorker : IDisposable
     {
         private readonly Process _worker;
@@ -1701,6 +1838,12 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             => File.WriteAllText(_releasePath, string.Empty);
 
         internal void WaitForCompletion()
+            => WaitForCompletion(_mode);
+
+        internal void WaitForUnblockedCompletion()
+            => WaitForCompletion($"{_mode}-acquired-without-blocking");
+
+        private void WaitForCompletion(string expectedResult)
         {
             if (_completed)
                 return;
@@ -1716,7 +1859,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
 
             _worker.WaitForExit();
             _worker.ExitCode.Should().Be(0, $"worker output:{Environment.NewLine}{_output}");
-            File.ReadAllText(_completedPath).Should().Be(_mode);
+            File.ReadAllText(_completedPath).Should().Be(expectedResult);
         }
 
         internal void WaitForCrashCompletion()

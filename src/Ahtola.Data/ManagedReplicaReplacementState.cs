@@ -305,13 +305,16 @@ internal static class ManagedReplicaReplacementState
         if (File.Exists(backupPath))
             ValidateFile(backupPath, intent.OriginalDatabaseSha256, "backup");
         var rollbackPrepared = File.Exists(databasePath + RollbackSidecarsPreparedSuffix);
+        string? validatedDisplacedSha256 = null;
         if (File.Exists(displacedPath))
         {
-            ValidateFile(
-                displacedPath,
+            validatedDisplacedSha256 =
                 rollbackPrepared && File.Exists(displacedSha256Path)
                     ? ReadSha256(displacedSha256Path, "displaced database")
-                    : intent.ReplacementDatabaseSha256,
+                    : intent.ReplacementDatabaseSha256;
+            ValidateFile(
+                displacedPath,
+                validatedDisplacedSha256,
                 "displaced database");
         }
 
@@ -411,6 +414,12 @@ internal static class ManagedReplicaReplacementState
                     lockedSha256,
                     intent.ReplacementDatabaseSha256,
                     StringComparison.Ordinal)
+                && (!rollbackPrepared
+                    || validatedDisplacedSha256 is null
+                    || !string.Equals(
+                        lockedSha256,
+                        validatedDisplacedSha256,
+                        StringComparison.Ordinal))
                 && (!rollbackPrepared
                     || !IsStrictFilePrefix(databaseLease, backupLease)))
             {
