@@ -220,6 +220,8 @@ internal static class ManagedReplicaReplacementState
         DeleteIfExists(GetBackupPath(databasePath));
         DeleteIfExists(GetDisplacedPath(databasePath));
         DeleteIfExists(databasePath + DisplacedStagingSuffix);
+        ManagedReplicaFaultInjection.Hit(
+            ManagedReplicaDurableBoundary.MainFileRollbackDisplacedRetired);
         DeleteIfExists(databasePath + DisplacedSha256Suffix);
         DeleteIfExists(databasePath + DisplacedSha256StagingSuffix);
         DeleteIfExists(databasePath + StagingSuffix);
@@ -351,6 +353,17 @@ internal static class ManagedReplicaReplacementState
                 rollbackLock?.Dispose();
             }
             return;
+        }
+        if (!File.Exists(displacedPath)
+            && rollbackPrepared
+            && File.Exists(displacedSha256Path))
+        {
+            validatedDisplacedSha256 =
+                ReadSha256(displacedSha256Path, "displaced database");
+            ValidateFile(
+                databasePath + DisplacedStagingSuffix,
+                validatedDisplacedSha256,
+                "staged displaced database");
         }
         if (!string.Equals(currentSha256, intent.ReplacementDatabaseSha256, StringComparison.Ordinal)
             && !rollbackPrepared)
@@ -793,6 +806,8 @@ internal static class ManagedReplicaReplacementState
             WriteSha256Durably(
                 databasePath,
                 ComputeSha256(displacedStagingPath));
+            ManagedReplicaFaultInjection.Hit(
+                ManagedReplicaDurableBoundary.MainFileRollbackDisplacedHashPublished);
         }
         File.Move(displacedStagingPath, displacedPath, overwrite: false);
     }

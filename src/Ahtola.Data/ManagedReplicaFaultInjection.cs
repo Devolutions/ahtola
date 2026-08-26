@@ -191,10 +191,21 @@ internal enum ManagedReplicaDurableBoundary
     MainFileReplacementPublishedBeforeLease,
 
     /// <summary>
+    /// Windows-only boundary after the displaced database hash is durable but before the staged
+    /// displaced image is promoted to its final recovery path.
+    /// </summary>
+    MainFileRollbackDisplacedHashPublished,
+
+    /// <summary>
     /// Windows-only boundary after the replacement image is durably preserved and before the
     /// retained backup is copied over the continuously leased destination inode.
     /// </summary>
     MainFileRollbackDisplacedPreserved,
+
+    /// <summary>
+    /// Hit after rollback retires displaced database images but before their durable hash is retired.
+    /// </summary>
+    MainFileRollbackDisplacedRetired,
 
     /// <summary>
     /// Hit after replacement-generation sidecars are quarantined while both main-file leases remain held.

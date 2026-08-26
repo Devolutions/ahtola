@@ -602,6 +602,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackRestoredUnderLease))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackSidecarsRestored))]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackDisplacedRetired))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackIntentRetired))]
     public async Task ColdOpenRecoversEveryWindowsReplacementRollbackPhase(
         string interruptedBoundaryName)
@@ -689,7 +690,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
 
         try
         {
-            await InterruptRollbackAfterPreservingMutatedReplacementAsync(
+            await InterruptRollbackAfterMutatingReplacementAsync(
                 path,
                 handler,
                 writerMode);
@@ -727,7 +728,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
 
         try
         {
-            await InterruptRollbackAfterPreservingMutatedReplacementAsync(
+            await InterruptRollbackAfterMutatingReplacementAsync(
                 path,
                 handler,
                 "sqlite-wal-checkpoint-commit");
@@ -746,6 +747,83 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
             var exception = Assert.Throws<InvalidDataException>(() => recovered.Open());
             exception!.Message.Should().Contain("unrecognized database image");
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeTrue();
+            File.ReadAllBytes(ManagedReplicaReplacementState.GetBackupPath(path))
+                .Should().Equal(initialImage);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ColdOpenPromotesHashedStagedDisplacedGenerationBeforeRestoringRollback()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("rollback-hashed-staged-displaced");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+
+        try
+        {
+            await InterruptRollbackAfterMutatingReplacementAsync(
+                path,
+                handler,
+                "sqlite-delete-commit",
+                ManagedReplicaDurableBoundary.MainFileRollbackDisplacedHashPublished);
+
+            File.ReadAllBytes(path).Should().NotEqual(updatedImage);
+            File.Exists(ManagedReplicaReplacementState.GetDisplacedPath(path)).Should().BeFalse();
+            File.Exists(path + ManagedReplicaReplacementState.DisplacedStagingSuffix).Should().BeTrue();
+            File.Exists(path + ManagedReplicaReplacementState.DisplacedSha256Suffix).Should().BeTrue();
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            recovered.Dispose();
+            File.ReadAllBytes(path).Should().Equal(initialImage);
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ColdOpenRejectsCorruptHashedStagedDisplacedGeneration()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("rollback-corrupt-hashed-staged-displaced");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        var displacedStagingPath = path + ManagedReplicaReplacementState.DisplacedStagingSuffix;
+
+        try
+        {
+            await InterruptRollbackAfterMutatingReplacementAsync(
+                path,
+                handler,
+                "sqlite-wal-checkpoint-commit",
+                ManagedReplicaDurableBoundary.MainFileRollbackDisplacedHashPublished);
+
+            File.WriteAllBytes(displacedStagingPath, [0x53, 0x54, 0x41, 0x47, 0x45]);
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            var exception = Assert.Throws<InvalidDataException>(() => recovered.Open());
+            exception!.Message.Should().Contain("staged displaced database is missing or corrupt");
             ManagedReplicaReplacementState.HasArtifacts(path).Should().BeTrue();
             File.ReadAllBytes(ManagedReplicaReplacementState.GetBackupPath(path))
                 .Should().Equal(initialImage);
@@ -1712,10 +1790,12 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         transaction.Commit();
     }
 
-    private static async Task InterruptRollbackAfterPreservingMutatedReplacementAsync(
+    private static async Task InterruptRollbackAfterMutatingReplacementAsync(
         string path,
         PullUpdatesHandler handler,
-        string writerMode)
+        string writerMode,
+        ManagedReplicaDurableBoundary interruptedBoundary =
+            ManagedReplicaDurableBoundary.MainFileRollbackDisplacedPreserved)
     {
         CrossProcessReplicaRaceWorker? writer = null;
         var replacementMutated = false;
@@ -1740,11 +1820,10 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                        }
                        else if (replacementMutated
                                 && !rollbackInterrupted
-                                && boundary
-                                    == ManagedReplicaDurableBoundary.MainFileRollbackDisplacedPreserved)
+                                && boundary == interruptedBoundary)
                        {
                            rollbackInterrupted = true;
-                           throw new IOException("Injected crash after preserving the displaced database.");
+                           throw new IOException($"Injected crash at {boundary}.");
                        }
                        else if (rollbackInterrupted
                                 && boundary
