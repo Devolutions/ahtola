@@ -2241,7 +2241,8 @@ internal static class ManagedReplicaBootstrapper
                     mainFileReplacementLock,
                     backupPath,
                     options.Path,
-                    displacedPath);
+                    displacedPath,
+                    () => ManagedReplicaReplacementState.PrepareRollbackSidecars(options.Path));
                 ManagedReplicaFaultInjection.Hit(
                     ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored);
                 ManagedReplicaReplacementState.CompleteRollback(options.Path);

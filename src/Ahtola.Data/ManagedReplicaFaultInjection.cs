@@ -197,6 +197,11 @@ internal enum ManagedReplicaDurableBoundary
     MainFileRollbackLeasesReleased,
 
     /// <summary>
+    /// Hit after replacement-generation sidecars are quarantined while both main-file leases remain held.
+    /// </summary>
+    MainFileRollbackSidecarsQuarantined,
+
+    /// <summary>
     /// Hit after the original WAL is durably captured but before the replacement intent is published.
     /// </summary>
     MainFileReplacementOriginalWalCaptured,
@@ -220,6 +225,12 @@ internal enum ManagedReplicaDurableBoundary
     /// Hit after rollback restores the exact old database image but before retiring recovery state.
     /// </summary>
     MainFileRollbackDatabaseRestored,
+
+    /// <summary>
+    /// Windows-only boundary after rollback installs the original main file and before reacquiring
+    /// leases on the restored and displaced inodes.
+    /// </summary>
+    MainFileRollbackPublishedBeforeLease,
 
     /// <summary>
     /// Hit after rollback restores the original database sidecar generation but before retiring

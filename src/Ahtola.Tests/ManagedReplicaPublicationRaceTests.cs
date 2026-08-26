@@ -249,15 +249,14 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                            throw new IOException("Injected replacement reacquisition failure.");
                        }
 
-                       if (boundary == ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased)
+                       if (boundary == ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased
+                           && rollbackWriter is null)
                        {
                            rollbackWriter = new CrossProcessReplicaRaceWorker(
                                TestContext.CurrentContext.WorkDirectory,
                                path,
-                               "sqlite-hold");
-                           rollbackWriter.WaitForProbeState("acquired");
-                           rollbackWriter.ReleaseBlockedProbe();
-                           rollbackWriter.WaitForCompletion();
+                               "sqlite-write");
+                           rollbackWriter.WaitForBlockedProbe();
                            rollbackInterrupted = true;
                            throw new IOException("Injected rollback handoff interruption.");
                        }
@@ -285,6 +284,8 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
             recovered.Open();
 
+            rollbackWriter!.ReleaseBlockedProbe();
+            rollbackWriter.WaitForCompletion();
             ReadBootstrapMarker(recovered).Should().Be(42);
             recovered.Dispose();
             File.ReadAllBytes(path).Should().Equal(initialImage);
@@ -373,6 +374,158 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [Test]
+    public async Task ColdOpenRollbackPreservesCommittedRestoredGenerationWal()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("rollback-restored-wal");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        CrossProcessReplicaRaceWorker? walWriter = null;
+        var rollbackPublished = false;
+        var rollbackReconciled = false;
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+            {
+                connection.Open();
+                using (ManagedReplicaFaultInjection.Push(boundary =>
+                       {
+                           if (boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease)
+                           {
+                               throw new IOException("Injected replacement reacquisition failure.");
+                           }
+                           if (boundary == ManagedReplicaDurableBoundary.MainFileRollbackPublishedBeforeLease
+                               && walWriter is null)
+                           {
+                               rollbackPublished = true;
+                               walWriter = new CrossProcessReplicaRaceWorker(
+                                   TestContext.CurrentContext.WorkDirectory,
+                                   path,
+                                   "sqlite-wal-crash");
+                               walWriter.WaitForProbeState("committed");
+                               walWriter.WaitForCrashCompletion();
+                           }
+                           else if (rollbackPublished
+                                    && boundary == ManagedReplicaDurableBoundary.MainFileRollbackSidecarsRestored)
+                           {
+                               rollbackReconciled = true;
+                               throw new IOException("Injected crash after preserving the restored-generation WAL.");
+                           }
+                           else if (rollbackReconciled
+                                    && boundary == ManagedReplicaDurableBoundary.MainFileReplacementRecoveryStarted)
+                           {
+                               throw new IOException("Injected automatic recovery interruption.");
+                           }
+                       }))
+                {
+                    var exception = Assert.ThrowsAsync<IOException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                    exception!.Message.Should().Be("Injected automatic recovery interruption.");
+                }
+            }
+
+            walWriter.Should().NotBeNull();
+            File.Exists(path + "-wal").Should().BeTrue();
+            File.Exists(ManagedReplicaReplacementState.GetDisplacedPath(path)).Should().BeTrue();
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeTrue();
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(126);
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+        }
+        finally
+        {
+            walWriter?.Dispose();
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task ColdOpenRollbackDiscardsReplacementWalRecreatedAfterQuarantineCrash()
+    {
+        Assume.That(OperatingSystem.IsWindows(), Is.True);
+        var path = NewReplicaPath("rollback-recreated-replacement-wal");
+        var initialImage = CreateDatabaseImageWithMarker(path + ".initial", 42);
+        var updatedImage = CreateDatabaseImageWithMarker(path + ".updated", 84);
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", initialImage),
+            CreatePullResponse("revision-43", updatedImage),
+        ]);
+        var rollbackInterrupted = false;
+        CrossProcessReplicaRaceWorker? preQuarantineWriter = null;
+        CrossProcessReplicaRaceWorker? walWriter = null;
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(CreateOptions(path, handler)))
+            {
+                connection.Open();
+                using (ManagedReplicaFaultInjection.Push(boundary =>
+                       {
+                           if (boundary == ManagedReplicaDurableBoundary.MainFileReplacementPublishedBeforeLease)
+                           {
+                               preQuarantineWriter = new CrossProcessReplicaRaceWorker(
+                                   TestContext.CurrentContext.WorkDirectory,
+                                   path,
+                                   "sqlite-wal-crash");
+                               preQuarantineWriter.WaitForProbeState("committed");
+                               preQuarantineWriter.WaitForCrashCompletion();
+                               throw new IOException("Injected replacement reacquisition failure.");
+                           }
+                           if (!rollbackInterrupted
+                               && boundary == ManagedReplicaDurableBoundary.MainFileRollbackSidecarsQuarantined)
+                           {
+                               rollbackInterrupted = true;
+                               throw new IOException("Injected crash after replacement sidecar quarantine.");
+                           }
+                           if (rollbackInterrupted
+                               && boundary == ManagedReplicaDurableBoundary.MainFileReplacementRecoveryStarted)
+                           {
+                               throw new IOException("Injected automatic recovery interruption.");
+                           }
+                       }))
+                {
+                    var exception = Assert.ThrowsAsync<IOException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                    exception!.Message.Should().Be("Injected automatic recovery interruption.");
+                }
+            }
+
+            walWriter = new CrossProcessReplicaRaceWorker(
+                TestContext.CurrentContext.WorkDirectory,
+                path,
+                "sqlite-wal-crash");
+            walWriter.WaitForProbeState("committed");
+            walWriter.WaitForCrashCompletion();
+            File.Exists(path + "-wal").Should().BeTrue();
+            File.Exists(path + ManagedReplicaReplacementState.ReplacementWalSuffix).Should().BeTrue();
+
+            using var recovered = AhtolaConnection.CreateReplica(CreateOptions(path, handler));
+            recovered.Open();
+
+            ReadBootstrapMarker(recovered).Should().Be(42);
+            ManagedReplicaReplacementState.HasArtifacts(path).Should().BeFalse();
+        }
+        finally
+        {
+            if (walWriter is not null)
+                walWriter.WaitForCrashCompletion();
+            preQuarantineWriter?.Dispose();
+            walWriter?.Dispose();
+            DeleteReplicaFiles(path);
+        }
+    }
+
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementOriginalWalCaptured), 42)]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementIntentPublished), 42)]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileReplacementSourceLeaseReleased), 42)]
@@ -442,6 +595,8 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     }
 
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased))]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackSidecarsQuarantined))]
+    [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackPublishedBeforeLease))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackSidecarsRestored))]
     [TestCase(nameof(ManagedReplicaDurableBoundary.MainFileRollbackIntentRetired))]
@@ -1250,7 +1405,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             }
 
             catch (Microsoft.Data.Sqlite.SqliteException exception)
-                when (exception.SqliteErrorCode is 5 or 6)
+                when (exception.SqliteErrorCode is 5 or 6 or 8)
             {
                 File.WriteAllText(blockedPath, "blocked");
             }

@@ -1020,7 +1020,8 @@ internal static class ManagedReplicaRevertWal
                         mainFileReplacementLock,
                         databaseBackupPath,
                         databasePath,
-                        displacedPath);
+                        displacedPath,
+                        () => ManagedReplicaReplacementState.PrepareRollbackSidecars(databasePath));
                     ManagedReplicaFaultInjection.Hit(
                         ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored);
                     ManagedReplicaReplacementState.CompleteRollback(databasePath);

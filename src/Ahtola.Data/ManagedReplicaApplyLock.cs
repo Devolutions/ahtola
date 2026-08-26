@@ -583,14 +583,16 @@ internal static class ManagedReplicaApplyLock
         IDisposable? replacementLock,
         string backupPath,
         string destinationPath,
-        string displacedPath)
+        string displacedPath,
+        Action beforeLeaseRelease)
     {
         if (replacementLock is MainFileReplacementLease lease)
         {
-            lease.RollBack(backupPath, destinationPath, displacedPath);
+            lease.RollBack(backupPath, destinationPath, displacedPath, beforeLeaseRelease);
             return;
         }
 
+        beforeLeaseRelease();
         File.Replace(backupPath, destinationPath, displacedPath, ignoreMetadataErrors: false);
     }
 
@@ -631,22 +633,52 @@ internal static class ManagedReplicaApplyLock
             }
         }
 
-        internal void RollBack(string backupPath, string destinationPath, string displacedPath)
+        internal void RollBack(
+            string backupPath,
+            string destinationPath,
+            string displacedPath,
+            Action beforeLeaseRelease)
         {
-            if (OperatingSystem.IsWindows())
+            FileStream? replacementHandoffGuard = null;
+            if (OperatingSystem.IsWindows() && _replacementMainFileLease is null)
             {
-                ReleaseMainFileLease();
-                Interlocked.Exchange(ref _replacementMainFileLease, null)?.Dispose();
-                ManagedReplicaFaultInjection.Hit(
-                    ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased);
+                // Forward replacement may have failed while reacquiring the published inode.
+                // Reestablish exclusion before classifying and quarantining its sidecars.
+                _replacementMainFileLease = AcquireSqliteMainFileLease(destinationPath);
             }
-            File.Replace(backupPath, destinationPath, displacedPath, ignoreMetadataErrors: false);
-            if (OperatingSystem.IsWindows())
+            try
             {
-                // A writer may have entered either inode while ReplaceFile required their leases
-                // to be released. Reacquire both before rollback state or sidecars are reconciled.
-                _destinationMainFileLease = AcquireSqliteMainFileLease(destinationPath);
-                _replacementMainFileLease = AcquireSqliteMainFileLease(displacedPath);
+                if (OperatingSystem.IsWindows())
+                {
+                    // This read-only handle denies new write handles while permitting ReplaceFile.
+                    // It follows the replacement inode to the displaced path through the swap.
+                    replacementHandoffGuard = File.Open(
+                        destinationPath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.Read | FileShare.Delete);
+                }
+                beforeLeaseRelease();
+                if (OperatingSystem.IsWindows())
+                {
+                    ReleaseMainFileLease();
+                    Interlocked.Exchange(ref _replacementMainFileLease, null)?.Dispose();
+                    ManagedReplicaFaultInjection.Hit(
+                        ManagedReplicaDurableBoundary.MainFileRollbackLeasesReleased);
+                }
+                File.Replace(backupPath, destinationPath, displacedPath, ignoreMetadataErrors: false);
+                if (OperatingSystem.IsWindows())
+                {
+                    ManagedReplicaFaultInjection.Hit(
+                        ManagedReplicaDurableBoundary.MainFileRollbackPublishedBeforeLease);
+                    _destinationMainFileLease = AcquireSqliteMainFileLease(destinationPath);
+                    _replacementMainFileLease = replacementHandoffGuard;
+                    replacementHandoffGuard = null;
+                }
+            }
+            finally
+            {
+                replacementHandoffGuard?.Dispose();
             }
         }
 

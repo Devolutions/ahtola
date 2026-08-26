@@ -316,7 +316,9 @@ public sealed partial class SqliteWalByteRangeLock
         => File.OpenHandle(
             LockFilePath,
             FileMode.Open,
-            mode == SqliteWalByteRangeLockMode.Shared ? FileAccess.Read : FileAccess.ReadWrite,
+            mode == SqliteWalByteRangeLockMode.Shared || OperatingSystem.IsWindows()
+                ? FileAccess.Read
+                : FileAccess.ReadWrite,
             FileShare.ReadWrite | FileShare.Delete,
             FileOptions.None);
 

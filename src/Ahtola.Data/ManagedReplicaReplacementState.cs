@@ -12,6 +12,10 @@ internal static class ManagedReplicaReplacementState
     internal const string BackupSuffix = ".ahtola-replica-replacement.bak";
     internal const string DisplacedSuffix = ".ahtola-replica-replacement.displaced";
     internal const string OriginalWalSuffix = ".ahtola-replica-replacement.original-wal";
+    internal const string RollbackSidecarsPreparedSuffix = ".ahtola-replica-replacement.rollback-sidecars";
+    internal const string ReplacementWalSuffix = ".ahtola-replica-replacement.replacement-wal";
+    internal const string ReplacementShmSuffix = ".ahtola-replica-replacement.replacement-shm";
+    internal const string ReplacementJournalSuffix = ".ahtola-replica-replacement.replacement-journal";
     internal const string StagingSuffix = ".ahtola-replica-replacement.tmp";
 
     private const int MaximumIntentLength = 4096;
@@ -33,6 +37,10 @@ internal static class ManagedReplicaReplacementState
         GetBackupPath(databasePath),
         GetDisplacedPath(databasePath),
         GetOriginalWalPath(databasePath),
+        databasePath + RollbackSidecarsPreparedSuffix,
+        databasePath + ReplacementWalSuffix,
+        databasePath + ReplacementShmSuffix,
+        databasePath + ReplacementJournalSuffix,
     ];
 
     internal static void DeleteArtifacts(string databasePath)
@@ -139,6 +147,7 @@ internal static class ManagedReplicaReplacementState
 
         DeleteIfExists(GetBackupPath(databasePath));
         DeleteIfExists(GetOriginalWalPath(databasePath));
+        DeleteRollbackSidecarArtifacts(databasePath, includePreparedMarker: true);
         ManagedReplicaFaultInjection.Hit(
             ManagedReplicaDurableBoundary.MainFileReplacementBackupRetired);
         DeleteIfExists(GetDisplacedPath(databasePath));
@@ -174,8 +183,46 @@ internal static class ManagedReplicaReplacementState
         DeleteIfExists(GetDisplacedPath(databasePath));
         DeleteIfExists(databasePath + StagingSuffix);
         DeleteIfExists(databasePath + IntentSuffix);
+        DeleteIfExists(databasePath + RollbackSidecarsPreparedSuffix);
         ManagedReplicaFaultInjection.Hit(
             ManagedReplicaDurableBoundary.MainFileRollbackIntentRetired);
+    }
+
+    internal static void PrepareRollbackSidecars(string databasePath)
+    {
+        var liveSidecars = GetSqliteSidecarPaths(databasePath);
+        var quarantinedSidecars = GetReplacementSidecarPaths(databasePath);
+        for (var index = 0; index < liveSidecars.Count; index++)
+        {
+            var livePath = liveSidecars[index];
+            if (!File.Exists(livePath))
+                continue;
+
+            var quarantinePath = quarantinedSidecars[index];
+            if (File.Exists(quarantinePath))
+            {
+                // Re-entry can follow a crash after quarantine but before the main-file swap.
+                // The caller holds the still-published replacement inode, so a recreated live
+                // sidecar belongs to that same generation and is discarded with it.
+                DeleteIfExists(livePath);
+                continue;
+            }
+            File.Move(livePath, quarantinePath, overwrite: false);
+        }
+
+        var preparedPath = databasePath + RollbackSidecarsPreparedSuffix;
+        if (!File.Exists(preparedPath))
+            WriteDurableMarker(preparedPath);
+        ManagedReplicaFaultInjection.Hit(
+            ManagedReplicaDurableBoundary.MainFileRollbackSidecarsQuarantined);
+
+        var intent = Read(databasePath);
+        if (intent.OriginalWalSha256 is not { } expectedOriginalWal)
+            return;
+
+        var originalWalBackupPath = GetOriginalWalPath(databasePath);
+        ValidateFile(originalWalBackupPath, expectedOriginalWal, "original WAL backup");
+        CopyFileDurably(originalWalBackupPath, databasePath + "-wal");
     }
 
     internal static void Recover(string databasePath)
@@ -193,6 +240,7 @@ internal static class ManagedReplicaReplacementState
                     "Managed embedded replica replacement recovery found a backup without its durable intent.");
             }
             DeleteIfExists(GetOriginalWalPath(databasePath));
+            DeleteRollbackSidecarArtifacts(databasePath, includePreparedMarker: true);
             DeleteIfExists(stagingPath);
             return;
         }
@@ -217,7 +265,7 @@ internal static class ManagedReplicaReplacementState
         var currentSha256 = ComputeSha256(databasePath);
         if (string.Equals(currentSha256, intent.OriginalDatabaseSha256, StringComparison.Ordinal))
         {
-            ValidateOriginalWalState(databasePath, intent);
+            ValidateOriginalWalState(databasePath, intent, originalDatabaseInstalled: true);
             IDisposable? rollbackLock = null;
             try
             {
@@ -257,8 +305,6 @@ internal static class ManagedReplicaReplacementState
             throw new InvalidDataException(
                 "Managed embedded replica replacement recovery cannot restore the original database because its backup is missing.");
         }
-        ValidateOriginalWalState(databasePath, intent);
-
         IDisposable? replacementLock = null;
         try
         {
@@ -266,12 +312,13 @@ internal static class ManagedReplicaReplacementState
                 databasePath,
                 backupPath,
                 CancellationToken.None);
-            ManagedReplicaApplyLock.ReplaceMainFile(
+            ValidateOriginalWalState(databasePath, intent, originalDatabaseInstalled: false);
+            ManagedReplicaApplyLock.RollBackMainFile(
                 replacementLock,
                 backupPath,
                 databasePath,
                 displacedPath,
-                static () => { });
+                () => PrepareRollbackSidecars(databasePath));
             ManagedReplicaFaultInjection.Hit(
                 ManagedReplicaDurableBoundary.MainFileRollbackDatabaseRestored);
             CompleteRollback(databasePath);
@@ -383,10 +430,20 @@ internal static class ManagedReplicaReplacementState
         }
     }
 
-    private static void ValidateOriginalWalState(string databasePath, ReplacementIntent intent)
+    private static void ValidateOriginalWalState(
+        string databasePath,
+        ReplacementIntent intent,
+        bool originalDatabaseInstalled)
     {
         var backupPath = GetOriginalWalPath(databasePath);
         var walPath = databasePath + "-wal";
+        if (originalDatabaseInstalled
+            && File.Exists(databasePath + RollbackSidecarsPreparedSuffix)
+            && File.Exists(walPath))
+        {
+            ValidateLiveRollbackSidecars(databasePath);
+            return;
+        }
         if (intent.OriginalWalSha256 is not { } expected)
         {
             if (File.Exists(backupPath))
@@ -407,10 +464,36 @@ internal static class ManagedReplicaReplacementState
         string databasePath,
         ReplacementIntent intent)
     {
-        var sidecars = GetSqliteSidecarPaths(databasePath);
         var displacedExists = File.Exists(GetDisplacedPath(databasePath));
         var walPath = databasePath + "-wal";
         var originalWalBackupPath = GetOriginalWalPath(databasePath);
+        var sidecarsPrepared = File.Exists(databasePath + RollbackSidecarsPreparedSuffix);
+        if (sidecarsPrepared)
+        {
+            ValidateLiveRollbackSidecars(databasePath);
+            if (File.Exists(walPath))
+            {
+                DeleteIfExists(originalWalBackupPath);
+            }
+            else if (intent.OriginalWalSha256 is not null)
+            {
+                if (!File.Exists(originalWalBackupPath))
+                {
+                    throw new InvalidDataException(
+                        "Managed embedded replica replacement rollback cannot restore the original WAL because its backup is missing.");
+                }
+                File.Move(originalWalBackupPath, walPath, overwrite: false);
+            }
+            else
+            {
+                DeleteIfExists(originalWalBackupPath);
+            }
+
+            DeleteRollbackSidecarArtifacts(databasePath, includePreparedMarker: false);
+            return;
+        }
+
+        var sidecars = GetSqliteSidecarPaths(databasePath);
         var originalWalAlreadyRestored =
             intent.OriginalWalSha256 is { } expectedOriginalWal
             && !File.Exists(originalWalBackupPath)
@@ -453,12 +536,39 @@ internal static class ManagedReplicaReplacementState
         }
     }
 
+    private static void ValidateLiveRollbackSidecars(string databasePath)
+    {
+        var walExists = File.Exists(databasePath + "-wal");
+        var shmExists = File.Exists(databasePath + "-shm");
+        var journalExists = File.Exists(databasePath + "-journal");
+        if ((shmExists && !walExists) || (journalExists && (walExists || shmExists)))
+        {
+            throw new InvalidDataException(
+                "Managed embedded replica replacement rollback found an incoherent restored-database sidecar set.");
+        }
+    }
+
     private static IReadOnlyList<string> GetSqliteSidecarPaths(string databasePath) =>
     [
         databasePath + "-wal",
         databasePath + "-shm",
         databasePath + "-journal",
     ];
+
+    private static IReadOnlyList<string> GetReplacementSidecarPaths(string databasePath) =>
+    [
+        databasePath + ReplacementWalSuffix,
+        databasePath + ReplacementShmSuffix,
+        databasePath + ReplacementJournalSuffix,
+    ];
+
+    private static void DeleteRollbackSidecarArtifacts(string databasePath, bool includePreparedMarker)
+    {
+        foreach (var path in GetReplacementSidecarPaths(databasePath))
+            DeleteIfExists(path);
+        if (includePreparedMarker)
+            DeleteIfExists(databasePath + RollbackSidecarsPreparedSuffix);
+    }
 
     private static void ValidateFile(string path, string expectedSha256, string role)
     {
@@ -498,6 +608,18 @@ internal static class ManagedReplicaReplacementState
             FileOptions.WriteThrough);
         source.CopyTo(destination);
         destination.Flush(flushToDisk: true);
+    }
+
+    private static void WriteDurableMarker(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.Read,
+            bufferSize: 1,
+            FileOptions.WriteThrough);
+        stream.Flush(flushToDisk: true);
     }
 
     private static InvalidDataException InvalidIntent()
