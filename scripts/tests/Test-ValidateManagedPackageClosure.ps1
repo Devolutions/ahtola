@@ -169,7 +169,8 @@ function Invoke-Validator([string[]]$Arguments, [bool]$ShouldSucceed, [string]$E
     $output = @(& pwsh -NoLogo -NoProfile -File $validator @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
     $renderedOutput = ($output -join [Environment]::NewLine) `
-        -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
+        -replace '\x1B\[[0-?]*[ -/]*[@-~]', '' `
+        -replace '\s+', ' '
     if ($ShouldSucceed -and $exitCode -ne 0) {
         Fail "validator unexpectedly failed: $renderedOutput"
     }
