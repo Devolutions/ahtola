@@ -245,6 +245,7 @@ internal sealed class SqliteManagedFileOwnership
     internal void AcquireExclusive(
         SqliteMainFileLockLease lease,
         bool requireReserved,
+        bool requireSoleManagedShared,
         TimeSpan timeout)
     {
         var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
@@ -301,7 +302,8 @@ internal sealed class SqliteManagedFileOwnership
             }
 
             var writerSharedCount = lease.BlocksExclusive ? 1 : 0;
-            while (_blockingSharedCount != writerSharedCount)
+            while (_blockingSharedCount != writerSharedCount
+                   || (requireSoleManagedShared && _sharedCount != 1))
             {
                 var remaining = RemainingTimeout(timeout, stopwatch);
                 if (remaining == TimeSpan.Zero)
@@ -799,7 +801,18 @@ internal sealed class SqliteMainFileLockLease : IDisposable
     internal void AcquireReserved(TimeSpan timeout) => GetOwner().AcquireReserved(this, timeout);
 
     internal void AcquireExclusive(bool requireReserved, TimeSpan timeout)
-        => GetOwner().AcquireExclusive(this, requireReserved, timeout);
+        => GetOwner().AcquireExclusive(
+            this,
+            requireReserved,
+            requireSoleManagedShared: false,
+            timeout);
+
+    internal void AcquirePersistentExclusive(TimeSpan timeout)
+        => GetOwner().AcquireExclusive(
+            this,
+            requireReserved: false,
+            requireSoleManagedShared: true,
+            timeout);
 
     internal void DowngradeToShared() => GetOwner().DowngradeToShared(this);
 

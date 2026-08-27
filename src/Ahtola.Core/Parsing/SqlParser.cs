@@ -1930,8 +1930,6 @@ internal sealed class SqlParser
 
         var returning = ParseReturning();
         var (orderBy, limit, offset) = ParseLimitedDmlTail("UPDATE");
-        if (from is not null && limit is not null)
-            throw Error("LIMIT is not supported on UPDATE ... FROM.");
 
         var update = new UpdateStatement(
             tableName,
@@ -2028,9 +2026,6 @@ internal sealed class SqlParser
         }
 
         var (orderBy, limit, offset) = ParseOrderByAndLimit();
-        if (orderBy.Count > 0 && limit is null)
-            throw Error($"ORDER BY without LIMIT on {statementKind} is not supported.");
-
         return (orderBy, limit, offset);
     }
 
@@ -2195,15 +2190,38 @@ internal sealed class SqlParser
             }
 
             Expect(TokenKind.LeftParen);
-            if (!IsQueryStart())
-                throw Error("Managed common table expressions must contain a SELECT or VALUES query; writable CTEs are not supported.");
-            var query = ParseQuery();
+            var body = ParseCommonTableExpressionBody();
             Expect(TokenKind.RightParen);
-            commonTableExpressions.Add(new CommonTableExpression(name, columns, query, materializationHint));
+            commonTableExpressions.Add(body is QueryStatement query
+                ? new CommonTableExpression(name, columns, query, materializationHint)
+                : new CommonTableExpression(
+                    name,
+                    columns,
+                    new ValuesClause([]),
+                    materializationHint,
+                    WritableBody: body));
         }
         while (Consume(TokenKind.Comma));
 
         return commonTableExpressions;
+    }
+
+    private ParsedStatement ParseCommonTableExpressionBody()
+    {
+        if (ConsumeKeyword("INSERT"))
+            return ParseInsert();
+        if (ConsumeKeyword("REPLACE"))
+            return ParseInsert(InsertConflictAlgorithm.Replace);
+        if (ConsumeKeyword("UPDATE"))
+            return ParseUpdate();
+        if (ConsumeKeyword("DELETE"))
+            return ParseDelete();
+        if (ConsumeKeyword("WITH"))
+            return ParseWithStatement();
+        if (IsQueryStart())
+            return ParseQuery();
+
+        throw Error("Expected a SELECT, VALUES, INSERT, REPLACE, UPDATE, or DELETE statement in the common table expression.");
     }
 
     private SelectStatement ParseSelectCore()
@@ -3496,8 +3514,6 @@ internal sealed class SqlParser
 
         if (withinGroup.Count != 1)
             throw Error($"WITHIN GROUP for {sourceName}() must specify exactly one ORDER BY expression");
-        if (withinGroup[0].Descending || withinGroup[0].NullPlacement != NullPlacement.Default)
-            throw Error("DESC and NULLS ordering inside WITHIN GROUP are not supported yet");
 
         var expectedDirectArguments = functionName == "MODE" ? 0 : 1;
         if (arguments.Count != expectedDirectArguments)
@@ -3520,7 +3536,8 @@ internal sealed class SqlParser
             false,
             filter,
             null,
-            OrderedSet: true);
+            OrderedSet: true,
+            OrderedSetOrderBy: withinGroup[0]);
     }
 
     /// <summary>

@@ -503,6 +503,8 @@ internal static class AlterTableSqlRewriter
                     if (function.Window is not null)
                         CollectWindow(function.Window);
                     CollectOrderBy(function.AggregateOrderBy);
+                    if (function.OrderedSetOrderBy is { } orderedSetOrderBy)
+                        CollectExpression(orderedSetOrderBy.Expression);
                     break;
                 case CaseExpression caseExpression:
                     CollectExpression(caseExpression.Operand);
@@ -588,7 +590,7 @@ internal static class AlterTableSqlRewriter
         private void CollectCommonTableExpressions(IReadOnlyList<CommonTableExpression> expressions)
         {
             foreach (var expression in expressions)
-                CollectQuery(expression.Query);
+                CollectStatement(expression.Body);
         }
 
         private void CollectProjections(IReadOnlyList<Projection>? projections)

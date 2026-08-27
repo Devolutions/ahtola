@@ -310,6 +310,169 @@ public sealed class ManagedPragmaRuntimeSliceTests
     }
 
     [Test]
+    [NonParallelizable]
+    public void PhysicalExclusiveLockingModeSurvivesWritesAndPoolResetRestoresNormal()
+    {
+        RequirePhysicalWalSupport();
+        if (OperatingSystem.IsMacOS())
+            Assert.Ignore("Darwin process-scoped locks cannot safely authorize physical exclusive locking mode.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "locking-mode.db");
+            using var database = EmbeddedDatabase.OpenFile(databasePath);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE items(value INTEGER);");
+            File.Exists(databasePath + "-shm").Should().BeTrue();
+
+            ReadValue(connection, "PRAGMA locking_mode=EXCLUSIVE;")
+                .Should().Be(SqlValue.Text("exclusive"));
+            File.Exists(databasePath + "-shm").Should().BeFalse(
+                "exclusive mode keeps the WAL-index in managed heap storage");
+            Execute(connection, "INSERT INTO items VALUES (42);");
+            ReadValue(connection, "SELECT value FROM items;").Should().Be(SqlValue.Integer(42));
+
+            ReadValue(connection, "PRAGMA locking_mode=NORMAL;")
+                .Should().Be(SqlValue.Text("normal"));
+            File.Exists(databasePath + "-shm").Should().BeTrue(
+                "NORMAL is not visible until a complete physical WAL-index is published");
+
+            ReadValue(connection, "PRAGMA locking_mode=EXCLUSIVE;")
+                .Should().Be(SqlValue.Text("exclusive"));
+            connection.ResetForPooling();
+            ReadValue(connection, "PRAGMA locking_mode;").Should().Be(SqlValue.Text("normal"));
+            File.Exists(databasePath + "-shm").Should().BeTrue();
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void PhysicalExclusiveDeleteModeReadsAndWritesWithoutReacquiringMainFileLocks()
+    {
+        RequirePhysicalWalSupport();
+        if (OperatingSystem.IsMacOS())
+            Assert.Ignore("Darwin process-scoped locks cannot safely authorize physical exclusive locking mode.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "locking-mode-delete.db");
+            using var database = EmbeddedDatabase.OpenFile(databasePath);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE items(value INTEGER);");
+            ReadValue(connection, "PRAGMA journal_mode=DELETE;")
+                .Should().Be(SqlValue.Text("delete"));
+            ReadValue(connection, "PRAGMA locking_mode=EXCLUSIVE;")
+                .Should().Be(SqlValue.Text("exclusive"));
+
+            Execute(connection, "INSERT INTO items VALUES (1);");
+            Execute(connection, "BEGIN;");
+            Execute(connection, "INSERT INTO items VALUES (2);");
+            Execute(connection, "COMMIT;");
+            ReadRows(connection, "SELECT value FROM items ORDER BY value;")
+                .Select(row => row[0])
+                .Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
+            ReadValue(connection, "PRAGMA locking_mode=NORMAL;")
+                .Should().Be(SqlValue.Text("normal"));
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void PhysicalExclusiveLockingModeRemainsUntilEveryPooledOwnerResets()
+    {
+        RequirePhysicalWalSupport();
+        if (OperatingSystem.IsMacOS())
+            Assert.Ignore("Darwin process-scoped locks cannot safely authorize physical exclusive locking mode.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "locking-mode-owners.db");
+            using var database = EmbeddedDatabase.OpenFile(databasePath);
+            using var primary = database.Connect();
+            using var sibling = database.Connect();
+
+            ReadValue(primary, "PRAGMA locking_mode=EXCLUSIVE;")
+                .Should().Be(SqlValue.Text("exclusive"));
+            ReadValue(sibling, "PRAGMA locking_mode=EXCLUSIVE;")
+                .Should().Be(SqlValue.Text("exclusive"));
+            File.Exists(databasePath + "-shm").Should().BeFalse();
+
+            primary.ResetForPooling();
+            File.Exists(databasePath + "-shm").Should().BeFalse(
+                "the sibling connection still owns exclusive locking mode");
+
+            sibling.ResetForPooling();
+            File.Exists(databasePath + "-shm").Should().BeTrue(
+                "the final pooled owner republishes the physical WAL-index before NORMAL");
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void MacOSPhysicalExclusiveLockingModeFailsClosedWithoutRemovingSharedMemory()
+    {
+        if (!OperatingSystem.IsMacOS())
+            Assert.Ignore("This characterizes Darwin's process-scoped F_SETLK behavior.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "macos-locking-mode.db");
+            using var database = EmbeddedDatabase.OpenFile(databasePath);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE items(value INTEGER);");
+
+            ReadValue(connection, "PRAGMA locking_mode=EXCLUSIVE;")
+                .Should().Be(SqlValue.Text("normal"));
+            ReadValue(connection, "PRAGMA locking_mode;")
+                .Should().Be(SqlValue.Text("normal"));
+            File.Exists(databasePath + "-shm").Should().BeTrue(
+                "a same-process stock SQLite user cannot be detected by Darwin process-scoped locks");
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ReadOnlyLockingModeRequestDoesNotCreateOrDeleteSharedMemory()
+    {
+        RequirePhysicalWalSupport();
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "readonly-locking-mode.db");
+            using var writable = EmbeddedDatabase.OpenFile(databasePath);
+            using var connection = writable.Connect();
+            Execute(connection, "CREATE TABLE items(value INTEGER);");
+            File.Exists(databasePath + "-shm").Should().BeTrue();
+
+            using var readOnly = EmbeddedDatabase.OpenFile(databasePath, readOnly: true);
+            using var readOnlyConnection = readOnly.Connect();
+            ReadValue(readOnlyConnection, "PRAGMA locking_mode=EXCLUSIVE;")
+                .Should().Be(SqlValue.Text("normal"));
+            File.Exists(databasePath + "-shm").Should().BeTrue();
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
     public void FileBackedHeaderPragmaWritesAreDurableTransactionalAndSchemaScoped()
     {
         var fileSystem = new InMemoryFileSystem();
@@ -515,4 +678,29 @@ public sealed class ManagedPragmaRuntimeSliceTests
 
     private static SqlValue[] FindCatalogEntry(IEnumerable<SqlValue[]> rows, string name)
         => rows.Single(row => row[1].AsText() == name);
+
+    private static string CreateWorkDirectory()
+    {
+        var directory = Path.Combine(
+            TestContext.CurrentContext.WorkDirectory,
+            $"ahtola-locking-mode-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        return directory;
+    }
+
+    private static void DeleteWorkDirectory(string directory)
+    {
+        if (Directory.Exists(directory))
+            Directory.Delete(directory, recursive: true);
+    }
+
+    private static void RequirePhysicalWalSupport()
+    {
+        if (!OperatingSystem.IsWindows()
+            && !(OperatingSystem.IsLinux() && Environment.Is64BitProcess)
+            && !OperatingSystem.IsMacOS())
+        {
+            Assert.Ignore("Physical SQLite WAL locks require Windows, 64-bit Linux, or macOS.");
+        }
+    }
 }

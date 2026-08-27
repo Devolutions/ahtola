@@ -923,6 +923,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             _materializationLease = materializationLease;
             _changeJournal = changeJournal;
             _encryptionFileSystem = encryptionFileSystem;
+            Volatile.Read(ref _connection)?.RestoreManagedReplicaDatabase(database);
             database = null!;
             encryptionFileSystem = null;
             materializationLease = null;

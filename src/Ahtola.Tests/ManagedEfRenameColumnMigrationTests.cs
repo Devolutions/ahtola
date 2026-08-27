@@ -50,14 +50,35 @@ public sealed class ManagedEfRenameColumnMigrationTests
     }
 
     [Test]
-    public void ManagedMigrationsRejectColumnRenamesInCompositePrimaryKeys()
+    public async Task ManagedMigrationsRenameColumnsWithConstraintAndTriggerDependencies()
     {
+        await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        await connection.OpenAsync();
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE "Items" (
+                "OldName" TEXT NOT NULL,
+                "Kind" TEXT NOT NULL,
+                "Mirror" TEXT AS ("OldName" || ':' || "Kind"),
+                CONSTRAINT "PK_Items" PRIMARY KEY ("OldName", "Kind"),
+                CONSTRAINT "CK_Items_OldName" CHECK ("OldName" <> '')
+            );
+            CREATE INDEX "IX_Items_OldName" ON "Items" ("OldName") WHERE "OldName" <> 'skip';
+            CREATE TABLE "Audit" ("Value" TEXT NOT NULL);
+            CREATE TRIGGER "TR_Items_OldName" AFTER UPDATE OF "OldName" ON "Items"
+            BEGIN
+                INSERT INTO "Audit" VALUES (NEW."OldName");
+            END;
+            INSERT INTO "Items" ("OldName", "Kind") VALUES ('before', 'kind');
+            """);
+
         var options = new DbContextOptionsBuilder<CompositeKeyRenameColumnMigrationContext>()
-            .UseAhtola("Data Source=:memory:;Local Provider=Managed")
+            .UseAhtola(connection)
             .Options;
-        using var context = new CompositeKeyRenameColumnMigrationContext(options);
+        await using var context = new CompositeKeyRenameColumnMigrationContext(options);
         var model = context.GetService<IDesignTimeModel>().Model;
-        var generate = () => context.GetService<IMigrationsSqlGenerator>().Generate(
+        var commands = context.GetService<IMigrationsSqlGenerator>().Generate(
         [
             new RenameColumnOperation
             {
@@ -66,9 +87,28 @@ public sealed class ManagedEfRenameColumnMigrationTests
                 NewName = "Name"
             }
         ], model);
+        foreach (var command in commands)
+            await ExecuteAsync(connection, command.CommandText);
 
-        generate.Should().Throw<NotSupportedException>()
-            .WithMessage("*cannot safely rename column*table-constraint*");
+        await ExecuteAsync(
+            connection,
+            "UPDATE \"Items\" SET \"Name\" = 'after' WHERE \"Name\" = 'before';");
+
+        await using var verify = connection.CreateCommand();
+        verify.CommandText =
+            "SELECT \"Name\" || ':' || \"Kind\" || ':' || \"Mirror\" FROM \"Items\";";
+        (await verify.ExecuteScalarAsync()).Should().Be("after:kind:after:kind");
+
+        await using var audit = connection.CreateCommand();
+        audit.CommandText = "SELECT \"Value\" FROM \"Audit\";";
+        (await audit.ExecuteScalarAsync()).Should().Be("after");
+
+        await using var schema = connection.CreateCommand();
+        schema.CommandText =
+            "SELECT group_concat(\"sql\", char(10)) FROM \"sqlite_master\" "
+            + "WHERE \"name\" IN ('Items', 'IX_Items_OldName', 'TR_Items_OldName');";
+        var sql = (string)(await schema.ExecuteScalarAsync())!;
+        sql.Should().NotContain("\"OldName\"").And.Contain("\"Name\"");
     }
 
     private static async Task ExecuteAsync(SqliteConnection connection, string sql)

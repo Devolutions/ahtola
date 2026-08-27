@@ -241,6 +241,145 @@ public class SqlitePagerLockingStorageTests
 
     [Test]
     [NonParallelizable]
+    public void UncheckpointedFinalPhysicalPagerRetainsSharedMemoryForReadOnlyReopen()
+    {
+        RequirePhysicalLockSupport();
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            var page = CreatePage(SqlitePageSize.Default, 0xB7);
+            using (var pager = CreatePhysicalPager(databasePath))
+            {
+                using var transaction = pager.BeginTransaction(targetDatabaseSizeInPages: 2);
+                transaction.WritePage(2, page);
+                transaction.Commit();
+            }
+
+            File.Exists(databasePath + "-shm").Should().BeTrue();
+            using var readOnly = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal",
+                readOnly: true);
+            readOnly.State.Should().Be(SqlitePagerState.Ready);
+            readOnly.ReadCommittedPage(2).Should().Equal(page);
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ExclusiveLockingModeUsesHeapIndexAndRepublishesPhysicalIndexBeforeNormal()
+    {
+        RequirePhysicalLockSupport();
+        if (OperatingSystem.IsMacOS())
+            Assert.Ignore("Darwin process-scoped locks cannot safely authorize a heap WAL-index handoff.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            using var pager = CreatePhysicalPager(databasePath);
+            var page = CreatePage(pager.PageSize, 0xA7);
+
+            pager.SetExclusiveLockingMode(exclusive: true, TimeSpan.Zero).Should().BeTrue();
+            pager.IsExclusiveLockingMode.Should().BeTrue();
+            File.Exists(databasePath + "-shm").Should().BeFalse();
+
+            using (var transaction = pager.BeginTransaction(targetDatabaseSizeInPages: 2))
+            {
+                transaction.WritePage(2, page);
+                transaction.Commit();
+            }
+            pager.ReadCommittedPage(2).Should().Equal(page);
+
+            pager.SetExclusiveLockingMode(exclusive: false, TimeSpan.Zero).Should().BeFalse();
+            pager.IsExclusiveLockingMode.Should().BeFalse();
+            File.Exists(databasePath + "-shm").Should().BeTrue();
+            using var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance)
+                .OpenSharedMemory(databasePath + "-shm", FileOpenMode.OpenExisting, readOnly: true);
+            mapping.Length.Should().BeGreaterThanOrEqualTo(SqliteWalIndexLayout.BlockSize);
+            var header = new byte[SqliteWalIndexLayout.HeaderRegionSize];
+            mapping.Read(0, header);
+            header.Should().Contain(value => value != 0,
+                "NORMAL is published only after a populated physical WAL-index is available");
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ExclusiveDeleteModeUsesPersistentAuthorityForReadsWritesAndCheckpoint()
+    {
+        RequirePhysicalLockSupport();
+        if (OperatingSystem.IsMacOS())
+            Assert.Ignore("Darwin process-scoped locks cannot safely authorize exclusive locking mode.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "exclusive-delete.db");
+            using var pager = CreatePhysicalPager(databasePath);
+            pager.SwitchJournalMode(SqliteJournalMode.Delete, TimeSpan.Zero)
+                .Should().Be(SqliteJournalMode.Delete);
+            pager.SetExclusiveLockingMode(exclusive: true, TimeSpan.Zero).Should().BeTrue();
+            var page = CreatePage(pager.PageSize, 0xD7);
+
+            using (var transaction = pager.BeginTransaction(targetDatabaseSizeInPages: 2))
+            {
+                transaction.WritePage(2, page);
+                transaction.Commit();
+            }
+
+            pager.ReadCommittedPage(2).Should().Equal(page);
+            Action checkpoint = () => _ = pager.CheckpointToMainStore(TimeSpan.Zero);
+            checkpoint.Should().NotThrow();
+            pager.ReadCommittedPage(2).Should().Equal(page);
+            pager.SetExclusiveLockingMode(exclusive: false, TimeSpan.Zero).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ExclusiveTransitionCleanupFailureRetainsAuthorityAndFaultsPager()
+    {
+        RequirePhysicalLockSupport();
+        if (OperatingSystem.IsMacOS())
+            Assert.Ignore("Darwin does not perform the physical exclusive handoff.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "exclusive-cleanup-failure.db");
+            using var pager = CreatePhysicalPager(databasePath);
+            PhysicalSqliteWalSharedMemoryMapping.BeforeFinalDeleteForTesting =
+                () => throw new IOException("Injected final SHM cleanup failure.");
+
+            Assert.Throws<IOException>(
+                () => pager.SetExclusiveLockingMode(exclusive: true, TimeSpan.Zero));
+            pager.IsExclusiveLockingMode.Should().BeTrue(
+                "the persistent main-file EXCLUSIVE authority must not be downgraded after heap publication");
+            pager.State.Should().Be(SqlitePagerState.Faulted);
+            Assert.Throws<InvalidOperationException>(
+                () => pager.SetExclusiveLockingMode(exclusive: false, TimeSpan.Zero));
+        }
+        finally
+        {
+            PhysicalSqliteWalSharedMemoryMapping.BeforeFinalDeleteForTesting = null;
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
     public void PhysicalPagerOpenFailureReleasesWriterAndRecoveryLocks()
     {
         if (!OperatingSystem.IsWindows())
@@ -421,6 +560,16 @@ public class SqlitePagerLockingStorageTests
             Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         return directory;
+    }
+
+    private static void RequirePhysicalLockSupport()
+    {
+        if (!OperatingSystem.IsWindows()
+            && !(OperatingSystem.IsLinux() && Environment.Is64BitProcess)
+            && !OperatingSystem.IsMacOS())
+        {
+            Assert.Ignore("Physical SQLite WAL locks require Windows, 64-bit Linux, or macOS.");
+        }
     }
 
     private static void DeleteWorkDirectory(string directory)

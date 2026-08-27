@@ -5,11 +5,9 @@ using MsData = Microsoft.Data.Sqlite;
 
 namespace Ahtola.Tests;
 
-// Coverage for Turso-compatible VIRTUAL generated columns. Runtime behavior is cross-checked
-// against SQLite: computed values and affinity, dependency ordering, recompute on UPDATE, the
-// generated-column exclusion from the default INSERT column list and from PRAGMA table_info,
-// and the family of CREATE/DML rejections. The bounded deterministic-function allow-list remains
-// a deliberate managed-engine boundary.
+// Runtime behavior for VIRTUAL and STORED generated columns is cross-checked against SQLite:
+// computed values and affinity, dependency ordering, recompute on UPDATE, persistence layout,
+// generated-column exclusion from INSERT and PRAGMA table_info, and CREATE/DML rejections.
 public class GeneratedColumnsTests
 {
     [Test]
@@ -24,13 +22,16 @@ public class GeneratedColumnsTests
             "SELECT a, v FROM t ORDER BY a");
     }
 
-    [Test]
     [TestCase("CREATE TABLE t(a INT, v AS (a * 2) STORED)")]
     [TestCase("CREATE TABLE t(a INT, v INT GENERATED ALWAYS AS (a * 2) STORED)")]
-    public void StoredGeneratedColumnIsRejectedLikeTurso(string sql)
-    {
-        CaptureManagedError([], sql).Should().Be("Stored generated columns are not supported");
-    }
+    public void StoredGeneratedColumnComputesAndUpdates(string sql)
+        => AssertMatchesSqlite(
+            [
+                sql,
+                "INSERT INTO t(a) VALUES (5)",
+                "UPDATE t SET a = 7",
+            ],
+            "SELECT a, v FROM t");
 
     [Test]
     public void GeneratedAlwaysSyntaxComputesValue()
@@ -329,6 +330,44 @@ public class GeneratedColumnsTests
             Execute(connection, "UPDATE t SET a = 40;");
             var updated = Query(connection, "SELECT a, v FROM t;");
             updated[0][1].AsInteger().Should().Be(41);
+        }
+    }
+
+    [Test]
+    public void StoredGeneratedColumnPersistsUpdatesAndIsReadableByRealSqlite()
+    {
+        var path = CreatePhysicalDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE TABLE t(a INT, v INT AS (a * 2) STORED);");
+                Execute(connection, "INSERT INTO t(a) VALUES (5);");
+                Execute(connection, "UPDATE t SET a = 7;");
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Query(connection, "SELECT a, v FROM t;").Single()
+                    .Should().Equal(SqlValue.Integer(7), SqlValue.Integer(14));
+                Execute(connection, "UPDATE t SET a = 9;");
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            Scalar(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            Scalar(sqlite, "SELECT v FROM t WHERE a = 9;").Should().Be(18L);
+            Scalar(sqlite, "SELECT hidden FROM pragma_table_xinfo('t') WHERE name = 'v';").Should().Be(3L);
+            Scalar(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 't';")
+                .Should().BeOfType<string>()
+                .Which.Should().Contain("STORED");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeletePhysicalDatabase(path);
         }
     }
 

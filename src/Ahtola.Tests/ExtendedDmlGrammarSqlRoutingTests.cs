@@ -337,37 +337,119 @@ public sealed class ExtendedDmlGrammarSqlRoutingTests
     }
 
     [Test]
-    public void UnsupportedExtendedFormsAreRejectedBeforeMutation()
+    public void OrderByWithoutLimitAndUpdateFromLimitSelectStableTargets()
     {
         using var connection = Connect(
             """
-            CREATE TABLE t(id INTEGER, value INTEGER);
-            CREATE TABLE source(id INTEGER, value INTEGER);
-            INSERT INTO t VALUES (1, 10);
-            INSERT INTO source VALUES (1, 99);
+            CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);
+            CREATE TABLE source(id INTEGER, value INTEGER, priority INTEGER);
+            INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+            INSERT INTO source VALUES
+                (1, 101, 1),
+                (2, 202, 4),
+                (2, 999, 9),
+                (3, 303, 3),
+                (4, 404, 2);
             """);
-        var cases = new[]
-        {
-            ("UPDATE t SET value = 20 ORDER BY id;", "ORDER BY without LIMIT"),
-            ("DELETE FROM t ORDER BY id;", "ORDER BY without LIMIT"),
 
-            // Introduced alongside UPDATE ... FROM: the limited-DML route buffers a
-            // source-ordered subset, which has no defined meaning once the row set
-            // comes from a join, so the combination is refused rather than guessed.
-            (
-                "UPDATE t SET value = source.value FROM source WHERE source.id = t.id LIMIT 1;",
-                "LIMIT is not supported on UPDATE ... FROM"),
-        };
+        ExecuteManaged(
+            connection,
+            """
+            UPDATE t
+            SET value = source.value
+            FROM source
+            WHERE source.id = t.id
+            ORDER BY source.priority DESC, t.id
+            LIMIT 2;
+            """);
 
-        foreach (var (sql, message) in cases)
-        {
-            Assert.Throws<EmbeddedSqlException>(() =>
-            {
-                using var statement = connection.Prepare(sql);
-                statement.Step();
-            })!.Message.Should().Contain(message, sql);
-            Scalar(connection, "SELECT value FROM t WHERE id = 1;").Should().Be(10);
-        }
+        ReadManagedRows(connection, "SELECT id, value FROM t ORDER BY id;").Should().BeEquivalentTo(
+        [
+            new[] { SqlValue.Integer(1), SqlValue.Integer(10) },
+            new[] { SqlValue.Integer(2), SqlValue.Integer(202) },
+            new[] { SqlValue.Integer(3), SqlValue.Integer(303) },
+            new[] { SqlValue.Integer(4), SqlValue.Integer(40) },
+        ], options => options.WithStrictOrdering());
+
+        ExecuteManaged(connection, "UPDATE t SET value = value + 1 ORDER BY id DESC;");
+        ExecuteManaged(connection, "DELETE FROM t ORDER BY id DESC;");
+        Scalar(connection, "SELECT count(*) FROM t;").Should().Be(0);
+    }
+
+    [Test]
+    public void UpdateFromLimitPreselectsDuplicateTargetsBeforeRunningTriggers()
+    {
+        using var connection = Connect(
+            """
+            CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);
+            CREATE TABLE source(id INTEGER, value INTEGER, priority INTEGER);
+            CREATE TABLE audit(id INTEGER, value INTEGER);
+            INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+            INSERT INTO source VALUES
+                (1, 101, 2),
+                (2, 202, 3),
+                (2, 999, 9),
+                (3, 303, 1);
+            """);
+        ExecuteManaged(
+            connection,
+            """
+            CREATE TRIGGER target_audit AFTER UPDATE ON target
+            BEGIN
+                INSERT INTO audit VALUES (NEW.id, NEW.value);
+            END;
+            """);
+
+        ExecuteManaged(
+            connection,
+            """
+            UPDATE target
+            SET value = source.value
+            FROM source
+            WHERE source.id = target.id
+            ORDER BY source.priority DESC
+            LIMIT 2;
+            """);
+
+        ReadManagedRows(connection, "SELECT id, value FROM target ORDER BY id;").Should().BeEquivalentTo(
+        [
+            new[] { SqlValue.Integer(1), SqlValue.Integer(101) },
+            new[] { SqlValue.Integer(2), SqlValue.Integer(202) },
+            new[] { SqlValue.Integer(3), SqlValue.Integer(30) },
+        ], options => options.WithStrictOrdering());
+        ReadManagedRows(connection, "SELECT id, value FROM audit ORDER BY id;").Should().BeEquivalentTo(
+        [
+            new[] { SqlValue.Integer(1), SqlValue.Integer(101) },
+            new[] { SqlValue.Integer(2), SqlValue.Integer(202) },
+        ], options => options.WithStrictOrdering());
+    }
+
+    [Test]
+    public void UpdateFromLimitValidatesSourceBindingsWhenSourceIsEmpty()
+    {
+        using var connection = Connect(
+            """
+            CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);
+            CREATE TABLE source(id INTEGER, value INTEGER, priority INTEGER);
+            INSERT INTO target VALUES (1, 10), (2, 20);
+            """);
+
+        ExecuteManaged(
+            connection,
+            """
+            UPDATE target
+            SET value = source.value
+            FROM source
+            WHERE source.id = target.id
+            ORDER BY source.priority DESC
+            LIMIT 1;
+            """);
+
+        ReadManagedRows(connection, "SELECT id, value FROM target ORDER BY id;").Should().BeEquivalentTo(
+        [
+            new[] { SqlValue.Integer(1), SqlValue.Integer(10) },
+            new[] { SqlValue.Integer(2), SqlValue.Integer(20) },
+        ], options => options.WithStrictOrdering());
     }
 
     [Test]

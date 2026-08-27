@@ -29,7 +29,7 @@ This cmdlet has no aliases.
 
 ## DESCRIPTION
 
-Pushes local replica changes and pulls remote changes for a connection created with `-ReplicaPath`. It does not apply to a direct cloud connection.
+Pushes local replica changes and pulls remote changes for a connection created with `-ReplicaPath`. It reports the Pushing, Pulling, Applying, and Completed stages through PowerShell's progress stream. It does not apply to a direct cloud connection.
 
 ## EXAMPLES
 
@@ -133,7 +133,7 @@ An `AhtolaSyncResult` with outcome and statistics.
 
 ## NOTES
 
-Supports `-WhatIf` and `-Confirm`. Sync failures, including conflicts, are surfaced to the caller.
+Supports `-WhatIf` and `-Confirm`. Typed Ahtola remote and replica exceptions, including conflict metadata, are preserved.
 
 ## RELATED LINKS
 

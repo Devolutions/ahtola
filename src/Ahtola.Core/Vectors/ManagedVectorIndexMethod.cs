@@ -41,9 +41,8 @@ internal static class ManagedVectorIndexLimits
 
 /// <summary>Validated <c>WITH (...)</c> options for one vector method index.</summary>
 /// <remarks>
-/// Every key is validated <em>and</em> consumed: nothing is accepted and then ignored. Keys whose
-/// behaviour is not implemented (<c>metric = 'jaccard'</c>, <c>encoding = 'float32_sparse'</c>,
-/// <c>exact = 0</c>) are rejected with a message that says so, rather than silently downgraded.
+/// Every key is validated <em>and</em> consumed: nothing is accepted and then ignored.
+/// <c>float32_sparse</c> is paired exclusively with <c>jaccard</c>; <c>exact = 0</c> is rejected.
 /// </remarks>
 internal sealed class ManagedVectorIndexOptions
 {
@@ -112,6 +111,8 @@ internal sealed class ManagedVectorIndexOptions
     /// <summary>Below this live row count the index declines and the ordinary scan wins.</summary>
     public long MinimumRows { get; }
 
+    public bool IsSparse => Encoding == VectorEncodingKind.Float32Sparse;
+
     /// <summary>The SQL function this index is bound to, used for planner matching.</summary>
     public string DistanceFunctionName => ManagedVectorPlannerAdapter.FunctionFor(Metric);
 
@@ -157,6 +158,28 @@ internal sealed class ManagedVectorIndexOptions
         // could only ever serve a query that errors on its first row.
         if (encoding == VectorEncodingKind.Float1Bit && metric == VectorDistanceKind.L2)
             throw new EmbeddedSqlException("L2 distance is not supported for float1bit vectors");
+        if (metric == VectorDistanceKind.Jaccard && encoding != VectorEncodingKind.Float32Sparse)
+        {
+            throw new EmbeddedSqlException(
+                "vector index metric 'jaccard' requires encoding = 'float32_sparse'");
+        }
+        if (encoding == VectorEncodingKind.Float32Sparse && metric != VectorDistanceKind.Jaccard)
+        {
+            throw new EmbeddedSqlException(
+                "vector index encoding 'float32_sparse' requires metric = 'jaccard'");
+        }
+
+        if (encoding == VectorEncodingKind.Float32Sparse)
+        {
+            foreach (var denseOnly in new[] { "lists", "probes", "seed", "iters", "train_sample" })
+            {
+                if (configuration.TryGetParameter(denseOnly, out _))
+                {
+                    throw new EmbeddedSqlException(
+                        $"vector index parameter '{denseOnly}' is not supported for float32_sparse");
+                }
+            }
+        }
 
         if (!configuration.TryGetParameter("dims", out _))
         {
@@ -216,7 +239,7 @@ internal sealed class ManagedVectorIndexOptions
             throw new EmbeddedSqlException("vector index parameter 'min_rows' must not be negative");
 
         var stateBytes = checked((long)lists * dimensions * sizeof(float));
-        if (stateBytes > ManagedVectorIndexLimits.MaxStateBytes)
+        if (encoding != VectorEncodingKind.Float32Sparse && stateBytes > ManagedVectorIndexLimits.MaxStateBytes)
         {
             throw new EmbeddedSqlException(
                 $"vector index state would exceed {ManagedVectorIndexLimits.MaxStateBytes} bytes; reduce 'lists' or 'dims'");
@@ -267,8 +290,7 @@ internal sealed class ManagedVectorIndexOptions
             "l2" => VectorDistanceKind.L2,
             "cosine" or "cos" => VectorDistanceKind.Cosine,
             "dot" => VectorDistanceKind.Dot,
-            "jaccard" => throw new EmbeddedSqlException(
-                "vector index metric 'jaccard' requires a sparse index and is not implemented"),
+            "jaccard" => VectorDistanceKind.Jaccard,
             _ => throw new EmbeddedSqlException($"unknown vector index metric: {text}"),
         };
 
@@ -279,8 +301,7 @@ internal sealed class ManagedVectorIndexOptions
             "float64" or "f64" => VectorEncodingKind.Float64,
             "float8" or "f8" => VectorEncodingKind.Float8,
             "float1bit" or "f1bit" => VectorEncodingKind.Float1Bit,
-            "float32_sparse" => throw new EmbeddedSqlException(
-                "vector index encoding 'float32_sparse' requires a sparse index and is not implemented"),
+            "float32_sparse" => VectorEncodingKind.Float32Sparse,
             _ => throw new EmbeddedSqlException($"unknown vector index encoding: {text}"),
         };
 
@@ -307,13 +328,13 @@ internal sealed class ManagedVectorIndexOptions
 }
 
 /// <summary>
-/// The pure-managed approximate-nearest-neighbour index method registered as <c>USING vector</c>.
+/// The pure-managed exact vector index method registered as <c>USING vector</c>.
 /// </summary>
 /// <remarks>
 /// <para>
-/// This is <em>not</em> a port of Turso's <c>toy_vector_sparse_ivf</c>
-/// (turso-src/core/index_method/toy_vector_sparse_ivf.rs), which despite its name is a jaccard-only
-/// sparse component inverted index pruned by three unbounded heuristics. What is carried over is the
+/// The sparse shape is informed by Turso's <c>toy_vector_sparse_ivf</c>
+/// (turso-src/core/index_method/toy_vector_sparse_ivf.rs), but its three unbounded approximate
+/// heuristics are deliberately not ported. What is carried over is the
 /// method/attachment/cursor shape from <c>index_method/mod.rs</c>, the materialized-result and
 /// transactional-backing-store declarations, and the <c>… ORDER BY distance LIMIT ?</c> query shape
 /// in both argument orders. The structure, the training, the state envelope, the cost model and the
@@ -341,7 +362,10 @@ internal sealed class ManagedVectorIndexMethod : ManagedIndexMethod
     public override ManagedIndexMethodAttachment Attach(ManagedIndexMethodConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
-        return new ManagedVectorIndexAttachment(configuration, ManagedVectorIndexOptions.Resolve(configuration));
+        var options = ManagedVectorIndexOptions.Resolve(configuration);
+        return options.IsSparse
+            ? new ManagedSparseVectorIndexAttachment(configuration, options)
+            : new ManagedVectorIndexAttachment(configuration, options);
     }
 }
 

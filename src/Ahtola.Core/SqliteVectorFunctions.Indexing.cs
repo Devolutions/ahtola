@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using Ahtola.Core.Vectors;
+
 namespace Ahtola.Core;
 
 /// <summary>The serialized vector encodings an index method may bind a column to.</summary>
@@ -52,13 +55,45 @@ internal readonly record struct DecodedVector(VectorEncodingKind Encoding, int D
     }
 }
 
+/// <summary>A validated sparse float32 vector without a dense expansion.</summary>
+internal readonly record struct DecodedSparseVector(int Dimensions, int[] Indices, float[] Values)
+{
+    public bool IsFinite
+    {
+        get
+        {
+            foreach (var value in Values)
+            {
+                if (!float.IsFinite(value))
+                    return false;
+            }
+
+            return true;
+        }
+    }
+
+    public bool IsNonNegative
+    {
+        get
+        {
+            foreach (var value in Values)
+            {
+                if (value < 0.0f)
+                    return false;
+            }
+
+            return true;
+        }
+    }
+}
+
 /// <summary>
 /// The indexing-facing half of the vector scalar functions.
 /// </summary>
 /// <remarks>
-/// Every member here delegates to the private parse/convert/distance helpers the SQL functions
-/// already use, so an index can decode a column value, reproduce a scalar error, and rank by a
-/// scalar distance without duplicating a single byte-layout or floating-point rule.
+/// Distance and error members delegate to the scalar implementation. The sparse structural decoder
+/// additionally validates the serialized layout in place so a declared index dimension bounds every
+/// allocation before bytes are copied.
 /// </remarks>
 internal static partial class SqliteVectorFunctions
 {
@@ -160,6 +195,63 @@ internal static partial class SqliteVectorFunctions
         }
 
         decoded = new DecodedVector(encoding.Value, parsed.Dimensions, values);
+        return true;
+    }
+
+    /// <summary>
+    /// Decodes the sparse on-wire form after proving its complete shape and entry count.
+    /// </summary>
+    /// <remarks>
+    /// This intentionally does not route through <c>Parse</c>: an index knows its declared
+    /// dimensionality, so it can reject a hostile blob before copying it. Strictly increasing,
+    /// in-range component indexes also bound the two result arrays by <paramref name="expectedDimensions"/>.
+    /// </remarks>
+    internal static bool TryDecodeSparseVector(
+        SqlValue value,
+        int expectedDimensions,
+        out DecodedSparseVector decoded)
+    {
+        decoded = default;
+        if (value.Kind != SqlValueKind.Blob
+            || expectedDimensions < 1
+            || expectedDimensions > ManagedVectorIndexLimits.MaxDimensions)
+        {
+            return false;
+        }
+
+        var blob = value.AsBlobSpan();
+        if (blob.Length > MaximumManagedBlobBytes || blob.Length < 5 || blob[^1] != 9)
+            return false;
+
+        var dataLength = blob.Length - 1;
+        if ((dataLength & 3) != 0 || (dataLength - sizeof(uint)) % 8 != 0)
+            return false;
+
+        var dimensions = BinaryPrimitives.ReadUInt32LittleEndian(blob.Slice(dataLength - sizeof(uint), sizeof(uint)));
+        if (dimensions != (uint)expectedDimensions)
+            return false;
+
+        var entries = (dataLength - sizeof(uint)) / 8;
+        if (entries > expectedDimensions)
+            return false;
+
+        var indices = new int[entries];
+        var values = new float[entries];
+        uint previous = 0;
+        for (var entry = 0; entry < entries; entry++)
+        {
+            var component = BinaryPrimitives.ReadUInt32LittleEndian(
+                blob.Slice((entries * sizeof(float)) + (entry * sizeof(uint)), sizeof(uint)));
+            if (component >= dimensions || (entry != 0 && component <= previous))
+                return false;
+
+            indices[entry] = (int)component;
+            values[entry] = BitConverter.Int32BitsToSingle(
+                BinaryPrimitives.ReadInt32LittleEndian(blob.Slice(entry * sizeof(float), sizeof(float))));
+            previous = component;
+        }
+
+        decoded = new DecodedSparseVector(expectedDimensions, indices, values);
         return true;
     }
 

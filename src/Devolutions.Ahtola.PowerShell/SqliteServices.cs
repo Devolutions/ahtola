@@ -40,10 +40,17 @@ internal static class TursoCloudConnectionFactory
         SecureString? authToken,
         string? replicaPath,
         bool useTursoEnvironment,
-        int syncInterval)
+        int syncInterval,
+        TimeSpan? longPollTimeout = null,
+        long? pushOperationsThreshold = null,
+        long? pullBytesThreshold = null,
+        AhtolaPartialBootstrapOptions? partialBootstrap = null,
+        SecureString? remoteEncryptionKey = null,
+        AhtolaRemoteEncryptionCipher? remoteEncryptionCipher = null)
     {
         var endpoint = ResolveEndpoint(remoteUrl, useTursoEnvironment);
         var token = ResolveAuthToken(authToken, useTursoEnvironment);
+        var encryptionKey = ResolveSecret(remoteEncryptionKey, nameof(remoteEncryptionKey));
         string? resolvedReplicaPath = null;
         try
         {
@@ -65,6 +72,18 @@ internal static class TursoCloudConnectionFactory
                 var options = new AhtolaReplicaOptions(resolvedReplicaPath, endpoint, token)
                 {
                     SyncInterval = syncInterval,
+                    LongPollTimeout = longPollTimeout,
+                    PushOperationsThreshold = pushOperationsThreshold,
+                    PullBytesThreshold = pullBytesThreshold,
+                    PartialBootstrap = partialBootstrap,
+                    RemoteEncryption = encryptionKey is null
+                        ? null
+                        : new AhtolaRemoteEncryptionOptions(
+                            encryptionKey,
+                            remoteEncryptionCipher
+                            ?? throw new ArgumentException(
+                                "RemoteEncryptionCipher is required with RemoteEncryptionKey.",
+                                nameof(remoteEncryptionCipher))),
                 };
                 connection = AhtolaConnection.CreateReplica(options);
             }
@@ -82,14 +101,15 @@ internal static class TursoCloudConnectionFactory
                 }
                 catch
                 {
-                    // Keep credential-bearing provider failures out of the PowerShell error stream.
+                    // Preserve the original provider exception and its replica metadata.
                 }
-                throw new InvalidOperationException("The Turso Cloud connection could not be opened.");
+                throw;
             }
         }
         finally
         {
             token = string.Empty;
+            encryptionKey = string.Empty;
         }
     }
 
@@ -137,6 +157,17 @@ internal static class TursoCloudConnectionFactory
         return useTursoEnvironment
             ? Environment.GetEnvironmentVariable(AuthTokenEnvironmentVariable)
             : null;
+    }
+
+    private static string? ResolveSecret(SecureString? secret, string parameterName)
+    {
+        if (secret is null)
+            return null;
+
+        var value = new NetworkCredential(string.Empty, secret).Password;
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("The secure value cannot be empty.", parameterName);
+        return value;
     }
 }
 

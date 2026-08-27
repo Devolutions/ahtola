@@ -134,6 +134,12 @@ public abstract class PSSqliteCmdlet : PSCmdlet
 [OutputType(typeof(SqliteConnection), typeof(AhtolaCloudConnection))]
 public sealed class NewPSSqliteConnectionCommand : PSSqliteCmdlet
 {
+    private const string TursoCloud = "byTursoCloud";
+    private const string TursoReplica = "byTursoReplica";
+    private const string TursoReplicaPrefix = "byTursoReplicaPrefix";
+    private const string TursoReplicaQuery = "byTursoReplicaQuery";
+    private const string TursoReplicaEncrypted = "byTursoReplicaEncrypted";
+
     [Parameter(ParameterSetName = "byConnectionString")]
     public string ConnectionString { get; set; } = "Data Source=:memory:;Cache=Shared;";
 
@@ -147,43 +153,155 @@ public sealed class NewPSSqliteConnectionCommand : PSSqliteCmdlet
     [Parameter(ParameterSetName = "byDatabasePath")]
     public SwitchParameter ReadOnly { get; set; }
 
-    [Parameter(ParameterSetName = "byTursoCloud")]
+    [Parameter(ParameterSetName = TursoCloud)]
+    [Parameter(ParameterSetName = TursoReplica)]
+    [Parameter(ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(ParameterSetName = TursoReplicaQuery)]
+    [Parameter(ParameterSetName = TursoReplicaEncrypted)]
     [Alias("RemoteUrl", "Url")]
     public string? TursoUrl { get; set; }
 
-    [Parameter(ParameterSetName = "byTursoCloud")]
+    [Parameter(ParameterSetName = TursoCloud)]
+    [Parameter(ParameterSetName = TursoReplica)]
+    [Parameter(ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(ParameterSetName = TursoReplicaQuery)]
+    [Parameter(ParameterSetName = TursoReplicaEncrypted)]
     [Alias("Token")]
     public SecureString? AuthToken { get; set; }
 
-    [Parameter(ParameterSetName = "byTursoCloud")]
+    [Parameter(Mandatory = true, ParameterSetName = TursoReplica)]
+    [Parameter(Mandatory = true, ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(Mandatory = true, ParameterSetName = TursoReplicaQuery)]
+    [Parameter(Mandatory = true, ParameterSetName = TursoReplicaEncrypted)]
     public string? ReplicaPath { get; set; }
 
-    [Parameter(ParameterSetName = "byTursoCloud")]
+    [Parameter(ParameterSetName = TursoCloud)]
+    [Parameter(ParameterSetName = TursoReplica)]
+    [Parameter(ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(ParameterSetName = TursoReplicaQuery)]
+    [Parameter(ParameterSetName = TursoReplicaEncrypted)]
     public SwitchParameter UseTursoEnvironment { get; set; }
 
-    [Parameter(ParameterSetName = "byTursoCloud")]
+    [Parameter(ParameterSetName = TursoReplica)]
+    [Parameter(ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(ParameterSetName = TursoReplicaQuery)]
+    [Parameter(ParameterSetName = TursoReplicaEncrypted)]
     [ValidateRange(0, int.MaxValue)]
     public int SyncInterval { get; set; }
 
+    [Parameter(ParameterSetName = TursoReplica)]
+    [Parameter(ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(ParameterSetName = TursoReplicaQuery)]
+    [Parameter(ParameterSetName = TursoReplicaEncrypted)]
+    public TimeSpan? LongPollTimeout { get; set; }
+
+    [Parameter(ParameterSetName = TursoReplica)]
+    [Parameter(ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(ParameterSetName = TursoReplicaQuery)]
+    [Parameter(ParameterSetName = TursoReplicaEncrypted)]
+    [ValidateRange(1, long.MaxValue)]
+    public long PushOperationsThreshold { get; set; }
+
+    [Parameter(ParameterSetName = TursoReplica)]
+    [Parameter(ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(ParameterSetName = TursoReplicaEncrypted)]
+    [ValidateRange(1, long.MaxValue)]
+    public long PullBytesThreshold { get; set; }
+
+    [Parameter(Mandatory = true, ParameterSetName = TursoReplicaPrefix)]
+    [ValidateRange(4096, int.MaxValue)]
+    public int BootstrapPrefixBytes { get; set; }
+
+    [Parameter(Mandatory = true, ParameterSetName = TursoReplicaQuery)]
+    [ValidateNotNullOrEmpty]
+    public string? BootstrapQuery { get; set; }
+
+    [Parameter(ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(ParameterSetName = TursoReplicaQuery)]
+    [ValidateRange(4096, long.MaxValue)]
+    public long BootstrapSegmentBytes { get; set; }
+
+    [Parameter(ParameterSetName = TursoReplicaPrefix)]
+    [Parameter(ParameterSetName = TursoReplicaQuery)]
+    public SwitchParameter BootstrapPrefetch { get; set; }
+
+    [Parameter(Mandatory = true, ParameterSetName = TursoReplicaEncrypted)]
+    public SecureString? RemoteEncryptionKey { get; set; }
+
+    [Parameter(Mandatory = true, ParameterSetName = TursoReplicaEncrypted)]
+    [ValidateSet(
+        nameof(AhtolaRemoteEncryptionCipher.Aes256Gcm),
+        nameof(AhtolaRemoteEncryptionCipher.Aes128Gcm),
+        nameof(AhtolaRemoteEncryptionCipher.Aegis128L),
+        nameof(AhtolaRemoteEncryptionCipher.Aegis128X2),
+        nameof(AhtolaRemoteEncryptionCipher.Aegis128X4),
+        nameof(AhtolaRemoteEncryptionCipher.Aegis256),
+        nameof(AhtolaRemoteEncryptionCipher.Aegis256X2),
+        nameof(AhtolaRemoteEncryptionCipher.Aegis256X4))]
+    public string? RemoteEncryptionCipher { get; set; }
+
     protected override void ProcessRecord()
     {
-        if (ParameterSetName == "byTursoCloud")
+        if (ParameterSetName is TursoCloud
+            or TursoReplica
+            or TursoReplicaPrefix
+            or TursoReplicaQuery
+            or TursoReplicaEncrypted)
         {
-            var replicaPath = string.IsNullOrWhiteSpace(ReplicaPath)
-                ? null
-                : ResolveFileSystemPath(ReplicaPath);
-            var operation = string.IsNullOrWhiteSpace(ReplicaPath)
+            var isReplicaParameterSet = ParameterSetName is TursoReplica
+                or TursoReplicaPrefix
+                or TursoReplicaQuery
+                or TursoReplicaEncrypted;
+            if (isReplicaParameterSet && string.IsNullOrWhiteSpace(ReplicaPath))
+            {
+                throw new ArgumentException(
+                    "ReplicaPath cannot be null, empty, or whitespace for a replica connection.",
+                    nameof(ReplicaPath));
+            }
+
+            var replicaPath = isReplicaParameterSet
+                ? ResolveFileSystemPath(ReplicaPath!)
+                : null;
+            var cipher = RemoteEncryptionCipher is null
+                ? (AhtolaRemoteEncryptionCipher?)null
+                : Enum.Parse<AhtolaRemoteEncryptionCipher>(RemoteEncryptionCipher, ignoreCase: true);
+            var operation = replicaPath is null
                 ? "Open Turso Cloud connection"
                 : "Open managed Turso Cloud replica";
             if (!ShouldProcess("Turso Cloud endpoint", operation))
                 return;
 
+            var segmentSize = MyInvocation.BoundParameters.ContainsKey(nameof(BootstrapSegmentBytes))
+                ? BootstrapSegmentBytes
+                : (long?)null;
+            var partialBootstrap = ParameterSetName switch
+            {
+                TursoReplicaPrefix => AhtolaPartialBootstrapOptions.Prefix(
+                    BootstrapPrefixBytes,
+                    segmentSize,
+                    BootstrapPrefetch.IsPresent),
+                TursoReplicaQuery => AhtolaPartialBootstrapOptions.QueryPages(
+                    BootstrapQuery!,
+                    segmentSize,
+                    BootstrapPrefetch.IsPresent),
+                _ => null,
+            };
             WriteObject(TursoCloudConnectionFactory.Create(
                 TursoUrl,
                 AuthToken,
                 replicaPath,
                 UseTursoEnvironment.IsPresent,
-                SyncInterval));
+                SyncInterval,
+                LongPollTimeout,
+                MyInvocation.BoundParameters.ContainsKey(nameof(PushOperationsThreshold))
+                    ? PushOperationsThreshold
+                    : null,
+                MyInvocation.BoundParameters.ContainsKey(nameof(PullBytesThreshold))
+                    ? PullBytesThreshold
+                    : null,
+                partialBootstrap,
+                RemoteEncryptionKey,
+                cipher));
             return;
         }
 
@@ -261,24 +379,16 @@ public sealed class InvokePSSqliteQueryCommand : PSSqliteCmdlet
 
     protected override void ProcessRecord()
     {
-        object? result;
-        try
-        {
-            result = QueryExecutor.Execute(
-                Connection,
-                CommandText,
-                Parameters,
-                new QueryOptions
-                {
-                    OutputFormat = As,
-                    CommandTimeout = CommandTimeout,
-                    Transaction = Transaction
-                });
-        }
-        catch when (Connection is AhtolaCloudConnection)
-        {
-            throw new InvalidOperationException("The Turso Cloud query failed.");
-        }
+        object? result = QueryExecutor.Execute(
+            Connection,
+            CommandText,
+            Parameters,
+            new QueryOptions
+            {
+                OutputFormat = As,
+                CommandTimeout = CommandTimeout,
+                Transaction = Transaction
+            });
 
         if (CastAs is not null && result is not null)
         {

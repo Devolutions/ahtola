@@ -11,13 +11,19 @@ public sealed class AhtolaManagedSqliteHistoryRepository(HistoryRepositoryDepend
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
 
     public override string GetBeginIfNotExistsScript(string migrationId)
-        => throw IdempotentScriptsNotSupported();
+        => $"-- Migration {migrationId}; SQLite has no procedural history guard, so generation permits only operations prevalidated as repeat-safe.{Environment.NewLine}";
 
     public override string GetBeginIfExistsScript(string migrationId)
-        => throw IdempotentScriptsNotSupported();
+        => $"-- Rollback {migrationId}; SQLite has no procedural history guard, so generation permits only operations prevalidated as repeat-safe.{Environment.NewLine}";
 
     public override string GetEndIfScript()
-        => throw IdempotentScriptsNotSupported();
+        => $"-- End repeat-safe migration.{Environment.NewLine}";
+
+    public override string GetInsertScript(HistoryRow row)
+        => base.GetInsertScript(row).Replace(
+            "INSERT INTO ",
+            "INSERT OR IGNORE INTO ",
+            StringComparison.Ordinal);
 
     bool IHistoryRepository.CreateIfNotExists()
     {
@@ -114,7 +120,4 @@ public sealed class AhtolaManagedSqliteHistoryRepository(HistoryRepositoryDepend
             Dependencies.CommandLogger,
             CommandSource.Migrations);
 
-    private static NotSupportedException IdempotentScriptsNotSupported()
-        => new(
-            "The managed local provider does not support idempotent migration scripts because the engine cannot conditionally execute DDL blocks.");
 }

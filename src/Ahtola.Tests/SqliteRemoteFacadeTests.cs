@@ -483,6 +483,62 @@ public sealed class SqliteRemoteFacadeTests
     }
 
     [Test]
+    public async Task ManagedReplicaAhtolaConnectionAppliesConnectionPragmas()
+    {
+        var path = Path.Combine(
+            TestContext.CurrentContext.WorkDirectory,
+            $"ahtola-pragmas-replica-{Guid.NewGuid():N}.db");
+        try
+        {
+            using (var local = new AhtolaConnection(
+                       $"Data Source={path};Local Provider=Managed;Pooling=False"))
+            {
+                local.Open();
+                local.ExecuteNonQuery("CREATE TABLE parent(id INTEGER PRIMARY KEY);");
+                local.ExecuteNonQuery("CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));");
+            }
+
+            await using var replica = new AhtolaConnection(
+                $"Data Source=https://example.test/cluster;Replica Path={path};"
+                + "Local Provider=Managed;Foreign Keys=True;Recursive Triggers=True;Pooling=False");
+            await replica.OpenAsync();
+
+            using (var foreignKeys = replica.CreateCommand())
+            {
+                foreignKeys.CommandText = "PRAGMA foreign_keys;";
+                foreignKeys.ExecuteScalar().Should().Be(1L);
+            }
+            using (var recursiveTriggers = replica.CreateCommand())
+            {
+                recursiveTriggers.CommandText = "PRAGMA recursive_triggers;";
+                recursiveTriggers.ExecuteScalar().Should().Be(1L);
+            }
+
+            replica.Invoking(static current => current.ExecuteNonQuery("INSERT INTO child VALUES (1);"))
+                .Should()
+                .Throw<AhtolaException>();
+
+            await replica.QuiesceManagedReplicaAsync(static _ => Task.CompletedTask);
+            using (var foreignKeys = replica.CreateCommand())
+            {
+                foreignKeys.CommandText = "PRAGMA foreign_keys;";
+                foreignKeys.ExecuteScalar().Should().Be(1L);
+            }
+            using (var recursiveTriggers = replica.CreateCommand())
+            {
+                recursiveTriggers.CommandText = "PRAGMA recursive_triggers;";
+                recursiveTriggers.ExecuteScalar().Should().Be(1L);
+            }
+        }
+        finally
+        {
+            var directory = Path.GetDirectoryName(path)!;
+            foreach (var file in Directory.GetFiles(directory, Path.GetFileName(path) + "*"))
+                File.Delete(file);
+        }
+    }
+
+    [Test]
     public void EmbeddedReplicaReadOnlyMode_DeniesWrites()
     {
         var path = Path.Combine(

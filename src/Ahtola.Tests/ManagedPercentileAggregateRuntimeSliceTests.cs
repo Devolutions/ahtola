@@ -89,20 +89,29 @@ public class ManagedPercentileAggregateRuntimeSliceTests
     }
 
     [Test]
-    public void OrderedSetAggregatesEnforceTursoSyntaxRestrictions()
+    public void OrderedSetAggregatesHonorDescendingAndExplicitNullOrdering()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE valueset(value);");
+        Execute(connection, "INSERT INTO valueset VALUES (1), (1), (2), (3), (3), (4), (NULL);");
 
         AssertParseError(
             connection,
             "SELECT mode() FROM valueset;",
             "mode() requires a WITHIN GROUP (ORDER BY ...) clause");
-        AssertParseError(
+        ReadRows(
             connection,
-            "SELECT mode() WITHIN GROUP (ORDER BY value DESC) FROM valueset;",
-            "DESC and NULLS ordering inside WITHIN GROUP are not supported yet");
+            """
+            SELECT
+                mode() WITHIN GROUP (ORDER BY value DESC NULLS FIRST),
+                percentile_cont(0.25) WITHIN GROUP (ORDER BY value DESC NULLS LAST),
+                percentile_disc(0.25) WITHIN GROUP (ORDER BY value DESC NULLS FIRST)
+            FROM valueset;
+            """)[0].Should().Equal(
+                SqlValue.Integer(3),
+                SqlValue.Real(3),
+                SqlValue.Integer(3));
         AssertParseError(
             connection,
             "SELECT percentile_cont() WITHIN GROUP (ORDER BY value) FROM valueset;",

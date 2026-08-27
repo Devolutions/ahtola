@@ -111,6 +111,7 @@ public sealed class SqlitePager : IDisposable
     private uint _observedWalIndexSalt2;
     private bool _hasObservedWalStamp;
     private FileWriteStamp? _observedWalStamp;
+    private bool _exclusiveLockingMode;
 
     private SqlitePager(
     IFileSystem fileSystem,
@@ -227,6 +228,15 @@ public sealed class SqlitePager : IDisposable
                 ThrowIfDisposed();
                 return _journalMode;
             }
+        }
+    }
+
+    internal bool IsExclusiveLockingMode
+    {
+        get
+        {
+            lock (_gate)
+                return _exclusiveLockingMode;
         }
     }
 
@@ -1134,18 +1144,22 @@ public sealed class SqlitePager : IDisposable
         {
             bool deleteMode;
             bool readOnly;
+            bool persistentExclusive;
+            bool useExternalCoordinator;
             lock (_gate)
             {
                 ThrowIfNotReadable();
                 deleteMode = _journalMode == SqliteJournalMode.Delete;
                 readOnly = IsReadOnly;
+                persistentExclusive = _exclusiveLockingMode;
+                useExternalCoordinator = !deleteMode && !persistentExclusive;
             }
 
             mainFileLock = null;
             SqlitePagerLockLease? readerLock = null;
             try
             {
-                if (deleteMode && _clientOwnership is not null)
+                if (deleteMode && !persistentExclusive && _clientOwnership is not null)
                 {
                     mainFileLock = _clientOwnership.AcquireShared(
                         SqlitePagerLockOperation.Reader,
@@ -1159,7 +1173,7 @@ public sealed class SqlitePager : IDisposable
                             ? SqlitePagerLockManager.RemainingFileLockTimeout(timeout, stopwatch)
                             : TimeSpan.Zero,
                         readOnly,
-                        useExternalCoordinator: !deleteMode);
+                        useExternalCoordinator);
                 }
                 catch (SqlitePagerBusyException exception) when (mainFileLock is not null)
                 {
@@ -1178,7 +1192,9 @@ public sealed class SqlitePager : IDisposable
                 lock (_gate)
                 {
                     ThrowIfNotReadable();
-                    if ((_journalMode == SqliteJournalMode.Delete) == deleteMode)
+                    if ((_journalMode == SqliteJournalMode.Delete) == deleteMode
+                        && _exclusiveLockingMode == persistentExclusive
+                        && (!_exclusiveLockingMode && !deleteMode) == useExternalCoordinator)
                         return readerLock;
                 }
             }
@@ -1205,7 +1221,7 @@ public sealed class SqlitePager : IDisposable
             lock (_gate)
             {
                 ThrowIfNotReadable();
-                SynchronizeCommittedView(mainFileLock);
+                SynchronizeCommittedView(GetSynchronizationMainFileLock(mainFileLock));
                 var page = new byte[_pageStore.PageSize];
                 ReadCommittedPageCore(pageNumber, page);
                 return page;
@@ -1231,7 +1247,7 @@ public sealed class SqlitePager : IDisposable
             lock (_gate)
             {
                 ThrowIfNotReadable();
-                SynchronizeCommittedView(mainFileLock);
+                SynchronizeCommittedView(GetSynchronizationMainFileLock(mainFileLock));
                 ReadCommittedPageCore(pageNumber, destination);
             }
         }
@@ -1260,7 +1276,7 @@ public sealed class SqlitePager : IDisposable
             lock (_gate)
             {
                 ThrowIfNotReadable();
-                SynchronizeCommittedView(mainFileLock);
+                SynchronizeCommittedView(GetSynchronizationMainFileLock(mainFileLock));
                 var transaction = new SqlitePagerReadTransaction(
                     this,
                     readerLock,
@@ -1288,6 +1304,7 @@ public sealed class SqlitePager : IDisposable
             return _walIndex is not null
                 && _wal is not null
                 && UsesWalStorage(_journalMode)
+                && !_exclusiveLockingMode
                 && !_foreignReadOnly
                 && _lockManager.UsesFileBackedWalLocks;
         }
@@ -1389,17 +1406,19 @@ public sealed class SqlitePager : IDisposable
         while (true)
         {
             var deleteMode = JournalMode == SqliteJournalMode.Delete;
+            var persistentExclusive = IsExclusiveLockingMode;
+            var useExternalCoordinator = !deleteMode && !persistentExclusive;
             var remaining = SqlitePagerLockManager.RemainingFileLockTimeout(
                 configuredBusyTimeout,
                 lockStopwatch);
             var transactionLock = _lockManager.EnterWriter(
                 remaining,
-                useExternalCoordinator: !deleteMode);
+                useExternalCoordinator);
             SqliteMainFileLockLease? mainFileLock = null;
             var retry = false;
             try
             {
-                if (deleteMode && _clientOwnership is not null)
+                if (deleteMode && !persistentExclusive && _clientOwnership is not null)
                 {
                     mainFileLock = _clientOwnership.AcquireShared(
                         SqlitePagerLockOperation.Writer,
@@ -1416,8 +1435,10 @@ public sealed class SqlitePager : IDisposable
                 {
                     ThrowIfDisposed();
                     ThrowIfReadOnly();
-                    SynchronizeCommittedView(mainFileLock);
-                    if ((_journalMode == SqliteJournalMode.Delete) != deleteMode)
+                    SynchronizeCommittedView(GetSynchronizationMainFileLock(mainFileLock));
+                    if ((_journalMode == SqliteJournalMode.Delete) != deleteMode
+                        || _exclusiveLockingMode != persistentExclusive
+                        || (!_exclusiveLockingMode && !deleteMode) != useExternalCoordinator)
                     {
                         retry = true;
                     }
@@ -1426,9 +1447,11 @@ public sealed class SqlitePager : IDisposable
                         if (_lockManager.UsesFileBackedWalLocks
                             && HasUncommittedOrInvalidTail(_recoveryInfo))
                         {
-                            var recoveryLock = _lockManager.EnterRecoveryLock(
-                                SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
-                                configuredBusyTimeout);
+                            var recoveryLock = useExternalCoordinator
+                                ? _lockManager.EnterRecoveryLock(
+                                    SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
+                                    configuredBusyTimeout)
+                                : null;
                             try
                             {
                                 using (recoveryLock)
@@ -1453,7 +1476,7 @@ public sealed class SqlitePager : IDisposable
                             transactionLock,
                             mainFileLock,
                             configuredBusyTimeout,
-                            requiresExclusiveCommit: deleteMode);
+                            requiresExclusiveCommit: deleteMode && !persistentExclusive);
                         mainFileLock = null;
                         _activeTransaction = transaction;
                         _state = SqlitePagerState.TransactionActive;
@@ -1488,13 +1511,15 @@ public sealed class SqlitePager : IDisposable
             ? null
             : Stopwatch.StartNew();
         var deleteMode = JournalMode == SqliteJournalMode.Delete;
+        var persistentExclusive = IsExclusiveLockingMode;
+        var useExternalCoordinator = !deleteMode && !persistentExclusive;
         var transactionLock = _lockManager.EnterCheckpoint(
             configuredBusyTimeout,
-            useExternalCoordinator: !deleteMode);
+            useExternalCoordinator);
         SqliteMainFileLockLease? mainFileLock = null;
         try
         {
-            if (deleteMode && _clientOwnership is not null)
+            if (deleteMode && !persistentExclusive && _clientOwnership is not null)
             {
                 mainFileLock = _clientOwnership.AcquireShared(
                     SqlitePagerLockOperation.Writer,
@@ -1511,15 +1536,17 @@ public sealed class SqlitePager : IDisposable
             {
                 ThrowIfDisposed();
                 ThrowIfReadOnly();
-                SynchronizeCommittedView(mainFileLock);
+                SynchronizeCommittedView(GetSynchronizationMainFileLock(mainFileLock));
                 if (_lockManager.UsesFileBackedWalLocks
                     && HasUncommittedOrInvalidTail(_recoveryInfo))
                 {
-                    var recoveryLock = _lockManager.EnterRecoveryLock(
-                        SqlitePagerLockManager.RemainingFileLockTimeout(
-                            configuredBusyTimeout,
-                            lockStopwatch),
-                        configuredBusyTimeout);
+                    var recoveryLock = useExternalCoordinator
+                        ? _lockManager.EnterRecoveryLock(
+                            SqlitePagerLockManager.RemainingFileLockTimeout(
+                                configuredBusyTimeout,
+                                lockStopwatch),
+                            configuredBusyTimeout)
+                        : null;
                     try
                     {
                         using (recoveryLock)
@@ -1544,7 +1571,7 @@ public sealed class SqlitePager : IDisposable
                     transactionLock,
                     mainFileLock,
                     configuredBusyTimeout,
-                    requiresExclusiveCommit: deleteMode,
+                    requiresExclusiveCommit: deleteMode && !persistentExclusive,
                     checkpointWalAfterCommit: true);
                 mainFileLock = null;
                 _activeTransaction = transaction;
@@ -1576,10 +1603,15 @@ public sealed class SqlitePager : IDisposable
         var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
             ? null
             : Stopwatch.StartNew();
-        using var writerLock = _lockManager.EnterWriter(configuredBusyTimeout);
-        var recoveryLock = _lockManager.EnterRecoveryLock(
-            SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
-            configuredBusyTimeout);
+        var useExternalCoordinator = !IsExclusiveLockingMode;
+        using var writerLock = _lockManager.EnterWriter(
+            configuredBusyTimeout,
+            useExternalCoordinator);
+        var recoveryLock = useExternalCoordinator
+            ? _lockManager.EnterRecoveryLock(
+                SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
+                configuredBusyTimeout)
+            : null;
         try
         {
             lock (_gate)
@@ -1602,7 +1634,7 @@ public sealed class SqlitePager : IDisposable
                         return;
                     }
 
-                    if (_walIndex is not null)
+                    if (_walIndex is not null && !_exclusiveLockingMode)
                     {
                         RecoverWalIndexAndTail(
                             wal,
@@ -1618,6 +1650,7 @@ public sealed class SqlitePager : IDisposable
                         throw new InvalidDataException("SQLite WAL recovery did not remove its uncommitted or invalid tail.");
 
                     InitializeCommittedView(recovery);
+                    PublishWalIndexFromCurrentWal();
                     _lockGeneration = writerLock.PublishStorageChange();
                 }
                 catch
@@ -1743,7 +1776,10 @@ public sealed class SqlitePager : IDisposable
             : synchronousMode;
         var timeout = ResolveBusyTimeout(busyTimeout);
         var lockStopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
-        using var checkpointLock = _lockManager.EnterCheckpoint(timeout);
+        var preserveExclusiveLock = IsExclusiveLockingMode;
+        using var checkpointLock = _lockManager.EnterCheckpoint(
+            timeout,
+            useExternalCoordinator: !preserveExclusiveLock);
         if (journalMode == SqliteJournalMode.Delete)
         {
             if (UsesWalIndexCheckpointProtocol())
@@ -1776,14 +1812,16 @@ public sealed class SqlitePager : IDisposable
             originalMode = _journalMode;
         }
 
-        SqliteMainFileLockLease? transitionMainFileLock = UsesWalStorage(originalMode)
+        SqliteMainFileLockLease? transitionMainFileLock = preserveExclusiveLock
+            ? _mainFileLock
+            : UsesWalStorage(originalMode)
             ? _mainFileLock
             : _clientOwnership?.AcquireShared(
                 SqlitePagerLockOperation.Checkpoint,
                 SqlitePagerLockManager.RemainingFileLockTimeout(timeout, lockStopwatch));
         try
         {
-            if (transitionMainFileLock is not null)
+            if (transitionMainFileLock is not null && !preserveExclusiveLock)
             {
                 transitionMainFileLock.AcquireReserved(
                     SqlitePagerLockManager.RemainingFileLockTimeout(timeout, lockStopwatch));
@@ -1863,11 +1901,23 @@ public sealed class SqlitePager : IDisposable
                         _recoveryInfo = RequireWal().ScanRecovery();
                         _visibleRecoveryInfo = _recoveryInfo;
                         if (_walIndex is null)
-                            AttachAndPublishWalIndex(readOnly: false);
+                        {
+                            if (preserveExclusiveLock)
+                            {
+                                var heapMapping = new HeapSqliteWalSharedMemoryMapping();
+                                var heapIndex = new SqliteWalIndexSharedMemory(heapMapping);
+                                heapIndex.RebuildFromWal(RequireWal(), GetWalIndexMainPageCount());
+                                ReplaceWalIndex(heapMapping, heapIndex, deletePhysicalIfLast: true);
+                            }
+                            else
+                            {
+                                AttachAndPublishWalIndex(readOnly: false);
+                            }
+                        }
                     }
                     else
                     {
-                        DisposeWalIndex();
+                        DisposeWalIndex(deletePhysicalIfLast: true);
                         _wal?.Dispose();
                         _wal = null;
                         _recoveryInfo = CreateEmptyRecoveryInfo();
@@ -1882,7 +1932,11 @@ public sealed class SqlitePager : IDisposable
                     _lockGeneration = checkpointLock.PublishJournalModeChange();
                     if (transitionMainFileLock is not null)
                     {
-                        if (UsesWalStorage(_journalMode))
+                        if (preserveExclusiveLock)
+                        {
+                            _mainFileLock = transitionMainFileLock;
+                        }
+                        else if (UsesWalStorage(_journalMode))
                         {
                             transitionMainFileLock.DowngradeToShared();
                             transitionMainFileLock.MarkAsPersistentWalShared();
@@ -1912,10 +1966,202 @@ public sealed class SqlitePager : IDisposable
         {
             if (transitionMainFileLock is not null)
             {
-                if (UsesWalStorage(originalMode))
+                if (preserveExclusiveLock)
+                {
+                    // The existing lifetime lease remains EXCLUSIVE after a
+                    // failed journal transition.
+                }
+                else if (UsesWalStorage(originalMode))
                     transitionMainFileLock.DowngradeToShared();
                 else
                     transitionMainFileLock.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Changes the pager's persistent locking mode. Physical WAL pagers replace
+    /// their mapped WAL-index with a heap index only after obtaining sole managed
+    /// main-file EXCLUSIVE ownership. Returning to NORMAL publishes a complete
+    /// physical index before releasing that main-file authority.
+    /// </summary>
+    internal bool SetExclusiveLockingMode(bool exclusive, TimeSpan? busyTimeout = null)
+    {
+        var timeout = ResolveBusyTimeout(busyTimeout);
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_exclusiveLockingMode == exclusive)
+                return _exclusiveLockingMode;
+            if (IsReadOnly)
+                return false;
+        }
+
+        // Custom and in-memory stores have no cross-process main-file/SHM
+        // protocol. Their existing process-local pager serialization is already
+        // the exclusive authority.
+        if (_clientOwnership is null || !_lockManager.UsesFileBackedWalLocks)
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                _exclusiveLockingMode = exclusive;
+                return _exclusiveLockingMode;
+            }
+        }
+
+        // Darwin exposes only process-scoped F_SETLK locks. A stock SQLite
+        // connection in this process is therefore invisible to an EXCLUSIVE
+        // upgrade performed by another descriptor, so heap-index handoff cannot
+        // be proven safe.
+        if (OperatingSystem.IsMacOS())
+            return false;
+
+        using var localCheckpoint = _lockManager.EnterCheckpoint(
+            timeout,
+            useExternalCoordinator: false);
+        return exclusive
+            ? EnterExclusiveLockingMode(timeout)
+            : ExitExclusiveLockingMode();
+    }
+
+    private bool EnterExclusiveLockingMode(TimeSpan timeout)
+    {
+        SqliteMainFileLockLease? mainFileLock;
+        var acquiredLifetimeLease = false;
+        HeapSqliteWalSharedMemoryMapping? heapMapping = null;
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_state != SqlitePagerState.Ready
+                || _activeTransaction is not null
+                || _activeReadTransactions.Count != 0)
+            {
+                throw new InvalidOperationException(
+                    "Cannot enter exclusive locking mode while the SQLite pager has an active transaction.");
+            }
+
+            mainFileLock = _mainFileLock;
+        }
+
+        if (mainFileLock is null)
+        {
+            mainFileLock = _clientOwnership!.AcquireShared(
+                SqlitePagerLockOperation.Checkpoint,
+                timeout);
+            acquiredLifetimeLease = true;
+        }
+
+        try
+        {
+            mainFileLock.AcquirePersistentExclusive(timeout);
+            SqliteWalIndexSharedMemory? heapIndex = null;
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                if (_state != SqlitePagerState.Ready
+                    || _activeTransaction is not null
+                    || _activeReadTransactions.Count != 0)
+                {
+                    throw new InvalidOperationException(
+                        "The SQLite pager became active while exclusive locking mode was being acquired.");
+                }
+
+                if (UsesWalStorage(_journalMode) && _wal is not null)
+                {
+                    heapMapping = new HeapSqliteWalSharedMemoryMapping();
+                    heapIndex = new SqliteWalIndexSharedMemory(heapMapping);
+                    heapIndex.RebuildFromWal(_wal, GetWalIndexMainPageCount());
+                }
+
+                _lockManager.ReleaseRetainedSharedReaderLock();
+                _mainFileLock = mainFileLock;
+                _exclusiveLockingMode = true;
+                ReplaceWalIndex(heapMapping, heapIndex, deletePhysicalIfLast: true);
+                heapMapping = null;
+                return true;
+            }
+        }
+        catch
+        {
+            var preserveExclusive = false;
+            lock (_gate)
+            {
+                preserveExclusive = _exclusiveLockingMode
+                    && ReferenceEquals(_mainFileLock, mainFileLock);
+                if (preserveExclusive)
+                    TransitionToFaulted();
+            }
+            if (preserveExclusive)
+                throw;
+
+            heapMapping?.Dispose();
+            if (mainFileLock.State is SqliteMainFileLockState.Pending
+                or SqliteMainFileLockState.Exclusive)
+            {
+                mainFileLock.DowngradeToShared();
+            }
+            if (acquiredLifetimeLease)
+                mainFileLock.Dispose();
+            throw;
+        }
+    }
+
+    private bool ExitExclusiveLockingMode()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (!_exclusiveLockingMode)
+                return false;
+            if (_state != SqlitePagerState.Ready
+                || _activeTransaction is not null
+                || _activeReadTransactions.Count != 0)
+            {
+                throw new InvalidOperationException(
+                    "Cannot leave exclusive locking mode while the SQLite pager has an active transaction.");
+            }
+
+            var mainFileLock = _mainFileLock
+                ?? throw new InvalidOperationException("Exclusive locking mode has no main-file lock.");
+            ISqliteWalSharedMemoryMapping? physicalMapping = null;
+            SqliteWalIndexSharedMemory? physicalIndex = null;
+            var physicalPublished = false;
+            try
+            {
+                if (UsesWalStorage(_journalMode) && _wal is not null)
+                {
+                    physicalMapping = PhysicalFileSystem.Instance.OpenSharedMemory(
+                        _sharedMemoryPath,
+                        FileOpenMode.OpenOrCreate,
+                        readOnly: false);
+                    physicalIndex = new SqliteWalIndexSharedMemory(physicalMapping);
+                    physicalIndex.RebuildFromWal(_wal, GetWalIndexMainPageCount());
+                }
+
+                ReplaceWalIndex(physicalMapping, physicalIndex, deletePhysicalIfLast: false);
+                physicalPublished = true;
+                physicalMapping = null;
+                if (UsesWalStorage(_journalMode))
+                {
+                    mainFileLock.DowngradeToShared();
+                    mainFileLock.MarkAsPersistentWalShared();
+                }
+                else
+                {
+                    mainFileLock.Dispose();
+                    _mainFileLock = null;
+                }
+
+                _exclusiveLockingMode = false;
+                return false;
+            }
+            catch
+            {
+                physicalMapping?.Dispose();
+                if (physicalPublished)
+                    TransitionToFaulted();
+                throw;
             }
         }
     }
@@ -1939,11 +2185,17 @@ public sealed class SqlitePager : IDisposable
         using var checkpointLock = _lockManager.EnterCheckpoint(
             TimeSpan.Zero,
             useExternalCoordinator: false);
-        using var mainFileLock = _clientOwnership?.AcquireShared(
-            SqlitePagerLockOperation.Checkpoint,
-            TimeSpan.Zero);
-        mainFileLock?.AcquireReserved(TimeSpan.Zero);
-        mainFileLock?.AcquireExclusive(requireReserved: true, timeout: TimeSpan.Zero);
+        var persistentExclusive = IsExclusiveLockingMode;
+        using var mainFileLock = persistentExclusive
+            ? null
+            : _clientOwnership?.AcquireShared(
+                SqlitePagerLockOperation.Checkpoint,
+                TimeSpan.Zero);
+        if (!persistentExclusive)
+        {
+            mainFileLock?.AcquireReserved(TimeSpan.Zero);
+            mainFileLock?.AcquireExclusive(requireReserved: true, timeout: TimeSpan.Zero);
+        }
         lock (_gate)
         {
             ThrowIfDisposed();
@@ -1979,19 +2231,25 @@ public sealed class SqlitePager : IDisposable
         using var checkpointLock = _lockManager.EnterCheckpoint(
             timeout,
             useExternalCoordinator: false);
-        using var mainFileLock = _clientOwnership?.AcquireShared(
-            SqlitePagerLockOperation.Checkpoint,
-            SqlitePagerLockManager.RemainingFileLockTimeout(timeout, stopwatch));
-        mainFileLock?.AcquireReserved(
-            SqlitePagerLockManager.RemainingFileLockTimeout(timeout, stopwatch));
-        mainFileLock?.AcquireExclusive(
-            requireReserved: true,
-            timeout: SqlitePagerLockManager.RemainingFileLockTimeout(timeout, stopwatch));
+        var persistentExclusive = IsExclusiveLockingMode;
+        using var mainFileLock = persistentExclusive
+            ? null
+            : _clientOwnership?.AcquireShared(
+                SqlitePagerLockOperation.Checkpoint,
+                SqlitePagerLockManager.RemainingFileLockTimeout(timeout, stopwatch));
+        if (!persistentExclusive)
+        {
+            mainFileLock?.AcquireReserved(
+                SqlitePagerLockManager.RemainingFileLockTimeout(timeout, stopwatch));
+            mainFileLock?.AcquireExclusive(
+                requireReserved: true,
+                timeout: SqlitePagerLockManager.RemainingFileLockTimeout(timeout, stopwatch));
+        }
         lock (_gate)
         {
             ThrowIfDisposed();
             ThrowIfReadOnly();
-            SynchronizeCommittedView(mainFileLock);
+            SynchronizeCommittedView(GetSynchronizationMainFileLock(mainFileLock));
             if (_journalMode != SqliteJournalMode.Delete)
                 throw new InvalidOperationException("SQLite database replacement requires DELETE journal mode.");
             if (_state != SqlitePagerState.Ready)
@@ -2040,8 +2298,11 @@ public sealed class SqlitePager : IDisposable
         }
 
         var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
-        using var checkpointLock = _lockManager.EnterCheckpoint(timeout);
-        using var mainFileLock = JournalMode == SqliteJournalMode.Delete
+        var persistentExclusive = IsExclusiveLockingMode;
+        using var checkpointLock = _lockManager.EnterCheckpoint(
+            timeout,
+            useExternalCoordinator: !persistentExclusive);
+        using var mainFileLock = JournalMode == SqliteJournalMode.Delete && !persistentExclusive
             ? _clientOwnership?.AcquireShared(
                 SqlitePagerLockOperation.Checkpoint,
                 SqlitePagerLockManager.RemainingFileLockTimeout(timeout, stopwatch))
@@ -2061,6 +2322,7 @@ public sealed class SqlitePager : IDisposable
             return _walIndex is not null
                 && _wal is not null
                 && UsesWalStorage(_journalMode)
+                && !_exclusiveLockingMode
                 && !_foreignReadOnly
                 && _lockManager.UsesFileBackedWalLocks
                 && _walIndexMapping is { IsReadOnly: false };
@@ -2078,7 +2340,7 @@ public sealed class SqlitePager : IDisposable
         {
             ThrowIfDisposed();
             ThrowIfReadOnly();
-            SynchronizeCommittedView(mainFileLock);
+            SynchronizeCommittedView(GetSynchronizationMainFileLock(mainFileLock));
             if (_journalMode == SqliteJournalMode.Delete)
             {
                 if (_state != SqlitePagerState.Ready)
@@ -2696,6 +2958,9 @@ public sealed class SqlitePager : IDisposable
                 _mainFileLock = null;
                 _clientOwnership = null;
                 _state = SqlitePagerState.Disposed;
+                // Keep the carrier for future non-mutating read-only opens. A
+                // header-only WAL is not enough to make unlink safe: later reads
+                // still require the existing file to acquire SQLite's SHM locks.
                 DisposeWalIndex();
                 _wal?.Dispose();
                 _pageStore.Dispose();
@@ -3041,7 +3306,7 @@ public sealed class SqlitePager : IDisposable
         {
             lock (_gate)
             {
-                SynchronizeCommittedView(mainFileLock);
+                SynchronizeCommittedView(GetSynchronizationMainFileLock(mainFileLock));
                 return CaptureCommittedViewTokenUnderLock();
             }
         }
@@ -3072,6 +3337,10 @@ public sealed class SqlitePager : IDisposable
     /// storage. Reads that reuse an unchanged view do not increment it.
     /// </summary>
     internal long CommittedViewRescanCount { get; private set; }
+
+    private SqliteMainFileLockLease? GetSynchronizationMainFileLock(
+        SqliteMainFileLockLease? operationLock)
+        => operationLock ?? (_exclusiveLockingMode ? _mainFileLock : null);
 
     private void SynchronizeCommittedView(SqliteMainFileLockLease? mainFileLock = null)
     {
@@ -3418,7 +3687,7 @@ public sealed class SqlitePager : IDisposable
             return;
 
         var wal = RequireWal();
-        if (_walIndex is not null)
+        if (_walIndex is not null && !_exclusiveLockingMode)
         {
             // Caller holds lock-manager writer + recovery bytes.
             RecoverWalIndexAndTail(
@@ -3435,6 +3704,7 @@ public sealed class SqlitePager : IDisposable
             throw new InvalidDataException("SQLite WAL recovery did not remove its uncommitted or invalid tail.");
 
         InitializeCommittedView(recovery);
+        PublishWalIndexFromCurrentWal();
         _lockGeneration = writerLock.PublishStorageChange();
     }
 
@@ -3996,15 +4266,43 @@ public sealed class SqlitePager : IDisposable
         PublishWalIndexFromCurrentWal();
     }
 
-    private void DisposeWalIndex()
+    private uint GetWalIndexMainPageCount()
+    {
+        var mainPageCount = _committedPageCount != 0
+            ? _committedPageCount
+            : _pageStore.PageCount;
+        if (mainPageCount == 0)
+        {
+            throw new InvalidDataException(
+                "Cannot publish a SQLite WAL-index without a nonzero main-database page count.");
+        }
+
+        return mainPageCount;
+    }
+
+    private void ReplaceWalIndex(
+        ISqliteWalSharedMemoryMapping? mapping,
+        SqliteWalIndexSharedMemory? index,
+        bool deletePhysicalIfLast)
     {
         _readSnapshotCoordinator?.Dispose();
         _readSnapshotCoordinator = null;
         _walIndexLocks = null;
-        _walIndex = null;
-        _walIndexMapping?.Dispose();
-        _walIndexMapping = null;
+        var priorMapping = _walIndexMapping;
+        _walIndexMapping = mapping;
+        _walIndex = index;
         ClearObservedWalIndexIdentity();
+        if (priorMapping is PhysicalSqliteWalSharedMemoryMapping physical && deletePhysicalIfLast)
+            physical.DisposeAndTryDeleteIfLast();
+        else
+            priorMapping?.Dispose();
+        if (index is not null && _wal is not null)
+            ObserveWalIndexIdentityFromAttachedIndex();
+    }
+
+    private void DisposeWalIndex(bool deletePhysicalIfLast = false)
+    {
+        ReplaceWalIndex(mapping: null, index: null, deletePhysicalIfLast);
     }
 
     private void EnsureReadSnapshotCoordinatorLocked()
@@ -4223,7 +4521,7 @@ public sealed class SqlitePager : IDisposable
             lock (_gate)
             {
                 ThrowIfNotReadable();
-                SynchronizeCommittedView(mainFileLock);
+                SynchronizeCommittedView(GetSynchronizationMainFileLock(mainFileLock));
                 ValidateVisiblePageNumber(pageNumber);
                 requiresMaterialization = !_walPageOverlay.ContainsKey(pageNumber)
                     && pageNumber <= _pageStore.PageCount;

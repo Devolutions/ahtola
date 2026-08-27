@@ -181,9 +181,9 @@ Both are gated by `./build.ps1 validate-browser-trim` (browser profiles) and
 publishes).
 
 Common connection-string keywords: `Data Source`, `Mode`, `Cache`, `Pooling`,
-`Foreign Keys`, `Default Timeout` / `Command Timeout`, `Foreign Read Only`,
+`Foreign Keys`, `Recursive Triggers`, `Default Timeout` / `Command Timeout`, `Foreign Read Only`,
 `DateTimeKind`, `BinaryGUID`, `Password` (passphrase → AES-256-GCM), or
-`Encryption Cipher` + `Encryption Key` (hex AES-128/256-GCM). Turso/Hrana URLs
+`Encryption Cipher` + `Encryption Key` (hex AES-GCM or AEGIS keys). Turso/Hrana URLs
 also accept `Auth Token`, `Replica Path`, `Sync Interval`, `Read Your Writes`,
 and `Tls` through either ADO.NET facade. Default local provider is managed-only.
 
@@ -201,7 +201,7 @@ Encryption is layered so new recipes can be added without rewriting the pager:
 | Layer | Role | Extension point |
 | --- | --- | --- |
 | **Passphrase scheme** | Password to AES key | `IAhtolaPassphraseScheme` + `AhtolaPassphraseSchemes`; CS `Password Scheme=` |
-| **Built-in AHTLA page crypto** | On-disk AES-GCM pages (`AHTLA` header) | `AhtolaEncryptionOptions` / `Encryption Cipher` + `Encryption Key` |
+| **Built-in AHTLA page crypto** | On-disk AES-GCM or AEGIS pages (`AHTLA` header) | `AhtolaEncryptionOptions` / `Encryption Cipher` + `Encryption Key` |
 | **External page codec** | Entirely different page layout | `IPageCodec` (mutually exclusive with built-in encryption) |
 
 | Mechanism | Connection string | Notes |
@@ -357,9 +357,15 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
 - **Multi-engine files (Stage 6)** — physical opens use SQLite main-file SHARED
   locking (Windows / 64-bit Linux / macOS). Managed and stock SQLite can share
   the same live WAL database on Windows/Linux (`-shm` DMS + peer WAL visibility
-  on new statements). Pooling may retain managed handles until `Pooling=False`
-  or `SqliteConnection.ClearAllPools()`. PENDING/RESERVED DELETE-mode polish and
-  a Turso binary differential remain optional depth. See
+  on new statements). Ordinary closes retain `-shm` so a later read-only open
+  can coordinate without mutating storage. On Windows/Linux, an explicit
+  transition to `locking_mode=EXCLUSIVE` removes the carrier only after an
+  exclusive DMS proof, keeps the main-file lock, and uses a private heap
+  WAL-index. macOS keeps the carrier and rejects physical EXCLUSIVE mode because
+  process-owned `fcntl` locks cannot distinguish an in-process foreign mapping.
+  Pooling may retain managed handles
+  until `Pooling=False` or `SqliteConnection.ClearAllPools()`. A Turso binary
+  differential remains optional qualification. See
   [docs/wal-interoperability-contract.md](docs/wal-interoperability-contract.md).
 - **Foreign read-only** — `Mode=ReadOnly;Foreign Read Only=True;Pooling=False`
   can read a DB still held by native SQLite/Turso (e.g. winget `index.db`) without
@@ -392,8 +398,8 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   catch-up resumed on the next open. See
   [docs/replica-bootstrap-publication.md](docs/replica-bootstrap-publication.md).
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
-  is null), AEGIS encryption ciphers, the full sync engine / advanced replica
-  protocols, `CREATE SEQUENCE`, and typed-value extensions.
+  is null), the full sync engine / advanced replica protocols,
+  `CREATE SEQUENCE`, and typed-value extensions.
 - **Native / Sync companions** — not shipped. Connection-string paths that need
   them fail closed. OS P/Invoke in the pager for locks/WAL is intentional engine
   code, not a Rust SDK binding.

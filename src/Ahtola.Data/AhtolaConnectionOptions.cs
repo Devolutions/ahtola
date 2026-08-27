@@ -37,6 +37,10 @@ public class AhtolaConnectionOptions
 
     public bool Pooling => _builder.Pooling;
 
+    public bool? ForeignKeys => _builder.ForeignKeys;
+
+    public bool RecursiveTriggers => _builder.RecursiveTriggers;
+
     public bool ForeignReadOnly => _builder.ForeignReadOnly;
 
     public int SyncInterval => _builder.SyncInterval;
@@ -54,6 +58,8 @@ public class AhtolaConnectionOptions
 
     public bool IsReplica => AhtolaConnectionModeClassifier.Classify(DataSource, ReplicaPath)
         == AhtolaConnectionEndpointMode.EmbeddedReplica;
+
+    internal bool HasRecursiveTriggers => _builder.GetOption("Recursive Triggers") is not null;
 
     public AhtolaEncryptionCipher? GetEncryptionCipher() => _builder.GetEncryptionCipher();
 
@@ -136,10 +142,6 @@ public class AhtolaConnectionOptions
                 "Vfs is not supported when Local Provider=Managed because the managed engine does not use native SQLite VFS implementations.");
         }
 
-        if (_builder.GetOption("Foreign Keys") is not null)
-            throw new NotSupportedException("Foreign Keys is not supported when Local Provider=Managed.");
-        if (_builder.GetOption("Recursive Triggers") is not null)
-            throw new NotSupportedException("Recursive Triggers is not supported when Local Provider=Managed.");
         var timeout = DefaultTimeout;
         if (timeout < 0)
             throw new ArgumentOutOfRangeException(nameof(DefaultTimeout), timeout, "Default Timeout cannot be negative.");

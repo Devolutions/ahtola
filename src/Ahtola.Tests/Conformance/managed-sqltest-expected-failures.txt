@@ -8,3 +8,7 @@
 # (journal_mode=mvcc + BEGIN CONCURRENT + sequential DML under MvStore).
 # Remaining MVCC depth (row-version chains, durable logical log, checkpoint SM)
 # is tracked in docs/mvcc-port-contract.md — not as silent expected failures.
+
+# Intentional SQLite-compatible extensions beyond the pinned Turso baseline.
+gencol.sqltest::gencol_stored_rejected | STORED generated columns are supported instead of returning Turso's expected rejection
+gencol.sqltest::gencol_stored_generated_always_rejected | GENERATED ALWAYS AS ... STORED is supported instead of returning Turso's expected rejection

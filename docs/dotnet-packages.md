@@ -170,10 +170,11 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 | `Cache` | `Private` (default) / `Shared` |
 | `Pooling` | Connection pooling (default `true`) |
 | `Foreign Keys` | `PRAGMA foreign_keys` |
+| `Recursive Triggers` | `PRAGMA recursive_triggers` |
 | `Default Timeout` / `Command Timeout` | Busy timeout in seconds |
 | `Vfs` | Named VFS registration |
 | `Password` / `Password Scheme` | Passphrase-based encryption (see [Encryption](#encryption)) |
-| `Encryption Cipher` / `Encryption Key` | Raw-key encryption (hex AES-128/256-GCM) |
+| `Encryption Cipher` / `Encryption Key` | Raw-key encryption (hex AES-GCM or AEGIS keys) |
 | `Local Provider` | `Managed` (default) or `Native`. `Native` requires the optional, non-shipped native companion to have called `AhtolaNativeProvider.Register(factory)` (typically from a `[ModuleInitializer]`); nothing is loaded by assembly name, so without a registration the connection fails closed with `NotSupportedException`. |
 | `Foreign Read Only` | Read another engine's open database without taking main-file locks (`Mode=ReadOnly` + `Pooling=False`) |
 | `DateTimeKind`, `BinaryGUID` | Facade-only ADO.NET conversion behavior |
@@ -314,7 +315,7 @@ Encryption is layered so new recipes can be added without rewriting the pager:
 | Layer | Role | Extension point |
 | --- | --- | --- |
 | **Passphrase scheme** | Password to AES key | `IAhtolaPassphraseScheme` + `AhtolaPassphraseSchemes`; CS `Password Scheme=` |
-| **Built-in AHTLA page crypto** | On-disk AES-GCM pages (`AHTLA` header) | `AhtolaEncryptionOptions` / `Encryption Cipher` + `Encryption Key` |
+| **Built-in AHTLA page crypto** | On-disk AES-GCM or AEGIS pages (`AHTLA` header) | `AhtolaEncryptionOptions` / `Encryption Cipher` + `Encryption Key` |
 | **External page codec** | Entirely different page layout | `IPageCodec` (mutually exclusive with built-in encryption; see [`samples/PageCodecExamples`](../samples/PageCodecExamples)) |
 
 ```csharp
@@ -385,6 +386,17 @@ cannot enforce `Mode=ReadOnly` (there is no local file to guard) and its
 `EnsureDeleted`/`Delete` is always a no-op — the remote database is
 provisioned and owned independently (e.g. via the Turso CLI/API), so
 `UseAhtola` never attempts to drop it.
+
+The managed migration generator supports transactional table rebuilds for
+standalone unique/check constraints, dependency-bearing table and column
+renames, filtered indexes, and true `STORED` computed columns. Rebuilds preserve
+data, indexes, triggers, foreign keys, defaults, collations, and generated
+expressions, including attached-schema tables. Idempotent scripts are emitted
+only for operations that can be guarded safely with SQLite SQL; a standalone
+script containing a rebuild operation is rejected before SQL is returned
+rather than emitting a script that could rerun destructively. Normal
+`Database.Migrate()` execution performs rebuilds inside the migration
+transaction.
 
 Because a remote/replica connection cannot register client-side SQL
 functions or collations, a few LINQ constructs that translate to those on
@@ -655,9 +667,10 @@ Server-side rejection of a replayed local change surfaces as
 `Ahtola.AhtolaReplicaConflictException`: `ConflictKind`
 (`RowWrite`/`SchemaChange`/`Unknown`), `RemoteErrorCode`, and
 `LocalChangeSequence` for programmatic handling. Synchronization never
-rebases or auto-merges — the journal is retained on conflict so the
-application can resolve it explicitly (e.g. read the remote state, decide
-whether to discard or replay the conflicting local change).
+automatically rebases or merges. The journal is retained on conflict, and the
+application can inspect it and explicitly choose
+`PullAndRebaseEligible` or `DiscardUnresolvedChanges` through
+`ResolveReplicaConflictAsync`.
 
 ### Concurrent writes with an embedded replica
 
@@ -674,8 +687,9 @@ in-process MVCC:
 - Writes made **between two different replicas** (or a replica and the
   primary) are only reconciled when each side calls `Sync`/`SyncAsync` (or
   its `Sync Interval` background loop). Synchronization never rebases or
-  auto-merges: if the server rejects a replayed change, catch
-  `AhtolaReplicaConflictException` and decide how to reconcile.
+  merges automatically: if the server rejects a replayed change, catch
+  `AhtolaReplicaConflictException`, inspect the durable conflict, and select
+  an explicit resolution.
 
 ## Error handling patterns
 

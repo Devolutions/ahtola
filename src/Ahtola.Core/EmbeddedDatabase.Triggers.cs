@@ -643,29 +643,49 @@ public sealed partial class EmbeddedDatabase
             table,
             TriggerMutationKind.Update,
             plan);
-        var selectedPositions = statement.Limit is null
-            ? null
-            : SelectLimitedDmlPositions(
-                statement.TargetQualifier,
-                table,
-                statement.Where,
-                statement.EffectiveOrderBy,
-                statement.Limit,
-                statement.Offset,
-                statement.Assignments.Select(assignment => assignment.Value),
-                statement.Returning,
-                parameters,
-                context);
         IReadOnlyList<TriggerRowIdentity> candidates;
         IReadOnlyList<SourceRow?> evaluationRows = [];
         if (statement.From is not null)
         {
+            var updateFromValidationRow = CreateUpdateFromSchemaValidationRow(statement, table, context);
             var matches = MatchUpdateFromRows(statement, table, parameters, context);
-            candidates = [.. matches.Select(match => CaptureTriggerRowIdentity(table, match.Position))];
-            evaluationRows = [.. matches.Select(match => (SourceRow?)match.Row)];
+            var fromMatches = matches.ToDictionary(match => match.Position, match => match.Row);
+            var selectedPositions = statement.Limit is null && statement.EffectiveOrderBy.Count == 0
+                ? null
+                : SelectLimitedDmlPositions(
+                    statement.TargetQualifier,
+                    table,
+                    where: null,
+                    statement.EffectiveOrderBy,
+                    statement.Limit,
+                    statement.Offset,
+                    statement.Assignments.Select(assignment => assignment.Value),
+                    statement.Returning,
+                    parameters,
+                    context,
+                    fromMatches,
+                    updateFromValidationRow);
+            var selectedMatches = selectedPositions is null
+                ? matches
+                : matches.Where(match => selectedPositions.Contains(match.Position)).ToList();
+            candidates = [.. selectedMatches.Select(match => CaptureTriggerRowIdentity(table, match.Position))];
+            evaluationRows = [.. selectedMatches.Select(match => (SourceRow?)match.Row)];
         }
         else
         {
+            var selectedPositions = statement.Limit is null && statement.EffectiveOrderBy.Count == 0
+                ? null
+                : SelectLimitedDmlPositions(
+                    statement.TargetQualifier,
+                    table,
+                    statement.Where,
+                    statement.EffectiveOrderBy,
+                    statement.Limit,
+                    statement.Offset,
+                    statement.Assignments.Select(assignment => assignment.Value),
+                    statement.Returning,
+                    parameters,
+                    context);
             candidates = selectedPositions is null
                 ? CaptureMatchingTriggerRowIdentities(
                     table,
@@ -866,7 +886,7 @@ public sealed partial class EmbeddedDatabase
             statement.TableName,
             TriggerEvent.Delete,
             beforeTriggers.Concat(afterTriggers));
-        var selectedPositions = statement.Limit is null
+        var selectedPositions = statement.Limit is null && statement.EffectiveOrderBy.Count == 0
             ? null
             : SelectLimitedDmlPositions(
                 statement.TargetQualifier,
@@ -2051,10 +2071,18 @@ public sealed partial class EmbeddedDatabase
     }
 
     private void ValidateTriggerStatementQuerySources(
-                QueryContext context,
-                ParsedStatement statement)
+        QueryContext context,
+        ParsedStatement statement)
+        => ValidateTriggerStatementQuerySources(
+            context,
+            statement,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+
+    private void ValidateTriggerStatementQuerySources(
+        QueryContext context,
+        ParsedStatement statement,
+        HashSet<string> commonTableExpressions)
     {
-        var commonTableExpressions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         switch (statement)
         {
             case QueryStatement query:
@@ -2087,14 +2115,34 @@ public sealed partial class EmbeddedDatabase
                 }
                 break;
             case UpdateStatement update:
+                ValidateTriggerSourceNames(context, update.From, commonTableExpressions);
                 foreach (var expression in update.Assignments.Select(assignment => assignment.Value)
-                             .Append(update.Where))
+                             .Append(update.Where)
+                             .Concat(update.EffectiveOrderBy.Select(term => term.Expression))
+                             .Append(update.Limit)
+                             .Concat((update.Returning ?? []).Select(projection => projection.Expression)))
                 {
                     ValidateTriggerExpressionSources(context, expression, commonTableExpressions);
                 }
                 break;
             case DeleteStatement delete:
-                ValidateTriggerExpressionSources(context, delete.Where, commonTableExpressions);
+                foreach (var expression in new[] { delete.Where, delete.Limit }
+                             .Concat(delete.EffectiveOrderBy.Select(term => term.Expression))
+                             .Concat((delete.Returning ?? []).Select(projection => projection.Expression)))
+                {
+                    ValidateTriggerExpressionSources(context, expression, commonTableExpressions);
+                }
+                break;
+            case WithDmlStatement with:
+                var withNames = new HashSet<string>(
+                    commonTableExpressions,
+                    StringComparer.OrdinalIgnoreCase);
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                {
+                    withNames.Add(commonTableExpression.Name);
+                    ValidateTriggerStatementQuerySources(context, commonTableExpression.Body, withNames);
+                }
+                ValidateTriggerStatementQuerySources(context, with.Dml, withNames);
                 break;
         }
     }
@@ -2153,7 +2201,7 @@ public sealed partial class EmbeddedDatabase
                 foreach (var commonTableExpression in with.CommonTableExpressions)
                 {
                     withNames.Add(commonTableExpression.Name);
-                    ValidateTriggerQuerySources(context, commonTableExpression.Query, withNames);
+                    ValidateTriggerStatementQuerySources(context, commonTableExpression.Body, withNames);
                 }
                 ValidateTriggerQuerySources(context, with.Query, withNames);
                 break;
@@ -2424,6 +2472,7 @@ public sealed partial class EmbeddedDatabase
                             || TriggerExpressionCanAbort(update.Where))) == true,
             UpdateStatement update => update.Assignments.Any(assignment =>
                     TriggerExpressionCanAbort(assignment.Value))
+                || TriggerSourceCanAbort(update.From)
                 || TriggerExpressionCanAbort(update.Where)
                 || update.Returning?.Any(projection =>
                     TriggerExpressionCanAbort(projection.Expression)) == true
@@ -2438,6 +2487,9 @@ public sealed partial class EmbeddedDatabase
                     TriggerExpressionCanAbort(term.Expression))
                 || TriggerExpressionCanAbort(delete.Limit)
                 || TriggerExpressionCanAbort(delete.Offset),
+            WithDmlStatement with => with.CommonTableExpressions.Any(common =>
+                    TriggerStatementExpressionCanAbort(common.Body))
+                || TriggerStatementExpressionCanAbort(with.Dml),
             QueryStatement query => TriggerQueryCanAbort(query),
             _ => false,
         };
@@ -2467,7 +2519,7 @@ public sealed partial class EmbeddedDatabase
                 || TriggerExpressionCanAbort(compound.Limit)
                 || TriggerExpressionCanAbort(compound.Offset),
             WithSelectStatement with => with.CommonTableExpressions.Any(common =>
-                    TriggerQueryCanAbort(common.Query))
+                    TriggerStatementExpressionCanAbort(common.Body))
                 || TriggerQueryCanAbort(with.Query),
             _ => false,
         };
@@ -2661,7 +2713,8 @@ public sealed partial class EmbeddedDatabase
             CompoundSelectStatement compound => compound.Terms.Any(term =>
                 TriggerQueryReferencesAbortCapableView(context, term, visited)),
             WithSelectStatement with => with.CommonTableExpressions.Any(common =>
-                    TriggerQueryReferencesAbortCapableView(context, common.Query, visited))
+                    common.IsWritable
+                    || TriggerQueryReferencesAbortCapableView(context, common.Query, visited))
                 || TriggerQueryReferencesAbortCapableView(context, with.Query, visited),
             _ => false,
         };
@@ -3057,6 +3110,7 @@ public sealed partial class EmbeddedDatabase
             case UpdateStatement update:
                 foreach (var assignment in update.Assignments)
                     ValidateTriggerExpression(assignment.Value, triggerEvent, columns, hasRowid);
+                ValidateTriggerSource(update.From, triggerEvent, columns, hasRowid);
                 ValidateTriggerExpression(update.Where, triggerEvent, columns, hasRowid);
                 ValidateTriggerProjections(update.Returning, triggerEvent, columns, hasRowid);
                 foreach (var term in update.EffectiveOrderBy)
@@ -3074,6 +3128,11 @@ public sealed partial class EmbeddedDatabase
                 break;
             case QueryStatement query:
                 ValidateTriggerQuery(query, triggerEvent, columns, hasRowid);
+                break;
+            case WithDmlStatement with:
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                    ValidateTriggerStatement(commonTableExpression.Body, triggerEvent, columns, hasRowid);
+                ValidateTriggerStatement(with.Dml, triggerEvent, columns, hasRowid);
                 break;
         }
     }
@@ -3125,7 +3184,7 @@ public sealed partial class EmbeddedDatabase
                 return;
             case WithSelectStatement with:
                 foreach (var commonTableExpression in with.CommonTableExpressions)
-                    ValidateTriggerQuery(commonTableExpression.Query, triggerEvent, columns, hasRowid);
+                    ValidateTriggerStatement(commonTableExpression.Body, triggerEvent, columns, hasRowid);
                 ValidateTriggerQuery(with.Query, triggerEvent, columns, hasRowid);
                 return;
         }

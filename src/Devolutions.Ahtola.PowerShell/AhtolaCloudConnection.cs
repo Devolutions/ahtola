@@ -51,57 +51,38 @@ public sealed class AhtolaCloudConnection : DbConnection
     public override void ChangeDatabase(string databaseName) => _connection.ChangeDatabase(databaseName);
 
     public override void Close()
-    {
-        try
-        {
-            _connection.Close();
-        }
-        catch
-        {
-            throw new InvalidOperationException("The Turso Cloud connection could not be closed.");
-        }
-    }
+        => _connection.Close();
 
     public override void Open()
-    {
-        try
-        {
-            _connection.Open();
-        }
-        catch
-        {
-            throw new InvalidOperationException("The Turso Cloud connection could not be opened.");
-        }
-    }
+        => _connection.Open();
 
     public override async Task OpenAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            await _connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            throw new InvalidOperationException("The Turso Cloud connection could not be opened.");
-        }
-    }
+        => await _connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
     public override string ToString() => $"{nameof(AhtolaCloudConnection)} ({_endpoint})";
 
-    internal Ahtola.AhtolaSyncResult Synchronize()
+    internal Task<Ahtola.AhtolaSyncResult> SynchronizeAsync(
+        Ahtola.AhtolaSyncOptions options,
+        CancellationToken cancellationToken)
     {
         if (!IsReplica)
             throw new NotSupportedException("Sync requires a managed embedded replica connection.");
 
-        try
-        {
-            return _connection.Sync(new Ahtola.AhtolaSyncOptions());
-        }
-        catch
-        {
-            throw new InvalidOperationException("The Turso Cloud replica synchronization failed.");
-        }
+        return _connection.SyncAsync(options, cancellationToken);
     }
+
+    internal Task<Ahtola.AhtolaReplicaConflictReport?> InspectReplicaConflictAsync(
+        CancellationToken cancellationToken)
+        => _connection.InspectReplicaConflictAsync(cancellationToken);
+
+    internal Task<Ahtola.AhtolaReplicaConflictResolutionResult> ResolveReplicaConflictAsync(
+        Ahtola.AhtolaReplicaConflictResolution resolution,
+        Ahtola.AhtolaReplicaConflictResolutionOptions options,
+        CancellationToken cancellationToken)
+        => _connection.ResolveReplicaConflictAsync(resolution, options, cancellationToken);
+
+    internal Ahtola.AhtolaReplicaChangeCaptureBatch PeekPendingChangeCapture()
+        => _connection.PeekPendingChangeCapture();
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
         => _connection.BeginTransaction(isolationLevel);
@@ -111,16 +92,7 @@ public sealed class AhtolaCloudConnection : DbConnection
     protected override void Dispose(bool disposing)
     {
         if (disposing)
-        {
-            try
-            {
-                _connection.Dispose();
-            }
-            catch
-            {
-                throw new InvalidOperationException("The Turso Cloud connection could not be disposed.");
-            }
-        }
+            _connection.Dispose();
         base.Dispose(disposing);
     }
 }

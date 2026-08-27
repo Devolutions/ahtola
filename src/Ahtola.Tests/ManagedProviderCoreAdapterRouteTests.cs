@@ -59,6 +59,66 @@ public class ManagedProviderCoreAdapterRouteTests
         new SqliteConnectionStringBuilder("Local Provider=Native").LocalProvider.Should().Be(AhtolaLocalProvider.Native);
     }
 
+    [Test]
+    public void ManagedAhtolaConnectionAppliesConnectionPragmas()
+    {
+        using var connection = new AhtolaConnection(
+            "Data Source=:memory:;Local Provider=Managed;Foreign Keys=True;Recursive Triggers=True");
+        connection.Open();
+
+        ExecuteScalar(connection, "PRAGMA foreign_keys;").Should().Be(1);
+        ExecuteScalar(connection, "PRAGMA recursive_triggers;").Should().Be(1);
+
+        connection.ExecuteNonQuery("CREATE TABLE parent(id INTEGER PRIMARY KEY);");
+        connection.ExecuteNonQuery("CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));");
+        connection.Invoking(static current => current.ExecuteNonQuery("INSERT INTO child VALUES (1);"))
+            .Should()
+            .Throw<AhtolaException>();
+
+        using var sqlite = new SqliteConnection(
+            "Data Source=:memory:;Local Provider=Managed;Foreign Keys=True;Recursive Triggers=True");
+        sqlite.Open();
+        sqlite.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(1);
+        sqlite.ExecuteScalar<long>("PRAGMA recursive_triggers;").Should().Be(1);
+    }
+
+    [Test]
+    public void ManagedAhtolaConnectionAppliesExplicitFalseAfterPoolReset()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"ahtola-options-{Guid.NewGuid():N}.db");
+        try
+        {
+            using (var enabled = new AhtolaConnection(
+                       $"Data Source={path};Local Provider=Managed;Pooling=True;Foreign Keys=True;Recursive Triggers=True"))
+            {
+                enabled.Open();
+                ExecuteScalar(enabled, "PRAGMA foreign_keys;").Should().Be(1);
+                ExecuteScalar(enabled, "PRAGMA recursive_triggers;").Should().Be(1);
+            }
+
+            using var disabled = new AhtolaConnection(
+                $"Data Source={path};Local Provider=Managed;Pooling=True;Foreign Keys=False;Recursive Triggers=False");
+            disabled.Open();
+
+            ExecuteScalar(disabled, "PRAGMA foreign_keys;").Should().Be(0);
+            ExecuteScalar(disabled, "PRAGMA recursive_triggers;").Should().Be(0);
+        }
+        finally
+        {
+            AhtolaConnection.ClearAllPools();
+            File.Delete(path);
+            File.Delete(path + "-wal");
+            File.Delete(path + "-shm");
+        }
+    }
+
+    private static long ExecuteScalar(AhtolaConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToInt64(command.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     private static object? GetPrivateField(object instance, string fieldName)
     {
         var field = instance.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)

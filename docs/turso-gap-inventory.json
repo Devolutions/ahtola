@@ -14,7 +14,7 @@
       "commit_at_analysis": "7b62a3f"
     },
     "conformance_ground_truth": "src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt (606 failure lines at analysis time)",
-    "current_conformance_expected_failures": 0,
+    "current_conformance_expected_failures": 2,
     "last_reconciled": "2026-08-26",
     "entry_count": 216,
     "counts": {
@@ -28,12 +28,12 @@
         "vdbe": 38
       },
       "by_kind": {
-        "divergent": 72,
+        "divergent": 73,
         "extension": 9,
         "intentional-divergence": 1,
-        "missing": 73,
-        "parity": 55,
-        "partial": 6
+        "missing": 70,
+        "parity": 56,
+        "partial": 7
       },
       "by_severity": {
         "s1-correctness": 39,
@@ -1163,7 +1163,7 @@
         "cte.sqltest::cte-update-direct-ref-nonkeyed",
         "cte.sqltest::cte-unreferenced-column-mismatch-delete"
       ],
-      "notes": "F2.40 (2026-08-10): promoted partial→parity; dependency-closure CTE materialization matches the delivered claim. Closed: execution and metadata now materialize only the dependency closure reached by the SELECT or DML body. Unused CTEs therefore defer invalid explicit-column validation, while direct CTE column references in DML retain SQLite's missing-column error. (Previously linked keys cleared by earlier wave work: cte-limit-inside, range-scan-text-vs-int-affinity.)",
+      "notes": "F2.40 (2026-08-10): promoted partial→parity; dependency-closure CTE materialization matches the delivered claim. Closed: execution and metadata now materialize only the dependency closure reached by the SELECT or DML body. Unused CTEs therefore defer invalid explicit-column validation, while direct CTE column references in DML retain SQLite's missing-column error. Reconciled 2026-08-26: writable INSERT/UPDATE/DELETE CTE bodies participate in the same dependency closure, returning rows transactionally to top-level, nested derived-table, and view consumers; schema validation describes the DML body rather than its parser placeholder. UPDATE ... FROM ... LIMIT and UPDATE/DELETE ORDER BY without LIMIT use a pre-mutation target selection, and ordered-set WITHIN GROUP retains direction and explicit NULL placement. (Previously linked keys cleared by earlier wave work: cte-limit-inside, range-scan-text-vs-int-affinity.)",
       "status": "closed"
     },
     {
@@ -1586,7 +1586,7 @@
       "conformance_links": [
         "views.sqltest::view-rejects-aggregate-order-by"
       ],
-      "notes": "Closed 2026-08-06 as a deliberate extension. Real SQLite supports ORDER BY inside aggregate calls, while Turso v0.7.2 rejects it. Ahtola intentionally supports ordered aggregates because the EF Core provider depends on them; views.sqltest::view-rejects-aggregate-order-by remains an expected failure documenting this product divergence. Do not 'fix' it by rejecting ordered aggregates.",
+      "notes": "Closed 2026-08-06 as a deliberate extension. Real SQLite supports ORDER BY inside aggregate calls, while Turso v0.7.2 rejects it. Ahtola intentionally supports ordered aggregates because the EF Core provider depends on them; views.sqltest::view-rejects-aggregate-order-by remains historical evidence of this product divergence. Reconciled 2026-08-26: ordered-set WITHIN GROUP accepts ASC/DESC and explicit NULLS FIRST/LAST and carries that policy through evaluation. Do not 'fix' this extension by rejecting ordered aggregates.",
       "status": "closed"
     },
     {
@@ -1714,13 +1714,13 @@
     {
       "id": "func-vector-family",
       "layer": "functions",
-      "kind": "missing",
+      "kind": "parity",
       "turso_ref": "turso-src/core/vector/mod.rs, turso-src/core/vector/operations/{distance_cos,distance_l2,distance_dot,jaccard,concat,slice,serialize,convert}.rs; turso-src/core/function.rs::VectorFunc (Vector, Vector32, Vector32Sparse, Vector64, Vector8, Vector1Bit, VectorExtract, VectorDistanceCos, VectorDistanceL2, VectorDistanceJaccard, VectorDistanceDot, VectorConcat, VectorSlice)",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Core/SqliteVectorFunctions.cs; src/Ahtola.Core/SqliteVectorFunctions.Indexing.cs; src/Ahtola.Core/Vectors",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as an unadopted Turso embedding extension. vector/vector32/vector_distance_* have no managed implementation; ManagedAdvancedFeatureBoundaryTests locks 'no such function: vector32'. Out of scope for pure-managed SQLite classic surface; do not port core/vector without an explicit product decision. Reconciled 2026-08-24 by managed-vector-index: the scalar family shipped earlier, and a dense vector index method (USING vector) now serves exact KNN over float32/float64/float8/float1bit under l2/cosine/dot. Sparse-vector and jaccard indexing remain unimplemented and are rejected at CREATE INDEX; see index-method-vector-ivf-divergence.",
+      "notes": "Reconciled 2026-08-26 as parity for the managed vector function family. The scalar constructors, extraction, conversion, serialization, concatenation/slicing, and l2/cosine/dot/Jaccard distance functions cover dense and sparse encodings. The USING vector method now adds exact dense KNN plus a deterministic, bounded float32_sparse/Jaccard inverted index. See docs/managed-vector-functions.md and docs/managed-vector-index.md.",
       "status": "closed"
     },
     {
@@ -2141,7 +2141,7 @@
       "conformance_links": [
         "temp_tables.sqltest::pragma-temp-wal-checkpoint-without-temp-db-matches-sqlite"
       ],
-      "notes": "Closed 2026-08-06 as Stage 0 parity. SqliteWalSharedMemoryLocks is the live pager byte-lock coordinator at SQLite's shm offsets; the detached WAL-index protocol belongs to future cross-process Stages 1-6, not the current process-exclusive contract.",
+      "notes": "Reconciled 2026-08-26 as Stage 6 parity. SqliteWalSharedMemoryLocks and PhysicalSqliteWalSharedMemoryMapping are the live pager coordinators at SQLite's shm offsets: mapped dual-header WAL-index publication, read marks, writer/checkpoint roles, DMS-proven Windows/Linux cleanup when entering EXCLUSIVE, and a heap index under physical EXCLUSIVE mode. Ordinary close retains the carrier for safe non-mutating read-only reopen. macOS retains the carrier and rejects physical EXCLUSIVE because its process-owned locks cannot distinguish an in-process foreign mapping.",
       "status": "closed"
     },
     {
@@ -2231,7 +2231,7 @@
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "F2.40 (2026-08-10): promoted partial→parity/s4-intentional roadmap; PhysicalSqliteWalSharedMemoryMapping foundation present, live multi-connection SHM mapping is Stages 1–2 interop not a Stage-0 defect. Closed 2026-08-06 as a future-interop roadmap item rather than a current Stage 0 defect. The detached PhysicalSqliteWalSharedMemoryMapping/WalIndex foundation is tested, while the current pager intentionally uses shm only as a byte-lock carrier under process-exclusive ownership; attaching the mapping belongs to contract Stages 1-2.",
+      "notes": "Reconciled 2026-08-26 as live Stage 6 parity. Physical pagers attach and publish the byte-exact mapped WAL-index, synchronize committed views through header identity, use DMS/read/write/checkpoint roles, and safely transition NORMAL to/from a private heap WAL-index for physical EXCLUSIVE mode on descriptor-owned-lock platforms. EXCLUSIVE-transition cleanup is DMS-proven on Windows/Linux; ordinary close retains the carrier for read-only reopen, and macOS fails physical EXCLUSIVE closed.",
       "status": "closed"
     },
     {
@@ -2255,7 +2255,7 @@
       "severity": "s2-capability",
       "effort": "S",
       "conformance_links": [],
-      "notes": "Audited as parity for Ahtola's documented managed-only ownership model. The process-local manager queues new readers and writers behind a pending checkpoint, preventing managed checkpoint starvation. SqliteManagedFileOwnership additionally takes the complete 512-byte SQLite PENDING/RESERVED/SHARED range for the pager lifetime, so a foreign client cannot enter as a new reader while managed owns the file. Ownership is keyed by canonical physical database path; distinct attached files therefore use independent managers and may write concurrently (PhysicalPagersForDistinctAttachedDatabasePathsUseIndependentWriterLocks).",
+      "notes": "Reconciled 2026-08-26 as SQLite lock-role parity. The process-local manager prevents managed checkpoint starvation while SqliteManagedFileOwnership brokers canonical-path SHARED/RESERVED/PENDING/EXCLUSIVE roles onto a stable platform handle. WAL retains lifetime SHARED and serializes writer/checkpoint roles in shm; DELETE upgrades at transaction boundaries. Physical EXCLUSIVE reuses its persistent authority instead of self-acquiring SHARED, and failed WAL-index transitions retain EXCLUSIVE and fault the pager.",
       "status": "closed"
     },
     {
@@ -2489,13 +2489,13 @@
     {
       "id": "sync-no-embedded-sync-engine-port",
       "layer": "sync",
-      "kind": "missing",
+      "kind": "partial",
       "turso_ref": "turso-src/sync/engine/src/database_sync_engine.rs::DatabaseSyncEngine (bootstrap_db, open_db, create_db, checkpoint, apply_changes_from_remote, push_changes_to_remote, pull_changes_from_remote, wait_changes_from_remote)",
-      "ahtola_ref": "src/Ahtola.Data/AhtolaReplicaProvider.cs::AhtolaReplicaProvider.TryRegisterCompanion / AhtolaReplicaProviderFactory",
+      "ahtola_ref": "src/Ahtola.Data/ManagedReplicaConnectionHost.cs; src/Ahtola.Data/ManagedReplicaBootstrapper.cs; src/Ahtola.Data/AhtolaConnection.cs::SyncAsync",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Reconciled 2026-08-26 as a delivered pure-managed subset plus intentional boundary. ManagedReplicaConnectionHost implements raw and MVCC-logical pull, local push journaling, ambiguous-push recovery, bounded wait-for-changes long polling, partial/query bootstrap with lazy page materialization, remote page encryption, typed conflict quarantine and explicit rebase/discard. It does not port Turso's native sdk-kit, zstd page sets, or reusable passive-prefix/history checkpoint policy; optional native/sync companion registration remains fail-closed and is not shipped.",
       "status": "closed"
     },
     {
@@ -2657,13 +2657,13 @@
     {
       "id": "sync-connection-pooling-no-replica-awareness",
       "layer": "sync",
-      "kind": "missing",
+      "kind": "divergent",
       "turso_ref": "turso-src/sync/engine/src/database_sync_engine.rs::wait_changes_from_remote/DbChangesStatus (long-poll driven change notification loop)",
       "ahtola_ref": "src/Ahtola.Data/ManagedConnectionPool.cs, src/Ahtola.Data/AhtolaConnection.cs::Sync/SyncAsync",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "F2.40 (2026-08-10): cleared partial; remains intentional companion-not-shipped (missing managed sync engine). Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Reconciled 2026-08-26 as an intentional lifecycle divergence rather than a missing notification path. Managed replicas expose bounded wait-for-changes polling through AhtolaReplicaOptions.LongPollTimeout and the sync loop, while ordinary ADO.NET pooling remains scoped to local physical connections and does not own a hidden replica session. The PowerShell surface exposes LongPollTimeout explicitly. Native/sync companion dispatch remains optional and fail-closed.",
       "status": "closed"
     },
     {
@@ -3159,7 +3159,7 @@
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Opened and closed 2026-08-24 by managed-vector-index as a recorded divergence. Ahtola ships CREATE INDEX ... USING vector on the managed index-method foundation, but it is NOT a port of Turso's toy_vector_sparse_ivf: that file is a jaccard-only sparse component inverted index over vector32_sparse columns, backed by two real b-trees Ahtola has no per-statement write API for, and pruned by three unbounded heuristics (delta, scan_portion, scan_order) with no recall bound, no k-means, no centroids, no training, no rebuild/optimize, no versioned state and no cost model. Ahtola's method is an Ahtola-designed IVF-Flat with an exactness certificate: k-means centroids are durable in the versioned catalog state envelope, assignments/postings/radii are derived from the base rows, and a list is skipped only when a proven inequality (triangle inequality for l2, angular for cosine, Cauchy-Schwarz for dot, exact integer Hamming for float1bit), widened by a floating-point slack sized to the reported distance's accumulation width, shows no member of it can enter the top-k; otherwise more lists are probed, degrading to a full scan rather than to a wrong answer. What is carried over from Turso is the method/attachment/cursor shape from index_method/mod.rs, results_materialized=true, TransactionalBackingStore, and the 'ORDER BY distance LIMIT ?' query shape in both argument orders. Honest limits: sparse vectors and metric='jaccard' are rejected at CREATE INDEX rather than silently downgraded; exact=0 (approximate mode) is rejected, so no configuration returns a different row set than the unindexed query; a single NULL or otherwise invalid indexed value declines the plan entirely, because the scalar form of the query raises on that row and an index that skipped it would turn an error into a result set; and data with no exploitable cluster structure re-prices the index out of the plan (the cost model measures reranked rows, not probes) instead of becoming approximate. Supported: float32/float64/float8/float1bit encodings under l2/cosine/dot, minus l2-over-float1bit which the scalar evaluator does not define. See docs/managed-vector-index.md.",
+      "notes": "Opened and closed 2026-08-24 by managed-vector-index as a recorded divergence, completed for the exact managed subset on 2026-08-26. Dense float32/float64/float8/float1bit l2/cosine/dot uses Ahtola's exact-certificate IVF-Flat design. float32_sparse/Jaccard now uses a separate versioned inverted index with bounded state decoding and candidate accumulation, deterministic rowid tie ordering, transactional DML/savepoint/rollback maintenance, REINDEX/Optimize, reopen/WAL/VACUUM recovery, and exhaustive exact fallback. It deliberately does not port Turso toy_vector_sparse_ivf's unbounded delta/scan_portion/scan_order approximations or two-private-btree layout. exact=0 remains rejected, so no supported configuration returns a different row set from the scalar query. See docs/managed-vector-index.md.",
       "status": "closed"
     }
   ]

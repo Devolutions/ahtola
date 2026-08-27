@@ -53,27 +53,45 @@ public sealed partial class PhysicalFileSystem
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported file open mode."),
         };
 
-        var handle = File.OpenHandle(
-            path,
-            fileMode,
-            readOnly ? FileAccess.Read : FileAccess.ReadWrite,
-            share,
-            FileOptions.None);
-        try
+        lock (PhysicalSqliteWalSharedMemoryMapping.SqliteWalSharedMemoryLifecycleRegistry.Gate)
         {
-            return new PhysicalSqliteWalSharedMemoryMapping(
-                handle,
-                        path,
-                        readOnly,
-                        preventsCarrierReplacement);
-                }
-                catch
+            var handle = mode == FileOpenMode.CreateNew
+                ? File.OpenHandle(
+                    path,
+                    fileMode,
+                    readOnly ? FileAccess.Read : FileAccess.ReadWrite,
+                    share,
+                    FileOptions.None)
+                : PhysicalSqliteWalSharedMemoryMapping
+                    .SqliteWalSharedMemoryLifecycleRegistry
+                    .TryGetOrCreateBrokeredHandle(path, requireWritable: !readOnly)
+                  ?? File.OpenHandle(
+                      path,
+                      fileMode,
+                      readOnly ? FileAccess.Read : FileAccess.ReadWrite,
+                      share,
+                      FileOptions.None);
+            try
+            {
+                return new PhysicalSqliteWalSharedMemoryMapping(
+                    handle,
+                    path,
+                    readOnly,
+                    preventsCarrierReplacement);
+            }
+            catch
+            {
+                if (!PhysicalSqliteWalSharedMemoryMapping
+                        .SqliteWalSharedMemoryLifecycleRegistry
+                        .OwnsBrokeredHandle(handle))
                 {
                     handle.Dispose();
-                    throw;
                 }
+                throw;
             }
         }
+    }
+}
 
 /// <summary>
 /// A physical, file-backed SQLite shared-memory mapping. Its mapped range follows
@@ -103,11 +121,14 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
 
     private readonly object _gate = new();
     private readonly SafeFileHandle _fileHandle;
-    private readonly SqliteWalByteRangeLockLease? _deadManSwitchLease;
+    private readonly string _lockFilePath;
     private SafeWindowsFileMappingHandle? _windowsMapping;
     private SafeMappedViewHandle? _view;
     private long _length;
+    private bool _registered;
     private bool _disposed;
+
+    internal static Action? BeforeFinalDeleteForTesting { get; set; }
 
     internal PhysicalSqliteWalSharedMemoryMapping(
         SafeFileHandle fileHandle,
@@ -116,31 +137,45 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
         bool preventsCarrierReplacement)
     {
         _fileHandle = fileHandle;
+        _lockFilePath = lockFilePath;
         CarrierIdentity = SqliteWalSharedMemoryCarrierIdentity.FromHandle(fileHandle);
         IsReadOnly = readOnly;
         PreventsCarrierReplacement = preventsCarrierReplacement && OperatingSystem.IsWindows();
 
         // Hold the DMS shared lock for the mapping lifetime so stock SQLite/Turso
-                // do not treat this process as absent and truncate a live -shm mapping
-                // (SQLite winLockSharedMemory / unixLockSharedMemory). On failure the
-                // caller still owns fileHandle and must dispose it.
-                _deadManSwitchLease = new SqliteWalByteRangeLock(lockFilePath).AcquireShared(
+        // do not treat this process as absent and truncate a live -shm mapping
+        // (SQLite winLockSharedMemory / unixLockSharedMemory). One process-registry
+        // lease per carrier also prevents a sibling mapping from closing the DMS
+        // lease that represents all managed mappings on macOS.
+        lock (SqliteWalSharedMemoryLifecycleRegistry.Gate)
+        {
+            SqliteWalSharedMemoryLifecycleRegistry.Register(
+                CarrierIdentity,
+                lockFilePath,
+                fileHandle,
+                writable: !readOnly,
+                () => new SqliteWalByteRangeLock(lockFilePath).AcquireShared(
                     DeadManSwitchLockOffset,
                     length: 1,
-                    timeout: TimeSpan.FromSeconds(5));
-                try
+                    timeout: TimeSpan.FromSeconds(5),
+                    cancellationToken: CancellationToken.None));
+            _registered = true;
+            try
+            {
+                lock (_gate)
                 {
-                    lock (_gate)
-                    {
-                        MapCurrentFileLengthLocked(RandomAccess.GetLength(_fileHandle));
-                    }
-                }
-                catch
-                {
-                    _deadManSwitchLease.Dispose();
-                    throw;
+                    MapCurrentFileLengthLocked(RandomAccess.GetLength(_fileHandle));
                 }
             }
+            catch
+            {
+                SqliteWalSharedMemoryLifecycleRegistry.Unregister(
+                    CarrierIdentity);
+                _registered = false;
+                throw;
+            }
+        }
+    }
 
     public bool IsReadOnly { get; }
 
@@ -180,6 +215,13 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
             if ((OperatingSystem.IsLinux() && Environment.Is64BitProcess)
                 || OperatingSystem.IsMacOS())
             {
+                if (OperatingSystem.IsMacOS())
+                {
+                    return new SafeFileHandle(
+                        _fileHandle.DangerousGetHandle(),
+                        ownsHandle: false);
+                }
+
                 var descriptor = Native.Dup(_fileHandle);
                 if (descriptor < 0)
                     ThrowNativeIOException("dup", Marshal.GetLastPInvokeError());
@@ -279,15 +321,29 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
     }
 
     public void Dispose()
+        => DisposeCore(deleteIfLast: false);
+
+    /// <summary>
+    /// Releases this mapping and removes its transient carrier only when it is the
+    /// final managed mapping and a non-blocking exclusive DMS probe proves that no
+    /// stock SQLite/Turso peer remains.
+    /// </summary>
+    internal bool DisposeAndTryDeleteIfLast()
+        => DisposeCore(deleteIfLast: true);
+
+    private bool DisposeCore(bool deleteIfLast)
     {
         Exception? flushFailure = null;
-            Exception? dmsFailure = null;
+        Exception? dmsFailure = null;
+        var deleted = false;
+        var fileHandleBrokered = OperatingSystem.IsMacOS();
+        lock (SqliteWalSharedMemoryLifecycleRegistry.Gate)
+        {
             lock (_gate)
             {
                 if (_disposed)
-                    return;
+                    return false;
 
-                _disposed = true;
                 try
                 {
                     FlushMappedViewLocked();
@@ -301,26 +357,78 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
                     DisposeMappedViewLocked();
                     try
                     {
-                        _deadManSwitchLease?.Dispose();
+                        var isFinalManagedMapping = !_registered
+                            || SqliteWalSharedMemoryLifecycleRegistry.Unregister(CarrierIdentity);
+                        _registered = false;
+                        if (!isFinalManagedMapping)
+                        {
+                            deleteIfLast = false;
+                        }
+                        else if (deleteIfLast && !OperatingSystem.IsMacOS())
+                        {
+                            BeforeFinalDeleteForTesting?.Invoke();
+                        }
                     }
                     catch (Exception exception)
                     {
                         dmsFailure = exception;
+                        deleteIfLast = false;
                     }
 
-                    _fileHandle.Dispose();
+                    SqliteWalByteRangeLockLease? exclusiveDms = null;
+                    if (deleteIfLast
+                        && !OperatingSystem.IsMacOS()
+                        && !IsReadOnly
+                        && flushFailure is null
+                        && dmsFailure is null)
+                    {
+                        var locks = new SqliteWalByteRangeLock(_lockFilePath);
+                        if (locks.TryAcquireExclusive(
+                                this,
+                                DeadManSwitchLockOffset,
+                                length: 1,
+                                out exclusiveDms))
+                        {
+                            try
+                            {
+                                if (File.Exists(_lockFilePath)
+                                    && SqliteWalSharedMemoryCarrierIdentity.FromPath(_lockFilePath) == CarrierIdentity)
+                                {
+                                    File.Delete(_lockFilePath);
+                                    deleted = true;
+                                }
+                            }
+                            catch (IOException)
+                            {
+                                // The transient carrier is an optimization. A peer
+                                // or platform policy may still prevent unlink.
+                            }
+                            catch (UnauthorizedAccessException)
+                            {
+                                // Best effort, matching SQLite's close-time unlink.
+                            }
+                        }
+                    }
+
+                    _disposed = true;
+                    exclusiveDms?.Dispose();
+                    if (!fileHandleBrokered)
+                        _fileHandle.Dispose();
                 }
             }
-
-            if (flushFailure is not null)
-                throw new IOException("Failed to flush the SQLite shared-memory mapping during disposal.", flushFailure);
-            if (dmsFailure is not null)
-            {
-                throw new IOException(
-                    "Failed to release the SQLite WAL-index dead-man switch lock during disposal.",
-                    dmsFailure);
-            }
         }
+
+        if (flushFailure is not null)
+            throw new IOException("Failed to flush the SQLite shared-memory mapping during disposal.", flushFailure);
+        if (dmsFailure is not null)
+        {
+            throw new IOException(
+                "Failed to release the SQLite WAL-index dead-man switch lock during disposal.",
+                dmsFailure);
+        }
+
+        return deleted;
+    }
 
     internal static void ThrowIfPlatformUnsupported()
     {
@@ -486,6 +594,247 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
         throw new IOException(
             $"{operation} failed with native error {error}: {nativeError.Message}.",
             nativeError);
+    }
+
+    internal static class SqliteWalSharedMemoryLifecycleRegistry
+    {
+        internal static object Gate { get; } = new();
+        private static readonly Dictionary<SqliteWalSharedMemoryCarrierIdentity, Entry> Mappings = [];
+        private static readonly Dictionary<string, Entry> MappingsByPath =
+            new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+        internal static void Register(
+            SqliteWalSharedMemoryCarrierIdentity identity,
+            string path,
+            SafeFileHandle handle,
+            bool writable,
+            Func<SqliteWalByteRangeLockLease> acquireSharedDms)
+        {
+            if (Mappings.TryGetValue(identity, out var entry))
+            {
+                entry.MappingCount = checked(entry.MappingCount + 1);
+                entry.AddPath(path);
+                if (OperatingSystem.IsMacOS())
+                    entry.AddBrokeredHandle(handle, writable);
+                return;
+            }
+
+            var sharedDms = acquireSharedDms();
+            if (sharedDms.CarrierIdentity != identity)
+            {
+                sharedDms.Dispose();
+                throw new InvalidDataException(
+                    "The SQLite WAL shared-memory path changed while its DMS lease was being acquired.");
+            }
+
+            entry = new Entry(identity, sharedDms);
+            entry.AddPath(path);
+            if (OperatingSystem.IsMacOS())
+                entry.AddBrokeredHandle(handle, writable);
+            Mappings.Add(identity, entry);
+        }
+
+        internal static bool Unregister(SqliteWalSharedMemoryCarrierIdentity identity)
+        {
+            if (!Mappings.TryGetValue(identity, out var entry) || entry.MappingCount <= 0)
+                throw new InvalidOperationException("SQLite WAL shared-memory mapping registry underflow.");
+
+            entry.MappingCount--;
+            if (entry.MappingCount != 0 || entry.BorrowedLeaseCount != 0)
+                return false;
+
+            RemoveAndDisposeEntry(identity, entry);
+            return true;
+        }
+
+        internal static SafeFileHandle? TryGetOrCreateBrokeredHandle(string path, bool requireWritable)
+        {
+            if (!OperatingSystem.IsMacOS())
+                return null;
+
+            lock (Gate)
+            {
+                var fullPath = Path.GetFullPath(path);
+                if (!MappingsByPath.TryGetValue(fullPath, out var entry))
+                    return null;
+                try
+                {
+                    if (SqliteWalSharedMemoryCarrierIdentity.FromPath(path) != entry.Identity)
+                    {
+                        MappingsByPath.Remove(fullPath);
+                        return null;
+                    }
+                }
+
+                catch (FileNotFoundException)
+                {
+                    MappingsByPath.Remove(fullPath);
+                    return null;
+                }
+
+                if (!requireWritable)
+                    return entry.WritableHandle ?? entry.ReadOnlyHandle;
+                if (entry.WritableHandle is not null)
+                    return entry.WritableHandle;
+
+                // F_WRLCK requires a writable descriptor on Darwin. Keep this
+                // lazily opened descriptor in the carrier registry: closing a
+                // per-lease descriptor would release every process-owned fcntl
+                // lock for the inode, including DMS and unrelated read marks.
+                var writableHandle = File.OpenHandle(
+                    fullPath,
+                    FileMode.Open,
+                    FileAccess.ReadWrite,
+                    FileShare.ReadWrite | FileShare.Delete,
+                    FileOptions.None);
+                try
+                {
+                    if (SqliteWalSharedMemoryCarrierIdentity.FromHandle(writableHandle) != entry.Identity)
+                    {
+                        throw new IOException(
+                            "The SQLite WAL shared-memory path changed while opening its writable lock broker.");
+                    }
+
+                    entry.AddBrokeredHandle(writableHandle, writable: true);
+                    return writableHandle;
+                }
+                catch
+                {
+                    writableHandle.Dispose();
+                    throw;
+                }
+            }
+        }
+
+        internal static BrokeredHandleBorrow? TryBorrowBrokeredHandle(
+            string path,
+            bool requireWritable)
+        {
+            if (!OperatingSystem.IsMacOS())
+                return null;
+
+            lock (Gate)
+            {
+                var handle = TryGetOrCreateBrokeredHandle(path, requireWritable);
+                if (handle is null)
+                    return null;
+
+                var identity = SqliteWalSharedMemoryCarrierIdentity.FromHandle(handle);
+                if (!Mappings.TryGetValue(identity, out var entry))
+                    throw new InvalidOperationException("SQLite WAL shared-memory broker entry disappeared.");
+
+                entry.BorrowedLeaseCount = checked(entry.BorrowedLeaseCount + 1);
+                return new BrokeredHandleBorrow(identity, handle);
+            }
+        }
+
+        internal static bool OwnsBrokeredHandle(SafeFileHandle handle)
+        {
+            lock (Gate)
+            {
+                return Mappings.Values.Any(
+                    entry => entry.BrokeredHandles.Any(
+                        brokeredHandle => ReferenceEquals(brokeredHandle, handle)));
+            }
+        }
+
+        internal static int GetBrokeredHandleCountForTesting(string path)
+        {
+            lock (Gate)
+            {
+                return MappingsByPath.TryGetValue(Path.GetFullPath(path), out var entry)
+                    ? entry.BrokeredHandles.Count
+                    : 0;
+            }
+        }
+
+        private static void ReleaseBrokeredHandle(SqliteWalSharedMemoryCarrierIdentity identity)
+        {
+            lock (Gate)
+            {
+                if (!Mappings.TryGetValue(identity, out var entry)
+                    || entry.BorrowedLeaseCount <= 0)
+                {
+                    throw new InvalidOperationException("SQLite WAL shared-memory broker lease underflow.");
+                }
+
+                entry.BorrowedLeaseCount--;
+                if (entry.MappingCount == 0 && entry.BorrowedLeaseCount == 0)
+                    RemoveAndDisposeEntry(identity, entry);
+            }
+        }
+
+        private static void RemoveAndDisposeEntry(
+            SqliteWalSharedMemoryCarrierIdentity identity,
+            Entry entry)
+        {
+            Mappings.Remove(identity);
+            foreach (var path in entry.Paths)
+            {
+                if (MappingsByPath.TryGetValue(path, out var mappedEntry)
+                    && ReferenceEquals(mappedEntry, entry))
+                {
+                    MappingsByPath.Remove(path);
+                }
+            }
+
+            try
+            {
+                entry.SharedDms.Dispose();
+            }
+            finally
+            {
+                foreach (var brokeredHandle in entry.BrokeredHandles)
+                    brokeredHandle.Dispose();
+            }
+        }
+
+        internal sealed class BrokeredHandleBorrow(
+            SqliteWalSharedMemoryCarrierIdentity identity,
+            SafeFileHandle handle) : IDisposable
+        {
+            private int _disposed;
+
+            internal SafeFileHandle Handle { get; } = handle;
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                    ReleaseBrokeredHandle(identity);
+            }
+        }
+
+        private sealed class Entry(
+            SqliteWalSharedMemoryCarrierIdentity identity,
+            SqliteWalByteRangeLockLease sharedDms)
+        {
+            internal SqliteWalSharedMemoryCarrierIdentity Identity { get; } = identity;
+            internal int MappingCount { get; set; } = 1;
+            internal int BorrowedLeaseCount { get; set; }
+            internal SqliteWalByteRangeLockLease SharedDms { get; } = sharedDms;
+            internal SafeFileHandle? ReadOnlyHandle { get; private set; }
+            internal SafeFileHandle? WritableHandle { get; private set; }
+            internal List<SafeFileHandle> BrokeredHandles { get; } = [];
+            internal HashSet<string> Paths { get; } =
+                new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+            internal void AddPath(string path)
+            {
+                var fullPath = Path.GetFullPath(path);
+                Paths.Add(fullPath);
+                MappingsByPath[fullPath] = this;
+            }
+
+            internal void AddBrokeredHandle(SafeFileHandle handle, bool writable)
+            {
+                if (!BrokeredHandles.Any(candidate => ReferenceEquals(candidate, handle)))
+                    BrokeredHandles.Add(handle);
+                if (writable)
+                    WritableHandle ??= handle;
+                else
+                    ReadOnlyHandle ??= handle;
+            }
+        }
     }
 
     private abstract class SafeMappedViewHandle : SafeHandle

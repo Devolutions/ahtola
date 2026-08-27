@@ -60,6 +60,87 @@ public interface ISqliteWalSharedMemoryMapping : IDisposable
 }
 
 /// <summary>
+/// Process-private WAL-index storage used while the main database file is held
+/// EXCLUSIVE. The main-file lock is the cross-process authority in that mode,
+/// so publishing SQLite's transient index into <c>-shm</c> would add no safety.
+/// </summary>
+internal sealed class HeapSqliteWalSharedMemoryMapping : ISqliteWalSharedMemoryMapping
+{
+    private readonly object _gate = new();
+    private byte[]? _bytes = [];
+
+    public long Length
+    {
+        get
+        {
+            lock (_gate)
+                return GetBytes().LongLength;
+        }
+    }
+
+    public bool IsReadOnly => false;
+
+    public void Read(long position, Span<byte> destination)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(position);
+        lock (_gate)
+        {
+            var bytes = GetBytes();
+            ValidateRange(bytes, position, destination.Length);
+            bytes.AsSpan(checked((int)position), destination.Length).CopyTo(destination);
+        }
+    }
+
+    public void Write(long position, ReadOnlySpan<byte> source)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(position);
+        lock (_gate)
+        {
+            var bytes = GetBytes();
+            if (source.Length > int.MaxValue - position)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(position),
+                    "The heap WAL-index write exceeds the maximum managed array length.");
+            }
+
+            var requiredLength = checked((int)position + source.Length);
+            if (requiredLength > bytes.Length)
+            {
+                Array.Resize(ref bytes, requiredLength);
+                _bytes = bytes;
+            }
+
+            source.CopyTo(bytes.AsSpan(checked((int)position), source.Length));
+        }
+    }
+
+    public void MemoryBarrier()
+    {
+        lock (_gate)
+        {
+            _ = GetBytes();
+            Thread.MemoryBarrier();
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+            _bytes = null;
+    }
+
+    private byte[] GetBytes()
+        => _bytes ?? throw new ObjectDisposedException(nameof(HeapSqliteWalSharedMemoryMapping));
+
+    private static void ValidateRange(byte[] bytes, long position, int length)
+    {
+        if (position > bytes.LongLength || length > bytes.LongLength - position)
+            throw new ArgumentOutOfRangeException(nameof(position), "The heap WAL-index access exceeds its length.");
+    }
+}
+
+/// <summary>
 /// Provides the immutable identity of the physical file backing a mapped SQLite
 /// WAL shared-memory region.
 /// </summary>

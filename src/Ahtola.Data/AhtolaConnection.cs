@@ -210,9 +210,21 @@ public class AhtolaConnection :
                 .ConfigureAwait(false);
             _ = await database.ConnectAsync(cancellationToken).ConfigureAwait(false);
             _managedDatabase = database;
-            database = null;
             _managedReadOnly = _managedDatabaseFactory.IsReadOnly;
             _managedSharedMemory = _managedDatabaseFactory.IsSharedMemory;
+            try
+            {
+                await ApplyManagedConnectionOptionsAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                _managedDatabase = null;
+                _managedReadOnly = false;
+                _managedSharedMemory = false;
+                throw;
+            }
+
+            database = null;
         }
         finally
         {
@@ -952,6 +964,22 @@ public class AhtolaConnection :
                 _managedDatabase = null;
             }
         }
+
+    }
+
+    internal void RestoreManagedReplicaDatabase(IManagedDatabaseAdapter database)
+    {
+        ArgumentNullException.ThrowIfNull(database);
+        _managedDatabase = database;
+        try
+        {
+            ApplyManagedConnectionOptions(database.Connection);
+        }
+        catch
+        {
+            _managedDatabase = null;
+            throw;
+        }
     }
 
     internal void TransactionCompleted(AhtolaTransaction transaction)
@@ -1524,10 +1552,13 @@ public class AhtolaConnection :
         try
         {
             SetManagedReplicaHost(replicaHost);
+            ApplyManagedConnectionOptions();
             StartAutomaticManagedReplicaSync(replicaHost);
         }
         catch
         {
+            _managedReplicaHost = null;
+            _managedDatabase = null;
             replicaHost.Dispose();
             throw;
         }
@@ -1539,10 +1570,13 @@ public class AhtolaConnection :
         try
         {
             SetManagedReplicaHost(replicaHost);
+            await ApplyManagedConnectionOptionsAsync(cancellationToken).ConfigureAwait(false);
             StartAutomaticManagedReplicaSync(replicaHost);
         }
         catch
         {
+            _managedReplicaHost = null;
+            _managedDatabase = null;
             replicaHost.Dispose();
             throw;
         }
@@ -1808,6 +1842,15 @@ public class AhtolaConnection :
         {
             using var managedOptions = _connectionOptions.GetManagedLocalOpenOptions();
             OpenManagedDatabase(managedOptions);
+            try
+            {
+                ApplyManagedConnectionOptions();
+            }
+            catch
+            {
+                Close();
+                throw;
+            }
 
             return;
         }
@@ -1947,6 +1990,77 @@ public class AhtolaConnection :
         {
             Close();
             throw;
+        }
+    }
+
+    private void ApplyManagedConnectionOptions()
+    {
+        if (_connectionOptions.ForeignKeys.HasValue)
+        {
+            ExecuteNonQuery(
+                "PRAGMA foreign_keys = "
+                + (_connectionOptions.ForeignKeys.Value ? "1" : "0")
+                + ";");
+        }
+
+        if (_connectionOptions.HasRecursiveTriggers)
+        {
+            ExecuteNonQuery(
+                "PRAGMA recursive_triggers = "
+                + (_connectionOptions.RecursiveTriggers ? "1" : "0")
+                + ";");
+        }
+    }
+
+    private void ApplyManagedConnectionOptions(IManagedConnectionAdapter connection)
+    {
+        if (_connectionOptions.ForeignKeys.HasValue)
+        {
+            ExecuteManagedNonQuery(
+                connection,
+                "PRAGMA foreign_keys = "
+                + (_connectionOptions.ForeignKeys.Value ? "1" : "0")
+                + ";");
+        }
+
+        if (_connectionOptions.HasRecursiveTriggers)
+        {
+            ExecuteManagedNonQuery(
+                connection,
+                "PRAGMA recursive_triggers = "
+                + (_connectionOptions.RecursiveTriggers ? "1" : "0")
+                + ";");
+        }
+    }
+
+    private static void ExecuteManagedNonQuery(IManagedConnectionAdapter connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        while (statement.Step() == StatementStepResult.Row)
+        {
+        }
+    }
+
+    private async Task ApplyManagedConnectionOptionsAsync(CancellationToken cancellationToken)
+    {
+        if (_connectionOptions.ForeignKeys.HasValue)
+        {
+            using var foreignKeys = CreateCommand();
+            foreignKeys.CommandText =
+                "PRAGMA foreign_keys = "
+                + (_connectionOptions.ForeignKeys.Value ? "1" : "0")
+                + ";";
+            await foreignKeys.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (_connectionOptions.HasRecursiveTriggers)
+        {
+            using var recursiveTriggers = CreateCommand();
+            recursiveTriggers.CommandText =
+                "PRAGMA recursive_triggers = "
+                + (_connectionOptions.RecursiveTriggers ? "1" : "0")
+                + ";";
+            await recursiveTriggers.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 

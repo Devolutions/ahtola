@@ -456,7 +456,12 @@ internal sealed record CommonTableExpression(
     string Name,
     IReadOnlyList<string>? Columns,
     QueryStatement Query,
-    CteMaterializationHint MaterializationHint);
+    CteMaterializationHint MaterializationHint,
+    ParsedStatement? WritableBody = null)
+{
+    public ParsedStatement Body => WritableBody ?? Query;
+    public bool IsWritable => WritableBody is not null;
+}
 
 /// <summary>The locking behavior requested by <c>BEGIN</c>.</summary>
 internal enum TransactionMode
@@ -879,7 +884,8 @@ internal sealed record FunctionExpression(
     Expression? Filter = null,
     WindowSpecification? Window = null,
     IReadOnlyList<OrderByTerm>? AggregateOrderBy = null,
-    bool OrderedSet = false) : Expression;
+    bool OrderedSet = false,
+    OrderByTerm? OrderedSetOrderBy = null) : Expression;
 
 internal sealed record ScalarSubqueryExpression(QueryStatement Query) : Expression;
 

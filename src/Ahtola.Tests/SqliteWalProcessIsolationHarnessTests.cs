@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Text;
 using AwesomeAssertions;
 using Microsoft.Data.Sqlite;
+using Ahtola.Core;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
@@ -278,6 +279,32 @@ public sealed class SqliteWalProcessIsolationHarnessTests
     }
 
     [Test]
+    [NonParallelizable]
+    public void ExclusiveManagedLockingModeBlocksStockSqliteUntilNormalHandoff()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = DetachedSqliteWalArtifact.CreateManaged();
+        using var database = EmbeddedDatabase.OpenFile(artifact.DatabasePath);
+        using var connection = database.Connect();
+
+        ExecuteManagedScalar(connection, "PRAGMA locking_mode=EXCLUSIVE;")
+            .Should().Be(SqlValue.Text("exclusive"));
+        File.Exists(artifact.DatabasePath + "-shm").Should().BeFalse();
+        using (var blocked = StartWorker(artifact, WorkerOperation.StockReadAndReport))
+        {
+            blocked.WaitForExit();
+            blocked.ReadResult().Should().Be("busy");
+        }
+
+        ExecuteManagedScalar(connection, "PRAGMA locking_mode=NORMAL;")
+            .Should().Be(SqlValue.Text("normal"));
+        File.Exists(artifact.DatabasePath + "-shm").Should().BeTrue();
+        using var handedOff = StartWorker(artifact, WorkerOperation.StockReadAndReport);
+        handedOff.WaitForExit();
+        handedOff.ReadResult().Should().Be("success");
+    }
+
+    [Test]
     [Category("ProcessWorker")]
     [NonParallelizable]
     public void ProcessWorker()
@@ -308,6 +335,9 @@ public sealed class SqliteWalProcessIsolationHarnessTests
                     break;
                 case WorkerOperation.RecoverAfterCarrierReplacement:
                     RecoverAfterCarrierReplacement(context);
+                    break;
+                case WorkerOperation.StockReadAndReport:
+                    StockReadAndReport(context);
                     break;
                 default:
                     throw new InvalidOperationException($"Unknown WAL process harness operation '{operation}'.");
@@ -444,6 +474,27 @@ public sealed class SqliteWalProcessIsolationHarnessTests
         finally
         {
             SqliteWalWriterCheckpointCoordinator.BeforeDetachedTailRepairForTesting = null;
+        }
+    }
+
+    private static void StockReadAndReport(WorkerContext context)
+    {
+        try
+        {
+            using var connection = new SqliteConnection(
+                $"Data Source={context.DatabasePath};Mode=ReadWrite;Pooling=False;Default Timeout=1");
+            connection.Open();
+            _ = ExecuteScalar(connection, "SELECT count(*) FROM sqlite_schema;");
+            File.WriteAllText(context.ResultPath, "success");
+        }
+        catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6)
+        {
+            File.WriteAllText(context.ResultPath, "busy");
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            File.WriteAllText(context.ReadyPath, string.Empty);
         }
     }
 
@@ -589,50 +640,50 @@ public sealed class SqliteWalProcessIsolationHarnessTests
 
     private static void AssertSqliteCanReopen(string databasePath)
     {
-            // After abrupt worker kills and managed SHM unmap, Windows can briefly surface
-            // SQLITE_BUSY/LOCKED/IOERR while the kernel releases byte-range locks and
-            // section objects. Retry only those transient codes; real corruption fails closed.
-            const int sqliteBusy = 5;
-            const int sqliteLocked = 6;
-            const int sqliteIoErr = 10;
-            const int maxAttempts = 8;
-            Exception? lastFailure = null;
+        // After abrupt worker kills and managed SHM unmap, Windows can briefly surface
+        // SQLITE_BUSY/LOCKED/IOERR while the kernel releases byte-range locks and
+        // section objects. Retry only those transient codes; real corruption fails closed.
+        const int sqliteBusy = 5;
+        const int sqliteLocked = 6;
+        const int sqliteIoErr = 10;
+        const int maxAttempts = 8;
+        Exception? lastFailure = null;
 
-            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            SqliteConnection.ClearAllPools();
+            // Drop any leftover finalizers holding -shm/-wal handles from the prior attempt.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            try
+            {
+                using var connection = new SqliteConnection(
+                    $"Data Source={databasePath};Mode=ReadWrite;Pooling=False");
+                connection.Open();
+
+                ExecuteScalar(connection, "PRAGMA integrity_check;").Should().Be("ok");
+                ExecuteScalar(connection, "SELECT count(*) FROM data;").Should().Be("3");
+                return;
+            }
+            catch (SqliteException exception)
+                when (exception.SqliteErrorCode is sqliteBusy or sqliteLocked or sqliteIoErr
+                      && attempt < maxAttempts)
+            {
+                lastFailure = exception;
+                Thread.Sleep(TimeSpan.FromMilliseconds(25 * attempt * attempt));
+            }
+            finally
             {
                 SqliteConnection.ClearAllPools();
-                // Drop any leftover finalizers holding -shm/-wal handles from the prior attempt.
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-                GC.Collect();
-
-                try
-                {
-                    using var connection = new SqliteConnection(
-                        $"Data Source={databasePath};Mode=ReadWrite;Pooling=False");
-                    connection.Open();
-
-                    ExecuteScalar(connection, "PRAGMA integrity_check;").Should().Be("ok");
-                    ExecuteScalar(connection, "SELECT count(*) FROM data;").Should().Be("3");
-                    return;
-                }
-                catch (SqliteException exception)
-                    when (exception.SqliteErrorCode is sqliteBusy or sqliteLocked or sqliteIoErr
-                          && attempt < maxAttempts)
-                {
-                    lastFailure = exception;
-                    Thread.Sleep(TimeSpan.FromMilliseconds(25 * attempt * attempt));
-                }
-                finally
-                {
-                    SqliteConnection.ClearAllPools();
-                }
             }
-
-            throw new IOException(
-                $"Stock SQLite could not reopen the recovered database after {maxAttempts} attempts.",
-                lastFailure);
         }
+
+        throw new IOException(
+            $"Stock SQLite could not reopen the recovered database after {maxAttempts} attempts.",
+            lastFailure);
+    }
 
     private static string ExecuteScalar(SqliteConnection connection, string commandText)
     {
@@ -640,6 +691,15 @@ public sealed class SqliteWalProcessIsolationHarnessTests
         command.CommandText = commandText;
         return Convert.ToString(command.ExecuteScalar(), CultureInfo.InvariantCulture)
             ?? throw new InvalidOperationException($"SQLite command '{commandText}' returned null.");
+    }
+
+    private static SqlValue ExecuteManagedScalar(EmbeddedConnection connection, string commandText)
+    {
+        using var statement = connection.Prepare(commandText);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        var value = statement.GetValue(0);
+        statement.Step().Should().Be(StatementStepResult.Done);
+        return value;
     }
 
     private static void Execute(SqliteConnection connection, string commandText)
@@ -701,6 +761,7 @@ public sealed class SqliteWalProcessIsolationHarnessTests
         internal const string PauseCheckpoint = "pause-checkpoint";
         internal const string ReopenAndReport = "reopen-and-report";
         internal const string RecoverAfterCarrierReplacement = "recover-after-carrier-replacement";
+        internal const string StockReadAndReport = "stock-read-and-report";
     }
 
     private sealed class DetachedSqliteWalArtifact : IDisposable
@@ -753,6 +814,41 @@ public sealed class SqliteWalProcessIsolationHarnessTests
                 if (Directory.Exists(workDirectory))
                     Directory.Delete(workDirectory, recursive: true);
                 throw;
+            }
+        }
+
+        internal static DetachedSqliteWalArtifact CreateManaged()
+        {
+            var workDirectory = Path.Combine(
+                TestContext.CurrentContext.WorkDirectory,
+                "sqlite-wal-process-isolation",
+                Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(workDirectory);
+            var databasePath = Path.Combine(workDirectory, "managed.db");
+            try
+            {
+                using (var database = EmbeddedDatabase.OpenFile(databasePath))
+                using (var connection = database.Connect())
+                {
+                    ExecuteManaged(connection, "CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT);");
+                    ExecuteManaged(connection, "INSERT INTO data(value) VALUES ('one'), ('two'), ('three');");
+                }
+
+                return new DetachedSqliteWalArtifact(workDirectory, databasePath);
+            }
+            catch
+            {
+                if (Directory.Exists(workDirectory))
+                    Directory.Delete(workDirectory, recursive: true);
+                throw;
+            }
+        }
+
+        private static void ExecuteManaged(EmbeddedConnection connection, string sql)
+        {
+            using var statement = connection.Prepare(sql);
+            while (statement.Step() == StatementStepResult.Row)
+            {
             }
         }
 
@@ -927,14 +1023,14 @@ public sealed class SqliteWalProcessIsolationHarnessTests
                 _process.Kill(entireProcessTree: true);
             if (!_process.WaitForExit(WorkerTimeout))
                 Assert.Fail($"The WAL process harness worker did not terminate:{Environment.NewLine}{DrainOutput()}");
-                    // Drain async stdout/stderr callbacks after the kill so Dispose is quiet.
-                    _process.WaitForExit();
-                    _completed = true;
-                    // Windows can retain byte-range locks and section objects briefly after the
-                    // process image exits; give the kernel a moment before the parent reopens.
-                    if (OperatingSystem.IsWindows())
-                        Thread.Sleep(TimeSpan.FromMilliseconds(50));
-                }
+            // Drain async stdout/stderr callbacks after the kill so Dispose is quiet.
+            _process.WaitForExit();
+            _completed = true;
+            // Windows can retain byte-range locks and section objects briefly after the
+            // process image exits; give the kernel a moment before the parent reopens.
+            if (OperatingSystem.IsWindows())
+                Thread.Sleep(TimeSpan.FromMilliseconds(50));
+        }
 
         internal void WaitForExit()
         {

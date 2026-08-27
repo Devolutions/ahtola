@@ -426,7 +426,9 @@ internal static class SqlAuthorization
             var ctes = new List<CommonTableExpression>(statement.CommonTableExpressions.Count);
             foreach (var cte in statement.CommonTableExpressions)
             {
-                ctes.Add(cte with { Query = Query(cte.Query) });
+                ctes.Add(cte.WritableBody is null
+                    ? cte with { Query = Query(cte.Query) }
+                    : cte with { WritableBody = Statement(cte.WritableBody) });
                 if (_cteNames.Add(cte.Name))
                     added.Add(cte.Name);
             }
@@ -493,7 +495,9 @@ internal static class SqlAuthorization
                         var ctes = new List<CommonTableExpression>(with.CommonTableExpressions.Count);
                         foreach (var cte in with.CommonTableExpressions)
                         {
-                            ctes.Add(cte with { Query = Query(cte.Query) });
+                            ctes.Add(cte.WritableBody is null
+                                ? cte with { Query = Query(cte.Query) }
+                                : cte with { WritableBody = Statement(cte.WritableBody) });
                             if (_cteNames.Add(cte.Name))
                                 added.Add(cte.Name);
                         }
@@ -762,11 +766,19 @@ internal static class SqlAuthorization
                         if (decision == SqliteAuthorizerResult.Ignore)
                             return new LiteralExpression(SqlValue.Null);
 
+                        var arguments = function.Arguments.Select(Expr).ToArray();
                         return function with
                         {
-                            Arguments = function.Arguments.Select(Expr).ToArray(),
+                            Arguments = arguments,
                             Filter = function.Filter is null ? null : Expr(function.Filter),
                             Window = function.Window is null ? null : Window(function.Window),
+                            AggregateOrderBy = OrderBy(function.AggregateOrderBy),
+                            OrderedSetOrderBy = function.OrderedSetOrderBy is null
+                                ? null
+                                : function.OrderedSetOrderBy with
+                                {
+                                    Expression = arguments[0],
+                                },
                         };
                     }
 
