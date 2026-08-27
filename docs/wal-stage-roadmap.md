@@ -25,14 +25,18 @@ This document is the **ordered engineering plan** to finish full Turso/SQLite WA
 | Stage 2 read marks via `SqliteWalReadSnapshotCoordinator` | **Attached** for physical WAL readers |
 | Stage 3 writer publish + CKPT_LOCK checkpoint/`nBackfill` | **Attached** |
 | Stage 4 busy taxonomy + SQLite backoff | **Attached** |
-| Stage 5 recovery + `iChange` invalidation | **Attached** (`-shm` unlink deferred) |
+| Stage 5 recovery + `iChange` invalidation | **Attached** |
 | Stage 6 main-file SHARED (retire exclusive 512-byte ownership) | **Attached** |
 | Live multi-engine WAL (`-shm` DMS + shared readers) | **Attached** (stock SQLite 3.53+ coexistence proven; Turso binary differential optional) |
 | Foreign read-only guest (§1.9) | Live; not full interop |
 
-**Pager gate:** Stages 1–6 are attached. Remaining WAL lifecycle work is
-last-connection `-shm` unlink/heap fallback plus optional Turso binary
-differential stress.
+**Pager gate:** Stages 1–6 and physical EXCLUSIVE-mode transitions are attached.
+Ordinary closes intentionally retain `-shm` so a later read-only open can
+coordinate without creating storage. Windows/Linux perform DMS-proven carrier
+cleanup when explicitly entering `locking_mode=EXCLUSIVE`, then use a heap
+WAL-index. macOS retains the carrier and rejects physical EXCLUSIVE mode because
+its process-owned `fcntl` locks cannot distinguish an in-process foreign SQLite
+mapping. Optional Turso binary differential stress remains qualification depth.
 
 ---
 
@@ -141,13 +145,14 @@ differential stress.
 2. Replace process-local `LockManager.Generation` invalidation with `iChange` / `mxFrame` / salts comparisons for physical WAL.
 3. Handle last-connection `-shm` unlink, exclusive locking mode, heap WAL-index fallback where required.
 
-**Landed:** pager recovery takes CKPT + exclusive read marks (reuses lock-manager writer/recovery bytes when already held), repairs dirty tails, `RebuildFromWal` bumps `iChange`; `SynchronizeCommittedView` invalidates on shared header identity change. Ownership still Stage 0. Deferred: last-connection `-shm` unlink, heap WAL-index fallback (Stage 6-adjacent).
+**Landed:** pager recovery takes CKPT + exclusive read marks (reuses lock-manager writer/recovery bytes when already held), repairs dirty tails, `RebuildFromWal` bumps `iChange`; `SynchronizeCommittedView` invalidates on shared header identity change. Windows/Linux EXCLUSIVE transitions take exclusive DMS before unlinking; exclusive locking mode uses a heap WAL-index. Ordinary close retains the carrier for non-mutating read-only reopen.
 
 **Exit criteria**
 
 - [x] Torn/corrupt publication fail-closed; clean WAL rebuilds index with bumped `iChange`.
 - [x] Committed-view rescan when `iChange`/`mxFrame`/salts advance.
-- [ ] Last-connection `-shm` unlink + heap fallback (deferred with Stage 6).
+- [x] DMS-proven EXCLUSIVE-transition `-shm` unlink + heap fallback on platforms with descriptor-owned locks; macOS fails closed as described above.
+- [ ] Ordinary final-close unlink is intentionally retained as a residual because removing a header-only carrier breaks later non-mutating read-only opens.
 
 ---
 
@@ -176,9 +181,8 @@ coexistence, writer conflict, PENDING exclusion of new readers, release after
 transaction/pager disposal, and peer-commit freshness. Live multi-engine WAL
 remains proven in both directions with checkpoint agreement.
 
-**Known remaining polish:** last-connection `-shm` unlink / heap WAL-index
-fallback; optional Turso binary differential stress; expanded
-process-isolation harness on Linux CI.
+**Known remaining qualification:** optional Turso binary differential stress
+and an expanded process-isolation harness on Linux/macOS CI.
 
 **Exit criteria**
 

@@ -1504,6 +1504,15 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     internal SqliteJournalMode JournalMode => _pager.JournalMode;
 
+    internal bool IsExclusiveLockingMode => _pager.IsExclusiveLockingMode;
+
+    internal bool SetExclusiveLockingMode(bool exclusive, TimeSpan busyTimeout)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        return _pager.SetExclusiveLockingMode(exclusive, busyTimeout);
+    }
+
     /// <summary>Backfills the WAL pages materialized by an MVCC checkpoint.</summary>
     internal SqliteCheckpointResult BackfillMvccCheckpoint(TimeSpan busyTimeout)
     {
@@ -8496,13 +8505,25 @@ internal sealed class EmbeddedFileStore : IDisposable
                 break;
             case UpdateStatement update:
                 tables.Add(update.TableName);
+                CollectTriggerReferencedTables(update.From, tables);
                 foreach (var assignment in update.Assignments)
                     CollectTriggerReferencedTables(assignment.Value, tables);
                 CollectTriggerReferencedTables(update.Where, tables);
+                foreach (var term in update.EffectiveOrderBy)
+                    CollectTriggerReferencedTables(term.Expression, tables);
+                CollectTriggerReferencedTables(update.Limit, tables);
                 break;
             case DeleteStatement delete:
                 tables.Add(delete.TableName);
                 CollectTriggerReferencedTables(delete.Where, tables);
+                foreach (var term in delete.EffectiveOrderBy)
+                    CollectTriggerReferencedTables(term.Expression, tables);
+                CollectTriggerReferencedTables(delete.Limit, tables);
+                break;
+            case WithDmlStatement with:
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                    CollectTriggerReferencedTables(commonTableExpression.Body, tables);
+                CollectTriggerReferencedTables(with.Dml, tables);
                 break;
             case QueryStatement query:
                 CollectTriggerReferencedTables(query, tables);
@@ -8555,7 +8576,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 break;
             case WithSelectStatement with:
                 foreach (var commonTableExpression in with.CommonTableExpressions)
-                    CollectTriggerReferencedTables(commonTableExpression.Query, tables);
+                    CollectTriggerReferencedTables(commonTableExpression.Body, tables);
                 CollectTriggerReferencedTables(with.Query, tables);
                 break;
         }
@@ -8775,11 +8796,19 @@ internal sealed class EmbeddedFileStore : IDisposable
                 FindRuntimeDependency(insert.Upsert)),
             UpdateStatement update => FirstRuntimeDependency(
                 FindRuntimeDependency(update.Assignments),
+                FindRuntimeDependency(update.From),
                 FindRuntimeDependency(update.Where),
+                FindRuntimeDependency(update.EffectiveOrderBy),
+                FindRuntimeDependency(update.Limit),
                 FindRuntimeDependency(update.Returning)),
             DeleteStatement delete => FirstRuntimeDependency(
                 FindRuntimeDependency(delete.Where),
+                FindRuntimeDependency(delete.EffectiveOrderBy),
+                FindRuntimeDependency(delete.Limit),
                 FindRuntimeDependency(delete.Returning)),
+            WithDmlStatement with => FirstRuntimeDependency(
+                FindRuntimeDependency(with.CommonTableExpressions),
+                FindRuntimeDependency(with.Dml)),
             QueryStatement query => FindRuntimeDependency(query),
             _ => $"unsupported trigger body statement {statement.GetType().Name}",
         };
@@ -8952,7 +8981,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         foreach (var expression in expressions)
         {
-            var dependency = FindRuntimeDependency(expression.Query);
+            var dependency = FindRuntimeDependency(expression.Body);
             if (dependency is not null)
                 return dependency;
         }

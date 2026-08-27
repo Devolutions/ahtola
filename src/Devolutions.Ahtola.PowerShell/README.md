@@ -17,6 +17,9 @@ Microsoft.Data.Sqlite / SQLitePCLRaw.
 - Adds managed operational cmdlets for connections, transactions, backups, schema
   inspection, maintenance, bulk copy, JSON/CSV table interchange, and Ahtola
   file-password rotation.
+- Replica administration includes long-poll and batch thresholds, partial or
+  encrypted bootstrap, progress, conflict inspection/resolution, and pending
+  CDC projection.
 - `DataReader` is a backward-compatible name for a detached materialized result
   reader. It is not a live streaming reader and does not retain command or
   connection ownership.
@@ -87,7 +90,10 @@ pwsh ./scripts/Invoke-PowerShellModuleTests.ps1
 - `New-AhtolaSqliteConnection -TursoUrl <libsql-url> -AuthToken <SecureString>`
   opens a direct Turso Cloud connection. Add `-ReplicaPath <file>` for a
   managed embedded replica, optionally with `-SyncInterval <seconds>`, then
-  use `Invoke-AhtolaSqliteReplicaSync` for an explicit sync. `-UseTursoEnvironment`
+  use `Invoke-AhtolaSqliteReplicaSync` for an explicit sync. Use
+  `Get-AhtolaSqliteReplicaConflict`, `Resolve-AhtolaSqliteReplicaConflict`,
+  and `Get-AhtolaSqliteReplicaChangeCapture` for replica administration.
+  `-UseTursoEnvironment`
   opts into `TURSO_REMOTE_URL` and `TURSO_AUTH_TOKEN` defaults; explicit
   parameters take precedence. Cloud connections expose only a redacted
   connection string and never serialize their token.

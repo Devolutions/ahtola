@@ -61,6 +61,8 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
             'Get-AhtolaSqliteDatabaseInfo'
             'Get-AhtolaSqliteDatabaseMetadata'
             'Get-AhtolaSqliteIndex'
+            'Get-AhtolaSqliteReplicaChangeCapture'
+            'Get-AhtolaSqliteReplicaConflict'
             'Get-AhtolaSqliteRow'
             'Get-AhtolaSqliteSchema'
             'Get-AhtolaSqliteTable'
@@ -73,6 +75,7 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
             'New-AhtolaSqliteRow'
             'Optimize-AhtolaSqliteDatabase'
             'Remove-AhtolaSqliteRow'
+            'Resolve-AhtolaSqliteReplicaConflict'
             'Save-AhtolaSqliteTransaction'
             'Set-AhtolaSqlitePassword'
             'Set-AhtolaSqliteRow'
@@ -156,6 +159,11 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
         $parameters['ReplicaPath'] | Should-NotBeNull
         $parameters['UseTursoEnvironment'] | Should-NotBeNull
         $parameters['SyncInterval'] | Should-NotBeNull
+        $parameters['LongPollTimeout'].ParameterType | Should-Be ([Nullable[TimeSpan]])
+        $parameters['PushOperationsThreshold'].ParameterType | Should-Be ([long])
+        $parameters['PullBytesThreshold'].ParameterType | Should-Be ([long])
+        $parameters['RemoteEncryptionKey'].ParameterType | Should-Be ([securestring])
+        $parameters['RemoteEncryptionCipher'] | Should-NotBeNull
         $readOnlySets = @(
             $command.ParameterSets |
                 Where-Object { $_.Parameters.Name -contains 'ReadOnly' } |
@@ -163,6 +171,23 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
         )
         $readOnlySets | Should-ContainCollection 'byConnectionString', 'byDatabasePath'
         ($readOnlySets -contains 'byTursoCloud') | Should-BeFalse
+        $replicaSets = @(
+            $command.ParameterSets |
+                Where-Object { $_.Parameters.Name -contains 'ReplicaPath' } |
+                Select-Object -ExpandProperty Name
+        )
+        $replicaSets | Should-ContainCollection @(
+            'byTursoReplica'
+            'byTursoReplicaPrefix'
+            'byTursoReplicaQuery'
+            'byTursoReplicaEncrypted'
+        )
+        ((($command.ParameterSets |
+                    Where-Object Name -eq 'byTursoReplicaQuery').Parameters.Name) -contains
+            'PullBytesThreshold') | Should-BeFalse
+        ((($command.ParameterSets |
+                    Where-Object Name -eq 'byTursoReplicaEncrypted').Parameters.Name) -contains
+            'BootstrapQuery') | Should-BeFalse
         (Get-Command Invoke-AhtolaSqliteReplicaSync).Parameters['ReplicaConnection'].ParameterType |
             Should-Be ([Ahtola.PSSqlite.AhtolaCloudConnection])
 
@@ -180,7 +205,30 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
             $output.Contains($secret) | Should-BeFalse
             $output.Contains('TURSO_AUTH_TOKEN') | Should-BeFalse
 
+            {
+                New-AhtolaSqliteConnection `
+                    -UseTursoEnvironment `
+                    -ReplicaPath '   ' `
+                    -WhatIf `
+                    -ErrorAction Stop
+            } | Should-Throw
+
             $secureToken = ConvertTo-SecureString $secret -AsPlainText -Force
+            $remoteKeyText = 'c2VjcmV0LXJlcGxpY2Eta2V5'
+            $remoteKey = ConvertTo-SecureString $remoteKeyText -AsPlainText -Force
+            $encryptionWhatIf = @(
+                New-AhtolaSqliteConnection `
+                    -TursoUrl 'libsql://example.turso.io' `
+                    -AuthToken $secureToken `
+                    -ReplicaPath ./encrypted-replica.db `
+                    -RemoteEncryptionKey $remoteKey `
+                    -RemoteEncryptionCipher aes256gcm `
+                    -WhatIf 6>&1 |
+                    Out-String
+            ) -join [Environment]::NewLine
+            $encryptionWhatIf.Contains($secret) | Should-BeFalse
+            $encryptionWhatIf.Contains($remoteKeyText) | Should-BeFalse
+
             $errorText = try {
                 New-AhtolaSqliteConnection -TursoUrl 'http://127.0.0.1:1' -AuthToken $secureToken -ErrorAction Stop
                 throw 'Expected the unavailable local endpoint to fail.'
@@ -194,6 +242,57 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
             $env:TURSO_REMOTE_URL = $originalUrl
             $env:TURSO_AUTH_TOKEN = $originalToken
         }
+    }
+
+    It 'exposes replica administration parameter sets and completion metadata' {
+        foreach ($name in @(
+                'Get-AhtolaSqliteReplicaChangeCapture'
+                'Get-AhtolaSqliteReplicaConflict'
+                'Invoke-AhtolaSqliteReplicaSync'
+                'Resolve-AhtolaSqliteReplicaConflict')) {
+            (Get-Command $name).Parameters['ReplicaConnection'].ParameterType |
+                Should-Be ([Ahtola.PSSqlite.AhtolaCloudConnection])
+        }
+
+        $resolve = Get-Command Resolve-AhtolaSqliteReplicaConflict
+        $resolve.ParameterSets.Name | Should-ContainCollection 'RebaseEligible', 'DiscardUnresolved'
+        $resolve.Parameters['WhatIf'] | Should-NotBeNull
+        $resolve.Parameters['Confirm'] | Should-NotBeNull
+        $resolve.Parameters['RebaseEligible'].Aliases | Should-ContainCollection 'ReplayEligible'
+        ($resolve.ParameterSets |
+            Where-Object Name -eq 'DiscardUnresolved').Parameters.Name |
+            Should-ContainCollection 'DiscardUnresolvedChanges', 'AcknowledgeDataLoss'
+
+        $cipherValues = @(
+            (Get-Command New-AhtolaSqliteConnection).Parameters['RemoteEncryptionCipher'].Attributes |
+                Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } |
+                Select-Object -ExpandProperty ValidValues
+        )
+        $cipherValues | Should-ContainCollection 'Aes256Gcm', 'Aes128Gcm', 'Aegis256'
+        ($cipherValues -contains 'ChaCha20Poly1305') | Should-BeFalse
+    }
+
+    It 'rejects an explicitly disabled destructive replica resolution before WhatIf dispatch' {
+        $replica = [System.Runtime.CompilerServices.RuntimeHelpers]::GetUninitializedObject(
+            [Ahtola.PSSqlite.AhtolaCloudConnection])
+
+        $errorRecord = try {
+            Resolve-AhtolaSqliteReplicaConflict `
+                -ReplicaConnection $replica `
+                -DiscardUnresolvedChanges:$false `
+                -AcknowledgeDataLoss `
+                -WhatIf `
+                -ErrorAction Stop
+            $null
+        }
+        catch {
+            $_
+        }
+
+        $errorRecord | Should-NotBeNull
+        $errorRecord.CategoryInfo.Category | Should-Be (
+            [System.Management.Automation.ErrorCategory]::InvalidArgument)
+        $errorRecord.Exception.Message.Contains('DiscardUnresolvedChanges') | Should-BeTrue
     }
 }
 

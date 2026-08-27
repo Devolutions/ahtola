@@ -14,9 +14,13 @@ SHARED, RESERVED, PENDING, and EXCLUSIVE at SQLite transaction boundaries;
 WAL pagers retain their lifetime SHARED lock and continue to coordinate writers
 and checkpoints through `-shm`. Managed and stock SQLite can share one live WAL
 or DELETE-mode database without `IOERR`, and long-lived managed connections
-refresh their committed view from peer changes on new statements. Remaining
-polish is last-connection `-shm` unlink/heap fallback and expanded Turso binary
-differential stress. An explicit
+refresh their committed view from peer changes on new statements. Ordinary
+closes retain `-shm` for later non-mutating read-only opens. Windows and Linux
+remove the carrier on an explicit `locking_mode=EXCLUSIVE` transition only
+after exclusive DMS proof and then use a heap WAL-index. macOS retains `-shm` and rejects
+physical EXCLUSIVE mode because process-owned record locks cannot prove that
+an in-process foreign SQLite mapping is absent. Expanded Turso binary
+differential stress remains optional qualification. An explicit
 `Foreign Read Only=True` connection may still read without main-file locks
 (§1.9).
 
@@ -129,8 +133,13 @@ Additional current behavior:
 5. **Process-local coordination remains intentional.** `SqlitePagerLockManager`
    aggregates managed readers/writers and prevents same-process lock anomalies,
    while the main-file and `-shm` byte locks are the cross-process authority.
-6. **Remaining WAL lifecycle gap.** Last-connection `-shm` unlink and the
-   exclusive-locking-mode heap WAL-index fallback are not yet implemented.
+6. **WAL lifecycle boundary.** Ordinary close retains the carrier because even
+   a header-only WAL needs it for a future read-only open that must not create
+   storage. On Windows/Linux, entering EXCLUSIVE takes exclusive DMS before
+   removing the carrier, keeps main-file EXCLUSIVE, and replaces the mapped
+   index with a private heap index; returning to NORMAL republishes a physical
+   index before downgrading. macOS retains the carrier and fails physical
+   EXCLUSIVE closed for the process-owned-lock reason above.
 
 #### 1.3.1 `PRAGMA synchronous` durability
 
@@ -616,8 +625,10 @@ add a distinct snapshot-invalidated result for readers whose mark was reset.
   `mxFrame`, salts). The current physical-pager guards — `ValidateMainFileFormat`,
   `ValidateWalIncarnation`, and the uncommitted-tail check — become ordinary
   snapshot comparisons instead of "dispose and reopen" errors.
-- Handle `-shm` unlink by the last connection out, exclusive locking mode, and the
-  heap-memory WAL-index fallback.
+- EXCLUSIVE-transition `-shm` cleanup and the heap WAL-index follow the platform
+  boundary in §1.3; failed transitions retain EXCLUSIVE authority and fault the
+  pager rather than publishing through the wrong index. Ordinary close keeps
+  the carrier for safe read-only reopen.
 
 ### Stage 6 — retire process-exclusive ownership
 

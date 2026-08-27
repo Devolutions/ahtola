@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Migrations.Operations;
 using Microsoft.EntityFrameworkCore.Sqlite.Metadata.Internal;
+using System.Text;
 
 namespace Ahtola.EntityFrameworkCore.Sqlite.Migrations.Internal;
 
@@ -12,24 +13,48 @@ public sealed class AhtolaManagedSqliteMigrationsSqlGenerator(
     IRelationalAnnotationProvider migrationsAnnotations)
     : SqliteMigrationsSqlGenerator(dependencies, migrationsAnnotations)
 {
+    private bool _idempotent;
+    private HashSet<(string Table, string? Schema)> _rebuildTables = [];
+    private (string Table, string? Schema)? _pendingRebuildCopy;
+
     public override IReadOnlyList<MigrationCommand> Generate(
         IReadOnlyList<MigrationOperation> operations,
         IModel? model = null,
         MigrationsSqlGenerationOptions options = MigrationsSqlGenerationOptions.Default)
     {
-        if (options.HasFlag(MigrationsSqlGenerationOptions.Idempotent))
+        var plannedOperations = ManagedSqliteTableRebuildPlanner.Plan(operations, model);
+        _idempotent = options.HasFlag(MigrationsSqlGenerationOptions.Idempotent);
+        if (_idempotent)
         {
-            throw new NotSupportedException(
-                "The managed local provider does not support idempotent migration scripts because the engine cannot conditionally execute DDL blocks.");
+            ManagedSqliteTableRebuildPlanner.ValidateIdempotent(
+                plannedOperations,
+                options.HasFlag(MigrationsSqlGenerationOptions.Script));
         }
-
-        ValidateOperations(operations, model);
-                // Do not rewrite DropColumn to bare ALTER TABLE ... DROP COLUMN. EF Core's
-                // SqliteMigrationsSqlGenerator rebuilds tables (ef_temp_*) and toggles
-                // PRAGMA foreign_keys around the swap — required for histories that drop
-                // columns still referenced by FK definitions (e.g. PowerShell Universal).
-                return base.Generate(operations, model, options);
+        _rebuildTables = ManagedSqliteTableRebuildPlanner.GetRebuildTables(plannedOperations);
+        try
+        {
+            if (options.HasFlag(MigrationsSqlGenerationOptions.Script) && _rebuildTables.Count != 0)
+            {
+                throw new NotSupportedException(
+                    "The managed local provider cannot generate a standalone script for a table rebuild because arbitrary live trigger definitions can only be captured and restored by the managed migration executor.");
             }
+
+            var commands = base.Generate(plannedOperations, model, options);
+            if (_pendingRebuildCopy is { } pending)
+            {
+                throw new InvalidOperationException(
+                    $"The managed SQLite rebuild for table '{pending.Table}' did not generate its expected copy operation.");
+            }
+
+            return commands;
+        }
+        finally
+        {
+            _idempotent = false;
+            _rebuildTables = [];
+            _pendingRebuildCopy = null;
+        }
+    }
 
     protected override void ColumnDefinition(
         string? schema,
@@ -41,14 +66,9 @@ public sealed class AhtolaManagedSqliteMigrationsSqlGenerator(
     {
         var autoincrement = operation.FindAnnotation(SqliteAnnotationNames.Autoincrement);
         var legacyAutoincrement = operation.FindAnnotation(SqliteAnnotationNames.LegacyAutoincrement);
-        if (autoincrement is null && legacyAutoincrement is null)
-        {
-            base.ColumnDefinition(schema, table, name, operation, model, builder);
-            return;
-        }
-
         operation.RemoveAnnotation(SqliteAnnotationNames.Autoincrement);
         operation.RemoveAnnotation(SqliteAnnotationNames.LegacyAutoincrement);
+
         try
         {
             base.ColumnDefinition(schema, table, name, operation, model, builder);
@@ -63,122 +83,474 @@ public sealed class AhtolaManagedSqliteMigrationsSqlGenerator(
         }
     }
 
-    protected override void ForeignKeyConstraint(
-        AddForeignKeyOperation operation,
+    protected override void Generate(
+        CreateTableOperation operation,
         IModel? model,
-        MigrationCommandListBuilder builder)
+        MigrationCommandListBuilder builder,
+        bool terminate = true)
     {
-        base.ForeignKeyConstraint(operation, model, builder);
-    }
-
-    private static void ValidateOperations(IReadOnlyList<MigrationOperation> operations, IModel? model)
-    {
-        foreach (var operation in operations)
+        if (operation.Name.StartsWith("ef_temp_", StringComparison.Ordinal))
         {
-            if (operation is CreateTableOperation createTableWithDefaultSql)
+            var rebuild = (operation.Name["ef_temp_".Length..], operation.Schema);
+            if (_rebuildTables.Contains(rebuild))
             {
-                foreach (var column in createTableWithDefaultSql.Columns)
-                    ValidateComputedColumn(column);
+                if (_pendingRebuildCopy is not null)
+                    throw new InvalidOperationException("Managed SQLite rebuild copy operations overlapped.");
 
+                _pendingRebuildCopy = rebuild;
             }
+        }
 
-            if (operation is AddColumnOperation or AlterColumnOperation)
-                ValidateComputedColumn((ColumnOperation)operation);
+        if (!_idempotent && operation.Schema is null)
+        {
+            base.Generate(operation, model, builder, terminate);
+            return;
+        }
 
-            if (operation is AddUniqueConstraintOperation addUniqueConstraint)
-            {
-                throw new NotSupportedException(
-                    $"The managed local provider does not support unique constraints ('{addUniqueConstraint.Name}' on '{addUniqueConstraint.Table}'). " +
-                    "Use a unique index instead.");
-            }
+        builder
+            .Append(_idempotent ? "CREATE TABLE IF NOT EXISTS " : "CREATE TABLE ")
+            .Append(DelimitIdentifier(operation.Name, operation.Schema))
+            .AppendLine(" (");
 
-            if (operation is DropUniqueConstraintOperation dropUniqueConstraint)
-            {
-                throw new NotSupportedException(
-                    $"The managed local provider does not support unique constraints ('{dropUniqueConstraint.Name}' on '{dropUniqueConstraint.Table}'). " +
-                    "Use a unique index instead.");
-            }
+        using (builder.Indent())
+        {
+            CreateTableColumns(operation, model, builder);
+            CreateTableConstraints(operation, model, builder);
+            builder.AppendLine();
+        }
 
-            if (operation is AddCheckConstraintOperation addCheckConstraint)
-            {
-                throw new NotSupportedException(
-                    $"The managed local provider does not support check constraints on '{addCheckConstraint.Table}'.");
-            }
-
-            if (operation is DropCheckConstraintOperation dropCheckConstraint)
-            {
-                throw new NotSupportedException(
-                    $"The managed local provider does not support dropping check constraints ('{dropCheckConstraint.Name}' on '{dropCheckConstraint.Table}').");
-            }
-
-            // SqlOperation is allowed: production apps (e.g. PowerShell Universal) ship large EF
-                        // migration histories with migrationBuilder.Sql(...). Modeled-op validation above
-                        // still covers unique/check constraints and filtered indexes when those ops appear.
-
-                        if (operation is CreateIndexOperation createIndex)
-                ValidateCreateIndex(createIndex);
-
-            if (operation is RenameIndexOperation renameIndex)
-                ValidateRenameIndex(renameIndex, model);
-
-            if (operation is RenameTableOperation renameTable)
-                ValidateRenameTable(renameTable, model);
-
-            if (operation is RenameColumnOperation renameColumn)
-                ValidateRenameColumn(renameColumn, model);
+        builder.Append(")");
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            EndStatement(builder);
         }
     }
 
-    private static void ValidateRenameTable(RenameTableOperation operation, IModel? model)
+    protected override void Generate(
+        CreateIndexOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder,
+        bool terminate = true)
+    {
+        if (!_idempotent && operation.Schema is null)
+        {
+            base.Generate(operation, model, builder, terminate);
+            return;
+        }
+
+        builder.Append("CREATE ");
+        if (operation.IsUnique)
+            builder.Append("UNIQUE ");
+
+        IndexTraits(operation, model, builder);
+        builder
+            .Append(_idempotent ? "INDEX IF NOT EXISTS " : "INDEX ")
+            .Append(DelimitIdentifier(operation.Name, operation.Schema))
+            .Append(" ON ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Table))
+            .Append(" (");
+        GenerateIndexColumnList(operation, model, builder);
+        builder.Append(")");
+        IndexOptions(operation, model, builder);
+
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            EndStatement(builder);
+        }
+    }
+
+    protected override void Generate(
+        DropIndexOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder,
+        bool terminate = true)
+    {
+        if (!_idempotent && operation.Schema is null)
+        {
+            base.Generate(operation, model, builder, terminate);
+            return;
+        }
+
+        builder
+            .Append(_idempotent ? "DROP INDEX IF EXISTS " : "DROP INDEX ")
+            .Append(DelimitIdentifier(operation.Name, operation.Schema));
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            EndStatement(builder);
+        }
+    }
+
+    protected override void Generate(
+        DropTableOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder,
+        bool terminate = true)
+    {
+        if (_rebuildTables.Contains((operation.Name, operation.Schema)))
+        {
+            builder
+                .Append("-- AHTOLA_REBUILD:")
+                .Append(operation.Schema is null ? "-" : EncodeMarkerValue(operation.Schema))
+                .Append(":")
+                .Append(EncodeMarkerValue(operation.Name))
+                .AppendLine();
+        }
+
+        if (!_idempotent && operation.Schema is null)
+        {
+            base.Generate(operation, model, builder, terminate);
+            return;
+        }
+
+        builder
+            .Append(_idempotent ? "DROP TABLE IF EXISTS " : "DROP TABLE ")
+            .Append(DelimitIdentifier(operation.Name, operation.Schema));
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            EndStatement(builder);
+        }
+    }
+
+    private static string EncodeMarkerValue(string value)
+        => Convert.ToHexString(Encoding.UTF8.GetBytes(value));
+
+    private string DelimitIdentifier(string name, string? schema)
+        => schema is null
+            ? Dependencies.SqlGenerationHelper.DelimitIdentifier(name)
+            : Dependencies.SqlGenerationHelper.DelimitIdentifier(schema)
+                + "."
+                + Dependencies.SqlGenerationHelper.DelimitIdentifier(name);
+
+    protected override void Generate(
+        RenameTableOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder)
     {
         if (operation.NewName is null || operation.NewName == operation.Name)
             return;
 
-        var targetTable = model?.GetRelationalModel()
-            .FindTable(operation.NewName, operation.NewSchema);
-        if (targetTable is null)
+        builder
+            .Append("ALTER TABLE ")
+            .Append(DelimitIdentifier(operation.Name, operation.Schema))
+            .Append(" RENAME TO ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.NewName))
+            .AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+        EndStatement(builder);
+    }
+
+    protected override void Generate(
+        RenameColumnOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder)
+    {
+        builder
+            .Append("ALTER TABLE ")
+            .Append(DelimitIdentifier(operation.Table, operation.Schema))
+            .Append(" RENAME COLUMN ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Name))
+            .Append(" TO ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.NewName))
+            .AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+        EndStatement(builder);
+    }
+
+    protected override void Generate(
+        SqlOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder)
+    {
+        var originalSql = operation.Sql;
+        var rebuild = _pendingRebuildCopy;
+        if (rebuild is { } pending)
         {
-            throw new NotSupportedException(
-                $"The managed local provider can rename table '{operation.Name}' only when the target model contains '{operation.NewName}'.");
+            var unqualifiedTemporary =
+                Dependencies.SqlGenerationHelper.DelimitIdentifier("ef_temp_" + pending.Table);
+            var unqualifiedTable = Dependencies.SqlGenerationHelper.DelimitIdentifier(pending.Table);
+            if (!operation.Sql.Contains("INSERT INTO " + unqualifiedTemporary, StringComparison.Ordinal)
+                || !operation.Sql.Contains("FROM " + unqualifiedTable, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"The managed SQLite rebuild for table '{pending.Table}' generated an unexpected copy operation.");
+            }
+
+            if (pending.Schema is not null)
+            {
+                operation.Sql = operation.Sql
+                    .Replace(
+                        "INSERT INTO " + unqualifiedTemporary,
+                        "INSERT INTO " + DelimitIdentifier("ef_temp_" + pending.Table, pending.Schema),
+                        StringComparison.Ordinal)
+                    .Replace(
+                        "FROM " + unqualifiedTable,
+                        "FROM " + DelimitIdentifier(pending.Table, pending.Schema),
+                        StringComparison.Ordinal);
+            }
         }
 
-        if (targetTable.ForeignKeyConstraints.Any()
-            || targetTable.ReferencingForeignKeyConstraints.Any()
-            || targetTable.Triggers.Any())
+        try
         {
-            throw new NotSupportedException(
-                $"The managed local provider cannot safely rename table '{operation.Name}' because the target table '{operation.NewName}' has foreign key or trigger dependencies.");
+            base.Generate(operation, model, builder);
+        }
+        finally
+        {
+            operation.Sql = originalSql;
+            if (rebuild is not null)
+                _pendingRebuildCopy = null;
         }
     }
 
-    private static void ValidateRenameColumn(RenameColumnOperation operation, IModel? model)
+    protected override void ForeignKeyConstraint(
+        AddForeignKeyOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder)
+        => base.ForeignKeyConstraint(operation, model, builder);
+}
+
+internal static class ManagedSqliteTableRebuildPlanner
+{
+    public static HashSet<(string Table, string? Schema)> GetRebuildTables(
+        IReadOnlyList<MigrationOperation> operations)
     {
-        var targetTable = model?.GetRelationalModel()
-            .FindTable(operation.Table, operation.Schema);
-        var targetColumn = targetTable?.FindColumn(operation.NewName);
-        if (targetTable is null || targetColumn is null)
+        var rebuilds = new HashSet<(string Table, string? Schema)>();
+        var createdTables = new HashSet<(string Table, string? Schema)>();
+
+        foreach (var operation in operations)
         {
-            throw new NotSupportedException(
-                $"The managed local provider can rename column '{operation.Name}' on '{operation.Table}' only when the target model contains '{operation.NewName}'.");
+            switch (operation)
+            {
+                case CreateTableOperation create:
+                    createdTables.Add((create.Name, create.Schema));
+                    break;
+
+                case AddPrimaryKeyOperation primaryKey:
+                    rebuilds.Add((primaryKey.Table, primaryKey.Schema));
+                    break;
+                case AddUniqueConstraintOperation unique:
+                    rebuilds.Add((unique.Table, unique.Schema));
+                    break;
+                case AddCheckConstraintOperation check:
+                    rebuilds.Add((check.Table, check.Schema));
+                    break;
+                case AlterTableOperation table:
+                    rebuilds.Add((table.Name, table.Schema));
+                    break;
+                case DropCheckConstraintOperation check:
+                    rebuilds.Add((check.Table, check.Schema));
+                    break;
+                case DropForeignKeyOperation foreignKey:
+                    rebuilds.Add((foreignKey.Table, foreignKey.Schema));
+                    break;
+                case DropPrimaryKeyOperation primaryKey:
+                    rebuilds.Add((primaryKey.Table, primaryKey.Schema));
+                    break;
+                case DropUniqueConstraintOperation unique:
+                    rebuilds.Add((unique.Table, unique.Schema));
+                    break;
+                case DropColumnOperation column:
+                    rebuilds.Add((column.Table, column.Schema));
+                    break;
+                case AlterColumnOperation column:
+                    rebuilds.Add((column.Table, column.Schema));
+                    break;
+                case AddColumnOperation column when column.Comment is not null:
+                    rebuilds.Add((column.Table, column.Schema));
+                    break;
+                case AddForeignKeyOperation foreignKey
+                    when !createdTables.Contains((foreignKey.Table, foreignKey.Schema)):
+                    rebuilds.Add((foreignKey.Table, foreignKey.Schema));
+                    break;
+
+                case RenameTableOperation rename:
+                    if (rebuilds.Remove((rename.Name, rename.Schema)))
+                    {
+                        rebuilds.Add(
+                            (rename.NewName ?? rename.Name, rename.NewSchema ?? rename.Schema));
+                    }
+                    break;
+            }
         }
 
-        var hasForeignKeyDependency = targetTable.ForeignKeyConstraints
-                .Concat(targetTable.ReferencingForeignKeyConstraints)
-                .Any(foreignKey => foreignKey.Columns.Contains(targetColumn)
-                    || foreignKey.PrincipalColumns.Contains(targetColumn));
-        var hasTableConstraintDependency = targetTable.PrimaryKey is { Columns.Count: > 1 } primaryKey
-                && primaryKey.Columns.Contains(targetColumn)
-            || targetTable.UniqueConstraints.Any(uniqueConstraint =>
-                uniqueConstraint != targetTable.PrimaryKey
-                && uniqueConstraint.Columns.Contains(targetColumn));
-        if (hasForeignKeyDependency
-            || hasTableConstraintDependency
-            || targetTable.Triggers.Any()
-            || targetTable.Columns.Any(column => column.ComputedColumnSql is not null))
+        return rebuilds;
+    }
+
+    public static IReadOnlyList<MigrationOperation> Plan(
+        IReadOnlyList<MigrationOperation> operations,
+        IModel? model)
+    {
+        var planned = new List<MigrationOperation>(operations.Count);
+        foreach (var operation in operations)
         {
-            throw new NotSupportedException(
-                $"The managed local provider cannot safely rename column '{operation.Name}' on '{operation.Table}' because the target table has foreign key, table-constraint, trigger, or computed-column dependencies.");
+            switch (operation)
+            {
+                case CreateTableOperation createTable:
+                    foreach (var column in createTable.Columns)
+                        ValidateComputedColumn(column);
+                    foreach (var check in createTable.CheckConstraints)
+                        ValidateExpression(check.Sql, "check constraint", check.Name, createTable.Name);
+                    break;
+
+                case AddColumnOperation column:
+                    ValidateComputedColumn(column);
+                    if (column.ComputedColumnSql is not null && column.IsStored is true)
+                        ValidateRebuildTable(column.Table, column.Schema, model);
+                    break;
+
+                case AlterColumnOperation column:
+                    ValidateComputedColumn(column);
+                    ValidateRebuildTable(column.Table, column.Schema, model);
+                    break;
+
+                case CreateIndexOperation index:
+                    if (index.Filter is not null)
+                        ValidateExpression(index.Filter, "filtered index", index.Name, index.Table);
+                    break;
+
+                case RenameIndexOperation rename:
+                    ValidateRenameIndex(rename, model);
+                    break;
+
+                case AddCheckConstraintOperation check:
+                    ValidateExpression(check.Sql, "check constraint", check.Name, check.Table);
+                    ValidateRebuildTable(check.Table, check.Schema, model);
+                    break;
+
+                case AddUniqueConstraintOperation unique:
+                    ValidateRebuildTable(unique.Table, unique.Schema, model);
+                    break;
+
+                case DropCheckConstraintOperation check:
+                    ValidateRebuildTable(check.Table, check.Schema, model);
+                    break;
+
+                case DropUniqueConstraintOperation unique:
+                    ValidateRebuildTable(unique.Table, unique.Schema, model);
+                    break;
+
+                case AddPrimaryKeyOperation primaryKey:
+                    ValidateRebuildTable(primaryKey.Table, primaryKey.Schema, model);
+                    break;
+
+                case DropPrimaryKeyOperation primaryKey:
+                    ValidateRebuildTable(primaryKey.Table, primaryKey.Schema, model);
+                    break;
+
+                case AddForeignKeyOperation foreignKey:
+                    if (!operations.OfType<CreateTableOperation>().Any(
+                            table => table.Name == foreignKey.Table
+                                && table.Schema == foreignKey.Schema))
+                    {
+                        ValidateRebuildTable(foreignKey.Table, foreignKey.Schema, model);
+                    }
+                    break;
+
+                case DropForeignKeyOperation foreignKey:
+                    ValidateRebuildTable(foreignKey.Table, foreignKey.Schema, model);
+                    break;
+
+                case DropColumnOperation column:
+                    ValidateRebuildTable(column.Table, column.Schema, model);
+                    break;
+
+                case AlterTableOperation table:
+                    ValidateRebuildTable(table.Name, table.Schema, model);
+                    break;
+
+                case RenameTableOperation rename
+                    when rename.NewSchema is not null && rename.NewSchema != rename.Schema:
+                    throw new NotSupportedException(
+                        $"The managed local provider cannot move table '{rename.Name}' between attached schemas.");
+            }
+
+            if (operation is AddColumnOperation
+                {
+                    ComputedColumnSql: not null,
+                    IsStored: true
+                } storedColumn)
+            {
+                planned.Add(
+                    new DropColumnOperation
+                    {
+                        Name = storedColumn.Name,
+                        Table = storedColumn.Table,
+                        Schema = storedColumn.Schema
+                    });
+            }
+
+            planned.Add(operation);
         }
+
+        return planned;
+    }
+
+    public static void ValidateIdempotent(
+        IReadOnlyList<MigrationOperation> operations,
+        bool standaloneScript)
+    {
+        foreach (var operation in operations)
+        {
+            if (operation is RenameTableOperation
+                or RenameColumnOperation
+                or InsertDataOperation
+                or UpdateDataOperation
+                or DeleteDataOperation
+                or SqlOperation
+                || operation is AddColumnOperation
+                {
+                    ComputedColumnSql: null
+                }
+                || operation is AddColumnOperation
+                {
+                    IsStored: not true
+                })
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider cannot generate an honest idempotent script for '{operation.GetType().Name}' because SQLite cannot conditionally execute that operation.");
+            }
+
+            if (standaloneScript
+                && operation is not CreateTableOperation
+                && operation is not CreateIndexOperation
+                && operation is not EnsureSchemaOperation)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider cannot generate an honest standalone idempotent script for '{operation.GetType().Name}' because SQLite has no procedural __EFMigrationsHistory guard.");
+            }
+        }
+    }
+
+    private static void ValidateRebuildTable(string table, string? schema, IModel? model)
+    {
+        var relationalTable = model?.GetRelationalModel().FindTable(table, schema);
+        if (relationalTable is null)
+        {
+            throw new InvalidOperationException(
+                $"Rebuilding table '{table}' requires the target relational model so columns, indexes, foreign keys, defaults, generated expressions, and collations can be preserved.");
+        }
+
+        foreach (var column in relationalTable.Columns)
+        {
+            if (column.ComputedColumnSql is { } expression)
+                ValidateExpression(expression, "computed column", column.Name, table);
+        }
+
+        foreach (var check in relationalTable.CheckConstraints)
+            ValidateExpression(check.Sql, "check constraint", check.Name ?? "<unnamed>", table);
+
+        foreach (var index in relationalTable.Indexes)
+        {
+            if (index.Filter is { } filter)
+                ValidateExpression(filter, "filtered index", index.Name, table);
+        }
+    }
+
+    private static void ValidateComputedColumn(ColumnOperation operation)
+    {
+        if (operation.ComputedColumnSql is { } expression)
+            ValidateExpression(expression, "computed column", operation.Name, operation.Table);
     }
 
     private static void ValidateRenameIndex(RenameIndexOperation operation, IModel? model)
@@ -194,26 +566,96 @@ public sealed class AhtolaManagedSqliteMigrationsSqlGenerator(
                 $"The managed local provider can rename index '{operation.Name}' on '{operation.Table}' only when the target model contains '{operation.NewName}'.");
         }
 
-        ValidateCreateIndex(CreateIndexOperation.CreateFrom(targetIndex));
+        if (targetIndex.Filter is { } filter)
+            ValidateExpression(filter, "filtered index", targetIndex.Name, operation.Table!);
     }
 
-    private static void ValidateCreateIndex(CreateIndexOperation operation)
+    private static void ValidateExpression(string expression, string kind, string name, string table)
     {
-        if (operation.Filter is not null)
+        if (string.IsNullOrWhiteSpace(expression)
+            || ContainsUnsafeSql(expression))
         {
             throw new NotSupportedException(
-                $"The managed local provider does not support filtered indexes ('{operation.Name}' on '{operation.Table}').");
+                $"The managed local provider cannot use expression '{expression}' for {kind} '{name}' on '{table}'.");
         }
-
     }
 
-    private static void ValidateComputedColumn(ColumnOperation operation)
+    private static bool ContainsUnsafeSql(string sql)
     {
-        if (operation.ComputedColumnSql is not null && operation.IsStored is true)
+        for (var index = 0; index < sql.Length;)
         {
-            throw new NotSupportedException(
-                $"The managed local provider does not support STORED computed columns for '{operation.Name}' on '{operation.Table}'. " +
-                "Declare the computed column as VIRTUAL.");
+            var value = sql[index];
+            if (value == '\0' || value == ';')
+                return true;
+
+            if (value is '\'' or '"' or '`' or '[')
+            {
+                if (!SkipQuoted(sql, ref index, value))
+                    return true;
+
+                continue;
+            }
+
+            if ((value == '-'
+                    && index + 1 < sql.Length
+                    && sql[index + 1] == '-')
+                || (value == '/'
+                    && index + 1 < sql.Length
+                    && sql[index + 1] == '*'))
+            {
+                return true;
+            }
+
+            if (IsIdentifierCharacter(value))
+            {
+                var start = index++;
+                while (index < sql.Length && IsIdentifierCharacter(sql[index]))
+                    index++;
+
+                var token = sql.AsSpan(start, index - start);
+                if (token.Equals("SELECT", StringComparison.OrdinalIgnoreCase)
+                    || token.Equals("OVER", StringComparison.OrdinalIgnoreCase)
+                    || token.Equals("PRAGMA", StringComparison.OrdinalIgnoreCase)
+                    || token.Equals("ATTACH", StringComparison.OrdinalIgnoreCase)
+                    || token.Equals("DETACH", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            index++;
         }
+
+        return false;
     }
+
+    private static bool SkipQuoted(string sql, ref int index, char opening)
+    {
+        var closing = opening == '[' ? ']' : opening;
+        index++;
+        while (index < sql.Length)
+        {
+            if (sql[index] != closing)
+            {
+                index++;
+                continue;
+            }
+
+            index++;
+            if (index < sql.Length && sql[index] == closing && opening != '[')
+            {
+                index++;
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsIdentifierCharacter(char value)
+        => char.IsLetterOrDigit(value) || value is '_' or '$';
 }

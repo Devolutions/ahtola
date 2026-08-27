@@ -1,6 +1,6 @@
 # The managed vector index method (`USING vector`)
 
-Ahtola ships a pure-managed approximate-nearest-neighbour index method that answers
+Ahtola ships pure-managed dense IVF and sparse component-posting index implementations that answer
 `ORDER BY vector_distance_*(col, ?) LIMIT n` **exactly**. It is registered as `vector` on the
 [managed index-method foundation](managed-index-methods.md) and shares that foundation's lifecycle,
 transaction, journal, cost and EXPLAIN machinery.
@@ -25,6 +25,14 @@ CREATE INDEX docs_knn ON docs USING vector (embedding)
 
 DROP INDEX docs_knn;   -- runs Destroy
 REINDEX docs_knn;      -- retrains centroids and rebuilds postings, atomically
+
+CREATE INDEX docs_sparse
+    ON docs USING vector (sparse_embedding)
+    WITH ( metric = 'jaccard',
+           encoding = 'float32_sparse',
+           dims = 1000,
+           exact = 1,
+           min_rows = 512 );
 ```
 
 Nothing in the parser changed: `CREATE INDEX … USING m (cols) WITH (k = literal)` and the inherited
@@ -38,8 +46,8 @@ behaviour is not implemented is rejected with a message that says so.
 
 | Key | Values | Default | Effect |
 | --- | --- | --- | --- |
-| `metric` | `l2`, `cosine`, `dot` | `l2` | Binds the index to exactly one `vector_distance_*` call. `jaccard` is rejected: it needs the sparse structure that is not implemented. |
-| `encoding` | `float32`, `float64`, `float8`, `float1bit` | `float32` | The column's serialized encoding. `float32_sparse` is rejected for the same reason as `jaccard`. |
+| `metric` | `l2`, `cosine`, `dot`, `jaccard` | `l2` | Binds the index to exactly one `vector_distance_*` call. `jaccard` is accepted only with `float32_sparse`. |
+| `encoding` | `float32`, `float64`, `float8`, `float1bit`, `float32_sparse` | `float32` | The column's serialized encoding. `float32_sparse` is accepted only with `jaccard`. |
 | `dims` | 1 … 2048 | **required** | Declared, never inferred: an index whose dimensionality came from row 1 would change meaning when row 1 was deleted. |
 | `lists` | 1 … 4096 | `64` | Inverted lists (k-means clusters). Persisted; changing it is a schema change. |
 | `probes` | 1 … `lists` | `ceil(sqrt(lists))` | Where the certificate loop *starts*. A speed knob, never a correctness knob. |
@@ -48,6 +56,10 @@ behaviour is not implemented is rejected with a message that says so.
 | `train_sample` | 256 … 65536 | `32768` | Reservoir size, drawn in rowid order. |
 | `exact` | `1` | `1` | Exact mode is the only mode shipped. `exact = 0` is **rejected**, not silently upgraded. |
 | `min_rows` | ≥ 0 | `512` | Below this many live rows the index declines and the scan wins. |
+
+`lists`, `probes`, `seed`, `iters`, and `train_sample` describe dense IVF and are rejected when
+`encoding = 'float32_sparse'`; accepting knobs that do nothing would make the declaration
+misleading. Sparse declarations consume `dims`, `metric`, `encoding`, `exact`, and `min_rows`.
 
 `l2` over `float1bit` is rejected at `CREATE INDEX`, because the scalar evaluator has no L2 distance
 for bit vectors: such an index could only ever serve a query that errors on its first row.
@@ -110,11 +122,11 @@ cannot resurrect its old assignment.
 4. After at least `probes` lists, compare the bound of the *next* unprobed list against the k-th best
    reported distance so far. Because the order is ascending, that single comparison certifies every
    remaining list at once: if the bound is strictly greater, no unprobed row can enter the top-k.
-5. Return every reranked row that ties with or beats the k-th best, **in scan order**.
+5. Return every reranked row that ties with or beats the k-th best, **in ascending rowid order**.
 
 The engine's own `ORDER BY` then sorts and truncates that set. Its sort is stable — ties resolve by
-scan position (`EmbeddedDatabase.cs`, "ORDER BY ties follow the scan order the query produced") — so
-emitting candidates in scan order makes the indexed result byte-identical to the unindexed one,
+the table b-tree scan's ascending rowid order — so emitting candidates in rowid order makes the
+indexed result byte-identical to the unindexed one,
 including tie order and the emitted distance values.
 
 ### Why it is exact
@@ -144,6 +156,23 @@ scalar evaluator *reports* is not the exact real distance:
 
 Radii are stored as **upper** bounds and only ever recomputed downward by `REINDEX`/`Optimize`, so a
 stale radius costs probes and never recall.
+
+## Structure: exact sparse Jaccard postings
+
+The sparse implementation keeps an ascending posting set for every nonzero component and an
+authoritative rowid-to-component placement. Positive finite rows are candidates when they share a
+component with the query. Every omitted positive row then has an empty intersection and distance
+exactly `1`; it may be omitted only after the current k-th result is strictly below `1`. Otherwise
+all remaining rows are scored. Negative rows are always reranked, and a negative, non-finite, empty,
+or otherwise uncertifiable query forces an exhaustive scalar-equivalent pass. There are no
+heuristic cutoffs.
+
+Sparse blobs are validated before allocation: type, exact payload shape, declared dimensionality,
+entry count, strictly increasing component indexes, and index bounds must all agree. Because entry
+count cannot exceed declared `dims` (at most 2048 for an index), malformed input cannot induce an
+unbounded postings allocation. Final scores use the same single-precision accumulation and
+Rust-compatible min/max rules as `vector_distance_jaccard`. Candidate ties are returned as a
+superset in ascending rowid order, preserving deterministic scalar tie behavior.
 
 ### When no bound can be proven
 
@@ -253,10 +282,10 @@ larger than `4 × train_sample` — which re-ran k-means on every single refresh
 | DML | Journal driven. Every `INSERT`/`UPDATE`/`DELETE`/`REPLACE`/upsert, trigger body and foreign-key cascade funnels through the engine's single row-change reporter, so the index sees every touched rowid and reconciles in `O(changed)`. A row that cannot be indexed is recorded, never rejected: DML must not fail because of an index. |
 | Refresh | `source.Revision == appliedRevision` ⇒ `O(1)`; a proven journal delta ⇒ `O(changed)`; otherwise a full rebuild of the postings from the base rows. |
 | Drift | When the live row count reaches four times, or a quarter of, the **eligible population the centroids were fitted to**, the next refresh retrains. It is never compared against the capped `train_sample` reservoir. Drift never costs recall — the certificate simply stops pruning — but it does cost speed, and the cost model prices that. |
-| `REINDEX` | Retrains centroids **and** rebuilds postings into a detached structure, publishing only on success. A throw leaves the previous index live and queryable. |
-| `Optimize` (opcode 109) | Compaction only. It reclaims tombstoned posting slots and recomputes radii exactly, which can only shrink an upper bound. It never trains centroids itself; the refresh it performs first follows the ordinary drift rule above. It never runs inline in DML. |
+| `REINDEX` | Dense: retrains centroids and rebuilds postings. Sparse: deterministically rebuilds component postings. Both build detached and publish only on success. |
+| `Optimize` (opcode 109) | Dense: compacts tombstones/recomputes radii. Sparse: rebuilds compact sorted posting sets. It never runs inline in DML. |
 | `DROP INDEX` | Runs `Destroy`, clearing centroids and postings. |
-| Rollback / savepoint | Inherited: `Fork()` starts with empty postings and carries the immutable centroids, so a rolled-back statement leaves no assignments behind and does not silently re-cluster. |
+| Rollback / savepoint | Inherited: `Fork()` starts with empty derived postings (and dense forks carry immutable centroids), so rolled-back assignments cannot leak. |
 
 ## Cost model
 
@@ -285,6 +314,11 @@ The practical consequence is that adversarial data re-prices itself out. On a co
 can be pruned, the first query is exact but reads everything; the measured fraction rises to one, and
 every later query takes the scan instead.
 
+Sparse pricing uses the same feedback rule with posting candidates rather than IVF lists. Its cold
+estimate is one quarter of the live rows; after execution the measured rerank fraction replaces that
+estimate. An empty-intersection tie at distance `1`, unsafe values, or broad postings can therefore
+make the first search exhaustive, after which the sparse path honestly loses to the scan.
+
 ### Planning is deferred
 
 Pricing a candidate never opens it. The planner asks each method index what a pattern would cost
@@ -309,9 +343,10 @@ SEARCH docs USING INDEX METHOD vector INDEX docs_knn
 
 ## State envelope
 
-`/*ahtola-index-method:1:<base64>*/` appended to the stored `CREATE INDEX` text — written, rolled
-back and recovered by the same pager/WAL transaction as the rest of `sqlite_schema`. Only centroids
-and configuration are persisted; assignments, postings and radii are derived.
+`/*ahtola-index-method:1:<base64>*/` appended to the stored `CREATE INDEX` text is written, rolled
+back and recovered by the same pager/WAL transaction as the rest of `sqlite_schema`. Dense state
+persists centroids and configuration; sparse state persists a fixed 36-byte declaration envelope.
+Assignments, component postings and radii are always derived from base rows.
 
 ```
 0   u32  magic 'A' 'V' 'I' 'X'
@@ -347,6 +382,12 @@ Every check runs **before** the centroid array is allocated:
 | envelope larger than 4 MiB | rejected before decode: `vector index state would exceed 4194304 bytes` |
 | lookalike comment on an ordinary index | left untouched |
 
+The sparse envelope carries magic `AHSP`, version and exact length, dimensions, encoding, metric,
+exact mode, `min_rows`, and a CRC-32. Length, magic, version, checksum, and every declaration field
+are checked before any postings are allocated. It intentionally stores no rowids: reopen, WAL
+recovery, backup and `VACUUM INTO` reconstruct postings from the recovered table, avoiding a second
+source of truth.
+
 A database carrying a method index is Ahtola/Turso-only: `CREATE INDEX … USING …` is not parseable by
 stock SQLite. That is asserted, not assumed.
 
@@ -359,7 +400,7 @@ stock SQLite. That is asserted, not assumed.
 | `train_sample` | 256 … 65536 |
 | `iters` | 16 |
 | centroid state | 4 MiB |
-| reranked candidates per search | 1 000 000, above which the search reads everything instead of truncating |
+| reranked candidates per search | 1 000 000; collection stops at the cap, releases the partial set, then takes the exact exhaustive path |
 | indexed columns | exactly 1 |
 | worst-case query | one full scan plus one centroid pass — never worse than the plan it replaced |
 
@@ -383,8 +424,8 @@ argument orders. Turso's heuristic knobs are deliberately not ported.
 
 Honest limits of the Ahtola implementation:
 
-- **Sparse vectors and `jaccard` are not implemented.** Both are rejected at `CREATE INDEX` with a
-  message that says why, rather than silently downgraded.
+- **Sparse indexing is exact-only.** It supports only the `float32_sparse`/`jaccard` pair. Dense
+  encodings cannot request Jaccard, and sparse encoding cannot request another metric.
 - **Approximate mode is not implemented.** `exact = 0` is rejected. There is therefore no
   configuration in which a `LIMIT`ed KNN query returns a different row set than the same query
   without the index.
@@ -408,7 +449,8 @@ Honest limits of the Ahtola implementation:
 | `ManagedVectorIndexDeterminismTests` | generator determinism, identical envelopes across databases, insertion-order independence, seed independence of the answer, REINDEX idempotence |
 | `ManagedVectorIndexMaintenanceTests` | incremental DML, reused rowids, triggers and cascades, REINDEX, Optimize, DROP, growth-driven retraining, delta vs full rebuild |
 | `ManagedVectorIndexTransactionTests` | rollback, nested savepoints, DDL rollback, MVCC declarations, fork emptiness |
-| `ManagedVectorIndexDurabilityTests` | reopen, crash, VACUUM/backup, the full corruption matrix, pre-allocation size rejection, stock-SQLite non-interop |
+| `ManagedVectorIndexDurabilityTests` | reopen, crash, VACUUM/backup, the dense corruption matrix, pre-allocation size rejection, stock-SQLite non-interop |
+| `ManagedSparseVectorIndexTests` | exact scalar parity/ties, planner use, DML/reused rowids/triggers/cascades, rollback/savepoints, REINDEX/Optimize, reopen/WAL/VACUUM, bounded decode and state corruption |
 | `ManagedVectorIndexingBridgeTests` | bit-for-bit parity between `DistanceExact` and every `vector_distance_*` across all encodings |
 | `ManagedIndexMethodAotSafetyTests` | no reflection, no runtime generics, no ambient randomness or clock reads in the shipped method sources |
 | `VdbeIndexMethodOpcodeTests` | opcode numbers unchanged; the vector method drives the same opcodes as FTS |

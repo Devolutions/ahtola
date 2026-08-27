@@ -14,6 +14,40 @@ namespace Ahtola.Tests;
 public sealed class ManagedTempSchemaObjectTests
 {
     [Test]
+    public void TempStoreChangeBeforeTempDatabaseExistsSurvivesRollback()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Execute(connection, "BEGIN;");
+        Execute(connection, "PRAGMA temp_store = MEMORY;");
+        Execute(connection, "ROLLBACK;");
+
+        ReadRows(connection, "PRAGMA temp_store;").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Integer(2));
+    }
+
+    [Test]
+    public void TempStoreChangeKeepsTransactionOwnershipForSubsequentTempDdl()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Execute(connection, "BEGIN;");
+        Execute(connection, "PRAGMA temp_store = MEMORY;");
+        Execute(connection, "CREATE TEMP TABLE t(x INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1);");
+        ReadRows(connection, "SELECT x FROM t;").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Integer(1));
+        Execute(connection, "ROLLBACK;");
+
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "SELECT x FROM t;"))!
+            .Message.Should().Be("no such table: t");
+        ReadRows(connection, "PRAGMA temp_store;").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Integer(2));
+    }
+
+    [Test]
     public void TempViewAndTriggerAreInvisibleToAnotherConnection()
     {
         using var database = new EmbeddedDatabase();

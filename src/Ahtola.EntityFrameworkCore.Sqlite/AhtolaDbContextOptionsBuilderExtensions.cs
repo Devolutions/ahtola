@@ -18,7 +18,7 @@ namespace Microsoft.EntityFrameworkCore;
 
 public static class AhtolaDbContextOptionsBuilderExtensions
 {
-    #if NET10_0_OR_GREATER
+#if NET10_0_OR_GREATER
     private const int SupportedEntityFrameworkCoreMajorVersion = 10;
 #else
     private const int SupportedEntityFrameworkCoreMajorVersion = 9;
@@ -86,6 +86,7 @@ public static class AhtolaDbContextOptionsBuilderExtensions
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaReplicaSqliteQuerySqlGeneratorFactory))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteHistoryRepository))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedMigrationCommandExecutor))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaManagedSqliteMigrationsSqlGenerator))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaSqliteParameterBasedSqlProcessorFactory))]
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AhtolaRestrictedSqliteParameterBasedSqlProcessorFactory))]
@@ -114,6 +115,7 @@ public static class AhtolaDbContextOptionsBuilderExtensions
                 .ReplaceService<IQuerySqlGeneratorFactory, AhtolaManagedSqliteQuerySqlGeneratorFactory>()
                 .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, AhtolaManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
                 .ReplaceService<IHistoryRepository, AhtolaManagedSqliteHistoryRepository>()
+                .ReplaceService<IMigrationCommandExecutor, AhtolaManagedMigrationCommandExecutor>()
                 .ReplaceService<IMigrationsSqlGenerator, AhtolaManagedSqliteMigrationsSqlGenerator>()
                 .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, AhtolaSqliteParameterBasedSqlProcessorFactory>(),
 
@@ -121,6 +123,7 @@ public static class AhtolaDbContextOptionsBuilderExtensions
                 .ReplaceService<IQuerySqlGeneratorFactory, AhtolaReplicaSqliteQuerySqlGeneratorFactory>()
                 .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, AhtolaManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
                 .ReplaceService<IHistoryRepository, AhtolaManagedSqliteHistoryRepository>()
+                .ReplaceService<IMigrationCommandExecutor, AhtolaManagedMigrationCommandExecutor>()
                 .ReplaceService<IMigrationsSqlGenerator, AhtolaManagedSqliteMigrationsSqlGenerator>()
                 .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, AhtolaRestrictedSqliteParameterBasedSqlProcessorFactory>(),
 

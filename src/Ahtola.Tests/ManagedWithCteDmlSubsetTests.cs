@@ -1,5 +1,6 @@
 using AwesomeAssertions;
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
 
@@ -180,10 +181,6 @@ public class ManagedWithCteDmlSubsetTests
             Assert.Throws<EmbeddedSqlException>(() => expired.Step())!
                 .Message.Should().Contain("no such table: attempted");
 
-        Assert.Throws<EmbeddedSqlException>(() => connection.Prepare(
-            "WITH attempted AS (INSERT INTO target VALUES (3) RETURNING id) SELECT * FROM attempted;"))!
-            .Message.Should().Contain("writable CTEs are not supported");
-
         using var schemaQualified = connection.Prepare(
             "WITH attempted AS (SELECT id FROM main.target) INSERT INTO target SELECT id FROM attempted;");
         Assert.Throws<EmbeddedSqlException>(() => schemaQualified.Step())!
@@ -198,6 +195,276 @@ public class ManagedWithCteDmlSubsetTests
         using var finalRows = connection.Prepare("SELECT id FROM target ORDER BY id;");
         AssertRows(ReadRows(finalRows), [SqlValue.Integer(1)], [SqlValue.Integer(3)]);
     }
+
+    [Test]
+    public void WritableCteExecutesOnStepMaterializesReturningAndRunsOnce()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);");
+        Execute(connection, "INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);");
+
+        using var statement = connection.Prepare("""
+            WITH changed AS (
+                UPDATE target
+                SET value = value + 5
+                WHERE id <= 2
+                RETURNING id, value
+            )
+            SELECT a.id, a.value, b.value
+            FROM changed AS a
+            JOIN changed AS b ON b.id = a.id
+            ORDER BY a.id;
+            """);
+
+        statement.GetColumnName(0).Should().Be("id");
+        Scalar(connection, "SELECT sum(value) FROM target;").Should().Be(60);
+
+        AssertRows(
+            ReadRows(statement),
+            [SqlValue.Integer(1), SqlValue.Integer(15), SqlValue.Integer(15)],
+            [SqlValue.Integer(2), SqlValue.Integer(25), SqlValue.Integer(25)]);
+        statement.RowsAffected.Should().Be(2);
+        Scalar(connection, "SELECT sum(value) FROM target;").Should().Be(70);
+        Scalar(connection, "SELECT changes();").Should().Be(2);
+    }
+
+    [Test]
+    public void WritableCtesRunEagerlyAndRollbackTogetherOnFailure()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);");
+        Execute(connection, "INSERT INTO target VALUES (1, 10);");
+
+        Execute(connection, """
+            WITH unused AS (
+                UPDATE target SET value = value + 1 RETURNING id
+            )
+            SELECT 1;
+            """);
+        Scalar(connection, "SELECT value FROM target;").Should().Be(11);
+
+        using var failed = connection.Prepare("""
+            WITH changed AS (
+                UPDATE target SET value = value + 100 RETURNING id
+            ),
+            duplicate AS (
+                INSERT INTO target VALUES (1, 999) RETURNING id
+            )
+            SELECT * FROM changed;
+            """);
+        Assert.Throws<EmbeddedSqlException>(() => failed.Step())!
+            .Message.Should().Contain("UNIQUE constraint failed");
+        Scalar(connection, "SELECT value FROM target;").Should().Be(11);
+    }
+
+    [Test]
+    public void WritableCtesHonorTriggersForeignKeysAndSavepointRollback()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "PRAGMA foreign_keys = ON;");
+        Execute(connection, "CREATE TABLE parent(id INTEGER PRIMARY KEY, value INTEGER);");
+        Execute(connection, "CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));");
+        Execute(connection, "CREATE TABLE audit(parent_id INTEGER, value INTEGER);");
+        Execute(connection, "INSERT INTO parent VALUES (1, 10);");
+        Execute(connection, "INSERT INTO child VALUES (1);");
+        Execute(connection, """
+            CREATE TRIGGER parent_audit AFTER UPDATE ON parent
+            BEGIN
+                INSERT INTO audit VALUES (NEW.id, NEW.value);
+            END;
+            """);
+
+        Execute(connection, "BEGIN;");
+        Execute(connection, "SAVEPOINT writable_cte;");
+        using (var changed = connection.Prepare("""
+                   WITH changed AS (
+                       UPDATE parent SET value = value + 1 RETURNING id, value
+                   )
+                   SELECT id, value FROM changed;
+                   """))
+        {
+            AssertRows(ReadRows(changed), [SqlValue.Integer(1), SqlValue.Integer(11)]);
+            changed.RowsAffected.Should().Be(1);
+        }
+        Scalar(connection, "SELECT value FROM parent;").Should().Be(11);
+        Scalar(connection, "SELECT count(*) FROM audit;").Should().Be(1);
+        Execute(connection, "ROLLBACK TO writable_cte;");
+        Execute(connection, "RELEASE writable_cte;");
+        Execute(connection, "COMMIT;");
+        Scalar(connection, "SELECT value FROM parent;").Should().Be(10);
+        Scalar(connection, "SELECT count(*) FROM audit;").Should().Be(0);
+
+        using var failed = connection.Prepare("""
+            WITH changed AS (
+                UPDATE parent SET value = value + 100 RETURNING id
+            ),
+            removed AS (
+                DELETE FROM parent WHERE id = 1 RETURNING id
+            )
+            SELECT * FROM changed;
+            """);
+        Assert.Throws<EmbeddedSqlException>(() => failed.Step())!
+            .Message.Should().Contain("FOREIGN KEY constraint failed");
+        Scalar(connection, "SELECT value FROM parent;").Should().Be(10);
+        Scalar(connection, "SELECT count(*) FROM audit;").Should().Be(0);
+    }
+
+    [Test]
+    public void WritableCteNestedInDerivedTableDescribesBodyWithoutExecutingDuringPrepare()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);");
+        Execute(connection, "INSERT INTO target VALUES (1, 10);");
+
+        using var statement = connection.Prepare("""
+            SELECT id, value
+            FROM (
+                WITH changed AS (
+                    UPDATE target SET value = value + 1 RETURNING id, value
+                )
+                SELECT id, value FROM changed
+            );
+            """);
+
+        statement.GetColumnName(0).Should().Be("id");
+        statement.GetColumnName(1).Should().Be("value");
+        Scalar(connection, "SELECT value FROM target;").Should().Be(10);
+        AssertRows(ReadRows(statement), [SqlValue.Integer(1), SqlValue.Integer(11)]);
+        Scalar(connection, "SELECT value FROM target;").Should().Be(11);
+    }
+
+    [Test]
+    public void WritableCteNestedInViewDescribesBodyWithoutExecutingDuringPrepare()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);");
+        Execute(connection, "INSERT INTO target VALUES (1, 10);");
+        Execute(connection, """
+            CREATE VIEW changed_target AS
+            WITH changed AS (
+                UPDATE target SET value = value + 1 RETURNING id, value
+            )
+            SELECT id, value FROM changed;
+            """);
+
+        using var statement = connection.Prepare("SELECT id, value FROM changed_target;");
+
+        statement.GetColumnName(0).Should().Be("id");
+        statement.GetColumnName(1).Should().Be("value");
+        Scalar(connection, "SELECT value FROM target;").Should().Be(10);
+        AssertRows(ReadRows(statement), [SqlValue.Integer(1), SqlValue.Integer(11)]);
+        Scalar(connection, "SELECT value FROM target;").Should().Be(11);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void NestedWritableCtePersistsAcrossFileReopen(bool throughView)
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "nested-writable-cte.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            CreateNestedWritableCteFixture(connection, throughView);
+            using var statement = connection.Prepare(NestedWritableCteSql(throughView));
+            AssertRows(ReadRows(statement), [SqlValue.Integer(1), SqlValue.Integer(11)]);
+            statement.RowsAffected.Should().Be(1);
+            Scalar(connection, "SELECT changes();").Should().Be(1);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true);
+        using var reopenedConnection = reopened.Connect();
+        Scalar(reopenedConnection, "SELECT value FROM target;").Should().Be(11);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void QueryOnlyRejectsNestedWritableCte(bool throughView)
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        CreateNestedWritableCteFixture(connection, throughView);
+        Execute(connection, "PRAGMA query_only = ON;");
+
+        using var statement = connection.Prepare(NestedWritableCteSql(throughView));
+        Assert.Throws<EmbeddedSqlException>(() => statement.Step())!
+            .Message.Should().Contain("readonly database");
+        Scalar(connection, "SELECT value FROM target;").Should().Be(10);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void ReadOnlyDatabaseRejectsNestedWritableCte(bool throughView)
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "readonly-nested-writable-cte.db";
+        using (var writable = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var setup = writable.Connect())
+            CreateNestedWritableCteFixture(setup, throughView);
+
+        using var database = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true);
+        using var connection = database.Connect();
+        using var statement = connection.Prepare(NestedWritableCteSql(throughView));
+        Assert.Throws<EmbeddedSqlException>(() => statement.Step())!
+            .Message.Should().Contain("readonly database");
+        Scalar(connection, "SELECT value FROM target;").Should().Be(10);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void TransactionRollbackRestoresNestedWritableCte(bool throughView)
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        CreateNestedWritableCteFixture(connection, throughView);
+
+        Execute(connection, "BEGIN;");
+        using (var statement = connection.Prepare(NestedWritableCteSql(throughView)))
+        {
+            AssertRows(ReadRows(statement), [SqlValue.Integer(1), SqlValue.Integer(11)]);
+            statement.RowsAffected.Should().Be(1);
+        }
+        Scalar(connection, "SELECT value FROM target;").Should().Be(11);
+        Execute(connection, "ROLLBACK;");
+
+        Scalar(connection, "SELECT value FROM target;").Should().Be(10);
+    }
+
+    private static void CreateNestedWritableCteFixture(
+        EmbeddedConnection connection,
+        bool throughView)
+    {
+        Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);");
+        Execute(connection, "INSERT INTO target VALUES (1, 10);");
+        if (throughView)
+        {
+            Execute(connection, """
+                CREATE VIEW changed_target AS
+                WITH changed AS (
+                    UPDATE target SET value = value + 1 RETURNING id, value
+                )
+                SELECT id, value FROM changed;
+                """);
+        }
+    }
+
+    private static string NestedWritableCteSql(bool throughView)
+        => throughView
+            ? "SELECT id, value FROM changed_target;"
+            : """
+                SELECT id, value
+                FROM (
+                    WITH changed AS (
+                        UPDATE target SET value = value + 1 RETURNING id, value
+                    )
+                    SELECT id, value FROM changed
+                );
+                """;
 
     private static void Execute(EmbeddedConnection connection, string sql)
     {
@@ -219,6 +486,13 @@ public class ManagedWithCteDmlSubsetTests
         }
 
         return rows;
+    }
+
+    private static long Scalar(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        return statement.GetValue(0).AsInteger();
     }
 
     private static void AssertRows(IReadOnlyList<SqlValue[]> actual, params SqlValue[][] expected)

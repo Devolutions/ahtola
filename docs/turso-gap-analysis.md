@@ -16,9 +16,10 @@ time (171 entries)**; the JSON is the live tracking source of truth. Closure
 progress since analysis (waves F1–F2.18) is recorded in
 [section 11](#11-closure-progress-since-analysis), and current counts are:
 **216 entries, 216 closed, 0 open**; expected-failures file down from
-**606 → 0** lines after Phase 1 MVCC surface (`journal_mode=mvcc` +
-`BEGIN CONCURRENT` + in-process `MvStore`). Remaining MVCC depth (row-version
-cursors, durable logical log, checkpoint SM) is tracked in
+**606 → 2** lines. The two live markers record intentional SQLite-compatible
+STORED-generated-column support beyond the pinned Turso baseline, not missing
+managed behavior. Remaining MVCC depth (row-version cursors, durable logical
+log, checkpoint SM) is tracked in
 [`mvcc-port-contract.md`](mvcc-port-contract.md).
 
 **Ground truth.** `src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt`
@@ -1080,11 +1081,12 @@ push/pull sync path: raw-page bootstrap/page protocol, MVCC `lml3` logical
 decode and transactional replay, opaque revision/protocol/table-map metadata,
 local-change push journaling, independent ambiguous-push recovery, self-origin
 filtering, partial/query bootstrap with lazy page faults, remote page encryption,
-typed conflict quarantine/resolution, and atomic ReplaceBase fallback. It does
-not claim Turso's full native sync engine: zstd page sets, the reusable
-passive-synced-prefix/history checkpoint policy, wait-for-changes, and full
-reference-server qualification remain residuals. Optional companion dispatch
-remains an intentional extension point and is not shipped by this repository.
+typed conflict quarantine/resolution, bounded wait-for-changes long polling, and
+atomic ReplaceBase fallback. It does not claim Turso's full native sync engine:
+zstd page sets, the reusable passive-synced-prefix/history checkpoint policy,
+and full reference-server qualification remain residuals. Optional companion
+dispatch remains an intentional extension point and is not shipped by this
+repository.
 
 ### 9.1 Managed Cloud replica support matrix
 
@@ -1129,11 +1131,11 @@ qualified subset in the matrix above.
 | `sync-no-cdc-capture-pragma` | divergent | s2-capability | L | 0 | 0 | Ahtola implements the public pinned-Turso `capture_data_changes_conn` V1/V2 table surface, but its managed replica intentionally continues to capture committed local changes in the private `<db>.ahtola-replica-journal`. Public CDC is not yet consumed by replica push/pull or logical replay. |
 | `sync-checkpoint-mode-mismatch-vs-managed-storage` | divergent | s2-capability | M | 0 | 0 | Turso's sync checkpoint explicitly composes Passive (checkpoint only the already-synced WAL prefix, tracked by a watermark) followed by Truncate (once fully synced) to ke… |
 | `sync-conflict-error-surfaced-not-handled` | extension | s2-capability | M | 0 | 0 | **Closed as an Ahtola managed extension, not a port.** `AhtolaReplicaPushFailure.Classify` maps every push failure to a stable `AhtolaReplicaPushFailureKind` (Conflict/TransientTransport/InvalidLocalState) at the push response boundary, mirroring Turso's conflict-vs-transient split. A typed conflict now also durably records a `<db>.ahtola-replica-conflict` marker naming the exact rejected batch (first sequence, watermark, reported sequence) and the conservatively classified unresolved subset; explicit, manual, and automatic sync then fail closed with `AhtolaReplicaConflictPendingException` rather than re-pushing a rejected batch. `AhtolaConnection.InspectReplicaConflictAsync`/`ResolveReplicaConflictAsync` expose the two explicit resolutions — `PullAndRebaseEligible` (pull a fresh logical base and replay only provably eligible journaled changes through the existing transactional logical replay and compensation, keeping the marker while anything stays quarantined) and `DiscardUnresolvedChanges` (data-loss-acknowledged journal removal that never advances the remote-ack watermark). Turso upstream (`turso-src/sync/engine/src/database_sync_operations.rs`, `wal_push`) still surfaces a push conflict terminally as `Error::DatabaseSyncEngineConflict` and never rebases, so there is no upstream classification or resolution policy to mirror. Schema conflicts, `Unknown` conflicts, stale sequence references, same-row chains, and page-protocol replicas remain manual by design. Contract: `docs/replica-conflict-resolution.md`. |
-| `sync-connection-pooling-no-replica-awareness` | partial | s3-perf | M | 0 | 0 | Turso's engine has a wait_changes_from_remote long-poll loop that lets a replica connection block until the server reports new changes, enabling push-driven refresh inste… |
+| `sync-connection-pooling-no-replica-awareness` | divergent | s4-intentional | M | 0 | 0 | Managed replicas expose bounded wait-for-changes long polling through `LongPollTimeout`; pooling remains deliberately local-file scoped rather than owning background replica sessions. |
 | `sync-ef-core-provider-no-sync-surface` | closed | s3-perf | M | 0 | 0 | `UseAhtola` accepts direct Turso/Hrana and `Replica Path` connection strings. EF queries, CRUD, migrations, creator operations, and transactions route through the remote/replica-capable SQLite facade; explicit sync remains on the underlying `SqliteConnection`. |
 | `sync-http-pipeline-v2-only-no-v3-websocket` | closed | s4-intentional | M | 0 | 0 | `http`/`https`/`libsql`/`turso` use the Hrana HTTP pipeline (v3 with v2 fallback); `ws`/`wss` open a persistent Hrana WebSocket connection with hrana3/hrana2/hrana1 subprotocol negotiation, request-id multiplexing, v3 cursor paging and bounded reconnect. Targets the legacy libSQL/sqld Hrana WS server — the pinned Turso engine has no native Hrana WS server and maps ws/wss to its HTTP endpoint. wal_push/pull_updates stay with the unported sync engine entries. |
 | `sync-native-provider-companion-intentional` | extension | s4-intentional | S | 0 | 0 | AhtolaNativeProvider's explicit `Register(factory)` hook for an optional 'Turso.Data.Native' companion (used for Local Provider=Native) exists purely as an extension point for… |
-| `sync-no-embedded-sync-engine-port` | partial | s2-capability | L | 0 | 0 | The managed provider now implements raw bootstrap/page pulls, partial prefix and server-side query selection with durable lazy page faults, remote page encryption, pull-only MVCC logical replay, durable local push journaling, independent watermark-based ambiguous-outcome recovery, typed conflict resolution, protocol metadata, and atomic publication. zstd, wait-for-changes, and Turso's reusable passive-prefix/history checkpoint policy remain outside the managed subset. |
+| `sync-no-embedded-sync-engine-port` | partial | s2-capability | L | 0 | 0 | The managed provider implements raw bootstrap/page pulls, partial prefix and server-side query selection with durable lazy page faults, remote page encryption, pull-only MVCC logical replay, durable local push journaling, independent watermark-based ambiguous-outcome recovery, typed conflict resolution, bounded long polling, protocol metadata, and atomic publication. zstd and Turso's reusable passive-prefix/history checkpoint policy remain outside the managed subset. |
 | `sync-no-mvcc-logical-log-replay` | closed | s2-capability | L | 0 | 0 | The managed pull path decodes Turso v0.7.2 portable `lml3` transactions, validates range/frame CRCs and bounds, replays header/schema/row changes atomically, persists protocol/table maps, filters client echoes, and compensates post-commit metadata failures. |
 | `sync-no-page-protocol-pull-decode` | partial | s2-capability | M | 0 | 0 | Raw 4-KiB page bootstrap/incremental streams and protocol-2 full ReplaceBase fallback are decoded and atomically published. Prefix and targeted missing-page selectors use Turso's portable RoaringBitmap page-selector protocol (tag 5); query bootstrap emits the tag-7 `server_query_selector` string alone on the one bootstrap request. zstd remains explicitly rejected. |
 | `sync-no-partial-sync-lazy-page-storage` | closed | s2-capability | L | 0 | 0 | Incomplete prefix and query-selected images publish only after their bootstrap marker, metadata, and integrity-protected page-state sidecar are durable. The sidecar stores arbitrary unordered/non-contiguous page sets as a run list, so worst-case scattered query selections cost one run per page. Pager reads coalesce targeted pulls pinned to the bootstrap revision, validate page identity and size before durable publication, support optional segment prefetch, persist across reopen, and use write-ahead mutation intents plus process-exclusive physical ownership. Tracked local changes are pushed before the pinned image is completed for ordinary revision-advancing sync. |
@@ -1302,9 +1304,10 @@ removed from `managed-sqltest-expected-failures.txt` → inventory entry flipped
 **Totals.** 181 entries closed since analysis (183 including the 2 `parity`
 entries closed at analysis time); the inventory grew 171 → **216** entries as
 closure work surfaced adjacent gaps that were recorded rather than folded in;
-the expected-failures file dropped **606 → 0** lines (all cleared; lines
-multi-map, so a cleared line may redistribute to the next blocker in its
-chain rather than disappear). One deliberate extension was recorded:
+the expected-failures file dropped **606 → 0** lines by F5, then F6 added two
+intentional Turso-negative markers for SQLite-compatible STORED generated
+columns. Lines multi-map, so a cleared line may redistribute to the next
+blocker in its chain rather than disappear. One earlier deliberate extension was recorded:
 `compile-ordered-aggregates-intentional-extension` (s4 — Ahtola keeps ordered
 aggregates because the EF Core provider depends on them).
 
@@ -1451,12 +1454,15 @@ defects, all now closed with regression coverage in
   `EXPLAIN QUERY PLAN` advertises is the plan that executes.
 
 **Current residual (honest, not scoreboard).** Inventory is **216 closed · 0 open**,
-but “closed” includes intentional scope and closed-with-residual notes (e.g.
-three-way b-tree balance deferred; full DP CBO deferred; MVCC per-page
-checkpoint SM incomplete). Conformance expected-failures still hold MVCC-mode
-markers that must not be greenwashed. Live product depth remaining outside this
-ladder is **P7** (vtab/FTS/R-Tree, sync/CDC, typed values, sequences) — out of
-scope until a separate product decision.
+and the live conformance expected-failures file contains two intentional
+Turso-negative markers for STORED generated columns. “Closed” still includes
+intentional scope and closed-with-residual notes: recursive b-tree
+balancing can still fall back to a catalog rewrite, the general planner lacks
+STAT4/multi-index-AND/direct persisted join cursors, and MVCC lacks Turso's lazy
+per-page checkpoint state machine. The managed vtab/FTS/R-Tree subset has
+landed, but portable SQLite shadow-table storage, the full sync/history engine,
+typed values, sequences, and native extension ABIs remain explicit product
+boundaries rather than hidden open entries.
 
 ### F5 — correlated aggregate subquery decorrelation (2026-08-26)
 
@@ -1490,6 +1496,42 @@ including the empty-input storage classes (`count` → INTEGER 0, `total` →
 REAL 0.0), duplicate and NULL correlation keys, multi-column correlations,
 collation/affinity compatibility, and the preserved prepare-time and runtime
 diagnostics.
+
+### F6 — balanced pure-managed completion areas (2026-08-26)
+
+Seven low/medium-residual areas were completed without widening the native or
+architectural boundary:
+
+1. **ADO.NET option parity.** Both facades apply explicit `Foreign Keys` and
+   `Recursive Triggers` settings on managed open and pooled reopen.
+2. **Release closure.** Every shipped nupkg and staged PowerShell binary is
+   checked for exact package structure, dependency ranges, managed assemblies,
+   and native/RID leakage; the browser EF trim probe executes real async CRUD.
+3. **PowerShell replica administration.** The module exposes managed replica
+   bootstrap/encryption/threshold controls, progress, conflict inspection and
+   explicit rebase/discard, plus pending CDC projection with redacted secrets
+   and typed provider errors.
+4. **Extended DML and ordered sets.** Writable CTE bodies, `UPDATE ... FROM ...
+   LIMIT`, DML `ORDER BY` without `LIMIT`, and ordered-set direction/NULL policy
+   execute through the existing statement-atomic paths, including nested
+   schema validation.
+5. **WAL EXCLUSIVE lifecycle.** Windows/Linux perform DMS-proven carrier cleanup
+   when entering physical EXCLUSIVE mode and then use a heap WAL-index. Ordinary
+   closes intentionally retain the carrier for safe read-only reopen; macOS
+   also rejects physical EXCLUSIVE because process-owned locks cannot
+   distinguish an in-process foreign mapping.
+6. **Sparse vector indexing.** `float32_sparse` + Jaccard has an exact,
+   bounded, versioned managed index with deterministic rowid ties, transactional
+   maintenance, recovery, and corruption validation. Approximate mode remains
+   rejected.
+7. **EF migrations.** Transactional rebuilds preserve schema dependencies and
+   support standalone unique/check constraints, dependency-bearing renames,
+   filtered indexes, and true STORED generated columns. Standalone idempotent
+   scripts reject unsafe rebuild operations before emitting destructive SQL.
+
+These completion claims intentionally exclude the general planner, recursive
+b-tree allocator, lazy MVCC checkpoint, generic vtab planner, portable
+FTS5/R-Tree storage, and embedded sync-history rewrites.
 
 
 ## Appendix A — Inventory JSON schema

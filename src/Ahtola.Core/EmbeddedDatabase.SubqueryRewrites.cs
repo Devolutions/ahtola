@@ -3120,7 +3120,7 @@ public sealed partial class EmbeddedDatabase
                 return true;
             case WithSelectStatement with:
                 foreach (var cte in with.CommonTableExpressions)
-                    pending.Push(cte.Query);
+                    pending.Push(cte.Body);
                 pending.Push(with.Query);
                 return true;
             case NamedTableSource:

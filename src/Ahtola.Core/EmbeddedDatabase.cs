@@ -280,6 +280,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private long _version;
     private int _activeTransactions;
     private int _activeStatementReaders;
+    private readonly object _lockingModeGate = new();
+    private int _exclusiveLockingConnections;
     private readonly Dictionary<BlobMutationIdentity, int> _activeBlobMutations = new();
     private readonly Dictionary<BlobMutationIdentity, long> _blobMutationGenerations = new();
     private long _nextBlobMutationGeneration;
@@ -418,6 +420,43 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     internal bool IsFileBacked => _fileStore is not null;
+
+    internal bool SetConnectionExclusiveLockingMode(bool exclusive, TimeSpan busyTimeout)
+    {
+        lock (_lockingModeGate)
+        {
+            if (_fileStore is null)
+                return exclusive;
+            if (_readOnly)
+                return false;
+
+            if (exclusive)
+            {
+                if (_exclusiveLockingConnections != 0)
+                {
+                    _exclusiveLockingConnections++;
+                    return true;
+                }
+
+                if (!_fileStore.SetExclusiveLockingMode(exclusive: true, busyTimeout))
+                    return false;
+                _exclusiveLockingConnections = 1;
+                return true;
+            }
+
+            if (_exclusiveLockingConnections == 0)
+                return false;
+            if (_exclusiveLockingConnections == 1)
+            {
+                _ = _fileStore.SetExclusiveLockingMode(exclusive: false, busyTimeout);
+                _exclusiveLockingConnections = 0;
+                return false;
+            }
+
+            _exclusiveLockingConnections--;
+            return false;
+        }
+    }
 
     /// <summary>
     /// How long autocommit statements on this database wait out a conflicting
@@ -597,6 +636,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
         OuterAggregateScope? Parent,
         QueryContext Context);
 
+    internal sealed class CteMutationState
+    {
+        internal int RowsAffected { get; set; }
+        internal bool Changed { get; set; }
+        internal bool ForceFullCatalogRewrite { get; set; }
+        internal long? LastInsertRowId { get; set; }
+    }
+
     internal sealed record QueryContext(
         Dictionary<string, EmbeddedTable> Tables,
         IReadOnlyDictionary<string, SourceData> CommonTableExpressions,
@@ -642,7 +689,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqliteTextEncoding MvccTextEncoding = SqliteTextEncoding.Utf8,
         IReadOnlyDictionary<string, VirtualTableDefinition>? VirtualTables = null,
         ChangeDataCaptureSession? ChangeDataCapture = null,
-        VdbeExecutionOptions? VdbeExecutionOptions = null)
+        VdbeExecutionOptions? VdbeExecutionOptions = null,
+        CteMutationState? CteMutationState = null)
     {
         /// <summary>
         /// Per-statement cache of opened managed index-method scan state. Derived contexts created
@@ -1479,9 +1527,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// Mirrors sqlite3_changes()/sqlite3_total_changes(): only INSERT, UPDATE, and
     /// DELETE update the counters, and every other statement leaves them intact.
     /// </summary>
-    internal void RecordChangeCounters(ParsedStatement statement, ExecutionResult result)
+    internal void RecordChangeCounters(
+        ParsedStatement statement,
+        ExecutionResult result,
+        IReadOnlyDictionary<string, ViewDefinition>? views = null)
     {
-        if (statement is not (InsertStatement or UpdateStatement or DeleteStatement))
+        var updatesCounters = statement is InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement
+            || statement is QueryStatement && MayMutate(statement, views ?? _views);
+        if (!updatesCounters)
             return;
 
         _changes = result.RowsAffected;
@@ -1512,7 +1565,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (RequiresRecursiveTriggerStack(
                 statement,
                 recursiveTriggersEnabled,
-                hasTriggers: true))
+                hasTriggers: true,
+                views: _views))
         {
             return ExecuteWithRecursiveTriggerStack(() => ExecuteCore(
                 statement,
@@ -1557,7 +1611,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     // fast path below mutates the live catalog in place and cannot be rolled back, so an
                     // installed gate forces the clone-and-publish shape here.
                     var commitGate = hooks?.CommitGate;
-                    if ((cancellationToken.CanBeCanceled || commitGate is not null) && MayMutate(statement))
+                    var statementMayMutate = MayMutate(statement, _views);
+                    if ((cancellationToken.CanBeCanceled || commitGate is not null) && statementMayMutate)
                     {
                         var cancellableWorking = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
                         ExecutionResult cancellableResult;
@@ -1674,7 +1729,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     // a working clone so that a rejected pre-commit persist rolls back
                     // cleanly. A reported post-commit maintenance failure instead publishes
                     // the catalog because the WAL mutation is already durable.
-                    if (!MayMutate(statement))
+                    if (!statementMayMutate)
                         return Execute(
                             statement,
                             parameters,
@@ -1786,7 +1841,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         lock (_gate)
         {
-            if (_readOnly && MayMutate(statement))
+            if (_readOnly && MayMutate(statement, catalog.Views))
                 throw new EmbeddedSqlException("attempt to write a readonly database");
 
             var context = new QueryContext(
@@ -1922,17 +1977,213 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return orphaned.Length != 0;
     }
 
-    internal static bool MayMutate(ParsedStatement statement) => statement is
-        CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
-        or DropTableStatement or CreateIndexStatement or DropIndexStatement
-        or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
-        or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
-        or AlterTableAlterColumnStatement or AlterTableDropColumnStatement
-        or InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement
-        or AnalyzeStatement or ReindexStatement or VacuumStatement
-        or PragmaHeaderIntegerStatement { Value: not null }
-        or PragmaJournalModeStatement { Mode: not null }
-        or PragmaMaxPageCountStatement;
+    internal static bool MayMutate(
+        ParsedStatement statement,
+        IReadOnlyDictionary<string, ViewDefinition>? views = null)
+        => MayMutate(
+            statement,
+            views,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+
+    private static bool MayMutate(
+        ParsedStatement statement,
+        IReadOnlyDictionary<string, ViewDefinition>? views,
+        HashSet<string> visibleCtes,
+        HashSet<string> activeViews)
+    {
+        if (statement is
+            CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
+            or DropTableStatement or CreateIndexStatement or DropIndexStatement
+            or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
+            or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
+            or AlterTableAlterColumnStatement or AlterTableDropColumnStatement
+            or InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement
+            or AnalyzeStatement or ReindexStatement or VacuumStatement
+            or PragmaHeaderIntegerStatement { Value: not null }
+            or PragmaJournalModeStatement { Mode: not null }
+            or PragmaMaxPageCountStatement)
+        {
+            return true;
+        }
+
+        return statement is QueryStatement query
+            && QueryMayMutate(query, views, visibleCtes, activeViews);
+    }
+
+    private static bool QueryMayMutate(
+        QueryStatement query,
+        IReadOnlyDictionary<string, ViewDefinition>? views,
+        HashSet<string> visibleCtes,
+        HashSet<string> activeViews)
+    {
+        switch (query)
+        {
+            case WithSelectStatement with:
+                {
+                    var scopedCtes = new HashSet<string>(visibleCtes, StringComparer.OrdinalIgnoreCase);
+                    foreach (var commonTableExpression in with.CommonTableExpressions)
+                        scopedCtes.Add(commonTableExpression.Name);
+                    foreach (var commonTableExpression in with.CommonTableExpressions)
+                    {
+                        if (MayMutate(commonTableExpression.Body, views, scopedCtes, activeViews))
+                            return true;
+                    }
+
+                    return QueryMayMutate(with.Query, views, scopedCtes, activeViews);
+                }
+            case SelectStatement select:
+                return TableSourceMayMutate(select.Source, views, visibleCtes, activeViews)
+                    || select.Projections.Any(item =>
+                        ExpressionMayMutate(item.Expression, views, visibleCtes, activeViews))
+                    || ExpressionMayMutate(select.Where, views, visibleCtes, activeViews)
+                    || select.GroupBy.Any(item =>
+                        ExpressionMayMutate(item, views, visibleCtes, activeViews))
+                    || ExpressionMayMutate(select.Having, views, visibleCtes, activeViews)
+                    || select.NamedWindows.Any(window =>
+                        WindowMayMutate(window.Specification, views, visibleCtes, activeViews))
+                    || select.OrderBy.Any(item =>
+                        ExpressionMayMutate(item.Expression, views, visibleCtes, activeViews))
+                    || ExpressionMayMutate(select.Limit, views, visibleCtes, activeViews)
+                    || ExpressionMayMutate(select.Offset, views, visibleCtes, activeViews);
+            case CompoundSelectStatement compound:
+                return compound.Terms.Any(term =>
+                        QueryMayMutate(term, views, visibleCtes, activeViews))
+                    || compound.OrderBy.Any(item =>
+                        ExpressionMayMutate(item.Expression, views, visibleCtes, activeViews))
+                    || ExpressionMayMutate(compound.Limit, views, visibleCtes, activeViews)
+                    || ExpressionMayMutate(compound.Offset, views, visibleCtes, activeViews);
+            case ValuesClause values:
+                return values.Rows.SelectMany(static row => row).Any(item =>
+                    ExpressionMayMutate(item, views, visibleCtes, activeViews));
+            default:
+                return false;
+        }
+    }
+
+    private static bool TableSourceMayMutate(
+        TableSource? source,
+        IReadOnlyDictionary<string, ViewDefinition>? views,
+        HashSet<string> visibleCtes,
+        HashSet<string> activeViews)
+    {
+        switch (source)
+        {
+            case null:
+                return false;
+            case DerivedTableSource derived:
+                return QueryMayMutate(derived.Query, views, visibleCtes, activeViews);
+            case JoinTableSource join:
+                return TableSourceMayMutate(join.Left, views, visibleCtes, activeViews)
+                    || TableSourceMayMutate(join.Right, views, visibleCtes, activeViews)
+                    || ExpressionMayMutate(join.Condition, views, visibleCtes, activeViews);
+            case TableValuedFunctionSource tableValuedFunction:
+                return tableValuedFunction.Arguments.Any(item =>
+                    ExpressionMayMutate(item, views, visibleCtes, activeViews));
+            case NamedTableSource named
+                when !visibleCtes.Contains(ManagedSchemaName.Display(named.Name))
+                    && views is not null
+                    && views.TryGetValue(ManagedSchemaName.Display(named.Name), out var view)
+                    && activeViews.Add(ManagedSchemaName.Display(named.Name)):
+                try
+                {
+                    return QueryMayMutate(
+                        view.Query,
+                        views,
+                        new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+                        activeViews);
+                }
+                finally
+                {
+                    activeViews.Remove(ManagedSchemaName.Display(named.Name));
+                }
+            default:
+                return false;
+        }
+    }
+
+    private static bool ExpressionMayMutate(
+        Expression? expression,
+        IReadOnlyDictionary<string, ViewDefinition>? views,
+        HashSet<string> visibleCtes,
+        HashSet<string> activeViews)
+    {
+        switch (expression)
+        {
+            case null:
+                return false;
+            case ScalarSubqueryExpression scalar:
+                return QueryMayMutate(scalar.Query, views, visibleCtes, activeViews);
+            case ExistsExpression exists:
+                return QueryMayMutate(exists.Query, views, visibleCtes, activeViews);
+            case InSubqueryExpression inSubquery:
+                return ExpressionMayMutate(inSubquery.Value, views, visibleCtes, activeViews)
+                    || QueryMayMutate(inSubquery.Query, views, visibleCtes, activeViews);
+            case FunctionExpression function:
+                return function.Arguments.Any(item =>
+                        ExpressionMayMutate(item, views, visibleCtes, activeViews))
+                    || ExpressionMayMutate(function.Filter, views, visibleCtes, activeViews)
+                    || (function.Window is not null
+                        && WindowMayMutate(function.Window, views, visibleCtes, activeViews))
+                    || (function.AggregateOrderBy?.Any(item =>
+                        ExpressionMayMutate(item.Expression, views, visibleCtes, activeViews)) ?? false)
+                    || (function.OrderedSetOrderBy is { } orderedSet
+                        && ExpressionMayMutate(
+                            orderedSet.Expression,
+                            views,
+                            visibleCtes,
+                            activeViews));
+            case RaiseExpression raise:
+                return ExpressionMayMutate(raise.Message, views, visibleCtes, activeViews);
+            case RowValueExpression rowValue:
+                return rowValue.Values.Any(item =>
+                    ExpressionMayMutate(item, views, visibleCtes, activeViews));
+            case CollationExpression collation:
+                return ExpressionMayMutate(collation.Expression, views, visibleCtes, activeViews);
+            case CastExpression cast:
+                return ExpressionMayMutate(cast.Expression, views, visibleCtes, activeViews);
+            case CaseExpression @case:
+                return ExpressionMayMutate(@case.Operand, views, visibleCtes, activeViews)
+                    || @case.Clauses.Any(clause =>
+                        ExpressionMayMutate(clause.When, views, visibleCtes, activeViews)
+                        || ExpressionMayMutate(clause.Then, views, visibleCtes, activeViews))
+                    || ExpressionMayMutate(@case.Else, views, visibleCtes, activeViews);
+            case LikeExpression like:
+                return ExpressionMayMutate(like.Value, views, visibleCtes, activeViews)
+                    || ExpressionMayMutate(like.Pattern, views, visibleCtes, activeViews)
+                    || ExpressionMayMutate(like.Escape, views, visibleCtes, activeViews);
+            case InExpression @in:
+                return ExpressionMayMutate(@in.Value, views, visibleCtes, activeViews)
+                    || @in.Values.Any(item =>
+                        ExpressionMayMutate(item, views, visibleCtes, activeViews));
+            case BetweenExpression between:
+                return ExpressionMayMutate(between.Value, views, visibleCtes, activeViews)
+                    || ExpressionMayMutate(between.Lower, views, visibleCtes, activeViews)
+                    || ExpressionMayMutate(between.Upper, views, visibleCtes, activeViews);
+            case UnaryExpression unary:
+                return ExpressionMayMutate(unary.Operand, views, visibleCtes, activeViews);
+            case GlobExpression glob:
+                return ExpressionMayMutate(glob.Value, views, visibleCtes, activeViews)
+                    || ExpressionMayMutate(glob.Pattern, views, visibleCtes, activeViews);
+            case BinaryExpression binary:
+                return ExpressionMayMutate(binary.Left, views, visibleCtes, activeViews)
+                    || ExpressionMayMutate(binary.Right, views, visibleCtes, activeViews);
+            default:
+                return false;
+        }
+    }
+
+    private static bool WindowMayMutate(
+        WindowSpecification window,
+        IReadOnlyDictionary<string, ViewDefinition>? views,
+        HashSet<string> visibleCtes,
+        HashSet<string> activeViews)
+        => window.PartitionBy.Any(item =>
+                ExpressionMayMutate(item, views, visibleCtes, activeViews))
+            || window.OrderBy.Any(item =>
+                ExpressionMayMutate(item.Expression, views, visibleCtes, activeViews))
+            || ExpressionMayMutate(window.Frame?.Start.Offset, views, visibleCtes, activeViews)
+            || ExpressionMayMutate(window.Frame?.End.Offset, views, visibleCtes, activeViews);
 
     internal static bool MayChangeSchema(ParsedStatement statement) => statement is
         CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
@@ -2880,7 +3131,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 using var writeRegistration = RegisterCatalogWrite(_databasePath);
                 if (_fileStore.JournalMode != SqliteJournalMode.Mvcc)
                     _ = _fileStore.SwitchJournalMode(SqliteJournalMode.Mvcc);
-                _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
+                _fileCatalogVersion = _fileStore.CommittedCatalogVersion;
             }
         }
 
@@ -2941,7 +3192,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 EnsureFileCatalogVersionCurrent(busyTimeout);
                 using var writeRegistration = RegisterCatalogWrite(_databasePath);
                 var result = _fileStore.SwitchJournalMode(journalMode);
-                _fileCatalogVersion = ReadFileCatalogVersion(fileSystem, _databasePath);
+                _fileCatalogVersion = _fileStore.CommittedCatalogVersion;
                 _version++;
                 return result;
             }
@@ -2980,7 +3231,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 else
                     _fileStore.MigratePageSize(pageSize, _tables, _views, _triggers, _virtualTables);
                 _fileStore.AdoptCommittedTables(_tables);
-                _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
+                _fileCatalogVersion = _fileStore.CommittedCatalogVersion;
                 _version++;
             }
         }
@@ -3215,6 +3466,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private bool TryReadFileCatalogVersion(out FileCatalogVersion version)
     {
+        if (_fileStore?.IsExclusiveLockingMode == true)
+        {
+            version = _fileStore.CommittedCatalogVersion;
+            return true;
+        }
+
         try
         {
             version = ReadFileCatalogVersion(_fileSystem!, _databasePath);
@@ -3235,6 +3492,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private bool TryReloadFileCatalogIfChanged(bool forceReload = false)
     {
+        if (_fileStore?.IsExclusiveLockingMode == true)
+            return true;
+
         var durableVersion = ReadFileCatalogVersion(_fileSystem!, _databasePath);
         if (!forceReload && durableVersion == _fileCatalogVersion)
             return true;
@@ -3519,6 +3779,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         lock (_gate)
         {
             if (_fileStore is null)
+                return;
+            if (_fileStore.IsExclusiveLockingMode)
                 return;
             if (_fileSystem is null || _fileCatalogWriteLock is null)
                 throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
@@ -3893,7 +4155,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (RequiresRecursiveTriggerStack(
                 statement,
                 recursiveTriggersEnabled,
-                catalog.Triggers.Count != 0))
+                catalog.Triggers.Count != 0,
+                views: catalog.Views))
         {
             return ExecuteWithRecursiveTriggerStack(() => Execute(
                 statement,
@@ -3918,7 +4181,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        if (_readOnly && MayMutate(statement))
+        var statementMayMutate = MayMutate(statement, catalog.Views);
+        if (_readOnly && statementMayMutate)
             throw new EmbeddedSqlException("attempt to write a readonly database");
 
         var cdcSchemaBefore = changeDataCapture is not null
@@ -3946,14 +4210,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ExecuteTableList: executeTableList,
             ConcurrentMvStore: concurrentMvStore,
             ConcurrentMvccTxId: concurrentMvccTxId,
-            ConcurrentBaseTables: concurrentMvStore is null || !MayMutate(statement)
+            ConcurrentBaseTables: concurrentMvStore is null || !statementMayMutate
                 ? null
                 : CloneTablesShallow(catalog.Tables),
             ConcurrentMvccIdentityTracker: concurrentMvStore is null ? null : new ConcurrentMvccIdentityTracker(),
             MvccTextEncoding: GetTextEncoding(),
             VirtualTables: catalog.VirtualTables,
             ChangeDataCapture: changeDataCapture,
-            VdbeExecutionOptions: vdbeExecutionOptions);
+            VdbeExecutionOptions: vdbeExecutionOptions,
+            CteMutationState: statement is QueryStatement && statementMayMutate
+                ? new CteMutationState()
+                : null);
         EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
         var result = statement switch
         {
@@ -4002,7 +4269,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 context,
                 scoped => ExecuteWithDml(with, parameters, scoped)),
             ValuesClause values => ExecuteValuesStatement(values, parameters, context, null),
-            QueryStatement query => ExecuteQuery(query, parameters, context, null),
+            QueryStatement query => ExecutePotentiallyMutatingQuery(
+                query,
+                parameters,
+                context,
+                statementMayMutate),
             PragmaTableInfoStatement tableInfo => ExecutePragmaTableInfo(tableInfo, context),
             PragmaTableXInfoStatement tableXInfo => ExecutePragmaTableXInfo(tableXInfo, context),
             PragmaIndexListStatement indexList => ExecutePragmaIndexList(indexList, tables),
@@ -5723,8 +5994,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 || ExpressionContainsAggregateInternalOrderBy(compound.Limit)
                 || ExpressionContainsAggregateInternalOrderBy(compound.Offset),
             WithSelectStatement with => with.CommonTableExpressions.Any(commonTableExpression =>
-                    QueryContainsAggregateInternalOrderBy(commonTableExpression.Query))
+                    commonTableExpression.Body is QueryStatement query
+                        ? QueryContainsAggregateInternalOrderBy(query)
+                        : StatementContainsAggregateInternalOrderBy(commonTableExpression.Body))
                 || QueryContainsAggregateInternalOrderBy(with.Query),
+            _ => false,
+        };
+    }
+
+    private static bool StatementContainsAggregateInternalOrderBy(ParsedStatement statement)
+    {
+        return statement switch
+        {
+            QueryStatement query => QueryContainsAggregateInternalOrderBy(query),
+            InsertStatement insert => insert.Source is not null
+                && QueryContainsAggregateInternalOrderBy(insert.Source),
+            UpdateStatement update => SourceContainsAggregateInternalOrderBy(update.From),
+            WithDmlStatement with => with.CommonTableExpressions.Any(cte =>
+                    StatementContainsAggregateInternalOrderBy(cte.Body))
+                || StatementContainsAggregateInternalOrderBy(with.Dml),
             _ => false,
         };
     }
@@ -7569,6 +7857,27 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CancellationToken cancellationToken,
         SourceRow? groupByScope = null)
     {
+        var scopedContext = ValidateCommonTableExpressionSchemas(
+            expressions,
+            context,
+            outerRow,
+            cancellationToken,
+            groupByScope);
+        ValidateQuerySchema(
+            query,
+            scopedContext,
+            outerRow,
+            cancellationToken,
+            groupByScope);
+    }
+
+    private QueryContext ValidateCommonTableExpressionSchemas(
+        IReadOnlyList<CommonTableExpression> expressions,
+        QueryContext context,
+        SourceRow? outerRow,
+        CancellationToken cancellationToken,
+        SourceRow? groupByScope)
+    {
         var resolved = new Dictionary<string, SourceData>(
             context.CommonTableExpressions,
             StringComparer.OrdinalIgnoreCase);
@@ -7580,36 +7889,88 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 throw new EmbeddedSqlException($"duplicate WITH table name: {expression.Name}");
 
             var expressionContext = context with { CommonTableExpressions = resolved };
-            var descriptor = expression.Query is CompoundSelectStatement { Terms.Count: > 0 } compound
-                ? compound.Terms[0]
-                : expression.Query;
-            ValidateQuerySchema(
-                descriptor,
+            if (expression.Body is QueryStatement bodyQuery)
+            {
+                var descriptor = bodyQuery is CompoundSelectStatement { Terms.Count: > 0 } compound
+                    ? compound.Terms[0]
+                    : bodyQuery;
+                ValidateQuerySchema(
+                    descriptor,
+                    expressionContext,
+                    outerRow,
+                    cancellationToken,
+                    groupByScope);
+                var columns = ResolveCommonTableExpressionColumns(
+                    expression,
+                    DescribeQuery(descriptor, expressionContext));
+                resolved[expression.Name] = new SourceData(columns, []);
+                if (!ReferenceEquals(descriptor, bodyQuery))
+                {
+                    ValidateQuerySchema(
+                        bodyQuery,
+                        context with { CommonTableExpressions = resolved },
+                        outerRow,
+                        cancellationToken,
+                        groupByScope);
+                }
+                continue;
+            }
+
+            ValidateCommonTableExpressionBodySchema(
+                expression.Body,
                 expressionContext,
                 outerRow,
                 cancellationToken,
                 groupByScope);
-            var columns = ResolveCommonTableExpressionColumns(
+            var writableColumns = ResolveCommonTableExpressionColumns(
                 expression,
-                DescribeQuery(descriptor, expressionContext));
-            resolved[expression.Name] = new SourceData(columns, []);
-            if (!ReferenceEquals(descriptor, expression.Query))
-            {
-                ValidateQuerySchema(
-                    expression.Query,
-                    context with { CommonTableExpressions = resolved },
+                DescribeCommonTableExpressionBody(expression.Body, expressionContext));
+            resolved[expression.Name] = new SourceData(writableColumns, []);
+        }
+
+        return context with { CommonTableExpressions = resolved };
+    }
+
+    private void ValidateCommonTableExpressionBodySchema(
+        ParsedStatement body,
+        QueryContext context,
+        SourceRow? outerRow,
+        CancellationToken cancellationToken,
+        SourceRow? groupByScope)
+    {
+        var validationOuterRow = outerRow ?? new SourceRow([], []);
+        switch (body)
+        {
+            case QueryStatement query:
+                ValidateQuerySchema(query, context, outerRow, cancellationToken, groupByScope);
+                return;
+            case InsertStatement insert:
+                ValidateTriggerInsert(insert, context, validationOuterRow, cancellationToken);
+                return;
+            case UpdateStatement update:
+                ValidateTriggerUpdate(update, context, validationOuterRow, cancellationToken);
+                return;
+            case DeleteStatement delete:
+                ValidateTriggerDelete(delete, context, validationOuterRow, cancellationToken);
+                return;
+            case WithDmlStatement with:
+                var scopedContext = ValidateCommonTableExpressionSchemas(
+                    with.CommonTableExpressions,
+                    context,
                     outerRow,
                     cancellationToken,
                     groupByScope);
-            }
+                ValidateCommonTableExpressionBodySchema(
+                    with.Dml,
+                    scopedContext,
+                    outerRow,
+                    cancellationToken,
+                    groupByScope);
+                return;
+            default:
+                throw new EmbeddedSqlException(
+                    "a writable common-table expression must contain INSERT, UPDATE, or DELETE");
         }
-
-        ValidateQuerySchema(
-            query,
-            context with { CommonTableExpressions = resolved },
-            outerRow,
-            cancellationToken,
-            groupByScope);
     }
 
     private void ValidateTableSourceSchema(
@@ -8301,11 +8662,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private static bool RequiresRecursiveTriggerStack(
         ParsedStatement statement,
         bool recursiveTriggersEnabled,
-        bool hasTriggers)
+        bool hasTriggers,
+        IReadOnlyDictionary<string, ViewDefinition>? views)
         => recursiveTriggersEnabled
             && hasTriggers
             && !s_hasRecursiveTriggerStack
-            && statement is InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement;
+            && MayMutate(statement, views);
 
     private T ExecuteWithRecursiveTriggerStack<T>(Func<T> operation)
     {
@@ -11913,23 +12275,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
         var plan = PrepareUpdate(statement, table, context);
+        var updateFromValidationRow = statement.From is null
+            ? null
+            : CreateUpdateFromSchemaValidationRow(statement, table, context);
         var fromMatches = statement.From is null
             ? null
             : MatchUpdateFromRows(statement, table, parameters, context)
                 .ToDictionary(match => match.Position, match => match.Row);
-        var selectedPositions = statement.Limit is null
+        var selectedPositions = statement.Limit is null && statement.EffectiveOrderBy.Count == 0
             ? null
             : SelectLimitedDmlPositions(
                 statement.TargetQualifier,
                 table,
-                statement.Where,
+                fromMatches is null ? statement.Where : null,
                 statement.EffectiveOrderBy,
                 statement.Limit,
                 statement.Offset,
                 statement.Assignments.Select(assignment => assignment.Value),
                 statement.Returning,
                 parameters,
-                context);
+                context,
+                fromMatches,
+                updateFromValidationRow);
         var rows = table.Rows.Select(row => row.ToArray()).ToList();
         var rowIds = table.RowIds.Count == table.Rows.Count
             ? table.RowIds.ToList()
@@ -11951,6 +12318,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (fromMatches is not null)
             {
                 if (!fromMatches.TryGetValue(position, out evaluationRow))
+                    continue;
+                if (selectedPositions is not null && !selectedPositions.Contains(position))
                     continue;
             }
             else if (selectedPositions is not null)
@@ -12148,6 +12517,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return matches;
     }
 
+    private static SourceRow CreateUpdateFromSchemaValidationRow(
+        UpdateStatement statement,
+        EmbeddedTable table,
+        QueryContext context)
+    {
+        var joined = new JoinTableSource(
+            new NamedTableSource(statement.TableName, statement.TargetQualifier),
+            statement.From!,
+            Condition: null,
+            JoinKind.Inner);
+        return CreateQuerySchemaValidationRow(
+            joined,
+            context,
+            GetSourceColumns(joined, context),
+            GetOutputColumns(joined, context),
+            outerRow: null);
+    }
+
     // SQLite adds a hidden rowid reference for every FROM entry so it can drive the update from
     // an ephemeral table; two entries sharing a qualifier make that reference ambiguous. The
     // target is exempt because its rowid is referenced positionally rather than by name.
@@ -12254,19 +12641,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
         EmbeddedTable table,
         Expression? where,
         IReadOnlyList<OrderByTerm> orderBy,
-        Expression limitExpression,
+        Expression? limitExpression,
         Expression? offsetExpression,
         IEnumerable<Expression> mutationExpressions,
         IReadOnlyList<Projection>? returning,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        IReadOnlyDictionary<int, SourceRow>? candidateRows = null,
+        SourceRow? schemaValidationRow = null)
     {
         ValidateOrderByCollations(orderBy);
-        var validationRow = CreateDmlTargetRow(
-            table,
-            qualifier,
-            Enumerable.Repeat(SqlValue.Null, table.Columns.Length).ToArray(),
-            1);
+        var validationRow = schemaValidationRow
+            ?? candidateRows?.Values.FirstOrDefault()
+            ?? CreateDmlTargetRow(
+                table,
+                qualifier,
+                Enumerable.Repeat(SqlValue.Null, table.Columns.Length).ToArray(),
+                1);
         ValidateColumnReferences(where, validationRow);
         foreach (var expression in mutationExpressions)
             ValidateColumnReferences(expression, validationRow);
@@ -12281,7 +12672,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
-        var limit = RequireLimitInteger(Evaluate(limitExpression, parameters, null, context));
+        var limit = limitExpression is null
+            ? -1
+            : RequireLimitInteger(Evaluate(limitExpression, parameters, null, context));
         var offset = offsetExpression is null
             ? 0
             : Math.Max(0, RequireLimitInteger(Evaluate(offsetExpression, parameters, null, context)));
@@ -12292,7 +12685,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         for (var position = 0; position < table.Rows.Count; position++)
         {
             var rowid = position < table.RowIds.Count ? table.RowIds[position] : position + 1;
-            var source = CreateDmlTargetRow(table, qualifier, table.Rows[position], rowid);
+            SourceRow? source = null;
+            if (candidateRows is not null && !candidateRows.TryGetValue(position, out source))
+                continue;
+            source ??= CreateDmlTargetRow(table, qualifier, table.Rows[position], rowid);
             if (where is not null && !IsTrue(Evaluate(where, parameters, source, context)))
                 continue;
 
@@ -14188,7 +14584,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
         ValidateTableReturning(statement.Returning, statement.TableName, table, context);
-        var selectedPositions = statement.Limit is null
+        var selectedPositions = statement.Limit is null && statement.EffectiveOrderBy.Count == 0
             ? null
             : SelectLimitedDmlPositions(
                 statement.TargetQualifier,
@@ -16928,7 +17324,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             CompoundSelectStatement compound => compound.Terms.Any(ContainsLimitedCompoundTerm),
             WithSelectStatement with => ContainsLimitedCompoundTerm(with.Query)
                 || with.CommonTableExpressions.Any(cte =>
-                    ContainsLimitedCompoundTerm(cte.Query)),
+                    cte.IsWritable || ContainsLimitedCompoundTerm(cte.Query)),
             _ => false,
         };
     }
@@ -16982,7 +17378,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     with.Query,
                     context)
                     || with.CommonTableExpressions.Any(cte =>
-                        ContainsObservableAggregateCompoundTerm(cte.Query, context));
+                        cte.IsWritable
+                        || ContainsObservableAggregateCompoundTerm(cte.Query, context));
             default:
                 return false;
         }
@@ -22799,8 +23196,8 @@ out bool hasReturning)
         foreach (var expression in expressions)
         {
             commonTableExpressions[expression.Name] = new SourceData([], []);
-            ValidateQueryIndexDirectives(
-                expression.Query,
+            ValidateStatementIndexDirectives(
+                expression.Body,
                 context with { CommonTableExpressions = commonTableExpressions });
         }
 
@@ -25100,13 +25497,16 @@ out bool hasReturning)
                 continue;
 
             var cteContext = context with { CommonTableExpressions = commonTableExpressions };
+            var bodyCollations = GetCommonTableExpressionBodyCollations(
+                commonTableExpression.Body,
+                cteContext);
             var columns = ResolveCommonTableExpressionColumns(
                 commonTableExpression,
-                DescribeQuery(commonTableExpression.Query, cteContext));
+                DescribeCommonTableExpressionBody(commonTableExpression.Body, cteContext));
             commonTableExpressions[commonTableExpression.Name] = new SourceData(
                 columns,
                 [],
-                GetQueryOutputCollations(commonTableExpression.Query, cteContext));
+                bodyCollations);
         }
 
         return GetQueryOutputCollations(
@@ -25592,39 +25992,105 @@ out bool hasReturning)
         return new ExecutionResult(columns, rows, 0);
     }
 
+    private ExecutionResult ExecutePotentiallyMutatingQuery(
+        QueryStatement statement,
+        SqlValue[] parameters,
+        QueryContext context,
+        bool mayMutate)
+    {
+        if (!mayMutate)
+            return ExecuteQuery(statement, parameters, context, null);
+
+        var mutationState = context.CteMutationState ?? new CteMutationState();
+        context = context with { CteMutationState = mutationState };
+        var backup = CloneTablesShallow(context.Tables);
+        try
+        {
+            var result = ExecuteQuery(statement, parameters, context, null);
+            return result with
+            {
+                RowsAffected = mutationState.RowsAffected,
+                Changed = result.Changed || mutationState.Changed,
+                ForceFullCatalogRewrite = result.ForceFullCatalogRewrite
+                    || mutationState.ForceFullCatalogRewrite,
+                LastInsertRowId = result.LastInsertRowId ?? mutationState.LastInsertRowId,
+            };
+        }
+        catch (EmbeddedConflictFailException)
+        {
+            throw;
+        }
+        catch
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+    }
+
     private ExecutionResult ExecuteWithSelect(
         WithSelectStatement statement,
         SqlValue[] parameters,
         QueryContext context,
         SourceRow? outerRow)
     {
-        if (TryExecuteNotMaterializedPassThrough(
-                statement,
+        var writableState = statement.CommonTableExpressions.Any(cte => MayMutate(cte.Body, context.Views))
+            ? context.CteMutationState ?? new CteMutationState()
+            : null;
+        if (writableState is not null)
+            context = context with { CteMutationState = writableState };
+
+        var backup = writableState is null ? null : CloneTablesShallow(context.Tables);
+        try
+        {
+            if (TryExecuteNotMaterializedPassThrough(
+                    statement,
+                    parameters,
+                    context,
+                    outerRow,
+                    out var passThrough))
+            {
+                return passThrough;
+            }
+
+            var requiredCteNames = GetRequiredCommonTableExpressionNames(
+                statement.CommonTableExpressions,
+                name => CountAllReferences(statement.Query, name),
+                context.Views);
+            var cteContext = MaterializeCommonTableExpressions(
+                statement.CommonTableExpressions,
                 parameters,
                 context,
                 outerRow,
-                out var passThrough))
-        {
-            return passThrough;
+                requiredCteNames,
+                GetRecursiveCteOuterRowBudgets(
+                    statement.CommonTableExpressions,
+                    statement.Query,
+                    parameters,
+                    context,
+                    outerRow));
+
+            var result = ExecuteQuery(statement.Query, parameters, cteContext, outerRow);
+            return writableState is null
+                ? result
+                : result with
+                {
+                    RowsAffected = writableState.RowsAffected,
+                    Changed = result.Changed || writableState.Changed,
+                    ForceFullCatalogRewrite = result.ForceFullCatalogRewrite
+                        || writableState.ForceFullCatalogRewrite,
+                    LastInsertRowId = result.LastInsertRowId ?? writableState.LastInsertRowId,
+                };
         }
-
-        var requiredCteNames = GetRequiredCommonTableExpressionNames(
-            statement.CommonTableExpressions,
-            name => CountAllReferences(statement.Query, name));
-        var cteContext = MaterializeCommonTableExpressions(
-            statement.CommonTableExpressions,
-            parameters,
-            context,
-            outerRow,
-            requiredCteNames,
-            GetRecursiveCteOuterRowBudgets(
-                statement.CommonTableExpressions,
-                statement.Query,
-                parameters,
-                context,
-                outerRow));
-
-        return ExecuteQuery(statement.Query, parameters, cteContext, outerRow);
+        catch (EmbeddedConflictFailException)
+        {
+            throw;
+        }
+        catch
+        {
+            if (backup is not null)
+                RestoreTables(context.Tables, backup);
+            throw;
+        }
     }
 
     // NOT MATERIALIZED is advisory in SQLite. The only managed flattening proof is a single
@@ -25660,30 +26126,47 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context)
     {
-        var returningCteScope = CreateReturningCteScope(
-            statement.CommonTableExpressions,
-            statement.Dml);
-        var requiredCteNames = GetRequiredCommonTableExpressionNames(
-            statement.CommonTableExpressions,
-            name => CountDmlReferences(statement.Dml, name));
-        var cteContext = MaterializeCommonTableExpressions(
-            statement.CommonTableExpressions,
-            parameters,
-            context,
-            outerRow: null,
-            requiredCteNames: requiredCteNames);
-        if (returningCteScope is not null)
-            cteContext = cteContext with { ReturningCteScope = returningCteScope };
+        var writableState = statement.CommonTableExpressions.Any(cte => MayMutate(cte.Body, context.Views))
+            ? context.CteMutationState ?? new CteMutationState()
+            : null;
+        if (writableState is not null)
+            context = context with { CteMutationState = writableState };
+
         var backup = CloneTablesShallow(context.Tables);
         try
         {
-            return statement.Dml switch
+            var returningCteScope = CreateReturningCteScope(
+                statement.CommonTableExpressions,
+                statement.Dml);
+            var requiredCteNames = GetRequiredCommonTableExpressionNames(
+                statement.CommonTableExpressions,
+                name => CountDmlReferences(statement.Dml, name),
+                context.Views);
+            var cteContext = MaterializeCommonTableExpressions(
+                statement.CommonTableExpressions,
+                parameters,
+                context,
+                outerRow: null,
+                requiredCteNames: requiredCteNames);
+            if (returningCteScope is not null)
+                cteContext = cteContext with { ReturningCteScope = returningCteScope };
+
+            var result = statement.Dml switch
             {
                 InsertStatement insert => ExecuteInsert(insert, parameters, cteContext),
                 UpdateStatement update => ExecuteUpdate(update, parameters, cteContext),
                 DeleteStatement delete => ExecuteDelete(delete, parameters, cteContext),
                 _ => throw new EmbeddedSqlException("WITH must precede an INSERT, UPDATE, or DELETE statement."),
             };
+            return writableState is null
+                ? result
+                : result with
+                {
+                    Changed = result.Changed || writableState.Changed,
+                    ForceFullCatalogRewrite = result.ForceFullCatalogRewrite
+                        || writableState.ForceFullCatalogRewrite,
+                    LastInsertRowId = result.LastInsertRowId ?? writableState.LastInsertRowId,
+                };
         }
         catch (EmbeddedConflictFailException)
         {
@@ -25701,12 +26184,14 @@ out bool hasReturning)
     // a referenced CTE is materialized in declaration order.
     private static HashSet<string> GetRequiredCommonTableExpressionNames(
         IReadOnlyList<CommonTableExpression> expressions,
-        Func<string, int> countRootReferences)
+        Func<string, int> countRootReferences,
+        IReadOnlyDictionary<string, ViewDefinition>? views = null)
     {
         var required = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var commonTableExpression in expressions)
         {
-            if (countRootReferences(commonTableExpression.Name) > 0)
+            if (MayMutate(commonTableExpression.Body, views)
+                || countRootReferences(commonTableExpression.Name) > 0)
                 required.Add(commonTableExpression.Name);
         }
 
@@ -25721,7 +26206,7 @@ out bool hasReturning)
 
                 foreach (var candidate in expressions)
                 {
-                    if (CountAllReferences(commonTableExpression.Query, candidate.Name) > 0)
+                    if (CountStatementReferences(commonTableExpression.Body, candidate.Name) > 0)
                         changed |= required.Add(candidate.Name);
                 }
             }
@@ -25794,7 +26279,8 @@ out bool hasReturning)
                 continue;
 
             var cteContext = context with { CommonTableExpressions = resolvedExpressions };
-            var resolved = CountAllReferences(commonTableExpression.Query, commonTableExpression.Name) > 0
+            var resolved = commonTableExpression.Body is QueryStatement query
+                && CountAllReferences(query, commonTableExpression.Name) > 0
                 ? EvaluateRecursiveCte(
                     commonTableExpression,
                     parameters,
@@ -25832,6 +26318,24 @@ out bool hasReturning)
         QueryContext cteContext,
         SourceRow? outerRow)
     {
+        if (commonTableExpression.WritableBody is { } writableBody)
+        {
+            var writableResult = MaterializeQueryResult(ExecuteCteBody(writableBody, parameters, cteContext));
+            var writableColumns = ResolveCommonTableExpressionColumns(
+                commonTableExpression,
+                writableResult.Columns);
+            var collations = GetCommonTableExpressionBodyCollations(writableBody, cteContext);
+            var affinities = DescribeCommonTableExpressionBodyAffinities(
+                writableBody,
+                cteContext,
+                BuildAffinityMapFromRuntimeCtes(cteContext.CommonTableExpressions));
+            return new SourceData(
+                writableColumns,
+                writableResult.Rows.Select(row => new SourceRow(writableColumns, row.ToArray())).ToArray(),
+                collations,
+                BuildSourceColumnDefinitionsFromAffinities(affinities, writableColumns, collations));
+        }
+
         var result = MaterializeQueryResult(
             ExecuteQuery(commonTableExpression.Query, parameters, cteContext, outerRow));
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, result.Columns);
@@ -25841,6 +26345,32 @@ out bool hasReturning)
             result.Rows.Select(row => new SourceRow(columns, row.ToArray())).ToArray(),
             GetQueryOutputCollations(commonTableExpression.Query, cteContext),
             columnDefinitions);
+    }
+
+    private ExecutionResult ExecuteCteBody(
+        ParsedStatement body,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var result = body switch
+        {
+            QueryStatement query => ExecuteQuery(query, parameters, context, outerRow: null),
+            InsertStatement insert => ExecuteInsert(insert, parameters, context),
+            UpdateStatement update => ExecuteUpdate(update, parameters, context),
+            DeleteStatement delete => ExecuteDelete(delete, parameters, context),
+            WithDmlStatement withDml => ExecuteWithDml(withDml, parameters, context),
+            _ => throw new EmbeddedSqlException(
+                "a writable common-table expression must contain INSERT, UPDATE, or DELETE"),
+        };
+        if (context.CteMutationState is { } state)
+        {
+            state.RowsAffected += result.RowsAffected;
+            state.Changed |= result.Changed;
+            state.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
+            state.LastInsertRowId = result.LastInsertRowId ?? state.LastInsertRowId;
+        }
+
+        return result;
     }
 
     // Memory backstop on the number of rows a recursive CTE may materialize. SQLite streams
@@ -26339,7 +26869,9 @@ out bool hasReturning)
 
         var target = expressions.FirstOrDefault(expression =>
             string.Equals(expression.Name, named.Name, StringComparison.OrdinalIgnoreCase));
-        if (target is null || CountAllReferences(target.Query, target.Name) == 0)
+        if (target is null
+            || target.IsWritable
+            || CountAllReferences(target.Query, target.Name) == 0)
             return null;
 
         // Any second consumer (including a sibling CTE) would see the truncated set, so only a single
@@ -26347,7 +26879,7 @@ out bool hasReturning)
         var references = CountAllReferences(query, target.Name)
             + expressions
                 .Where(expression => !ReferenceEquals(expression, target))
-                .Sum(expression => CountAllReferences(expression.Query, target.Name));
+                .Sum(expression => CountStatementReferences(expression.Body, target.Name));
         if (references != 1)
             return null;
 
@@ -26394,7 +26926,8 @@ out bool hasReturning)
             return false;
 
         var candidate = statement.CommonTableExpressions[0];
-        if (candidate.MaterializationHint != CteMaterializationHint.NotMaterialized
+        if (candidate.IsWritable
+            || candidate.MaterializationHint != CteMaterializationHint.NotMaterialized
             || CountAllReferences(candidate.Query, candidate.Name) != 0
             || !IsBareSelectStarFrom(statement.Query, candidate.Name))
         {
@@ -26662,6 +27195,18 @@ out bool hasReturning)
         };
     }
 
+    private static int CountStatementReferences(ParsedStatement statement, string name)
+    {
+        return statement switch
+        {
+            QueryStatement query => CountAllReferences(query, name),
+            WithDmlStatement withDml => withDml.CommonTableExpressions.Sum(
+                    cte => CountStatementReferences(cte.Body, name))
+                + CountDmlReferences(withDml.Dml, name),
+            _ => CountDmlReferences(statement, name),
+        };
+    }
+
     // Deep count of references to a CTE name anywhere in a query, including derived tables
     // and subquery expressions. A nested WITH that redefines the name shadows it, so
     // references beneath such a clause are not counted.
@@ -26690,7 +27235,7 @@ out bool hasReturning)
             case WithSelectStatement with:
                 if (with.CommonTableExpressions.Any(cte => string.Equals(cte.Name, name, StringComparison.OrdinalIgnoreCase)))
                     return 0;
-                return with.CommonTableExpressions.Sum(cte => CountAllReferences(cte.Query, name))
+                return with.CommonTableExpressions.Sum(cte => CountStatementReferences(cte.Body, name))
                     + CountAllReferences(with.Query, name);
             default:
                 return 0;
@@ -30225,6 +30770,8 @@ out bool hasReturning)
 
     private static string[] DescribeValues(ValuesClause values)
     {
+        if (values.Rows.Count == 0)
+            return [];
         var columns = new string[values.Rows[0].Count];
         for (var index = 0; index < columns.Length; index++)
             columns[index] = $"column{index + 1}";
@@ -30253,8 +30800,8 @@ out bool hasReturning)
 
             var columns = ResolveCommonTableExpressionColumns(
                 commonTableExpression,
-                DescribeQuery(
-                    commonTableExpression.Query,
+                DescribeCommonTableExpressionBody(
+                    commonTableExpression.Body,
                     context with { CommonTableExpressions = commonTableExpressions }));
             commonTableExpressions[commonTableExpression.Name] = new SourceData(columns, []);
         }
@@ -30262,6 +30809,91 @@ out bool hasReturning)
         return DescribeQuery(
             statement.Query,
             context with { CommonTableExpressions = commonTableExpressions });
+    }
+
+    private static string[] DescribeCommonTableExpressionBody(
+        ParsedStatement body,
+        QueryContext context)
+    {
+        if (body is QueryStatement query)
+            return DescribeQuery(query, context);
+
+        IReadOnlyList<Projection>? returning;
+        string tableName;
+        switch (body)
+        {
+            case InsertStatement insert:
+                returning = insert.Returning;
+                tableName = insert.TableName;
+                break;
+            case UpdateStatement update:
+                returning = update.Returning;
+                tableName = update.TableName;
+                break;
+            case DeleteStatement delete:
+                returning = delete.Returning;
+                tableName = delete.TableName;
+                break;
+            case WithDmlStatement withDml:
+                return DescribeCommonTableExpressionBody(withDml.Dml, context);
+            default:
+                throw new EmbeddedSqlException(
+                    "a writable common-table expression must contain INSERT, UPDATE, or DELETE");
+        }
+
+        if (returning is null || returning.Count == 0)
+            return [];
+        if (!context.Tables.TryGetValue(tableName, out var table))
+            throw new EmbeddedSqlException($"no such table: {tableName}");
+
+        var outputColumns = BuildOutputColumns(tableName, table.Columns);
+        return GetColumnNames(returning, outputColumns, outputColumns);
+    }
+
+    private static IReadOnlyList<string?> GetCommonTableExpressionBodyCollations(
+        ParsedStatement body,
+        QueryContext context)
+    {
+        if (body is QueryStatement query)
+            return GetQueryOutputCollations(query, context);
+        if (!TryGetReturning(body, out var tableName, out var returning)
+            || !context.Tables.TryGetValue(tableName, out var table))
+        {
+            return [];
+        }
+
+        var source = new NamedTableSource(tableName);
+        var outputColumns = BuildOutputColumns(tableName, table.Columns);
+        return GetDistinctProjectionCollations(
+            returning,
+            outputColumns,
+            outputColumns,
+            source,
+            context);
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> DescribeCommonTableExpressionBodyAffinities(
+        ParsedStatement body,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        if (body is QueryStatement query)
+            return DescribeQueryAffinities(query, context, commonTableExpressions);
+        if (!TryGetReturning(body, out var tableName, out var returning))
+            return [];
+
+        var select = new SelectStatement(
+            Distinct: false,
+            returning,
+            new NamedTableSource(tableName),
+            Where: null,
+            GroupBy: [],
+            Having: null,
+            NamedWindows: [],
+            OrderBy: [],
+            Limit: null,
+            Offset: null);
+        return DescribeSelectAffinities(select, context, commonTableExpressions);
     }
 
     private sealed record QueryAffinityColumn(
@@ -30648,8 +31280,8 @@ out bool hasReturning)
             if (!requiredCteNames.Contains(cte.Name))
                 continue;
 
-            var columns = DescribeQueryAffinities(
-                cte.Query,
+            var columns = DescribeCommonTableExpressionBodyAffinities(
+                cte.Body,
                 context with { CommonTableExpressions = runtimeCtes },
                 ctes).ToArray();
             if (cte.Columns is { } declared)
@@ -31335,7 +31967,7 @@ out bool hasReturning)
                     break;
                 case WithSelectStatement with:
                     foreach (var cte in with.CommonTableExpressions)
-                        pending.Push(cte.Query);
+                        pending.Push(cte.Body);
                     pending.Push(with.Query);
                     break;
                 case ValuesClause values:
@@ -32941,7 +33573,8 @@ out bool hasReturning)
                 {
                     var cteNames = with.CommonTableExpressions.Select(cte => cte.Name);
                     var bodyNames = new HashSet<string>(outerNames.Except(cteNames), StringComparer.OrdinalIgnoreCase);
-                    return with.CommonTableExpressions.Any(cte => QueryReferencesFromNames(cte.Query, outerNames))
+                    return with.CommonTableExpressions.Any(cte =>
+                            cte.IsWritable || QueryReferencesFromNames(cte.Query, outerNames))
                         || QueryReferencesFromNames(with.Query, bodyNames);
                 }
             case ValuesClause values:
@@ -34589,6 +35222,8 @@ out bool hasReturning)
                 return SqlValue.Null;
 
             values.Sort(ComparePercentileValues);
+            if (function.OrderedSetOrderBy?.Descending == true)
+                values.Reverse();
             var rank = fraction * (values.Count - 1);
             var lower = (int)Math.Floor(rank);
             var upper = (int)Math.Ceiling(rank);
@@ -34611,8 +35246,10 @@ out bool hasReturning)
         if (discreteValues.Count == 0)
             return SqlValue.Null;
 
-        var collation = GetCollation(function.Arguments[0]);
-        discreteValues.Sort((left, right) => Compare(left, right, collation));
+        var orderBy = function.OrderedSetOrderBy
+            ?? new OrderByTerm(function.Arguments[0], Descending: false);
+        var collation = GetCollation(orderBy.Expression);
+        discreteValues.Sort((left, right) => CompareForOrdering(left, right, orderBy, collation));
         var index = fraction <= 0d
             ? 0
             : Math.Max(0, (int)Math.Ceiling(fraction * discreteValues.Count) - 1);
@@ -34638,8 +35275,10 @@ out bool hasReturning)
         if (values.Count == 0)
             return SqlValue.Null;
 
-        var collation = GetCollation(function.Arguments[0]);
-        values.Sort((left, right) => Compare(left, right, collation));
+        var orderBy = function.OrderedSetOrderBy
+            ?? new OrderByTerm(function.Arguments[0], Descending: false);
+        var collation = GetCollation(orderBy.Expression);
+        values.Sort((left, right) => CompareForOrdering(left, right, orderBy, collation));
         var bestIndex = 0;
         var bestCount = 0;
         for (var index = 0; index < values.Count;)
@@ -43088,7 +43727,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         cancellationToken.ThrowIfCancellationRequested();
         if (_transactionDatabases is not null
             || _database.IsReadOnly
-            || !EmbeddedDatabase.MayMutate(statement))
+            || !StatementMayMutate(_database, statement))
         {
             return null;
         }
@@ -44291,7 +44930,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         _cacheSizes.Clear();
         _cacheSpills.Clear();
         _synchronousModes.Clear();
-        _lockingModes.Clear();
+        ReleaseExclusiveLockingModes();
         _dataSyncRetry = false;
         _fullColumnNames = false;
         _shortColumnNames = true;
@@ -44432,6 +45071,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfRecursiveTriggerCallbackReentry();
         ReleaseAllStatementReaders();
         ResetTransactionState();
+        ReleaseExclusiveLockingModes();
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Dispose();
         _attachedDatabases.Clear();
@@ -44474,7 +45114,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         _cacheSizes.Remove(_tempDatabase);
         _cacheSpills.Remove(_tempDatabase);
         _synchronousModes.Remove(_tempDatabase);
-        _lockingModes.Remove(_tempDatabase);
+        ReleaseExclusiveLockingMode(_tempDatabase);
         _tempDatabase.Dispose();
         _tempDatabase = new EmbeddedDatabase();
         _database.CopyFunctionAndCollationRegistriesTo(_tempDatabase);
@@ -44490,7 +45130,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfInsideHookCallback();
         cancellationToken.ThrowIfCancellationRequested();
         ThrowIfRequireWhereViolated(statement);
-        if (_transactionMutationDatabase is not null && EmbeddedDatabase.MayMutate(statement))
+        if (_transactionMutationDatabase is not null && StatementMayMutate(_database, statement))
         {
             throw new EmbeddedSqlException(
                 "Managed connections do not support reentrant writes from SQL callbacks.");
@@ -44634,10 +45274,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                     throw new EmbeddedSqlException("attempt to write a readonly database");
                 return ExecuteCreateTableAs(createTableAs, parameters, cancellationToken);
             default:
-                if (_queryOnly && EmbeddedDatabase.MayMutate(statement))
-                    throw new EmbeddedSqlException("attempt to write a readonly database");
-
                 var routed = RouteStatement(statement);
+                var routedMayMutate = StatementMayMutate(routed.Database, routed.Statement);
+                if (_queryOnly && routedMayMutate)
+                    throw new EmbeddedSqlException("attempt to write a readonly database");
                 var vdbeExecutionOptions = CreateVdbeExecutionOptions(routed.Database);
                 // A reader-excluding EXCLUSIVE transaction on another connection blocks
                 // this statement outright, which is what SQLite's EXCLUSIVE lock does
@@ -44662,7 +45302,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                     transactionState = GetTransactionState(routed.Database);
                     if (transactionState is not null
                         && _foreignKeys
-                        && EmbeddedDatabase.MayMutate(routed.Statement))
+                        && routedMayMutate)
                     {
                         deferredBefore = routed.Database.CollectForeignKeyViolations(
                             transactionState.Catalog.Tables,
@@ -44670,7 +45310,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                     }
                     var mutationReserved = ReserveTransactionMutation(routed.Database, routed.Statement);
                     TryGetConcurrentMvccScope(routed.Database, out concurrentStore, out concurrentTxId);
-                    if (EmbeddedDatabase.MayMutate(routed.Statement)
+                    if (routedMayMutate
                         && concurrentStore is not null
                         && concurrentTxId is not null)
                     {
@@ -44728,7 +45368,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                             }
                             catch (Exception failure)
                                 when (failure is not EmbeddedConflictFailException
-                                    && EmbeddedDatabase.MayMutate(routed.Statement))
+                                    && routedMayMutate)
                             {
                                 // SQLite rolls back the implicit transaction wrapping a failed
                                 // autocommit mutation and notifies the rollback hook. ON CONFLICT
@@ -44740,7 +45380,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                         }
                         else
                         {
-                            statementCatalog = EmbeddedDatabase.MayMutate(routed.Statement)
+                            statementCatalog = routedMayMutate
                                 ? transactionState.Catalog.Clone()
                                 : transactionState.Catalog;
                             result = routed.Database.Execute(
@@ -44764,12 +45404,15 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 concurrentMvccTxId: concurrentTxId,
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions);
-                            if (EmbeddedDatabase.MayMutate(routed.Statement))
+                            if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not
                             // record change counters itself, so mirror the autocommit path here:
                             // changes()/total_changes() must observe in-transaction writes.
-                            routed.Database.RecordChangeCounters(routed.Statement, result);
+                            routed.Database.RecordChangeCounters(
+                                routed.Statement,
+                                result,
+                                statementCatalog?.Views ?? transactionState.Catalog.Views);
                         }
                     }
                     finally
@@ -44950,7 +45593,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                         concurrentStore,
                         concurrentTxId,
                         mvccStatementSavepoint);
-                    if (transactionState is not null && EmbeddedDatabase.MayMutate(routed.Statement))
+                    if (transactionState is not null && routedMayMutate)
                     {
                         ResetTransactionState();
                         FireRollbackHook();
@@ -45234,7 +45877,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         _cacheSizes.Remove(attachment.Database);
         _cacheSpills.Remove(attachment.Database);
         _synchronousModes.Remove(attachment.Database);
-        _lockingModes.Remove(attachment.Database);
+        ReleaseExclusiveLockingMode(attachment.Database);
         attachment.Dispose();
         return ExecutionResult.Empty;
     }
@@ -45520,6 +46163,7 @@ public sealed partial class EmbeddedConnection : IDisposable
             InsertStatement insert => RouteDataStatement(insert),
             UpdateStatement update => RouteDataStatement(update),
             DeleteStatement delete => RouteDataStatement(delete),
+            QueryStatement query when StatementMayMutate(_database, query) => RouteDataStatement(query),
             QueryStatement query => RouteQuery(query),
             ExplainStatement explain => RouteExplain(
                             explain.Inner,
@@ -46252,6 +46896,8 @@ Func<string, ParsedStatement> rewrite)
         if (resolvedSchemas.Count == 0)
             return new RoutedStatement(_database, statement, IsAttached: false);
         if (statement is QueryStatement query
+            && !StatementMayMutate(_database, statement)
+            && !StatementMayMutate(_tempDatabase, statement)
             && resolvedSchemas.Count == 2
             && resolvedSchemas.Contains("main")
             && resolvedSchemas.Contains("temp"))
@@ -46494,6 +47140,15 @@ Func<string, ParsedStatement> rewrite)
                         function.AggregateOrderBy,
                         sourceNames,
                         commonTableExpressions),
+                OrderedSetOrderBy = function.OrderedSetOrderBy is null
+                    ? null
+                    : function.OrderedSetOrderBy with
+                    {
+                        Expression = RewriteMainTempReadExpression(
+                            function.OrderedSetOrderBy.Expression,
+                            sourceNames,
+                            commonTableExpressions)!,
+                    },
             },
             RowValueExpression rowValue => rowValue with
             {
@@ -46687,9 +47342,12 @@ Func<string, ParsedStatement> rewrite)
                 foreach (var commonTableExpression in with.CommonTableExpressions)
                 {
                     names.Add(commonTableExpression.Name);
-                    CollectQuerySchemas(commonTableExpression.Query, schemas, names);
+                    CollectStatementSchemas(commonTableExpression.Body, schemas, names);
                 }
                 CollectStatementSchemas(with.Dml, schemas, names);
+                break;
+            case QueryStatement query:
+                CollectQuerySchemas(query, schemas, commonTableExpressions);
                 break;
             default:
                 throw new InvalidOperationException($"Cannot route data statement {statement.GetType().Name}.");
@@ -46734,7 +47392,7 @@ Func<string, ParsedStatement> rewrite)
                 foreach (var commonTableExpression in with.CommonTableExpressions)
                 {
                     names.Add(commonTableExpression.Name);
-                    CollectQuerySchemas(commonTableExpression.Query, schemas, names);
+                    CollectStatementSchemas(commonTableExpression.Body, schemas, names);
                 }
                 CollectQuerySchemas(with.Query, schemas, names);
                 break;
@@ -47014,10 +47672,7 @@ Func<string, ParsedStatement> rewrite)
         foreach (var commonTableExpression in statement.CommonTableExpressions)
         {
             names.Add(commonTableExpression.Name);
-            rewritten.Add(commonTableExpression with
-            {
-                Query = RewriteQuerySchema(commonTableExpression.Query, schema, names),
-            });
+            rewritten.Add(RewriteCommonTableExpressionSchema(commonTableExpression, schema, names));
         }
 
         return statement with
@@ -47118,10 +47773,7 @@ Func<string, ParsedStatement> rewrite)
         foreach (var commonTableExpression in statement.CommonTableExpressions)
         {
             names.Add(commonTableExpression.Name);
-            rewritten.Add(commonTableExpression with
-            {
-                Query = RewriteQuerySchema(commonTableExpression.Query, schema, names),
-            });
+            rewritten.Add(RewriteCommonTableExpressionSchema(commonTableExpression, schema, names));
         }
 
         return statement with
@@ -47129,6 +47781,25 @@ Func<string, ParsedStatement> rewrite)
             CommonTableExpressions = rewritten,
             Query = RewriteQuerySchema(statement.Query, schema, names),
         };
+    }
+
+    private static CommonTableExpression RewriteCommonTableExpressionSchema(
+        CommonTableExpression commonTableExpression,
+        string schema,
+        HashSet<string> names)
+    {
+        return commonTableExpression.WritableBody is null
+            ? commonTableExpression with
+            {
+                Query = RewriteQuerySchema(commonTableExpression.Query, schema, names),
+            }
+            : commonTableExpression with
+            {
+                WritableBody = RewriteStatementSchema(
+                    commonTableExpression.WritableBody,
+                    schema,
+                    names),
+            };
     }
 
     private static TableSource? RewriteSourceSchema(
@@ -47225,6 +47896,19 @@ Func<string, ParsedStatement> rewrite)
                     RewriteExpressionSchema(argument, schema, commonTableExpressions)).ToArray(),
                 Filter = RewriteNullableExpression(function.Filter, schema, commonTableExpressions),
                 Window = RewriteWindowSchema(function.Window, schema, commonTableExpressions),
+                AggregateOrderBy = RewriteOrderBy(
+                    function.AggregateOrderBy ?? [],
+                    schema,
+                    commonTableExpressions),
+                OrderedSetOrderBy = function.OrderedSetOrderBy is null
+                    ? null
+                    : function.OrderedSetOrderBy with
+                    {
+                        Expression = RewriteExpressionSchema(
+                            function.OrderedSetOrderBy.Expression,
+                            schema,
+                            commonTableExpressions),
+                    },
             },
             RowValueExpression rowValue => rowValue with
             {
@@ -47392,6 +48076,7 @@ Func<string, ParsedStatement> rewrite)
                 || (insert.Returning?.Any(projection => ExpressionContainsSchemaQualification(projection.Expression)) ?? false),
             UpdateStatement update => ManagedSchemaName.TrySplit(update.TableName, out _, out _)
                 || update.Assignments.Any(assignment => ExpressionContainsSchemaQualification(assignment.Value))
+                || SourceContainsSchemaQualification(update.From)
                 || ExpressionContainsSchemaQualification(update.Where)
                 || update.EffectiveOrderBy.Any(term => ExpressionContainsSchemaQualification(term.Expression))
                 || ExpressionContainsSchemaQualification(update.Limit)
@@ -47405,7 +48090,7 @@ Func<string, ParsedStatement> rewrite)
                 || (delete.Returning?.Any(projection => ExpressionContainsSchemaQualification(projection.Expression)) ?? false),
             WithDmlStatement with => with.CommonTableExpressions.Any(commonTableExpression =>
                     ManagedSchemaName.TrySplit(commonTableExpression.Name, out _, out _)
-                    || QueryContainsSchemaQualification(commonTableExpression.Query))
+                    || ContainsSchemaQualification(commonTableExpression.Body))
                 || ContainsSchemaQualification(with.Dml),
             QueryStatement query => QueryContainsSchemaQualification(query),
             ExplainStatement explain => ContainsSchemaQualification(explain.Inner),
@@ -47433,7 +48118,7 @@ Func<string, ParsedStatement> rewrite)
                 || ExpressionContainsSchemaQualification(compound.Limit)
                 || ExpressionContainsSchemaQualification(compound.Offset),
             WithSelectStatement with => with.CommonTableExpressions.Any(commonTableExpression =>
-                    QueryContainsSchemaQualification(commonTableExpression.Query))
+                    ContainsSchemaQualification(commonTableExpression.Body))
                 || QueryContainsSchemaQualification(with.Query),
             _ => false,
         };
@@ -47606,6 +48291,19 @@ Func<string, ParsedStatement> rewrite)
         return state;
     }
 
+    private bool StatementMayMutate(EmbeddedDatabase database, ParsedStatement statement)
+    {
+        var catalog = _transactionDatabases is not null
+            && _transactionDatabases.TryGetValue(database, out var transactionState)
+                ? transactionState.Catalog
+                : database.LiveCatalog;
+        return EmbeddedDatabase.MayMutate(statement, catalog.Views);
+    }
+
+    internal bool StatementMayMutate(ParsedStatement statement)
+        => StatementMayMutate(_database, statement)
+            || StatementMayMutate(_tempDatabase, statement);
+
     private void BeginTransaction(bool openedBySavepoint, TransactionMode mode)
     {
         if (mode == TransactionMode.Concurrent)
@@ -47740,7 +48438,7 @@ Func<string, ParsedStatement> rewrite)
 
     private void EnsureTransactionMayMutate(EmbeddedDatabase database, ParsedStatement statement)
     {
-        if (!EmbeddedDatabase.MayMutate(statement))
+        if (!StatementMayMutate(database, statement))
             return;
         if (database.IsReadOnly)
             throw new EmbeddedSqlException("attempt to write a readonly database");
@@ -47774,7 +48472,7 @@ Func<string, ParsedStatement> rewrite)
     private bool ReserveTransactionMutation(EmbeddedDatabase database, ParsedStatement statement)
     {
         EnsureTransactionMayMutate(database, statement);
-        if (!EmbeddedDatabase.MayMutate(statement))
+        if (!StatementMayMutate(database, statement))
             return false;
 
         if (_transactionDatabases is null)
@@ -48466,7 +49164,11 @@ Func<string, ParsedStatement> rewrite)
             throw new EmbeddedSqlException("temporary storage cannot be changed from within a transaction");
 
         _tempStore = statement.Value.Value;
-        ResetTemporaryDatabase();
+        // A transaction already owns the current temp database snapshot. When no temp object
+        // exists there is nothing to reset, and preserving that instance keeps subsequent temp
+        // DDL inside the same transaction ownership map.
+        if (!HasActiveTransaction)
+            ResetTemporaryDatabase();
         _tempInitialized = false;
         return ExecutionResult.Empty;
     }
@@ -48562,19 +49264,51 @@ Func<string, ParsedStatement> rewrite)
     {
         var database = ResolvePragmaDatabase(statement.Schema);
         var lockingMode = _lockingModes.GetValueOrDefault(database, "normal");
+        if (statement.Value is not null && _transactionDatabases is not null)
+            return new ExecutionResult(["locking_mode"], [[SqlValue.Text(lockingMode)]], 0);
+
         if (statement.Value is not null
-            && statement.Value.Equals("normal", StringComparison.OrdinalIgnoreCase))
+            && statement.Value.Equals("normal", StringComparison.OrdinalIgnoreCase)
+            && lockingMode == "exclusive")
         {
+            _ = database.SetConnectionExclusiveLockingMode(exclusive: false, BusyTimeout);
             lockingMode = "normal";
         }
         else if (statement.Value is not null
-            && statement.Value.Equals("exclusive", StringComparison.OrdinalIgnoreCase))
+            && statement.Value.Equals("exclusive", StringComparison.OrdinalIgnoreCase)
+            && lockingMode == "normal")
         {
-            lockingMode = "exclusive";
+            lockingMode = database.SetConnectionExclusiveLockingMode(exclusive: true, BusyTimeout)
+                ? "exclusive"
+                : "normal";
         }
 
         _lockingModes[database] = lockingMode;
         return new ExecutionResult(["locking_mode"], [[SqlValue.Text(lockingMode)]], 0);
+    }
+
+    private void ReleaseExclusiveLockingMode(EmbeddedDatabase database)
+    {
+        if (!_lockingModes.Remove(database, out var lockingMode)
+            || !lockingMode.Equals("exclusive", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _ = database.SetConnectionExclusiveLockingMode(exclusive: false, BusyTimeout);
+    }
+
+    private void ReleaseExclusiveLockingModes()
+    {
+        foreach (var database in _lockingModes
+                     .Where(pair => pair.Value.Equals("exclusive", StringComparison.Ordinal))
+                     .Select(pair => pair.Key)
+                     .ToArray())
+        {
+            _ = database.SetConnectionExclusiveLockingMode(exclusive: false, BusyTimeout);
+        }
+
+        _lockingModes.Clear();
     }
 
     private ExecutionResult ExecutePragmaAutoVacuum(PragmaAutoVacuumStatement statement)
@@ -49456,6 +50190,7 @@ public sealed class EmbeddedStatement : IDisposable
             return;
         }
 
+        var mayMutate = _connection.StatementMayMutate(_statement);
         IDisposable? executionLease = _statement is
             VacuumStatement or PragmaJournalModeStatement or PragmaPageSizeStatement
             ? null
@@ -49463,7 +50198,7 @@ public sealed class EmbeddedStatement : IDisposable
         try
         {
             _result = _connection.Execute(_statement, _boundValues, cancellationToken);
-            if (!EmbeddedDatabase.MayMutate(_statement))
+            if (!mayMutate)
                 cancellationToken.ThrowIfCancellationRequested();
             if (HasPotentialRows(_result.Rows))
             {
@@ -50800,9 +51535,6 @@ internal sealed class EmbeddedTable
 
         if (generated.Count == 0)
             return [];
-
-        if (generated.Any(index => columns[index].GeneratedStored))
-            throw new EmbeddedSqlException("Stored generated columns are not supported");
 
         foreach (var index in generated)
         {

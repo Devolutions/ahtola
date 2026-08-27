@@ -33,8 +33,43 @@ New-AhtolaSqliteConnection -DatabaseFile <string> [-DatabasePath <string>] [-Rea
 ### byTursoCloud
 
 ```
-New-AhtolaSqliteConnection [-TursoUrl <string>] [-AuthToken <securestring>] [-ReplicaPath <string>]
- [-UseTursoEnvironment] [-SyncInterval <int>] [-WhatIf] [-Confirm]
+New-AhtolaSqliteConnection [-TursoUrl <string>] [-AuthToken <securestring>] [-UseTursoEnvironment]
+ [-WhatIf] [-Confirm]
+```
+
+### byTursoReplica
+
+```
+New-AhtolaSqliteConnection -ReplicaPath <string> [-TursoUrl <string>] [-AuthToken <securestring>]
+ [-UseTursoEnvironment] [-SyncInterval <int>] [-LongPollTimeout <timespan>]
+ [-PushOperationsThreshold <long>] [-PullBytesThreshold <long>] [-WhatIf] [-Confirm]
+```
+
+### byTursoReplicaPrefix
+
+```
+New-AhtolaSqliteConnection -ReplicaPath <string> -BootstrapPrefixBytes <int> [-TursoUrl <string>]
+ [-AuthToken <securestring>] [-UseTursoEnvironment] [-SyncInterval <int>]
+ [-LongPollTimeout <timespan>] [-PushOperationsThreshold <long>] [-PullBytesThreshold <long>]
+ [-BootstrapSegmentBytes <long>] [-BootstrapPrefetch] [-WhatIf] [-Confirm]
+```
+
+### byTursoReplicaQuery
+
+```
+New-AhtolaSqliteConnection -ReplicaPath <string> -BootstrapQuery <string> [-TursoUrl <string>]
+ [-AuthToken <securestring>] [-UseTursoEnvironment] [-SyncInterval <int>]
+ [-LongPollTimeout <timespan>] [-PushOperationsThreshold <long>]
+ [-BootstrapSegmentBytes <long>] [-BootstrapPrefetch] [-WhatIf] [-Confirm]
+```
+
+### byTursoReplicaEncrypted
+
+```
+New-AhtolaSqliteConnection -ReplicaPath <string> -RemoteEncryptionKey <securestring>
+ -RemoteEncryptionCipher <string> [-TursoUrl <string>] [-AuthToken <securestring>]
+ [-UseTursoEnvironment] [-SyncInterval <int>] [-LongPollTimeout <timespan>]
+ [-PushOperationsThreshold <long>] [-PullBytesThreshold <long>] [-WhatIf] [-Confirm]
 ```
 
 ## ALIASES
@@ -43,7 +78,7 @@ This cmdlet has no aliases.
 
 ## DESCRIPTION
 
-Creates a connection from a connection string, database path and file, or Turso endpoint. The returned connection is open and caller-owned. Local relative paths resolve from the current filesystem location.
+Creates a connection from a connection string, database path and file, or Turso endpoint. Replica parameter sets expose long polling, push/pull thresholds, prefix/query bootstrap, and remote encryption. The returned connection is open and caller-owned. Local relative paths resolve from the current filesystem location.
 
 ## EXAMPLES
 
@@ -72,6 +107,126 @@ Aliases:
 - Token
 ParameterSets:
 - Name: byTursoCloud
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaQuery
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaEncrypted
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplica
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+DontShow: false
+AcceptedValues: []
+HelpMessage: ''
+```
+
+### -BootstrapPrefetch
+
+Prefetches adjacent pages when a partially bootstrapped replica faults a missing page.
+
+```yaml
+Type: System.Management.Automation.SwitchParameter
+DefaultValue: ''
+SupportsWildcards: false
+Aliases: []
+ParameterSets:
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaQuery
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+DontShow: false
+AcceptedValues: []
+HelpMessage: ''
+```
+
+### -BootstrapPrefixBytes
+
+Bootstraps complete 4 KiB pages covered by this initial byte prefix.
+
+```yaml
+Type: System.Int32
+DefaultValue: ''
+SupportsWildcards: false
+Aliases: []
+ParameterSets:
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: true
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+DontShow: false
+AcceptedValues: []
+HelpMessage: ''
+```
+
+### -BootstrapQuery
+
+Server-side SQL query used once to select the initial page set.
+
+```yaml
+Type: System.String
+DefaultValue: ''
+SupportsWildcards: false
+Aliases: []
+ParameterSets:
+- Name: byTursoReplicaQuery
+  Position: Named
+  IsRequired: true
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+DontShow: false
+AcceptedValues: []
+HelpMessage: ''
+```
+
+### -BootstrapSegmentBytes
+
+Lazy-loading segment size. It must be a whole number of 4 KiB pages.
+
+```yaml
+Type: System.Int64
+DefaultValue: ''
+SupportsWildcards: false
+Aliases: []
+ParameterSets:
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaQuery
   Position: Named
   IsRequired: false
   ValueFromPipeline: false
@@ -167,6 +322,117 @@ AcceptedValues: []
 HelpMessage: ''
 ```
 
+### -LongPollTimeout
+
+Maximum server long-poll duration. Omit this parameter to disable long polling.
+
+```yaml
+Type: System.Nullable[System.TimeSpan]
+DefaultValue: ''
+SupportsWildcards: false
+Aliases: []
+ParameterSets:
+- Name: byTursoReplica
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaQuery
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaEncrypted
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+DontShow: false
+AcceptedValues: []
+HelpMessage: ''
+```
+
+### -PullBytesThreshold
+
+Target byte size for each initial bootstrap pull, rounded to complete 4 KiB pages.
+
+```yaml
+Type: System.Int64
+DefaultValue: ''
+SupportsWildcards: false
+Aliases: []
+ParameterSets:
+- Name: byTursoReplica
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaEncrypted
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+DontShow: false
+AcceptedValues: []
+HelpMessage: ''
+```
+
+### -PushOperationsThreshold
+
+Maximum CDC operation target for one replica push batch.
+
+```yaml
+Type: System.Int64
+DefaultValue: ''
+SupportsWildcards: false
+Aliases: []
+ParameterSets:
+- Name: byTursoReplica
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaQuery
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaEncrypted
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+DontShow: false
+AcceptedValues: []
+HelpMessage: ''
+```
+
 ### -ReadOnly
 
 Opens a local database with `Mode=ReadOnly`. It is unavailable for Turso Cloud connections.
@@ -194,6 +460,56 @@ AcceptedValues: []
 HelpMessage: ''
 ```
 
+### -RemoteEncryptionCipher
+
+Cipher configured on the encrypted remote database.
+
+```yaml
+Type: System.String
+DefaultValue: ''
+SupportsWildcards: false
+Aliases: []
+ParameterSets:
+- Name: byTursoReplicaEncrypted
+  Position: Named
+  IsRequired: true
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+DontShow: false
+AcceptedValues:
+- Aes256Gcm
+- Aes128Gcm
+- Aegis128L
+- Aegis128X2
+- Aegis128X4
+- Aegis256
+- Aegis256X2
+- Aegis256X4
+HelpMessage: ''
+```
+
+### -RemoteEncryptionKey
+
+Base64 remote encryption key supplied as a secure string. The key is never written to output.
+
+```yaml
+Type: System.Security.SecureString
+DefaultValue: ''
+SupportsWildcards: false
+Aliases: []
+ParameterSets:
+- Name: byTursoReplicaEncrypted
+  Position: Named
+  IsRequired: true
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+DontShow: false
+AcceptedValues: []
+HelpMessage: ''
+```
+
 ### -ReplicaPath
 
 Local database file for a managed Turso replica.
@@ -204,9 +520,27 @@ DefaultValue: ''
 SupportsWildcards: false
 Aliases: []
 ParameterSets:
-- Name: byTursoCloud
+- Name: byTursoReplica
   Position: Named
-  IsRequired: false
+  IsRequired: true
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: true
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaQuery
+  Position: Named
+  IsRequired: true
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaEncrypted
+  Position: Named
+  IsRequired: true
   ValueFromPipeline: false
   ValueFromPipelineByPropertyName: false
   ValueFromRemainingArguments: false
@@ -225,7 +559,25 @@ DefaultValue: ''
 SupportsWildcards: false
 Aliases: []
 ParameterSets:
-- Name: byTursoCloud
+- Name: byTursoReplica
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaQuery
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaEncrypted
   Position: Named
   IsRequired: false
   ValueFromPipeline: false
@@ -254,6 +606,30 @@ ParameterSets:
   ValueFromPipeline: false
   ValueFromPipelineByPropertyName: false
   ValueFromRemainingArguments: false
+- Name: byTursoReplica
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaQuery
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaEncrypted
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
 DontShow: false
 AcceptedValues: []
 HelpMessage: ''
@@ -270,6 +646,30 @@ SupportsWildcards: false
 Aliases: []
 ParameterSets:
 - Name: byTursoCloud
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplica
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaPrefix
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaQuery
+  Position: Named
+  IsRequired: false
+  ValueFromPipeline: false
+  ValueFromPipelineByPropertyName: false
+  ValueFromRemainingArguments: false
+- Name: byTursoReplicaEncrypted
   Position: Named
   IsRequired: false
   ValueFromPipeline: false
@@ -325,7 +725,7 @@ An open direct Turso Cloud connection or managed replica connection.
 
 ## NOTES
 
-`-WhatIf` reports the request without opening a connection or creating a local database file. Close the returned connection explicitly.
+`-WhatIf` reports the request without opening a connection or creating a local database file. Partial bootstrap cannot be combined with remote encryption, and query bootstrap cannot be combined with `-PullBytesThreshold`. Authentication tokens and encryption keys are never included in output. Close the returned connection explicitly.
 
 ## RELATED LINKS
 

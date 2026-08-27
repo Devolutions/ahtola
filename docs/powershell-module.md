@@ -77,7 +77,11 @@ may open it if it's closed, but never closes or disposes it for you.
 | --- | --- | --- |
 | `byConnectionString` (default) | `-ConnectionString` (default `Data Source=:memory:;Cache=Shared;`) | `SqliteConnection` |
 | `byDatabasePath` | `-DatabasePath`, `-DatabaseFile` | `SqliteConnection` |
-| `byTursoCloud` | `-TursoUrl`/`-RemoteUrl`/`-Url`, `-AuthToken`/`-Token`, `-ReplicaPath`, `-UseTursoEnvironment`, `-SyncInterval` | `AhtolaCloudConnection` |
+| `byTursoCloud` | `-TursoUrl`/`-RemoteUrl`/`-Url`, `-AuthToken`/`-Token`, `-UseTursoEnvironment` | Direct `AhtolaCloudConnection` |
+| `byTursoReplica` | Cloud parameters, mandatory `-ReplicaPath`, optional long-poll/push/pull thresholds and `-SyncInterval` | Managed replica `AhtolaCloudConnection` |
+| `byTursoReplicaPrefix` | Replica parameters plus `-BootstrapPrefixBytes`, optional `-BootstrapSegmentBytes` and `-BootstrapPrefetch` | Prefix-selected managed replica |
+| `byTursoReplicaQuery` | Replica parameters plus `-BootstrapQuery`, optional `-BootstrapSegmentBytes` and `-BootstrapPrefetch` | Query-selected managed replica |
+| `byTursoReplicaEncrypted` | Replica parameters plus `-RemoteEncryptionKey` and `-RemoteEncryptionCipher` | Encrypted managed replica |
 
 `-ReadOnly` applies to the first two sets and sets `Mode=ReadOnly` on the
 connection string before opening. Relative `Data Source`, `-DatabasePath`, and
@@ -425,10 +429,12 @@ $env:TURSO_AUTH_TOKEN = $plaintextToken   # set by your secret manager, not hard
 $cloud = New-AhtolaSqliteConnection -UseTursoEnvironment
 ```
 
-Every cmdlet that talks to the network (`Invoke-AhtolaSqliteQuery`,
-`Test-AhtolaSqliteConnection`, open/close) wraps provider failures in a
-generic `InvalidOperationException` for cloud connections, specifically so a
-credential never leaks into an error message or the error stream.
+Remote/provider exceptions are preserved. In particular,
+`AhtolaRemoteSqlException`, `AhtolaReplicaConflictException`, and
+`AhtolaReplicaConflictPendingException` retain their typed status,
+classification, and conflict metadata. Tokens and encryption keys are accepted
+only as `SecureString` parameters and are never included in connection output,
+progress, or `WhatIf` targets.
 
 ## Turso Cloud: managed embedded replica
 
@@ -454,6 +460,45 @@ $result = Invoke-AhtolaSqliteReplicaSync -ReplicaConnection $replica
 $result.Outcome                  # UpToDate | RemoteChangesApplied
 $result.Statistics.LastPush
 $result.Statistics.LastPull
+```
+
+Replica construction exposes the managed provider's tuning and bootstrap
+options without requiring direct .NET API calls:
+
+```powershell
+# Wait up to 20 seconds for remote changes and bound push/pull batches.
+$replica = New-AhtolaSqliteConnection `
+    -UseTursoEnvironment -ReplicaPath ./replica.db `
+    -LongPollTimeout ([TimeSpan]::FromSeconds(20)) `
+    -PushOperationsThreshold 500 -PullBytesThreshold 4194304
+
+# Bootstrap complete pages covered by the first 1 MiB, then fault other pages.
+$prefixReplica = New-AhtolaSqliteConnection `
+    -UseTursoEnvironment -ReplicaPath ./prefix.db `
+    -BootstrapPrefixBytes 1MB -BootstrapSegmentBytes 64KB -BootstrapPrefetch
+
+# Let the server select bootstrap pages touched by a query.
+$queryReplica = New-AhtolaSqliteConnection `
+    -UseTursoEnvironment -ReplicaPath ./query.db `
+    -BootstrapQuery 'SELECT * FROM customer WHERE region = ''east''' `
+    -BootstrapSegmentBytes 64KB
+```
+
+`-PullBytesThreshold` is intentionally unavailable with query bootstrap,
+because the server chooses that page set. Partial bootstrap and remote
+encryption are separate parameter sets because the provider rejects that
+combination. Prefix and segment sizes must cover complete 4 KiB pages.
+
+For an encrypted remote, pass the base64 key as a secure string and choose the
+matching server cipher. Supported managed-replica ciphers are `Aes128Gcm`,
+`Aes256Gcm`, `Aegis128L`, `Aegis128X2`, `Aegis128X4`, `Aegis256`,
+`Aegis256X2`, and `Aegis256X4`.
+
+```powershell
+$remoteKey = Read-Host -AsSecureString -Prompt 'Base64 remote encryption key'
+$encrypted = New-AhtolaSqliteConnection `
+    -UseTursoEnvironment -ReplicaPath ./encrypted.db `
+    -RemoteEncryptionKey $remoteKey -RemoteEncryptionCipher Aes256Gcm
 ```
 
 `-SyncInterval <seconds>` (positive integer) starts a background
@@ -492,10 +537,48 @@ try {
 }
 catch [Ahtola.AhtolaReplicaConflictException] {
     Write-Warning "Replica push conflicted ($($_.Exception.ConflictKind)): $($_.Exception.Message)"
-    # The journal is untouched: inspect local state, resolve manually, and
-    # retry the sync (or discard/recreate the replica) once resolved.
+    $report = Get-AhtolaSqliteReplicaConflict -ReplicaConnection $replica
+    $report.Entries | Format-Table Sequence, Kind, Table, RowId, Eligibility
 }
 ```
+
+Inspecting is local and non-mutating. Eligible changes can be pulled onto a
+fresh remote base and replayed explicitly; unresolved changes remain
+quarantined:
+
+```powershell
+$resolution = Resolve-AhtolaSqliteReplicaConflict `
+    -ReplicaConnection $replica -RebaseEligible
+
+# ReplayEligible is an alias for RebaseEligible.
+$resolution.RebasedChangeCount
+$resolution.RemainingConflict
+```
+
+Discard is intentionally a separate high-impact parameter set. It requires
+both explicit data-loss acknowledgement and confirmation:
+
+```powershell
+Resolve-AhtolaSqliteReplicaConflict `
+    -ReplicaConnection $replica `
+    -DiscardUnresolvedChanges -AcknowledgeDataLoss -Confirm
+```
+
+Use `-WhatIf` to inspect either resolution without pulling, replaying, or
+discarding anything. Sync and eligible rebase publish `Pushing`, `Pulling`,
+`Applying`, and `Completed` progress through PowerShell's progress stream.
+
+Pending local row changes can be projected read-only into the public CDC
+contract without network I/O or advancing the acknowledgement watermark:
+
+```powershell
+$capture = Get-AhtolaSqliteReplicaChangeCapture -ReplicaConnection $replica
+$capture.Rows | Select-Object ChangeId, ChangeTransactionId, ChangeType, TableName, RowId
+```
+
+The projection fails closed for an active transaction, schema changes, or
+legacy deletes without a safe pre-image. It preserves the provider's
+`AhtolaReplicaChangeCaptureException`.
 
 Because each replica's writes stay purely local until the next sync, treat
 `-SyncInterval` as a convenience for keeping data roughly fresh, not as a
@@ -526,9 +609,9 @@ catch {
   MVCC conflict) surface as an exception whose message contains `database is
   locked`; `-CommandTimeout` on `Invoke-AhtolaSqliteQuery` (and `PRAGMA
   busy_timeout`) control how long a statement waits before giving up.
-- Turso Cloud / embedded-replica network and provider failures are wrapped as
-  `InvalidOperationException` with a generic message, to keep credentials and
-  provider internals out of the error stream.
+- Turso Cloud / embedded-replica failures retain their typed Ahtola exception
+  and metadata. Secrets are not included in cmdlet targets or connection
+  display values.
 - Embedded-replica sync conflicts are `Ahtola.AhtolaReplicaConflictException`
   (see above) and expose `ConflictKind` (`RowWrite`/`SchemaChange`/`Unknown`),
   `RemoteErrorCode`, and `LocalChangeSequence` for programmatic handling.

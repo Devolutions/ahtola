@@ -64,6 +64,14 @@ Retrieves stored Ahtola SQLite metadata values.
 
 Lists indexes and their definitions.
 
+### [Get-AhtolaSqliteReplicaChangeCapture](Get-AhtolaSqliteReplicaChangeCapture.md)
+
+Projects pending managed-replica changes into the public CDC contract.
+
+### [Get-AhtolaSqliteReplicaConflict](Get-AhtolaSqliteReplicaConflict.md)
+
+Inspects a managed replica's durable push conflict.
+
 ### [Get-AhtolaSqliteRow](Get-AhtolaSqliteRow.md)
 
 Retrieves rows from a configured table or view.
@@ -112,6 +120,10 @@ Runs VACUUM, optionally followed by ANALYZE, on a local database.
 
 Deletes rows from a configured SQLite table.
 
+### [Resolve-AhtolaSqliteReplicaConflict](Resolve-AhtolaSqliteReplicaConflict.md)
+
+Rebases eligible changes or discards unresolved managed-replica changes.
+
 ### [Save-AhtolaSqliteTransaction](Save-AhtolaSqliteTransaction.md)
 
 Creates a named savepoint in an active transaction.
@@ -139,4 +151,3 @@ Runs SQLite `PRAGMA integrity_check`.
 ### [Undo-AhtolaSqliteTransaction](Undo-AhtolaSqliteTransaction.md)
 
 Rolls back a transaction or rolls back to a savepoint.
-

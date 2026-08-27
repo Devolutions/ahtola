@@ -63,12 +63,12 @@ public sealed class SqliteWalByteRangeLockBusyException : InvalidOperationExcept
 /// <remarks>
 /// This primitive does not create, map, or interpret a <c>-shm</c> file, and it
 /// does not implement any pager, WAL-index, read-mark, writer, or checkpoint
-/// protocol. Each returned lease owns a dedicated file descriptor until disposal,
-/// so its operating-system lock lifetime cannot be shortened by an unrelated
-/// lease. Windows uses <c>LockFileEx</c>; 64-bit Linux uses OFD locks so closing
-/// an unrelated descriptor cannot release a lease; macOS uses POSIX
-/// <c>fcntl(F_SETLK)</c> (process-associated, not OFD — same class of lock SQLite
-/// uses on Darwin).
+/// protocol. Windows uses <c>LockFileEx</c>; 64-bit Linux uses OFD locks so
+/// closing an unrelated descriptor cannot release a lease. macOS uses POSIX
+/// <c>fcntl(F_SETLK)</c> (process-associated, not OFD — the same class SQLite
+/// uses on Darwin), so leases for a registered SHM carrier reuse registry-owned
+/// descriptors that remain open until both its final mapping and final borrowed
+/// lock lease are released.
 /// </remarks>
 public sealed partial class SqliteWalByteRangeLock
 {
@@ -328,46 +328,73 @@ public sealed partial class SqliteWalByteRangeLock
         out SqliteWalByteRangeLockLease? lease,
         out IOException? contention)
     {
-        var handle = carrier is null
-            ? OpenLeaseHandle(mode, writableLease)
+        IDisposable? brokeredHandleBorrow = null;
+        var handle = carrier is null || OperatingSystem.IsMacOS()
+            ? OpenLeaseHandle(mode, writableLease, out brokeredHandleBorrow)
             : carrier.DuplicateLockCarrierHandle();
         try
         {
             if (!TryLock(handle, offset, length, mode, out contention))
             {
                 handle.Dispose();
+                brokeredHandleBorrow?.Dispose();
+                brokeredHandleBorrow = null;
                 lease = null;
                 return false;
             }
 
             try
             {
-                lease = new SqliteWalByteRangeLockLease(handle, offset, length, mode);
+                lease = new SqliteWalByteRangeLockLease(
+                    handle,
+                    offset,
+                    length,
+                    mode,
+                    brokeredHandleBorrow);
                 handle = null!;
+                brokeredHandleBorrow = null;
                 return true;
             }
             catch
             {
                 handle.Dispose();
+                brokeredHandleBorrow?.Dispose();
+                brokeredHandleBorrow = null;
                 throw;
             }
         }
         finally
         {
             handle?.Dispose();
+            brokeredHandleBorrow?.Dispose();
         }
     }
 
-    private SafeFileHandle OpenLeaseHandle(SqliteWalByteRangeLockMode mode, bool writableLease)
-        => File.OpenHandle(
+    private SafeFileHandle OpenLeaseHandle(
+        SqliteWalByteRangeLockMode mode,
+        bool writableLease,
+        out IDisposable? brokeredHandleBorrow)
+    {
+        brokeredHandleBorrow = null;
+        var requireWritable = mode != SqliteWalByteRangeLockMode.Shared
+            && (!OperatingSystem.IsWindows() || writableLease);
+        if (OperatingSystem.IsMacOS()
+            && PhysicalSqliteWalSharedMemoryMapping.SqliteWalSharedMemoryLifecycleRegistry
+                .TryBorrowBrokeredHandle(LockFilePath, requireWritable) is { } borrow)
+        {
+            brokeredHandleBorrow = borrow;
+            return new SafeFileHandle(
+                borrow.Handle.DangerousGetHandle(),
+                ownsHandle: false);
+        }
+
+        return File.OpenHandle(
             LockFilePath,
             FileMode.Open,
-            mode == SqliteWalByteRangeLockMode.Shared
-                || (OperatingSystem.IsWindows() && !writableLease)
-                ? FileAccess.Read
-                : FileAccess.ReadWrite,
+            requireWritable ? FileAccess.ReadWrite : FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete,
             FileOptions.None);
+    }
 
     internal static bool TryLock(
         SafeFileHandle handle,
@@ -771,6 +798,7 @@ internal sealed class SqliteByteRangeLockHandle : IDisposable
 public sealed class SqliteWalByteRangeLockLease : IDisposable
 {
     private SafeFileHandle? _handle;
+    private IDisposable? _handleLifetime;
     private readonly long _offset;
     private readonly long _length;
 
@@ -778,9 +806,11 @@ public sealed class SqliteWalByteRangeLockLease : IDisposable
         SafeFileHandle handle,
         long offset,
         long length,
-        SqliteWalByteRangeLockMode mode)
+        SqliteWalByteRangeLockMode mode,
+        IDisposable? handleLifetime = null)
     {
         _handle = handle;
+        _handleLifetime = handleLifetime;
         CarrierIdentity = SqliteWalSharedMemoryCarrierIdentity.FromHandle(handle);
         _offset = offset;
         _length = length;
@@ -828,7 +858,14 @@ public sealed class SqliteWalByteRangeLockLease : IDisposable
         {
             // Closing a dedicated carrier is a second release path if the
             // explicit native unlock itself reports an error.
-            handle.Dispose();
+            try
+            {
+                handle.Dispose();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _handleLifetime, null)?.Dispose();
+            }
         }
     }
 

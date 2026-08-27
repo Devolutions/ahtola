@@ -521,13 +521,34 @@ internal static class RenameColumnRewriter
         {
             foreach (var cte in expressions)
             {
-                WalkQuery(cte.Query, scope);
+                WalkStatement(cte.Body, scope);
                 scope.Bindings.Add(new Binding(
                     cte.Name,
-                    cte.Columns ?? TryComputeOutputColumns(cte.Query),
+                    cte.Columns ?? TryComputeOutputColumns(cte.Body),
                     IsTarget: false,
                     QualifiedOnly: false));
             }
+        }
+
+        private IReadOnlyList<string>? TryComputeOutputColumns(ParsedStatement statement)
+        {
+            if (statement is QueryStatement query)
+                return TryComputeOutputColumns(query);
+            if (!EmbeddedDatabase.TryGetReturning(statement, out _, out var returning))
+                return [];
+
+            var names = new List<string>(returning.Count);
+            foreach (var projection in returning)
+            {
+                if (projection.Alias is not null)
+                    names.Add(projection.Alias);
+                else if (projection.Expression is ColumnExpression column)
+                    names.Add(column.Name);
+                else
+                    return null;
+            }
+
+            return names;
         }
 
         private void WalkSelect(SelectStatement select, Scope? outer)
@@ -684,6 +705,8 @@ internal static class RenameColumnRewriter
                         WalkExpression(argument, scope, skipExistsSubqueries);
 
                     WalkExpression(function.Filter, scope, skipExistsSubqueries);
+                    if (function.OrderedSetOrderBy is { } orderedSetOrderBy)
+                        WalkExpression(orderedSetOrderBy.Expression, scope, skipExistsSubqueries);
                     WalkWindow(function.Window, scope);
                     return;
                 case ScalarSubqueryExpression scalar:

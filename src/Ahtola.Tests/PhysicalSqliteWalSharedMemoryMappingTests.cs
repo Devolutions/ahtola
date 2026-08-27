@@ -132,6 +132,239 @@ public sealed class PhysicalSqliteWalSharedMemoryMappingTests
     }
 
     [Test]
+    [NonParallelizable]
+    public void CleanupRequiresExclusiveDmsAfterCrossProcessMappingLeaves()
+    {
+        RequirePhysicalMappingSupport();
+        if (OperatingSystem.IsMacOS())
+            Assert.Ignore("Darwin deliberately prohibits last-owner SHM unlink.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var path = Path.Combine(workDirectory, "main.db-shm");
+            var fileSystem = (ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance;
+            var mapping = (PhysicalSqliteWalSharedMemoryMapping)fileSystem.OpenSharedMemory(
+                path,
+                FileOpenMode.CreateNew);
+            mapping.Write(0, [0x5A]);
+
+            using (var peer = new CrossProcessMappingObserver(workDirectory, path, byteCount: 1))
+            {
+                mapping.DisposeAndTryDeleteIfLast().Should().BeFalse();
+                File.Exists(path).Should().BeTrue(
+                    "the peer's shared DMS lease prevents final-owner cleanup");
+                peer.ReadPublishedBytes().Should().Equal(0x5A);
+            }
+
+            var final = (PhysicalSqliteWalSharedMemoryMapping)fileSystem.OpenSharedMemory(
+                path,
+                FileOpenMode.OpenExisting);
+            final.DisposeAndTryDeleteIfLast().Should().BeTrue();
+            File.Exists(path).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void MacOSTransientMappingsReuseBrokeredDescriptorAndFinalOwnerNeverUnlinks()
+    {
+        if (!OperatingSystem.IsMacOS())
+            Assert.Ignore("This characterizes Darwin's process-scoped F_SETLK behavior.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var path = Path.Combine(workDirectory, "main.db-shm");
+            var fileSystem = (ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance;
+            var first = fileSystem.OpenSharedMemory(path, FileOpenMode.CreateNew);
+            var second = (PhysicalSqliteWalSharedMemoryMapping)fileSystem.OpenSharedMemory(
+                path,
+                FileOpenMode.OpenExisting);
+            first.Dispose();
+
+            for (var index = 0; index < 256; index++)
+            {
+                using var transient = fileSystem.OpenSharedMemory(path, FileOpenMode.OpenExisting);
+            }
+            PhysicalSqliteWalSharedMemoryMapping.SqliteWalSharedMemoryLifecycleRegistry
+                .GetBrokeredHandleCountForTesting(path)
+                .Should().Be(1, "transient mappings reuse the carrier descriptor on Darwin");
+            var byteRangeLocks = new SqliteWalByteRangeLock(path);
+            for (var index = 0; index < 256; index++)
+            {
+                using var transientLock = byteRangeLocks.AcquireExclusive(
+                    offset: 120,
+                    length: 1,
+                    timeout: TimeSpan.Zero);
+            }
+            RunCleanupProbeWorker(workDirectory, path).Should().BeFalse(
+                "transient mappings and lock leases must not release the process DMS lease");
+            second.DisposeAndTryDeleteIfLast().Should().BeFalse(
+                "same-process foreign SQLite users cannot be excluded on Darwin");
+            File.Exists(path).Should().BeTrue();
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void MacOSReadOnlyMappingBrokersWritableReadMarkLocksUntilFinalRelease()
+    {
+        if (!OperatingSystem.IsMacOS())
+            Assert.Ignore("This characterizes Darwin's process-scoped F_SETLK behavior.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var path = Path.Combine(workDirectory, "main.db-shm");
+            File.WriteAllBytes(path, new byte[SqliteWalIndexLayout.BlockSize]);
+            var fileSystem = (ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance;
+            using var mapping = fileSystem.OpenSharedMemory(
+                path,
+                FileOpenMode.OpenExisting,
+                readOnly: true);
+            var locks = new SqliteWalByteRangeLock(path);
+            using var retainedReadMark = locks.AcquireShared(
+                offset: 123,
+                length: 1,
+                timeout: TimeSpan.Zero);
+
+            using (locks.AcquireExclusiveWritable(
+                       offset: 124,
+                       length: 1,
+                       timeout: TimeSpan.Zero,
+                       cancellationToken: CancellationToken.None))
+            {
+            }
+
+            PhysicalSqliteWalSharedMemoryMapping.SqliteWalSharedMemoryLifecycleRegistry
+                .GetBrokeredHandleCountForTesting(path)
+                .Should().Be(2, "the read-only mapping lazily adds one registry-owned writable descriptor");
+            RunCleanupProbeWorker(workDirectory, path).Should().BeFalse(
+                "disposing the writable read-mark lease must preserve DMS");
+            RunCleanupProbeWorker(workDirectory, path, offset: 123).Should().BeFalse(
+                "disposing the writable read-mark lease must preserve unrelated process locks");
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void MacOSFinalMappingReleaseWaitsForBorrowedCheckpointAndReadMarkLeases()
+    {
+        if (!OperatingSystem.IsMacOS())
+            Assert.Ignore("This characterizes Darwin's process-scoped F_SETLK behavior.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var path = Path.Combine(workDirectory, "main.db-shm");
+            File.WriteAllBytes(path, new byte[SqliteWalIndexLayout.BlockSize]);
+            var fileSystem = (ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance;
+            using var mapping = fileSystem.OpenSharedMemory(
+                path,
+                FileOpenMode.OpenExisting,
+                readOnly: true);
+            var locks = new SqliteWalByteRangeLock(path);
+            using var checkpoint = locks.AcquireExclusiveWritable(
+                offset: 121,
+                length: 1,
+                timeout: TimeSpan.Zero,
+                cancellationToken: CancellationToken.None);
+            using var readMark = locks.AcquireExclusiveWritable(
+                offset: 124,
+                length: 1,
+                timeout: TimeSpan.Zero,
+                cancellationToken: CancellationToken.None);
+
+            mapping.Dispose();
+
+            PhysicalSqliteWalSharedMemoryMapping.SqliteWalSharedMemoryLifecycleRegistry
+                .GetBrokeredHandleCountForTesting(path)
+                .Should().Be(2, "borrowed leases keep both broker descriptors alive");
+            RunCleanupProbeWorker(workDirectory, path).Should().BeFalse(
+                "DMS remains held after the final mapping leaves while leases survive");
+            RunCleanupProbeWorker(workDirectory, path, offset: 121).Should().BeFalse();
+            RunCleanupProbeWorker(workDirectory, path, offset: 124).Should().BeFalse();
+
+            checkpoint.Dispose();
+            RunCleanupProbeWorker(workDirectory, path).Should().BeFalse(
+                "the remaining read-mark lease still owns the registry lifetime");
+            readMark.Dispose();
+
+            RunCleanupProbeWorker(workDirectory, path).Should().BeTrue(
+                "the registry releases DMS only after mappings and borrowed leases reach zero");
+            PhysicalSqliteWalSharedMemoryMapping.SqliteWalSharedMemoryLifecycleRegistry
+                .GetBrokeredHandleCountForTesting(path)
+                .Should().Be(0);
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ConcurrentFinalCleanupAndOpenNeverReturnsADeletedCarrier()
+    {
+        RequirePhysicalMappingSupport();
+        if (OperatingSystem.IsMacOS())
+            Assert.Ignore("Darwin deliberately prohibits last-owner SHM unlink.");
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var path = Path.Combine(workDirectory, "main.db-shm");
+            var fileSystem = (ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance;
+            for (var iteration = 0; iteration < 128; iteration++)
+            {
+                var closing = (PhysicalSqliteWalSharedMemoryMapping)fileSystem.OpenSharedMemory(
+                    path,
+                    FileOpenMode.OpenOrCreate);
+                PhysicalSqliteWalSharedMemoryMapping? opened = null;
+                var start = new ManualResetEventSlim();
+                var closeTask = Task.Run(() =>
+                {
+                    start.Wait();
+                    closing.DisposeAndTryDeleteIfLast();
+                });
+                var openTask = Task.Run(() =>
+                {
+                    start.Wait();
+                    opened = (PhysicalSqliteWalSharedMemoryMapping)fileSystem.OpenSharedMemory(
+                        path,
+                        FileOpenMode.OpenOrCreate);
+                });
+
+                start.Set();
+                Task.WaitAll(closeTask, openTask);
+                try
+                {
+                    File.Exists(path).Should().BeTrue();
+                    SqliteWalSharedMemoryCarrierIdentity.FromPath(path)
+                        .Should().Be(opened!.CarrierIdentity);
+                }
+                finally
+                {
+                    opened?.DisposeAndTryDeleteIfLast();
+                    start.Dispose();
+                }
+            }
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
     [Category("ProcessWorker")]
     [NonParallelizable]
     public void CrossProcessMappingWorkerObservesPublishedBytes()
@@ -159,6 +392,30 @@ public sealed class PhysicalSqliteWalSharedMemoryMappingTests
         var bytes = new byte[byteCount];
         mapping.Read(0, bytes);
         File.WriteAllText(resultPath, Convert.ToHexString(bytes));
+    }
+
+    [Test]
+    [Category("ProcessWorker")]
+    [NonParallelizable]
+    public void CrossProcessCleanupProbeWorker()
+    {
+        var path = Environment.GetEnvironmentVariable("TURSO_SHM_CLEANUP_WORKER_PATH");
+        if (string.IsNullOrEmpty(path))
+            return;
+        var resultPath = Environment.GetEnvironmentVariable("TURSO_SHM_CLEANUP_WORKER_RESULT_PATH")
+            ?? throw new InvalidOperationException("The cleanup probe worker is missing its result path.");
+
+        var offsetText = Environment.GetEnvironmentVariable("TURSO_SHM_CLEANUP_WORKER_OFFSET");
+        var offset = string.IsNullOrEmpty(offsetText)
+            ? PhysicalSqliteWalSharedMemoryMapping.DeadManSwitchLockOffset
+            : long.Parse(offsetText, System.Globalization.CultureInfo.InvariantCulture);
+        var locks = new SqliteWalByteRangeLock(path);
+        var acquired = locks.TryAcquireExclusive(
+            offset,
+            length: 1,
+            out var lease);
+        lease?.Dispose();
+        File.WriteAllText(resultPath, acquired ? "acquired" : "blocked");
     }
 
     [Test]
@@ -293,6 +550,47 @@ public sealed class PhysicalSqliteWalSharedMemoryMappingTests
                 return _output.ToString();
             }
         }
+    }
+
+    private static bool RunCleanupProbeWorker(
+        string workDirectory,
+        string path,
+        long? offset = null)
+    {
+        var resultPath = Path.Combine(workDirectory, $"shm-cleanup-result-{Guid.NewGuid():N}");
+        var testDirectory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
+        var startInfo = new ProcessStartInfo(
+            Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+        {
+            WorkingDirectory = testDirectory.FullName,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        startInfo.ArgumentList.Add("vstest");
+        startInfo.ArgumentList.Add(Path.Combine(testDirectory.FullName, "Ahtola.Tests.dll"));
+        startInfo.ArgumentList.Add(
+            "--TestCaseFilter:FullyQualifiedName=Ahtola.Tests.PhysicalSqliteWalSharedMemoryMappingTests."
+            + nameof(CrossProcessCleanupProbeWorker));
+        startInfo.Environment["TURSO_SHM_CLEANUP_WORKER_PATH"] = path;
+        startInfo.Environment["TURSO_SHM_CLEANUP_WORKER_RESULT_PATH"] = resultPath;
+        if (offset is not null)
+        {
+            startInfo.Environment["TURSO_SHM_CLEANUP_WORKER_OFFSET"] =
+                offset.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        using var worker = Process.Start(startInfo)
+                           ?? throw new InvalidOperationException("Failed to start the SHM cleanup probe worker.");
+        if (!worker.WaitForExit(TimeSpan.FromSeconds(60)))
+        {
+            worker.Kill(entireProcessTree: true);
+            Assert.Fail("The SHM cleanup probe worker did not exit within 60 seconds.");
+        }
+
+        var output = worker.StandardOutput.ReadToEnd() + worker.StandardError.ReadToEnd();
+        worker.ExitCode.Should().Be(0, $"worker output:{Environment.NewLine}{output}");
+        return File.ReadAllText(resultPath) == "acquired";
     }
 
     private static void WaitForFile(

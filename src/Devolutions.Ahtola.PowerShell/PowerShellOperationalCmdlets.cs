@@ -19,18 +19,11 @@ public sealed class TestPSSqliteConnectionCommand : PSSqliteCmdlet
 
     protected override void ProcessRecord()
     {
-        try
-        {
-            OpenIfNeeded(Connection);
-            using var command = Connection.CreateCommand();
-            command.CommandText = "SELECT 1;";
-            _ = command.ExecuteScalar();
-            WriteObject(true);
-        }
-        catch when (Connection is AhtolaCloudConnection)
-        {
-            throw new InvalidOperationException("The Turso Cloud connection test failed.");
-        }
+        OpenIfNeeded(Connection);
+        using var command = Connection.CreateCommand();
+        command.CommandText = "SELECT 1;";
+        _ = command.ExecuteScalar();
+        WriteObject(true);
     }
 }
 
@@ -74,23 +67,6 @@ public sealed class StartPSSqliteTransactionCommand : PSSqliteCmdlet
             ? sqliteConnection.BeginTransaction(IsolationLevel, Deferred.IsPresent)
             : Connection.BeginTransaction(IsolationLevel);
         WriteObject(transaction);
-    }
-}
-
-[Cmdlet(VerbsLifecycle.Invoke, "AhtolaSqliteReplicaSync", SupportsShouldProcess = true)]
-[OutputType(typeof(Ahtola.AhtolaSyncResult))]
-public sealed class InvokePSSqliteReplicaSyncCommand : PSSqliteCmdlet
-{
-    [Parameter(Mandatory = true, ValueFromPipeline = true)]
-    [Alias("Connection")]
-    public AhtolaCloudConnection ReplicaConnection { get; set; } = null!;
-
-    protected override void ProcessRecord()
-    {
-        if (!ShouldProcess(ReplicaConnection.Endpoint, "Synchronize managed Turso Cloud replica"))
-            return;
-
-        WriteObject(ReplicaConnection.Synchronize());
     }
 }
 

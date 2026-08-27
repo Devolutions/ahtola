@@ -40,20 +40,51 @@ public sealed class ManagedEfRenameTableMigrationTests
     }
 
     [Test]
-    public void ManagedMigrationsRejectTableRenamesWithForeignKeyDependencies()
+    public async Task ManagedMigrationsRenameTablesWithForeignKeyAndTriggerDependencies()
     {
+        await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        await connection.OpenAsync();
+        await ExecuteAsync(
+            connection,
+            """
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE "Parents" ("Id" INTEGER NOT NULL CONSTRAINT "PK_Parents" PRIMARY KEY);
+            CREATE TABLE "Children" (
+                "Id" INTEGER NOT NULL CONSTRAINT "PK_Children" PRIMARY KEY,
+                "ParentId" INTEGER NOT NULL,
+                CONSTRAINT "FK_Children_Parents" FOREIGN KEY ("ParentId") REFERENCES "Parents" ("Id")
+            );
+            CREATE TABLE "Audit" ("ParentId" INTEGER NOT NULL);
+            CREATE TRIGGER "TR_Parents_Insert" AFTER INSERT ON "Parents"
+            BEGIN
+                INSERT INTO "Audit" VALUES (NEW."Id");
+            END;
+            INSERT INTO "Parents" VALUES (1);
+            INSERT INTO "Children" VALUES (1, 1);
+            """);
+
         var options = new DbContextOptionsBuilder<DependentRenameTableMigrationContext>()
-            .UseAhtola("Data Source=:memory:;Local Provider=Managed")
+            .UseAhtola(connection)
             .Options;
-        using var context = new DependentRenameTableMigrationContext(options);
+        await using var context = new DependentRenameTableMigrationContext(options);
         var model = context.GetService<IDesignTimeModel>().Model;
 
-        var generate = () => context.GetService<IMigrationsSqlGenerator>().Generate(
+        var commands = context.GetService<IMigrationsSqlGenerator>().Generate(
             [new RenameTableOperation { Name = "Parents", NewName = "RenamedParents" }],
             model);
+        foreach (var command in commands)
+            await ExecuteAsync(connection, command.CommandText);
 
-        generate.Should().Throw<NotSupportedException>()
-            .WithMessage("*cannot safely rename table*foreign key or trigger dependencies*");
+        await ExecuteAsync(connection, "INSERT INTO \"RenamedParents\" VALUES (2);");
+        await ExecuteAsync(connection, "INSERT INTO \"Children\" VALUES (2, 2);");
+
+        await using var audit = connection.CreateCommand();
+        audit.CommandText = "SELECT group_concat(\"ParentId\", ',') FROM \"Audit\";";
+        (await audit.ExecuteScalarAsync()).Should().Be("1,2");
+
+        await using var foreignKey = connection.CreateCommand();
+        foreignKey.CommandText = "SELECT \"table\" FROM pragma_foreign_key_list('Children');";
+        (await foreignKey.ExecuteScalarAsync()).Should().Be("RenamedParents");
     }
 
     private static async Task ExecuteAsync(SqliteConnection connection, string sql)

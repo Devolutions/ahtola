@@ -85,8 +85,9 @@ public sealed class ManagedVectorIndexSyntaxTests
     [TestCase("dims = 4, exact = 0", "'exact' must be 1; approximate mode is not implemented")]
     [TestCase("dims = 4, metric = 'euclidean'", "unknown vector index metric: euclidean")]
     [TestCase("dims = 4, encoding = 'bfloat16'", "unknown vector index encoding: bfloat16")]
-    [TestCase("dims = 4, metric = 'jaccard'", "requires a sparse index and is not implemented")]
-    [TestCase("dims = 4, encoding = 'float32_sparse'", "requires a sparse index and is not implemented")]
+    [TestCase("dims = 4, metric = 'jaccard'", "requires encoding = 'float32_sparse'")]
+    [TestCase("dims = 4, encoding = 'float32_sparse'", "requires metric = 'jaccard'")]
+    [TestCase("dims = 4, encoding = 'float32_sparse', metric = 'jaccard', lists = 8", "'lists' is not supported for float32_sparse")]
     [TestCase("dims = 4, encoding = 'float1bit', metric = 'l2'", "L2 distance is not supported for float1bit")]
     [TestCase("dims = '4'", "'dims' requires an integer literal")]
     [TestCase("dims = 4, metric = 2", "'metric' requires a text literal")]
@@ -96,6 +97,21 @@ public sealed class ManagedVectorIndexSyntaxTests
         using var connection = Connect(database);
         ShouldThrow(connection, $"CREATE INDEX docs_knn ON docs USING vector (embedding) WITH ({options});")
             .Message.Should().Contain(expected);
+    }
+
+    [Test]
+    public void ExactSparseJaccardDeclarationIsAcceptedAndRoundTrips()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = Connect(database);
+
+        Execute(
+            connection,
+            "CREATE INDEX docs_sparse ON docs USING vector (embedding) "
+            + "WITH (dims = 4, encoding = 'float32_sparse', metric = 'jaccard', exact = 1, min_rows = 0);");
+
+        var sql = Query(connection, "SELECT sql FROM sqlite_schema WHERE name = 'docs_sparse';")[0][0].AsText();
+        sql.Should().Contain("float32_sparse").And.Contain("jaccard").And.Contain("exact = 1");
     }
 
     [Test]

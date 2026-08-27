@@ -83,6 +83,7 @@ $PowerShellModuleOutput = "./artifacts/powershell-modules/$PowerShellModuleName"
 $PowerShellAssemblyName = 'Devolutions.Ahtola.PowerShell'
 $PowerShellHelpMarkdown = Join-Path $RepoRoot "docs/powershell-help/$PowerShellModuleName"
 $PowerShellHelpBuilder = Join-Path $RepoRoot 'scripts/Build-PowerShellHelp.ps1'
+$PowerShellVersionStager = Join-Path $RepoRoot 'scripts/Set-PowerShellModuleVersion.ps1'
 $PowerShellTestRunner = Join-Path $RepoRoot 'scripts/Invoke-PowerShellModuleTests.ps1'
 $ConsumerProject = './samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj'
 $BrowserConsumerRunner = Join-Path $RepoRoot 'scripts/Invoke-BrowserPackageConsumer.ps1'
@@ -207,7 +208,7 @@ function Invoke-Build {
 
         $moduleAbsolute = Get-AbsolutePath $PowerShellModuleOutput
         $manifestPath = Join-Path $moduleAbsolute "$PowerShellModuleName.psd1"
-        $assemblyPath = Join-Path $moduleAbsolute "bin\$PowerShellAssemblyName.dll"
+        $assemblyPath = Join-Path (Join-Path $moduleAbsolute 'bin') "$PowerShellAssemblyName.dll"
         if (-not (Test-Path -LiteralPath $manifestPath)) {
             throw "Expected staged module manifest at $manifestPath"
         }
@@ -224,19 +225,18 @@ function Invoke-Build {
         )
 
         if (-not [string]::IsNullOrWhiteSpace($Version)) {
-            if ($Version -notmatch '^\d+\.\d+\.\d+(?:\.\d+)?$') {
-                throw "PowerShell module versions must contain only numeric components. Received '$Version'."
+            if (-not (Test-Path -LiteralPath $PowerShellVersionStager -PathType Leaf)) {
+                throw "PowerShell version stager not found: $PowerShellVersionStager"
             }
-
-            $manifest = Get-Content -LiteralPath $manifestPath -Raw
-            if ($manifest -notmatch '(?m)^\s*ModuleVersion\s*=\s*''[^'']+''') {
-                throw "Could not locate ModuleVersion in staged manifest $manifestPath"
-            }
-
-            $updatedManifest = $manifest -replace '(?m)^(\s*ModuleVersion\s*=\s*)''[^'']+''', "`$1'$Version'"
-            Set-Content -LiteralPath $manifestPath -Value $updatedManifest -Encoding utf8NoBOM
+            Invoke-PwshScript -Path $PowerShellVersionStager -Arguments @(
+                '-ManifestPath', $manifestPath,
+                '-RequestedVersion', $Version
+            )
         }
 
+        Invoke-PwshScript -Path $ClosureValidator -Arguments @(
+            '-StagedBinaryDirectory', $moduleAbsolute
+        )
         Write-Host "PowerShell module staged at $moduleAbsolute" -ForegroundColor Green
     }
 
@@ -332,7 +332,15 @@ function Invoke-ValidatePackedClosure {
 
     $outputAbsolute = Get-AbsolutePath $Output
     Write-Step "Validating packed nupkg closure in $outputAbsolute"
-    Invoke-PwshScript -Path $ClosureValidator -Arguments @('-PackageDirectory', $outputAbsolute)
+    $arguments = @('-PackageDirectory', $outputAbsolute)
+    $powerShellModuleAbsolute = Get-AbsolutePath $PowerShellModuleOutput
+    if (Test-Path -LiteralPath $powerShellModuleAbsolute -PathType Container) {
+        $arguments += @(
+            '-StagedBinaryDirectory',
+            $powerShellModuleAbsolute
+        )
+    }
+    Invoke-PwshScript -Path $ClosureValidator -Arguments $arguments
 }
 
 function Assert-ExactPackageVersion {
