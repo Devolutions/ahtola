@@ -346,3 +346,5 @@ finally {
         Remove-Item -LiteralPath $scratchRoot -Recurse -Force
     }
 }
+
+exit 0
