@@ -168,16 +168,18 @@ function New-TestPackageSet(
 function Invoke-Validator([string[]]$Arguments, [bool]$ShouldSucceed, [string]$ExpectedFailure = '') {
     $output = @(& pwsh -NoLogo -NoProfile -File $validator @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
+    $renderedOutput = ($output -join [Environment]::NewLine) `
+        -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
     if ($ShouldSucceed -and $exitCode -ne 0) {
-        Fail "validator unexpectedly failed: $($output -join [Environment]::NewLine)"
+        Fail "validator unexpectedly failed: $renderedOutput"
     }
     if (-not $ShouldSucceed -and $exitCode -eq 0) {
         Fail "validator unexpectedly accepted: $($Arguments -join ' ')"
     }
     if (-not $ShouldSucceed -and
         -not [string]::IsNullOrWhiteSpace($ExpectedFailure) -and
-        ($output -join [Environment]::NewLine) -notmatch [regex]::Escape($ExpectedFailure)) {
-        Fail "validator failure did not contain '$ExpectedFailure': $($output -join [Environment]::NewLine)"
+        $renderedOutput -notmatch [regex]::Escape($ExpectedFailure)) {
+        Fail "validator failure did not contain '$ExpectedFailure': $renderedOutput"
     }
 }
 
