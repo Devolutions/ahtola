@@ -63,6 +63,7 @@ function Invoke-Validator(
     $exitCode = $LASTEXITCODE
     $renderedOutput = ($output -join [Environment]::NewLine) `
         -replace '\x1B\[[0-?]*[ -/]*[@-~]', '' `
+        -replace '\s*\|\s*', ' ' `
         -replace '\s+', ' '
     if ($ShouldSucceed -and $exitCode -ne 0) {
         Fail "validator unexpectedly failed: $renderedOutput"
