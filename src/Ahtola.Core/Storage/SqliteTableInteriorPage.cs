@@ -18,7 +18,10 @@ public sealed class SqliteTableInteriorCell
     /// <summary>The non-zero child page containing keys less than or equal to <see cref="RowId"/>.</summary>
     public uint LeftChildPage { get; }
 
-    /// <summary>The largest rowid in <see cref="LeftChildPage"/>.</summary>
+    /// <summary>
+    /// The inclusive routing upper bound for <see cref="LeftChildPage"/>.
+    /// SQLite may retain a value above that child's live maximum after deletion.
+    /// </summary>
     public long RowId { get; }
 
     /// <summary>The exact number of bytes occupied by this cell.</summary>
@@ -73,7 +76,7 @@ public sealed class SqliteTableInteriorCell
     }
 }
 
-/// <summary>Packs a compact SQLite table-interior page from sorted separator cells.</summary>
+/// <summary>Packs a compact SQLite table-interior page from sorted upper-bound separator cells.</summary>
 /// <remarks>
 /// This is a single-page codec. It has no page allocation, parent propagation,
 /// sibling handling, or durable multi-page mutation.
@@ -126,7 +129,7 @@ public sealed class SqliteTableInteriorPageBuilder
         => new ReadOnlyCollection<SqliteTableInteriorCell>(_cells);
 
     /// <summary>
-    /// Adds one left-child/maximum-rowid separator. Keys and child pages must be
+    /// Adds one left-child/inclusive-upper-bound separator. Keys and child pages must be
     /// unique so this one page cannot introduce an ambiguous path.
     /// </summary>
     public void Append(SqliteTableInteriorCell cell)
@@ -320,6 +323,19 @@ public sealed class SqliteTableInteriorPageView
             ranges,
             "table-interior");
         return new SqliteTableInteriorPageView(page.Length, usableSpace, header, pointers, cells);
+    }
+
+    /// <summary>
+    /// Returns whether a non-empty child's live rowid range fits between its
+    /// exclusive lower separator and inclusive upper separator.
+    /// </summary>
+    internal bool IsChildRangeValid(int childIndex, long minimumRowId, long maximumRowId)
+    {
+        if (childIndex < 0 || childIndex > Cells.Count || minimumRowId > maximumRowId)
+            return false;
+
+        return (childIndex == 0 || minimumRowId > Cells[childIndex - 1].Cell.RowId)
+            && (childIndex == Cells.Count || maximumRowId <= Cells[childIndex].Cell.RowId);
     }
 
     /// <summary>

@@ -178,11 +178,69 @@ public class ManagedTableInteriorFileStoreTests
         }
 
         [Test]
-        public void OpensExternalSqliteTableInteriorWithStaleSeparatorsAfterDeletes()
+        public void ReopenRejectsInteriorWhoseSeparatorOverlapsFollowingLeaf()
         {
-            // Real SQLite leaves parent separators unchanged when the left child's
-            // maximum rowid is deleted. RDM Connections.db hits this shape; managed
-            // open must accept separator >= left-child max, not require equality.
+            var fileSystem = new InMemoryFileSystem();
+            const string path = "interior-overlapping-separator.db";
+            SqliteDatabaseHeader header;
+            uint rootPage;
+            using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);");
+                Execute(connection, BuildInsert(1, 120));
+            }
+
+            using (var store = SqlitePageStore.Open(fileSystem, path))
+            {
+                header = store.Header;
+                var schema = SqliteTableLeafPageView.Parse(
+                    store.ReadPage(1),
+                    header.UsableSpace,
+                    isFirstPage: true);
+                rootPage = checked((uint)schema.Cells
+                    .Select(cell => SqliteRecordCodec.Decode(cell.Cell.LocalPayload.Span, header.TextEncoding))
+                    .Single(values => values[0].AsText() == "table" && values[1].AsText() == "t")[3]
+                    .AsInteger());
+
+                var rootImage = store.ReadPage(rootPage);
+                var root = SqliteTableInteriorPageView.Parse(rootImage, header.UsableSpace);
+                root.Cells.Should().NotBeEmpty();
+                var nextChildPage = root.Cells.Count == 1
+                    ? root.Header.RightMostChildPage
+                    : root.Cells[1].Cell.LeftChildPage;
+                var nextChild = SqliteTableLeafPageView.Parse(
+                    store.ReadPage(nextChildPage),
+                    header.UsableSpace);
+                nextChild.Cells.Should().NotBeEmpty();
+
+                var separator = root.Cells[0];
+                var nextMinimumRowId = nextChild.Cells[0].Cell.RowId;
+                SqliteVarint.GetLength(unchecked((ulong)nextMinimumRowId))
+                    .Should()
+                    .Be(separator.Cell.EncodedLength - sizeof(uint));
+                SqliteVarint.Write(
+                    unchecked((ulong)nextMinimumRowId),
+                    rootImage.AsSpan(separator.Offset + sizeof(uint)));
+                store.WritePage(rootPage, rootImage);
+                store.Flush();
+            }
+
+            fileSystem.DeleteFile(path + "-wal");
+            using (SqliteWalFile.Create(
+                       fileSystem,
+                       path + "-wal",
+                       SqliteWalHeader.Create(header.PageSize, salt1: 3, salt2: 5)))
+            {
+            }
+
+            var reopen = () => EmbeddedDatabase.OpenFile(path, fileSystem);
+            reopen.Should().Throw<EmbeddedSqlException>().WithMessage("*separator*is not below minimum rowid*");
+        }
+
+        [Test]
+        public void ReopenRejectsNestedSeparatorThatOverlapsFollowingSubtree()
+        {
             var path = CreateDatabasePath();
             try
             {
@@ -193,26 +251,85 @@ public class ManagedTableInteriorFileStoreTests
                     command.CommandText =
                         """
                         PRAGMA journal_mode=DELETE;
+                        PRAGMA page_size=512;
+                        VACUUM;
                         CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
                         """;
                     command.ExecuteNonQuery();
-
-                    command.CommandText = BuildInsert(1, 200);
-                    command.ExecuteNonQuery();
-
-                    // Do not VACUUM: rebuild would tighten separators. Stale parent keys
-                    // after deleting left-child maxima are what production RDM files keep.
-                    command.CommandText =
-                        """
-                        DELETE FROM t WHERE id % 5 = 0;
-                        DELETE FROM t WHERE id IN (1, 2, 3, 50, 51, 99, 100, 150, 199, 200);
-                        """;
+                    command.CommandText = BuildInsert(1, 2_000);
                     command.ExecuteNonQuery();
                 }
 
                 MsData.SqliteConnection.ClearAllPools();
+                using (var store = SqlitePageStore.Open(PhysicalFileSystem.Instance, path))
+                {
+                    var header = store.Header;
+                    var schema = SqliteTableLeafPageView.Parse(
+                        store.ReadPage(1),
+                        header.UsableSpace,
+                        isFirstPage: true);
+                    var rootPage = checked((uint)schema.Cells
+                        .Select(cell => SqliteRecordCodec.Decode(cell.Cell.LocalPayload.Span, header.TextEncoding))
+                        .Single(values => values[0].AsText() == "table" && values[1].AsText() == "t")[3]
+                        .AsInteger());
 
-                AssertStaleSeparatorPresent(path);
+                    var rootImage = store.ReadPage(rootPage);
+                    var root = SqliteTableInteriorPageView.Parse(rootImage, header.UsableSpace);
+                    root.Cells.Should().NotBeEmpty();
+                    var nextChildPage = root.Cells.Count == 1
+                        ? root.Header.RightMostChildPage
+                        : root.Cells[1].Cell.LeftChildPage;
+                    SqliteBtreePageHeader.Parse(store.ReadPage(nextChildPage)).PageType
+                        .Should()
+                        .Be(SqliteBtreePageType.TableInterior);
+
+                    var nextMinimumRowId = ReadSubtreeMinimumRowId(
+                        store,
+                        header,
+                        nextChildPage);
+                    var separator = root.Cells[0];
+                    SqliteVarint.GetLength(unchecked((ulong)nextMinimumRowId))
+                        .Should()
+                        .Be(separator.Cell.EncodedLength - sizeof(uint));
+                    SqliteVarint.Write(
+                        unchecked((ulong)nextMinimumRowId),
+                        rootImage.AsSpan(separator.Offset + sizeof(uint)));
+                    store.WritePage(rootPage, rootImage);
+                    store.Flush();
+                }
+
+                using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+                {
+                    sqlite.Open();
+                    using var quickCheck = sqlite.CreateCommand();
+                    quickCheck.CommandText = "PRAGMA quick_check;";
+                    Convert.ToString(quickCheck.ExecuteScalar()).Should().NotBe("ok");
+                }
+
+                MsData.SqliteConnection.ClearAllPools();
+                var reopen = () => EmbeddedDatabase.OpenFile(path);
+                reopen.Should().Throw<EmbeddedSqlException>().WithMessage("*separator*is not below minimum rowid*");
+            }
+            finally
+            {
+                MsData.SqliteConnection.ClearAllPools();
+                DeleteDatabase(path);
+            }
+        }
+
+        [Test]
+        public void OpensExternalSqliteTableInteriorWithStaleSeparatorsAfterDeletes()
+        {
+            // Real SQLite leaves parent separators unchanged when the left child's
+            // maximum rowid is deleted. RDM Connections.db hits this shape; managed
+            // open must accept separator >= left-child max, not require equality.
+            var path = CreateDatabasePath();
+            try
+            {
+                CreateExternalTableWithStaleSeparators(path);
+                MsData.SqliteConnection.ClearAllPools();
+
+                _ = FindStaleSeparatorRowId(path);
 
                 using (var database = EmbeddedDatabase.OpenFile(path))
                 using (var connection = database.Connect())
@@ -238,7 +355,76 @@ public class ManagedTableInteriorFileStoreTests
             }
         }
 
-        private static void AssertStaleSeparatorPresent(string path)
+        [Test]
+        public void InsertsAtExternalStaleSeparatorAndRemainsSqliteCompatible()
+        {
+            var path = CreateDatabasePath();
+            try
+            {
+                CreateExternalTableWithStaleSeparators(path);
+                MsData.SqliteConnection.ClearAllPools();
+                var staleSeparatorRowId = FindStaleSeparatorRowId(path);
+
+                using (var database = EmbeddedDatabase.OpenFile(path))
+                using (var connection = database.Connect())
+                {
+                    Execute(
+                        connection,
+                        $"INSERT INTO t VALUES ({staleSeparatorRowId}, 'restored-stale-separator');");
+                    Query(connection, $"SELECT value FROM t WHERE id = {staleSeparatorRowId};")
+                        .Should()
+                        .ContainSingle()
+                        .Which[0]
+                        .AsText()
+                        .Should()
+                        .Be("restored-stale-separator");
+                }
+
+                using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
+                sqlite.Open();
+                using (var quickCheck = sqlite.CreateCommand())
+                {
+                    quickCheck.CommandText = "PRAGMA quick_check;";
+                    quickCheck.ExecuteScalar().Should().Be("ok");
+                }
+
+                using var select = sqlite.CreateCommand();
+                select.CommandText = $"SELECT value FROM t WHERE id = {staleSeparatorRowId};";
+                select.ExecuteScalar().Should().Be("restored-stale-separator");
+            }
+            finally
+            {
+                MsData.SqliteConnection.ClearAllPools();
+                DeleteDatabase(path);
+            }
+        }
+
+        private static void CreateExternalTableWithStaleSeparators(string path)
+        {
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
+            sqlite.Open();
+            using var command = sqlite.CreateCommand();
+            command.CommandText =
+                """
+                PRAGMA journal_mode=DELETE;
+                CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                """;
+            command.ExecuteNonQuery();
+
+            command.CommandText = BuildInsert(1, 200);
+            command.ExecuteNonQuery();
+
+            // Do not VACUUM: rebuild would tighten separators. Stale parent keys
+            // after deleting left-child maxima are what production RDM files keep.
+            command.CommandText =
+                """
+                DELETE FROM t WHERE id % 5 = 0;
+                DELETE FROM t WHERE id IN (1, 2, 3, 50, 51, 99, 100, 150, 199, 200);
+                """;
+            command.ExecuteNonQuery();
+        }
+
+        private static long FindStaleSeparatorRowId(string path)
         {
             using var store = SqlitePageStore.Open(PhysicalFileSystem.Instance, path, readOnly: true);
             var header = store.Header;
@@ -253,23 +439,26 @@ public class ManagedTableInteriorFileStoreTests
             var rootHeader = SqliteBtreePageHeader.Parse(store.ReadPage(rootPage));
             rootHeader.PageType.Should().Be(SqliteBtreePageType.TableInterior);
 
+            long? staleSeparatorRowId;
             SubtreeMaximumRowId(
                     store,
                     header,
                     rootPage,
-                    out var sawStaleSeparator)
+                    out staleSeparatorRowId)
                 .Should()
                 .NotBeNull();
-            sawStaleSeparator.Should().BeTrue("the fixture must keep at least one stale interior separator");
+            staleSeparatorRowId.Should().NotBeNull(
+                "the fixture must keep at least one stale interior separator");
+            return staleSeparatorRowId.GetValueOrDefault();
         }
 
         private static long? SubtreeMaximumRowId(
             SqlitePageStore store,
             SqliteDatabaseHeader header,
             uint pageNumber,
-            out bool sawStaleSeparator)
+            out long? staleSeparatorRowId)
         {
-            sawStaleSeparator = false;
+            staleSeparatorRowId = null;
             var page = store.ReadPage(pageNumber);
             var pageHeader = SqliteBtreePageHeader.Parse(page);
             if (pageHeader.PageType == SqliteBtreePageType.TableLeaf)
@@ -290,19 +479,45 @@ public class ManagedTableInteriorFileStoreTests
                     store,
                     header,
                     childPage,
-                    out var childStale);
-                sawStaleSeparator |= childStale;
+                    out var childStaleSeparatorRowId);
+                staleSeparatorRowId ??= childStaleSeparatorRowId;
                 if (childMax is { } value)
                     maximum = value;
                 if (index < interior.Cells.Count
                     && childMax is { } leftMax
                     && leftMax < interior.Cells[index].Cell.RowId)
                 {
-                    sawStaleSeparator = true;
+                    staleSeparatorRowId ??= interior.Cells[index].Cell.RowId;
                 }
             }
 
             return maximum;
+        }
+
+        private static long ReadSubtreeMinimumRowId(
+            SqlitePageStore store,
+            SqliteDatabaseHeader header,
+            uint pageNumber)
+        {
+            var page = store.ReadPage(pageNumber);
+            return SqliteBtreePageHeader.Parse(page).PageType switch
+            {
+                SqliteBtreePageType.TableLeaf => SqliteTableLeafPageView
+                    .Parse(page, header.UsableSpace)
+                    .Cells[0]
+                    .Cell
+                    .RowId,
+                SqliteBtreePageType.TableInterior => ReadSubtreeMinimumRowId(
+                    store,
+                    header,
+                    SqliteTableInteriorPageView
+                        .Parse(page, header.UsableSpace)
+                        .Cells[0]
+                        .Cell
+                        .LeftChildPage),
+                var pageType => throw new InvalidDataException(
+                    $"Expected a table b-tree page, found {pageType}."),
+            };
         }
 
         private static List<long> LoadSqliteRowIds(string path)

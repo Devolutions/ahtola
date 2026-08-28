@@ -89,6 +89,68 @@ public sealed class ManagedSchemaInteriorFileStoreTests
         }
     }
 
+    [Test]
+    public void RejectsSchemaInteriorSeparatorThatOverlapsNextChild()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            CreateExternalDatabase(path);
+            MsData.SqliteConnection.ClearAllPools();
+
+            using (var store = SqlitePageStore.Open(PhysicalFileSystem.Instance, path))
+            {
+                var page = store.ReadPage(1);
+                var interior = SqliteTableInteriorPageView.Parse(
+                    page,
+                    store.Header.UsableSpace,
+                    isFirstPage: true);
+                interior.Cells.Should().NotBeEmpty();
+
+                var nextChildPage = interior.Cells.Count == 1
+                    ? interior.Header.RightMostChildPage
+                    : interior.Cells[1].Cell.LeftChildPage;
+                var nextChild = SqliteTableLeafPageView.Parse(
+                    store.ReadPage(nextChildPage),
+                    store.Header.UsableSpace);
+                nextChild.Cells.Should().NotBeEmpty();
+
+                var separator = interior.Cells[0];
+                var nextMinimumRowId = nextChild.Cells[0].Cell.RowId;
+                SqliteVarint.GetLength(unchecked((ulong)nextMinimumRowId))
+                    .Should()
+                    .Be(separator.Cell.EncodedLength - sizeof(uint));
+                SqliteVarint.Write(
+                    unchecked((ulong)nextMinimumRowId),
+                    page.AsSpan(separator.Offset + sizeof(uint)));
+                store.WritePage(1, page);
+                store.Flush();
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                using var quickCheck = sqlite.CreateCommand();
+                quickCheck.CommandText = "PRAGMA quick_check;";
+                Convert.ToString(quickCheck.ExecuteScalar()).Should().NotBe("ok");
+            }
+
+            MsData.SqliteConnection.ClearAllPools();
+            var exception = Assert.Throws<EmbeddedSqlException>(() =>
+            {
+                using var facade = new Ahtola.Data.Sqlite.SqliteConnection(
+                    $"Data Source={path};Mode=ReadOnly;Pooling=False");
+                facade.Open();
+            });
+            exception.Message.Should().Contain("is not below minimum rowid");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     private static void CreateExternalDatabase(string path)
     {
         using var sqlite = new MsData.SqliteConnection($"Data Source={path}");

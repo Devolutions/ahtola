@@ -38,6 +38,34 @@ public class SqliteInteriorStorageTests
     }
 
     [Test]
+    public void TableInteriorChildRangesUseExclusiveLowerAndInclusiveUpperBounds()
+    {
+        const int usableSpace = SqlitePageSize.Minimum;
+        var builder = new SqliteTableInteriorPageBuilder(
+            SqlitePageSize.Minimum,
+            usableSpace,
+            rightMostChildPage: 3);
+        builder.Append(SqliteTableInteriorCell.Create(2, 10));
+        var view = SqliteTableInteriorPageView.Parse(builder.Build(), usableSpace);
+
+        view.IsChildRangeValid(childIndex: 0, minimumRowId: 1, maximumRowId: 8)
+            .Should()
+            .BeTrue("a stale separator may remain above its left child's live maximum");
+        view.IsChildRangeValid(childIndex: 0, minimumRowId: 1, maximumRowId: 10)
+            .Should()
+            .BeTrue();
+        view.IsChildRangeValid(childIndex: 0, minimumRowId: 1, maximumRowId: 11)
+            .Should()
+            .BeFalse();
+        view.IsChildRangeValid(childIndex: 1, minimumRowId: 11, maximumRowId: 20)
+            .Should()
+            .BeTrue();
+        view.IsChildRangeValid(childIndex: 1, minimumRowId: 10, maximumRowId: 20)
+            .Should()
+            .BeFalse("the lower separator belongs to the left child");
+    }
+
+    [Test]
     public void IndexInteriorCodecPreservesChildAndRecordOrder()
     {
         const int pageSize = SqlitePageSize.Minimum;

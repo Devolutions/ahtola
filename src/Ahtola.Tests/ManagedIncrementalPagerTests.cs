@@ -178,9 +178,8 @@ public sealed class ManagedIncrementalPagerTests
                 for (var id = 1; id <= 200; id++)
                     Execute(connection, InsertStatement(id));
 
-                // Deleting the largest rowid of an interior child lowers that
-                // child's maximum, which the managed loader only accepts when
-                // the separator above it is repaired to the new exact maximum.
+                // Deleting the largest rowid of an interior child exercises
+                // separator tightening in the incremental mutation path.
                 for (var id = 30; id <= 200; id += 30)
                     Execute(connection, $"DELETE FROM t WHERE id = {id};");
             }

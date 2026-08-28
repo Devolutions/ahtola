@@ -239,6 +239,7 @@ public sealed class SqliteBtreeSplitWriter
             parentImage,
             header.UsableSpace,
             isFirstPage: parentPageNumber.Value == 1);
+        ValidateTableChildRange(parent, leafPageNumber, leaf.Cells[0].Cell.RowId, leaf.Cells[^1].Cell.RowId);
 
         var rightPageNumber = reservations.NextPageNumber;
         var propagatedParent = BuildTableParentPage(
@@ -335,7 +336,6 @@ public sealed class SqliteBtreeSplitWriter
         }
 
         var replacementChildren = new List<TableTreeChild>(childPages.Length + 1);
-        long? previousMaximumRowId = null;
         byte[]? sourceRightLeafPage = null;
         SqliteTableLeafPageView? sourceRightLeaf = null;
         for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
@@ -357,24 +357,27 @@ public sealed class SqliteBtreeSplitWriter
 
             var child = SqliteTableLeafPageView.Parse(childImage, header.UsableSpace);
             if (child.Cells.Count == 0
-                || child.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null)
-                || (previousMaximumRowId is { } maximumRowId
-                    && child.Cells[0].Cell.RowId <= maximumRowId))
+                || child.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null))
             {
                 throw new InvalidDataException(
                     "SQLite table-interior root has unsupported empty, overflow, or unordered leaf children.");
             }
 
             var childMaximumRowId = child.Cells[^1].Cell.RowId;
-            if (childIndex < root.Cells.Count
-                && root.Cells[childIndex].Cell.RowId != childMaximumRowId)
+            if (!root.IsChildRangeValid(
+                    childIndex,
+                    child.Cells[0].Cell.RowId,
+                    childMaximumRowId))
             {
                 throw new InvalidDataException(
-                    "SQLite table-interior root separator does not match its left child's maximum rowid.");
+                    "SQLite table-interior root has a leaf child outside its separator bounds.");
             }
 
-            replacementChildren.Add(new TableTreeChild(childPageNumber, childMaximumRowId));
-            previousMaximumRowId = childMaximumRowId;
+            var childUpperBoundRowId = childIndex < root.Cells.Count
+                ? root.Cells[childIndex].Cell.RowId
+                : long.MaxValue;
+
+            replacementChildren.Add(new TableTreeChild(childPageNumber, childUpperBoundRowId));
             if (childIndex == childPages.Length - 1)
             {
                 sourceRightLeafPage = childImage;
@@ -762,7 +765,7 @@ public sealed class SqliteBtreeSplitWriter
                     rightInteriorPage);
                 rootBuilder.Append(SqliteTableInteriorCell.Create(
                     leftInteriorPage,
-                    leftChildren[^1].MaximumRowId));
+                    leftChildren[^1].UpperBoundRowId));
                 replacementRootPage = sourceRootPage.ToArray();
                 rootBuilder.WriteTo(replacementRootPage);
                 return true;
@@ -801,7 +804,7 @@ public sealed class SqliteBtreeSplitWriter
                 var child = children[childIndex];
                 builder.Append(SqliteTableInteriorCell.Create(
                     child.PageNumber,
-                    child.MaximumRowId));
+                    child.UpperBoundRowId));
             }
 
             page = builder.Build();
@@ -1077,6 +1080,37 @@ public sealed class SqliteBtreeSplitWriter
         }
     }
 
+    private static void ValidateTableChildRange(
+        SqliteTableInteriorPageView parent,
+        uint childPageNumber,
+        long minimumRowId,
+        long maximumRowId)
+    {
+        var childIndex = FindTableLeftChildIndex(parent, childPageNumber);
+        if (childIndex < 0)
+        {
+            if (parent.Header.RightMostChildPage != childPageNumber)
+                throw new InvalidDataException("SQLite table-interior parent does not reference the split leaf.");
+            childIndex = parent.Cells.Count;
+        }
+
+        if (parent.IsChildRangeValid(childIndex, minimumRowId, maximumRowId))
+            return;
+
+        if (childIndex > 0 && minimumRowId <= parent.Cells[childIndex - 1].Cell.RowId)
+        {
+            throw new InvalidDataException(
+                "SQLite table-interior parent separator is not below its right child's minimum rowid.");
+        }
+        if (childIndex < parent.Cells.Count && maximumRowId > parent.Cells[childIndex].Cell.RowId)
+        {
+            throw new InvalidDataException(
+                "SQLite table-interior parent separator is below its left child's maximum rowid.");
+        }
+
+        throw new InvalidDataException("SQLite table-interior child has an invalid rowid range.");
+    }
+
     private static void EnsureIndexParentContainsChild(SqliteIndexInteriorPageView parent, uint childPageNumber)
     {
         if (FindIndexLeftChildIndex(parent, childPageNumber) < 0
@@ -1108,7 +1142,7 @@ public sealed class SqliteBtreeSplitWriter
         return -1;
     }
 
-    private sealed record TableTreeChild(uint PageNumber, long MaximumRowId);
+    private sealed record TableTreeChild(uint PageNumber, long UpperBoundRowId);
 
     private sealed record MaterializedIndexSeparator(
         SqliteIndexInteriorCell Cell,
