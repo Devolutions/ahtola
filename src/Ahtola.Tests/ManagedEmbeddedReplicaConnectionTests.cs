@@ -3295,6 +3295,8 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     [TestCase(PullResponseFailure.InvalidPage)]
     [TestCase(PullResponseFailure.Non4KiBPage)]
     [TestCase(PullResponseFailure.LogicalStream)]
+    [TestCase(PullResponseFailure.UnknownStream)]
+    [TestCase(PullResponseFailure.UnknownApplyMode)]
     public void CreateReplicaRejectsInvalidBootstrapStreamsWithoutInstallingFiles(PullResponseFailure failure)
     {
         var path = Path.Combine(
@@ -3306,6 +3308,8 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             PullResponseFailure.InvalidPage => CreatePullResponse("revision-page", new byte[1]),
             PullResponseFailure.Non4KiBPage => CreatePullResponse("revision-non-4k", new byte[4095]),
             PullResponseFailure.LogicalStream => CreatePullResponse("revision-logical", new byte[4096], streamKind: 1),
+            PullResponseFailure.UnknownStream => CreatePullResponse("revision-unknown-stream", new byte[4096], streamKind: 99),
+            PullResponseFailure.UnknownApplyMode => CreatePullResponse("revision-unknown-mode", new byte[4096], applyMode: 99),
             _ => throw new ArgumentOutOfRangeException(nameof(failure)),
         };
         var handler = new PullUpdatesHandler(response);
@@ -6058,6 +6062,8 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         InvalidPage,
         Non4KiBPage,
         LogicalStream,
+        UnknownStream,
+        UnknownApplyMode,
     }
 
     public enum UnsupportedReplicaMode

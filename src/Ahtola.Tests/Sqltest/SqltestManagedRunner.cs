@@ -7,6 +7,12 @@ namespace Ahtola.Tests.Sqltest;
 
 internal sealed record SqltestOutcome(bool Matched, string Detail);
 
+internal sealed record SqltestIntegrityResult(IReadOnlyList<string> Rows, string? Error);
+
+internal delegate SqltestIntegrityResult SqltestIntegrityCheck(
+    EmbeddedConnection connection,
+    CancellationToken cancellationToken);
+
 /// <summary>
 /// Executes a discovered <c>.sqltest</c> case against the managed engine using the same
 /// execution and comparison rules as the Rust <c>sqltest</c> runner: every statement in the
@@ -20,18 +26,43 @@ internal static class SqltestManagedRunner
     // Mirrors Turso's test-helper-only process-global atomic counter.
     private static long _testNondeterministicCounter;
 
-    public static SqltestOutcome Run(SqltestFile file, SqltestCase test)
+    public static SqltestOutcome Run(
+        SqltestFile file,
+        SqltestCase test,
+        SqltestIntegrityCheck? integrityCheck = null)
     {
-        var database = file.Databases[0];
+        integrityCheck ??= RunManagedIntegrityCheck;
+        var failures = new List<string>();
+        for (var databaseIndex = 0; databaseIndex < file.Databases.Count; databaseIndex++)
+        {
+            var database = file.Databases[databaseIndex];
+            var outcome = RunVariant(file, test, database, integrityCheck);
+            if (!outcome.Matched)
+            {
+                failures.Add(
+                    $"database variant {databaseIndex + 1}/{file.Databases.Count} " +
+                    $"({database.DisplayName}): {outcome.Detail}");
+            }
+        }
+
+        return failures.Count == 0
+            ? new SqltestOutcome(true, string.Empty)
+            : new SqltestOutcome(false, string.Join(Environment.NewLine, failures));
+    }
+
+    private static SqltestOutcome RunVariant(
+        SqltestFile file,
+        SqltestCase test,
+        SqltestDatabase database,
+        SqltestIntegrityCheck integrityCheck)
+    {
         var temporaryPath = database.Kind == SqltestDatabaseKind.TempFile
-            ? Path.Combine(Path.GetTempPath(), $"Ahtola-sqltest-{Guid.NewGuid():N}.db")
+            ? CreateTemporaryDatabasePath()
             : null;
 
         try
         {
-            using var embedded = temporaryPath is null
-                ? new EmbeddedDatabase()
-                : EmbeddedDatabase.OpenFile(temporaryPath);
+            using var embedded = OpenDatabase(database, temporaryPath);
             embedded.RegisterScalarFunction(
                 "test_nondet_counter",
                 0,
@@ -49,12 +80,65 @@ internal static class SqltestManagedRunner
             }
 
             var error = TryExecute(connection, test.Sql, timeout.Token, out var rows);
-            return Compare(test.Expectation, rows, error);
+            var outcome = Compare(test.Expectation, rows, error);
+            // Match Turso's runner: integrity cross-checks apply only to passing,
+            // writable cases that did not intentionally expect an error.
+            if (!outcome.Matched
+                || !test.CrossCheckIntegrity
+                || database.ReadOnly
+                || test.Expectation.Kind == SqltestExpectationKind.Error)
+                return outcome;
+
+            var integrity = integrityCheck(connection, timeout.Token);
+            if (integrity.Error is null
+                && integrity.Rows.Count == 1
+                && string.Equals(integrity.Rows[0], "ok", StringComparison.Ordinal))
+            {
+                return outcome;
+            }
+
+            var actual = integrity.Error is { } integrityError
+                ? $"error: {integrityError}"
+                : $"{integrity.Rows.Count} row(s): [{string.Join(", ", integrity.Rows.Select(static row => $"'{row}'"))}]";
+            return new SqltestOutcome(
+                false,
+                $"integrity_check failed for {file.RelativePath}::{test.Name}: " +
+                $"expected exactly one row 'ok', got {actual}");
         }
         finally
         {
             DeleteTemporaryDatabase(temporaryPath);
         }
+    }
+
+    private static EmbeddedDatabase OpenDatabase(SqltestDatabase database, string? temporaryPath)
+        => database.Kind switch
+        {
+            SqltestDatabaseKind.Memory => new EmbeddedDatabase(),
+            SqltestDatabaseKind.TempFile => EmbeddedDatabase.OpenFile(temporaryPath!),
+            SqltestDatabaseKind.Default => EmbeddedDatabase.OpenFile(
+                SqltestDefaultDatabaseGenerator.GetDefaultPath(noRowidAlias: false),
+                readOnly: true),
+            SqltestDatabaseKind.DefaultNoRowidAlias => EmbeddedDatabase.OpenFile(
+                SqltestDefaultDatabaseGenerator.GetDefaultPath(noRowidAlias: true),
+                readOnly: true),
+            _ => throw new NotSupportedException(
+                $"The managed sqltest harness cannot construct database fixture '{database.DisplayName}'."),
+        };
+
+    private static string CreateTemporaryDatabasePath()
+    {
+        var directory = Path.Combine(TestContext.CurrentContext.WorkDirectory, ".sqltest-temporary");
+        Directory.CreateDirectory(directory);
+        return Path.Combine(directory, $"Ahtola-sqltest-{Guid.NewGuid():N}.db");
+    }
+
+    private static SqltestIntegrityResult RunManagedIntegrityCheck(
+        EmbeddedConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var error = TryExecute(connection, "PRAGMA integrity_check", cancellationToken, out var rows);
+        return new SqltestIntegrityResult(rows, error);
     }
 
     private static void DeleteTemporaryDatabase(string? path)

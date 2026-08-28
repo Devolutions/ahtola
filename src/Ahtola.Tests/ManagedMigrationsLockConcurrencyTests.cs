@@ -29,6 +29,7 @@ namespace Ahtola.Tests;
 /// implicit-write-transaction semantics. The one-shot EF-faithful gate now rotates
 /// 24/24 racers in ~1.3s (native reference: 1.03s).
 /// </summary>
+[Category("CoverageExcluded")]
 public class ManagedMigrationsLockConcurrencyTests
 {
     /// <summary>

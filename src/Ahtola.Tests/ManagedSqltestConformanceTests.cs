@@ -10,6 +10,7 @@ namespace Ahtola.Tests;
 /// currently satisfy are listed in <c>Conformance/managed-sqltest-expected-failures.txt</c>
 /// so both coverage and known gaps stay visible instead of being silently omitted.
 /// </summary>
+[Category("CoverageExcluded")]
 public class ManagedSqltestConformanceTests
 {
     public static IEnumerable<TestCaseData> CorpusFiles()
@@ -55,7 +56,8 @@ public class ManagedSqltestConformanceTests
             }
         }
 
-        problems.Should().BeEmpty();
+        if (problems.Count != 0)
+            Assert.Fail(string.Join(Environment.NewLine, problems));
     }
 
     [Test]
@@ -135,6 +137,22 @@ public class ManagedSqltestConformanceTests
             .Where(id => !runnable.Contains(id))
             .Should()
             .BeEmpty("stale expected-failure entries hide corpus coverage changes");
+    }
+
+    [Test]
+    public void HarnessExclusionsAreReviewableAndReferToUnsupportedCases()
+    {
+        var unsupported = SqltestCorpus.Cases
+            .Where(static discovered => discovered.Status == SqltestCaseStatus.UnsupportedHarness)
+            .ToDictionary(static discovered => discovered.Id, StringComparer.Ordinal);
+
+        SqltestCorpus.HarnessExclusions.Should().ContainSingle(
+            "in-process exclusions must stay exceptional and individually reviewed");
+        foreach (var (id, reason) in SqltestCorpus.HarnessExclusions)
+        {
+            unsupported.Should().ContainKey(id, "stale exclusions silently shrink conformance coverage");
+            reason.Should().NotBeNullOrWhiteSpace();
+        }
     }
 
     [Test]

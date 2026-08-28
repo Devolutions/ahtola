@@ -6,6 +6,7 @@ using AwesomeAssertions;
 using Microsoft.Data.Sqlite;
 using Ahtola.Core;
 using Ahtola.Core.Storage;
+using Ahtola.Tests.Infrastructure;
 
 namespace Ahtola.Tests;
 
@@ -504,7 +505,14 @@ public sealed class SqliteWalProcessIsolationHarnessTests
         long? lockOffset = null,
         bool holdLease = true,
         CheckpointWindow? checkpointWindow = null)
-        => new(artifact.WorkDirectory, artifact.DatabasePath, operation, lockOffset, holdLease, checkpointWindow);
+        => new(
+            artifact.WorkDirectory,
+            artifact.DatabasePath,
+            operation,
+            lockOffset,
+            holdLease,
+            checkpointWindow,
+            artifact.ProcessTrace);
 
     private static CommittedWritePages ReadCommittedWritePages(string databasePath)
     {
@@ -770,11 +778,14 @@ public sealed class SqliteWalProcessIsolationHarnessTests
         {
             WorkDirectory = workDirectory;
             DatabasePath = databasePath;
+            ProcessTrace = new ProcessLifecycleTrace(Path.Combine(workDirectory, "process-lifecycle.jsonl"));
         }
 
         internal string WorkDirectory { get; }
 
         internal string DatabasePath { get; }
+
+        internal ProcessLifecycleTrace ProcessTrace { get; }
 
         internal static DetachedSqliteWalArtifact Create()
         {
@@ -939,6 +950,8 @@ public sealed class SqliteWalProcessIsolationHarnessTests
         private readonly string _pausePath;
         private readonly string _resultPath;
         private readonly StringBuilder _output = new();
+        private readonly ProcessLifecycleTrace _trace;
+        private readonly string _operation;
         private bool _completed;
         private bool _released;
 
@@ -948,8 +961,11 @@ public sealed class SqliteWalProcessIsolationHarnessTests
             string operation,
             long? lockOffset,
             bool holdLease,
-            CheckpointWindow? checkpointWindow)
+            CheckpointWindow? checkpointWindow,
+            ProcessLifecycleTrace trace)
         {
+            _trace = trace;
+            _operation = operation;
             var token = Guid.NewGuid().ToString("N");
             _readyPath = Path.Combine(workDirectory, $"wal-process-ready-{token}");
             _releasePath = Path.Combine(workDirectory, $"wal-process-release-{token}");
@@ -987,6 +1003,7 @@ public sealed class SqliteWalProcessIsolationHarnessTests
 
             _process = Process.Start(startInfo)
                 ?? throw new InvalidOperationException("Failed to start the WAL process harness worker.");
+            _trace.RecordStart("wal-worker", operation);
             _process.OutputDataReceived += AppendOutput;
             _process.ErrorDataReceived += AppendOutput;
             _process.BeginOutputReadLine();
@@ -997,11 +1014,15 @@ public sealed class SqliteWalProcessIsolationHarnessTests
         internal string ReadResult()
         {
             WaitForSignal(_resultPath, "The WAL process harness worker did not report a result.");
+            _trace.RecordOperation("wal-worker", "read-result", _operation);
             return File.ReadAllText(_resultPath);
         }
 
         internal void SignalGo()
-            => File.WriteAllText(_goPath, string.Empty);
+        {
+            _trace.RecordOperation("wal-worker", "signal-go", _operation);
+            File.WriteAllText(_goPath, string.Empty);
+        }
 
         internal void WaitForPause()
             => WaitForSignal(_pausePath, "The WAL process harness worker did not reach its pause point.");
@@ -1010,6 +1031,7 @@ public sealed class SqliteWalProcessIsolationHarnessTests
         {
             if (!_released)
             {
+                _trace.RecordOperation("wal-worker", "release", _operation);
                 File.WriteAllText(_releasePath, string.Empty);
                 _released = true;
             }
@@ -1019,12 +1041,10 @@ public sealed class SqliteWalProcessIsolationHarnessTests
 
         internal void Abort()
         {
+            _trace.RecordOperation("wal-worker", "abort", _operation);
             if (!_process.HasExited)
                 _process.Kill(entireProcessTree: true);
-            if (!_process.WaitForExit(WorkerTimeout))
-                Assert.Fail($"The WAL process harness worker did not terminate:{Environment.NewLine}{DrainOutput()}");
-            // Drain async stdout/stderr callbacks after the kill so Dispose is quiet.
-            _process.WaitForExit();
+            _trace.WaitForExit(_process, WorkerTimeout, "wal-worker", _operation, DrainOutput);
             _completed = true;
             // Windows can retain byte-range locks and section objects briefly after the
             // process image exits; give the kernel a moment before the parent reopens.
@@ -1037,14 +1057,10 @@ public sealed class SqliteWalProcessIsolationHarnessTests
             if (_completed)
                 return;
 
-            if (!_process.WaitForExit(WorkerTimeout))
-            {
-                _process.Kill(entireProcessTree: true);
-                Assert.Fail($"The WAL process harness worker did not exit:{Environment.NewLine}{DrainOutput()}");
-            }
-
-            _process.WaitForExit();
-            _process.ExitCode.Should().Be(0, $"worker output:{Environment.NewLine}{DrainOutput()}");
+            _trace.WaitForExit(_process, WorkerTimeout, "wal-worker", _operation, DrainOutput);
+            _process.ExitCode.Should().Be(
+                0,
+                $"worker output:{Environment.NewLine}{DrainOutput()}{Environment.NewLine}{_trace.ReplayDiagnostics()}");
             _completed = true;
         }
 
@@ -1063,21 +1079,20 @@ public sealed class SqliteWalProcessIsolationHarnessTests
 
         private void WaitForSignal(string path, string failureMessage)
         {
-            var stopwatch = Stopwatch.StartNew();
-            while (!File.Exists(path))
+            try
             {
-                if (_process.HasExited)
-                {
-                    _process.WaitForExit();
-                    Assert.Fail($"{failureMessage}{Environment.NewLine}{DrainOutput()}");
-                }
-                if (stopwatch.Elapsed >= WorkerTimeout)
-                {
-                    _process.Kill(entireProcessTree: true);
-                    Assert.Fail($"{failureMessage}{Environment.NewLine}{DrainOutput()}");
-                }
-
-                Thread.Sleep(TimeSpan.FromMilliseconds(10));
+                _trace.WaitUntil(
+                    () => File.Exists(path),
+                    WorkerTimeout,
+                    "wal-worker",
+                    System.IO.Path.GetFileName(path),
+                    _process,
+                    DrainOutput);
+            }
+            catch (Exception exception) when (exception is TimeoutException or InvalidOperationException)
+            {
+                Assert.Fail(
+                    $"{failureMessage}{Environment.NewLine}{DrainOutput()}{Environment.NewLine}{_trace.ReplayDiagnostics()}");
             }
         }
 

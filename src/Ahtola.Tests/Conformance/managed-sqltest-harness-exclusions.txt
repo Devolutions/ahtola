@@ -1,0 +1,3 @@
+# Cases that cannot be safely bounded by the in-process managed sqltest harness.
+# Format: <relative path>::<test name> | <reviewable harness limitation>
+join/default.sqltest::four-way-inner-join | query planning does not observe the managed sqltest cancellation token, so this known gap cannot be bounded in-process

@@ -12,7 +12,17 @@ internal enum SqltestDatabaseKind
     DefaultNoRowidAlias,
 }
 
-internal sealed record SqltestDatabase(SqltestDatabaseKind Kind, string? Path, bool ReadOnly);
+internal sealed record SqltestDatabase(SqltestDatabaseKind Kind, string? Path, bool ReadOnly)
+{
+    public string DisplayName => Kind switch
+    {
+        SqltestDatabaseKind.Memory => ":memory:",
+        SqltestDatabaseKind.TempFile => ":temp:",
+        SqltestDatabaseKind.Default => ":default:",
+        SqltestDatabaseKind.DefaultNoRowidAlias => ":default-no-rowidalias:",
+        _ => Path ?? "<path>",
+    };
+}
 
 internal enum SqltestExpectationKind
 {
@@ -37,7 +47,8 @@ internal sealed record SqltestCase(
     IReadOnlyList<string> Setups,
     IReadOnlyList<SqltestSkip> Skips,
     string? Backend,
-    IReadOnlyList<string> Requires);
+    IReadOnlyList<string> Requires,
+    bool CrossCheckIntegrity);
 
 internal sealed record SqltestFile(
     string RelativePath,
@@ -347,6 +358,8 @@ internal static class SqltestParser
                     new SqltestDatabase(SqltestDatabaseKind.Default, null, true),
                 { Kind: TokenKind.Location, Value: ":default-no-rowidalias:" } =>
                     new SqltestDatabase(SqltestDatabaseKind.DefaultNoRowidAlias, null, true),
+                { Kind: TokenKind.Location, Value: ":default-no-rowid-alias:" } =>
+                    new SqltestDatabase(SqltestDatabaseKind.DefaultNoRowidAlias, null, true),
                 { Kind: TokenKind.Word } =>
                     new SqltestDatabase(SqltestDatabaseKind.Path, token.Value, ConsumeReadOnly()),
                 _ => throw new SqltestParseException($"Unexpected database specifier '{token.Value}'."),
@@ -367,6 +380,7 @@ internal static class SqltestParser
             var skips = new List<SqltestSkip>();
             var requires = new List<string>();
             string? backend = null;
+            var crossCheckIntegrity = false;
 
             while (Peek() is { Kind: TokenKind.Directive } directive)
             {
@@ -391,6 +405,7 @@ internal static class SqltestParser
                         backend = ExpectWord();
                         break;
                     case "@cross-check-integrity":
+                        crossCheckIntegrity = true;
                         break;
                     default:
                         throw new SqltestParseException($"Unexpected directive '{directive.Value}' in {relativePath}.");
@@ -436,7 +451,15 @@ internal static class SqltestParser
             if (expectation is null)
                 throw new SqltestParseException($"Test '{name}' in {relativePath} has no default expect block.");
 
-            return new SqltestCase(name, sql, expectation, setups, skips, backend, requires);
+            return new SqltestCase(
+                name,
+                sql,
+                expectation,
+                setups,
+                skips,
+                backend,
+                requires,
+                crossCheckIntegrity);
         }
 
         private SqltestExpectation ParseExpectation()

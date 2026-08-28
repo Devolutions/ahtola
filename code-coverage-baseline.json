@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "framework": "net10.0",
+  "platform": "windows",
+  "assemblies": [
+    {
+      "name": "Devolutions.Ahtola.Core",
+      "minimumLineRate": 0.81,
+      "minimumBranchRate": 0.74
+    },
+    {
+      "name": "Devolutions.Ahtola.Data",
+      "minimumLineRate": 0.83,
+      "minimumBranchRate": 0.70
+    },
+    {
+      "name": "Devolutions.Ahtola.Data.Sqlite",
+      "minimumLineRate": 0.72,
+      "minimumBranchRate": 0.63
+    },
+    {
+      "name": "Devolutions.Ahtola.Data.Sqlite.Browser",
+      "minimumLineRate": 0.47,
+      "minimumBranchRate": 0.56
+    },
+    {
+      "name": "Devolutions.Ahtola.EntityFrameworkCore.Sqlite",
+      "minimumLineRate": 0.66,
+      "minimumBranchRate": 0.56
+    }
+  ]
+}

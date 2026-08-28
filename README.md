@@ -422,6 +422,7 @@ Requires the .NET SDK and PowerShell 7+:
 ```powershell
 ./build.ps1 build
 ./build.ps1 test
+./build.ps1 test-coverage     # managed suite + per-assembly coverage ratchet
 ./build.ps1 pack              # -> ./artifacts/managed-packages
 ./build.ps1 pack-powershell   # -> ./artifacts/powershell-modules
 ./build.ps1 validate-runtime  # packed consumer trim + NativeAOT publish
@@ -430,7 +431,8 @@ Requires the .NET SDK and PowerShell 7+:
 ```
 
 Contributor details — the full task list, validation gates, conformance suite,
-and repo layout — live in [AGENTS.md](AGENTS.md) and [docs/](docs).
+repo layout, and [managed testing capabilities](docs/testing-capabilities.md)
+live in [AGENTS.md](AGENTS.md) and [docs/](docs).
 
 ## License
 

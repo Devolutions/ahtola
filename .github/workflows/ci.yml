@@ -64,6 +64,10 @@ jobs:
         shell: pwsh
         run: ./scripts/tests/Test-AssertExactPackageVersion.ps1
 
+      - name: Test code coverage assertion
+        shell: pwsh
+        run: ./scripts/tests/Test-AssertCodeCoverage.ps1
+
       - name: Test managed package closure validator
         shell: pwsh
         run: ./scripts/tests/Test-ValidateManagedPackageClosure.ps1
@@ -119,6 +123,13 @@ jobs:
         # job focused on the managed suite instead of repeating that full gate.
         run: ./scripts/Invoke-ManagedTestSuite.ps1 -Framework net10.0 -MinimumExecutedTests $env:MINIMUM_EXECUTED_TESTS
 
+      - name: Collect and validate code coverage
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        # Windows is the canonical coverage lane; merging reports from different
+        # operating-system branches would make the ratchet nondeterministic.
+        run: ./build.ps1 test-coverage -Framework net10.0 -MinimumExecutedTests $env:MINIMUM_EXECUTED_TESTS
+
       - name: Report Ubuntu cross-process WAL gap
         if: always() && steps.managed-test.outcome == 'failure'
         shell: pwsh
@@ -132,7 +143,7 @@ jobs:
           name: test-results-${{ matrix.os }}
           path: |
             **/*.trx
-            artifacts/
+            artifacts/test-results/**
           if-no-files-found: ignore
           retention-days: 7
 

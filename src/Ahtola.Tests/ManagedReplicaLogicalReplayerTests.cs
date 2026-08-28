@@ -454,6 +454,37 @@ public sealed class ManagedReplicaLogicalReplayerTests
     }
 
     [Test]
+    public void KeyChangingReplayDeletesTheOldCompositeKeyBeforeUpsertingTheNewKey()
+    {
+        using var connection = OpenConnection();
+        Exec(connection, "CREATE TABLE t(tenant TEXT, code TEXT, value TEXT, PRIMARY KEY(tenant, code))");
+        Exec(connection, "INSERT INTO t VALUES ('a', 'old', 'local'), ('a', 'keep', 'untouched')");
+
+        var oldKey = SqliteRecordCodecTestHelper.EncodeRow(SqlValue.Text("a"), SqlValue.Text("old"));
+        var newRecord = SqliteRecordCodecTestHelper.EncodeRow(
+            SqlValue.Text("a"),
+            SqlValue.Text("new"),
+            SqlValue.Text("remote"));
+        var txn = new ManagedReplicaLogicalTxn(
+            2,
+            1,
+            [
+                RowOp(ManagedReplicaLogicalOpType.DeleteRow, "t", rowId: 999, oldKey),
+                RowOp(ManagedReplicaLogicalOpType.UpsertRow, "t", rowId: 999, newRecord),
+            ],
+            string.Empty);
+
+        Apply(connection, [txn]);
+
+        Scalar(connection, "SELECT COUNT(*) FROM t WHERE tenant = 'a' AND code = 'old'").AsInteger()
+            .Should().Be(0);
+        Scalar(connection, "SELECT value FROM t WHERE tenant = 'a' AND code = 'new'").AsText()
+            .Should().Be("remote");
+        Scalar(connection, "SELECT value FROM t WHERE tenant = 'a' AND code = 'keep'").AsText()
+            .Should().Be("untouched");
+    }
+
+    [Test]
     public void HeaderUpdateReplaysBothPragmasWhenBothArePresent()
     {
         using var connection = OpenConnection();
