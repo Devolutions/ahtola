@@ -33,6 +33,7 @@ internal sealed record SqltestDiscoveredCase(
 internal static class SqltestCorpus
 {
     private const string ExpectedFailuresFileName = "managed-sqltest-expected-failures.txt";
+    private const string HarnessExclusionsFileName = "managed-sqltest-harness-exclusions.txt";
 
     private static readonly HashSet<string> ManagedCapabilities =
         new(StringComparer.Ordinal) { "trigger", "strict" };
@@ -42,12 +43,18 @@ internal static class SqltestCorpus
     private static readonly Lazy<IReadOnlyDictionary<string, string>> LazyExpectedFailures =
         new(LoadExpectedFailures);
 
+    private static readonly Lazy<IReadOnlyDictionary<string, string>> LazyHarnessExclusions =
+        new(() => LoadReasonFile(HarnessExclusionsFileName));
+
     private static readonly ConcurrentDictionary<string, SqltestFile> ParsedFiles = new(StringComparer.Ordinal);
 
     public static IReadOnlyList<SqltestDiscoveredCase> Cases => LazyCases.Value;
 
     /// <summary>Case id to the reason the managed engine currently fails it.</summary>
     public static IReadOnlyDictionary<string, string> ExpectedFailures => LazyExpectedFailures.Value;
+
+    /// <summary>Case id to a reviewed reason it cannot be bounded by the in-process harness.</summary>
+    public static IReadOnlyDictionary<string, string> HarnessExclusions => LazyHarnessExclusions.Value;
 
     public static string ExpectedFailuresSourcePath =>
         Path.Combine(ResolveTestProjectDirectory(), "Conformance", ExpectedFailuresFileName);
@@ -87,10 +94,9 @@ internal static class SqltestCorpus
                 continue;
             }
 
-            var fileReason = DescribeFileLimitation(file);
             foreach (var test in file.Tests)
             {
-                var (status, reason) = Classify(file, test, fileReason);
+                var (status, reason) = Classify(file, test);
                 discovered.Add(new SqltestDiscoveredCase(relativePath, fullPath, test.Name, status, reason));
             }
         }
@@ -98,30 +104,33 @@ internal static class SqltestCorpus
         return discovered;
     }
 
-    private static string? DescribeFileLimitation(SqltestFile file)
+    internal static string? DescribeFileLimitation(SqltestFile file)
     {
         if (file.Databases.Count == 0)
             return "the file declares no @database";
 
-        if (file.Databases.Count > 1)
-            return "the managed harness runs one @database configuration per file";
-
-        var database = file.Databases[0];
-        return database.Kind switch
+        foreach (var database in file.Databases)
         {
-            SqltestDatabaseKind.Default or SqltestDatabaseKind.DefaultNoRowidAlias =>
-                "the generated :default: fixture is produced by the Rust runner's seeded data generator",
-            SqltestDatabaseKind.Path =>
-                "the fixture database is produced by the Rust runner's generator",
-            _ => null,
-        };
+            if (database.Kind == SqltestDatabaseKind.Path)
+            {
+                return
+                    $"path fixture '{database.Path}' has no equivalent managed generator; " +
+                    "Turso's integrity fixtures are produced by explicit page-corruption routines";
+            }
+        }
+
+        return null;
     }
 
-    private static (SqltestCaseStatus Status, string? Reason) Classify(
+    internal static (SqltestCaseStatus Status, string? Reason) Classify(
         SqltestFile file,
-        SqltestCase test,
-        string? fileLimitation)
+        SqltestCase test)
     {
+        var id = $"{file.RelativePath}::{test.Name}";
+        if (HarnessExclusions.TryGetValue(id, out var exclusionReason))
+            return (SqltestCaseStatus.UnsupportedHarness, exclusionReason);
+
+        var fileLimitation = DescribeFileLimitation(file);
         if (fileLimitation is not null)
             return (SqltestCaseStatus.UnsupportedHarness, fileLimitation);
 
@@ -147,8 +156,11 @@ internal static class SqltestCorpus
     }
 
     private static IReadOnlyDictionary<string, string> LoadExpectedFailures()
+        => LoadReasonFile(ExpectedFailuresFileName);
+
+    private static IReadOnlyDictionary<string, string> LoadReasonFile(string fileName)
     {
-        var path = ResolveExpectedFailuresPath();
+        var path = ResolveReasonFilePath(fileName);
         var entries = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var line in File.ReadLines(path))
         {
@@ -169,13 +181,14 @@ internal static class SqltestCorpus
         return entries;
     }
 
-    private static string ResolveExpectedFailuresPath()
+    private static string ResolveReasonFilePath(string fileName)
     {
         var copied = Path.Combine(
             TestContext.CurrentContext.TestDirectory,
             "Conformance",
-            ExpectedFailuresFileName);
-        return File.Exists(copied) ? copied : ExpectedFailuresSourcePath;
+            fileName);
+        var source = Path.Combine(ResolveTestProjectDirectory(), "Conformance", fileName);
+        return File.Exists(copied) ? copied : source;
     }
 
     private static string ResolveCorpusRoot()

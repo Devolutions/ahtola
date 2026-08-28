@@ -40,7 +40,9 @@ public class AhtolaParameterCollection : DbParameterCollection
 
     public override bool Contains(object value)
     {
-        return _parameters.Any(p => value is AhtolaParameter ? p == value : p.Value == value);
+        return value is AhtolaParameter parameter
+            ? _parameters.Contains(parameter)
+            : _parameters.Any(p => Equals(p.Value, value));
     }
 
     public override bool Contains(string value)
@@ -62,7 +64,9 @@ public class AhtolaParameterCollection : DbParameterCollection
 
     public override int IndexOf(object value)
     {
-        return _parameters.FindIndex(p => value is AhtolaParameter ? p == value : p.Value == value);
+        return value is AhtolaParameter parameter
+            ? _parameters.IndexOf(parameter)
+            : _parameters.FindIndex(p => Equals(p.Value, value));
     }
 
     public override int IndexOf(string parameterName)

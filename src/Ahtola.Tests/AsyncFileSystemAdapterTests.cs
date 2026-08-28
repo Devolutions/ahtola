@@ -399,6 +399,73 @@ public sealed class DeterministicAsyncFileSystemTests
         physicalController.GetOperationCount(FileSystemOperation.OpenTemporary).Should().Be(1);
     }
 
+    [Test]
+    public async Task PendingOperationsCanBeReleasedOutOfOrderExactlyOnce()
+    {
+        var controller = new DeterministicAsyncIoController(forceYield: true);
+        var fileSystem = DeterministicAsyncFileSystem.Create(
+            AsyncFileSystemAdapter.Create(new InMemoryFileSystem()),
+            controller);
+        var first = await CompleteYieldAsync(
+            fileSystem.OpenFileAsync("first.db", FileOpenMode.CreateNew),
+            controller);
+        var second = await CompleteYieldAsync(
+            fileSystem.OpenFileAsync("second.db", FileOpenMode.CreateNew),
+            controller);
+
+        var firstWrite = first.WriteAsync(0, new byte[] { 1 });
+        var secondWrite = second.WriteAsync(0, new byte[] { 2 });
+        var pending = controller.PendingOperations;
+        pending.Select(operation => operation.Path).Should().Equal("first.db", "second.db");
+
+        controller.Release(pending[1].Id);
+        await secondWrite;
+        firstWrite.IsCompleted.Should().BeFalse();
+        controller.PendingOperations.Should().ContainSingle()
+            .Which.Id.Should().Be(pending[0].Id);
+
+        controller.Release(pending[0].Id);
+        await firstWrite;
+        Assert.Throws<InvalidOperationException>(() => controller.Release(pending[0].Id));
+        controller.History
+            .Where(@event => @event.Kind == DeterministicAsyncIoEventKind.Released)
+            .TakeLast(2)
+            .Select(@event => @event.Operation.Id)
+            .Should().Equal(pending[1].Id, pending[0].Id);
+    }
+
+    [Test]
+    public async Task PathAndOccurrenceFaultTargetsOnlyTheSelectedIo()
+    {
+        var expected = new IOException("second beta write");
+        var controller = new DeterministicAsyncIoController(forceYield: true);
+        var fileSystem = DeterministicAsyncFileSystem.Create(
+            AsyncFileSystemAdapter.Create(new InMemoryFileSystem()),
+            controller);
+        var alpha = await CompleteYieldAsync(
+            fileSystem.OpenFileAsync("alpha.db", FileOpenMode.CreateNew),
+            controller);
+        var beta = await CompleteYieldAsync(
+            fileSystem.OpenFileAsync("beta.db", FileOpenMode.CreateNew),
+            controller);
+        controller.FailOnOccurrence(FileSystemOperation.Write, "beta.db", 2, expected);
+
+        await CompleteYieldAsync(alpha.WriteAsync(0, new byte[] { 1 }), controller);
+        await CompleteYieldAsync(beta.WriteAsync(0, new byte[] { 2 }), controller);
+        var failed = beta.WriteAsync(1, new byte[] { 3 });
+        controller.ReleaseNext();
+
+        var exception = Assert.ThrowsAsync<IOException>(async () => await failed);
+        exception.Should().BeSameAs(expected);
+        controller.GetOperationCount(FileSystemOperation.Write, "alpha.db").Should().Be(1);
+        controller.GetOperationCount(FileSystemOperation.Write, "beta.db").Should().Be(2);
+        controller.History.Should().ContainSingle(@event =>
+            @event.Kind == DeterministicAsyncIoEventKind.Faulted
+            && @event.Operation.Path == "beta.db"
+            && @event.Operation.PathOccurrence == 2);
+        (await CompleteYieldAsync(beta.GetLengthAsync(), controller)).Should().Be(1);
+    }
+
     private static async Task CompleteYieldAsync(
         ValueTask operation,
         DeterministicAsyncIoController controller)
@@ -417,330 +484,5 @@ public sealed class DeterministicAsyncFileSystemTests
         controller.PendingYieldCount.Should().Be(1);
         controller.ReleaseNext();
         return await operation;
-    }
-}
-
-internal sealed class DeterministicAsyncIoController(bool forceYield)
-{
-    private readonly object _gate = new();
-    private readonly Dictionary<FileSystemOperation, long> _counts = new();
-    private readonly Dictionary<(FileSystemOperation Operation, long Occurrence), Exception> _faults = new();
-    private readonly Queue<TaskCompletionSource> _pendingYields = new();
-
-    internal int PendingYieldCount
-    {
-        get
-        {
-            lock (_gate)
-                return _pendingYields.Count;
-        }
-    }
-
-    internal void FailNext(FileSystemOperation operation, Exception exception)
-    {
-        ArgumentNullException.ThrowIfNull(exception);
-        lock (_gate)
-        {
-            var occurrence = _counts.GetValueOrDefault(operation) + 1;
-            _faults[(operation, occurrence)] = exception;
-        }
-    }
-
-    internal long GetOperationCount(FileSystemOperation operation)
-    {
-        lock (_gate)
-            return _counts.GetValueOrDefault(operation);
-    }
-
-    internal void ReleaseNext()
-    {
-        TaskCompletionSource completion;
-        lock (_gate)
-            completion = _pendingYields.Dequeue();
-        completion.SetResult();
-    }
-
-    internal async ValueTask BeforeOperationAsync(
-        FileSystemOperation operation,
-        CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        TaskCompletionSource? completion = null;
-        Exception? fault;
-        lock (_gate)
-        {
-            var occurrence = _counts.GetValueOrDefault(operation) + 1;
-            _counts[operation] = occurrence;
-            _faults.Remove((operation, occurrence), out fault);
-            if (forceYield)
-            {
-                completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                _pendingYields.Enqueue(completion);
-            }
-        }
-
-        if (completion is not null)
-            await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-        cancellationToken.ThrowIfCancellationRequested();
-        if (fault is not null)
-            ExceptionDispatchInfo.Capture(fault).Throw();
-    }
-}
-
-internal class DeterministicAsyncFileSystem : IAsyncFileSystem
-{
-    protected DeterministicAsyncFileSystem(
-        IAsyncFileSystem inner,
-        DeterministicAsyncIoController controller)
-    {
-        Inner = inner;
-        Controller = controller;
-    }
-
-    protected IAsyncFileSystem Inner { get; }
-
-    protected DeterministicAsyncIoController Controller { get; }
-
-    internal static IAsyncFileSystem Create(
-        IAsyncFileSystem inner,
-        DeterministicAsyncIoController controller)
-    {
-        ArgumentNullException.ThrowIfNull(inner);
-        ArgumentNullException.ThrowIfNull(controller);
-        return (inner is IAsyncAtomicFileSystem, inner is IAsyncTemporaryFileSystem) switch
-        {
-            (true, true) => new AtomicTemporaryFileSystem(inner, controller),
-            (true, false) => new AtomicFileSystem(inner, controller),
-            (false, true) => new TemporaryFileSystem(inner, controller),
-            _ => new DeterministicAsyncFileSystem(inner, controller),
-        };
-    }
-
-    public async ValueTask<bool> FileExistsAsync(
-        string path,
-        CancellationToken cancellationToken = default)
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.FileExists,
-            cancellationToken).ConfigureAwait(false);
-        return await Inner.FileExistsAsync(path, cancellationToken).ConfigureAwait(false);
-    }
-
-    public async ValueTask<IAsyncFile> OpenFileAsync(
-        string path,
-        FileOpenMode mode,
-        bool readOnly = false,
-        CancellationToken cancellationToken = default)
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.Open,
-            cancellationToken).ConfigureAwait(false);
-        var file = await Inner.OpenFileAsync(path, mode, readOnly, cancellationToken).ConfigureAwait(false);
-        return DeterministicAsyncFile.Create(file, Controller);
-    }
-
-    public async ValueTask DeleteFileAsync(
-        string path,
-        CancellationToken cancellationToken = default)
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.Delete,
-            cancellationToken).ConfigureAwait(false);
-        await Inner.DeleteFileAsync(path, cancellationToken).ConfigureAwait(false);
-    }
-
-    public async ValueTask<FileWriteStamp?> GetWriteStampAsync(
-        string path,
-        CancellationToken cancellationToken = default)
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.GetWriteStamp,
-            cancellationToken).ConfigureAwait(false);
-        return await Inner.GetWriteStampAsync(path, cancellationToken).ConfigureAwait(false);
-    }
-
-    private sealed class AtomicFileSystem(
-        IAsyncFileSystem inner,
-        DeterministicAsyncIoController controller) :
-        DeterministicAsyncFileSystem(inner, controller),
-        IAsyncAtomicFileSystem
-    {
-        public async ValueTask ReplaceFileAtomicallyAsync(
-            string sourcePath,
-            string destinationPath,
-            bool replaceEmptyDestination,
-            CancellationToken cancellationToken = default)
-        {
-            await Controller.BeforeOperationAsync(
-                FileSystemOperation.AtomicReplace,
-                cancellationToken).ConfigureAwait(false);
-            await ((IAsyncAtomicFileSystem)Inner).ReplaceFileAtomicallyAsync(
-                sourcePath,
-                destinationPath,
-                replaceEmptyDestination,
-                cancellationToken).ConfigureAwait(false);
-        }
-    }
-
-    private sealed class TemporaryFileSystem(
-        IAsyncFileSystem inner,
-        DeterministicAsyncIoController controller) :
-        DeterministicAsyncFileSystem(inner, controller),
-        IAsyncTemporaryFileSystem
-    {
-        public async ValueTask<IAsyncFile> OpenTemporaryFileAsync(
-            string path,
-            CancellationToken cancellationToken = default)
-        {
-            await Controller.BeforeOperationAsync(
-                FileSystemOperation.OpenTemporary,
-                cancellationToken).ConfigureAwait(false);
-            var file = await ((IAsyncTemporaryFileSystem)Inner)
-                .OpenTemporaryFileAsync(path, cancellationToken).ConfigureAwait(false);
-            return DeterministicAsyncFile.Create(file, Controller);
-        }
-    }
-
-    private sealed class AtomicTemporaryFileSystem(
-        IAsyncFileSystem inner,
-        DeterministicAsyncIoController controller) :
-        DeterministicAsyncFileSystem(inner, controller),
-        IAsyncAtomicFileSystem,
-        IAsyncTemporaryFileSystem
-    {
-        public async ValueTask ReplaceFileAtomicallyAsync(
-            string sourcePath,
-            string destinationPath,
-            bool replaceEmptyDestination,
-            CancellationToken cancellationToken = default)
-        {
-            await Controller.BeforeOperationAsync(
-                FileSystemOperation.AtomicReplace,
-                cancellationToken).ConfigureAwait(false);
-            await ((IAsyncAtomicFileSystem)Inner).ReplaceFileAtomicallyAsync(
-                sourcePath,
-                destinationPath,
-                replaceEmptyDestination,
-                cancellationToken).ConfigureAwait(false);
-        }
-
-        public async ValueTask<IAsyncFile> OpenTemporaryFileAsync(
-            string path,
-            CancellationToken cancellationToken = default)
-        {
-            await Controller.BeforeOperationAsync(
-                FileSystemOperation.OpenTemporary,
-                cancellationToken).ConfigureAwait(false);
-            var file = await ((IAsyncTemporaryFileSystem)Inner)
-                .OpenTemporaryFileAsync(path, cancellationToken).ConfigureAwait(false);
-            return DeterministicAsyncFile.Create(file, Controller);
-        }
-    }
-}
-
-internal class DeterministicAsyncFile : IAsyncFile
-{
-    protected DeterministicAsyncFile(
-        IAsyncFile inner,
-        DeterministicAsyncIoController controller)
-    {
-        Inner = inner;
-        Controller = controller;
-    }
-
-    protected IAsyncFile Inner { get; }
-
-    protected DeterministicAsyncIoController Controller { get; }
-
-    internal static IAsyncFile Create(
-        IAsyncFile inner,
-        DeterministicAsyncIoController controller)
-    {
-        ArgumentNullException.ThrowIfNull(inner);
-        ArgumentNullException.ThrowIfNull(controller);
-        return inner is IAsyncPageMaterializingFile
-            ? new MaterializingFile(inner, controller)
-            : new DeterministicAsyncFile(inner, controller);
-    }
-
-    public bool IsReadOnly => Inner.IsReadOnly;
-
-    public async ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.GetLength,
-            cancellationToken).ConfigureAwait(false);
-        return await Inner.GetLengthAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    public async ValueTask<int> ReadAsync(
-        long position,
-        Memory<byte> destination,
-        CancellationToken cancellationToken = default)
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.Read,
-            cancellationToken).ConfigureAwait(false);
-        return await Inner.ReadAsync(position, destination, cancellationToken).ConfigureAwait(false);
-    }
-
-    public async ValueTask WriteAsync(
-        long position,
-        ReadOnlyMemory<byte> source,
-        CancellationToken cancellationToken = default)
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.Write,
-            cancellationToken).ConfigureAwait(false);
-        await Inner.WriteAsync(position, source, cancellationToken).ConfigureAwait(false);
-    }
-
-    public async ValueTask SetLengthAsync(
-        long length,
-        CancellationToken cancellationToken = default)
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.SetLength,
-            cancellationToken).ConfigureAwait(false);
-        await Inner.SetLengthAsync(length, cancellationToken).ConfigureAwait(false);
-    }
-
-    public async ValueTask FlushToDiskAsync(CancellationToken cancellationToken = default)
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.FlushToDisk,
-            cancellationToken).ConfigureAwait(false);
-        await Inner.FlushToDiskAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        await Controller.BeforeOperationAsync(
-            FileSystemOperation.Dispose,
-            CancellationToken.None).ConfigureAwait(false);
-        await Inner.DisposeAsync().ConfigureAwait(false);
-    }
-
-    private sealed class MaterializingFile(
-        IAsyncFile inner,
-        DeterministicAsyncIoController controller) :
-        DeterministicAsyncFile(inner, controller),
-        IAsyncPageMaterializingFile
-    {
-        public async ValueTask EnsureMaterializedAsync(
-            long position,
-            int length,
-            CancellationToken cancellationToken = default)
-        {
-            await Controller.BeforeOperationAsync(
-                FileSystemOperation.EnsureMaterialized,
-                cancellationToken).ConfigureAwait(false);
-            await ((IAsyncPageMaterializingFile)Inner).EnsureMaterializedAsync(
-                position,
-                length,
-                cancellationToken).ConfigureAwait(false);
-        }
     }
 }

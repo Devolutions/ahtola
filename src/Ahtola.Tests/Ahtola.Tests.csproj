@@ -51,5 +51,7 @@
                  CopyToOutputDirectory="PreserveNewest" />
         <Content Include="Conformance\managed-sqltest-expected-failures.txt"
                  CopyToOutputDirectory="PreserveNewest" />
+        <Content Include="Conformance\managed-sqltest-harness-exclusions.txt"
+                 CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 </Project>

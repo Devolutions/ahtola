@@ -24,6 +24,7 @@ param(
         'restore',
         'build',
         'test',
+        'test-coverage',
         'pack',
                 'pack-powershell',
                 'test-powershell',
@@ -91,6 +92,14 @@ $BrowserTrimAnalysisRunner = Join-Path $RepoRoot 'scripts/Invoke-TrimAnalysisGat
 $ConsumerNugetConfig = './samples/ManagedPackageConsumer/obj/managed-package-consumer.nuget.config'
 $ClosureValidator = Join-Path $RepoRoot 'scripts/Validate-ManagedPackageClosure.ps1'
 $TestRunner = Join-Path $RepoRoot 'scripts/Invoke-ManagedTestSuite.ps1'
+$CoverageValidator = Join-Path $RepoRoot 'scripts/Assert-CodeCoverage.ps1'
+$CoverageSettings = Join-Path $RepoRoot 'coverage.runsettings'
+$CoverageBaseline = Join-Path $RepoRoot 'code-coverage-baseline.json'
+$CoverageResultsDirectory = Join-Path $RepoRoot 'artifacts/test-results/coverage'
+# Coverlet changes the timing of migration stress, and instrumenting generated
+# 10,000-row sqltest fixtures is prohibitively slow. The ordinary Windows test
+# leg still runs every class in this explicit category.
+$CoverageFilter = 'TestCategory!=CoverageExcluded'
 $ConsumerFrameworks = @('net8.0', 'net9.0', 'net10.0')
 
 $NativeLeakPattern = '(?i)(Ahtola\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native[^"]*|Sync))|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)'
@@ -619,6 +628,23 @@ function Invoke-Test {
     )
 }
 
+function Invoke-TestCoverage {
+    Write-Step "Running managed test suite with coverage ($Framework)"
+    Invoke-PwshScript -Path $TestRunner -Arguments @(
+        '-Framework', $Framework,
+        '-MinimumExecutedTests', "$MinimumExecutedTests",
+        '-CollectCoverage',
+        '-CoverageSettings', $CoverageSettings,
+        '-ResultsDirectory', $CoverageResultsDirectory,
+        '-Filter', $CoverageFilter,
+        '-HangTimeoutMinutes', '10'
+    )
+    Invoke-PwshScript -Path $CoverageValidator -Arguments @(
+        '-CoveragePath', (Join-Path $CoverageResultsDirectory "$Framework/coverage.cobertura.xml"),
+        '-BaselinePath', $CoverageBaseline
+    )
+}
+
 function Invoke-FormatCheck {
     Write-Step 'Checking formatting'
     Invoke-DotNet @('format', $Solution, '--verify-no-changes')
@@ -648,6 +674,7 @@ switch ($Task) {
             Assert-ExactPackageVersion -Directory $PackageOutput -ExpectedVersion $PackageVersion
         }
         'test' { Invoke-Test }
+        'test-coverage' { Invoke-TestCoverage }
         'format-check' { Invoke-FormatCheck }
         default { throw "Unknown task '$Task'" }
     }

@@ -43,6 +43,10 @@ param(
     # reports as a cancelled job with no indication of which test stalled.
     [int]$HangTimeoutMinutes = 0,
     [switch]$NoBuild,
+    # Collects shipped-assembly coverage through the existing Coverlet VSTest
+    # collector and normalizes its GUID-scoped report to the results root.
+    [switch]$CollectCoverage,
+    [string]$CoverageSettings = './coverage.runsettings',
     # Reproduces the managed lane's "must not shell out to Rust" invariant by
     # putting failing cargo/rustc shims ahead of the real toolchain on PATH.
     [switch]$DenyNativeToolchain
@@ -170,6 +174,12 @@ if ($NoBuild) { $arguments += '--no-build' }
 if ($HangTimeoutMinutes -gt 0) {
     $arguments += @('--blame-hang', '--blame-hang-timeout', "${HangTimeoutMinutes}m", '--blame-hang-dump-type', 'none')
 }
+if ($CollectCoverage) {
+    if (-not (Test-Path -LiteralPath $CoverageSettings -PathType Leaf)) {
+        Fail "coverage settings file '$CoverageSettings' does not exist."
+    }
+    $arguments += @('--collect', 'XPlat Code Coverage', '--settings', $CoverageSettings)
+}
 
 $denyDirectory = $null
 $originalPath = $env:PATH
@@ -213,6 +223,31 @@ if ($sequenceFiles.Count -gt 0) {
 
 if (-not (Test-Path -LiteralPath $trxPath -PathType Leaf)) {
     Fail "the run produced no TRX report at '$trxPath', so it cannot be proven to have executed any test (dotnet test exit code $testExitCode)."
+}
+
+if ($CollectCoverage) {
+    $coverageReports = @(
+        Get-ChildItem -LiteralPath $resultsRoot -Recurse -Filter 'coverage.cobertura.xml' |
+            Where-Object { $_.DirectoryName -ne (Resolve-Path -LiteralPath $resultsRoot).Path }
+    )
+    if ($coverageReports.Count -eq 0) {
+        Fail "coverage collection produced no Cobertura report under '$resultsRoot'."
+    }
+
+    $coverageHashes = @(
+        $coverageReports |
+            Group-Object -Property { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+    )
+    if ($coverageHashes.Count -ne 1) {
+        Fail "coverage collection produced $($coverageHashes.Count) distinct Cobertura reports under '$resultsRoot'; one logical report was expected."
+    }
+
+    $normalizedCoveragePath = Join-Path $resultsRoot 'coverage.cobertura.xml'
+    $sourceCoveragePath = $coverageReports |
+        Sort-Object { $_.FullName.Length } |
+        Select-Object -First 1 -ExpandProperty FullName
+    Copy-Item -LiteralPath $sourceCoveragePath -Destination $normalizedCoveragePath
+    Write-Host "coverage report: $normalizedCoveragePath"
 }
 
 $summary = Get-TrxSummary -TrxPath $trxPath
