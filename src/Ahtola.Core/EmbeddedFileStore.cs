@@ -1005,11 +1005,13 @@ internal sealed class EmbeddedFileStore : IDisposable
                             throw new EmbeddedSqlException(
                                 $"Managed file database sqlite_schema interior page {pageNumber} has children with inconsistent heights.");
                         }
+                        // SQLite preserves table-interior separators as upper bounds
+                        // when deleting the current maximum rowid from a left child.
                         if (childIndex < interior.Cells.Count
-                            && childMaximumRowId != interior.Cells[childIndex].Cell.RowId)
+                            && childMaximumRowId > interior.Cells[childIndex].Cell.RowId)
                         {
                             throw new EmbeddedSqlException(
-                                $"Managed file database sqlite_schema interior page {pageNumber} has an invalid separator at index {childIndex}.");
+                                $"Managed file database sqlite_schema interior page {pageNumber} separator {childIndex} is below maximum rowid on child page {childPage}.");
                         }
 
                         childHeight = child.Height;
