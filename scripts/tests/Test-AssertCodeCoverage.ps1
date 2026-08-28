@@ -61,7 +61,9 @@ function Invoke-Validator(
             -CoveragePath $CoveragePath -BaselinePath $BaselinePath 2>&1
     )
     $exitCode = $LASTEXITCODE
-    $renderedOutput = ($output -join [Environment]::NewLine) -replace '\s+', ' '
+    $renderedOutput = ($output -join [Environment]::NewLine) `
+        -replace '\x1B\[[0-?]*[ -/]*[@-~]', '' `
+        -replace '\s+', ' '
     if ($ShouldSucceed -and $exitCode -ne 0) {
         Fail "validator unexpectedly failed: $renderedOutput"
     }
