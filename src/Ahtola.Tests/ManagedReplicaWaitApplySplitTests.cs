@@ -479,6 +479,14 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             using var hostA = ManagedReplicaConnectionHost.Open(options);
             using var hostB = ManagedReplicaConnectionHost.Open(options);
 
+            await hostB.QuiesceAndReopenAsync(
+                _ => Task.CompletedTask,
+                CancellationToken.None);
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix)
+                .Should().BeTrue();
+            ReadHostScalar(hostA, "SELECT value FROM bootstrap_marker;").Should().Be(42);
+            ReadHostScalar(hostB, "SELECT value FROM bootstrap_marker;").Should().Be(42);
+
             var paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var pausedOnce = 0;
@@ -550,5 +558,12 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         {
             DeleteReplicaFiles(path);
         }
+    }
+
+    private static long ReadHostScalar(ManagedReplicaConnectionHost host, string sql)
+    {
+        using var statement = host.Database.Connection.Prepare(sql);
+        statement.Step().Should().Be(Ahtola.Core.StatementStepResult.Row);
+        return statement.GetValue(0).AsInteger();
     }
 }
