@@ -30,7 +30,7 @@ scope decision; it does not mean Ahtola implements every newer Turso feature.
 | 7 | `join-coalescing-parity` | 4 sqltests closed | `core/translate/planner.rs`, `plan.rs`, `select.rs` | Done |
 | 8 | `planner-access-path-depth` | Documented runtime limit | `core/translate/optimizer/`, `planner.rs`, `main_loop/` | Planned |
 | 9 | `mvcc-page-native-depth` | Documented runtime limit | `core/mvcc/` | Planned |
-| 10 | `sync-engine-depth` | Documented runtime limit | `sync/engine/src/` | Blocked by rank 9 |
+| 10 | `sync-engine-depth` | Wait/apply lifecycle split landed | `sync/engine/src/` | Partial (checkpoint policy blocked by rank 9) |
 
 The sqltest counts overlap by subsystem only in implementation, not in this
 classification: ranks 1-7 account for 133 distinct expected-failure entries.
@@ -47,6 +47,14 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   exposed case was not in the 135-entry baseline).
 - Current expected-failure count: 2, both intentional STORED-generated-column
   differences. There are no actionable sqltest failures in the baseline.
+- 2026-08-29: `sync-engine-depth` -- landed the managed equivalent of Turso's
+  `wait_changes_from_remote` -> opaque staged changes -> `apply_changes_from_remote`
+  split (`ManagedReplicaBootstrapper.WaitForRemoteChangesAsync` /
+  `ApplyRemoteChangesAsync` / `ManagedReplicaStagedChanges`), and refactored
+  `AhtolaConnection.SyncAsync`'s host publication gate to close/reopen sibling
+  connections only around push and the local apply, never around the network
+  long-poll in between. See the detailed TODOs below for what remains blocked
+  on the parallel MVCC branch.
 
 ## Detailed TODOs
 
@@ -187,18 +195,64 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 ### 10. Managed sync-engine depth
 
 - [ ] Port the passive synced-prefix/history checkpoint policy without
-  weakening ambiguous-push recovery.
-- [ ] Complete wait-for-changes cancellation, timeout, reconnect, and revision
-  ordering.
-- [ ] Negotiate physical and logical protocols explicitly and qualify them
-  against the pinned reference server.
-- [ ] Evaluate compressed page sets only through a pure-managed,
+  weakening ambiguous-push recovery. Blocked on the parallel page-native MVCC
+  branch: Turso's `checkpoint_passive` (`sync/engine/src/database_sync_engine.rs`)
+  checkpoints only the already-synced WAL prefix
+  (`revert_since_wal_watermark`), which is a bounded, WAL-frame-based concept
+  that only exists once the MVCC logical protocol has a real logical log/WAL
+  to bound. The page protocol already has a *functionally* equivalent, tested
+  safety net for its own on-disk format: `ManagedReplicaRevertWal.CaptureAndCheckpoint`
+  captures a full pre-checkpoint page image before checkpointing WAL into the
+  main store, so a push that turns out to conflict can still restore the exact
+  pre-push database. Needed from the MVCC branch before this item can close:
+  an `Ahtola.Core/Mvcc` primitive that checkpoints up to a caller-supplied WAL
+  watermark while leaving frames above it (and their revert evidence) intact --
+  the managed equivalent of Turso's `revert_since_wal_watermark` /
+  `CheckpointMode::Passive { upper_bound_inclusive }`. No fail-closed seam was
+  added speculatively ahead of that primitive existing; see the sync-engine
+  session's report to the MVCC session for the exact requirement.
+- [x] Complete wait-for-changes cancellation, timeout, reconnect, and revision
+  ordering. Ported Turso's `wait_changes_from_remote` -> opaque staged changes
+  -> `apply_changes_from_remote` split
+  (`ManagedReplicaBootstrapper.WaitForRemoteChangesAsync` /
+  `ApplyRemoteChangesAsync` / `ManagedReplicaStagedChanges`): waiting stages
+  and validates a response without touching local state or holding any
+  publication gate; applying consumes the staged result exactly once (fails
+  closed on cross-replica, duplicate-apply, and disposed-result misuse) and
+  throws a dedicated `ManagedReplicaStaleChangesException` -- instead of
+  silently retrying a network fetch under a lease -- when local state advanced
+  past the snapshot the response was negotiated against. `AhtolaConnection.SyncAsync`
+  now runs push and the local apply as their own short publication windows,
+  with the network long-poll for remote changes in between holding no gate at
+  all, so sibling connections to the same replica keep serving local reads and
+  writes for however long the remote takes to answer. Cancellation, timeout,
+  and no-change (up-to-date) responses were already exercised end-to-end and
+  remain covered; reconnect/redirect handling in the HTTP transport itself was
+  untouched (no protocol-layer change was needed for this split).
+- [x] Negotiate physical and logical protocols explicitly and qualify them
+  against the pinned reference server. Already in place before this workstream
+  (raw `PageUpdatesEncodingReq=0`, persisted Pages/MvccLogical detection,
+  stream/apply mode parsing, LML3 logical replay) and unaffected by the
+  wait/apply split, which reuses the exact same request/response parsing code.
+- [x] Evaluate compressed page sets only through a pure-managed,
   NativeAOT/trim-safe dependency; otherwise keep explicit raw negotiation and
-  fail closed.
-- [ ] Preserve sparse-bootstrap publication, encryption exclusions, conflict
-  quarantine, and one push flight per physical identity.
-- [ ] Add canned-server protocol tests, every-boundary fault injection, and
-  cross-process publication tests.
+  fail closed. No pure-managed, trim-safe zstd implementation is available, so
+  the existing explicit raw-encoding request and fail-closed zstd rejection
+  stand as the deliberate, documented choice; the wait/apply split changes
+  nothing about encoding negotiation.
+- [x] Preserve sparse-bootstrap publication, encryption exclusions, conflict
+  quarantine, and one push flight per physical identity. Verified unchanged
+  by the full existing `ManagedReplicaPublicationRaceTests` /
+  `ManagedEmbeddedReplicaPushRecoveryTests` /
+  `ManagedReplicaBootstrapCatchUpDurabilityTests` suites, including the
+  cross-process conflict-during-network-wait races.
+- [x] Add canned-server protocol tests, every-boundary fault injection, and
+  cross-process publication tests. Added direct unit tests for the new staged
+  wait/apply primitives (cross-replica, duplicate-apply, disposed-result,
+  stale-revision retry, no-change response, cancellation mid-long-poll) plus
+  an integration test proving `SyncAsync` no longer blocks sibling reads/writes
+  during the long-poll (`ManagedReplicaWaitApplySplitTests.cs`); reran the full
+  existing canned-server and cross-process publication-race suites unchanged.
 
 ## Definition of done
 
