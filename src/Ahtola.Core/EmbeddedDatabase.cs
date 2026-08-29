@@ -806,10 +806,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             var allocated = store.AllocateRowId(tableId, minimumExclusive: rowId - 1);
                             if (allocated != rowId)
                             {
+                                var promoted = table.Rows[index].ToArray();
                                 table.RowIds[index] = allocated;
                                 var aliasIndex = table.RowidAliasColumnIndex;
-                                if (aliasIndex >= 0 && aliasIndex < table.Rows[index].Length)
-                                    table.Rows[index][aliasIndex] = SqlValue.Integer(allocated);
+                                if (aliasIndex >= 0 && aliasIndex < promoted.Length)
+                                    promoted[aliasIndex] = SqlValue.Integer(allocated);
+                                table.Rows[index] = promoted;
                                 rowId = allocated;
                             }
                             else
@@ -5741,6 +5743,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         var statistics = GetOrCreateSqliteStat1Table(catalog);
         var histogramStatistics = GetOrCreateSqliteStat4Table(catalog);
+        var stat4RowIds = new Stat4RowIdAllocator(
+            histogramStatistics,
+            _plannerAccessPathMetrics);
         foreach (var target in targets)
         {
             DeleteStatistics(statistics, target.Table.Name, target.Index?.Name);
@@ -5748,13 +5753,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (target.Index is not null)
             {
                 AddIndexStatistic(statistics, target.Table, target.Index);
-                AddIndexStat4Samples(histogramStatistics, target.Table, target.Index);
+                AddIndexStat4Samples(histogramStatistics, target.Table, target.Index, stat4RowIds);
             }
             else
             {
                 AddTableStatistics(statistics, target.Table);
                 foreach (var index in target.Table.Indexes)
-                    AddIndexStat4Samples(histogramStatistics, target.Table, index);
+                    AddIndexStat4Samples(histogramStatistics, target.Table, index, stat4RowIds);
             }
         }
 
@@ -51548,6 +51553,9 @@ internal sealed class EmbeddedTable
     private InsertConflictAlgorithm? _effectivePrimaryKeyConflictAlgorithm;
     private int[]? _cachedRowidScanOrder;
     private long _cachedRowidScanOrderRevision = -1;
+    private Dictionary<long, int>? _cachedRowIdPositions;
+    private long _cachedRowIdPositionsRevision = -1;
+    private int _cachedRowIdPositionsCount = -1;
     private readonly Dictionary<string, (long Revision, int[] Order)> _cachedIndexScanOrders =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -52308,6 +52316,70 @@ internal sealed class EmbeddedTable
 
         foreach (var index in _cachedRowidScanOrder)
             yield return index;
+    }
+
+    // STAT4 validates a small sample set repeatedly while planning. Cache the rowid map by
+    // RowStore revision, but verify the live slot so same-count rowid replacements fail closed.
+    internal int TryGetRowIdPosition(long rowId, out bool cacheRebuilt)
+    {
+        cacheRebuilt = false;
+        if (!HasRowid || RowIds.Count != Rows.Count)
+        {
+            InvalidateCache();
+            return -1;
+        }
+
+        var builtThisCall = false;
+        if (_cachedRowIdPositions is null
+            || _cachedRowIdPositionsRevision != Rows.Revision
+            || _cachedRowIdPositionsCount != RowIds.Count)
+        {
+            RebuildCache();
+            cacheRebuilt = true;
+            builtThisCall = true;
+        }
+
+        if (TryReadLivePosition(rowId, out var position))
+            return position;
+        if (builtThisCall)
+            return -1;
+
+        // A same-count rowid replacement can bypass RowStore.Revision. Rebuild once on a stale
+        // hit or miss, then let the caller's live index-key validation decide whether to trust it.
+        RebuildCache();
+        cacheRebuilt = true;
+        return TryReadLivePosition(rowId, out position) ? position : -1;
+
+        bool TryReadLivePosition(long id, out int found)
+        {
+            if (_cachedRowIdPositions!.TryGetValue(id, out found)
+                && found >= 0
+                && found < RowIds.Count
+                && RowIds[found] == id)
+            {
+                return true;
+            }
+
+            found = -1;
+            return false;
+        }
+
+        void RebuildCache()
+        {
+            var positions = new Dictionary<long, int>(RowIds.Count);
+            for (var index = 0; index < RowIds.Count; index++)
+                positions.TryAdd(RowIds[index], index);
+            _cachedRowIdPositions = positions;
+            _cachedRowIdPositionsRevision = Rows.Revision;
+            _cachedRowIdPositionsCount = RowIds.Count;
+        }
+
+        void InvalidateCache()
+        {
+            _cachedRowIdPositions = null;
+            _cachedRowIdPositionsRevision = -1;
+            _cachedRowIdPositionsCount = -1;
+        }
     }
 
     internal IReadOnlyList<int> GetOrCreateIndexScanOrder(

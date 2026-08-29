@@ -155,6 +155,71 @@ public sealed class PlannerAccessPathDepthTests
     }
 
     [Test]
+    public void Stat4SampleValidationReusesOneRowIdMapPerTableRevision()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE cached_stats(id INTEGER PRIMARY KEY, bucket INTEGER, payload TEXT);");
+        Execute(connection, "CREATE INDEX cached_stats_bucket ON cached_stats(bucket);");
+        Execute(
+            connection,
+            "INSERT INTO cached_stats VALUES "
+            + string.Join(
+                ", ",
+                Enumerable.Range(1, 2_000).Select(value =>
+                    $"({value}, {value % 100}, 'p{value}')"))
+            + ";");
+        Execute(connection, "ANALYZE;");
+        var sampleCount = ReadScalar(
+            connection,
+            "SELECT count(*) FROM sqlite_stat4 WHERE idx='cached_stats_bucket';").AsInteger();
+        sampleCount.Should().Be(24);
+
+        database.ResetJoinOrderDiagnostics();
+        PlanDetail(connection, "SELECT id FROM cached_stats WHERE bucket=42;")
+            .Should().Contain("cached_stats_bucket");
+        PlanDetail(connection, "SELECT id FROM cached_stats WHERE bucket=42;")
+            .Should().Contain("cached_stats_bucket");
+        database.PlannerAccessPathMetrics.Stat4SampleRowIdLookups.Should().Be(sampleCount * 2);
+        database.PlannerAccessPathMetrics.Stat4RowIdCacheRebuilds.Should().Be(1);
+
+        Execute(connection, "UPDATE cached_stats SET payload='changed' WHERE id=1;");
+        database.ResetJoinOrderDiagnostics();
+        PlanDetail(connection, "SELECT id FROM cached_stats WHERE bucket=42;")
+            .Should().Contain("cached_stats_bucket");
+        database.PlannerAccessPathMetrics.Stat4SampleRowIdLookups.Should().Be(sampleCount);
+        database.PlannerAccessPathMetrics.Stat4RowIdCacheRebuilds.Should().Be(1);
+    }
+
+    [Test]
+    public void Stat4VectorDerivationScalesByRowsAndColumnsWithoutSampleMultiplier()
+    {
+        const int columnCount = 4;
+        const int smallRows = 500;
+        const int largeRows = 1_000;
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        CreateCompositeTable(connection, "small_stats", smallRows);
+        CreateCompositeTable(connection, "large_stats", largeRows);
+
+        database.ResetJoinOrderDiagnostics();
+        Execute(connection, "ANALYZE;");
+        var expectedComparisons = columnCount * ((smallRows - 1L) + (largeRows - 1L));
+        database.PlannerAccessPathMetrics.Stat4VectorComparisons.Should().Be(expectedComparisons);
+        database.PlannerAccessPathMetrics.Stat4RowIdSeedPasses.Should().Be(1);
+        database.PlannerAccessPathMetrics.Stat4RowIdSeedRowsVisited.Should().Be(0);
+        database.PlannerAccessPathMetrics.Stat4RowsWritten.Should().Be(48);
+        AssertDuplicateLeadingCompositeStat4Vectors(connection);
+
+        database.ResetJoinOrderDiagnostics();
+        Execute(connection, "ANALYZE;");
+        database.PlannerAccessPathMetrics.Stat4VectorComparisons.Should().Be(expectedComparisons);
+        database.PlannerAccessPathMetrics.Stat4RowIdSeedPasses.Should().Be(1);
+        database.PlannerAccessPathMetrics.Stat4RowIdSeedRowsVisited.Should().Be(48);
+        database.PlannerAccessPathMetrics.Stat4RowsWritten.Should().Be(48);
+    }
+
+    [Test]
     public void ProfitableInnerJoinBuildsOneAutomaticCoveringIndex()
     {
         using var database = new EmbeddedDatabase();
@@ -399,6 +464,44 @@ public sealed class PlannerAccessPathDepthTests
         => ReadRows(connection, "EXPLAIN " + sql)
             .Single(row => row[1].AsText() == "OpenReadCursor")[5]
             .AsText();
+
+    private static void CreateCompositeTable(
+        EmbeddedConnection connection,
+        string tableName,
+        int rowCount)
+    {
+        Execute(
+            connection,
+            $"CREATE TABLE {tableName}(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d INTEGER);");
+        Execute(connection, $"CREATE INDEX {tableName}_abcd ON {tableName}(a,b,c,d);");
+        Execute(
+            connection,
+            $"INSERT INTO {tableName} VALUES "
+            + string.Join(
+                ", ",
+                Enumerable.Range(1, rowCount).Select(value =>
+                    $"({value}, 1, 1, 1, {value})"))
+            + ";");
+    }
+
+    private static void AssertDuplicateLeadingCompositeStat4Vectors(EmbeddedConnection connection)
+    {
+        var rows = ReadRows(
+            connection,
+            "SELECT idx,neq,nlt,ndlt FROM sqlite_stat4 "
+            + "WHERE idx IN ('small_stats_abcd','large_stats_abcd');");
+        rows.Should().HaveCount(48);
+        foreach (var row in rows)
+        {
+            var sourceRows = row[0].AsText() == "small_stats_abcd" ? 500 : 1_000;
+            row[1].AsText().Should().Be($"{sourceRows} {sourceRows} {sourceRows} 1");
+            var less = row[2].AsText().Split(' ');
+            var distinctLess = row[3].AsText().Split(' ');
+            less.Should().HaveCount(4);
+            less.Take(3).Should().OnlyContain(value => value == "0");
+            distinctLess.Should().Equal(less);
+        }
+    }
 
     private static string PlanDetail(EmbeddedConnection connection, string sql)
         => PlanDetails(connection, sql).Single();
