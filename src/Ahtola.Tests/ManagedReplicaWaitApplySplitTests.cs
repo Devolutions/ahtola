@@ -350,4 +350,188 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             DeleteReplicaFiles(path);
         }
     }
+
+    [Test]
+    public async Task SyncAsyncCalledImmediatelyAfterAPriorSyncCompletesNeverJoinsItsAlreadyCompletedTask()
+    {
+        var path = NewReplicaPath("managed-replica-wait-split-reentrant-sync");
+        var image = CreateDatabaseImage(path + ".source");
+        var handler = new PullUpdatesHandler(
+        [
+            CreatePullResponse("revision-42", image),
+            CreatePullResponse("revision-42", [], declaredPages: 1),
+            CreatePullResponse("revision-43", CreateDatabaseImageWithMarker(path + ".updated", 7)),
+        ]);
+        var options = CreateOptions(path, handler);
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            var first = connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+
+            // Chained via ContinueWith rather than a sequential await: this schedules the second
+            // call to run as soon as `first` becomes observably complete -- exactly the
+            // reentrancy window ManagedReplicaSyncRegistry.Entry.CompleteSyncAsync's fix closes.
+            // Clearing _inFlightSync now happens-before completing first's TaskCompletionSource,
+            // so any continuation of `first` (including this one) is guaranteed to observe
+            // _inFlightSync already cleared and must start a brand-new sync rather than silently
+            // joining the first call's already-completed cached result.
+            var second = first
+                .ContinueWith(_ => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None))
+                .Unwrap();
+
+            var firstResult = await first.WaitAsync(TimeSpan.FromSeconds(5));
+            var secondResult = await second.WaitAsync(TimeSpan.FromSeconds(5));
+
+            firstResult.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            secondResult.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            // Bootstrap consumed the first queued response; each SyncAsync call above must have
+            // performed its own real network poll rather than the second one silently reusing the
+            // first's already-completed result, so exactly three /pull-updates calls were made.
+            handler.CallCount.Should().Be(3);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task DisposingTheLastHostWhileASyncIsWaitingForRemoteChangesDoesNotRetireTheEntry()
+    {
+        var path = NewReplicaPath("managed-replica-wait-split-dispose-during-wait");
+        var image = CreateDatabaseImage(path + ".source");
+        var handler = new BlockingPullUpdatesHandler(
+            CreatePullResponse("revision-42", image),
+            CreatePullResponse("revision-42", [], declaredPages: 1));
+        var options = CreateOptions(path, handler);
+        try
+        {
+            var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            var entryBeforeDispose = ManagedReplicaSyncRegistry.Acquire(path);
+            entryBeforeDispose.ReleaseReference();
+
+            var sync = connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            await handler.SyncStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // The sync's pull-updates request is now blocked inside the network long-poll, which
+            // -- per the wait/apply split -- runs without holding the per-path publication gate.
+            // Disposing the only host registered for this path while that wait is still in flight
+            // must not let RetireIfUnusedNoLock remove the coordinating Entry from the registry: a
+            // subsequently opened host for the same path would otherwise get a brand-new,
+            // unrelated Entry with no in-process coordination against this orphaned sync's still-
+            // pending apply.
+            connection.Dispose();
+
+            var entryAfterDispose = ManagedReplicaSyncRegistry.Acquire(path);
+            try
+            {
+                entryAfterDispose.Should().BeSameAs(entryBeforeDispose);
+            }
+            finally
+            {
+                entryAfterDispose.ReleaseReference();
+            }
+
+            handler.Release();
+            var result = await sync.WaitAsync(TimeSpan.FromSeconds(5));
+            result.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+
+            // The orphaned sync's apply (a no-op here, since the response carried no changes)
+            // still completed successfully with no host left registered to observe it. A fresh
+            // connection afterward must see correct, undamaged data, proving the pinned Entry was
+            // reused correctly and released cleanly once the sync actually finished.
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            reopened.Open();
+            ReadBootstrapMarker(reopened).Should().Be(42);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task PreparePushReadsTheMaterializationLeaseFreshAfterAConcurrentHostsPublicationDisposesIt()
+    {
+        var path = NewReplicaPath("managed-replica-wait-split-materializer-turnover");
+        var databaseImage = CreateDatabaseImage(path + ".source");
+        var handler = new LazyPagePullHandler("revision-prefix", databaseImage);
+        var options = CreateOptions(
+            path,
+            handler,
+            partialBootstrap: AhtolaPartialBootstrapOptions.Prefix(4096));
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                ReadBootstrapMarker(connection).Should().Be(42);
+            }
+
+            // Both hosts open onto the still-partial replica: each attaches its own reference-
+            // counted Lease onto the SAME underlying ManagedReplicaPageMaterializingFileSystem
+            // (see ManagedReplicaPageMaterializationRegistry.Acquire).
+            using var connectionA = AhtolaConnection.CreateReplica(options);
+            using var connectionB = AhtolaConnection.CreateReplica(options);
+            connectionA.Open();
+            connectionB.Open();
+
+            var paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var pausedOnce = 0;
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+                   {
+                       if (boundary != ManagedReplicaDurableBoundary.ReplicaPublicationOwnershipAcquired
+                           || Interlocked.Exchange(ref pausedOnce, 1) != 0)
+                       {
+                           return;
+                       }
+
+                       paused.TrySetResult();
+                       release.Task.GetAwaiter().GetResult();
+                   }))
+            {
+                // Host B's own sync acquires the publication gate first and pauses there --
+                // still holding it -- immediately before it would complete the partial image
+                // (deleting the sidecar) and reopen every registered host, including host A.
+                var syncB = Task.Run(
+                    () => connectionB.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                await paused.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+                // Host A's own sync now queues behind host B's held gate. With the fix, host A's
+                // gated PreparePushAndPartialReplicaAsync has not run yet -- and will not until
+                // host B's publication (and its reopen pass across every host) has fully
+                // completed -- so it has not read _materializationLease at all yet.
+                var syncA = connectionA.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+                await Task.Delay(TimeSpan.FromMilliseconds(250));
+                syncA.IsCompleted.Should().BeFalse();
+
+                release.TrySetResult();
+                var resultB = await syncB.WaitAsync(TimeSpan.FromSeconds(5));
+                resultB.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+
+                // Host B's publication has now completed the partial image and reopened every
+                // host, including host A, which disposed host A's OWN retained lease (the
+                // sidecar is gone). Host A's own gated PreparePushAndPartialReplicaAsync runs
+                // next and must read _materializationLease fresh -- now null -- rather than
+                // reuse whatever it captured before it ever requested the gate; the old,
+                // reverted ordering would hand a disposed ManagedReplicaPageMaterializingFileSystem
+                // to PushLocalChangesAsync/CompletePartialReplicaAsync here and throw
+                // ObjectDisposedException.
+                var resultA = await syncA.WaitAsync(TimeSpan.FromSeconds(5));
+                resultA.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+            }
+
+            File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
 }
