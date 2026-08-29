@@ -508,7 +508,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                                     options,
                                     metadata,
                                     allowTrackedLocalMutations: false,
-                                    retainedMaterializer: null,
+                                    retainedMaterializer: hostB.RetainedMaterializerForTesting,
                                     token)
                                 .ConfigureAwait(false);
                         },
@@ -522,6 +522,9 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 var syncA = hostA.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
                 await Task.Delay(TimeSpan.FromMilliseconds(250));
                 syncA.IsCompleted.Should().BeFalse();
+                hostA.RetainedMaterializerReadsForTesting.Should().Be(
+                    0,
+                    "the queued sync must not capture publication-owned state before it acquires the gate");
 
                 release.TrySetResult();
                 await publicationB.WaitAsync(TimeSpan.FromSeconds(5));
@@ -536,6 +539,9 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 // ObjectDisposedException.
                 var resultA = await syncA.WaitAsync(TimeSpan.FromSeconds(5));
                 resultA.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+                hostA.RetainedMaterializerReadsForTesting.Should().Be(
+                    1,
+                    "the retained materializer is read exactly once inside host A's gated preparation");
             }
 
             File.Exists(path + ManagedReplicaPageMaterializingFileSystem.StateSuffix).Should().BeFalse();

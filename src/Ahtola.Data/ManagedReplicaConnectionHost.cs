@@ -27,6 +27,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     private IDisposable? _sqlTransactionOperation;
     private bool _sqlTransactionBeginPending;
     private bool _sqlTransactionCompletionPending;
+    private long _retainedMaterializerReadsForTesting;
 
     private ManagedReplicaConnectionHost(
         IManagedDatabaseAdapter database,
@@ -58,6 +59,12 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     }
 
     public bool SupportsSync => _metadata is not null;
+
+    internal long RetainedMaterializerReadsForTesting
+        => Interlocked.Read(ref _retainedMaterializerReadsForTesting);
+
+    internal ManagedReplicaPageMaterializingFileSystem? RetainedMaterializerForTesting
+        => _materializationLease?.FileSystem;
 
     public IDisposable EnterLocalOperation(CancellationToken cancellationToken)
         => _syncEntry.EnterLocalOperation(cancellationToken);
@@ -786,7 +793,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     {
         var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0
             || _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark).Count != 0;
-        var retainedMaterializer = _materializationLease?.FileSystem;
+        var retainedMaterializer = ReadRetainedMaterializer();
 
         var push = await PushLocalChangesAsync(
                 replicaOptions,
@@ -807,6 +814,12 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             .ConfigureAwait(false);
 
         return (metadata, push.ChangeCount);
+    }
+
+    private ManagedReplicaPageMaterializingFileSystem? ReadRetainedMaterializer()
+    {
+        Interlocked.Increment(ref _retainedMaterializerReadsForTesting);
+        return _materializationLease?.FileSystem;
     }
 
     public void Dispose()
@@ -956,6 +969,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                     _options.Path,
                     retainedLease!.FileSystem,
                     readOnly: false);
+                _ = database.Connect();
                 materializationLease = retainedLease;
             }
             else
