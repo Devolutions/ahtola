@@ -57,6 +57,59 @@ public sealed class WindowFunctionSemanticsTests
             """);
     }
 
+    [Test]
+    public void DefaultRangeCumulativeAggregatesScaleAcrossUniquePeers()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        using var statement = connection.Prepare(
+            """
+            SELECT value,
+                   sum(value) OVER (ORDER BY value),
+                   min(value) OVER (ORDER BY value),
+                   count(*) OVER (ORDER BY value)
+            FROM generate_series(1, 10000);
+            """);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        var rowCount = 0;
+        SqlValue[]? last = null;
+        while (statement.Step(timeout.Token) == StatementStepResult.Row)
+        {
+            last = Enumerable.Range(0, statement.GetColumnCount())
+                .Select(statement.GetValue)
+                .ToArray();
+            rowCount++;
+        }
+
+        rowCount.Should().Be(10000);
+        last.Should().Equal(
+            SqlValue.Integer(10000),
+            SqlValue.Integer(50005000),
+            SqlValue.Integer(1),
+            SqlValue.Integer(10000));
+    }
+
+    [Test]
+    public void CumulativeAndExplicitFramesPreserveDeclaredArgumentCollation()
+    {
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE collated(id INTEGER, value TEXT COLLATE NOCASE);",
+                "INSERT INTO collated VALUES (1, 'Banana'), (2, 'apple'), (3, 'Cherry');",
+            ],
+            """
+            SELECT id,
+                   min(value) OVER (ORDER BY id),
+                   min(value) OVER (
+                       ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                   max(value) OVER (ORDER BY id),
+                   max(value) OVER (
+                       ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            FROM collated
+            ORDER BY id;
+            """);
+    }
+
     [TestCase(
         "sum(value) OVER (PARTITION BY grp ORDER BY ord NULLS FIRST "
         + "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW)")]

@@ -39357,6 +39357,100 @@ out bool hasReturning)
 
     private readonly record struct WindowFunctionInput(bool Included, SqlValue[] Arguments);
 
+    private enum CumulativeWindowAggregateKind
+    {
+        Count,
+        Sum,
+        Total,
+        Average,
+        Minimum,
+        Maximum,
+    }
+
+    private sealed class CumulativeWindowAggregate
+    {
+        private readonly EmbeddedDatabase _database;
+        private readonly CumulativeWindowAggregateKind _kind;
+        private readonly NumericAggregateAccumulator? _numeric;
+        private readonly string? _collation;
+        private long _count;
+        private SqlValue _extreme = SqlValue.Null;
+
+        public CumulativeWindowAggregate(
+            EmbeddedDatabase database,
+            CumulativeWindowAggregateKind kind,
+            string? collation)
+        {
+            _database = database;
+            _kind = kind;
+            _collation = collation;
+            _numeric = kind switch
+            {
+                CumulativeWindowAggregateKind.Sum => new NumericAggregateAccumulator(
+                    forceReal: false,
+                    average: false),
+                CumulativeWindowAggregateKind.Total => new NumericAggregateAccumulator(
+                    forceReal: true,
+                    average: false),
+                CumulativeWindowAggregateKind.Average => new NumericAggregateAccumulator(
+                    forceReal: true,
+                    average: true),
+                _ => null,
+            };
+        }
+
+        public void Accumulate(WindowFunctionInput input)
+        {
+            if (!input.Included)
+                return;
+
+            switch (_kind)
+            {
+                case CumulativeWindowAggregateKind.Count:
+                    if (input.Arguments.Length == 0 || input.Arguments[0].Kind != SqlValueKind.Null)
+                        _count++;
+                    return;
+                case CumulativeWindowAggregateKind.Sum:
+                case CumulativeWindowAggregateKind.Total:
+                case CumulativeWindowAggregateKind.Average:
+                    _numeric!.Accumulate(input.Arguments[0]);
+                    return;
+                case CumulativeWindowAggregateKind.Minimum:
+                case CumulativeWindowAggregateKind.Maximum:
+                    var value = input.Arguments[0];
+                    if (value.Kind == SqlValueKind.Null)
+                        return;
+                    if (_extreme.Kind == SqlValueKind.Null
+                        || (_kind == CumulativeWindowAggregateKind.Maximum
+                            ? _database.Compare(value, _extreme, _collation) > 0
+                            : _database.Compare(value, _extreme, _collation) < 0))
+                    {
+                        _extreme = value;
+                    }
+
+                    return;
+                default:
+                    throw new InvalidOperationException(
+                        $"Unsupported cumulative window aggregate {_kind}.");
+            }
+        }
+
+        public SqlValue GetValue()
+        {
+            return _kind switch
+            {
+                CumulativeWindowAggregateKind.Count => SqlValue.Integer(_count),
+                CumulativeWindowAggregateKind.Sum
+                    or CumulativeWindowAggregateKind.Total
+                    or CumulativeWindowAggregateKind.Average => _numeric!.Finalize(),
+                CumulativeWindowAggregateKind.Minimum
+                    or CumulativeWindowAggregateKind.Maximum => _extreme,
+                _ => throw new InvalidOperationException(
+                    $"Unsupported cumulative window aggregate {_kind}."),
+            };
+        }
+    }
+
     private sealed record WindowPeerInfo(
         int[] Starts,
         int[] Ends,
@@ -39500,6 +39594,15 @@ out bool hasReturning)
             // group therefore sees the same frame, so intrinsic aggregate results can be reused
             // without changing user-defined aggregate callback timing.
             var sharePeerAggregateFrames = CanShareAggregateFrameAcrossPeers(spec);
+            var cumulativeAggregates =
+                CreateCumulativeWindowAggregates(functions, context, sharePeerAggregateFrames);
+            var directEvaluationNeedsFrame = functions.Any(function =>
+                !cumulativeAggregates.ContainsKey(function)
+                && WindowFunctionUsesFrame(function));
+            var cumulativeThrough = cumulativeAggregates.Keys.ToDictionary(
+                function => function,
+                _ => -1);
+            var cumulativeValues = new Dictionary<FunctionExpression, SqlValue>();
             IReadOnlyList<int>? sharedFramePositions = null;
             Dictionary<FunctionExpression, SqlValue>? sharedAggregateValues = null;
             var sharedPeerGroupStart = -1;
@@ -39516,7 +39619,7 @@ out bool hasReturning)
                     && sharedPeerGroupStart != peers.Starts[position];
                 if (startsNewSharedPeerGroup)
                 {
-                    sharedFramePositions = needsFrame
+                    sharedFramePositions = directEvaluationNeedsFrame
                         ? ResolveWindowFramePositions(
                             spec,
                             entries,
@@ -39530,7 +39633,7 @@ out bool hasReturning)
 
                 var framePositions = sharePeerAggregateFrames
                     ? sharedFramePositions!
-                    : needsFrame
+                    : directEvaluationNeedsFrame
                         ? ResolveWindowFramePositions(
                             spec,
                             entries,
@@ -39540,6 +39643,29 @@ out bool hasReturning)
                         : [];
                 foreach (var function in functions)
                 {
+                    if (cumulativeAggregates.TryGetValue(function, out var cumulative))
+                    {
+                        if (startsNewSharedPeerGroup)
+                        {
+                            var end = peers.Ends[position];
+                            for (var candidate = cumulativeThrough[function] + 1;
+                                 candidate <= end;
+                                 candidate++)
+                            {
+                                context.CheckInterrupt();
+                                cumulative.Accumulate(
+                                    inputs[function][entries[candidate].SourceIndex]);
+                            }
+
+                            cumulativeThrough[function] = end;
+                            cumulativeValues[function] = cumulative.GetValue();
+                        }
+
+                        results[function][entries[position].SourceIndex] =
+                            cumulativeValues[function];
+                        continue;
+                    }
+
                     if (sharePeerAggregateFrames && IsIntrinsicAggregateWindowFunction(function))
                     {
                         if (startsNewSharedPeerGroup)
@@ -39575,6 +39701,54 @@ out bool hasReturning)
         }
 
         return results;
+    }
+
+    private Dictionary<FunctionExpression, CumulativeWindowAggregate>
+        CreateCumulativeWindowAggregates(
+            IReadOnlyList<FunctionExpression> functions,
+            QueryContext context,
+            bool sharePeerAggregateFrames)
+    {
+        var aggregates = new Dictionary<FunctionExpression, CumulativeWindowAggregate>();
+        if (!sharePeerAggregateFrames)
+            return aggregates;
+
+        foreach (var function in functions)
+        {
+            if (function.Distinct
+                || function.OrderedSet
+                || function.AggregateOrderBy is { Count: > 0 })
+            {
+                continue;
+            }
+
+            var kind = function.Name.ToUpperInvariant() switch
+            {
+                "COUNT" when function.CountStar || function.Arguments.Count is 0 or 1
+                    => CumulativeWindowAggregateKind.Count,
+                "SUM" when function.Arguments.Count == 1
+                    => CumulativeWindowAggregateKind.Sum,
+                "TOTAL" when function.Arguments.Count == 1
+                    => CumulativeWindowAggregateKind.Total,
+                "AVG" when function.Arguments.Count == 1
+                    => CumulativeWindowAggregateKind.Average,
+                "MIN" when function.Arguments.Count == 1
+                    => CumulativeWindowAggregateKind.Minimum,
+                "MAX" when function.Arguments.Count == 1
+                    => CumulativeWindowAggregateKind.Maximum,
+                _ => (CumulativeWindowAggregateKind?)null,
+            };
+            if (kind is null)
+                continue;
+
+            var collation = kind is CumulativeWindowAggregateKind.Minimum
+                or CumulativeWindowAggregateKind.Maximum
+                    ? GetEffectiveCollation(function.Arguments[0], context)
+                    : null;
+            aggregates.Add(function, new CumulativeWindowAggregate(this, kind.Value, collation));
+        }
+
+        return aggregates;
     }
 
     private static bool CanShareAggregateFrameAcrossPeers(WindowSpecification specification)
@@ -40037,7 +40211,8 @@ out bool hasReturning)
         var preparedArguments = function.Arguments
             .Select((argument, index) => RewritePreparedWindowArgument(
                 argument,
-                new ColumnExpression(argumentNames[index])))
+                new ColumnExpression(argumentNames[index]),
+                context))
             .ToArray();
         return EvaluateAggregateFunction(
             function with
@@ -40051,12 +40226,16 @@ out bool hasReturning)
             context);
     }
 
-    private static Expression RewritePreparedWindowArgument(
+    private Expression RewritePreparedWindowArgument(
         Expression original,
-        ColumnExpression prepared)
-        => original is CollationExpression collation
-            ? collation with { Expression = prepared }
-            : prepared;
+        ColumnExpression prepared,
+        QueryContext context)
+    {
+        var collation = GetEffectiveCollation(original, context);
+        return collation is null
+            ? prepared
+            : new CollationExpression(prepared, collation);
+    }
 
     private static long ComputeNtile(int position, int count, long buckets)
     {
