@@ -72,6 +72,28 @@ public class ManagedJsonConstructionMutationSliceTests
     }
 
     [Test]
+    public void DefaultFixtureJsonEdgeCasesMatchTurso()
+    {
+        AssertNull("json_extract()");
+        AssertInteger("json_extract('{\"a\":1}', '$.\"\\x61\"')", 1);
+        AssertText("'{\"1.5\":\"abc\"}' -> 1.5", "\"abc\"");
+        AssertInteger("json_extract('[1,2,3]', '$[4294967297]')", 2);
+        AssertText("json_type(x'7B2261223A317D00FF')", "object");
+        AssertInteger("json_error_position('{\"a\":55,\"b\":72,}')", 0);
+        AssertInteger(
+            "json_error_position('{a:null,{\"h\":[1,[1,2,3]],\"j\":\"abc\"}:true}')",
+            9);
+        AssertText("json_set(X'45312e652b', '$.x', 3)", "1.e+");
+        AssertNull("json_remove(x'8BC7C8000000000000', '$[0]')");
+        AssertText(
+            "json(jsonb('{\"hex_value\": \"\\x68\\x65\\x6c\\x6c\\x6f\"}'))",
+            "{\"hex_value\":\"\\u0068\\u0065\\u006c\\u006c\\u006f\"}");
+        AssertText(
+            "json(jsonb('{\"mixed\":\"\\x61\u0001\"}'))",
+            "{\"mixed\":\"\\u0061\\u0001\"}");
+    }
+
+    [Test]
     public void CoreJsonSubsetPreservesNullPathAndReturnTypeSemantics()
     {
         AssertInteger("json_array_length('[1,2,3]')", 3);

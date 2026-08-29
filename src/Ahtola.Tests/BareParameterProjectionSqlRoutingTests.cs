@@ -50,7 +50,7 @@ public class BareParameterProjectionSqlRoutingTests
     }
 
     [Test]
-    public void ComputedProjectionFallsBackAndPreservesFirstProjectionError()
+    public void ComputedProjectionValidationResolvesFunctionsBeforeEvaluation()
     {
         using var connection = new EmbeddedDatabase().Connect();
         const string query = "SELECT abs(-9223372036854775808), no_such_function();";
@@ -60,7 +60,7 @@ public class BareParameterProjectionSqlRoutingTests
 
         using var statement = connection.Prepare(query);
         Assert.Throws<EmbeddedSqlException>(() => statement.Step())!
-            .Message.Should().Be("integer overflow");
+            .Message.Should().Be("no such function: NO_SUCH_FUNCTION");
     }
 
     private static (string[] Columns, List<SqlValue[]> Rows) RunManaged(

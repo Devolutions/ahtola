@@ -44,7 +44,7 @@ public sealed partial class EmbeddedDatabase
             return SqlValue.Null;
 
         var isBlob = arguments[0].Kind == SqlValueKind.Blob;
-        var text = isBlob ? null : ToSqlText(arguments[0]);
+        var text = isBlob ? null : SqliteTextPrefix(ToSqlText(arguments[0]));
         var length = isBlob ? arguments[0].AsBlob().Length : text!.EnumerateRunes().LongCount();
         var start = ToSqliteInteger(arguments[1]);
         var hasExplicitLength = arguments.Count == 3;
@@ -106,7 +106,7 @@ public sealed partial class EmbeddedDatabase
 
         var source = ToSqlText(arguments[0]);
         var pattern = ToSqlText(arguments[1]);
-        if (pattern.Length == 0)
+        if (pattern.Length == 0 || pattern[0] == '\0')
             return SqlValue.Text(source);
 
         return SqlValue.Text(source.Replace(pattern, ToSqlText(arguments[2]), StringComparison.Ordinal));
@@ -457,7 +457,7 @@ public sealed partial class EmbeddedDatabase
             SqlValueKind.Integer => SqlValue.Text(value.AsInteger().ToString(CultureInfo.InvariantCulture)),
             SqlValueKind.Real => SqlValue.Text(FormatQuotedReal(value.AsReal())),
             SqlValueKind.Blob => SqlValue.Text($"X'{Convert.ToHexString(value.AsBlob().Span)}'"),
-            _ => SqlValue.Text($"'{value.AsText().Replace("'", "''", StringComparison.Ordinal)}'"),
+            _ => SqlValue.Text($"'{SqliteTextPrefix(value.AsText()).Replace("'", "''", StringComparison.Ordinal)}'"),
         };
     }
 
@@ -469,8 +469,42 @@ public sealed partial class EmbeddedDatabase
             return "9.0e+999";
         if (double.IsNegativeInfinity(value))
             return "-9.0e+999";
+        if (value == 0)
+            return "0.0";
 
-        return value.ToString("R", CultureInfo.InvariantCulture);
+        var negative = double.IsNegative(value);
+        var magnitude = Math.Abs(value);
+        var compact = FormatPrintfGeneral(magnitude, 15, upperCase: false);
+        var compactExponentIndex = compact.IndexOfAny(['e', 'E']);
+        if (compactExponentIndex < 0)
+        {
+            if (!compact.Contains('.'))
+                compact += ".0";
+        }
+        else if (!compact.AsSpan(0, compactExponentIndex).Contains('.'))
+        {
+            compact = compact.Insert(compactExponentIndex, ".0");
+        }
+        if (negative)
+            compact = "-" + compact;
+
+        if (double.TryParse(compact, NumberStyles.Float, CultureInfo.InvariantCulture, out var roundTrip)
+            && roundTrip.Equals(value))
+        {
+            return compact;
+        }
+
+        var scientific = magnitude.ToString("e18", CultureInfo.InvariantCulture);
+        var exponentIndex = scientific.IndexOf('e');
+        var mantissa = scientific[..exponentIndex].TrimEnd('0');
+        if (mantissa.EndsWith('.'))
+            mantissa += "0";
+        var exponent = int.Parse(scientific[(exponentIndex + 1)..], CultureInfo.InvariantCulture);
+        var sign = exponent < 0 ? '-' : '+';
+        var exponentDigits = Math.Abs(exponent).ToString(
+            Math.Abs(exponent) > 99 ? "D3" : "D2",
+            CultureInfo.InvariantCulture);
+        return string.Concat(negative ? "-" : string.Empty, mantissa, "e", sign, exponentDigits);
     }
 
     private static SqlValue EvaluateChar(IReadOnlyList<SqlValue> arguments)
@@ -513,7 +547,7 @@ public sealed partial class EmbeddedDatabase
         if (arguments[0].Kind == SqlValueKind.Null)
             return SqlValue.Null;
 
-        var text = ToSqlText(arguments[0]);
+        var text = SqliteTextPrefix(ToSqlText(arguments[0]));
         if (text.Length == 0)
             return SqlValue.Null;
 
@@ -648,7 +682,7 @@ public sealed partial class EmbeddedDatabase
 
     private static SqlValue EvaluateConcatWithSeparator(IReadOnlyList<SqlValue> arguments)
     {
-        if (arguments.Count == 0)
+        if (arguments.Count < 2)
             throw new EmbeddedSqlException("wrong number of arguments to function concat_ws()");
         if (arguments[0].Kind == SqlValueKind.Null)
             return SqlValue.Null;

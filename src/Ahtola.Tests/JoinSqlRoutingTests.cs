@@ -381,6 +381,42 @@ public class JoinSqlRoutingTests
     }
 
     [Test]
+    public void MultiTableUsingAndNaturalJoinsShareCoalescedHashKeys()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE a(id INTEGER, av TEXT);");
+        Execute(connection, "CREATE TABLE b(id INTEGER, bv TEXT);");
+        Execute(connection, "CREATE TABLE c(id INTEGER, cv TEXT);");
+        Execute(connection, "INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3');");
+        Execute(connection, "INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (4, 'b4');");
+        Execute(connection, "INSERT INTO c VALUES (1, 'c1'), (2, 'c2'), (5, 'c5');");
+
+        var usingRows = ReadRows(
+            connection,
+            "SELECT a.av, b.bv, c.cv FROM a JOIN b USING(id) JOIN c USING(id);");
+        usingRows.Should().HaveCount(2);
+        usingRows[0].Should().Equal(SqlValue.Text("a1"), SqlValue.Text("b1"), SqlValue.Text("c1"));
+        usingRows[1].Should().Equal(SqlValue.Text("a2"), SqlValue.Text("b2"), SqlValue.Text("c2"));
+        ReadRows(connection, "SELECT a.av, b.bv, c.cv FROM a NATURAL JOIN b NATURAL JOIN c;")
+            .Should().HaveCount(2);
+    }
+
+    [Test]
+    public void ConstantFalseInnerJoinShortCircuitsAnOuterJoinInput()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE a(id INTEGER);");
+        Execute(connection, "CREATE TABLE b(id INTEGER);");
+        Execute(connection, "CREATE TABLE c(id INTEGER);");
+        Execute(connection, "INSERT INTO a VALUES (1), (2);");
+        Execute(connection, "INSERT INTO b VALUES (1), (2);");
+        Execute(connection, "INSERT INTO c VALUES (1), (2);");
+
+        ReadRows(connection, "SELECT * FROM a LEFT JOIN b ON 1 JOIN c ON 0;")
+            .Should().BeEmpty();
+    }
+
+    [Test]
     public void ThreeTableJoinRoutesThroughMaterializingJoinCursor()
     {
         using var connection = new EmbeddedDatabase().Connect();

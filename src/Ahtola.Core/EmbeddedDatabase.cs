@@ -594,7 +594,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         Func<SqlValue, IReadOnlyList<SqlValue>, SqlValue> Step,
         Func<SqlValue, SqlValue> Finalize);
 
-    private sealed record GroupedResult(SourceRow Representative, IReadOnlyList<SourceRow> Rows, SqlValue[] Values);
+    private sealed record GroupedResult(
+        SourceRow Representative,
+        IReadOnlyList<SourceRow> Rows,
+        SqlValue[] GroupKey,
+        SqlValue[] Values);
 
     private sealed record OrderByKeyed<T>(T Item, SqlValue[] Keys, int Position);
 
@@ -690,7 +694,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyDictionary<string, VirtualTableDefinition>? VirtualTables = null,
         ChangeDataCaptureSession? ChangeDataCapture = null,
         VdbeExecutionOptions? VdbeExecutionOptions = null,
-        CteMutationState? CteMutationState = null)
+        CteMutationState? CteMutationState = null,
+        EmbeddedDatabase? Database = null)
     {
         /// <summary>
         /// Per-statement cache of opened managed index-method scan state. Derived contexts created
@@ -2367,7 +2372,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool foreignKeysEnabled,
         bool recursiveTriggersEnabled,
         CancellationToken cancellationToken,
-        VdbeExecutionOptions? vdbeExecutionOptions = null)
+        VdbeExecutionOptions? vdbeExecutionOptions = null,
+        Func<string?, string?, ExecutionResult>? executeTableList = null,
+        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null)
     {
         lock (_gate)
         {
@@ -2379,7 +2386,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 foreignKeysEnabled,
                 recursiveTriggersEnabled,
                 cancellationToken,
-                vdbeExecutionOptions);
+                vdbeExecutionOptions,
+                executeTableList,
+                externalTables);
         }
     }
 
@@ -2391,10 +2400,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool foreignKeysEnabled,
         bool recursiveTriggersEnabled,
         CancellationToken cancellationToken,
-        VdbeExecutionOptions? vdbeExecutionOptions = null)
+        VdbeExecutionOptions? vdbeExecutionOptions = null,
+        Func<string?, string?, ExecutionResult>? executeTableList = null,
+        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null)
     {
+        var tables = CreateExecutionTables(catalog.Tables, externalTables);
         var context = new QueryContext(
-            catalog.Tables,
+            tables,
             new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
             catalog.Views,
             catalog.Triggers,
@@ -2402,7 +2414,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ForeignKeysEnabled: foreignKeysEnabled,
             RecursiveTriggersEnabled: recursiveTriggersEnabled,
             CancellationToken: cancellationToken,
-            VdbeExecutionOptions: vdbeExecutionOptions);
+            ExecuteTableList: executeTableList,
+            VirtualTables: catalog.VirtualTables,
+            VdbeExecutionOptions: vdbeExecutionOptions,
+            Database: this);
         var result = MaterializeQueryResult(ExecuteQuery(statement, parameters, context, outerRow: null));
         var affinities = DescribeQueryAffinities(
             statement,
@@ -4220,7 +4235,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             VdbeExecutionOptions: vdbeExecutionOptions,
             CteMutationState: statement is QueryStatement && statementMayMutate
                 ? new CteMutationState()
-                : null);
+                : null,
+            Database: this);
         EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
         var result = statement switch
         {
@@ -4320,6 +4336,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
         {
+            if (TryDescribeSchemaTable(statement.TableName, includeHidden: false, out var schemaRows))
+            {
+                return new ExecutionResult(
+                    ["cid", "name", "type", "notnull", "dflt_value", "pk"],
+                    schemaRows,
+                    0);
+            }
             if (TryGetView(context, statement.TableName, out var infoView))
             {
                 return new ExecutionResult(
@@ -4347,6 +4370,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
         {
+            if (TryDescribeSchemaTable(statement.TableName, includeHidden: true, out var schemaRows))
+            {
+                return new ExecutionResult(
+                    ["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"],
+                    schemaRows,
+                    0);
+            }
             if (TryGetView(context, statement.TableName, out var xinfoView))
             {
                 return new ExecutionResult(
@@ -5086,6 +5116,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
         switch (expression)
         {
             case FunctionExpression function:
+                if (SqliteBuiltinFunctions.Contains(function.Name)
+                    && !SqliteBuiltinFunctions.AcceptsCall(
+                        function.Name,
+                        function.Arguments.Count,
+                        function.CountStar))
+                {
+                    throw new EmbeddedSqlException(
+                        $"wrong number of arguments to function {function.Name.ToLowerInvariant()}()");
+                }
                 if (!SqliteBuiltinFunctions.Contains(function.Name)
                     && !_scalarFunctions.ContainsKey((function.Name, function.Arguments.Count))
                     && !_scalarFunctions.ContainsKey((function.Name, -1)))
@@ -8016,29 +8055,51 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     groupByScope);
                 return;
             case JoinTableSource join:
-                ValidateTableSourceSchema(
-                    join.Left,
-                    context,
-                    outerRow,
-                    cancellationToken,
-                    groupByScope);
-                // Table-valued function arguments on the right side of a join may reference the
-                // preceding source (for example json_each(json_array(t.c))). Validate the right
-                // source against that left-side schema just as execution evaluates it per left row.
-                var leftColumns = GetSourceColumns(join.Left, context);
-                var leftOutputColumns = GetOutputColumns(join.Left, context);
-                var leftRow = CreateQuerySchemaValidationRow(
-                    join.Left,
-                    context,
-                    leftColumns,
-                    leftOutputColumns,
-                    outerRow);
-                ValidateTableSourceSchema(
-                    join.Right,
-                    context,
-                    leftRow,
-                    cancellationToken,
-                    groupByScope);
+                if (IsReverseCorrelatedTableFunctionJoin(join, context))
+                {
+                    ValidateTableSourceSchema(
+                        join.Right,
+                        context,
+                        outerRow,
+                        cancellationToken,
+                        groupByScope);
+                    var rightRow = CreateQuerySchemaValidationRow(
+                        join.Right,
+                        context,
+                        GetSourceColumns(join.Right, context),
+                        GetOutputColumns(join.Right, context),
+                        outerRow);
+                    ValidateTableSourceSchema(
+                        join.Left,
+                        context,
+                        rightRow,
+                        cancellationToken,
+                        groupByScope);
+                }
+                else
+                {
+                    ValidateTableSourceSchema(
+                        join.Left,
+                        context,
+                        outerRow,
+                        cancellationToken,
+                        groupByScope);
+                    // Table-valued function arguments on the right side of a join may reference the
+                    // preceding source (for example json_each(json_array(t.c))). Validate the right
+                    // source against that left-side schema just as execution evaluates it per left row.
+                    var leftRow = CreateQuerySchemaValidationRow(
+                        join.Left,
+                        context,
+                        GetSourceColumns(join.Left, context),
+                        GetOutputColumns(join.Left, context),
+                        outerRow);
+                    ValidateTableSourceSchema(
+                        join.Right,
+                        context,
+                        leftRow,
+                        cancellationToken,
+                        groupByScope);
+                }
                 var columns = GetSourceColumns(join, context);
                 var outputColumns = GetOutputColumns(join, context);
                 // Reuse the query validation row so qualified rowid references on real
@@ -8100,6 +8161,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     return;
                 }
             case FunctionExpression function:
+                ValidateFunctionResolution(function);
+                if (function.Window is null && IsAggregateFunctionCall(function))
+                {
+                    foreach (var argument in function.Arguments)
+                    {
+                        if (FindAggregateFunction(argument) is { } nested)
+                        {
+                            throw new EmbeddedSqlException(
+                                $"misuse of aggregate function {nested.Name.ToUpperInvariant()}()");
+                        }
+                    }
+                }
                 foreach (var argument in function.Arguments)
                     ValidateExpressionSchema(argument, row, context, cancellationToken, groupByScope);
                 ValidateExpressionSchema(
@@ -19556,6 +19629,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     ContainsAggregate(term.Expression),
                     role: "order"))
                 .ToArray();
+            var orderedGroupKeyIndexes = ResolveOrderedGroupKeyIndexes(
+                select.GroupBy,
+                resolvedOrderBy);
             VdbeRowComparer outputOrderComparer = (left, right) =>
             {
                 context.CheckInterrupt();
@@ -19571,14 +19647,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         return comparison;
                 }
 
-                // ORDER BY ties (and statements without ORDER BY) fall back to
-                // ascending group-key order, the order SQLite's aggregation sorter emits.
-                return CompareGroupKeysForOrdering(
+                return CompareGroupKeyTieBreak(
                     left,
                     right,
                     select.GroupBy.Count,
                     groupCollations,
-                    offset: resolvedOrderBy.Count);
+                    orderedGroupKeyIndexes,
+                    resolvedOrderBy.Count,
+                    resolvedOrderBy.Count > 0 && resolvedOrderBy[0].Descending);
             };
 
             program = AggregateProgramBuilder.BuildRowGrouped(
@@ -19919,6 +19995,51 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (left.Kind == SqlValueKind.Null || right.Kind == SqlValueKind.Null)
             return left.Kind == right.Kind ? 0 : left.Kind == SqlValueKind.Null ? -1 : 1;
         return Compare(left, right, collation);
+    }
+
+    private static HashSet<int> ResolveOrderedGroupKeyIndexes(
+        IReadOnlyList<Expression> groupBy,
+        IReadOnlyList<OrderByTerm> orderBy)
+    {
+        var result = new HashSet<int>();
+        for (var groupIndex = 0; groupIndex < groupBy.Count; groupIndex++)
+        {
+            if (orderBy.Any(term =>
+                    IndexExpressionSemantics.ExpressionsEqual(
+                        groupBy[groupIndex],
+                        term.Expression)))
+            {
+                result.Add(groupIndex);
+            }
+        }
+
+        return result;
+    }
+
+    private int CompareGroupKeyTieBreak(
+        IReadOnlyList<SqlValue> left,
+        IReadOnlyList<SqlValue> right,
+        int count,
+        IReadOnlyList<string?> collations,
+        IReadOnlySet<int> orderedGroupKeyIndexes,
+        int offset,
+        bool reverseWhenNoGroupKeyIsExplicitlyOrdered)
+    {
+        var reverse = orderedGroupKeyIndexes.Count == 0 && reverseWhenNoGroupKeyIsExplicitlyOrdered;
+        for (var index = 0; index < count; index++)
+        {
+            if (orderedGroupKeyIndexes.Contains(index))
+                continue;
+
+            var comparison = CompareGroupKeyValues(
+                left[offset + index],
+                right[offset + index],
+                collations[index]);
+            if (comparison != 0)
+                return reverse ? -comparison : comparison;
+        }
+
+        return 0;
     }
 
     private VdbeGroupHasher? BuildGroupHasher(
@@ -24897,6 +25018,7 @@ out bool hasReturning)
                 return new GroupedResult(
                     representative,
                     group,
+                    entry.Key,
                     EvaluateGroupedProjectionRow(
                         statement,
                         representative,
@@ -24922,11 +25044,17 @@ out bool hasReturning)
                             group.Representative,
                             WithOuterAggregateScope(context, group.Rows))));
             }
-            if (statement.OrderBy.Count > 0 && !source.OrderByConsumed)
+            if (statement.OrderBy.Count > 0)
             {
                 var orderCollations = resolvedOrderBy
                     .Select(term => GetEffectiveCollation(term.Expression, context))
                     .ToArray();
+                var groupCollations = statement.GroupBy
+                    .Select(expression => GetEffectiveCollation(expression, context))
+                    .ToArray();
+                var orderedGroupKeyIndexes = ResolveOrderedGroupKeyIndexes(
+                    statement.GroupBy,
+                    resolvedOrderBy);
                 var orderedGroups = groupedRows
                     .Select((group, index) => new OrderByKeyed<GroupedResult>(
                         group,
@@ -24952,8 +25080,19 @@ out bool hasReturning)
                         right.Keys,
                         resolvedOrderBy,
                         orderCollations);
-                    return comparison != 0
-                        ? comparison
+                    if (comparison != 0)
+                        return comparison;
+
+                    var groupComparison = CompareGroupKeyTieBreak(
+                        left.Item.GroupKey,
+                        right.Item.GroupKey,
+                        statement.GroupBy.Count,
+                        groupCollations,
+                        orderedGroupKeyIndexes,
+                        offset: 0,
+                        reverseWhenNoGroupKeyIsExplicitlyOrdered: resolvedOrderBy[0].Descending);
+                    return groupComparison != 0
+                        ? groupComparison
                         : left.Position.CompareTo(right.Position);
                 });
                 groupedRows = orderedGroups.Select(group => group.Item).ToList();
@@ -28123,6 +28262,17 @@ out bool hasReturning)
         return sawRight ? JoinSidePredicate.Right : JoinSidePredicate.None;
     }
 
+    private static bool IsReverseCorrelatedTableFunctionJoin(
+        JoinTableSource source,
+        QueryContext context)
+        => source.Kind == JoinKind.Inner
+            && source.Left is TableValuedFunctionSource { Arguments.Count: > 0 } function
+            && function.Arguments.Any(argument =>
+                ClassifyJoinSidePredicate(
+                    argument,
+                    [],
+                    GetJoinSidePredicateColumns(source.Right, context)) == JoinSidePredicate.Right);
+
     private SourceData FilterSourceRows(
         SourceData data,
         Expression predicate,
@@ -28650,14 +28800,24 @@ out bool hasReturning)
                 leftPredicate,
                 sourceOrderBy);
         }
+        if (source.Kind == JoinKind.Inner
+            && source.Condition is not null
+            && IsConstantScalarExpression(source.Condition)
+            && !IsTrue(Evaluate(source.Condition, parameters, outerRow, context)))
+        {
+            return new SourceData(GetSourceColumns(source, context), []);
+        }
 
-        var left = GetSideSourceRows(
-            source.Left,
-            leftPredicate,
-            parameters,
-            context,
-            outerRow,
-            sourceOrderBy);
+        var leftIsReverseCorrelatedTableFunction = IsReverseCorrelatedTableFunctionJoin(source, context);
+        var left = leftIsReverseCorrelatedTableFunction
+            ? new SourceData(GetSourceColumns(source.Left, context), [])
+            : GetSideSourceRows(
+                source.Left,
+                leftPredicate,
+                parameters,
+                context,
+                outerRow,
+                sourceOrderBy);
         var rightIsCorrelatedTableFunction = source.Right is TableValuedFunctionSource { Arguments.Count: > 0 };
         var right = rightIsCorrelatedTableFunction
             ? new SourceData(GetSourceColumns(source.Right, context), [])
@@ -28708,6 +28868,67 @@ out bool hasReturning)
                 result,
                 OmittedVirtualTablePredicates: omittedPredicates);
 
+        SourceRow CreateJoinedRow(SourceRow leftRow, SourceRow rightRow)
+            => new(
+                columns,
+                leftRow.Values.Concat(rightRow.Values).ToArray(),
+                CombineQualifiedColumns(leftRow.QualifiedColumns, rightRow.QualifiedColumns, leftWidth),
+                outerRow,
+                outputColumns,
+                QualifiedRowIds: CombineQualifiedRowIds(
+                    GetQualifiedRowIds(leftRow),
+                    GetQualifiedRowIds(rightRow)),
+                ColumnDefinitions: CombineColumnDefinitions(
+                    leftRow,
+                    rightRow,
+                    left.Columns.Length,
+                    right.Columns.Length,
+                    columnDefinitions),
+                QualifiedColumnDefinitions: qualifiedColumnDefinitions,
+                AmbiguousQualifiedColumns: ambiguousQualifiedColumns,
+                QualifiedMethodIndexSources: CombineMethodIndexSources(
+                    GetMethodIndexSources(leftRow),
+                    GetMethodIndexSources(rightRow)),
+                QualifiedFts5Sources: CombineFts5Sources(
+                    GetFts5Sources(leftRow),
+                    GetFts5Sources(rightRow)));
+
+        if (leftIsReverseCorrelatedTableFunction)
+        {
+            foreach (var rightRow in right.Rows)
+            {
+                var rowsForRight = GetSideSourceRows(
+                    source.Left,
+                    leftPredicate,
+                    parameters,
+                    context,
+                    rightRow,
+                    sourceOrderBy);
+                AddOmittedPredicates(rowsForRight.OmittedVirtualTablePredicates);
+                foreach (var leftRow in rowsForRight.Rows)
+                {
+                    if (source.Condition is null
+                        && !JoinConditionMatches(source, joinPairs, combinedRow: null, leftRow, rightRow, parameters, context))
+                    {
+                        continue;
+                    }
+
+                    var row = CreateJoinedRow(leftRow, rightRow);
+                    if (source.Condition is not null
+                        && !JoinConditionMatches(source, joinPairs, row, leftRow, rightRow, parameters, context))
+                    {
+                        continue;
+                    }
+
+                    rows.Add(row);
+                    if (maximumRows is not null && rows.Count >= maximumRows.Value)
+                        return CreateResult(rows);
+                }
+            }
+
+            return CreateResult(rows);
+        }
+
         var rightMatched = new bool[right.Rows.Count];
         foreach (var leftRow in left.Rows)
         {
@@ -28736,30 +28957,7 @@ out bool hasReturning)
                     continue;
                 }
 
-                var values = leftRow.Values.Concat(rightRow.Values).ToArray();
-                var row = new SourceRow(
-                    columns,
-                    values,
-                    CombineQualifiedColumns(leftRow.QualifiedColumns, rightRow.QualifiedColumns, leftWidth),
-                    outerRow,
-                    outputColumns,
-                    QualifiedRowIds: CombineQualifiedRowIds(
-                        GetQualifiedRowIds(leftRow),
-                        GetQualifiedRowIds(rightRow)),
-                    ColumnDefinitions: CombineColumnDefinitions(
-                        leftRow,
-                        rightRow,
-                        left.Columns.Length,
-                        right.Columns.Length,
-                        columnDefinitions),
-                    QualifiedColumnDefinitions: qualifiedColumnDefinitions,
-                    AmbiguousQualifiedColumns: ambiguousQualifiedColumns,
-                    QualifiedMethodIndexSources: CombineMethodIndexSources(
-                        GetMethodIndexSources(leftRow),
-                        GetMethodIndexSources(rightRow)),
-                    QualifiedFts5Sources: CombineFts5Sources(
-                        GetFts5Sources(leftRow),
-                        GetFts5Sources(rightRow)));
+                var row = CreateJoinedRow(leftRow, rightRow);
                 if (source.Condition is not null
                     && !JoinConditionMatches(source, joinPairs, row, leftRow, rightRow, parameters, context))
                 {
@@ -29089,12 +29287,20 @@ out bool hasReturning)
         SourceData right,
         QueryContext context)
     {
-        if (source.Condition is null)
-            return null;
-
         var leftColumns = GetOutputColumns(source.Left, context);
         var rightColumns = GetOutputColumns(source.Right, context);
         var keys = new List<EquiJoinKey>();
+        if (source.Condition is null)
+        {
+            foreach (var (left, rightColumn) in BuildJoinPairs(source, context))
+            {
+                if (TryCreateEquiJoinKey(source, left, rightColumn, context) is { } key)
+                    keys.Add(key);
+            }
+
+            return keys.Count == 0 ? null : new EquiJoinHashIndex(keys, right);
+        }
+
         var pending = new Stack<Expression>();
         pending.Push(source.Condition);
         while (pending.Count > 0)
@@ -29153,12 +29359,28 @@ out bool hasReturning)
             return null;
         }
 
+        var explicitCollation = GetExplicitCollation(binary.Left)
+            ?? GetExplicitCollation(binary.Right);
+        return TryCreateEquiJoinKey(
+            source,
+            leftColumn,
+            rightColumn,
+            context,
+            explicitCollation);
+    }
+
+    private EquiJoinKey? TryCreateEquiJoinKey(
+        JoinTableSource source,
+        OutputColumn leftColumn,
+        OutputColumn rightColumn,
+        QueryContext context,
+        string? explicitCollation = null)
+    {
         var leftDefinition = GetOutputColumnDefinition(source.Left, leftColumn, context);
         var rightDefinition = GetOutputColumnDefinition(source.Right, rightColumn, context);
         var leftAffinity = GetJoinKeyAffinity(leftDefinition);
         var rightAffinity = GetJoinKeyAffinity(rightDefinition);
-        var collation = GetExplicitCollation(binary.Left)
-            ?? GetExplicitCollation(binary.Right)
+        var collation = explicitCollation
             ?? (leftDefinition is not null ? NormalizeDeclaredCollation(leftDefinition.Collation) : null)
             ?? (rightDefinition is not null ? NormalizeDeclaredCollation(rightDefinition.Collation) : null)
             ?? "BINARY";
@@ -30693,7 +30915,7 @@ out bool hasReturning)
             if (projection.Expression is StarExpression)
             {
                 if (outputColumns.Count == 0)
-                    throw new EmbeddedSqlException("SELECT * requires a row source");
+                    throw new EmbeddedSqlException("no tables specified");
 
                 ThrowIfAmbiguousStarExpansion(outputColumns);
                 names.AddRange(outputColumns.Select(column => column.Name));
@@ -30953,7 +31175,7 @@ out bool hasReturning)
             if (projection.Expression is StarExpression)
             {
                 if (output.Count == 0)
-                    throw new EmbeddedSqlException("SELECT * requires a row source");
+                    throw new EmbeddedSqlException("no tables specified");
                 result.AddRange(output.Select(column => new ArmColumn(
                     column.Qualifier,
                     column.Name,
@@ -31799,9 +32021,9 @@ out bool hasReturning)
         return probed;
     }
 
-    // Detaches a subquery result from the streaming projection state so the memoized value
-    // can be re-read after the surrounding statement moves on. Row values are preserved
-    // exactly (no JSON-subtype stripping); only the lazy wrapper is forced.
+    // Detaches a scalar-subquery result from streaming projection state so a memoized value
+    // can be re-read after the surrounding statement moves on. Scalar subqueries retain the
+    // JSON subtype; FROM/CTE/view/compound materialization strips it separately.
     private static ExecutionResult MaterializeSubqueryResult(ExecutionResult result)
         => result.Rows is StreamingProjectionRows
             ? result with { Rows = result.Rows.ToArray() }
@@ -31849,6 +32071,8 @@ out bool hasReturning)
         {
             switch (pending.Pop())
             {
+                case ColumnExpression { BooleanKeyword: not null }:
+                    break;
                 case ColumnExpression column:
                     if (allowTriggerPseudoRows
                         && column.Qualifier is not null
@@ -32514,19 +32738,10 @@ out bool hasReturning)
             return SqlValue.Null;
 
         typeName = typeName.ToUpperInvariant();
+        if (typeName.Length == 0)
+            return CastToNumeric(value);
         if (typeName.Contains("INT", StringComparison.Ordinal))
-        {
-            var numeric = ApplyNumericAffinity(value);
-            return numeric.Kind switch
-            {
-                SqlValueKind.Integer => numeric,
-                SqlValueKind.Real => SqlValue.Integer((long)Math.Clamp(
-                    Math.Truncate(numeric.AsReal()),
-                    long.MinValue,
-                    long.MaxValue)),
-                _ => throw new InvalidOperationException($"Unexpected numeric value {numeric.Kind}."),
-            };
-        }
+            return SqlValue.Integer(CoerceSqliteInteger(value));
         if (typeName is "REAL" or "FLOAT" or "DOUBLE"
             || typeName.Contains("REAL", StringComparison.Ordinal)
             || typeName.Contains("FLOA", StringComparison.Ordinal)
@@ -32633,6 +32848,9 @@ out bool hasReturning)
 
     private static bool IsGlobMatch(string text, string pattern)
     {
+        if (Encoding.UTF8.GetByteCount(pattern) > 50_000)
+            throw new EmbeddedSqlException("GLOB pattern too complex");
+
         return GlobMatch(ToCodePoints(SqliteTextPrefix(pattern)), 0, ToCodePoints(SqliteTextPrefix(text)), 0);
     }
 
@@ -33145,6 +33363,9 @@ out bool hasReturning)
 
     private static bool IsLikeMatch(string value, string pattern, char? escape)
     {
+        if (Encoding.UTF8.GetByteCount(pattern) > 50_000)
+            throw new EmbeddedSqlException("LIKE or GLOB pattern too complex");
+
         value = SqliteTextPrefix(value);
         pattern = SqliteTextPrefix(pattern);
         var valueIndex = 0;
@@ -34557,6 +34778,42 @@ out bool hasReturning)
         return EvaluateScalarFunction(function, parameters, row, context);
     }
 
+    private void ValidateFunctionResolution(FunctionExpression function)
+    {
+        var name = function.Name.ToUpperInvariant();
+        if (name == "MATCH")
+            return;
+        if (SqliteBuiltinFunctions.Contains(name))
+        {
+            if (function.Window is null
+                && !SqliteBuiltinFunctions.AcceptsCall(
+                    name,
+                    function.Arguments.Count,
+                    function.CountStar)
+                && (function.CountStar || !UsesJsonPairArityDiagnostic(name)))
+            {
+                throw new EmbeddedSqlException(
+                    $"wrong number of arguments to function {function.Name.ToLowerInvariant()}()");
+            }
+
+            return;
+        }
+        if (_scalarFunctions.ContainsKey((name, function.Arguments.Count))
+            || _scalarFunctions.ContainsKey((name, -1))
+            || TryGetAggregateFunction(name, function.Arguments.Count, out _))
+        {
+            return;
+        }
+
+        throw new EmbeddedSqlException($"no such function: {function.Name}");
+    }
+
+    private static bool UsesJsonPairArityDiagnostic(string name)
+        => name is "JSON_OBJECT" or "JSONB_OBJECT"
+            or "JSON_INSERT" or "JSONB_INSERT"
+            or "JSON_REPLACE" or "JSONB_REPLACE"
+            or "JSON_SET" or "JSONB_SET";
+
     // Walks the enclosing aggregate scopes for one whose rows own every argument column
     // and evaluates the call against them. Returns false when no scope qualifies or
     // ownership is indeterminate, in which case the caller uses the normal (local) path.
@@ -35442,8 +35699,18 @@ out bool hasReturning)
         if (function.Filter is not null)
             throw new EmbeddedSqlException($"FILTER may not be used with non-aggregate {function.Name.ToLowerInvariant()}()");
 
-        var arguments = function.Arguments.Select(argument => Evaluate(argument, parameters, row, context)).ToArray();
         var normalizedName = function.Name.ToUpperInvariant();
+        var builtinIsShadowed = !context.IndexExpression
+            && (_scalarFunctions.ContainsKey((normalizedName, function.Arguments.Count))
+                || _scalarFunctions.ContainsKey((normalizedName, -1)));
+        if (!builtinIsShadowed && SqliteBuiltinFunctions.IsWindowOnly(normalizedName))
+            throw new EmbeddedSqlException($"misuse of window function {normalizedName}()");
+        if (!builtinIsShadowed && normalizedName is "IF" or "IIF")
+            return EvaluateIif(function, parameters, row, context);
+        if (!builtinIsShadowed && normalizedName == "LIKELIHOOD")
+            ValidateLikelihood(function);
+
+        var arguments = function.Arguments.Select(argument => Evaluate(argument, parameters, row, context)).ToArray();
         if (!context.IndexExpression
             && (_scalarFunctions.TryGetValue((normalizedName, arguments.Length), out var managedFunction)
                 || _scalarFunctions.TryGetValue((normalizedName, -1), out managedFunction)))
@@ -35516,6 +35783,7 @@ out bool hasReturning)
             "CHANGES" => EvaluateChanges(arguments),
             "TOTAL_CHANGES" => EvaluateTotalChanges(arguments),
             "TIMEDIFF" => EvaluateTimeDiff(arguments),
+            "TIME_DATE" => EvaluateTimeDate(arguments),
             "COALESCE" => EvaluateCoalesce(arguments),
             "DATE" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.Date),
             "DATETIME" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.DateTime),
@@ -35598,6 +35866,43 @@ out bool hasReturning)
             "SNIPPET" => EvaluateFts5Snippet(function, arguments, row),
             _ => throw new EmbeddedSqlException($"no such function: {function.Name}"),
         };
+    }
+
+    private SqlValue EvaluateIif(
+        FunctionExpression function,
+        SqlValue[] parameters,
+        SourceRow? row,
+        QueryContext context)
+    {
+        if (function.Arguments.Count < 2)
+            throw new EmbeddedSqlException($"wrong number of arguments to function {function.Name.ToLowerInvariant()}()");
+
+        for (var index = 0; index + 1 < function.Arguments.Count; index += 2)
+        {
+            if (IsTrue(Evaluate(function.Arguments[index], parameters, row, context)))
+                return Evaluate(function.Arguments[index + 1], parameters, row, context);
+        }
+
+        return (function.Arguments.Count & 1) != 0
+            ? Evaluate(function.Arguments[^1], parameters, row, context)
+            : SqlValue.Null;
+    }
+
+    private static void ValidateLikelihood(FunctionExpression function)
+    {
+        if (function.Arguments.Count != 2)
+            return;
+
+        if (function.Arguments[1] is not LiteralExpression
+            {
+                Value.Kind: SqlValueKind.Real,
+            } probability
+            || !double.IsFinite(probability.Value.AsReal())
+            || probability.Value.AsReal() is < 0.0 or > 1.0)
+        {
+            throw new EmbeddedSqlException(
+                "second argument to likelihood() must be a constant between 0.0 and 1.0");
+        }
     }
 
     private static SqlValue EvaluateGlobFunction(IReadOnlyList<SqlValue> arguments)
@@ -36905,6 +37210,9 @@ out bool hasReturning)
             { Kind: SqlValueKind.Text } value => ParseUuid7StringTimestamp(value.AsText()),
             _ => throw new EmbeddedSqlException("invalid arguments to function uuid7_str()"),
         };
+        if (!IsValidUuid7Timestamp(seconds))
+            throw new EmbeddedSqlException("Invalid timestamp");
+
         return SqlValue.Text(FormatUuid(CreateUuid7FromUnixSeconds(seconds)));
     }
 
@@ -36914,6 +37222,7 @@ out bool hasReturning)
             return SqlValue.Blob(CreateUuid7((ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
 
         return arguments[0].Kind == SqlValueKind.Integer
+            && IsValidUuid7Timestamp(arguments[0].AsInteger())
             ? SqlValue.Blob(CreateUuid7FromUnixSeconds(arguments[0].AsInteger()))
             : SqlValue.Null;
     }
@@ -36959,11 +37268,14 @@ out bool hasReturning)
     {
         if (!long.TryParse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var seconds))
             throw new EmbeddedSqlException("invalid arguments to function uuid7_str()");
-        if (seconds <= 0)
+        if (!IsValidUuid7Timestamp(seconds))
             throw new EmbeddedSqlException("Invalid timestamp");
 
         return seconds;
     }
+
+    private static bool IsValidUuid7Timestamp(long seconds)
+        => seconds is > 0 and <= ((1L << 48) - 1) / 1000;
 
     private static byte[] CreateUuid4()
     {
@@ -37063,7 +37375,7 @@ out bool hasReturning)
         return value.Kind switch
         {
             SqlValueKind.Null => SqlValue.Null,
-            SqlValueKind.Text => SqlValue.Integer(value.AsText().EnumerateRunes().Count()),
+            SqlValueKind.Text => SqlValue.Integer(SqliteTextPrefix(value.AsText()).EnumerateRunes().Count()),
             SqlValueKind.Blob => SqlValue.Integer(value.AsBlob().Length),
             _ => SqlValue.Integer(ToSqlText(value).Length),
         };
@@ -38191,6 +38503,11 @@ out bool hasReturning)
         var isAggregate = IsAggregateWindowFunction(function);
         if (!isBuiltInWindow && !isAggregate)
         {
+            var knownScalar = SqliteBuiltinFunctions.Contains(name)
+                || _scalarFunctions.ContainsKey((name, function.Arguments.Count))
+                || _scalarFunctions.ContainsKey((name, -1));
+            if (!knownScalar)
+                throw new EmbeddedSqlException($"no such function: {function.Name}");
             throw new EmbeddedSqlException(
                 $"{function.Name} may not be used as a window function");
         }
@@ -38406,7 +38723,8 @@ out bool hasReturning)
 
     private static void RequireWindowArgumentCount(FunctionExpression function, int expected)
     {
-        if (function.CountStar || function.Arguments.Count != expected)
+        if (function.Arguments.Count != expected
+            || function.CountStar && expected != 0)
             ThrowWrongWindowArgumentCount(function);
     }
 
@@ -38519,9 +38837,50 @@ out bool hasReturning)
             var orderCollations = resolvedOrderBy
                 .Select(term => GetEffectiveCollation(term.Expression, context))
                 .ToArray();
+            var emissionOrder = WindowEmissionOrder(windowFunctions);
+            var emissionCollations = emissionOrder?
+                .Select(term => GetEffectiveCollation(term.Expression, context))
+                .ToArray();
+            var emissionKeys = emissionOrder is null
+                ? null
+                : Enumerable.Range(0, grouped.Count)
+                    .Select(index => emissionOrder
+                        .Select(term => EvaluateInGroup(index, term.Expression))
+                        .ToArray())
+                    .ToArray();
             results.Sort((left, right) =>
             {
                 var comparison = CompareOrderKeys(left.Keys, right.Keys, resolvedOrderBy, orderCollations);
+                if (comparison != 0)
+                    return comparison;
+                if (emissionOrder is not null)
+                {
+                    comparison = CompareWindowOrderKeys(
+                        emissionKeys![left.Position],
+                        emissionKeys[right.Position],
+                        emissionOrder,
+                        emissionCollations!);
+                }
+                return comparison != 0 ? comparison : left.Position.CompareTo(right.Position);
+            });
+        }
+        else if (WindowEmissionOrder(windowFunctions) is { } emissionOrder)
+        {
+            var emissionCollations = emissionOrder
+                .Select(term => GetEffectiveCollation(term.Expression, context))
+                .ToArray();
+            var emissionKeys = Enumerable.Range(0, grouped.Count)
+                .Select(index => emissionOrder
+                    .Select(term => EvaluateInGroup(index, term.Expression))
+                    .ToArray())
+                .ToArray();
+            results.Sort((left, right) =>
+            {
+                var comparison = CompareWindowOrderKeys(
+                    emissionKeys[left.Position],
+                    emissionKeys[right.Position],
+                    emissionOrder,
+                    emissionCollations);
                 return comparison != 0 ? comparison : left.Position.CompareTo(right.Position);
             });
         }
@@ -38649,8 +39008,32 @@ out bool hasReturning)
                         context))
                     .ToArray();
             }
+            var emissionOrder = WindowEmissionOrder(windowFunctions);
+            var emissionCollations = emissionOrder?
+                .Select(term => GetEffectiveCollation(term.Expression, context))
+                .ToArray();
+            var emissionKeys = emissionOrder is null
+                ? null
+                : Enumerable.Range(0, rowCount)
+                    .Select(index => emissionOrder
+                        .Select(term => Evaluate(term.Expression, parameters, selectedRows[index], context))
+                        .ToArray())
+                    .ToArray();
             indices = StableSortIndices(indices, (left, right) =>
-                CompareOrderKeys(orderKeys[left], orderKeys[right], orderBy, orderCollations));
+            {
+                var comparison = CompareOrderKeys(
+                    orderKeys[left],
+                    orderKeys[right],
+                    orderBy,
+                    orderCollations);
+                if (comparison != 0 || emissionOrder is null)
+                    return comparison;
+                return CompareWindowOrderKeys(
+                    emissionKeys![left],
+                    emissionKeys[right],
+                    emissionOrder,
+                    emissionCollations!);
+            });
         }
         else if (WindowEmissionOrder(windowFunctions) is { } windowOrder)
         {
@@ -40192,6 +40575,8 @@ out bool hasReturning)
 
     private static long RequireLimitInteger(SqlValue value)
     {
+        if (value.Kind == SqlValueKind.Text)
+            value = ApplyComparisonNumericAffinity(value);
         if (value.Kind == SqlValueKind.Integer)
             return value.AsInteger();
         if (value.Kind == SqlValueKind.Real)
@@ -41085,6 +41470,8 @@ out bool hasReturning)
                         if (p.RawS)
                         {
                             double r = p.S * 1000.0 + 210866760000000.0;
+                            if (!double.IsFinite(r) || r < 0 || r > MaxJd)
+                                return false;
                             p.IJd = (long)(r + 0.5);
                             p.ValidJd = true;
                             p.RawS = false;
@@ -41557,7 +41944,7 @@ out bool hasReturning)
         internal static SqlValue JsonExtract(IReadOnlyList<SqlValue> args)
         {
             if (args.Count < 1)
-                throw new EmbeddedSqlException("wrong number of arguments to function json_extract()");
+                return SqlValue.Null;
 
             var value = args[0];
             if (value.Kind == SqlValueKind.Null)
@@ -41773,7 +42160,25 @@ out bool hasReturning)
             if (args[0].Kind == SqlValueKind.Null)
                 return SqlValue.Null;
 
-            var root = ParseOrThrow(args[0]);
+            JNode root;
+            if (args[0].Kind == SqlValueKind.Blob
+                && !TryParseJsonb(args[0].AsBlob().Span, out root))
+            {
+                var data = args[0].AsBlob().Span;
+                var cursor = 0;
+                if (TryReadJsonbHeader(data, ref cursor, data.Length, out var type, out var payloadEnd)
+                    && payloadEnd == data.Length
+                    && type is 11 or 12)
+                {
+                    return SqlValue.Null;
+                }
+
+                root = ParseOrThrow(args[0]);
+            }
+            else
+            {
+                root = ParseOrThrow(args[0]);
+            }
             for (int i = 1; i < args.Count; i++)
             {
                 if (args[i].Kind == SqlValueKind.Null)
@@ -41933,7 +42338,7 @@ out bool hasReturning)
                     string key;
                     if (i < path.Length && path[i] == '"')
                     {
-                        var parser = new Parser(path, i);
+                        var parser = new Parser(path, i, json5: true);
                         var node = parser.ParseString();
                         if (node is null)
                             throw BadPath(path);
@@ -42002,7 +42407,7 @@ out bool hasReturning)
                     string key;
                     if (i < path.Length && path[i] == '"')
                     {
-                        var parser = new Parser(path, i);
+                        var parser = new Parser(path, i, json5: true);
                         var node = parser.ParseString();
                         if (node is null)
                             throw BadPath(path);
@@ -42376,7 +42781,7 @@ out bool hasReturning)
 
         private static string InputText(SqlValue value)
             => value.Kind == SqlValueKind.Blob
-                ? Encoding.UTF8.GetString(value.AsBlob().Span)
+                ? SqliteTextPrefix(Encoding.UTF8.GetString(value.AsBlob().Span))
                 : value.AsText();
 
         private static string RequirePathText(SqlValue value)
@@ -42407,6 +42812,11 @@ out bool hasReturning)
                         path = nameOrPath.Length == 0 || nameOrPath.StartsWith('$')
                             ? nameOrPath
                             : "$." + QuoteString(nameOrPath);
+                        return true;
+                    }
+                case SqlValueKind.Real:
+                    {
+                        path = "$." + QuoteString(FormatRealAsText(value.AsReal()));
                         return true;
                     }
                 default:
@@ -42452,7 +42862,9 @@ out bool hasReturning)
         }
 
         private static double ParseDouble(string raw)
-            => double.Parse(raw, NumberStyles.Float, CultureInfo.InvariantCulture);
+            => double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+                ? value
+                : throw new EmbeddedSqlException("malformed JSON");
 
         private static string Serialize(JNode node)
         {
@@ -42603,11 +43015,8 @@ out bool hasReturning)
                 case 4:
                 case 5:
                 case 6:
-                    if (!TryDecodeJsonbText(data[payloadStart..payloadEnd], out var number)
-                        || TryParse(number) is not { Kind: JKind.Integer or JKind.Real })
-                    {
+                    if (!TryDecodeJsonbText(data[payloadStart..payloadEnd], out var number))
                         return false;
-                    }
                     node = new JNode { Kind = type is 3 or 4 ? JKind.Integer : JKind.Real, Raw = number };
                     cursor = payloadEnd;
                     return true;
@@ -42788,7 +43197,7 @@ out bool hasReturning)
                     string keyName;
                     if (i < path.Length && path[i] == '"')
                     {
-                        var parser = new Parser(path, i);
+                        var parser = new Parser(path, i, json5: true);
                         var strNode = parser.ParseString();
                         if (strNode is null)
                             throw BadPath(path);
@@ -42883,11 +43292,10 @@ out bool hasReturning)
         private static bool ReadDigits(string s, ref int i, out long value)
         {
             int start = i;
-            long acc = 0;
+            uint acc = 0;
             while (i < s.Length && char.IsAsciiDigit(s[i]))
             {
-                if (acc < 100000000000000000L)
-                    acc = acc * 10 + (s[i] - '0');
+                acc = unchecked((acc * 10) + (uint)(s[i] - '0'));
                 i++;
             }
 
@@ -42937,7 +43345,7 @@ out bool hasReturning)
 
         private static int ParseErrorPosition(string input)
         {
-            var parser = new Parser(input, 0);
+            var parser = new Parser(input, 0, json5: true);
             parser.SkipWs();
             int rootStart = parser.Pos;
             var node = parser.ParseValue();
@@ -43401,10 +43809,75 @@ out bool hasReturning)
                 }
 
                 string text = sb.ToString();
+                var source = _s.Substring(start, _i - start);
                 string raw = quote == '"' && !json5Only
-                    ? _s.Substring(start, _i - start)
-                    : QuoteString(text);
+                    ? source
+                    : quote == '"' && source.Contains("\\x", StringComparison.Ordinal)
+                        ? CanonicalizeHexEscapes(source)
+                        : QuoteString(text);
                 return new JNode { Kind = JKind.Text, Raw = raw, Str = text };
+            }
+
+            private static string CanonicalizeHexEscapes(string source)
+            {
+                var result = new StringBuilder(source.Length + 8);
+                result.Append('"');
+                for (var index = 1; index < source.Length - 1; index++)
+                {
+                    var character = source[index];
+                    if (character != '\\' || index + 1 >= source.Length - 1)
+                    {
+                        if (character < 0x20)
+                        {
+                            result.Append("\\u");
+                            result.Append(((int)character).ToString("x4", CultureInfo.InvariantCulture));
+                        }
+                        else
+                        {
+                            result.Append(character);
+                        }
+                        continue;
+                    }
+
+                    var escaped = source[++index];
+                    if (escaped == 'x' && index + 2 < source.Length - 1)
+                    {
+                        result.Append("\\u00");
+                        result.Append(source[index + 1]);
+                        result.Append(source[index + 2]);
+                        index += 2;
+                        continue;
+                    }
+
+                    if (escaped == '0')
+                    {
+                        result.Append("\\u0000");
+                        continue;
+                    }
+                    if (escaped == 'v')
+                    {
+                        result.Append("\\u000b");
+                        continue;
+                    }
+                    if (escaped == '\n')
+                        continue;
+                    if (escaped == '\r')
+                    {
+                        if (index + 1 < source.Length - 1 && source[index + 1] == '\n')
+                            index++;
+                        continue;
+                    }
+                    if (escaped == '\'')
+                    {
+                        result.Append('\'');
+                        continue;
+                    }
+
+                    result.Append('\\').Append(escaped);
+                }
+
+                result.Append('"');
+                return result.ToString();
             }
 
             // (7) JSON5 unquoted object keys: a bare ECMAScript-style identifier is accepted as a
@@ -46010,8 +46483,9 @@ public sealed partial class EmbeddedConnection : IDisposable
         var sourceQuery = source.Statement as QueryStatement
             ?? throw new InvalidOperationException("CREATE TABLE AS SELECT routing did not return a query.");
         var sourceState = GetTransactionState(source.Database);
+        var sourceCatalog = source.ReadCatalog ?? sourceState?.Catalog;
         var vdbeExecutionOptions = CreateVdbeExecutionOptions(source.Database);
-        var materialization = sourceState is null
+        var materialization = sourceCatalog is null
             ? source.Database.MaterializeCreateTableAs(
                 sourceQuery,
                 parameters,
@@ -46019,16 +46493,20 @@ public sealed partial class EmbeddedConnection : IDisposable
                 _foreignKeys,
                 _recursiveTriggers,
                 cancellationToken,
-                vdbeExecutionOptions)
+                vdbeExecutionOptions,
+                ExecutePragmaTableList,
+                source.ExternalTables)
             : source.Database.MaterializeCreateTableAs(
                 sourceQuery,
                 parameters,
-                sourceState.Catalog,
+                sourceCatalog,
                 _lastInsertRowId,
                 _foreignKeys,
                 _recursiveTriggers,
                 cancellationToken,
-                vdbeExecutionOptions);
+                vdbeExecutionOptions,
+                ExecutePragmaTableList,
+                source.ExternalTables);
         cancellationToken.ThrowIfCancellationRequested();
         if (ReferenceEquals(source.Database, _tempDatabase))
             _tempInitialized = true;
@@ -46111,13 +46589,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                 dropColumn.TableName,
                 ManagedSchemaObjectKind.Table,
                 name => dropColumn with { TableName = name }),
-            PragmaTableInfoStatement tableInfo => RouteExistingNamedStatement(
+            PragmaTableInfoStatement tableInfo => RoutePragmaTableMetadataStatement(
                 tableInfo.TableName,
-                ManagedSchemaObjectKind.Table,
                 name => tableInfo with { TableName = name }),
-            PragmaTableXInfoStatement tableXInfo => RouteExistingNamedStatement(
+            PragmaTableXInfoStatement tableXInfo => RoutePragmaTableMetadataStatement(
                 tableXInfo.TableName,
-                ManagedSchemaObjectKind.Table,
                 name => tableXInfo with { TableName = name }),
             PragmaIndexListStatement indexList => RouteExistingNamedStatement(
                 indexList.TableName,
@@ -46412,6 +46888,23 @@ Func<string, ParsedStatement> rewrite)
 
         schema = ResolveExistingObjectSchema(objectName, kind);
         return RouteSchema(schema, objectName, rewrite);
+    }
+
+    private RoutedStatement RoutePragmaTableMetadataStatement(
+        string objectName,
+        Func<string, ParsedStatement> rewrite)
+    {
+        if (ManagedSchemaName.TrySplit(objectName, out var schema, out var localName)
+            && IsTemporarySchemaTable(localName)
+            && !schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+        {
+            return RouteSchema(schema, localName, _ => rewrite(objectName));
+        }
+
+        return RouteExistingNamedStatement(
+            objectName,
+            ManagedSchemaObjectKind.Table,
+            rewrite);
     }
 
     private string ResolveExistingObjectSchema(string objectName, ManagedSchemaObjectKind kind)
@@ -49436,69 +49929,16 @@ Func<string, ParsedStatement> rewrite)
     private ExecutionResult ExecutePragmaFunctionList(PragmaFunctionListStatement statement)
     {
         ValidatePragmaSchema(statement.Schema);
-        const long innocuousFlag = 0x200000;
-        var rows = SqliteBuiltinFunctions.All
-            .OrderBy(name => name, StringComparer.Ordinal)
-            .SelectMany(BuiltinFunctionListRows)
-            .ToList();
-        var registrations = _database.GetRegisteredFunctionMetadata();
-        rows.AddRange(registrations.Scalars.Select(function => FunctionListRow(
-            function.Name,
-            builtin: false,
-            type: "s",
-            function.Arity,
-            flags: 0)));
-        rows.AddRange(registrations.Aggregates.Select(function => FunctionListRow(
-            function.Name,
-            builtin: false,
-            type: "a",
-            function.Arity,
-            flags: 0)));
-        rows = rows
-            .OrderBy(row => row[0].AsText(), StringComparer.Ordinal)
-            .ThenBy(row => row[2].AsText(), StringComparer.Ordinal)
-            .ThenBy(row => row[4].AsInteger())
-            .ToList();
-        return new ExecutionResult(["name", "builtin", "type", "enc", "narg", "flags"], rows, 0);
-
-        IEnumerable<SqlValue[]> BuiltinFunctionListRows(string name)
-        {
-            var flags = innocuousFlag
-                | (SqliteBuiltinFunctions.IsDeterministic(name) ? 0x800 : 0);
-            if (name is "MIN" or "MAX")
-            {
-                yield return FunctionListRow(name, builtin: true, type: "s", arity: -1, flags);
-                yield return FunctionListRow(name, builtin: true, type: "w", arity: 1, flags: innocuousFlag);
-                yield break;
-            }
-
-            var type = SqliteBuiltinFunctions.IsWindowOnly(name) || SqliteBuiltinFunctions.IsAggregate(name)
-                ? "w"
-                : "s";
-            foreach (var arity in SqliteBuiltinFunctions.GetArities(name))
-                yield return FunctionListRow(name, builtin: true, type, arity, flags);
-        }
-
-        static SqlValue[] FunctionListRow(string name, bool builtin, string type, int arity, long flags)
-            =>
-            [
-                SqlValue.Text(name.ToLowerInvariant()),
-                SqlValue.Integer(builtin ? 1 : 0),
-                SqlValue.Text(type),
-                SqlValue.Text("utf8"),
-                SqlValue.Integer(arity),
-                SqlValue.Integer(flags),
-            ];
+        return new ExecutionResult(
+            ["name", "builtin", "type", "enc", "narg", "flags"],
+            EmbeddedDatabase.BuildPragmaFunctionListRows(_database),
+            0);
     }
 
     private ExecutionResult ExecutePragmaModuleList(PragmaModuleListStatement statement)
     {
         ValidatePragmaSchema(statement.Schema);
-        var rows = TableValuedFunctionRegistry.AllNames
-            .OrderBy(name => name, StringComparer.Ordinal)
-            .Select(name => new[] { SqlValue.Text(name) })
-            .ToArray();
-        return new ExecutionResult(["name"], rows, 0);
+        return new ExecutionResult(["name"], EmbeddedDatabase.BuildPragmaModuleListRows(), 0);
     }
 
     private ExecutionResult ExecuteVacuum(VacuumStatement statement, SqlValue[] parameters)
@@ -50956,7 +51396,9 @@ internal sealed class EmbeddedTable
                     // window misuse, aggregate calls an aggregate misuse.
                     if (function.Window is not null || SqliteBuiltinFunctions.IsWindowOnly(function.Name))
                         throw new EmbeddedSqlException($"misuse of window function {function.Name}()");
-                    if (function.CountStar || function.Distinct || function.Filter is not null
+                    if ((function.CountStar
+                            && string.Equals(function.Name, "COUNT", StringComparison.OrdinalIgnoreCase))
+                        || function.Distinct || function.Filter is not null
                         || EmbeddedDatabase.IsBuiltInAggregate(function)
                         || EmbeddedDatabase.IsManagedPercentileAggregate(function.Name))
                     {
@@ -51658,7 +52100,9 @@ internal sealed class EmbeddedTable
                 // its prohibition diagnostics before it ever reaches the determinism allow-list.
                 if (function.Window is not null)
                     throw new EmbeddedSqlException("window functions prohibited in generated columns");
-                if (function.CountStar || function.Distinct || function.Filter is not null
+                if ((function.CountStar
+                        && string.Equals(function.Name, "COUNT", StringComparison.OrdinalIgnoreCase))
+                    || function.Distinct || function.Filter is not null
                     || EmbeddedDatabase.IsBuiltInAggregate(function)
                     || EmbeddedDatabase.IsManagedPercentileAggregate(function.Name))
                 {
@@ -51729,6 +52173,13 @@ internal sealed class EmbeddedTable
     internal static bool IsDeterministicSchemaFunction(FunctionExpression function)
     {
         var upperName = function.Name.ToUpperInvariant();
+        if (!SqliteBuiltinFunctions.AcceptsCall(
+                upperName,
+                function.Arguments.Count,
+                function.CountStar))
+        {
+            return false;
+        }
         if (upperName is "DATE" or "TIME" or "DATETIME" or "UNIXEPOCH" or "JULIANDAY"
             or "STRFTIME" or "TIMEDIFF")
         {

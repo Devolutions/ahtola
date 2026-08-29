@@ -2895,7 +2895,11 @@ internal sealed class SqlParser
 
         var qualified = ManagedSchemaName.TrySplit(name, out var schema, out var functionName);
         if (!TableValuedFunctionRegistry.TryResolve(functionName, out var module))
+        {
+            if (functionName.StartsWith("pragma_", StringComparison.OrdinalIgnoreCase))
+                throw Error($"no such table: {ManagedSchemaName.Display(name)}");
             throw Error(TableValuedFunctionRegistry.UnsupportedMessage(ManagedSchemaName.Display(name)));
+        }
 
         Expect(TokenKind.LeftParen);
         var arguments = new List<Expression>();
@@ -3404,8 +3408,10 @@ internal sealed class SqlParser
                 {
                     var expression = ParseExpression();
                     ExpectKeyword("AS");
-                    var typeName = ExpectIdentifier();
-                    if (_lexer.Current.Kind == TokenKind.LeftParen)
+                    var typeName = _lexer.Current.Kind == TokenKind.RightParen
+                        ? string.Empty
+                        : ExpectIdentifier();
+                    if (typeName.Length != 0 && _lexer.Current.Kind == TokenKind.LeftParen)
                         SkipParenthesized();
                     Expect(TokenKind.RightParen);
                     return new CastExpression(expression, typeName);
@@ -3417,11 +3423,17 @@ internal sealed class SqlParser
                         return ParseRaiseExpression();
 
                     var functionName = token.Text.ToUpperInvariant();
-                    if (string.Equals(token.Text, "COUNT", StringComparison.OrdinalIgnoreCase) && Consume(TokenKind.Asterisk))
+                    if (Consume(TokenKind.Asterisk))
                     {
                         Expect(TokenKind.RightParen);
-                        var (countFilter, countWindow) = ParseFunctionSuffix();
-                        return new FunctionExpression("COUNT", [], true, false, countFilter, countWindow);
+                        var (starFilter, starWindow) = ParseFunctionSuffix();
+                        return new FunctionExpression(
+                            functionName,
+                            [],
+                            true,
+                            false,
+                            starFilter,
+                            starWindow);
                     }
 
                     var distinct = ConsumeKeyword("DISTINCT");

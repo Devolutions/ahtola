@@ -5,6 +5,15 @@ namespace Ahtola.Core;
 
 public sealed partial class EmbeddedDatabase
 {
+    private static readonly (string Name, string Type)[] SchemaTableColumns =
+    [
+        ("type", "TEXT"),
+        ("name", "TEXT"),
+        ("tbl_name", "TEXT"),
+        ("rootpage", "INT"),
+        ("sql", "TEXT"),
+    ];
+
     /// <summary>
     /// Runs one of the introspection PRAGMA statements on behalf of a
     /// <c>pragma_*</c> table-valued function so the statement form and the function form
@@ -78,6 +87,114 @@ public sealed partial class EmbeddedDatabase
         return true;
     }
 
+    private static bool TryDescribeSchemaTable(
+        string name,
+        bool includeHidden,
+        out SqlValue[][] rows)
+    {
+        var qualified = ManagedSchemaName.TrySplit(name, out var schema, out var splitName);
+        var localName = qualified ? splitName : name;
+        var isTemporaryAlias =
+            localName.Equals("sqlite_temp_master", StringComparison.OrdinalIgnoreCase)
+            || localName.Equals("sqlite_temp_schema", StringComparison.OrdinalIgnoreCase);
+        if ((!IsSchemaTable(localName) && !isTemporaryAlias)
+            || (isTemporaryAlias
+                && qualified
+                && !schema.Equals("temp", StringComparison.OrdinalIgnoreCase)))
+        {
+            rows = [];
+            return false;
+        }
+
+        rows = SchemaTableColumns
+            .Select((column, index) =>
+            {
+                var row = new List<SqlValue>
+                {
+                    SqlValue.Integer(index),
+                    SqlValue.Text(column.Name),
+                    SqlValue.Text(column.Type),
+                    SqlValue.Integer(0),
+                    SqlValue.Null,
+                    SqlValue.Integer(0),
+                };
+                if (includeHidden)
+                    row.Add(SqlValue.Integer(0));
+                return row.ToArray();
+            })
+            .ToArray();
+        return true;
+    }
+
+    internal static IReadOnlyList<SqlValue[]> BuildPragmaFunctionListRows(EmbeddedDatabase? database)
+    {
+        const long innocuousFlag = 0x200000;
+        var rows = SqliteBuiltinFunctions.All
+            .Where(SqliteBuiltinFunctions.IsExposedByFunctionList)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .SelectMany(BuiltinRows)
+            .ToList();
+        if (database is not null)
+        {
+            var registrations = database.GetRegisteredFunctionMetadata();
+            rows.AddRange(registrations.Scalars.Select(function => Row(
+                function.Name,
+                builtin: false,
+                type: "s",
+                function.Arity,
+                flags: 0)));
+            rows.AddRange(registrations.Aggregates.Select(function => Row(
+                function.Name,
+                builtin: false,
+                type: "a",
+                function.Arity,
+                flags: 0)));
+        }
+
+        return rows
+            .OrderBy(row => row[0].AsText(), StringComparer.Ordinal)
+            .ThenBy(row => row[2].AsText(), StringComparer.Ordinal)
+            .ThenBy(row => row[4].AsInteger())
+            .ToArray();
+
+        static IEnumerable<SqlValue[]> BuiltinRows(string name)
+        {
+            var flags = innocuousFlag
+                | (SqliteBuiltinFunctions.IsDeterministic(name) ? 0x800 : 0);
+            if (name is "MIN" or "MAX")
+            {
+                yield return Row(name, builtin: true, type: "s", arity: -1, flags);
+                yield return Row(name, builtin: true, type: "w", arity: 1, flags: innocuousFlag);
+                yield break;
+            }
+
+            var type = SqliteBuiltinFunctions.IsWindowOnly(name) || SqliteBuiltinFunctions.IsAggregate(name)
+                ? "w"
+                : "s";
+            foreach (var arity in SqliteBuiltinFunctions.GetArities(name))
+                yield return Row(name, builtin: true, type, arity, flags);
+        }
+
+        static SqlValue[] Row(string name, bool builtin, string type, int arity, long flags)
+            =>
+            [
+                SqlValue.Text(name.ToLowerInvariant()),
+                SqlValue.Integer(builtin ? 1 : 0),
+                SqlValue.Text(type),
+                SqlValue.Text("utf8"),
+                SqlValue.Integer(arity),
+                SqlValue.Integer(flags),
+            ];
+    }
+
+    internal static IReadOnlyList<SqlValue[]> BuildPragmaModuleListRows()
+        => TableValuedFunctionRegistry.AllNames
+            .Concat(ManagedVirtualTableModuleRegistry.AllNames)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .Select(name => new[] { SqlValue.Text(name) })
+            .ToArray();
+
     /// <summary>
     /// Resolves the parenthesis-free spelling of a table-valued function and binds the
     /// module's hidden argument columns from WHERE equality terms, so
@@ -92,12 +209,14 @@ public sealed partial class EmbeddedDatabase
             return statement;
 
         var source = BindBareTableValuedFunctions(statement.Source, context);
+        var terms = new List<Expression>();
+        CollectJoinConstraints(source, terms);
         if (statement.Where is not null)
         {
-            var terms = new List<Expression>();
             CollectConjuncts(statement.Where, terms);
-            source = BindTableValuedFunctionArguments(source, terms);
         }
+        if (terms.Count != 0)
+            source = BindTableValuedFunctionArguments(source, terms);
 
         return ReferenceEquals(source, statement.Source) ? statement : statement with { Source = source };
     }
@@ -175,7 +294,12 @@ public sealed partial class EmbeddedDatabase
         var highest = -1;
         for (var index = function.Arguments.Count; index < hidden.Count; index++)
         {
-            if (!TryFindHiddenArgument(terms, qualifier, hidden[index], out var value))
+            if (!TryFindHiddenArgument(
+                    terms,
+                    qualifier,
+                    module.Schema.AllColumns,
+                    hidden[index],
+                    out var value))
                 continue;
 
             bound[index] = value;
@@ -197,6 +321,7 @@ public sealed partial class EmbeddedDatabase
     private static bool TryFindHiddenArgument(
         IReadOnlyList<Expression> terms,
         string qualifier,
+        IReadOnlyList<string> moduleColumns,
         string column,
         out Expression value)
     {
@@ -206,14 +331,14 @@ public sealed partial class EmbeddedDatabase
                 continue;
 
             if (IsHiddenColumnReference(equality.Left, qualifier, column)
-                && IsConstantArgument(equality.Right))
+                && IsBindableArgument(equality.Right, qualifier, moduleColumns))
             {
                 value = equality.Right;
                 return true;
             }
 
             if (IsHiddenColumnReference(equality.Right, qualifier, column)
-                && IsConstantArgument(equality.Left))
+                && IsBindableArgument(equality.Left, qualifier, moduleColumns))
             {
                 value = equality.Left;
                 return true;
@@ -234,14 +359,60 @@ public sealed partial class EmbeddedDatabase
     /// Only argument expressions that cannot reference a row are bound, so binding never
     /// changes when a constraint is evaluated.
     /// </summary>
-    private static bool IsConstantArgument(Expression expression)
+    private static bool IsBindableArgument(
+        Expression expression,
+        string functionQualifier,
+        IReadOnlyList<string> moduleColumns)
         => expression switch
         {
             LiteralExpression => true,
             ParameterExpression => true,
-            UnaryExpression unary => IsConstantArgument(unary.Operand),
+            ColumnExpression column => column.Qualifier is not null
+                ? !column.Qualifier.Equals(functionQualifier, StringComparison.OrdinalIgnoreCase)
+                : !moduleColumns.Contains(
+                    column.UnqualifiedName ?? column.Name,
+                    StringComparer.OrdinalIgnoreCase),
+            UnaryExpression unary => IsBindableArgument(
+                unary.Operand,
+                functionQualifier,
+                moduleColumns),
+            BinaryExpression binary => IsBindableArgument(
+                    binary.Left,
+                    functionQualifier,
+                    moduleColumns)
+                && IsBindableArgument(
+                    binary.Right,
+                    functionQualifier,
+                    moduleColumns),
+            CastExpression cast => IsBindableArgument(
+                cast.Expression,
+                functionQualifier,
+                moduleColumns),
+            CollationExpression collation => IsBindableArgument(
+                collation.Expression,
+                functionQualifier,
+                moduleColumns),
+            FunctionExpression function => function.Window is null
+                && function.Filter is null
+                && !function.Distinct
+                && SqliteBuiltinFunctions.IsDeterministic(function.Name)
+                && function.Arguments.All(argument => IsBindableArgument(
+                    argument,
+                    functionQualifier,
+                    moduleColumns)),
             _ => false,
         };
+
+    private static void CollectJoinConstraints(TableSource source, List<Expression> terms)
+    {
+        if (source is not JoinTableSource join)
+            return;
+
+        CollectJoinConstraints(join.Left, terms);
+        CollectJoinConstraints(join.Right, terms);
+        if (join.Condition is not null)
+            CollectConjuncts(join.Condition, terms);
+    }
 
     private static void CollectConjuncts(Expression expression, List<Expression> terms)
     {

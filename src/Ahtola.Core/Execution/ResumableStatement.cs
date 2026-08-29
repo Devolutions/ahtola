@@ -3077,6 +3077,16 @@ public sealed class ResumableStatement : IDisposable
             var workspaceBytes = VdbeManagedFootprint.EstimateSortWorkspace(requiredCount);
             var workspaceGrowth = checked(workspaceBytes - _sortWorkspaceBytes);
             var retainedBytes = checked(recordBytes + listGrowth + workspaceGrowth);
+            if (_rows.Count > 0
+                && _bufferRowCapacity == int.MaxValue
+                && _spill is null
+                && _executionOptions.AllowTemporaryFileSpill
+                && retainedBytes > _memory.AvailableBytes
+                    - VdbeManagedFootprint.EstimateSorterSpillInfrastructure(
+                        _executionOptions.TemporaryDirectory))
+            {
+                return false;
+            }
             if (!_memory.TryRetain(retainedBytes))
                 return false;
 

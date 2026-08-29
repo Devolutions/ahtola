@@ -511,7 +511,6 @@ internal static class IndexExpressionSemantics
             case FunctionExpression function:
                 if (function.Window is not null
                     || function.Filter is not null
-                    || function.CountStar
                     || function.Distinct
                     || !IsDeterministicBuiltin(function))
                 {
@@ -593,7 +592,11 @@ internal static class IndexExpressionSemantics
     // by the registry lookup.
     private static bool IsDeterministicBuiltin(FunctionExpression function)
     {
-        if (EmbeddedDatabase.IsBuiltInAggregate(function)
+        if (!SqliteBuiltinFunctions.AcceptsCall(
+                function.Name,
+                function.Arguments.Count,
+                function.CountStar)
+            || EmbeddedDatabase.IsBuiltInAggregate(function)
             || EmbeddedDatabase.IsManagedPercentileAggregate(function.Name)
             || SqliteBuiltinFunctions.IsWindowOnly(function.Name))
         {

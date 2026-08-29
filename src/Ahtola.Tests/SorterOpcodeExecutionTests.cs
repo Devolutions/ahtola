@@ -290,6 +290,52 @@ public class SorterOpcodeExecutionTests
     }
 
     [Test]
+    public void AutomaticByteBudgetLeavesRoomToCreateSpillInfrastructure()
+    {
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: 2048,
+            temporaryDirectory: "sorter-automatic-budget",
+            metrics: metrics);
+        var values = Enumerable.Range(1, 100)
+            .Reverse()
+            .Select(static value => (long)value)
+            .ToArray();
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnSorterProgram(AscendingFirstColumn, values),
+            options);
+
+        DrainRows(statement)
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(Enumerable.Range(1, 100).Select(static value => (long)value));
+        metrics.SpillFilesCreated.Should().BeGreaterThan(0);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(2048);
+    }
+
+    [Test]
+    public void SpillEnabledStillBuffersASingleRowThatFitsTheBudget()
+    {
+        const long budget = 700;
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: budget,
+            temporaryDirectory: "sorter-single-row",
+            metrics: metrics);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            SingleColumnValueSpillSorterProgram(
+                AscendingFirstColumn,
+                bufferRowCapacity: 0,
+                SqlValue.Text(new string('x', 100))),
+            options);
+
+        DrainRows(statement).Should().ContainSingle();
+        metrics.SpillFilesCreated.Should().Be(0);
+    }
+
+    [Test]
     public void SorterConsolidatesManyRunsWithinConfiguredMergeFanIn()
     {
         var options = new VdbeExecutionOptions(

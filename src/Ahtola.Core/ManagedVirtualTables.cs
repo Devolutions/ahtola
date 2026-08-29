@@ -468,4 +468,13 @@ public static class ManagedVirtualTableModuleRegistry
         => TryResolve(name, out var module)
             ? module
             : throw new EmbeddedSqlException($"no such virtual table module: {name}");
+
+    internal static IReadOnlyList<string> AllNames
+    {
+        get
+        {
+            lock (Gate)
+                return Modules.Keys.ToArray();
+        }
+    }
 }

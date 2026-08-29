@@ -310,6 +310,142 @@ public sealed class ManagedScalarFunctionParityTests
             .Should().Be(SqlValue.Text("-0000-00-01 00:00:00.000"));
     }
 
+    [TestCase("SELECT iif(1, 'yes');", "yes")]
+    [TestCase("SELECT iif(0, 'no');", null)]
+    [TestCase("SELECT iif(0, 'a', 1, 'b', 1, 'c', 'fallback');", "b")]
+    [TestCase("SELECT iif(0, 'a', 0, 'b', 'fallback');", "fallback")]
+    [TestCase("SELECT if(1, 'yes');", "yes")]
+    [TestCase("SELECT if(0, 'a', 1, 'b', 'fallback');", "b")]
+    [TestCase("SELECT if(0, 'a', 0, 'b');", null)]
+    public void ManagedEngineEvaluatesVariadicIifAndIf(string sql, string? expected)
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        ReadValue(connection, sql).Should().Be(
+            expected is null ? SqlValue.Null : SqlValue.Text(expected));
+    }
+
+    [Test]
+    public void ManagedEngineShortCircuitsVariadicIifBranches()
+    {
+        using var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "boom",
+            0,
+            _ => throw new InvalidOperationException("unselected branch executed"));
+        using var connection = database.Connect();
+
+        ReadValue(connection, "SELECT iif(1, 'yes', boom());")
+            .Should().Be(SqlValue.Text("yes"));
+        Assert.Throws<EmbeddedSqlException>(
+                () => ReadValue(connection, "SELECT iif(1, 'yes', no_such_function());"))!
+            .Message.Should().Be("no such function: NO_SUCH_FUNCTION");
+        Assert.Throws<EmbeddedSqlException>(
+                () => ReadValue(connection, "SELECT iif(1, 'yes', abs());"))!
+            .Message.Should().Be("wrong number of arguments to function abs()");
+    }
+
+    [Test]
+    public void ManagedEngineMatchesTypelessAndIntegerCastSemantics()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        ReadValue(connection, "SELECT CAST(1 AS);").Should().Be(SqlValue.Integer(1));
+        ReadValue(connection, "SELECT CAST('hello' AS);").Should().Be(SqlValue.Integer(0));
+        ReadValue(connection, "SELECT CAST('123' AS);").Should().Be(SqlValue.Integer(123));
+        ReadValue(connection, "SELECT CAST('123.45' AS);").Should().Be(SqlValue.Real(123.45));
+        ReadValue(connection, "SELECT CAST('123e+5' AS INTEGER);").Should().Be(SqlValue.Integer(123));
+    }
+
+    [Test]
+    public void ManagedEngineUsesSqliteNulTerminatedTextSemantics()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        ReadValue(connection, "SELECT hex(substr('a' || char(0) || 'b', 1, 2));")
+            .Should().Be(SqlValue.Text("61"));
+        ReadValue(connection, "SELECT length('a' || char(0) || 'b');")
+            .Should().Be(SqlValue.Integer(1));
+        ReadValue(connection, "SELECT quote('abc' || char(0) || 'def');")
+            .Should().Be(SqlValue.Text("'abc'"));
+        ReadValue(connection, "SELECT unicode(char(0));").Should().Be(SqlValue.Null);
+    }
+
+    [Test]
+    public void ManagedEngineValidatesLikelihoodAndConcatWsArguments()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadValue(connection, "SELECT likelihood(1, 1.000001);"))!
+            .Message.Should().Be("second argument to likelihood() must be a constant between 0.0 and 1.0");
+        Assert.Throws<EmbeddedSqlException>(() => ReadValue(connection, "SELECT likelihood(1, 0.5 + 0.3);"))!
+            .Message.Should().Be("second argument to likelihood() must be a constant between 0.0 and 1.0");
+        Assert.Throws<EmbeddedSqlException>(() => ReadValue(connection, "SELECT concat_ws(',');"))!
+            .Message.Should().Be("wrong number of arguments to function concat_ws()");
+    }
+
+    [Test]
+    public void ManagedEngineMatchesTursoQuoteRealFallback()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        ReadValue(connection, "SELECT quote(CAST('2.042747795102219097e+05' AS REAL));")
+            .Should().Be(SqlValue.Text("2.042747795102219097e+05"));
+        ReadValue(connection, "SELECT quote(1e20);")
+            .Should().Be(SqlValue.Text("1.0e+20"));
+        ReadValue(connection, "SELECT quote(-0.0);")
+            .Should().Be(SqlValue.Text("0.0"));
+        ReadValue(connection, "SELECT sqlite_version(*);")
+            .Should().Be(SqlValue.Text(EmbeddedDatabase.SqliteCompatibilityVersion));
+    }
+
+    [Test]
+    public void ManagedEngineEnforcesLikePatternComplexity()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadValue(
+                connection,
+                "SELECT 'test' LIKE REPLACE(ZEROBLOB(50001), x'00', 'a');"))!
+            .Message.Should().Be("LIKE or GLOB pattern too complex");
+        ReadValue(
+                connection,
+                "SELECT 'test' LIKE REPLACE(ZEROBLOB(11000), x'00', '%');")
+            .Should().Be(SqlValue.Integer(0));
+    }
+
+    [Test]
+    public void ManagedEngineSupportsTursoTimeDateAndRejectsOverflow()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        var value = ReadValue(connection, "SELECT time_date(1970, 1, 1);");
+        value.Kind.Should().Be(SqlValueKind.Blob);
+        value.AsBlob().Length.Should().Be(13);
+        value.AsBlob().Span[0].Should().Be(1);
+        ReadValue(connection, "SELECT time_date(-1000, 11, 18);").Kind
+            .Should().Be(SqlValueKind.Blob);
+        ReadValue(connection, "SELECT time_date(2147483647, 2147483647, 2147483647);")
+            .Should().Be(SqlValue.Null);
+        ReadValue(connection, "SELECT time_date(-262145, 13, 1);")
+            .Should().Be(SqlValue.Null);
+        ReadValue(connection, "SELECT time_date(262143, 0, 1);")
+            .Should().Be(SqlValue.Null);
+        ReadValue(connection, "SELECT time_date(-262144, 1, 1);").Kind
+            .Should().Be(SqlValueKind.Blob);
+        ReadValue(connection, "SELECT time_date(262142, 12, 31, 23, 59, 59, 999999999);").Kind
+            .Should().Be(SqlValueKind.Blob);
+    }
+
+    [Test]
+    public void ManagedEngineRejectsOutOfRangeUnixepochBeforeUtcConversion()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        ReadValue(connection, "SELECT strftime('%Y', -9e18, 'unixepoch', 'utc');")
+            .Should().Be(SqlValue.Null);
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);

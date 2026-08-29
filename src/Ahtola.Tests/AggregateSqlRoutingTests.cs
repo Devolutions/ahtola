@@ -93,6 +93,22 @@ public class AggregateSqlRoutingTests
     }
 
     [Test]
+    public void AggregateOrderOverridesConsumedBaseIndexOrderAndBreaksTiesByGroupKey()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(name TEXT, age INTEGER);");
+        Execute(connection, "CREATE INDEX age_idx ON t(age);");
+        Execute(connection, "INSERT INTO t VALUES ('a', 100), ('c', 100), ('b', 100);");
+
+        ReadRows(
+                connection,
+                "SELECT name, round(avg(age)) FROM t "
+                + "GROUP BY name HAVING avg(age) > 97 ORDER BY avg(age) DESC LIMIT 3;")
+                .Select(row => row[0].AsText())
+                .Should().Equal("c", "b", "a");
+    }
+
+    [Test]
     public void GroupByWithoutOrderByEmitsGroupsInSortedKeyOrder()
     {
         // SQLite aggregates through a sorter, so grouped queries without ORDER BY observe

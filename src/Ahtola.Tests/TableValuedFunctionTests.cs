@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using AwesomeAssertions;
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
 
@@ -158,6 +159,73 @@ public class TableValuedFunctionTests
     }
 
     [Test]
+    public void PragmaEponymousModulesExposeSchemaAndFunctionMetadata()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        Rows(connection, "PRAGMA table_info(sqlite_schema);")
+            .Should().Equal(
+            [
+                "0|type|TEXT|0||0",
+                "1|name|TEXT|0||0",
+                "2|tbl_name|TEXT|0||0",
+                "3|rootpage|INT|0||0",
+                "4|sql|TEXT|0||0",
+            ]);
+        Rows(
+                connection,
+                "SELECT name, builtin, type, enc, narg, flags "
+                + "FROM pragma_function_list WHERE name = 'abs';")
+            .Should().Equal(["abs|1|s|utf8|1|2099200"]);
+        Rows(connection, "SELECT name FROM pragma_module_list WHERE name = 'generate_series';")
+            .Should().Equal(["generate_series"]);
+        Rows(
+                connection,
+                "SELECT name FROM pragma_module_list "
+                + "WHERE name IN ('fts5', 'rtree', 'rtree_i32') ORDER BY name;")
+            .Should().Equal(["fts5", "rtree", "rtree_i32"]);
+        Rows(connection, "SELECT name FROM pragma_function_list WHERE name = 'is_autocommit';")
+            .Should().BeEmpty();
+        Rows(connection, "PRAGMA table_info(sqlite_temp_schema);")
+            .Should().HaveCount(5);
+        Rows(connection, "PRAGMA main.table_info(sqlite_temp_schema);")
+            .Should().BeEmpty();
+        Rows(connection, "SELECT * FROM pragma_table_info('sqlite_temp_schema', 'main');")
+            .Should().BeEmpty();
+
+        Action unsupported = () => connection.Prepare("SELECT * FROM pragma_wal_checkpoint();");
+        unsupported.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: pragma_wal_checkpoint*");
+    }
+
+    [Test]
+    public void PragmaFunctionListRetainsRegisteredFunctionsThroughCtas()
+    {
+        using var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction("registered_scalar", 0, _ => SqlValue.Integer(1));
+        using var connection = database.Connect();
+
+        Execute(
+            connection,
+            "CREATE TABLE function_snapshot AS "
+            + "SELECT name FROM pragma_function_list WHERE name = 'registered_scalar';");
+        Execute(
+            connection,
+            "CREATE TABLE series_snapshot AS "
+            + "SELECT value FROM generate_series(2, 4);");
+        Execute(
+            connection,
+            "CREATE TABLE table_snapshot AS "
+            + "SELECT name FROM pragma_table_list() WHERE name = 'series_snapshot';");
+
+        Rows(connection, "SELECT name FROM function_snapshot;")
+            .Should().Equal(["registered_scalar"]);
+        Rows(connection, "SELECT value FROM series_snapshot ORDER BY value;")
+            .Should().Equal(["2", "3", "4"]);
+        Rows(connection, "SELECT name FROM table_snapshot;")
+            .Should().Equal(["series_snapshot"]);
+    }
+
+    [Test]
     public void GenerateSeriesAcceptsSqliteArgumentForms()
     {
         using var database = new EmbeddedDatabase();
@@ -241,6 +309,49 @@ public class TableValuedFunctionTests
             .Should().Equal(["7", "8", "9"]);
         Rows(connection, "SELECT s.value FROM t JOIN generate_series(1, t.a) AS s;")
             .Should().Equal(["1", "1", "2"]);
+    }
+
+    [Test]
+    public void PragmaTableInfoCanDependOnEitherJoinSide()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE users(id, name);");
+        Execute(connection, "CREATE TABLE products(id, price);");
+
+        var expected = new[] { "users|id", "users|name", "products|id", "products|price" };
+        Rows(
+                connection,
+                "SELECT s.name, ti.name FROM sqlite_schema AS s, pragma_table_info(s.name) AS ti;")
+            .Should().Equal(expected);
+        Rows(
+                connection,
+                "SELECT s.name, ti.name FROM pragma_table_info(s.name) AS ti, sqlite_schema AS s;")
+            .Should().Equal(expected);
+        Rows(
+                connection,
+                "SELECT ti.name FROM (SELECT 'users' AS table_name) AS t "
+                + "JOIN pragma_table_info AS ti ON ti.arg = lower(t.table_name);")
+            .Should().Equal(["id", "name"]);
+        Rows(connection, "SELECT ti.name FROM pragma_table_info AS ti WHERE arg = name;")
+            .Should().BeEmpty();
+    }
+
+    [Test]
+    public void FileBackedSchemaTablePreservesTableCreationOrder()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile("schema-order.db", fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE users(id, name);");
+            Execute(connection, "CREATE TABLE products(id, price);");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile("schema-order.db", fileSystem);
+        using var reader = reopened.Connect();
+        Rows(reader, "SELECT name FROM sqlite_schema WHERE type = 'table';")
+            .Should().Equal(["users", "products"]);
     }
 
     [Test]

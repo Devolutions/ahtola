@@ -3302,10 +3302,10 @@ public sealed class VdbeProgram
                     break;
                 case CastInstruction cast:
                     ValidateRegister(cast.Value, instructionIndex);
-                    if (string.IsNullOrWhiteSpace(cast.TypeName))
+                    if (cast.TypeName is null)
                     {
                         throw new VdbeProgramValidationException(
-                            $"VDBE instruction {instructionIndex} casts to an empty type name.");
+                            $"VDBE instruction {instructionIndex} casts without a type-name value.");
                     }
 
                     break;

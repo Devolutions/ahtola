@@ -105,6 +105,24 @@ public class GeneratedColumnsTests
     }
 
     [Test]
+    public void NullaryStarredFunctionsRemainValidInSchemaExpressions()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Execute(
+            connection,
+            "CREATE TABLE t("
+            + "value INTEGER CHECK(pi(*) > 3), "
+            + "p REAL AS (pi(*)));");
+        Execute(connection, "CREATE INDEX t_pi ON t(pi(*));");
+        Execute(connection, "INSERT INTO t(value) VALUES (1);");
+
+        Query(connection, "SELECT p = pi() FROM t;").Single()
+            .Should().Equal(SqlValue.Integer(1));
+    }
+
+    [Test]
     public void DefaultInsertColumnListExcludesGeneratedColumn()
     {
         // With v generated, a bare INSERT ... VALUES supplies only the non-generated column.

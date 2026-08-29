@@ -168,6 +168,14 @@ internal sealed class PragmaIntrospectionModule(
             return [];
 
         var argument = TableValuedFunctionRows.CoerceToText(call.Arguments[0]);
+        if (call.Schema is { } schema
+            && !schema.Equals("temp", StringComparison.OrdinalIgnoreCase)
+            && (argument.Equals("sqlite_temp_master", StringComparison.OrdinalIgnoreCase)
+                || argument.Equals("sqlite_temp_schema", StringComparison.OrdinalIgnoreCase)))
+        {
+            return [];
+        }
+
         var result = EmbeddedDatabase.ExecuteIntrospectionPragma(_build(argument), call.Context);
         return TableValuedFunctionRows.AppendArguments(result.Rows, call.Arguments, Schema);
     }
@@ -221,6 +229,39 @@ internal sealed class PragmaCacheSizeModule : TableValuedFunctionModule
 
     public override IReadOnlyList<SqlValue[]> Enumerate(TableValuedFunctionCall call)
         => [[SqlValue.Integer(DefaultCacheSize), call.Arguments[0]]];
+}
+
+internal sealed class PragmaFunctionListModule : TableValuedFunctionModule
+{
+    public override string Name => "pragma_function_list";
+
+    public override TableValuedFunctionSchema Schema { get; } = new(
+        ["name", "builtin", "type", "enc", "narg", "flags"],
+        [],
+        [
+            ColumnAffinity.Text,
+            ColumnAffinity.Integer,
+            ColumnAffinity.Text,
+            ColumnAffinity.Text,
+            ColumnAffinity.Integer,
+            ColumnAffinity.Integer,
+        ]);
+
+    public override IReadOnlyList<SqlValue[]> Enumerate(TableValuedFunctionCall call)
+        => EmbeddedDatabase.BuildPragmaFunctionListRows(call.Context.Database);
+}
+
+internal sealed class PragmaModuleListModule : TableValuedFunctionModule
+{
+    public override string Name => "pragma_module_list";
+
+    public override TableValuedFunctionSchema Schema { get; } = new(
+        ["name"],
+        [],
+        [ColumnAffinity.Text]);
+
+    public override IReadOnlyList<SqlValue[]> Enumerate(TableValuedFunctionCall call)
+        => EmbeddedDatabase.BuildPragmaModuleListRows();
 }
 
 internal static class TableValuedFunctionRows
