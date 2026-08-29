@@ -476,10 +476,8 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             // Both hosts open onto the still-partial replica: each attaches its own reference-
             // counted Lease onto the SAME underlying ManagedReplicaPageMaterializingFileSystem
             // (see ManagedReplicaPageMaterializationRegistry.Acquire).
-            using var connectionA = AhtolaConnection.CreateReplica(options);
-            using var connectionB = AhtolaConnection.CreateReplica(options);
-            connectionA.Open();
-            connectionB.Open();
+            using var hostA = ManagedReplicaConnectionHost.Open(options);
+            using var hostB = ManagedReplicaConnectionHost.Open(options);
 
             var paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -496,24 +494,37 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                        release.Task.GetAwaiter().GetResult();
                    }))
             {
-                // Host B's own sync acquires the publication gate first and pauses there --
-                // still holding it -- immediately before it would complete the partial image
-                // (deleting the sidecar) and reopen every registered host, including host A.
-                var syncB = Task.Run(
-                    () => connectionB.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                // Use a non-coalesced publication for host B. A second SyncAsync would join host A's
+                // single-flight task and never run its own publication body, which would not exercise
+                // the retained-materializer turnover this regression protects.
+                var publicationB = Task.Run(
+                    () => hostB.QuiesceAndReopenAsync(
+                        async token =>
+                        {
+                            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)
+                                ?? throw new InvalidDataException(
+                                    "Managed replica metadata disappeared during materializer turnover.");
+                            _ = await ManagedReplicaBootstrapper.CompletePartialReplicaAsync(
+                                    options,
+                                    metadata,
+                                    allowTrackedLocalMutations: false,
+                                    retainedMaterializer: null,
+                                    token)
+                                .ConfigureAwait(false);
+                        },
+                        CancellationToken.None));
                 await paused.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
                 // Host A's own sync now queues behind host B's held gate. With the fix, host A's
                 // gated PreparePushAndPartialReplicaAsync has not run yet -- and will not until
                 // host B's publication (and its reopen pass across every host) has fully
                 // completed -- so it has not read _materializationLease at all yet.
-                var syncA = connectionA.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+                var syncA = hostA.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
                 await Task.Delay(TimeSpan.FromMilliseconds(250));
                 syncA.IsCompleted.Should().BeFalse();
 
                 release.TrySetResult();
-                var resultB = await syncB.WaitAsync(TimeSpan.FromSeconds(5));
-                resultB.Outcome.Should().Be(AhtolaSyncOutcome.UpToDate);
+                await publicationB.WaitAsync(TimeSpan.FromSeconds(5));
 
                 // Host B's publication has now completed the partial image and reopened every
                 // host, including host A, which disposed host A's OWN retained lease (the
