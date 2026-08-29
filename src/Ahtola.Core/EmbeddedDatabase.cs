@@ -2261,54 +2261,88 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         lock (_gate)
         {
-            if (_fileStore is not null)
-            {
-                if (_fileCatalogWriteLock is null)
-                    throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+            RefreshTransactionSnapshotCatalogLocked(busyTimeout);
+            return CloneTransactionSnapshotLocked();
+        }
+    }
 
-                using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
-                {
-                    if (_foreignReadOnly)
-                    {
-                        RefreshForeignCatalogIfChangedLocked();
-                    }
-                    else
-                    {
-                        // BEGIN has no working state yet, so a stale snapshot is
-                        // simply re-read: the same catalog a freshly opened SQLite
-                        // connection would observe.
-                        while (true)
-                        {
-                            try
-                            {
-                                EnsureFileCatalogVersionCurrent(busyTimeout);
-                                break;
-                            }
-                            catch (EmbeddedCatalogSnapshotStaleException)
-                            {
-                                if (TryReloadFileCatalogIfChanged())
-                                    break;
-                                // The reload lost a mid-flight commit race; loop
-                                // to re-wait for stability and try again.
-                            }
-                        }
-                    }
-                }
+    internal (MvccTxId TransactionId, TransactionSnapshot Snapshot)
+        BeginConcurrentTransactionSnapshot(
+            TimeSpan busyTimeout,
+            Action? afterBegin)
+    {
+        lock (_gate)
+        {
+            RefreshTransactionSnapshotCatalogLocked(busyTimeout);
+            var store = _mvStore
+                ?? throw new InvalidOperationException(
+                    "A concurrent transaction snapshot requires an attached MVCC store.");
+            var transaction = store.BeginTransaction(store.SchemaGeneration);
+            try
+            {
+                afterBegin?.Invoke();
+                return (transaction.Id, CloneTransactionSnapshotLocked());
+            }
+            catch
+            {
+                store.Rollback(transaction.Id);
+                throw;
+            }
+        }
+    }
+
+    internal bool IsTransactionSnapshotGateHeldForTesting => Monitor.IsEntered(_gate);
+
+    private void RefreshTransactionSnapshotCatalogLocked(TimeSpan busyTimeout)
+    {
+        if (_fileStore is null)
+            return;
+        if (_fileCatalogWriteLock is null)
+            throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+
+        using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
+        {
+            if (_foreignReadOnly)
+            {
+                RefreshForeignCatalogIfChangedLocked();
+                return;
             }
 
-            var pragmaHeader = _fileStore is null
-                ? _inMemoryPragmaHeader
-                : new PragmaHeaderMetadata(
-                    unchecked((int)_fileCatalogVersion.SchemaCookie),
-                    _fileCatalogVersion.UserVersion,
-                    _fileCatalogVersion.ApplicationId);
-            var catalog = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
-            _activeTransactions = checked(_activeTransactions + 1);
-            return new TransactionSnapshot(
-                catalog,
-                _version,
-                pragmaHeader);
+            // BEGIN has no working state yet, so a stale snapshot is simply
+            // re-read: the same catalog a freshly opened SQLite connection
+            // would observe.
+            while (true)
+            {
+                try
+                {
+                    EnsureFileCatalogVersionCurrent(busyTimeout);
+                    return;
+                }
+                catch (EmbeddedCatalogSnapshotStaleException)
+                {
+                    if (TryReloadFileCatalogIfChanged())
+                        return;
+                    // The reload lost a mid-flight commit race; loop to
+                    // re-wait for stability and try again.
+                }
+            }
         }
+    }
+
+    private TransactionSnapshot CloneTransactionSnapshotLocked()
+    {
+        var pragmaHeader = _fileStore is null
+            ? _inMemoryPragmaHeader
+            : new PragmaHeaderMetadata(
+                unchecked((int)_fileCatalogVersion.SchemaCookie),
+                _fileCatalogVersion.UserVersion,
+                _fileCatalogVersion.ApplicationId);
+        var catalog = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
+        _activeTransactions = checked(_activeTransactions + 1);
+        return new TransactionSnapshot(
+            catalog,
+            _version,
+            pragmaHeader);
     }
 
     internal SqlValue EvaluateConstant(Expression expression, SqlValue[] parameters, long lastInsertRowId)
@@ -44710,7 +44744,9 @@ public sealed partial class EmbeddedConnection : IDisposable
     private EmbeddedDatabase? _transactionWriteDatabase;
     private EmbeddedDatabase? _transactionMutationDatabase;
     private EmbeddedDatabase? _autocommitWriteReservation;
+    private IDisposable? _autocommitMvccWriteAdmission;
     private readonly List<EmbeddedDatabase> _writeReservations = [];
+    private readonly Dictionary<EmbeddedDatabase, IDisposable> _classicMvccWriteAdmissions = [];
     private bool _transactionOpenedBySavepoint;
     /// <summary>When set, the open SQL transaction is a Turso <c>BEGIN CONCURRENT</c> MVCC tx.</summary>
     private bool _transactionIsConcurrent;
@@ -49465,12 +49501,27 @@ Func<string, ParsedStatement> rewrite)
                 // catalog snapshot being captured here.
                 if (concurrent
                     && ReferenceEquals(database, _database)
-                    && database.MvStore is { } store)
+                    && database.MvStore is not null)
                 {
-                    var expectedSchemaGeneration = store.SchemaGeneration;
-                    var tx = store.BeginTransaction(expectedSchemaGeneration);
-                    mvccTxs.Add(database, tx.Id);
-                    AfterMvccBeginBeforeCatalogSnapshotForTesting?.Invoke();
+                    var concurrentSnapshot = database.BeginConcurrentTransactionSnapshot(
+                        BusyTimeout,
+                        AfterMvccBeginBeforeCatalogSnapshotForTesting);
+                    mvccTxs.Add(database, concurrentSnapshot.TransactionId);
+                    try
+                    {
+                        states.Add(database, new TransactionDatabaseState(
+                            concurrentSnapshot.Snapshot.Catalog,
+                            concurrentSnapshot.Snapshot.Version,
+                            concurrentSnapshot.Snapshot.PragmaHeader));
+                    }
+                    catch
+                    {
+                        mvccTxs.Remove(database);
+                        database.MvStore?.Rollback(concurrentSnapshot.TransactionId);
+                        database.EndTransaction();
+                        throw;
+                    }
+                    continue;
                 }
                 else if (!concurrent
                     && database.MvStore is { } exclusiveStore
@@ -49556,6 +49607,9 @@ Func<string, ParsedStatement> rewrite)
         for (var index = _writeReservations.Count - 1; index >= 0; index--)
             _writeReservations[index].TransactionLock.Exit(this);
         _writeReservations.Clear();
+        foreach (var admission in _classicMvccWriteAdmissions.Values)
+            admission.Dispose();
+        _classicMvccWriteAdmissions.Clear();
     }
 
     private void EnsureTransactionMayMutate(EmbeddedDatabase database, ParsedStatement statement)
@@ -49597,38 +49651,71 @@ Func<string, ParsedStatement> rewrite)
         if (!StatementMayMutate(database, statement))
             return false;
 
-        if (_transactionDatabases is null)
+        IDisposable? newClassicAdmission = null;
+        var retainClassicAdmission = false;
+        if (!ReferenceEquals(database, _tempDatabase)
+            && !_mvccTransactions.ContainsKey(database))
         {
-            // An autocommit write takes the write reservation for the whole
-            // statement, exactly like SQLite's implicit write transaction:
-            // contenders then block through the current writer's statement
-            // burst and evaluate against the committed state it leaves behind,
-            // instead of slipping into the gap between a peer's commit and its
-            // next autocommit statement (ENGINE #17 EF migrations-lock convoy).
-            // The catalog was refreshed at statement entry, before this
-            // reservation was taken, so re-sync it now that the lock is held:
-            // the statement must decide against the committed state it
-            // serializes with, the way native reads the btree under the write
-            // lock.
-            database.TransactionLock.EnterAutocommit(this, BusyTimeout);
-            try
+            database.EnsureMvccAttachedIfDurable();
+            if (database.MvStore is { } store
+                && (_transactionDatabases is null
+                    || !_classicMvccWriteAdmissions.ContainsKey(database)))
             {
-                database.RefreshOwnedCatalogForStatementIfNeeded();
+                newClassicAdmission = store.EnterClassicWrite();
+                retainClassicAdmission = _transactionDatabases is not null;
             }
-            catch
+        }
+
+        try
+        {
+            if (_transactionDatabases is null)
             {
-                database.TransactionLock.Exit(this);
-                throw;
+                // An autocommit write takes the write reservation for the whole
+                // statement, exactly like SQLite's implicit write transaction:
+                // contenders then block through the current writer's statement
+                // burst and evaluate against the committed state it leaves behind,
+                // instead of slipping into the gap between a peer's commit and its
+                // next autocommit statement (ENGINE #17 EF migrations-lock convoy).
+                // The catalog was refreshed at statement entry, before this
+                // reservation was taken, so re-sync it now that the lock is held:
+                // the statement must decide against the committed state it
+                // serializes with, the way native reads the btree under the write
+                // lock.
+                database.TransactionLock.EnterAutocommit(this, BusyTimeout);
+                try
+                {
+                    database.RefreshOwnedCatalogForStatementIfNeeded();
+                }
+                catch
+                {
+                    database.TransactionLock.Exit(this);
+                    throw;
+                }
+
+                _autocommitMvccWriteAdmission = newClassicAdmission;
+                newClassicAdmission = null;
+                _autocommitWriteReservation = database;
+                _transactionMutationDatabase = database;
+                return true;
             }
 
-            _autocommitWriteReservation = database;
+            ReserveWriteAccess(database);
+            if (retainClassicAdmission)
+            {
+                _classicMvccWriteAdmissions.Add(
+                    database,
+                    newClassicAdmission
+                        ?? throw new InvalidOperationException(
+                            "The MVCC classic-writer admission was lost."));
+                newClassicAdmission = null;
+            }
             _transactionMutationDatabase = database;
             return true;
         }
-
-        ReserveWriteAccess(database);
-        _transactionMutationDatabase = database;
-        return true;
+        finally
+        {
+            newClassicAdmission?.Dispose();
+        }
     }
 
     /// <summary>
@@ -49689,7 +49776,16 @@ Func<string, ParsedStatement> rewrite)
         if (ReferenceEquals(_autocommitWriteReservation, database))
         {
             _autocommitWriteReservation = null;
-            database.TransactionLock.Exit(this);
+            try
+            {
+                database.TransactionLock.Exit(this);
+            }
+            finally
+            {
+                var admission = _autocommitMvccWriteAdmission;
+                _autocommitMvccWriteAdmission = null;
+                admission?.Dispose();
+            }
         }
     }
 

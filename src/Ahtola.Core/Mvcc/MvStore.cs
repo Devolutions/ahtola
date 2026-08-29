@@ -315,6 +315,7 @@ internal sealed class MvStore
     private ulong _lastCommittedTimestamp;
     private ulong _checkpointGeneration;
     private ulong? _schemaChangeTransaction;
+    private int _activeClassicWriters;
     private bool _checkpointInProgress;
     private bool _hasUnresolvedLegacyRows;
     private bool _hasIndeterminateCommit;
@@ -613,6 +614,17 @@ internal sealed class MvStore
         }
     }
 
+    internal IDisposable EnterClassicWrite()
+    {
+        lock (_gate)
+        {
+            if (_schemaChangeTransaction is not null)
+                throw new EmbeddedBusyException();
+            _activeClassicWriters = checked(_activeClassicWriters + 1);
+            return new ClassicWriteLease(this);
+        }
+    }
+
     internal MvccTransaction BeginExclusiveTransaction(MvccTxId? existing = null)
     {
         lock (_gate)
@@ -682,6 +694,8 @@ internal sealed class MvStore
             if (tx.BeginCommitGeneration != _commitGeneration)
                 throw new EmbeddedBusyException();
             if (_schemaChangeTransaction is { } owner && owner != id.Value)
+                throw new EmbeddedBusyException();
+            if (_activeClassicWriters != 0)
                 throw new EmbeddedBusyException();
 
             EnsureSchemaOwnerIsOnlyTransactionLocked(id, busyOnConflict: true);
@@ -1715,6 +1729,27 @@ internal sealed class MvStore
         {
             var store = Interlocked.Exchange(ref _store, null);
             store?.ReleaseCheckpoint();
+        }
+    }
+
+    private void ReleaseClassicWrite()
+    {
+        lock (_gate)
+        {
+            if (_activeClassicWriters == 0)
+                throw new InvalidOperationException("MVCC classic-writer admission count underflow.");
+            _activeClassicWriters--;
+        }
+    }
+
+    private sealed class ClassicWriteLease(MvStore store) : IDisposable
+    {
+        private MvStore? _store = store;
+
+        public void Dispose()
+        {
+            var owner = Interlocked.Exchange(ref _store, null);
+            owner?.ReleaseClassicWrite();
         }
     }
 
