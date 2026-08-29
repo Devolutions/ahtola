@@ -361,7 +361,60 @@ public sealed class MvccSelectDualCursorRoutingTests
     }
 
     [Test]
-    public void MvccBeginRegistersBeforeCatalogCloneCanRaceSchemaPublication()
+    public async Task ClassicWriterWaitsForSchemaPublicationWithinBusyTimeout()
+    {
+        using var db = new RoutingFileDatabase();
+        using var schemaWriter = db.Connect();
+        using var classicWriter = db.Connect();
+
+        schemaWriter.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        classicWriter.ExecuteNonQuery("PRAGMA busy_timeout=2000;");
+        schemaWriter.ExecuteNonQuery("BEGIN CONCURRENT;");
+        schemaWriter.ExecuteNonQuery("CREATE TABLE added(v INTEGER);");
+
+        var write = Task.Run(() => classicWriter.ExecuteNonQuery("INSERT INTO t VALUES (99);"));
+        await Task.Delay(100);
+        write.IsCompleted.Should().BeFalse();
+
+        schemaWriter.ExecuteNonQuery("COMMIT;");
+        await write.WaitAsync(TimeSpan.FromSeconds(5));
+        Convert.ToInt64(Scalar(classicWriter, "SELECT COUNT(*) FROM t WHERE v=99;"))
+            .Should().Be(1L);
+    }
+
+    [Test]
+    public async Task SchemaPublicationWaitsForDeferredClassicWriterWithinBusyTimeout()
+    {
+        using var db = new RoutingFileDatabase();
+        using var classicWriter = db.Connect();
+        using var schemaWriter = db.Connect();
+
+        classicWriter.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        schemaWriter.ExecuteNonQuery("PRAGMA busy_timeout=2000;");
+        classicWriter.ExecuteNonQuery("BEGIN;");
+        classicWriter.ExecuteNonQuery("INSERT INTO t VALUES (99);");
+        schemaWriter.ExecuteNonQuery("BEGIN CONCURRENT;");
+
+        var schemaChange = Task.Run(
+            () => Capture(
+                () => schemaWriter.ExecuteNonQuery("CREATE TABLE added(v INTEGER);")));
+        await Task.Delay(100);
+        schemaChange.IsCompleted.Should().BeFalse();
+
+        classicWriter.ExecuteNonQuery("COMMIT;");
+        var staleSchema = await schemaChange.WaitAsync(TimeSpan.FromSeconds(5));
+        staleSchema.Should().NotBeNull();
+        staleSchema!.Message.Should().ContainEquivalentOf("locked");
+        schemaWriter.ExecuteNonQuery("ROLLBACK;");
+        schemaWriter.ExecuteNonQuery("BEGIN CONCURRENT;");
+        schemaWriter.ExecuteNonQuery("CREATE TABLE added(v INTEGER);");
+        schemaWriter.ExecuteNonQuery("COMMIT;");
+        Convert.ToInt64(Scalar(schemaWriter, "SELECT COUNT(*) FROM t WHERE v=99;"))
+            .Should().Be(1L);
+    }
+
+    [Test]
+    public async Task MvccBeginRegistersBeforeCatalogCloneCanRaceSchemaPublication()
     {
         var fileSystem = new Ahtola.Core.Storage.InMemoryFileSystem();
         const string path = "mvcc-begin-schema-race.db";
@@ -372,6 +425,8 @@ public sealed class MvccSelectDualCursorRoutingTests
         Execute(reader, "PRAGMA journal_mode=mvcc;");
         Exception? rejected = null;
         var snapshotGateHeld = false;
+        Task? schemaAttempt = null;
+        using var peerStarted = new ManualResetEventSlim();
 
         try
         {
@@ -379,10 +434,16 @@ public sealed class MvccSelectDualCursorRoutingTests
             {
                 EmbeddedConnection.AfterMvccBeginBeforeCatalogSnapshotForTesting = null;
                 snapshotGateHeld = database.IsTransactionSnapshotGateHeldForTesting;
-                Execute(schemaWriter, "BEGIN CONCURRENT;");
-                rejected = Capture(
-                    () => Execute(schemaWriter, "CREATE TABLE raced(v INTEGER);"));
-                Execute(schemaWriter, "ROLLBACK;");
+                schemaAttempt = Task.Run(() =>
+                {
+                    peerStarted.Set();
+                    Execute(schemaWriter, "BEGIN CONCURRENT;");
+                    rejected = Capture(
+                        () => Execute(schemaWriter, "CREATE TABLE raced(v INTEGER);"));
+                    Execute(schemaWriter, "ROLLBACK;");
+                });
+                peerStarted.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue();
+                Thread.Sleep(100);
             };
             Execute(reader, "BEGIN CONCURRENT;");
         }
@@ -391,6 +452,7 @@ public sealed class MvccSelectDualCursorRoutingTests
             EmbeddedConnection.AfterMvccBeginBeforeCatalogSnapshotForTesting = null;
         }
 
+        await schemaAttempt!.WaitAsync(TimeSpan.FromSeconds(5));
         snapshotGateHeld.Should().BeTrue();
         rejected.Should().NotBeNull();
         rejected!.Message.Should().ContainEquivalentOf("locked");
@@ -405,11 +467,12 @@ public sealed class MvccSelectDualCursorRoutingTests
     {
         var fileSystem = new Ahtola.Core.Storage.InMemoryFileSystem();
         const string path = "mvcc-begin-checkpoint-race.db";
-        using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
-        using var reader = database.Connect();
-        using var peer = database.Connect();
+        using var readerDatabase = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reader = readerDatabase.Connect();
         Execute(reader, "CREATE TABLE t(v INTEGER);");
         Execute(reader, "PRAGMA journal_mode=mvcc;");
+        using var peerDatabase = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var peer = peerDatabase.Connect();
         Task? peerCheckpoint = null;
         using var peerStarted = new ManualResetEventSlim();
 

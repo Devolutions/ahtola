@@ -1,4 +1,5 @@
 using Ahtola.Core.Storage;
+using System.Diagnostics;
 
 namespace Ahtola.Core.Mvcc;
 
@@ -316,6 +317,7 @@ internal sealed class MvStore
     private ulong _checkpointGeneration;
     private ulong? _schemaChangeTransaction;
     private int _activeClassicWriters;
+    private int _snapshotBeginsInProgress;
     private bool _checkpointInProgress;
     private bool _hasUnresolvedLegacyRows;
     private bool _hasIndeterminateCommit;
@@ -614,14 +616,29 @@ internal sealed class MvStore
         }
     }
 
-    internal IDisposable EnterClassicWrite()
+    internal IDisposable EnterClassicWrite(TimeSpan timeout)
     {
         lock (_gate)
         {
-            if (_schemaChangeTransaction is not null)
-                throw new EmbeddedBusyException();
+            WaitWhileLocked(() => _schemaChangeTransaction is not null, timeout);
             _activeClassicWriters = checked(_activeClassicWriters + 1);
             return new ClassicWriteLease(this);
+        }
+    }
+
+    internal IDisposable EnterSnapshotBegin()
+    {
+        lock (_gate)
+        {
+            if (_checkpointInProgress
+                || _exclusiveTxId is not null
+                || _schemaChangeTransaction is not null)
+            {
+                throw new EmbeddedBusyException();
+            }
+
+            _snapshotBeginsInProgress = checked(_snapshotBeginsInProgress + 1);
+            return new SnapshotBeginLease(this);
         }
     }
 
@@ -635,6 +652,7 @@ internal sealed class MvStore
                     "The MVCC store has an indeterminate logical-log commit; dispose and reopen the database before starting another transaction.");
             }
             if (_checkpointInProgress
+                || _snapshotBeginsInProgress != 0
                 || (_schemaChangeTransaction is { } schemaOwner
                     && (existing is null || schemaOwner != existing.Value.Value))
                 || (_exclusiveTxId is { } held
@@ -682,7 +700,7 @@ internal sealed class MvStore
     /// pinned an MVCC snapshot; publishing a schema against that snapshot would
     /// otherwise leave compiled cursors with stale object bindings.
     /// </summary>
-    internal void BeginSchemaChange(MvccTxId id)
+    internal void BeginSchemaChange(MvccTxId id, TimeSpan timeout = default)
     {
         lock (_gate)
         {
@@ -695,8 +713,9 @@ internal sealed class MvStore
                 throw new EmbeddedBusyException();
             if (_schemaChangeTransaction is { } owner && owner != id.Value)
                 throw new EmbeddedBusyException();
-            if (_activeClassicWriters != 0)
-                throw new EmbeddedBusyException();
+            WaitWhileLocked(
+                () => _activeClassicWriters != 0 || _snapshotBeginsInProgress != 0,
+                timeout);
 
             EnsureSchemaOwnerIsOnlyTransactionLocked(id, busyOnConflict: true);
 
@@ -724,6 +743,7 @@ internal sealed class MvStore
             if (_schemaChangeTransaction == id.Value)
             {
                 _schemaChangeTransaction = null;
+                Monitor.PulseAll(_gate);
                 if (_transactions.TryGetValue(id.Value, out var tx)
                     && tx.State == MvccTransactionState.Active)
                 {
@@ -803,6 +823,7 @@ internal sealed class MvStore
 
             _schemaGeneration = tx.EffectiveSchemaGeneration;
             _schemaChangeTransaction = null;
+            Monitor.PulseAll(_gate);
 
             // The just-published catalog is a complete page-native image of this
             // transaction, including its DML. The pre-DDL checkpoint retired every
@@ -1361,6 +1382,7 @@ internal sealed class MvStore
         if (_schemaChangeTransaction == id.Value)
         {
             _schemaChangeTransaction = null;
+            Monitor.PulseAll(_gate);
             RemoveUnpublishedSchemaIdentitiesLocked(tx.BeginSchemaGeneration);
         }
         _finalizedStates[id.Value] = MvccTransactionState.Aborted;
@@ -1565,6 +1587,7 @@ internal sealed class MvStore
         lock (_gate)
         {
             if (_checkpointInProgress
+                || _snapshotBeginsInProgress != 0
                 || (_schemaChangeTransaction is { } schemaOwner
                     && schemaOwner != permittedTransaction?.Value)
                 || HasCheckpointBlockingTransactionLocked(permittedTransaction))
@@ -1713,6 +1736,7 @@ internal sealed class MvStore
             if (!_checkpointInProgress)
                 throw new InvalidOperationException("The MVCC checkpoint lease is not held.");
             _checkpointInProgress = false;
+            Monitor.PulseAll(_gate);
         }
     }
 
@@ -1739,6 +1763,7 @@ internal sealed class MvStore
             if (_activeClassicWriters == 0)
                 throw new InvalidOperationException("MVCC classic-writer admission count underflow.");
             _activeClassicWriters--;
+            Monitor.PulseAll(_gate);
         }
     }
 
@@ -1750,6 +1775,49 @@ internal sealed class MvStore
         {
             var owner = Interlocked.Exchange(ref _store, null);
             owner?.ReleaseClassicWrite();
+        }
+    }
+
+    private void ReleaseSnapshotBegin()
+    {
+        lock (_gate)
+        {
+            if (_snapshotBeginsInProgress == 0)
+                throw new InvalidOperationException("MVCC snapshot-begin admission count underflow.");
+            _snapshotBeginsInProgress--;
+            Monitor.PulseAll(_gate);
+        }
+    }
+
+    private sealed class SnapshotBeginLease(MvStore store) : IDisposable
+    {
+        private MvStore? _store = store;
+
+        public void Dispose()
+        {
+            var owner = Interlocked.Exchange(ref _store, null);
+            owner?.ReleaseSnapshotBegin();
+        }
+    }
+
+    private void WaitWhileLocked(Func<bool> blocked, TimeSpan timeout)
+    {
+        if (!blocked())
+            return;
+        if (timeout == TimeSpan.Zero)
+            throw new EmbeddedBusyException();
+
+        var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
+        while (blocked())
+        {
+            var remaining = stopwatch is null
+                ? Timeout.InfiniteTimeSpan
+                : timeout - stopwatch.Elapsed;
+            if (remaining <= TimeSpan.Zero
+                || !Monitor.Wait(_gate, remaining) && blocked())
+            {
+                throw new EmbeddedBusyException();
+            }
         }
     }
 
