@@ -25,11 +25,10 @@ namespace Ahtola.Core.Storage;
 /// is not required.
 /// </para>
 /// <para>
-/// The managed loader requires an interior separator to equal the exact maximum
-/// rowid of its left child. That invariant is preserved without extra work on
-/// insertion, because a descent only routes a rowid into a non-right-most child
-/// when the rowid is at most that child's separator, and it is restored
-/// explicitly after a deletion removes a child's maximum rowid.
+/// Table-interior separators are inclusive upper bounds for their left
+/// subtrees. They may remain above the live maximum after a deletion, while
+/// insertion, split, and rebalance paths are allowed to tighten them to an
+/// exact maximum.
 /// </para>
 /// </remarks>
 public sealed class SqliteIncrementalTableBtree

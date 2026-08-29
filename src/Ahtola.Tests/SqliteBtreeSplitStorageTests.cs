@@ -139,6 +139,62 @@ public class SqliteBtreeSplitStorageTests
     }
 
     [Test]
+    public void FullTableInteriorRootPromotionAcceptsStaleValidSeparator()
+    {
+        var path = CreateDatabasePath("stale-interior-root-promotion");
+        try
+        {
+            int expectedRowCount;
+            using (var pager = CreatePagerAtPath(PhysicalFileSystem.Instance, path))
+            {
+                var seed = SeedFullTableInteriorRoot(pager);
+                MakeFirstTableSeparatorStale(pager, seed.RootPage);
+                expectedRowCount = seed.RowCount + 1;
+
+                PrepareTableInteriorRootPromotion(pager, seed).CommitTo(pager);
+                ReadTableHeight(pager, seed.RootPage).Should().Be(3);
+                ReadTableRowIds(pager, seed.RootPage)
+                    .Should()
+                    .Equal(Enumerable.Range(2, expectedRowCount - 1)
+                        .Select(value => (long)value)
+                        .Prepend(0));
+                pager.CheckpointToMainStore();
+            }
+
+            using (var reopened = SqlitePager.Open(
+                       PhysicalFileSystem.Instance,
+                       path,
+                       path + "-wal",
+                       readOnly: true))
+            {
+                ReadTableHeight(reopened, pageNumber: 2).Should().Be(3);
+                ReadTableRowIds(reopened, rootPage: 2)
+                    .Should()
+                    .Equal(Enumerable.Range(2, expectedRowCount - 1)
+                        .Select(value => (long)value)
+                        .Prepend(0));
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
+            sqlite.Open();
+            using (var integrity = sqlite.CreateCommand())
+            {
+                integrity.CommandText = "PRAGMA integrity_check;";
+                integrity.ExecuteScalar().Should().Be("ok");
+            }
+
+            using var count = sqlite.CreateCommand();
+            count.CommandText = "SELECT COUNT(*) FROM t;";
+            Convert.ToInt32(count.ExecuteScalar()).Should().Be(expectedRowCount);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void EveryInterruptedFullTableInteriorRootPromotionRecoversThePriorTree()
     {
         for (var failedFrame = 1; failedFrame <= 6; failedFrame++)
@@ -484,6 +540,33 @@ public class SqliteBtreeSplitStorageTests
             RightMostLeafPage: rightMostLeafPage,
             AppendedCell: appendedCell,
             RowCount: (childCount - 1) + rightLeafCells.Count);
+    }
+
+    private static void MakeFirstTableSeparatorStale(SqlitePager pager, uint rootPage)
+    {
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var root = SqliteTableInteriorPageView.Parse(
+            pager.ReadCommittedPage(rootPage),
+            header.UsableSpace);
+        root.Cells.Should().NotBeEmpty();
+
+        var firstChildPage = root.Cells[0].Cell.LeftChildPage;
+        var firstChild = SqliteTableLeafPageView.Parse(
+            pager.ReadCommittedPage(firstChildPage),
+            header.UsableSpace);
+        firstChild.Cells.Should().ContainSingle();
+        firstChild.Cells[0].Cell.FirstOverflowPage.Should().BeNull();
+        firstChild.Cells[0].Cell.RowId.Should().Be(root.Cells[0].Cell.RowId);
+
+        var builder = new SqliteTableLeafPageBuilder(pager.PageSize, header.UsableSpace);
+        builder.Append(SqliteTableLeafCell.Create(
+            firstChild.Cells[0].Cell.RowId - 1,
+            firstChild.Cells[0].Cell.LocalPayload.Span,
+            header.UsableSpace));
+        CommitPages(
+            pager,
+            pager.CommittedPageCount,
+            [new SqlitePageImage(firstChildPage, builder.Build())]);
     }
 
     private static BoundedTableRootSeed ReadFullTableInteriorRootSeed(SqlitePager pager)
