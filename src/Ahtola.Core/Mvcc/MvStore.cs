@@ -714,9 +714,18 @@ internal sealed class MvStore
             if (_schemaChangeTransaction is { } owner && owner != id.Value)
                 throw new EmbeddedBusyException();
             WaitWhileLocked(
-                () => _activeClassicWriters != 0 || _snapshotBeginsInProgress != 0,
+                () => _activeClassicWriters != 0
+                    || _snapshotBeginsInProgress != 0
+                    || _checkpointInProgress,
                 timeout);
 
+            if (tx.BeginCommitGeneration != _commitGeneration
+                || _checkpointInProgress
+                || _schemaChangeTransaction is { } currentOwner
+                    && currentOwner != id.Value)
+            {
+                throw new EmbeddedBusyException();
+            }
             EnsureSchemaOwnerIsOnlyTransactionLocked(id, busyOnConflict: true);
 
             if (_schemaGeneration == ulong.MaxValue)

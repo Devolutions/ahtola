@@ -388,6 +388,7 @@ public sealed class MvccSelectDualCursorRoutingTests
         using var db = new RoutingFileDatabase();
         using var classicWriter = db.Connect();
         using var schemaWriter = db.Connect();
+        using var concurrentWriter = db.Connect();
 
         classicWriter.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
         schemaWriter.ExecuteNonQuery("PRAGMA busy_timeout=2000;");
@@ -401,7 +402,10 @@ public sealed class MvccSelectDualCursorRoutingTests
         await Task.Delay(100);
         schemaChange.IsCompleted.Should().BeFalse();
 
-        classicWriter.ExecuteNonQuery("COMMIT;");
+        concurrentWriter.ExecuteNonQuery("BEGIN CONCURRENT;");
+        concurrentWriter.ExecuteNonQuery("INSERT INTO t VALUES (2);");
+        concurrentWriter.ExecuteNonQuery("COMMIT;");
+        classicWriter.ExecuteNonQuery("ROLLBACK;");
         var staleSchema = await schemaChange.WaitAsync(TimeSpan.FromSeconds(5));
         staleSchema.Should().NotBeNull();
         staleSchema!.Message.Should().ContainEquivalentOf("locked");
@@ -410,6 +414,8 @@ public sealed class MvccSelectDualCursorRoutingTests
         schemaWriter.ExecuteNonQuery("CREATE TABLE added(v INTEGER);");
         schemaWriter.ExecuteNonQuery("COMMIT;");
         Convert.ToInt64(Scalar(schemaWriter, "SELECT COUNT(*) FROM t WHERE v=99;"))
+            .Should().Be(0L);
+        Convert.ToInt64(Scalar(schemaWriter, "SELECT COUNT(*) FROM t WHERE v=2;"))
             .Should().Be(1L);
     }
 
