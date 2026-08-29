@@ -444,6 +444,75 @@ public sealed class MvccSelectDualCursorRoutingTests
     }
 
     [Test]
+    public void FailedConcurrentDdlCommitDoesNotPublishItsSchemaGenerationOrRows()
+    {
+        var faults = new Ahtola.Core.Storage.DeterministicFaultInjector();
+        var fileSystem = new Ahtola.Core.Storage.InMemoryFileSystem(faults);
+        const string path = "mvcc-schema-publication-fault.db";
+        using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var connection = database.Connect();
+
+        Execute(connection, "CREATE TABLE original(v INTEGER);");
+        Execute(connection, "PRAGMA journal_mode=mvcc;");
+        Execute(connection, "BEGIN CONCURRENT;");
+        Execute(connection, "INSERT INTO original VALUES (1);");
+        Execute(connection, "COMMIT;");
+
+        var cookie = ReadEmbeddedScalar(connection, "PRAGMA schema_version;");
+        var generation = database.MvStore!.SchemaGeneration;
+        Execute(connection, "BEGIN CONCURRENT;");
+        Execute(connection, "INSERT INTO original VALUES (2);");
+        Execute(connection, "CREATE TABLE discarded(v INTEGER);");
+        Execute(connection, "INSERT INTO discarded VALUES (99);");
+
+        faults.FailNext(Ahtola.Core.Storage.FileSystemOperation.Write);
+        Assert.Throws<IOException>(() => Execute(connection, "COMMIT;"));
+
+        ReadEmbeddedScalar(connection, "PRAGMA schema_version;").Should().Be(cookie);
+        database.MvStore!.SchemaGeneration.Should().Be(generation);
+        ReadEmbeddedScalar(connection, "SELECT COUNT(*) FROM original;").Should().Be(1L);
+        ReadEmbeddedScalar(
+            connection,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'discarded';").Should().Be(0L);
+
+        Execute(connection, "BEGIN CONCURRENT;");
+        Execute(connection, "CREATE TABLE committed(v INTEGER);");
+        Execute(connection, "COMMIT;");
+        ReadEmbeddedScalar(connection, "PRAGMA schema_version;").Should().Be(cookie + 1);
+        database.MvStore!.SchemaGeneration.Should().Be(generation + 1);
+    }
+
+    [Test]
+    public void ConcurrentDmlAndDdlCommitAsOnePagerPublishedSchemaGeneration()
+    {
+        var fileSystem = new Ahtola.Core.Storage.InMemoryFileSystem();
+        const string path = "mvcc-schema-and-dml-commit.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE original(v INTEGER);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            var generation = database.MvStore!.SchemaGeneration;
+
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO original VALUES (1);");
+            Execute(connection, "CREATE TABLE added(v INTEGER);");
+            Execute(connection, "INSERT INTO added VALUES (2);");
+            Execute(connection, "COMMIT;");
+
+            database.MvStore!.SchemaGeneration.Should().Be(generation + 1);
+            ReadEmbeddedScalar(connection, "SELECT v FROM original;").Should().Be(1L);
+            ReadEmbeddedScalar(connection, "SELECT v FROM added;").Should().Be(2L);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadEmbeddedScalar(reopenedConnection, "SELECT v FROM original;").Should().Be(1L);
+        ReadEmbeddedScalar(reopenedConnection, "SELECT v FROM added;").Should().Be(2L);
+    }
+
+    [Test]
     public void ConcurrentLimitOneAllocationDoesNotScaleWithTheBaseCatalog()
     {
         const int largeRowCount = 10_000;
@@ -453,6 +522,18 @@ public sealed class MvccSelectDualCursorRoutingTests
         largeAllocation.Should().BeLessThan(
             smallAllocation + 256 * 1024,
             "a warmed LIMIT 1 scan should retain only the lazy cursor peeks and consumed row");
+    }
+
+    [Test]
+    public void ConcurrentIndexLimitOneAllocationDoesNotScaleWithTheBaseCatalog()
+    {
+        const int largeRowCount = 10_000;
+        var smallAllocation = MeasureConcurrentIndexLimitOneAllocation(rowCount: 10);
+        var largeAllocation = MeasureConcurrentIndexLimitOneAllocation(largeRowCount);
+
+        largeAllocation.Should().BeLessThan(
+            smallAllocation + 256 * 1024,
+            "a warmed index LIMIT 1 scan should not rebuild a materialized MVCC overlay");
     }
 
     private static object? Scalar(SqliteConnection connection, string sql)
@@ -476,6 +557,19 @@ public sealed class MvccSelectDualCursorRoutingTests
         {
             return exception;
         }
+    }
+
+    private static void Execute(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        _ = statement.Step();
+    }
+
+    private static long ReadEmbeddedScalar(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        return statement.GetValue(0).AsInteger();
     }
 
     private static long MeasureConcurrentLimitOneAllocation(int rowCount)
@@ -514,9 +608,48 @@ public sealed class MvccSelectDualCursorRoutingTests
         return allocated;
     }
 
+    private static long MeasureConcurrentIndexLimitOneAllocation(int rowCount)
+    {
+        var fileSystem = new Ahtola.Core.Storage.InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile($"mvcc-index-limit-{rowCount}.db", fileSystem);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(v INTEGER);");
+        Execute(connection, "CREATE INDEX ix_t_v ON t(v);");
+
+        var values = new System.Text.StringBuilder("INSERT INTO t VALUES ");
+        for (var value = rowCount; value >= 1; value--)
+        {
+            if (value != rowCount)
+                values.Append(',');
+            values.Append('(').Append(value).Append(')');
+        }
+        values.Append(';');
+        Execute(connection, values.ToString());
+        Execute(connection, "PRAGMA journal_mode=mvcc;");
+        Execute(connection, "BEGIN CONCURRENT;");
+
+        ExecuteIndexLimitOne(connection);
+        ExecuteIndexLimitOne(connection);
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        ExecuteIndexLimitOne(connection);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Execute(connection, "ROLLBACK;");
+        return allocated;
+    }
+
     private static void ExecuteLimitOne(EmbeddedConnection connection)
     {
         using var statement = connection.Prepare("SELECT v FROM t LIMIT 1;");
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).AsInteger().Should().Be(1L);
+    }
+
+    private static void ExecuteIndexLimitOne(EmbeddedConnection connection)
+    {
+        using var statement = connection.Prepare(
+            "SELECT v FROM t INDEXED BY ix_t_v WHERE v > 0 LIMIT 1;");
         statement.Step().Should().Be(StatementStepResult.Row);
         statement.GetValue(0).AsInteger().Should().Be(1L);
     }

@@ -72,6 +72,31 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
 
     [Test]
     [NonParallelizable]
+    public void PassiveCheckpointEvidenceBindsInclusiveWatermarkToWalIncarnation()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+
+        var checkpoint = coordinator.CheckpointPassiveValidated(TimeSpan.Zero);
+
+        checkpoint.IsBusy.Should().BeFalse();
+        checkpoint.HasValidatedWalIncarnation.Should().BeTrue();
+        checkpoint.SyncedFrameInclusive.Should().Be(checkpoint.MaximumFrame);
+        using var wal = OpenWalCopy(artifact.DatabasePath);
+        using var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance)
+            .OpenSharedMemory(
+                artifact.DatabasePath + "-shm",
+                FileOpenMode.OpenExisting,
+                readOnly: true);
+        var header = new SqliteWalIndexSharedMemory(mapping).ReadValidatedHeader(wal).Header;
+        checkpoint.WalIndexChangeCounter.Should().Be(header.ChangeCounter);
+        checkpoint.WalSalt1.Should().Be(header.Salt1);
+        checkpoint.WalSalt2.Should().Be(header.Salt2);
+    }
+
+    [Test]
+    [NonParallelizable]
     public void FullCheckpointWaitsInsteadOfCheckpointingPastAHeldSnapshot()
     {
         RequireCoordinatorSupport();

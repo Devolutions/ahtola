@@ -578,6 +578,14 @@ pre-existing lock carrier, detached recovery cannot prove that an unlink raced a
 live client. Focused tests use SQLite-produced artifacts and separate
 reader/writer/lock-worker processes.
 
+`SqliteWalWriterCheckpointCoordinator.CheckpointPassiveValidated(...)` is the
+narrow Core-only handoff for sync/replication policy. It returns
+`SyncedFrameInclusive` only after main-store flush and binds that watermark to
+the validated `WalIndexChangeCounter`, `WalSalt1`, and `WalSalt2` captured under
+the checkpoint lock. Callers must reject or retry the watermark when the live
+WAL incarnation no longer matches; a busy result carries no validated
+incarnation. The API does not couple checkpoint policy to `Ahtola.Data`.
+
 This remains unreachable from `SqlitePager`, normal managed execution, cache
 invalidation, and managed recovery. It does not relax the Stage 0 ownership
 lock or establish any stock-SQLite concurrent interoperability claim.
@@ -666,6 +674,7 @@ the attached WAL boundary:
 | `ManagedPassiveCheckpointHonorsHeldReadMarksWithoutCoarseLockArea` | Stage 3 — PASSIVE uses marks/`mxSafeFrame`; reset still needs exclusive marks |
 | `ManagedCheckpointClaimsSqliteCheckpointLockByte` | Stage 3 — checkpoint takes `WAL_CKPT_LOCK` (byte 121) |
 | `ManagedCheckpointPublishesWalIndexBackfillProgress` | Stage 3 — `nBackfill`/`nBackfillAttempted` published after install |
+| `PassiveCheckpointEvidenceBindsInclusiveWatermarkToWalIncarnation` | Stage 3 — sync-facing inclusive watermark is bound to validated WAL salts/`iChange` |
 | `ManagedRolesStayInsideSqliteReservedSharedMemoryLockArea` | §1.2 — no locks outside bytes 120–127 |
 | `ManagedReadOnlyOpenRefusesToCreateAMissingSharedMemoryLockCarrier` | §1.2, §3 — read-only opens never create `-shm` |
 | `PooledReopenSurvivesSharedMemoryCarrierRemovedByNativeClose` (`ManagedConnectionPoolingTests.cs`) | §1.2 — a read-write pager recreates a missing carrier on demand like a native read-write connection, and the pooling catalog refresh tolerates its absence |

@@ -55,6 +55,14 @@ internal enum MvccTransactionState : byte
 }
 
 /// <summary>
+/// Versioned logical identity for a table binding. Turso reserves -1 for
+/// <c>sqlite_schema</c> and allocates negative ids for unmaterialized objects.
+/// </summary>
+internal readonly record struct MvccSchemaObjectIdentity(
+    ulong SchemaGeneration,
+    string Name);
+
+/// <summary>
 /// One in-flight MVCC transaction: begin timestamp, write set, and lifecycle.
 /// </summary>
 internal sealed class MvccTransaction
@@ -66,12 +74,18 @@ internal sealed class MvccTransaction
     private MvccTransactionState _state = MvccTransactionState.Active;
     private ulong? _commitTimestamp;
     private bool _schemaChange;
+    private ulong? _pendingSchemaGeneration;
 
-    internal MvccTransaction(MvccTxId id, ulong beginTimestamp, ulong beginCommitGeneration)
+    internal MvccTransaction(
+        MvccTxId id,
+        ulong beginTimestamp,
+        ulong beginCommitGeneration,
+        ulong beginSchemaGeneration)
     {
         Id = id;
         BeginTimestamp = beginTimestamp;
         BeginCommitGeneration = beginCommitGeneration;
+        BeginSchemaGeneration = beginSchemaGeneration;
     }
 
     internal MvccTxId Id { get; }
@@ -79,6 +93,13 @@ internal sealed class MvccTransaction
     internal ulong BeginTimestamp { get; }
 
     internal ulong BeginCommitGeneration { get; }
+
+    internal ulong BeginSchemaGeneration { get; }
+
+    internal ulong EffectiveSchemaGeneration
+    {
+        get { lock (_gate) return _pendingSchemaGeneration ?? BeginSchemaGeneration; }
+    }
 
     internal MvccTransactionState State
     {
@@ -95,12 +116,23 @@ internal sealed class MvccTransaction
         get { lock (_gate) return _schemaChange; }
     }
 
-    internal void MarkSchemaChange()
+    internal void MarkSchemaChange(ulong pendingSchemaGeneration)
     {
         lock (_gate)
         {
             ThrowIfNotActive();
             _schemaChange = true;
+            _pendingSchemaGeneration = pendingSchemaGeneration;
+        }
+    }
+
+    internal void CancelSchemaChange()
+    {
+        lock (_gate)
+        {
+            ThrowIfNotActive();
+            _schemaChange = false;
+            _pendingSchemaGeneration = null;
         }
     }
 
@@ -256,6 +288,8 @@ internal sealed class MvccTransaction
 /// </summary>
 internal sealed class MvStore
 {
+    internal const long SqliteSchemaTableId = -1;
+
     private readonly ILogicalClock _clock;
     private readonly object _gate = new();
     private readonly Dictionary<ulong, MvccTransaction> _transactions = [];
@@ -263,8 +297,10 @@ internal sealed class MvStore
     private readonly Dictionary<ulong, ulong> _finalizedCommitTimestamps = [];
     private readonly Dictionary<MvccRowId, List<MvccRowVersion>> _rows = [];
     private readonly Dictionary<long, OrderedTableKeys> _orderedTableKeys = [];
-    private readonly Dictionary<string, long> _tableIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<MvccSchemaObjectIdentity, long> _tableIds =
+        new(MvccSchemaObjectIdentityComparer.Instance);
     private readonly Dictionary<long, string> _tableNames = [];
+    private readonly Dictionary<long, ulong> _tableSchemaGenerations = [];
     private readonly Dictionary<long, long> _nextRowIds = [];
     private long _nextTableId = -2;
     private ulong _nextTxId = 1;
@@ -272,16 +308,22 @@ internal sealed class MvStore
     private ulong? _exclusiveTxId;
     private ulong _schemaGeneration;
     private ulong _commitGeneration;
+    private ulong _lastCommittedTimestamp;
+    private ulong _checkpointGeneration;
     private ulong? _schemaChangeTransaction;
     private bool _checkpointInProgress;
     private bool _hasUnresolvedLegacyRows;
     private bool _hasIndeterminateCommit;
     private MvccLogicalLog? _logicalLog;
 
-    internal MvStore(ILogicalClock? clock = null, MvccLogicalLog? logicalLog = null)
+    internal MvStore(
+        ILogicalClock? clock = null,
+        MvccLogicalLog? logicalLog = null,
+        ulong schemaGeneration = 0)
     {
         _clock = clock ?? new MvccClock();
         _logicalLog = logicalLog;
+        _schemaGeneration = schemaGeneration;
     }
 
     internal ILogicalClock Clock => _clock;
@@ -311,6 +353,11 @@ internal sealed class MvStore
     internal ulong CommitGeneration
     {
         get { lock (_gate) return _commitGeneration; }
+    }
+
+    internal ulong LastCommittedTimestamp
+    {
+        get { lock (_gate) return _lastCommittedTimestamp; }
     }
 
     /// <summary>Attach durable log after construction (file-backed enable path).</summary>
@@ -379,21 +426,32 @@ internal sealed class MvStore
 
             // Advance clock past recovered commits so new txs get higher timestamps.
             _clock.Reset(commitTs + 1);
+            _lastCommittedTimestamp = Math.Max(_lastCommittedTimestamp, commitTs);
         }
     }
 
-    /// <summary>Stable negative table id for <paramref name="tableName"/>.</summary>
+    /// <summary>
+    /// Stable negative table id for <paramref name="tableName"/> in the currently
+    /// published schema generation.
+    /// </summary>
     internal long GetOrCreateTableId(string tableName)
     {
         ArgumentException.ThrowIfNullOrEmpty(tableName);
         lock (_gate)
+            return GetOrCreateTableIdLocked(tableName, _schemaGeneration);
+    }
+
+    /// <summary>
+    /// Resolves a table identity against the transaction's pinned (or provisional
+    /// DDL) schema generation.
+    /// </summary>
+    internal long GetOrCreateTableId(MvccTxId txId, string tableName)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(tableName);
+        lock (_gate)
         {
-            if (_tableIds.TryGetValue(tableName, out var id))
-                return id;
-            id = _nextTableId--;
-            _tableIds[tableName] = id;
-            _tableNames[id] = tableName;
-            return id;
+            var tx = RequireActive(txId);
+            return GetOrCreateTableIdLocked(tableName, tx.EffectiveSchemaGeneration);
         }
     }
 
@@ -411,15 +469,33 @@ internal sealed class MvStore
             throw new InvalidDataException(
                 $"MVCC logical log maps table id {tableId} to both '{existingName}' and '{tableName}'.");
         }
-        if (_tableIds.TryGetValue(tableName, out var existingId) && existingId != tableId)
+        var identity = new MvccSchemaObjectIdentity(_schemaGeneration, tableName);
+        if (_tableIds.TryGetValue(identity, out var existingId) && existingId != tableId)
         {
             throw new InvalidDataException(
                 $"MVCC logical log maps table '{tableName}' to both {existingId} and {tableId}.");
         }
 
-        _tableIds[tableName] = tableId;
+        _tableIds[identity] = tableId;
         _tableNames[tableId] = tableName;
+        _tableSchemaGenerations[tableId] = _schemaGeneration;
         _nextTableId = Math.Min(_nextTableId, checked(tableId - 1));
+    }
+
+    private long GetOrCreateTableIdLocked(string tableName, ulong schemaGeneration)
+    {
+        var identity = new MvccSchemaObjectIdentity(schemaGeneration, tableName);
+        if (_tableIds.TryGetValue(identity, out var id))
+            return id;
+
+        id = string.Equals(tableName, "sqlite_schema", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(tableName, "sqlite_master", StringComparison.OrdinalIgnoreCase)
+                ? SqliteSchemaTableId
+                : _nextTableId--;
+        _tableIds[identity] = id;
+        _tableNames[id] = tableName;
+        _tableSchemaGenerations[id] = schemaGeneration;
+        return id;
     }
 
     private MvccLogOp CreateLogUpsert(MvccRowId rowId, SqlValue[] cells)
@@ -478,7 +554,7 @@ internal sealed class MvStore
         }
     }
 
-    internal MvccTransaction BeginTransaction()
+    internal MvccTransaction BeginTransaction(ulong? expectedSchemaGeneration = null)
     {
         lock (_gate)
         {
@@ -491,10 +567,19 @@ internal sealed class MvStore
                 || _exclusiveTxId is not null
                 || _schemaChangeTransaction is not null)
                 throw new EmbeddedBusyException();
+            if (expectedSchemaGeneration is { } expected
+                && expected != _schemaGeneration)
+            {
+                throw new EmbeddedCatalogSnapshotStaleException();
+            }
 
             var beginTs = NextBeginTimestamp();
             var id = new MvccTxId(_nextTxId++);
-            var tx = new MvccTransaction(id, beginTs, _commitGeneration);
+            var tx = new MvccTransaction(
+                id,
+                beginTs,
+                _commitGeneration,
+                _schemaGeneration);
             _transactions.Add(id.Value, tx);
             return tx;
         }
@@ -525,7 +610,11 @@ internal sealed class MvStore
 
             var beginTs = NextBeginTimestamp();
             var id = new MvccTxId(_nextTxId++);
-            var tx = new MvccTransaction(id, beginTs, _commitGeneration);
+            var tx = new MvccTransaction(
+                id,
+                beginTs,
+                _commitGeneration,
+                _schemaGeneration);
             _transactions.Add(id.Value, tx);
             _exclusiveTxId = id.Value;
             return tx;
@@ -555,6 +644,8 @@ internal sealed class MvStore
         lock (_gate)
         {
             var tx = RequireActive(id);
+            if (tx.HasSchemaChange && _schemaChangeTransaction == id.Value)
+                return;
             if (_checkpointInProgress)
                 throw new EmbeddedBusyException();
             if (tx.BeginCommitGeneration != _commitGeneration)
@@ -571,7 +662,9 @@ internal sealed class MvStore
                 }
             }
 
-            tx.MarkSchemaChange();
+            if (_schemaGeneration == ulong.MaxValue)
+                throw new InvalidOperationException("The MVCC schema generation is exhausted.");
+            tx.MarkSchemaChange(_schemaGeneration + 1);
             _schemaChangeTransaction = id.Value;
         }
     }
@@ -586,57 +679,95 @@ internal sealed class MvStore
         }
     }
 
-    /// <summary>
-    /// Publishes a schema generation only after the catalog and page-one cookie
-    /// have committed through the normal pager/WAL path.
-    /// </summary>
-    internal void PublishSchemaChange(MvccTxId id)
-    {
-        lock (_gate)
-        {
-            if (_schemaChangeTransaction != id.Value)
-                throw new InvalidOperationException("The MVCC transaction does not own a pending schema publication.");
-            _schemaGeneration = checked(_schemaGeneration + 1);
-            _schemaChangeTransaction = null;
-        }
-    }
-
     internal void CancelSchemaChange(MvccTxId id)
     {
         lock (_gate)
         {
             if (_schemaChangeTransaction == id.Value)
+            {
                 _schemaChangeTransaction = null;
+                if (_transactions.TryGetValue(id.Value, out var tx)
+                    && tx.State == MvccTransactionState.Active)
+                {
+                    tx.CancelSchemaChange();
+                    RemoveUnpublishedSchemaIdentitiesLocked(tx.BeginSchemaGeneration);
+                }
+            }
         }
     }
 
     /// <summary>
-    /// A schema catalog was durably rewritten after all concurrent snapshots were
-    /// excluded. Its catalog already contains every committed logical row, so
-    /// retire the old object identities and their log prefix before a table name
-    /// can be reused by CREATE/RENAME.
+    /// Validates and timestamps a schema-changing transaction without appending
+    /// its row operations to the logical log. Its complete private catalog is
+    /// persisted through the pager before <see cref="CompleteSchemaCommit"/>.
     /// </summary>
-    internal void CompleteSchemaCheckpoint(
-        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+    internal void PrepareSchemaCommit(MvccTxId id)
     {
-        synchronousMode.Validate(nameof(synchronousMode));
+        MvccTransaction tx;
+        HashSet<MvccRowId> writes;
         lock (_gate)
         {
-            if (HasActiveTransactionsLocked())
+            if (_checkpointInProgress)
+                throw new EmbeddedBusyException();
+            tx = RequireActive(id);
+            if (!tx.HasSchemaChange || _schemaChangeTransaction != id.Value)
             {
                 throw new InvalidOperationException(
-                    "Cannot retire MVCC object identities while a transaction is active.");
+                    "The MVCC transaction does not own a pending schema publication.");
             }
 
-            _rows.Clear();
-            _orderedTableKeys.Clear();
-            _tableIds.Clear();
-            _tableNames.Clear();
-            _nextRowIds.Clear();
-            _nextTableId = -2;
-            _logicalLog?.TruncateAfterCheckpoint(synchronousMode);
-            if (_logicalLog is { RequiresVersion4Upgrade: true })
-                _logicalLog.UpgradeToVersion4AfterCheckpoint(synchronousMode);
+            writes = tx.SnapshotWriteSet().ToHashSet();
+            ValidateCommitLocked(tx, writes);
+            if (writes.Count != 0 && _commitGeneration == ulong.MaxValue)
+                throw new InvalidOperationException("The MVCC commit generation is exhausted.");
+        }
+
+        _clock.GetTimestamp(ts => tx.MarkPreparing(ts));
+
+        lock (_gate)
+        {
+            ValidatePreparingCommitLocked(tx, writes);
+        }
+    }
+
+    /// <summary>
+    /// Publishes a prepared schema generation after the catalog and page-one
+    /// schema cookie are durable. No I/O occurs here, so the post-pager publish
+    /// window cannot expose a discarded catalog.
+    /// </summary>
+    internal void CompleteSchemaCommit(MvccTxId id)
+    {
+        lock (_gate)
+        {
+            if (!_transactions.TryGetValue(id.Value, out var tx)
+                || tx.State != MvccTransactionState.Preparing
+                || !tx.HasSchemaChange
+                || _schemaChangeTransaction != id.Value)
+            {
+                throw new InvalidOperationException(
+                    "The MVCC schema transaction is not prepared for publication.");
+            }
+
+            var commitTs = tx.CommitTimestamp
+                ?? throw new InvalidOperationException(
+                    "Preparing schema transaction is missing its commit timestamp.");
+            var writes = tx.SnapshotWriteSet();
+            tx.MarkCommitted();
+            _finalizedStates[id.Value] = MvccTransactionState.Committed;
+            _finalizedCommitTimestamps[id.Value] = commitTs;
+            _lastCommittedTimestamp = Math.Max(_lastCommittedTimestamp, commitTs);
+            ClearExclusive(id);
+            _transactions.Remove(id.Value);
+            if (writes.Count != 0)
+                _commitGeneration++;
+
+            _schemaGeneration = tx.EffectiveSchemaGeneration;
+            _schemaChangeTransaction = null;
+
+            // The just-published catalog is a complete page-native image of this
+            // transaction, including its DML. The pre-DDL checkpoint retired every
+            // older logical frame, so no version or negative object identity remains.
+            ClearMaterializedStateLocked();
         }
     }
     /// <summary>Insert a new live version created by <paramref name="txId"/>.</summary>
@@ -646,6 +777,7 @@ internal sealed class MvStore
         lock (_gate)
         {
             var tx = RequireActive(txId);
+            ThrowIfCheckpointBlocksWriteLocked();
             var version = new MvccRowVersion(
                 _nextVersionId++,
                 begin: MvccStamp.FromTxId(txId),
@@ -676,6 +808,7 @@ internal sealed class MvStore
         lock (_gate)
         {
             var tx = RequireActive(txId);
+            ThrowIfCheckpointBlocksWriteLocked();
             if (!_rows.TryGetValue(rowId, out var chain))
                 return false;
 
@@ -706,6 +839,7 @@ internal sealed class MvStore
         lock (_gate)
         {
             var tx = RequireActive(txId);
+            ThrowIfCheckpointBlocksWriteLocked();
             if (_rows.TryGetValue(rowId, out var chain))
             {
                 for (var i = chain.Count - 1; i >= 0; i--)
@@ -789,6 +923,31 @@ internal sealed class MvStore
                 return true;
             }
 
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Resolves whether the version store has a visible upsert or delete that
+    /// shadows the physical/base row at <paramref name="rowId"/>.
+    /// </summary>
+    internal bool TryReadVisibleEffect(
+        MvccTxId txId,
+        MvccRowId rowId,
+        out SqlValue[]? cells,
+        out bool isDelete)
+    {
+        lock (_gate)
+        {
+            var tx = RequireActive(txId);
+            if (_rows.TryGetValue(rowId, out var chain)
+                && TryResolveVisibleEffectLocked(tx, chain, out cells, out isDelete))
+            {
+                return true;
+            }
+
+            cells = null;
+            isDelete = false;
             return false;
         }
     }
@@ -892,24 +1051,7 @@ internal sealed class MvStore
     internal IReadOnlyList<(MvccRowId RowId, SqlValue[] Cells)> SnapshotLiveCommittedRows()
     {
         lock (_gate)
-        {
-            var results = new List<(MvccRowId, SqlValue[])>();
-            foreach (var (rowId, chain) in _rows)
-            {
-                for (var i = chain.Count - 1; i >= 0; i--)
-                {
-                    var version = chain[i];
-                    if (version.End is not null || version.IsTombstone)
-                        continue;
-                    if (version.Begin is not { IsTimestamp: true })
-                        continue;
-                    results.Add((rowId, (SqlValue[])version.Cells.Clone()));
-                    break;
-                }
-            }
-
-            return results;
-        }
+            return SnapshotLiveCommittedRowsLocked();
     }
 
     /// <summary>
@@ -920,35 +1062,58 @@ internal sealed class MvStore
     internal IReadOnlyCollection<MvccRowId> SnapshotCommittedDeletes()
     {
         lock (_gate)
-        {
-            var deleted = new HashSet<MvccRowId>();
-            foreach (var (rowId, chain) in _rows)
-            {
-                var live = false;
-                var sawDelete = false;
-                for (var i = chain.Count - 1; i >= 0; i--)
-                {
-                    var version = chain[i];
-                    if (version.Begin is not { IsTimestamp: true })
-                        continue;
-                    if (version.End is null && !version.IsTombstone)
-                    {
-                        live = true;
-                        break;
-                    }
+            return SnapshotCommittedDeletesLocked();
+    }
 
-                    if (version.End is null && version.IsTombstone)
-                        sawDelete = true;
-                    else if (version.End is { IsTimestamp: true })
-                        sawDelete = true;
+    private IReadOnlyList<(MvccRowId RowId, SqlValue[] Cells)> SnapshotLiveCommittedRowsLocked()
+    {
+        var results = new List<(MvccRowId, SqlValue[])>();
+        foreach (var (rowId, chain) in _rows)
+        {
+            for (var i = chain.Count - 1; i >= 0; i--)
+            {
+                var version = chain[i];
+                if (version.End is not null || version.IsTombstone)
+                    continue;
+                if (version.Begin is not { IsTimestamp: true })
+                    continue;
+                results.Add((rowId, (SqlValue[])version.Cells.Clone()));
+                break;
+            }
+        }
+
+        return results;
+    }
+
+    private IReadOnlyCollection<MvccRowId> SnapshotCommittedDeletesLocked()
+    {
+        var deleted = new HashSet<MvccRowId>();
+        foreach (var (rowId, chain) in _rows)
+        {
+            var live = false;
+            var sawDelete = false;
+            for (var i = chain.Count - 1; i >= 0; i--)
+            {
+                var version = chain[i];
+                if (version.Begin is not { IsTimestamp: true })
+                    continue;
+                if (version.End is null && !version.IsTombstone)
+                {
+                    live = true;
+                    break;
                 }
 
-                if (!live && sawDelete)
-                    deleted.Add(rowId);
+                if (version.End is null && version.IsTombstone)
+                    sawDelete = true;
+                else if (version.End is { IsTimestamp: true })
+                    sawDelete = true;
             }
 
-            return deleted;
+            if (!live && sawDelete)
+                deleted.Add(rowId);
         }
+
+        return deleted;
     }
 
     /// <summary>Record a write-set entry without mutating version chains (catalog-path DML).</summary>
@@ -957,6 +1122,7 @@ internal sealed class MvStore
         lock (_gate)
         {
             var tx = RequireActive(id);
+            ThrowIfCheckpointBlocksWriteLocked();
             tx.RecordWrite(rowId);
         }
     }
@@ -974,7 +1140,14 @@ internal sealed class MvStore
         HashSet<MvccRowId> writes;
         lock (_gate)
         {
+            if (_checkpointInProgress)
+                throw new EmbeddedBusyException();
             tx = RequireActive(id);
+            if (tx.HasSchemaChange)
+            {
+                throw new InvalidOperationException(
+                    "Schema-changing MVCC transactions must use the pager-first schema commit path.");
+            }
             writes = tx.SnapshotWriteSet().ToHashSet();
             var preflightOps = tx.SnapshotLogOps();
             if (_logicalLog is { RequiresVersion4Upgrade: true }
@@ -984,40 +1157,18 @@ internal sealed class MvStore
                     "MVCC typed-key writes require a checkpoint that upgrades the logical log before commit.");
             }
 
-            foreach (var rowId in writes)
-            {
-                if (!_rows.TryGetValue(rowId, out var chain))
-                    continue;
-                foreach (var version in chain)
-                {
-                    if (IsWriteWriteConflict(tx, version))
-                        throw new EmbeddedWriteWriteConflictException();
-                }
-                if (!rowId.Key.IsInteger)
-                    ThrowIfTypedKeyInsertConflict(tx, chain);
-            }
+            ValidateCommitLocked(tx, writes);
+            if (writes.Count != 0 && _commitGeneration == ulong.MaxValue)
+                throw new InvalidOperationException("The MVCC commit generation is exhausted.");
         }
 
         _clock.GetTimestamp(ts => tx.MarkPreparing(ts));
 
         lock (_gate)
         {
+            ValidatePreparingCommitLocked(tx, writes);
             var commitTs = tx.CommitTimestamp
                 ?? throw new InvalidOperationException("Preparing transaction missing commit timestamp.");
-
-            foreach (var rowId in writes)
-            {
-                if (!_rows.TryGetValue(rowId, out var chain))
-                    continue;
-                foreach (var version in chain)
-                {
-                    if (IsWriteWriteConflict(tx, version))
-                    {
-                        AbortLocked(id, tx);
-                        throw new EmbeddedWriteWriteConflictException();
-                    }
-                }
-            }
 
             var logOps = tx.SnapshotLogOps();
             MvccLogicalLogCommitIndeterminateException? indeterminateCommit = null;
@@ -1040,10 +1191,11 @@ internal sealed class MvStore
             tx.MarkCommitted();
             _finalizedStates[id.Value] = MvccTransactionState.Committed;
             _finalizedCommitTimestamps[id.Value] = commitTs;
+            _lastCommittedTimestamp = Math.Max(_lastCommittedTimestamp, commitTs);
             ClearExclusive(id);
             _transactions.Remove(id.Value);
             if (writes.Count != 0)
-                _commitGeneration = checked(_commitGeneration + 1);
+                _commitGeneration++;
             PruneHistoryLocked(tx.BeginTimestamp);
             if (indeterminateCommit is not null)
             {
@@ -1167,7 +1319,10 @@ internal sealed class MvStore
 
         tx.MarkAborted();
         if (_schemaChangeTransaction == id.Value)
+        {
             _schemaChangeTransaction = null;
+            RemoveUnpublishedSchemaIdentitiesLocked(tx.BeginSchemaGeneration);
+        }
         _finalizedStates[id.Value] = MvccTransactionState.Aborted;
         ClearExclusive(id);
         _transactions.Remove(id.Value);
@@ -1358,17 +1513,21 @@ internal sealed class MvStore
     }
 
     /// <summary>
-    /// Acquires the process-shared stop-the-world checkpoint boundary. The lease
-    /// closes the transaction-admission race between checking the reader floor
-    /// and beginning catalog materialization.
+    /// Acquires the process-shared checkpoint boundary. Read-only snapshots may
+    /// remain active; the lease freezes their mutation path while collection and
+    /// page publication run. A schema owner may be explicitly admitted for the
+    /// pre-DDL retirement checkpoint.
     /// </summary>
-    internal bool TryAcquireCheckpoint(out CheckpointLease? lease)
+    internal bool TryAcquireCheckpoint(
+        out CheckpointLease? lease,
+        MvccTxId? permittedTransaction = null)
     {
         lock (_gate)
         {
             if (_checkpointInProgress
-                || _schemaChangeTransaction is not null
-                || HasActiveTransactionsLocked())
+                || (_schemaChangeTransaction is { } schemaOwner
+                    && schemaOwner != permittedTransaction?.Value)
+                || HasCheckpointBlockingTransactionLocked(permittedTransaction))
             {
                 lease = null;
                 return false;
@@ -1380,46 +1539,70 @@ internal sealed class MvStore
         }
     }
 
+    /// <summary>Collects one stable committed checkpoint input under its lease.</summary>
+    internal MvccCheckpointSnapshot CollectCheckpointSnapshot()
+    {
+        lock (_gate)
+        {
+            if (!_checkpointInProgress)
+                throw new InvalidOperationException("The MVCC checkpoint lease is not held.");
+
+            return new MvccCheckpointSnapshot(
+                SnapshotLiveCommittedRowsLocked(),
+                SnapshotCommittedDeletesLocked(),
+                _lastCommittedTimestamp);
+        }
+    }
+
     /// <summary>Count of version chains currently held (test/diagnostic).</summary>
     internal int VersionChainCount
     {
         get { lock (_gate) return _rows.Count; }
     }
 
-    /// <summary>
-    /// Post-checkpoint GC after catalog materialization. When no concurrent
-    /// transactions are open, drop the entire version store (rows now live in
-    /// the classic catalog). Otherwise prune ended history past the reader LWM
-    /// (Turso <c>GcTableRows</c> spirit without per-page btree walks).
-    /// </summary>
-    internal void GarbageCollectAfterCheckpoint()
+    internal int VersionCount
     {
+        get { lock (_gate) return _rows.Values.Sum(static chain => chain.Count); }
+    }
+
+    internal ulong OldestActiveSnapshot
+    {
+        get { lock (_gate) return ComputeReaderLowWaterMarkLocked(); }
+    }
+
+    /// <summary>
+    /// Stamps the collected committed prefix as page-materialized, then reclaims
+    /// only versions older than the oldest active snapshot. A current version is
+    /// dropped only when every active reader can use its pinned base catalog.
+    /// </summary>
+    internal void GarbageCollectAfterCheckpoint(MvccCheckpointSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
         lock (_gate)
         {
-            if (!HasActiveTransactionsLocked())
-            {
-                _rows.Clear();
-                foreach (var ordered in _orderedTableKeys.Values)
-                    ordered.Keys.Clear();
-                return;
-            }
-
+            if (!_checkpointInProgress)
+                throw new InvalidOperationException("The MVCC checkpoint lease is not held.");
+            if (_checkpointGeneration == ulong.MaxValue)
+                throw new InvalidOperationException("The MVCC checkpoint generation is exhausted.");
+            var materializedAt = ++_checkpointGeneration;
             var lwm = ComputeReaderLowWaterMarkLocked();
-            PruneHistoryLocked(lwm);
 
-            // Committed pure tombstones with begin &lt; LWM are catalog-owned once
-            // materialize has applied deletes; drop them so dual-cursor defers to base.
             foreach (var (rowId, chain) in _rows.ToArray())
             {
+                foreach (var version in chain)
+                {
+                    if (VersionIsCommittedThrough(version, snapshot.DurableTimestamp))
+                        version.MaterializedAt = materializedAt;
+                }
+
                 chain.RemoveAll(version =>
-                    version.IsTombstone
-                    && version.End is null
-                    && version.Begin is { IsTimestamp: true, Value: var beginTs }
-                    && beginTs < lwm);
+                    CanCollectMaterializedVersion(version, lwm, materializedAt));
 
                 if (chain.Count == 0)
                     RemoveRowLocked(rowId);
             }
+
+            PruneFinalizedTransactionsLocked(lwm);
         }
     }
 
@@ -1429,6 +1612,23 @@ internal sealed class MvStore
         {
             if (tx.State is MvccTransactionState.Active or MvccTransactionState.Preparing)
                 return true;
+        }
+
+        return false;
+    }
+
+    private bool HasCheckpointBlockingTransactionLocked(MvccTxId? permittedTransaction)
+    {
+        foreach (var tx in _transactions.Values)
+        {
+            if (permittedTransaction is { } permitted && tx.Id == permitted)
+                continue;
+            if (tx.State == MvccTransactionState.Preparing
+                || tx.HasSchemaChange
+                || tx.SnapshotWriteSet().Count != 0)
+            {
+                return true;
+            }
         }
 
         return false;
@@ -1472,8 +1672,7 @@ internal sealed class MvStore
                 : Math.Min(lowest.Value, active.BeginTimestamp);
         }
 
-        // No readers: LWM is a fresh clock tick so all ended history may drop.
-        return lowest ?? _clock.GetTimestamp(static _ => { });
+        return lowest ?? ulong.MaxValue;
     }
 
     private void PruneHistoryLocked(ulong minBegin)
@@ -1495,6 +1694,11 @@ internal sealed class MvStore
                 RemoveRowLocked(rowId);
         }
 
+        PruneFinalizedTransactionsLocked(lowestActiveBegin);
+    }
+
+    private void PruneFinalizedTransactionsLocked(ulong lowestActiveBegin)
+    {
         if (_finalizedStates.Count > 4096)
         {
             var stale = _finalizedCommitTimestamps
@@ -1506,6 +1710,112 @@ internal sealed class MvStore
                 _finalizedStates.Remove(key);
                 _finalizedCommitTimestamps.Remove(key);
             }
+        }
+    }
+
+    private void ValidateCommitLocked(
+        MvccTransaction tx,
+        IReadOnlyCollection<MvccRowId> writes)
+    {
+        foreach (var rowId in writes)
+        {
+            if (!_rows.TryGetValue(rowId, out var chain))
+                continue;
+            foreach (var version in chain)
+            {
+                if (IsWriteWriteConflict(tx, version))
+                    throw new EmbeddedWriteWriteConflictException();
+            }
+            if (!rowId.Key.IsInteger)
+                ThrowIfTypedKeyInsertConflict(tx, chain);
+        }
+    }
+
+    private void ValidatePreparingCommitLocked(
+        MvccTransaction tx,
+        IReadOnlyCollection<MvccRowId> writes)
+    {
+        foreach (var rowId in writes)
+        {
+            if (!_rows.TryGetValue(rowId, out var chain))
+                continue;
+            foreach (var version in chain)
+            {
+                if (!IsWriteWriteConflict(tx, version))
+                    continue;
+                AbortLocked(tx.Id, tx);
+                throw new EmbeddedWriteWriteConflictException();
+            }
+        }
+    }
+
+    private void ThrowIfCheckpointBlocksWriteLocked()
+    {
+        if (_checkpointInProgress)
+            throw new EmbeddedBusyException();
+    }
+
+    private static bool VersionIsCommittedThrough(
+        MvccRowVersion version,
+        ulong durableTimestamp)
+    {
+        if (version.Begin is { IsTimestamp: false }
+            || version.End is { IsTimestamp: false })
+        {
+            return false;
+        }
+
+        var latestTimestamp = Math.Max(
+            version.Begin is { IsTimestamp: true, Value: var beginTs } ? beginTs : 0,
+            version.End is { IsTimestamp: true, Value: var endTs } ? endTs : 0);
+        return latestTimestamp <= durableTimestamp;
+    }
+
+    private static bool CanCollectMaterializedVersion(
+        MvccRowVersion version,
+        ulong readerLowWaterMark,
+        ulong materializedAt)
+    {
+        if (version.MaterializedAt == 0 || version.MaterializedAt > materializedAt)
+            return false;
+        if (version.Begin is not { IsTimestamp: true, Value: var beginTs })
+            return false;
+
+        if (version.End is { IsTimestamp: true, Value: var endTs })
+            return endTs <= readerLowWaterMark;
+
+        return version.End is null && beginTs < readerLowWaterMark;
+    }
+
+    private void ClearMaterializedStateLocked()
+    {
+        _rows.Clear();
+        _orderedTableKeys.Clear();
+        _tableIds.Clear();
+        _tableNames.Clear();
+        _tableSchemaGenerations.Clear();
+        _nextRowIds.Clear();
+    }
+
+    private void RemoveUnpublishedSchemaIdentitiesLocked(ulong publishedGeneration)
+    {
+        var staleIds = _tableSchemaGenerations
+            .Where(pair => pair.Value != publishedGeneration)
+            .Select(pair => pair.Key)
+            .ToArray();
+        foreach (var tableId in staleIds)
+        {
+            if (_rows.Keys.Any(rowId => rowId.TableId == tableId))
+                continue;
+            var generation = _tableSchemaGenerations[tableId];
+            if (!_tableNames.Remove(tableId, out var tableName))
+                continue;
+            _tableSchemaGenerations.Remove(tableId);
+            _tableIds.Remove(new MvccSchemaObjectIdentity(
+                generation,
+                tableName));
+            _orderedTableKeys.Remove(tableId);
+            _nextRowIds.Remove(tableId);
         }
     }
 
@@ -1679,6 +1989,23 @@ internal sealed class MvStore
 
         internal SortedSet<MvccKey> Keys { get; } =
             new(comparer);
+    }
+
+    private sealed class MvccSchemaObjectIdentityComparer :
+        IEqualityComparer<MvccSchemaObjectIdentity>
+    {
+        internal static MvccSchemaObjectIdentityComparer Instance { get; } = new();
+
+        public bool Equals(
+            MvccSchemaObjectIdentity left,
+            MvccSchemaObjectIdentity right)
+            => left.SchemaGeneration == right.SchemaGeneration
+                && string.Equals(left.Name, right.Name, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode(MvccSchemaObjectIdentity identity)
+            => HashCode.Combine(
+                identity.SchemaGeneration,
+                StringComparer.OrdinalIgnoreCase.GetHashCode(identity.Name));
     }
 }
 

@@ -288,7 +288,11 @@ internal sealed class ChangeDataCaptureSession(ChangeDataCaptureConfiguration co
         if (!cdcTable.HasRowid || !cdcTable.IsAutoIncrement)
             throw new EmbeddedSqlException($"CDC table '{_configuration.Table}' has an unsupported schema");
 
-        var changeId = AllocateChangeId(tables, cdcTable, concurrentStore);
+        var changeId = AllocateChangeId(
+            tables,
+            cdcTable,
+            concurrentStore,
+            concurrentTxId);
         var transactionId = _configuration.Version == ChangeDataCaptureVersion.V2
             ? GetOrSetTransactionId(changeId)
             : -1;
@@ -330,7 +334,9 @@ internal sealed class ChangeDataCaptureSession(ChangeDataCaptureConfiguration co
         {
             store.Insert(
                 txId,
-                new MvccRowId(store.GetOrCreateTableId(_configuration.Table), changeId),
+                new MvccRowId(
+                    store.GetOrCreateTableId(txId, _configuration.Table),
+                    changeId),
                 row);
         }
 
@@ -341,16 +347,17 @@ internal sealed class ChangeDataCaptureSession(ChangeDataCaptureConfiguration co
     private long AllocateChangeId(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         EmbeddedTable cdcTable,
-        MvStore? concurrentStore)
+        MvStore? concurrentStore,
+        MvccTxId? concurrentTxId)
     {
         var allocator = new EmbeddedDatabase.AutoIncrementStatementState();
         var tracker = allocator.GetTracker(_configuration.Table, cdcTable, tables);
         var largest = cdcTable.RowIds.Count == 0 ? 0 : cdcTable.RowIds.Max();
         long changeId;
-        if (concurrentStore is { } store)
+        if (concurrentStore is { } store && concurrentTxId is { } txId)
         {
             changeId = store.AllocateRowId(
-                store.GetOrCreateTableId(_configuration.Table),
+                store.GetOrCreateTableId(txId, _configuration.Table),
                 minimumExclusive: largest);
             tracker.Observe(changeId);
         }

@@ -29,8 +29,8 @@ scope decision; it does not mean Ahtola implements every newer Turso feature.
 | 6 | `window-group-pipeline` | 9 sqltests closed | `core/translate/window.rs` | Done |
 | 7 | `join-coalescing-parity` | 4 sqltests closed | `core/translate/planner.rs`, `plan.rs`, `select.rs` | Done |
 | 8 | `planner-access-path-depth` | Documented runtime limit | `core/translate/optimizer/`, `planner.rs`, `main_loop/` | Planned |
-| 9 | `mvcc-page-native-depth` | Documented runtime limit | `core/mvcc/` | Planned |
-| 10 | `sync-engine-depth` | Wait/apply lifecycle split landed | `sync/engine/src/` | Partial (checkpoint policy blocked by rank 9) |
+| 9 | `mvcc-page-native-depth` | Documented runtime limit | `core/mvcc/` | Done |
+| 10 | `sync-engine-depth` | Wait/apply lifecycle split landed; passive checkpoint hook available | `sync/engine/src/` | Partial |
 
 The sqltest counts overlap by subsystem only in implementation, not in this
 classification: ranks 1-7 account for 133 distinct expected-failure entries.
@@ -179,18 +179,28 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 
 ### 9. Page-native MVCC depth
 
-- [ ] Version `sqlite_schema` identities and schema generations so concurrent
+- [x] Version `sqlite_schema` identities and schema generations so concurrent
   DDL can commit or conflict without exposing discarded catalog changes.
-- [ ] Replace materialized table/index overlays with lazy typed dual cursors
+- [x] Replace materialized table/index overlays with lazy typed dual cursors
   over base B-trees and version chains.
-- [ ] Preserve statement snapshots while peer commits advance the shared
+- [x] Preserve statement snapshots while peer commits advance the shared
   store.
-- [ ] Port Turso checkpoint phases onto managed I/O: lock, collect,
+- [x] Port Turso checkpoint phases onto managed I/O: lock, collect,
   materialize, page-WAL persist, backfill, logical-log retirement, WAL reset,
   then version GC.
-- [ ] Keep recovery evidence valid at every injected crash boundary.
-- [ ] Add deterministic schema-cookie, multi-connection, cursor, checkpoint,
+- [x] Keep recovery evidence valid at every injected crash boundary.
+- [x] Add deterministic schema-cookie, multi-connection, cursor, checkpoint,
   reopen, and oldest-snapshot GC tests.
+
+The managed port follows the pinned Turso `v0.8.0-pre.7` implementation:
+`core/mvcc/database/mod.rs` (`MVTableId`, schema-generation begin/commit
+checks, low-water mark GC), `core/mvcc/cursor.rs` (`MvccLazyCursor` and
+two-peek table/index merging), and
+`core/mvcc/database/checkpoint_state_machine.rs` (publish, backfill,
+logical-log retirement, WAL reset, then GC). Managed I/O completes each phase
+synchronously. A pager-first schema publish and pre-DDL retirement checkpoint
+keep discarded catalogs out of the logical log, while inclusive checkpoint
+watermark frames make every crash boundary replay-safe.
 
 ### 10. Managed sync-engine depth
 

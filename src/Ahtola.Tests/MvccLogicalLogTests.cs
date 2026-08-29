@@ -66,6 +66,42 @@ public sealed class MvccLogicalLogTests
     }
 
     [Test]
+    public void RecoverySkipsFramesAtOrBelowTheLastCheckpointWatermark()
+    {
+        var fs = new InMemoryFileSystem();
+        const string dbPath = "mvcc-checkpoint-watermark.db";
+
+        using (var log = MvccLogicalLog.CreateOrOpen(fs, dbPath))
+        {
+            var store = new MvStore(logicalLog: log);
+            var table = store.GetOrCreateTableId("t");
+            var materialized = store.BeginTransaction();
+            store.Insert(
+                materialized.Id,
+                new MvccRowId(table, 1),
+                [SqlValue.Text("materialized")]);
+            store.Commit(materialized.Id);
+            log.AppendCheckpointWatermark(store.LastCommittedTimestamp);
+
+            var afterCheckpoint = store.BeginTransaction();
+            store.Insert(
+                afterCheckpoint.Id,
+                new MvccRowId(table, 2),
+                [SqlValue.Text("logical-only")]);
+            store.Commit(afterCheckpoint.Id);
+        }
+
+        using var reopened = MvccLogicalLog.CreateOrOpen(fs, dbPath);
+        var recovered = new MvStore();
+        reopened.ReplayInto(recovered);
+        var reader = recovered.BeginTransaction();
+        var rows = recovered.ScanVisible(reader.Id);
+        rows.Should().ContainSingle();
+        rows[0].RowId.RowId.Should().Be(2);
+        rows[0].Cells[0].Should().Be(SqlValue.Text("logical-only"));
+    }
+
+    [Test]
     public void DeleteOpsReplayAsTombstones()
     {
         var fs = new InMemoryFileSystem();

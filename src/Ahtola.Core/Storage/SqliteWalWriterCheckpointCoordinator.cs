@@ -27,7 +27,34 @@ public sealed record SqliteWalCheckpointResult(
     uint BackfilledFrameCount,
     uint BackfillAttemptedFrameCount,
     bool IsBusy,
-    bool ResetWal);
+    bool ResetWal)
+{
+    /// <summary>Validated WAL-index change counter for this result.</summary>
+    public uint WalIndexChangeCounter { get; init; }
+
+    /// <summary>First salt of the validated WAL incarnation.</summary>
+    public uint WalSalt1 { get; init; }
+
+    /// <summary>Second salt of the validated WAL incarnation.</summary>
+    public uint WalSalt2 { get; init; }
+
+    /// <summary>Whether the incarnation fields were captured under the checkpoint lock.</summary>
+    public bool HasValidatedWalIncarnation { get; init; }
+}
+
+/// <summary>
+/// Core-only passive checkpoint evidence for replication/sync callers. The
+/// synced frame is inclusive and meaningful only for the returned validated
+/// WAL salt/change-counter incarnation.
+/// </summary>
+public sealed record SqliteWalPassiveCheckpointResult(
+    uint MaximumFrame,
+    uint SyncedFrameInclusive,
+    uint WalIndexChangeCounter,
+    uint WalSalt1,
+    uint WalSalt2,
+    bool IsBusy,
+    bool HasValidatedWalIncarnation);
 
 /// <summary>
 /// Coordinates detached writer, recovery, and checkpoint operations over existing
@@ -342,6 +369,28 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         }
     }
 
+    /// <summary>
+    /// Runs a passive checkpoint and returns an inclusive durable WAL watermark
+    /// bound to the validated WAL-index salt/change-counter incarnation.
+    /// </summary>
+    public SqliteWalPassiveCheckpointResult CheckpointPassiveValidated(
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        var result = Checkpoint(
+            SqliteWalCheckpointMode.Passive,
+            timeout,
+            cancellationToken);
+        return new SqliteWalPassiveCheckpointResult(
+            result.MaximumFrame,
+            result.BackfilledFrameCount,
+            result.WalIndexChangeCounter,
+            result.WalSalt1,
+            result.WalSalt2,
+            result.IsBusy,
+            result.HasValidatedWalIncarnation);
+    }
+
     /// <inheritdoc />
     public void Dispose()
     {
@@ -526,45 +575,62 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
                 }
 
                 _wal.ResetAfterDurableCheckpoint(publishCheckpointedRecoveryMarker: true);
-                _index.ResetAfterDurableRestart(
-                    confirmation.Header.WithRestartedWal(
-                        _mainStore.PageCount,
-                        _wal.Header.Salt1,
-                        _wal.Header.Salt2));
+                var restartedHeader = confirmation.Header.WithRestartedWal(
+                    _mainStore.PageCount,
+                    _wal.Header.Salt1,
+                    _wal.Header.Salt2);
+                _index.ResetAfterDurableRestart(restartedHeader);
                 if (mode == SqliteWalCheckpointMode.Truncate)
                     _wal.TruncateAfterDurableCheckpoint();
-                return new SqliteWalCheckpointResult(
+                return WithValidatedWalIncarnation(
+                    new SqliteWalCheckpointResult(
+                        mode,
+                        maximumFrame,
+                        safeFrame,
+                        BackfilledFrameCount: 0,
+                        BackfillAttemptedFrameCount: 0,
+                        IsBusy: false,
+                        ResetWal: true),
+                    restartedHeader);
+            }
+
+            return WithValidatedWalIncarnation(
+                new SqliteWalCheckpointResult(
                     mode,
                     maximumFrame,
                     safeFrame,
-                    BackfilledFrameCount: 0,
-                    BackfillAttemptedFrameCount: 0,
-                    IsBusy: false,
-                    ResetWal: true);
-            }
-
-            return new SqliteWalCheckpointResult(
-                mode,
-                maximumFrame,
-                safeFrame,
-                backfilledFrameCount,
-                attemptedFrameCount,
-                IsBusy: !allReadMarksExclusive && safeFrame < maximumFrame,
-                ResetWal: false);
+                    backfilledFrameCount,
+                    attemptedFrameCount,
+                    IsBusy: !allReadMarksExclusive && safeFrame < maximumFrame,
+                    ResetWal: false),
+                region.Header);
         }
     }
 
     private static SqliteWalCheckpointResult SoftSkipCheckpoint(
         SqliteWalCheckpointMode mode,
         SqliteWalIndexHeaderRegion liveRegion)
-        => new(
-            mode,
-            liveRegion.Header.MaximumFrame,
-            SafeFrame: liveRegion.CheckpointInfo.BackfilledFrameCount,
-            liveRegion.CheckpointInfo.BackfilledFrameCount,
-            liveRegion.CheckpointInfo.BackfillAttemptedFrameCount,
-            IsBusy: false,
-            ResetWal: false);
+        => WithValidatedWalIncarnation(
+            new SqliteWalCheckpointResult(
+                mode,
+                liveRegion.Header.MaximumFrame,
+                SafeFrame: liveRegion.CheckpointInfo.BackfilledFrameCount,
+                liveRegion.CheckpointInfo.BackfilledFrameCount,
+                liveRegion.CheckpointInfo.BackfillAttemptedFrameCount,
+                IsBusy: false,
+                ResetWal: false),
+            liveRegion.Header);
+
+    private static SqliteWalCheckpointResult WithValidatedWalIncarnation(
+        SqliteWalCheckpointResult result,
+        SqliteWalIndexHeader header)
+        => result with
+        {
+            WalIndexChangeCounter = header.ChangeCounter,
+            WalSalt1 = header.Salt1,
+            WalSalt2 = header.Salt2,
+            HasValidatedWalIncarnation = true,
+        };
 
     private void InstallBackfill(uint safeFrame)
     {

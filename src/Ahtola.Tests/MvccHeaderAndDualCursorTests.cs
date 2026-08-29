@@ -188,6 +188,48 @@ public sealed class MvccHeaderAndDualCursorTests
             .Equal("alpha-3", "alpha-2", "alpha-1", "beta-1");
     }
 
+    [Test]
+    public void OpenDualCursorKeepsItsTransactionSnapshotAsAPeerCommits()
+    {
+        var store = new MvStore();
+        var reader = store.BeginTransaction();
+        var writer = store.BeginTransaction();
+        var table = store.GetOrCreateTableId(reader.Id, "t");
+        var rows = MvccDualCursor.EnumerateVisibleRows(
+            store,
+            reader.Id,
+            table,
+            [
+                new MvccDualCursor.Row(
+                    MvccKey.FromInteger(1),
+                    [SqlValue.Text("one")]),
+                new MvccDualCursor.Row(
+                    MvccKey.FromInteger(2),
+                    [SqlValue.Text("two")]),
+            ],
+            MvccKeyComparer.Integer);
+
+        using var cursor = rows.GetEnumerator();
+        cursor.MoveNext().Should().BeTrue();
+        cursor.Current.Key.Integer.Should().Be(1);
+
+        store.UpdateIncludingBase(
+            writer.Id,
+            new MvccRowId(table, 2),
+            [SqlValue.Text("updated")]);
+        store.Insert(
+            writer.Id,
+            new MvccRowId(table, 3),
+            [SqlValue.Text("three")]);
+        store.Commit(writer.Id);
+
+        cursor.MoveNext().Should().BeTrue();
+        cursor.Current.Key.Integer.Should().Be(2);
+        cursor.Current.Cells[0].Should().Be(SqlValue.Text("two"));
+        cursor.MoveNext().Should().BeFalse();
+        store.Rollback(reader.Id);
+    }
+
     private static SqlValue ReadValue(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);
