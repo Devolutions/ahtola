@@ -220,30 +220,18 @@ internal static class MvccDualCursor
         IComparer<IndexRow> indexComparer,
         IComparer<MvccKey> tableKeyComparer)
     {
-        IndexRow? previous = null;
-        while (true)
+        var projected = new List<IndexRow>();
+        foreach (var visible in store.EnumerateVisible(
+                     txId,
+                     tableId,
+                     tableKeyComparer))
         {
-            IndexRow? next = null;
-            foreach (var visible in store.EnumerateVisible(
-                         txId,
-                         tableId,
-                         tableKeyComparer))
-            {
-                if (visible.IsDelete || projectOverlay(visible) is not { } candidate)
-                    continue;
-                if (previous is { } prior
-                    && indexComparer.Compare(candidate, prior) <= 0)
-                {
-                    continue;
-                }
-                if (next is null || indexComparer.Compare(candidate, next.Value) < 0)
-                    next = candidate;
-            }
-
-            if (next is not { } selected)
-                yield break;
-            yield return selected;
-            previous = selected;
+            if (!visible.IsDelete && projectOverlay(visible) is { } candidate)
+                projected.Add(candidate);
         }
+
+        projected.Sort(indexComparer);
+        foreach (var row in projected)
+            yield return row;
     }
 }

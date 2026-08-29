@@ -8,7 +8,8 @@ namespace Ahtola.Tests;
 
 /// <summary>
 /// Managed MVCC checkpoint phases from Turso's <c>CheckpointStateMachine</c>:
-/// collect, materialize, page-WAL persist, backfill, retire/reset, and GC.
+/// collect, materialize, page-WAL persist, backfill, publish recovery evidence,
+/// retire/reset, and GC.
 /// </summary>
 public sealed class MvccCheckpointStateMachineTests
 {
@@ -341,6 +342,7 @@ public sealed class MvccCheckpointStateMachineTests
     [TestCase(nameof(MvccCheckpointPhase.Materialize))]
     [TestCase(nameof(MvccCheckpointPhase.PersistPageWal))]
     [TestCase(nameof(MvccCheckpointPhase.Backfill))]
+    [TestCase(nameof(MvccCheckpointPhase.PublishRecoveryWatermark))]
     [TestCase(nameof(MvccCheckpointPhase.RetireLogicalLog))]
     [TestCase(nameof(MvccCheckpointPhase.ResetWal))]
     [TestCase(nameof(MvccCheckpointPhase.GarbageCollect))]
@@ -379,6 +381,60 @@ public sealed class MvccCheckpointStateMachineTests
         using var reopenedConnection = reopened.Connect();
         ReadScalar(reopenedConnection, "SELECT v FROM t;").Should().Be(107L);
         reopened.RunMvccCheckpoint("TRUNCATE").Busy.Should().BeFalse();
+    }
+
+    [Test]
+    public void RecoveryWatermarkAdvancesClockBeforeTheNextLogicalCommit()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "mvcc-watermark-clock.db";
+        ulong watermark;
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(v INTEGER);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO t VALUES (1);");
+            Execute(connection, "COMMIT;");
+            watermark = database.MvStore!.LastCommittedTimestamp;
+
+            try
+            {
+                MvccCheckpointFaultInjection.AfterPhaseForTesting = phase =>
+                {
+                    if (phase == MvccCheckpointPhase.PublishRecoveryWatermark)
+                        throw new IOException("Injected crash after checkpoint watermark publication.");
+                };
+                Assert.Throws<IOException>(() => database.RunMvccCheckpoint("TRUNCATE"));
+            }
+            finally
+            {
+                MvccCheckpointFaultInjection.AfterPhaseForTesting = null;
+            }
+        }
+
+        using (var reopened = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = reopened.Connect())
+        {
+            reopened.MvStore!.LastCommittedTimestamp.Should().Be(watermark);
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO t VALUES (2);");
+            Execute(connection, "COMMIT;");
+            reopened.MvStore!.LastCommittedTimestamp.Should().BeGreaterThan(watermark);
+        }
+
+        using var final = EmbeddedDatabase.OpenFile(path, fileSystem);
+        var table = final.MvStore!.GetOrCreateTableId("t");
+        var reader = final.MvStore.BeginTransaction();
+        final.MvStore.TryRead(
+                reader.Id,
+                new MvccRowId(table, 2),
+                out var cells)
+            .Should().BeTrue();
+        cells![0].Should().Be(SqlValue.Integer(2));
+        final.MvStore.Rollback(reader.Id);
     }
 
     private static object? Scalar(SqliteConnection connection, string sql)

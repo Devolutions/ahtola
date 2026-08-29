@@ -3101,14 +3101,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.Backfill);
 
                 var checkpointed = 0L;
+                if (log is not null && logBefore != 0)
+                {
+                    log.AppendCheckpointWatermark(
+                        snapshot.DurableTimestamp,
+                        synchronousMode);
+                }
+                stateMachine.Enter(MvccCheckpointPhase.PublishRecoveryWatermark);
+                MvccCheckpointFaultInjection.Hit(
+                    MvccCheckpointPhase.PublishRecoveryWatermark);
+
                 if (log is not null)
                 {
-                    if (logBefore != 0)
-                    {
-                        log.AppendCheckpointWatermark(
-                            snapshot.DurableTimestamp,
-                            synchronousMode);
-                    }
                     log.TruncateAfterCheckpoint(synchronousMode);
                     if (requiresLogUpgrade)
                         log.UpgradeToVersion4AfterCheckpoint(synchronousMode);
@@ -44693,6 +44697,10 @@ public sealed partial class EmbeddedConnection : IDisposable
     private const int MaximumAttachedDatabases = 10;
     private const char UnqualifiedSchemaMarker = '\0';
     private const string PersistentTriggerColumnSchemaMarker = "\u0001persistent-trigger-columns";
+
+    [field: ThreadStatic]
+    internal static Action? AfterMvccBeginBeforeCatalogSnapshotForTesting { get; set; }
+
     private readonly EmbeddedDatabase _database;
     private EmbeddedDatabase _tempDatabase;
     private readonly Dictionary<string, AttachedDatabase> _attachedDatabases = new(StringComparer.OrdinalIgnoreCase);
@@ -49414,10 +49422,12 @@ Func<string, ParsedStatement> rewrite)
 
     private void BeginTransaction(bool openedBySavepoint, TransactionMode mode)
     {
+        // A peer connection may have enabled MVCC after this connection opened.
+        // Every transaction mode must attach before deciding whether it needs an
+        // MvStore reader or exclusive-writer registration.
+        _database.EnsureMvccAttachedIfDurable();
         if (mode == TransactionMode.Concurrent)
         {
-            // Peer connections may have enabled MVCC after this connection opened.
-            _database.EnsureMvccAttachedIfDurable();
             if (!_database.IsMvccEnabled)
             {
                 throw new EmbeddedSqlException(
@@ -49460,6 +49470,7 @@ Func<string, ParsedStatement> rewrite)
                     var expectedSchemaGeneration = store.SchemaGeneration;
                     var tx = store.BeginTransaction(expectedSchemaGeneration);
                     mvccTxs.Add(database, tx.Id);
+                    AfterMvccBeginBeforeCatalogSnapshotForTesting?.Invoke();
                 }
                 else if (!concurrent
                     && database.MvStore is { } exclusiveStore

@@ -284,6 +284,8 @@ internal sealed class MvccLogicalLog : IDisposable
             }
 
             var validatedEnd = position;
+            if (durableTimestamp != 0)
+                store.ApplyRecoveredWatermark(durableTimestamp);
             position = LogHeaderSize;
             while (position < validatedEnd)
             {

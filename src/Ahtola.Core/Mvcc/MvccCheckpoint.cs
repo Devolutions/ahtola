@@ -13,10 +13,11 @@ internal enum MvccCheckpointPhase : byte
     Materialize = 3,
     PersistPageWal = 4,
     Backfill = 5,
-    RetireLogicalLog = 6,
-    ResetWal = 7,
-    GarbageCollect = 8,
-    Complete = 9,
+    PublishRecoveryWatermark = 6,
+    RetireLogicalLog = 7,
+    ResetWal = 8,
+    GarbageCollect = 9,
+    Complete = 10,
 }
 
 /// <summary>Outcome of a managed MVCC checkpoint attempt.</summary>
@@ -33,7 +34,8 @@ internal readonly record struct MvccCheckpointResult(
 internal sealed record MvccCheckpointSnapshot(
     IReadOnlyList<(MvccRowId RowId, SqlValue[] Cells)> LiveRows,
     IReadOnlyCollection<MvccRowId> DeletedRows,
-    ulong DurableTimestamp);
+    ulong DurableTimestamp,
+    ulong MaterializationGeneration);
 
 /// <summary>
 /// Synchronous managed port of Turso's checkpoint durability sequence:

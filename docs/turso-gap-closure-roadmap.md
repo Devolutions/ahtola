@@ -195,8 +195,8 @@ row count, built-in collation metadata, and sample record before using it.
 - [x] Preserve statement snapshots while peer commits advance the shared
   store.
 - [x] Port Turso checkpoint phases onto managed I/O: lock, collect,
-  materialize, page-WAL persist, backfill, logical-log retirement, WAL reset,
-  then version GC.
+  materialize, page-WAL persist, backfill, recovery-watermark publication,
+  logical-log retirement, WAL reset, then version GC.
 - [x] Keep recovery evidence valid at every injected crash boundary.
 - [x] Add deterministic schema-cookie, multi-connection, cursor, checkpoint,
   reopen, and oldest-snapshot GC tests.

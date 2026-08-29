@@ -237,6 +237,119 @@ public sealed class MvccSelectDualCursorRoutingTests
     }
 
     [Test]
+    public void ReadOnlyPeerSurvivesRejectedDdlBeforeTheNextSchemaGenerationCommits()
+    {
+        using var db = new RoutingFileDatabase();
+        using var reader = db.Connect();
+        using var schemaWriter = db.Connect();
+
+        reader.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        reader.ExecuteNonQuery("BEGIN CONCURRENT;");
+        schemaWriter.ExecuteNonQuery("BEGIN CONCURRENT;");
+        var rejected = Capture(
+            () => schemaWriter.ExecuteNonQuery("CREATE INDEX ix_t_v ON t(v);"));
+        rejected.Should().NotBeNull();
+        rejected!.Message.Should().ContainEquivalentOf("locked");
+        Convert.ToInt64(Scalar(reader, "SELECT COUNT(*) FROM t;")).Should().Be(0L);
+
+        schemaWriter.ExecuteNonQuery("ROLLBACK;");
+        reader.ExecuteNonQuery("COMMIT;");
+        schemaWriter.ExecuteNonQuery("BEGIN CONCURRENT;");
+        schemaWriter.ExecuteNonQuery("CREATE INDEX ix_t_v ON t(v);");
+        schemaWriter.ExecuteNonQuery("COMMIT;");
+
+        Convert.ToInt64(Scalar(
+            reader,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'ix_t_v';")).Should().Be(1L);
+    }
+
+    [Test]
+    public void WritePeerSurvivesRejectedDdlAndPublishesBeforeTheSchemaOwnerRetries()
+    {
+        using var db = new RoutingFileDatabase();
+        using var writer = db.Connect();
+        using var schemaWriter = db.Connect();
+
+        writer.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        writer.ExecuteNonQuery("BEGIN CONCURRENT;");
+        writer.ExecuteNonQuery("INSERT INTO t VALUES (41);");
+        schemaWriter.ExecuteNonQuery("BEGIN CONCURRENT;");
+        var rejected = Capture(
+            () => schemaWriter.ExecuteNonQuery("CREATE TABLE added(v INTEGER);"));
+        rejected.Should().NotBeNull();
+        rejected!.Message.Should().ContainEquivalentOf("locked");
+
+        schemaWriter.ExecuteNonQuery("ROLLBACK;");
+        writer.ExecuteNonQuery("COMMIT;");
+        schemaWriter.ExecuteNonQuery("BEGIN CONCURRENT;");
+        schemaWriter.ExecuteNonQuery("CREATE TABLE added(v INTEGER);");
+        schemaWriter.ExecuteNonQuery("COMMIT;");
+
+        Convert.ToInt64(Scalar(writer, "SELECT v FROM t;")).Should().Be(41L);
+        Convert.ToInt64(Scalar(
+            writer,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'added';")).Should().Be(1L);
+    }
+
+    [TestCase("IMMEDIATE")]
+    [TestCase("EXCLUSIVE")]
+    public void SchemaOwnerBlocksClassicMvccWriterAdmission(string mode)
+    {
+        using var db = new RoutingFileDatabase();
+        using var schemaOwner = db.Connect();
+        using var peer = db.Connect();
+
+        schemaOwner.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        schemaOwner.ExecuteNonQuery("BEGIN CONCURRENT;");
+        schemaOwner.ExecuteNonQuery("CREATE TABLE pending(v INTEGER);");
+
+        var rejected = Capture(() => peer.ExecuteNonQuery($"BEGIN {mode};"));
+        rejected.Should().NotBeNull();
+        rejected!.Message.Should().ContainEquivalentOf("locked");
+
+        schemaOwner.ExecuteNonQuery("ROLLBACK;");
+        peer.ExecuteNonQuery($"BEGIN {mode};");
+        peer.ExecuteNonQuery("ROLLBACK;");
+    }
+
+    [Test]
+    public void MvccBeginRegistersBeforeCatalogCloneCanRaceSchemaPublication()
+    {
+        var fileSystem = new Ahtola.Core.Storage.InMemoryFileSystem();
+        const string path = "mvcc-begin-schema-race.db";
+        using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reader = database.Connect();
+        using var schemaWriter = database.Connect();
+        Execute(reader, "CREATE TABLE t(v INTEGER);");
+        Execute(reader, "PRAGMA journal_mode=mvcc;");
+        Exception? rejected = null;
+
+        try
+        {
+            EmbeddedConnection.AfterMvccBeginBeforeCatalogSnapshotForTesting = () =>
+            {
+                EmbeddedConnection.AfterMvccBeginBeforeCatalogSnapshotForTesting = null;
+                Execute(schemaWriter, "BEGIN CONCURRENT;");
+                rejected = Capture(
+                    () => Execute(schemaWriter, "CREATE TABLE raced(v INTEGER);"));
+                Execute(schemaWriter, "ROLLBACK;");
+            };
+            Execute(reader, "BEGIN CONCURRENT;");
+        }
+        finally
+        {
+            EmbeddedConnection.AfterMvccBeginBeforeCatalogSnapshotForTesting = null;
+        }
+
+        rejected.Should().NotBeNull();
+        rejected!.Message.Should().ContainEquivalentOf("locked");
+        ReadEmbeddedScalar(
+            reader,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'raced';").Should().Be(0L);
+        Execute(reader, "ROLLBACK;");
+    }
+
+    [Test]
     public void FailedOrSavepointRolledBackConcurrentDdlReleasesTheSchemaGate()
     {
         using var db = new RoutingFileDatabase();

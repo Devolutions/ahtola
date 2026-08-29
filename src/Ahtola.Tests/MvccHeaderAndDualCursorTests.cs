@@ -230,6 +230,102 @@ public sealed class MvccHeaderAndDualCursorTests
         store.Rollback(reader.Id);
     }
 
+    [Test]
+    public void WriterCommitThenActiveReaderRetainsCurrentOverlayUntilItsBaseGenerationAdvances()
+    {
+        var store = new MvStore();
+        var table = store.GetOrCreateTableId("t");
+        var writer = store.BeginTransaction();
+        store.Insert(
+            writer.Id,
+            new MvccRowId(table, 1),
+            [SqlValue.Text("committed")]);
+        store.Commit(writer.Id);
+
+        var reader = store.BeginTransaction();
+        store.TryAcquireCheckpoint(out var lease).Should().BeTrue();
+        using (lease)
+        {
+            var snapshot = store.CollectCheckpointSnapshot();
+            store.GarbageCollectAfterCheckpoint(snapshot);
+        }
+
+        MvccDualCursor.EnumerateVisibleRows(
+                store,
+                reader.Id,
+                table,
+                baseRows: [],
+                comparer: MvccKeyComparer.Integer)
+            .Should()
+            .ContainSingle()
+            .Which.Cells[0]
+            .Should()
+            .Be(SqlValue.Text("committed"));
+
+        store.Rollback(reader.Id);
+        store.TryAcquireCheckpoint(out lease).Should().BeTrue();
+        using (lease)
+        {
+            var snapshot = store.CollectCheckpointSnapshot();
+            store.GarbageCollectAfterCheckpoint(snapshot);
+        }
+        store.VersionCount.Should().Be(0);
+    }
+
+    [Test]
+    public void IndexOverlayProjectsAndSortsEachVisibleVersionOnlyOnce()
+    {
+        const int rowCount = 1_024;
+        var store = new MvStore();
+        var transaction = store.BeginTransaction();
+        var table = store.GetOrCreateTableId(transaction.Id, "items");
+        for (var rowId = 1; rowId <= rowCount; rowId++)
+        {
+            store.Insert(
+                transaction.Id,
+                new MvccRowId(table, rowId),
+                [SqlValue.Integer(rowCount - rowId + 1)]);
+        }
+
+        var projections = 0;
+        var comparer = Comparer<MvccDualCursor.IndexRow>.Create((left, right) =>
+        {
+            var comparison = left.IndexKey[0].AsInteger()
+                .CompareTo(right.IndexKey[0].AsInteger());
+            return comparison != 0
+                ? comparison
+                : left.TableKey.Integer.CompareTo(right.TableKey.Integer);
+        });
+        MvccDualCursor.IndexRow? Project(MvccVisibleRow visible)
+        {
+            projections++;
+            return new MvccDualCursor.IndexRow(
+                visible.Key,
+                [visible.Cells![0]],
+                visible.Cells);
+        }
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var rows = MvccDualCursor.EnumerateVisibleIndexRows(
+                store,
+                transaction.Id,
+                table,
+                baseRows: [],
+                projectOverlay: Project,
+                indexComparer: comparer,
+                tableKeyComparer: MvccKeyComparer.Integer)
+            .ToArray();
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        projections.Should().Be(rowCount);
+        rows.Select(row => row.IndexKey[0].AsInteger())
+            .Should().Equal(Enumerable.Range(1, rowCount).Select(static value => (long)value));
+        allocated.Should().BeLessThan(
+            8 * 1024 * 1024,
+            "the version overlay should be projected and sorted once rather than rescanned per row");
+        store.Rollback(transaction.Id);
+    }
+
     private static SqlValue ReadValue(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);

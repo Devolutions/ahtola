@@ -80,12 +80,14 @@ internal sealed class MvccTransaction
         MvccTxId id,
         ulong beginTimestamp,
         ulong beginCommitGeneration,
-        ulong beginSchemaGeneration)
+        ulong beginSchemaGeneration,
+        ulong beginCheckpointGeneration)
     {
         Id = id;
         BeginTimestamp = beginTimestamp;
         BeginCommitGeneration = beginCommitGeneration;
         BeginSchemaGeneration = beginSchemaGeneration;
+        BeginCheckpointGeneration = beginCheckpointGeneration;
     }
 
     internal MvccTxId Id { get; }
@@ -95,6 +97,8 @@ internal sealed class MvccTransaction
     internal ulong BeginCommitGeneration { get; }
 
     internal ulong BeginSchemaGeneration { get; }
+
+    internal ulong BeginCheckpointGeneration { get; }
 
     internal ulong EffectiveSchemaGeneration
     {
@@ -431,6 +435,29 @@ internal sealed class MvStore
     }
 
     /// <summary>
+    /// Advances recovery ordering across a checkpoint watermark even when every
+    /// preceding transaction frame is skipped because its rows are page-resident.
+    /// </summary>
+    internal void ApplyRecoveredWatermark(ulong durableTimestamp)
+    {
+        lock (_gate)
+        {
+            if (HasActiveTransactionsLocked())
+            {
+                throw new InvalidOperationException(
+                    "Cannot apply an MVCC recovery watermark while transactions are active.");
+            }
+            if (durableTimestamp == ulong.MaxValue)
+                throw new InvalidDataException("MVCC recovery watermark exhausted the logical clock.");
+
+            _lastCommittedTimestamp = Math.Max(
+                _lastCommittedTimestamp,
+                durableTimestamp);
+            _clock.Reset(_lastCommittedTimestamp + 1);
+        }
+    }
+
+    /// <summary>
     /// Stable negative table id for <paramref name="tableName"/> in the currently
     /// published schema generation.
     /// </summary>
@@ -579,7 +606,8 @@ internal sealed class MvStore
                 id,
                 beginTs,
                 _commitGeneration,
-                _schemaGeneration);
+                _schemaGeneration,
+                _checkpointGeneration);
             _transactions.Add(id.Value, tx);
             return tx;
         }
@@ -595,6 +623,8 @@ internal sealed class MvStore
                     "The MVCC store has an indeterminate logical-log commit; dispose and reopen the database before starting another transaction.");
             }
             if (_checkpointInProgress
+                || (_schemaChangeTransaction is { } schemaOwner
+                    && (existing is null || schemaOwner != existing.Value.Value))
                 || (_exclusiveTxId is { } held
                     && (existing is null || held != existing.Value.Value)))
             {
@@ -614,7 +644,8 @@ internal sealed class MvStore
                 id,
                 beginTs,
                 _commitGeneration,
-                _schemaGeneration);
+                _schemaGeneration,
+                _checkpointGeneration);
             _transactions.Add(id.Value, tx);
             _exclusiveTxId = id.Value;
             return tx;
@@ -653,14 +684,7 @@ internal sealed class MvStore
             if (_schemaChangeTransaction is { } owner && owner != id.Value)
                 throw new EmbeddedBusyException();
 
-            foreach (var candidate in _transactions.Values)
-            {
-                if (candidate.Id != id
-                    && candidate.State is MvccTransactionState.Active or MvccTransactionState.Preparing)
-                {
-                    throw new EmbeddedBusyException();
-                }
-            }
+            EnsureSchemaOwnerIsOnlyTransactionLocked(id, busyOnConflict: true);
 
             if (_schemaGeneration == ulong.MaxValue)
                 throw new InvalidOperationException("The MVCC schema generation is exhausted.");
@@ -715,6 +739,7 @@ internal sealed class MvStore
                 throw new InvalidOperationException(
                     "The MVCC transaction does not own a pending schema publication.");
             }
+            EnsureSchemaOwnerIsOnlyTransactionLocked(id, busyOnConflict: true);
 
             writes = tx.SnapshotWriteSet().ToHashSet();
             ValidateCommitLocked(tx, writes);
@@ -747,6 +772,7 @@ internal sealed class MvStore
                 throw new InvalidOperationException(
                     "The MVCC schema transaction is not prepared for publication.");
             }
+            EnsureSchemaOwnerIsOnlyTransactionLocked(id, busyOnConflict: false);
 
             var commitTs = tx.CommitTimestamp
                 ?? throw new InvalidOperationException(
@@ -1550,7 +1576,8 @@ internal sealed class MvStore
             return new MvccCheckpointSnapshot(
                 SnapshotLiveCommittedRowsLocked(),
                 SnapshotCommittedDeletesLocked(),
-                _lastCommittedTimestamp);
+                _lastCommittedTimestamp,
+                checked(_checkpointGeneration + 1));
         }
     }
 
@@ -1582,26 +1609,38 @@ internal sealed class MvStore
         {
             if (!_checkpointInProgress)
                 throw new InvalidOperationException("The MVCC checkpoint lease is not held.");
-            if (_checkpointGeneration == ulong.MaxValue)
-                throw new InvalidOperationException("The MVCC checkpoint generation is exhausted.");
-            var materializedAt = ++_checkpointGeneration;
+            if (snapshot.MaterializationGeneration != _checkpointGeneration + 1)
+            {
+                throw new InvalidOperationException(
+                    "The MVCC checkpoint snapshot does not follow the published materialization generation.");
+            }
+            var materializedAt = snapshot.MaterializationGeneration;
             var lwm = ComputeReaderLowWaterMarkLocked();
+            var oldestBaseGeneration = ComputeReaderBaseGenerationLowWaterMarkLocked();
 
             foreach (var (rowId, chain) in _rows.ToArray())
             {
                 foreach (var version in chain)
                 {
-                    if (VersionIsCommittedThrough(version, snapshot.DurableTimestamp))
+                    if (version.MaterializedAt == 0
+                        && VersionIsCommittedThrough(version, snapshot.DurableTimestamp))
+                    {
                         version.MaterializedAt = materializedAt;
+                    }
                 }
 
                 chain.RemoveAll(version =>
-                    CanCollectMaterializedVersion(version, lwm, materializedAt));
+                    CanCollectMaterializedVersion(
+                        version,
+                        lwm,
+                        oldestBaseGeneration,
+                        materializedAt));
 
                 if (chain.Count == 0)
                     RemoveRowLocked(rowId);
             }
 
+            _checkpointGeneration = materializedAt;
             PruneFinalizedTransactionsLocked(lwm);
         }
     }
@@ -1615,6 +1654,25 @@ internal sealed class MvStore
         }
 
         return false;
+    }
+
+    private void EnsureSchemaOwnerIsOnlyTransactionLocked(
+        MvccTxId owner,
+        bool busyOnConflict)
+    {
+        foreach (var candidate in _transactions.Values)
+        {
+            if (candidate.Id == owner
+                || candidate.State is not (MvccTransactionState.Active or MvccTransactionState.Preparing))
+            {
+                continue;
+            }
+
+            if (busyOnConflict)
+                throw new EmbeddedBusyException();
+            throw new InvalidOperationException(
+                "A peer MVCC transaction was admitted while a schema generation was publishing.");
+        }
     }
 
     private bool HasCheckpointBlockingTransactionLocked(MvccTxId? permittedTransaction)
@@ -1670,6 +1728,21 @@ internal sealed class MvStore
             lowest = lowest is null
                 ? active.BeginTimestamp
                 : Math.Min(lowest.Value, active.BeginTimestamp);
+        }
+
+        return lowest ?? ulong.MaxValue;
+    }
+
+    private ulong ComputeReaderBaseGenerationLowWaterMarkLocked()
+    {
+        ulong? lowest = null;
+        foreach (var active in _transactions.Values)
+        {
+            if (active.State is not (MvccTransactionState.Active or MvccTransactionState.Preparing))
+                continue;
+            lowest = lowest is null
+                ? active.BeginCheckpointGeneration
+                : Math.Min(lowest.Value, active.BeginCheckpointGeneration);
         }
 
         return lowest ?? ulong.MaxValue;
@@ -1774,6 +1847,7 @@ internal sealed class MvStore
     private static bool CanCollectMaterializedVersion(
         MvccRowVersion version,
         ulong readerLowWaterMark,
+        ulong readerBaseGenerationLowWaterMark,
         ulong materializedAt)
     {
         if (version.MaterializedAt == 0 || version.MaterializedAt > materializedAt)
@@ -1784,7 +1858,9 @@ internal sealed class MvStore
         if (version.End is { IsTimestamp: true, Value: var endTs })
             return endTs <= readerLowWaterMark;
 
-        return version.End is null && beginTs < readerLowWaterMark;
+        return version.End is null
+            && beginTs < readerLowWaterMark
+            && version.MaterializedAt <= readerBaseGenerationLowWaterMark;
     }
 
     private void ClearMaterializedStateLocked()
