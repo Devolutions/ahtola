@@ -72,7 +72,9 @@ public class ManagedUuidFunctionTests
         AssertError("uuid_blob()", "wrong number of arguments to function uuid_blob()");
         AssertError("uuid7_timestamp_ms()", "wrong number of arguments to function uuid7_timestamp_ms()");
         AssertError("uuid7_str('0')", "Invalid timestamp");
+        AssertError("uuid7_str(-1)", "Invalid timestamp");
         AssertError("uuid7_str(x'00')", "invalid arguments to function uuid7_str()");
+        Scalar("uuid7(-1)").Should().Be(SqlValue.Null);
         Scalar("percentile(1, 50)").Should().Be(SqlValue.Real(1));
     }
 

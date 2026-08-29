@@ -28,6 +28,7 @@ internal static class SqliteBuiltinFunctions
         "CHAR", "CHR", "UNICODE", "UNISTR", "UNISTR_QUOTE", "UNHEX", "ZEROBLOB", "RANDOMBLOB", "RANDOM", "CONCAT", "CONCAT_WS",
         "IF", "IIF", "LIKELY", "UNLIKELY", "LIKELIHOOD",
         "SQLITE_VERSION", "TURSO_VERSION", "SQLITE_SOURCE_ID", "CHANGES", "TOTAL_CHANGES", "TIMEDIFF",
+        "TIME_DATE",
         "IS_AUTOCOMMIT",
         "COALESCE", "DATE", "DATETIME", "GLOB", "HEX", "IFNULL", "INSTR",
         "JSON", "JSONB", "JSON_ARRAY", "JSONB_ARRAY", "JSON_ARRAY_LENGTH", "JSON_ERROR_POSITION",
@@ -128,6 +129,36 @@ internal static class SqliteBuiltinFunctions
     public static bool IsAggregate(string name)
         => AggregateNames.Contains(name.ToUpperInvariant());
 
+    public static bool IsExposedByFunctionList(string name)
+        => name.ToUpperInvariant() is not ("PERCENT_RANK" or "CUME_DIST" or "IS_AUTOCOMMIT");
+
+    public static bool AcceptsCall(string name, int argumentCount, bool star)
+    {
+        var normalized = name.ToUpperInvariant();
+        if (!Names.Contains(normalized))
+            return false;
+        if (star && normalized == "COUNT")
+            return argumentCount == 0;
+
+        var arities = GetArities(normalized);
+        if (!arities.Contains(-1))
+            return arities.Contains(argumentCount);
+
+        return normalized switch
+        {
+            "COALESCE" => argumentCount >= 2,
+            "CONCAT" => argumentCount >= 1,
+            "CONCAT_WS" or "IF" or "IIF" => argumentCount >= 2,
+            "MIN" or "MAX" => argumentCount >= 1,
+            "JSON_OBJECT" or "JSONB_OBJECT" => (argumentCount & 1) == 0,
+            "JSON_INSERT" or "JSONB_INSERT"
+                or "JSON_REPLACE" or "JSONB_REPLACE"
+                or "JSON_SET" or "JSONB_SET" => argumentCount >= 1 && (argumentCount & 1) != 0,
+            "JSON_REMOVE" or "JSONB_REMOVE" => argumentCount >= 1,
+            _ => true,
+        };
+    }
+
     public static IReadOnlyList<int> GetArities(string name)
     {
         var normalized = name.ToUpperInvariant();
@@ -135,6 +166,10 @@ internal static class SqliteBuiltinFunctions
             return [0, 1];
         if (normalized == "GROUP_CONCAT")
             return [1, 2];
+        if (normalized == "TIME_DATE")
+            return [3, 6, 7, 8];
+        if (normalized is "UUID7_STR" or "UUID7")
+            return [0, 1];
         if (normalized is "LAG" or "LEAD")
             return [1, 2, 3];
         if (normalized is "LIKE" or "SUBSTR" or "SUBSTRING" or "LPAD" or "RPAD")
@@ -157,15 +192,15 @@ internal static class SqliteBuiltinFunctions
         if (normalized is "STRING_AGG" or "JSON_GROUP_OBJECT" or "JSONB_GROUP_OBJECT"
             or "PERCENTILE" or "PERCENTILE_CONT" or "PERCENTILE_DISC" or "NTH_VALUE"
             or "ATAN2" or "POW" or "POWER" or "GCD" or "LCM" or "MOD" or "REPEAT"
-            or "GLOB" or "INSTR" or "NULLIF" or "IFNULL" or "LIKELIHOOD" or "TIMEDIFF"
-            or "UUID_STR" or "UUID_BLOB" or "JSON_PATCH" or "JSONB_PATCH"
+            or "GLOB" or "INSTR" or "STRPOS" or "NULLIF" or "IFNULL" or "LIKELIHOOD" or "TIMEDIFF"
+            or "JSON_PATCH" or "JSONB_PATCH"
             or "VECTOR_DISTANCE_COS" or "VECTOR_DISTANCE_L2" or "VECTOR_DISTANCE_JACCARD"
             or "VECTOR_DISTANCE_DOT")
         {
             return [2];
         }
 
-        if (normalized is "REPLACE" or "IIF" or "IF" or "VECTOR_SLICE")
+        if (normalized is "REPLACE" or "VECTOR_SLICE")
             return [3];
 
         if (normalized is "FTS_HIGHLIGHT" or "HIGHLIGHT")
@@ -177,7 +212,7 @@ internal static class SqliteBuiltinFunctions
         if (normalized is "FTS_MATCH" or "FTS_SCORE" or "BM25")
             return [-1];
 
-        if (normalized is "COALESCE" or "CHAR" or "CONCAT" or "CONCAT_WS" or "FORMAT"
+        if (normalized is "COALESCE" or "CHAR" or "CHR" or "CONCAT" or "CONCAT_WS" or "IF" or "IIF" or "FORMAT"
             or "PRINTF" or "DATE" or "DATETIME" or "TIME" or "JULIANDAY" or "STRFTIME"
             or "UNIXEPOCH" or "MIN" or "MAX" or "JSON_ARRAY" or "JSONB_ARRAY"
             or "JSON_OBJECT" or "JSONB_OBJECT" or "JSON_EXTRACT" or "JSONB_EXTRACT"

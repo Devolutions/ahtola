@@ -56,13 +56,24 @@ internal static class SqltestManagedRunner
         SqltestDatabase database,
         SqltestIntegrityCheck integrityCheck)
     {
-        var temporaryPath = database.Kind == SqltestDatabaseKind.TempFile
+        var writableDefault = database.Kind is SqltestDatabaseKind.Default
+                or SqltestDatabaseKind.DefaultNoRowidAlias
+            && RequiresWritableDefaultFixture(test.Sql);
+        var temporaryPath = database.Kind == SqltestDatabaseKind.TempFile || writableDefault
             ? CreateTemporaryDatabasePath()
             : null;
 
         try
         {
-            using var embedded = OpenDatabase(database, temporaryPath);
+            if (writableDefault)
+            {
+                File.Copy(
+                    SqltestDefaultDatabaseGenerator.GetDefaultPath(
+                        database.Kind == SqltestDatabaseKind.DefaultNoRowidAlias),
+                    temporaryPath!);
+            }
+
+            using var embedded = OpenDatabase(database, temporaryPath, writableDefault);
             embedded.RegisterScalarFunction(
                 "test_nondet_counter",
                 0,
@@ -111,20 +122,33 @@ internal static class SqltestManagedRunner
         }
     }
 
-    private static EmbeddedDatabase OpenDatabase(SqltestDatabase database, string? temporaryPath)
+    private static EmbeddedDatabase OpenDatabase(
+        SqltestDatabase database,
+        string? temporaryPath,
+        bool writableDefault)
         => database.Kind switch
         {
             SqltestDatabaseKind.Memory => new EmbeddedDatabase(),
             SqltestDatabaseKind.TempFile => EmbeddedDatabase.OpenFile(temporaryPath!),
             SqltestDatabaseKind.Default => EmbeddedDatabase.OpenFile(
-                SqltestDefaultDatabaseGenerator.GetDefaultPath(noRowidAlias: false),
-                readOnly: true),
+                writableDefault
+                    ? temporaryPath!
+                    : SqltestDefaultDatabaseGenerator.GetDefaultPath(noRowidAlias: false),
+                readOnly: !writableDefault),
             SqltestDatabaseKind.DefaultNoRowidAlias => EmbeddedDatabase.OpenFile(
-                SqltestDefaultDatabaseGenerator.GetDefaultPath(noRowidAlias: true),
-                readOnly: true),
+                writableDefault
+                    ? temporaryPath!
+                    : SqltestDefaultDatabaseGenerator.GetDefaultPath(noRowidAlias: true),
+                readOnly: !writableDefault),
             _ => throw new NotSupportedException(
                 $"The managed sqltest harness cannot construct database fixture '{database.DisplayName}'."),
         };
+
+    private static bool RequiresWritableDefaultFixture(string sql)
+        => Regex.IsMatch(
+            sql,
+            @"(?im)(?:^|;)\s*(?:CREATE|DROP|ALTER|INSERT|UPDATE|DELETE|REPLACE|VACUUM|REINDEX)\b",
+            RegexOptions.CultureInvariant);
 
     private static string CreateTemporaryDatabasePath()
     {

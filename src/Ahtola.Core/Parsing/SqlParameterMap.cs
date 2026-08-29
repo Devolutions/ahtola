@@ -104,8 +104,12 @@ public sealed class SqlParameterMap
             return end;
         }
 
-        if (!int.TryParse(sql.AsSpan(cursor + 1, end - cursor - 1), out var index) || index < 1)
-            throw new FormatException($"Invalid numbered parameter at offset {cursor}.");
+        if (!int.TryParse(sql.AsSpan(cursor + 1, end - cursor - 1), out var index)
+            || index is < 1 or > MaximumParameterCount)
+        {
+            throw new FormatException(
+                $"variable number must be between ?1 and ?{MaximumParameterCount}");
+        }
 
         EnsureParameterLimit(index);
         EnsureSlot(names, referenced, index);
@@ -181,7 +185,10 @@ public sealed class SqlParameterMap
     private static void EnsureParameterLimit(int count)
     {
         if (count > MaximumParameterCount)
-            throw new FormatException($"SQLite parameter index {count} exceeds the maximum of {MaximumParameterCount}.");
+        {
+            throw new FormatException(
+                $"variable number must be between ?1 and ?{MaximumParameterCount}");
+        }
     }
 
     private static bool IsParameterIdentifierCharacter(char value)

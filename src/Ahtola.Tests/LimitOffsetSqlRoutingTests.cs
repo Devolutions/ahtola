@@ -1,5 +1,6 @@
 using AwesomeAssertions;
 using Ahtola.Core;
+using Ahtola.Core.Parsing;
 using MsData = Microsoft.Data.Sqlite;
 
 namespace Ahtola.Tests;
@@ -19,6 +20,29 @@ namespace Ahtola.Tests;
 // compound + LIMIT, unsupported ORDER BY shapes, and non-integer LIMIT/OFFSET ("datatype mismatch").
 public class LimitOffsetSqlRoutingTests
 {
+    [Test]
+    public void LimitCoercionAndSourceLessStarValidationMatchTurso()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1), (2), (3), (4);");
+
+        ReadRows(connection, "SELECT value FROM t ORDER BY value LIMIT true;")
+            .Select(row => row[0]).Should().Equal(SqlValue.Integer(1));
+        ReadRows(connection, "SELECT value FROM t ORDER BY value LIMIT false;").Should().BeEmpty();
+        ReadRows(connection, "SELECT value FROM t ORDER BY value LIMIT '2';")
+            .Select(row => row[0]).Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
+        ReadRows(connection, "SELECT value FROM t ORDER BY value LIMIT true + 2;")
+            .Select(row => row[0]).Should().HaveCount(3);
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "SELECT *;"))!
+            .Message.Should().Be("no tables specified");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "SELECT 1 FROM (SELECT *);"))!
+            .Message.Should().Be("no tables specified");
+        Assert.Throws<FormatException>(() => SqlParameterMap.Parse("SELECT ?0"))!
+            .Message.Should().Be("variable number must be between ?1 and ?250000");
+    }
+
     // ---- Scan + LIMIT / OFFSET routing ------------------------------------------------------
 
     [Test]

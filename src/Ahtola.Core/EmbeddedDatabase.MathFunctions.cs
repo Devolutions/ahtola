@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Numerics;
 
 namespace Ahtola.Core;
 
@@ -316,8 +317,102 @@ public sealed partial class EmbeddedDatabase
 
     private static SqlValue EvaluateIif(IReadOnlyList<SqlValue> arguments)
     {
-        RequireArgumentCount("iif", arguments, 3);
-        return IsTrue(arguments[0]) ? arguments[1] : arguments[2];
+        if (arguments.Count < 2)
+            throw new EmbeddedSqlException("wrong number of arguments to function iif()");
+
+        for (var index = 0; index + 1 < arguments.Count; index += 2)
+        {
+            if (IsTrue(arguments[index]))
+                return arguments[index + 1];
+        }
+
+        return (arguments.Count & 1) != 0 ? arguments[^1] : SqlValue.Null;
+    }
+
+    private static SqlValue EvaluateTimeDate(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count is not (3 or 6 or 7 or 8))
+            throw new EmbeddedSqlException("wrong number of arguments to function time_date()");
+        if (arguments.Any(static argument => argument.Kind != SqlValueKind.Integer))
+            throw new EmbeddedSqlException("all parameters should be integers");
+
+        var year = unchecked((int)arguments[0].AsInteger());
+        var month = unchecked((int)arguments[1].AsInteger());
+        var yearMonths = year == 0 ? BigInteger.Zero : ((BigInteger)year - 1) * 12;
+        var yearAfterYearShift = FloorDivide(yearMonths, 12) + 1;
+        if (yearAfterYearShift < -262144 || yearAfterYearShift > 262142)
+            return SqlValue.Null;
+
+        var totalMonths = yearMonths + (month == 0 ? BigInteger.Zero : month - 1);
+        var normalizedYear = FloorDivide(totalMonths, 12) + 1;
+        var normalizedMonth = totalMonths - ((normalizedYear - 1) * 12) + 1;
+        if (normalizedYear < -262144 || normalizedYear > 262142)
+            return SqlValue.Null;
+
+        var day = arguments[2].AsInteger();
+        var hour = arguments.Count >= 6 ? arguments[3].AsInteger() : 0;
+        var minute = arguments.Count >= 6 ? arguments[4].AsInteger() : 0;
+        var second = arguments.Count >= 6 ? arguments[5].AsInteger() : 0;
+        var nanosecond = arguments.Count >= 7 ? arguments[6].AsInteger() : 0;
+        var offset = arguments.Count == 8 ? unchecked((int)arguments[7].AsInteger()) : 0;
+
+        const long nanosecondsPerSecond = 1_000_000_000;
+        var unixDays = DaysFromCivil((int)normalizedYear, (int)normalizedMonth, 1);
+        var baseNanoseconds = unixDays * 86_400 * nanosecondsPerSecond;
+        var elapsedSeconds = ((BigInteger)day - 1) * 86_400
+            + (BigInteger)hour * 3_600
+            + (BigInteger)minute * 60
+            + second
+            - offset;
+        var totalNanoseconds = baseNanoseconds
+            + elapsedSeconds * nanosecondsPerSecond
+            + nanosecond;
+        var minimumNanoseconds =
+            DaysFromCivil(-262144, 1, 1) * 86_400 * nanosecondsPerSecond;
+        var maximumNanoseconds =
+            (DaysFromCivil(262142, 12, 31) + 1) * 86_400 * nanosecondsPerSecond - 1;
+        if (totalNanoseconds < minimumNanoseconds || totalNanoseconds > maximumNanoseconds)
+            return SqlValue.Null;
+
+        var wholeSeconds = BigInteger.DivRem(
+            totalNanoseconds,
+            nanosecondsPerSecond,
+            out var remainingNanoseconds);
+        if (remainingNanoseconds < 0)
+        {
+            wholeSeconds--;
+            remainingNanoseconds += nanosecondsPerSecond;
+        }
+
+        const long daysBeforeUnixEpoch = 719_162;
+        var seconds = checked((long)(wholeSeconds + (BigInteger)daysBeforeUnixEpoch * 86_400));
+        var nanos = (uint)remainingNanoseconds;
+        var blob = new byte[13];
+        blob[0] = 1;
+        for (var index = 0; index < 8; index++)
+            blob[index + 1] = (byte)(seconds >> ((7 - index) * 8));
+        blob[9] = (byte)(nanos >> 24);
+        blob[10] = (byte)(nanos >> 16);
+        blob[11] = (byte)(nanos >> 8);
+        blob[12] = (byte)nanos;
+        return SqlValue.Blob(blob);
+    }
+
+    private static BigInteger FloorDivide(BigInteger value, int divisor)
+    {
+        var quotient = BigInteger.DivRem(value, divisor, out var remainder);
+        return remainder < 0 ? quotient - 1 : quotient;
+    }
+
+    private static BigInteger DaysFromCivil(int year, int month, int day)
+    {
+        var adjustedYear = (BigInteger)year - (month <= 2 ? 1 : 0);
+        var era = FloorDivide(adjustedYear, 400);
+        var yearOfEra = adjustedYear - era * 400;
+        var adjustedMonth = month + (month > 2 ? -3 : 9);
+        var dayOfYear = (153 * adjustedMonth + 2) / 5 + day - 1;
+        var dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+        return era * 146_097 + dayOfEra - 719_468;
     }
 
     /// <summary>

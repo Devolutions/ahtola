@@ -70,6 +70,7 @@ public sealed class WindowWithGroupBySemanticsTests
     [TestCase("SELECT sum(sum(value)) OVER () FROM t;")]
     [TestCase("SELECT count(*), row_number() OVER (PARTITION BY sum(value)) FROM t;")]
     [TestCase("SELECT max(sum(value)) OVER (ORDER BY grp) FROM t;")]
+    [TestCase("SELECT max(sum(value)) OVER (ORDER BY grp) FROM t GROUP BY value;")]
     [TestCase("SELECT sum(count(*)) OVER (ORDER BY count(*)) FROM t WHERE value IS NULL;")]
     // GROUP BY over an expression, and a grouped window inside a larger expression.
     [TestCase(

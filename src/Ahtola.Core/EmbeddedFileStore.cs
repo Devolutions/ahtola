@@ -10686,7 +10686,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, uint> indexRootPages)
     {
         var entries = new List<SchemaEntry>();
-        foreach (var name in tables.Keys.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+        foreach (var name in tables.Keys)
         {
             entries.Add(new SchemaEntry(
                 "table",
@@ -10708,7 +10708,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 ManagedVirtualTableSchemaSql.Build(definition)));
         }
 
-        foreach (var tableName in tables.Keys.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+        foreach (var tableName in tables.Keys)
         {
             foreach (var index in tables[tableName].Indexes)
             {
