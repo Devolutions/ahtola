@@ -710,36 +710,61 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0
             || _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark).Count != 0;
         var retainedMaterializer = _materializationLease?.FileSystem;
-        var push = await PushLocalChangesAsync(
-                replicaOptions,
-                metadata,
-                syncOptions,
-                retainedMaterializer,
-                cancellationToken)
-            .ConfigureAwait(false);
-        metadata = push.Metadata;
-        var pushedChangeCount = push.ChangeCount;
 
-        metadata = await ManagedReplicaBootstrapper
-            .CompletePartialReplicaAsync(
-                replicaOptions,
-                metadata,
-                allowTrackedLocalMutations: hasTrackedLocalChanges,
-                retainedMaterializer,
+        // Push local changes, then (when a partial bootstrap is still catching up) complete the
+        // partial image. Both can mutate the local database file directly, so both run gated --
+        // every host on this path closed for their duration -- exactly as before the wait/apply
+        // split below. Unlike before, that gate is now its own short publication window instead of
+        // spanning the network wait for remote changes too.
+        var (metadataAfterPush, pushedChangeCount) = await _syncEntry.PublishExclusiveAsync(
+                token => PreparePushAndPartialReplicaAsync(
+                    replicaOptions, metadata, syncOptions, hasTrackedLocalChanges, retainedMaterializer, token),
                 cancellationToken)
             .ConfigureAwait(false);
+        metadata = metadataAfterPush;
         _metadata = metadata;
 
         var pendingLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes;
         var acknowledgedLocalChanges = _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark);
-        var result = await ManagedReplicaBootstrapper.CheckForUpdatesAsync(
-                replicaOptions,
-                metadata,
-                syncOptions,
-                pendingLocalChanges,
-                acknowledgedLocalChanges,
-                cancellationToken)
-            .ConfigureAwait(false);
+
+        AhtolaSyncResult result;
+        while (true)
+        {
+            // Wait for remote changes: a pure network long-poll, entirely outside any publication
+            // gate, so sibling connections to this replica keep serving local reads and writes for
+            // however long the remote takes to answer. Mirrors Turso's wait_changes_from_remote
+            // (turso-src/sync/engine/src/database_sync_engine.rs); see
+            // ManagedReplicaBootstrapper.WaitForRemoteChangesAsync.
+            using var staged = await ManagedReplicaBootstrapper.WaitForRemoteChangesAsync(
+                    replicaOptions, metadata, syncOptions, pendingLocalChanges, acknowledgedLocalChanges,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            try
+            {
+                // Apply the staged response: gated, since it mutates the local database file.
+                // Mirrors Turso's apply_changes_from_remote; see
+                // ManagedReplicaBootstrapper.ApplyRemoteChangesAsync.
+                var outcome = await _syncEntry.PublishExclusiveAsync(
+                        token => ManagedReplicaBootstrapper.ApplyRemoteChangesAsync(
+                            replicaOptions, staged, syncOptions, expectedConflictState: null, token),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                result = outcome.Result;
+                break;
+            }
+            catch (ManagedReplicaStaleChangesException stale)
+            {
+                // Local state (metadata/journal) advanced past the snapshot the staged response
+                // was negotiated against -- discard it and wait for remote changes again against
+                // the fresh snapshot, exactly as the original fused retry loop did, but without
+                // ever refetching over the network while a publication gate is held.
+                metadata = stale.FreshMetadata;
+                pendingLocalChanges = stale.FreshPendingLocalChanges;
+                acknowledgedLocalChanges = stale.FreshAcknowledgedLocalChanges;
+            }
+        }
+
         _metadata = ManagedReplicaBootstrapper.LoadMetadata(replicaOptions.Path);
         if (result.Outcome == AhtolaSyncOutcome.RemoteChangesApplied && _metadata is { } published)
             _changeJournal.PruneAcknowledged(published.JournalBaseWatermark);
@@ -751,6 +776,44 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
                 LastPush = pushedChangeCount == 0 ? result.Statistics.LastPush : DateTimeOffset.UtcNow,
             },
         };
+    }
+
+    /// <summary>
+    /// Runs the gated first half of one sync cycle: push local changes to the remote, then (when a
+    /// partial bootstrap is still catching up) complete the partial image. Split out of
+    /// <see cref="SynchronizeAsync"/> so it can be handed to
+    /// <see cref="ManagedReplicaSyncRegistry.Entry.PublishExclusiveAsync{T}"/> as its own
+    /// publication unit, distinct from the apply publication unit that follows the ungated wait
+    /// for remote changes.
+    /// </summary>
+    private async Task<(ManagedReplicaBootstrapper.ManagedReplicaMetadata Metadata, long PushedChangeCount)>
+        PreparePushAndPartialReplicaAsync(
+            AhtolaReplicaOptions replicaOptions,
+            ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
+            AhtolaSyncOptions syncOptions,
+            bool hasTrackedLocalChanges,
+            ManagedReplicaPageMaterializingFileSystem? retainedMaterializer,
+            CancellationToken cancellationToken)
+    {
+        var push = await PushLocalChangesAsync(
+                replicaOptions,
+                metadata,
+                syncOptions,
+                retainedMaterializer,
+                cancellationToken)
+            .ConfigureAwait(false);
+        metadata = push.Metadata;
+
+        metadata = await ManagedReplicaBootstrapper
+            .CompletePartialReplicaAsync(
+                replicaOptions,
+                metadata,
+                allowTrackedLocalMutations: hasTrackedLocalChanges,
+                retainedMaterializer,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return (metadata, push.ChangeCount);
     }
 
     public void Dispose()

@@ -867,6 +867,17 @@ internal static class ManagedReplicaBootstrapper
     /// state.
     /// </param>
     /// <param name="cancellationToken">Cancels the pull.</param>
+    /// <remarks>
+    /// Composed from the same <see cref="WaitForRemoteChangesAsync"/> / <see cref="ApplyRemoteChangesAsync"/>
+    /// primitives a caller that wants the network long-poll to run without holding any in-process
+    /// publication gate uses directly (see <c>ManagedReplicaConnectionHost.RunSyncCycleAsync</c>).
+    /// This fused overload simply loops the two back-to-back -- retrying the whole cycle, in
+    /// place, whenever <see cref="ApplyRemoteChangesAsync"/> reports the staged response is stale
+    /// -- for callers (explicit conflict-rebase, and every existing test) that want one call
+    /// covering both halves. Mirrors Turso's <c>wait_changes_from_remote</c> -&gt;
+    /// <c>apply_changes_from_remote</c> split (turso-src/sync/engine/src/database_sync_engine.rs)
+    /// collapsed back into one step.
+    /// </remarks>
     internal static async Task<ManagedReplicaPullOutcome> CheckForUpdatesAsync(
         AhtolaReplicaOptions options, ManagedReplicaMetadata metadata, AhtolaSyncOptions syncOptions,
         IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
@@ -876,273 +887,543 @@ internal static class ManagedReplicaBootstrapper
     {
         ArgumentNullException.ThrowIfNull(pendingLocalChanges);
         ArgumentNullException.ThrowIfNull(acknowledgedLocalChanges);
-        IReadOnlySet<long>? quarantinedSequences = expectedConflictState is { } conflict
-            ? new HashSet<long>(conflict.UnresolvedSequences)
-            : null;
-        ManagedReplicaSupportMatrix.ValidateOptions(options);
-        ManagedReplicaRevertWal.ValidateSynchronizationReady(options.Path, metadata);
         // The whole pull-and-apply cycle below is retried, in place, whenever the apply lease
         // reveals that local state already moved past the snapshot (metadata, pending local
         // changes) this iteration's request/response were negotiated against -- see
-        // TryUseCurrentLocalStateAsPullBase. That can only happen when a concurrent
-        // CheckForUpdatesAsync call (another sync/bootstrap-catch-up racing through the very same
-        // per-path apply lease, or -- today, before the cross-process OS lock lands -- a second
-        // process) commits its own apply while this call was waiting on the network or the lease,
-        // both of which are deliberately outside the lease's scope (see ManagedReplicaApplyLock).
-        // Retrying here, before any apply, means a stale response can never be applied on top of a
-        // base it was not actually built from: doing so could silently regress metadata (rewind
-        // Revision) or discard an intervening local change instead of reconciling it.
+        // ManagedReplicaStaleChangesException / TryUseCurrentLocalStateAsPullBase. That can only
+        // happen when a concurrent CheckForUpdatesAsync/ApplyRemoteChangesAsync call (another
+        // sync/bootstrap-catch-up racing through the very same per-path apply lease, or -- today,
+        // before the cross-process OS lock lands -- a second process) commits its own apply while
+        // this call was waiting on the network or the lease, both of which are deliberately
+        // outside the lease's scope (see ManagedReplicaApplyLock). Retrying here, before any
+        // apply, means a stale response can never be applied on top of a base it was not actually
+        // built from: doing so could silently regress metadata (rewind Revision) or discard an
+        // intervening local change instead of reconciling it.
         while (true)
         {
-            var requestLogical = metadata.Protocol == RemotePullProtocol.MvccLogical;
-            if (requestLogical && options.RemoteEncryption is not null)
-            {
-                throw new NotSupportedException(
-                    "Managed embedded replica synchronization does not support the MVCC logical pull "
-                    + "protocol combined with remote encryption.");
-            }
-
-            if (!requestLogical)
-            {
-                // A non-logical (page) protocol client can only ever receive a Pages response for
-                // any given pull, so this is known upfront and the guard can (and should) run before
-                // spending a network round-trip on a request that would have to be rejected anyway.
-                // This is the ORIGINAL, unconditional file-level check only (no pendingLocalChanges
-                // rejection): a page-protocol replica has never reconciled local writes via the pull
-                // path, so it has always tolerated unrelated journal-tracked pending push entries as
-                // long as the file itself has not diverged, and that historical behavior is
-                // preserved exactly here. A logical-protocol client cannot be checked here: its
-                // response might turn out to be a Pages stream too (see the equivalent, STRICTER
-                // check further down, after the actual stream kind of THIS response is known), or it
-                // might be a logical stream that needs no such check at all.
-                EnsureNoLocalDivergence(options.Path, metadata);
-            }
-
-            syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pulling));
-            var payload = CreatePullRequest(metadata.Revision, options.LongPollTimeout, requestLogical);
-            using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
-            using var scope = options.EnterApplicationHttpScope();
-            using var client = options.HttpPolicy.CreateHttpClient(options.RemoteEncryption is not null);
-            client.Timeout = Timeout.InfiniteTimeSpan;
-            var token = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
-            var effectiveToken = timeout?.Token ?? cancellationToken;
-            using var response = await AhtolaRemoteTransportSecurity
-                .SendAsync(
-                    client,
-                    CreatePullUpdatesUri(options.RemoteUri),
-                    requestUri => CreatePullUpdatesHttpRequest(
-                        requestUri,
-                        payload,
-                        token,
-                        options.RemoteEncryption),
-                    token,
-                    remoteEncryptionConfigured: options.RemoteEncryption is not null,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    effectiveToken)
+            using var staged = await WaitForRemoteChangesAsync(
+                    options, metadata, syncOptions, pendingLocalChanges, acknowledgedLocalChanges, cancellationToken)
                 .ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
-            await using var stream = await response.Content.ReadAsStreamAsync(effectiveToken).ConfigureAwait(false);
-            var reader = new DelimitedProtobufReader(stream);
-            var message = await reader.ReadAsync(MaxHeaderLength, effectiveToken).ConfigureAwait(false)
-                ?? throw new InvalidDataException("The pull-updates response did not contain a protobuf header.");
-            var header = ParseHeader(message);
-
-            if (header.StreamKind == PullStreamKind.MvccLogicalLog)
+            try
             {
-                if (header.ApplyMode == PullApplyMode.ReplaceBase)
-                {
-                    throw new InvalidDataException(
-                        "The pull-updates response returned replace_base apply mode with an MVCC logical-log stream.");
-                }
-                if (!requestLogical)
-                {
-                    throw new InvalidDataException(
-                        "The pull-updates response returned an MVCC logical-log stream, but a logical pull was not requested.");
-                }
-
-                var body = await ReadRemainingBytesAsync(stream, effectiveToken).ConfigureAwait(false);
-
-                // Pull publication always takes the physical push-flight lease before the apply
-                // lease. Both stay outside the network round trip above and span only the short local
-                // apply. Besides excluding an in-flight push intent, this order prevents a main-file
-                // replacement from changing the physical identity behind the push carrier while an
-                // older carrier is still held.
-                ManagedReplicaFaultInjection.Hit(
-                    ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting);
-                await using var logicalPushLease = await ManagedReplicaPushLock
-                    .AcquireExclusiveAsync(options.Path, effectiveToken)
+                return await ApplyRemoteChangesAsync(
+                        options, staged, syncOptions, expectedConflictState, cancellationToken)
                     .ConfigureAwait(false);
-                await using var logicalApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, effectiveToken)
-                    .ConfigureAwait(false);
-                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
-                effectiveToken.ThrowIfCancellationRequested();
-                ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
-
-                // The request above (and this response) were negotiated against `metadata` and
-                // `pendingLocalChanges` as they stood BEFORE the network round trip and the wait
-                // for this lease -- both entirely outside its scope by design. Re-validate that
-                // base is still current now that the lease is actually held: if another caller
-                // already advanced local state in the meantime, this response is stale relative to
-                // it and must never be applied; retry the whole pull against the now-current base
-                // instead of silently regressing metadata or discarding an intervening local change.
-                if (!TryUseCurrentLocalStateAsPullBase(
-                        options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
-                        out var freshLogicalMetadata,
-                        out var freshLogicalPendingLocalChanges,
-                        out var freshLogicalAcknowledgedLocalChanges))
-                {
-                    metadata = freshLogicalMetadata;
-                    pendingLocalChanges = freshLogicalPendingLocalChanges;
-                    acknowledgedLocalChanges = freshLogicalAcknowledgedLocalChanges;
-                    continue;
-                }
-                ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
-
-                var (outcome, statistics, replayed) = await ApplyLogicalUpdatesAsync(
-                    options, metadata, header, body, syncOptions,
-                    SelectReplayableLocalChanges(pendingLocalChanges, quarantinedSequences),
-                    acknowledgedLocalChanges,
-                    payload.Length, reader.BytesRead + body.Length,
-                    quarantinedSequences is { Count: > 0 },
-                    effectiveToken)
-                    .ConfigureAwait(false);
-                return new ManagedReplicaPullOutcome(new AhtolaSyncResult(outcome, statistics), replayed);
             }
-
-            // Pages stream (Incremental or ReplaceBase for a page-protocol remote, or a protocol-2
-            // remote using Pages+ReplaceBase for a validated full atomic replacement).
-            if (quarantinedSequences is { Count: > 0 })
+            catch (ManagedReplicaStaleChangesException stale)
             {
-                // A raw page stream has no per-operation replay mechanism at all: it either
-                // rejects every pending local change (Incremental) or replays all of them onto a
-                // whole new snapshot (ReplaceBase). Neither can honor a quarantine, so a conflict
-                // rebase over the page protocol fails closed instead of guessing.
-                throw new NotSupportedException(
-                    "Managed embedded replica cannot rebase an unresolved push conflict over a page-based "
-                    + "pull response; the page protocol has no way to hold back the conflicting changes. "
-                    + "Resolve or discard the conflicting changes explicitly instead.");
+                metadata = stale.FreshMetadata;
+                pendingLocalChanges = stale.FreshPendingLocalChanges;
+                acknowledgedLocalChanges = stale.FreshAcknowledgedLocalChanges;
             }
-            var pages = new List<PullPage>();
-            while (await reader.ReadAsync(MaxPageMessageLength, effectiveToken).ConfigureAwait(false) is { } page)
-            {
-                pages.Add(ParsePage(page));
-            }
-            if (pages.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
-            {
-                ManagedReplicaFaultInjection.Hit(
-                    ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting);
-                await using var noOpPushLease = await ManagedReplicaPushLock
-                    .AcquireExclusiveAsync(options.Path, effectiveToken)
-                    .ConfigureAwait(false);
-                await using var noOpApplyLease = await ManagedReplicaApplyLock
-                    .AcquireExclusiveAsync(options.Path, effectiveToken)
-                    .ConfigureAwait(false);
-                ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
-                effectiveToken.ThrowIfCancellationRequested();
-                ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
-                if (!TryUseCurrentLocalStateAsPullBase(
-                        options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
-                        out var freshNoOpMetadata,
-                        out var freshNoOpPendingLocalChanges,
-                        out var freshNoOpAcknowledgedLocalChanges))
-                {
-                    metadata = freshNoOpMetadata;
-                    pendingLocalChanges = freshNoOpPendingLocalChanges;
-                    acknowledgedLocalChanges = freshNoOpAcknowledgedLocalChanges;
-                    continue;
-                }
-                ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
-                syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
-                return new ManagedReplicaPullOutcome(
-                    new AhtolaSyncResult(AhtolaSyncOutcome.UpToDate,
-                        new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, metadata.Revision)),
-                    ReplayedLocalChangeCount: 0);
-            }
+        }
+    }
 
-            if (pages.Count == 0)
-                throw new InvalidDataException("The pull-updates response changed revision without returning page data.");
-            if (string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
-                throw new InvalidDataException("The pull-updates response returned page data without changing revision.");
-            if (header.ApplyMode == PullApplyMode.ReplaceBase && (ulong)pages.Count != header.DatabasePages)
+    /// <summary>
+    /// Waits for the remote's next pull-updates response and stages it without touching any local
+    /// database state: no push/apply lease is acquired, no page or logical change is applied, and
+    /// no metadata is published. Mirrors Turso's <c>wait_changes_from_remote</c>
+    /// (turso-src/sync/engine/src/database_sync_engine.rs) -- the network long-poll (bounded by
+    /// <see cref="AhtolaReplicaOptions.LongPollTimeout"/>) runs here and only here, so a caller
+    /// that does not wrap this call in an in-process publication gate (see
+    /// <c>ManagedReplicaSyncRegistry.Entry</c>) never blocks sibling connections to the same
+    /// replica while the remote takes its time to answer. The result must be applied at most once
+    /// with <see cref="ApplyRemoteChangesAsync"/>, or discarded via
+    /// <see cref="ManagedReplicaStagedChanges.Dispose"/> -- either is safe, since nothing durable
+    /// or in-memory-shared was touched while staged.
+    /// </summary>
+    internal static async Task<ManagedReplicaStagedChanges> WaitForRemoteChangesAsync(
+        AhtolaReplicaOptions options,
+        ManagedReplicaMetadata metadata,
+        AhtolaSyncOptions syncOptions,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+        IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(pendingLocalChanges);
+        ArgumentNullException.ThrowIfNull(acknowledgedLocalChanges);
+        ManagedReplicaSupportMatrix.ValidateOptions(options);
+        ManagedReplicaRevertWal.ValidateSynchronizationReady(options.Path, metadata);
+
+        var requestLogical = metadata.Protocol == RemotePullProtocol.MvccLogical;
+        if (requestLogical && options.RemoteEncryption is not null)
+        {
+            throw new NotSupportedException(
+                "Managed embedded replica synchronization does not support the MVCC logical pull "
+                + "protocol combined with remote encryption.");
+        }
+
+        if (!requestLogical)
+        {
+            // A non-logical (page) protocol client can only ever receive a Pages response for
+            // any given pull, so this is known upfront and the guard can (and should) run before
+            // spending a network round-trip on a request that would have to be rejected anyway.
+            // This is the ORIGINAL, unconditional file-level check only (no pendingLocalChanges
+            // rejection): a page-protocol replica has never reconciled local writes via the pull
+            // path, so it has always tolerated unrelated journal-tracked pending push entries as
+            // long as the file itself has not diverged, and that historical behavior is
+            // preserved exactly here. A logical-protocol client cannot be checked here: its
+            // response might turn out to be a Pages stream too (see the equivalent, STRICTER
+            // check further down, after the actual stream kind of THIS response is known), or it
+            // might be a logical stream that needs no such check at all.
+            EnsureNoLocalDivergence(options.Path, metadata);
+        }
+
+        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pulling));
+        var payload = CreatePullRequest(metadata.Revision, options.LongPollTimeout, requestLogical);
+        using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
+        using var scope = options.EnterApplicationHttpScope();
+        using var client = options.HttpPolicy.CreateHttpClient(options.RemoteEncryption is not null);
+        client.Timeout = Timeout.InfiniteTimeSpan;
+        var token = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
+        var effectiveToken = timeout?.Token ?? cancellationToken;
+        using var response = await AhtolaRemoteTransportSecurity
+            .SendAsync(
+                client,
+                CreatePullUpdatesUri(options.RemoteUri),
+                requestUri => CreatePullUpdatesHttpRequest(
+                    requestUri,
+                    payload,
+                    token,
+                    options.RemoteEncryption),
+                token,
+                remoteEncryptionConfigured: options.RemoteEncryption is not null,
+                HttpCompletionOption.ResponseHeadersRead,
+                effectiveToken)
+            .ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(effectiveToken).ConfigureAwait(false);
+        var reader = new DelimitedProtobufReader(stream);
+        var message = await reader.ReadAsync(MaxHeaderLength, effectiveToken).ConfigureAwait(false)
+            ?? throw new InvalidDataException("The pull-updates response did not contain a protobuf header.");
+        var header = ParseHeader(message);
+
+        if (header.StreamKind == PullStreamKind.MvccLogicalLog)
+        {
+            if (header.ApplyMode == PullApplyMode.ReplaceBase)
             {
                 throw new InvalidDataException(
-                    "The pull-updates response used replace_base apply mode without returning every database page exactly once.");
+                    "The pull-updates response returned replace_base apply mode with an MVCC logical-log stream.");
             }
-
-            // Keep the same push-to-apply order as the logical branch. The response is already fully
-            // staged in memory, so no remote I/O is covered by either lease.
-            ManagedReplicaFaultInjection.Hit(
-                ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting);
-            await using var pagesPushLease = await ManagedReplicaPushLock
-                .AcquireExclusiveAsync(options.Path, effectiveToken)
-                .ConfigureAwait(false);
-            await using var pagesApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, effectiveToken)
-                .ConfigureAwait(false);
-            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
-            effectiveToken.ThrowIfCancellationRequested();
-            ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
-
-            if (!TryUseCurrentLocalStateAsPullBase(
-                    options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
-                    out var freshPagesMetadata,
-                    out var freshPagesPendingLocalChanges,
-                    out var freshPagesAcknowledgedLocalChanges))
+            if (!requestLogical)
             {
-                metadata = freshPagesMetadata;
-                pendingLocalChanges = freshPagesPendingLocalChanges;
-                acknowledgedLocalChanges = freshPagesAcknowledgedLocalChanges;
-                continue;
-            }
-            ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
-
-            // The response turned out to be a Pages stream (Incremental or ReplaceBase) even though
-            // the remembered protocol is MvccLogical (a protocol-2 remote can still answer any given
-            // pull this way, e.g. after its logical log was garbage-collected). Unlike the ordinary,
-            // historical page-protocol path above, a logical-protocol replica's local writes are
-            // expected to keep living in the WAL between syncs (tracked by the change journal,
-            // reconciled by precollect/reapply for LOGICAL responses) -- but a raw page-based apply
-            // has no such reconciliation mechanism at all, so this surprise combination needs its
-            // OWN, apply-mode-aware guard: Incremental still rejects pending changes because a
-            // partial page patch cannot rebase journaled SQL. ReplaceBase installs every page, so
-            // pending statements can be replayed onto the new snapshot before metadata publication.
-            //
-            // The ordinary, historical page-protocol path (requestLogical == false) re-validates here
-            // too: EnsureNoLocalDivergence already ran once before the network call above, but only
-            // this post-network, lock-held check is authoritative -- a local write landing during the
-            // round trip must still be caught before the apply below mutates anything. Always the
-            // strict fingerprint/sidecar check here (never the checkpoint-and-discard behavior
-            // EnsurePagesApplyIsSafe uses for ReplaceBase): a page-protocol replica has no push
-            // mechanism, so there is no way to know local WAL content is already reflected upstream.
-            if (requestLogical)
-            {
-                metadata = EnsurePagesApplyIsSafe(
-                    options.Path,
-                    metadata,
-                    pendingLocalChanges,
-                    header.ApplyMode,
-                    effectiveToken);
-            }
-            else
-            {
-                CheckFileDivergence(options.Path, metadata);
+                throw new InvalidDataException(
+                    "The pull-updates response returned an MVCC logical-log stream, but a logical pull was not requested.");
             }
 
-            await ApplyIncrementalPagesAsync(
-                    options,
-                    header,
-                    pages,
-                    metadata,
-                    pendingLocalChanges,
-                    acknowledgedLocalChanges,
-                    effectiveToken)
-                .ConfigureAwait(false);
-            syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
-            syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
-            return new ManagedReplicaPullOutcome(
-                new AhtolaSyncResult(AhtolaSyncOutcome.RemoteChangesApplied,
-                    new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, payload.Length, reader.BytesRead, header.Revision)),
-                ReplayedLocalChangeCount: 0);
+            var body = await ReadRemainingBytesAsync(stream, effectiveToken).ConfigureAwait(false);
+            return ManagedReplicaStagedChanges.ForLogical(
+                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges, requestLogical,
+                payload.Length, reader.BytesRead + body.Length, header, body);
         }
+
+        // Pages stream (Incremental or ReplaceBase for a page-protocol remote, or a protocol-2
+        // remote using Pages+ReplaceBase for a validated full atomic replacement).
+        var pages = new List<PullPage>();
+        while (await reader.ReadAsync(MaxPageMessageLength, effectiveToken).ConfigureAwait(false) is { } page)
+        {
+            pages.Add(ParsePage(page));
+        }
+        if (pages.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
+        {
+            return ManagedReplicaStagedChanges.ForNoOp(
+                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges, requestLogical,
+                payload.Length, reader.BytesRead);
+        }
+
+        if (pages.Count == 0)
+            throw new InvalidDataException("The pull-updates response changed revision without returning page data.");
+        if (string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
+            throw new InvalidDataException("The pull-updates response returned page data without changing revision.");
+        if (header.ApplyMode == PullApplyMode.ReplaceBase && (ulong)pages.Count != header.DatabasePages)
+        {
+            throw new InvalidDataException(
+                "The pull-updates response used replace_base apply mode without returning every database page exactly once.");
+        }
+
+        return ManagedReplicaStagedChanges.ForPages(
+            options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges, requestLogical,
+            payload.Length, reader.BytesRead, header, pages);
+    }
+
+    /// <summary>
+    /// Consumes a response staged by <see cref="WaitForRemoteChangesAsync"/> and applies it to the
+    /// local database. Mirrors Turso's <c>apply_changes_from_remote</c>
+    /// (turso-src/sync/engine/src/database_sync_engine.rs): every local mutation -- lease
+    /// acquisition, staleness re-validation, and the actual logical/page apply -- lives here, so a
+    /// caller can wrap only this call (never <see cref="WaitForRemoteChangesAsync"/>) in whatever
+    /// write-blocking guard its local concurrency model needs. <paramref name="staged"/> is
+    /// consumed exactly once: reused, cross-replica, or already-disposed staged changes fail
+    /// closed with <see cref="InvalidOperationException"/> before any lease is taken. When local
+    /// state (metadata, pending/acknowledged local changes) advanced past the snapshot
+    /// <paramref name="staged"/> was negotiated against, this throws
+    /// <see cref="ManagedReplicaStaleChangesException"/> instead of silently regressing metadata
+    /// or discarding an intervening local change -- the caller must discard the staged response
+    /// and call <see cref="WaitForRemoteChangesAsync"/> again against the exception's fresh
+    /// snapshot, never retry the network round trip from inside this method.
+    /// </summary>
+    internal static async Task<ManagedReplicaPullOutcome> ApplyRemoteChangesAsync(
+        AhtolaReplicaOptions options,
+        ManagedReplicaStagedChanges staged,
+        AhtolaSyncOptions syncOptions,
+        ManagedReplicaConflictState? expectedConflictState,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(staged);
+        staged.ValidateAndConsume(options.Path);
+
+        IReadOnlySet<long>? quarantinedSequences = expectedConflictState is { } conflict
+            ? new HashSet<long>(conflict.UnresolvedSequences)
+            : null;
+
+        if (staged.Kind == ManagedReplicaStagedChanges.StagedKind.Logical)
+        {
+            return await ApplyStagedLogicalChangesAsync(
+                    options, staged, syncOptions, quarantinedSequences, expectedConflictState, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        // Pages stream (Incremental or ReplaceBase for a page-protocol remote, or a protocol-2
+        // remote using Pages+ReplaceBase for a validated full atomic replacement) -- including its
+        // no-op resolution (0 pages, unchanged revision). Checked unconditionally, before looking
+        // at whether the response turned out to carry any changes: a raw page stream has no
+        // per-operation replay mechanism at all, so it either rejects every pending local change
+        // (Incremental) or replays all of them onto a whole new snapshot (ReplaceBase). Neither
+        // can honor a quarantine, so a conflict rebase over the page protocol fails closed instead
+        // of guessing, even when the response itself turns out to be a no-op.
+        if (quarantinedSequences is { Count: > 0 })
+        {
+            throw new NotSupportedException(
+                "Managed embedded replica cannot rebase an unresolved push conflict over a page-based "
+                + "pull response; the page protocol has no way to hold back the conflicting changes. "
+                + "Resolve or discard the conflicting changes explicitly instead.");
+        }
+
+        return staged.IsEmpty
+            ? await ApplyStagedNoOpAsync(options, staged, syncOptions, expectedConflictState, cancellationToken)
+                .ConfigureAwait(false)
+            : await ApplyStagedPagesAsync(options, staged, syncOptions, expectedConflictState, cancellationToken)
+                .ConfigureAwait(false);
+    }
+
+    private static async Task<ManagedReplicaPullOutcome> ApplyStagedLogicalChangesAsync(
+        AhtolaReplicaOptions options,
+        ManagedReplicaStagedChanges staged,
+        AhtolaSyncOptions syncOptions,
+        IReadOnlySet<long>? quarantinedSequences,
+        ManagedReplicaConflictState? expectedConflictState,
+        CancellationToken cancellationToken)
+    {
+        var metadata = staged.RequestBaseMetadata;
+        var pendingLocalChanges = staged.RequestBasePendingLocalChanges;
+        var acknowledgedLocalChanges = staged.RequestBaseAcknowledgedLocalChanges;
+
+        // Pull publication always takes the physical push-flight lease before the apply
+        // lease. Both stay outside the network round trip (now entirely inside
+        // WaitForRemoteChangesAsync) and span only the short local apply. Besides excluding an
+        // in-flight push intent, this order prevents a main-file replacement from changing the
+        // physical identity behind the push carrier while an older carrier is still held.
+        ManagedReplicaFaultInjection.Hit(
+            ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting);
+        await using var logicalPushLease = await ManagedReplicaPushLock
+            .AcquireExclusiveAsync(options.Path, cancellationToken)
+            .ConfigureAwait(false);
+        await using var logicalApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, cancellationToken)
+            .ConfigureAwait(false);
+        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
+        cancellationToken.ThrowIfCancellationRequested();
+        ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
+
+        // The request that produced this staged response (and the response itself) were
+        // negotiated against `metadata` and `pendingLocalChanges` as they stood BEFORE the network
+        // round trip and the wait for this lease -- both entirely outside its scope by design.
+        // Re-validate that base is still current now that the lease is actually held: if another
+        // caller already advanced local state in the meantime, this response is stale relative to
+        // it and must never be applied. Unlike the historical fused retry loop, this never retries
+        // the network round trip itself -- it throws so the caller discards the staged response
+        // and waits for remote changes again, instead of silently regressing metadata or
+        // discarding an intervening local change.
+        if (!TryUseCurrentLocalStateAsPullBase(
+                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
+                out var freshMetadata,
+                out var freshPendingLocalChanges,
+                out var freshAcknowledgedLocalChanges))
+        {
+            throw new ManagedReplicaStaleChangesException(
+                freshMetadata, freshPendingLocalChanges, freshAcknowledgedLocalChanges);
+        }
+        ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
+
+        var (outcome, statistics, replayed) = await ApplyLogicalUpdatesAsync(
+            options, metadata, staged.Header, staged.LogicalBody!, syncOptions,
+            SelectReplayableLocalChanges(pendingLocalChanges, quarantinedSequences),
+            acknowledgedLocalChanges,
+            staged.RequestPayloadLength, staged.ResponseBytesRead,
+            quarantinedSequences is { Count: > 0 },
+            cancellationToken)
+            .ConfigureAwait(false);
+        return new ManagedReplicaPullOutcome(new AhtolaSyncResult(outcome, statistics), replayed);
+    }
+
+    private static async Task<ManagedReplicaPullOutcome> ApplyStagedNoOpAsync(
+        AhtolaReplicaOptions options,
+        ManagedReplicaStagedChanges staged,
+        AhtolaSyncOptions syncOptions,
+        ManagedReplicaConflictState? expectedConflictState,
+        CancellationToken cancellationToken)
+    {
+        var metadata = staged.RequestBaseMetadata;
+        var pendingLocalChanges = staged.RequestBasePendingLocalChanges;
+        var acknowledgedLocalChanges = staged.RequestBaseAcknowledgedLocalChanges;
+
+        ManagedReplicaFaultInjection.Hit(
+            ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting);
+        await using var noOpPushLease = await ManagedReplicaPushLock
+            .AcquireExclusiveAsync(options.Path, cancellationToken)
+            .ConfigureAwait(false);
+        await using var noOpApplyLease = await ManagedReplicaApplyLock
+            .AcquireExclusiveAsync(options.Path, cancellationToken)
+            .ConfigureAwait(false);
+        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
+        cancellationToken.ThrowIfCancellationRequested();
+        ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
+        if (!TryUseCurrentLocalStateAsPullBase(
+                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
+                out var freshMetadata,
+                out var freshPendingLocalChanges,
+                out var freshAcknowledgedLocalChanges))
+        {
+            throw new ManagedReplicaStaleChangesException(
+                freshMetadata, freshPendingLocalChanges, freshAcknowledgedLocalChanges);
+        }
+        ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
+        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
+        return new ManagedReplicaPullOutcome(
+            new AhtolaSyncResult(AhtolaSyncOutcome.UpToDate,
+                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, staged.RequestPayloadLength, staged.ResponseBytesRead, metadata.Revision)),
+            ReplayedLocalChangeCount: 0);
+    }
+
+    private static async Task<ManagedReplicaPullOutcome> ApplyStagedPagesAsync(
+        AhtolaReplicaOptions options,
+        ManagedReplicaStagedChanges staged,
+        AhtolaSyncOptions syncOptions,
+        ManagedReplicaConflictState? expectedConflictState,
+        CancellationToken cancellationToken)
+    {
+        var metadata = staged.RequestBaseMetadata;
+        var pendingLocalChanges = staged.RequestBasePendingLocalChanges;
+        var acknowledgedLocalChanges = staged.RequestBaseAcknowledgedLocalChanges;
+        var header = staged.Header;
+        var pages = staged.Pages!;
+
+        // Keep the same push-to-apply order as the logical branch. The response is already fully
+        // staged in memory, so no remote I/O is covered by either lease.
+        ManagedReplicaFaultInjection.Hit(
+            ManagedReplicaDurableBoundary.ReplicaPullPublicationLockWaiting);
+        await using var pagesPushLease = await ManagedReplicaPushLock
+            .AcquireExclusiveAsync(options.Path, cancellationToken)
+            .ConfigureAwait(false);
+        await using var pagesApplyLease = await ManagedReplicaApplyLock.AcquireExclusiveAsync(options.Path, cancellationToken)
+            .ConfigureAwait(false);
+        ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
+        cancellationToken.ThrowIfCancellationRequested();
+        ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
+
+        if (!TryUseCurrentLocalStateAsPullBase(
+                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
+                out var freshMetadata,
+                out var freshPendingLocalChanges,
+                out var freshAcknowledgedLocalChanges))
+        {
+            throw new ManagedReplicaStaleChangesException(
+                freshMetadata, freshPendingLocalChanges, freshAcknowledgedLocalChanges);
+        }
+        ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
+
+        // The response turned out to be a Pages stream (Incremental or ReplaceBase) even though
+        // the remembered protocol is MvccLogical (a protocol-2 remote can still answer any given
+        // pull this way, e.g. after its logical log was garbage-collected). Unlike the ordinary,
+        // historical page-protocol path above, a logical-protocol replica's local writes are
+        // expected to keep living in the WAL between syncs (tracked by the change journal,
+        // reconciled by precollect/reapply for LOGICAL responses) -- but a raw page-based apply
+        // has no such reconciliation mechanism at all, so this surprise combination needs its
+        // OWN, apply-mode-aware guard: Incremental still rejects pending changes because a
+        // partial page patch cannot rebase journaled SQL. ReplaceBase installs every page, so
+        // pending statements can be replayed onto the new snapshot before metadata publication.
+        //
+        // The ordinary, historical page-protocol path (requestLogical == false) re-validates here
+        // too: EnsureNoLocalDivergence already ran once before the network call above, but only
+        // this post-network, lock-held check is authoritative -- a local write landing during the
+        // round trip must still be caught before the apply below mutates anything. Always the
+        // strict fingerprint/sidecar check here (never the checkpoint-and-discard behavior
+        // EnsurePagesApplyIsSafe uses for ReplaceBase): a page-protocol replica has no push
+        // mechanism, so there is no way to know local WAL content is already reflected upstream.
+        if (staged.RequestedLogical)
+        {
+            metadata = EnsurePagesApplyIsSafe(
+                options.Path,
+                metadata,
+                pendingLocalChanges,
+                header.ApplyMode,
+                cancellationToken);
+        }
+        else
+        {
+            CheckFileDivergence(options.Path, metadata);
+        }
+
+        await ApplyIncrementalPagesAsync(
+                options,
+                header,
+                pages,
+                metadata,
+                pendingLocalChanges,
+                acknowledgedLocalChanges,
+                cancellationToken)
+            .ConfigureAwait(false);
+        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Applying));
+        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
+        return new ManagedReplicaPullOutcome(
+            new AhtolaSyncResult(AhtolaSyncOutcome.RemoteChangesApplied,
+                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, staged.RequestPayloadLength, staged.ResponseBytesRead, header.Revision)),
+            ReplayedLocalChangeCount: 0);
+    }
+
+    /// <summary>
+    /// A pull-updates response staged by <see cref="WaitForRemoteChangesAsync"/> but not yet
+    /// applied to the local database. Mirrors Turso's <c>DbChangesStatus</c>
+    /// (turso-src/sync/engine/src/types.rs) -- the opaque handle threaded from
+    /// <c>wait_changes_from_remote</c> to <c>apply_changes_from_remote</c>. Nothing durable or
+    /// shared is touched while an instance is staged, so discarding one (via <see cref="Dispose"/>
+    /// without ever applying it) is always safe. Applying is guarded against every documented
+    /// misuse: <see cref="ApplyRemoteChangesAsync"/> fails closed with
+    /// <see cref="InvalidOperationException"/> before taking any lease if the instance was staged
+    /// for a different replica path, was already applied, or was already discarded.
+    /// </summary>
+    internal sealed class ManagedReplicaStagedChanges : IDisposable
+    {
+        internal enum StagedKind
+        {
+            NoOp,
+            Logical,
+            Pages,
+        }
+
+        private readonly string _databasePath;
+        private int _consumed;
+
+        private ManagedReplicaStagedChanges(
+            string databasePath,
+            ManagedReplicaMetadata requestBaseMetadata,
+            IReadOnlyList<ReplicaLocalChange> requestBasePendingLocalChanges,
+            IReadOnlyList<ReplicaLocalChange> requestBaseAcknowledgedLocalChanges,
+            bool requestedLogical,
+            int requestPayloadLength,
+            long responseBytesRead,
+            StagedKind kind,
+            PullHeader header,
+            byte[]? logicalBody,
+            IReadOnlyList<PullPage>? pages)
+        {
+            _databasePath = databasePath;
+            RequestBaseMetadata = requestBaseMetadata;
+            RequestBasePendingLocalChanges = requestBasePendingLocalChanges;
+            RequestBaseAcknowledgedLocalChanges = requestBaseAcknowledgedLocalChanges;
+            RequestedLogical = requestedLogical;
+            RequestPayloadLength = requestPayloadLength;
+            ResponseBytesRead = responseBytesRead;
+            Kind = kind;
+            Header = header;
+            LogicalBody = logicalBody;
+            Pages = pages;
+        }
+
+        internal ManagedReplicaMetadata RequestBaseMetadata { get; }
+        internal IReadOnlyList<ReplicaLocalChange> RequestBasePendingLocalChanges { get; }
+        internal IReadOnlyList<ReplicaLocalChange> RequestBaseAcknowledgedLocalChanges { get; }
+        internal bool RequestedLogical { get; }
+        internal int RequestPayloadLength { get; }
+        internal long ResponseBytesRead { get; }
+        internal StagedKind Kind { get; }
+        internal PullHeader Header { get; }
+        internal byte[]? LogicalBody { get; }
+        internal IReadOnlyList<PullPage>? Pages { get; }
+
+        /// <summary>The response carried no changes and the revision did not move.</summary>
+        internal bool IsEmpty => Kind == StagedKind.NoOp;
+
+        internal static ManagedReplicaStagedChanges ForNoOp(
+            string databasePath,
+            ManagedReplicaMetadata requestBaseMetadata,
+            IReadOnlyList<ReplicaLocalChange> requestBasePendingLocalChanges,
+            IReadOnlyList<ReplicaLocalChange> requestBaseAcknowledgedLocalChanges,
+            bool requestedLogical,
+            int requestPayloadLength,
+            long responseBytesRead)
+            => new(databasePath, requestBaseMetadata, requestBasePendingLocalChanges,
+                requestBaseAcknowledgedLocalChanges, requestedLogical, requestPayloadLength, responseBytesRead,
+                StagedKind.NoOp, default, null, null);
+
+        internal static ManagedReplicaStagedChanges ForLogical(
+            string databasePath,
+            ManagedReplicaMetadata requestBaseMetadata,
+            IReadOnlyList<ReplicaLocalChange> requestBasePendingLocalChanges,
+            IReadOnlyList<ReplicaLocalChange> requestBaseAcknowledgedLocalChanges,
+            bool requestedLogical,
+            int requestPayloadLength,
+            long responseBytesRead,
+            PullHeader header,
+            byte[] body)
+            => new(databasePath, requestBaseMetadata, requestBasePendingLocalChanges,
+                requestBaseAcknowledgedLocalChanges, requestedLogical, requestPayloadLength, responseBytesRead,
+                StagedKind.Logical, header, body, null);
+
+        internal static ManagedReplicaStagedChanges ForPages(
+            string databasePath,
+            ManagedReplicaMetadata requestBaseMetadata,
+            IReadOnlyList<ReplicaLocalChange> requestBasePendingLocalChanges,
+            IReadOnlyList<ReplicaLocalChange> requestBaseAcknowledgedLocalChanges,
+            bool requestedLogical,
+            int requestPayloadLength,
+            long responseBytesRead,
+            PullHeader header,
+            IReadOnlyList<PullPage> pages)
+            => new(databasePath, requestBaseMetadata, requestBasePendingLocalChanges,
+                requestBaseAcknowledgedLocalChanges, requestedLogical, requestPayloadLength, responseBytesRead,
+                StagedKind.Pages, header, null, pages);
+
+        /// <summary>
+        /// Atomically marks this staged response consumed, failing closed if it was staged for a
+        /// different replica path (cross-replica misuse), or if it was already applied or already
+        /// discarded via <see cref="Dispose"/> (duplicate-apply / disposed-result misuse). Must be
+        /// the first thing <see cref="ApplyRemoteChangesAsync"/> does, before any lease is taken.
+        /// </summary>
+        internal void ValidateAndConsume(string databasePath)
+        {
+            if (!string.Equals(Path.GetFullPath(databasePath), Path.GetFullPath(_databasePath), PathComparison))
+            {
+                throw new InvalidOperationException(
+                    "Managed embedded replica staged remote changes were staged for a different replica path "
+                    + "and cannot be applied here.");
+            }
+            if (Interlocked.CompareExchange(ref _consumed, 1, 0) != 0)
+            {
+                throw new InvalidOperationException(
+                    "Managed embedded replica staged remote changes were already applied or discarded and "
+                    + "cannot be applied again.");
+            }
+        }
+
+        private static StringComparison PathComparison =>
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+        /// <summary>
+        /// Discards the staged response without applying it. Safe to call whether or not it was
+        /// ever applied: nothing durable or shared was touched while staged, so this only ever
+        /// marks the instance consumed (idempotent) to enforce the one-shot contract.
+        /// </summary>
+        public void Dispose() => Volatile.Write(ref _consumed, 1);
     }
 
     /// <summary>
@@ -4155,19 +4436,19 @@ internal static class ManagedReplicaBootstrapper
         long FirstSequence,
         long Watermark);
 
-    private enum PullStreamKind
+    internal enum PullStreamKind
     {
         Pages = 0,
         MvccLogicalLog = 1,
     }
 
-    private enum PullApplyMode
+    internal enum PullApplyMode
     {
         Incremental = 0,
         ReplaceBase = 1,
     }
 
-    private readonly record struct ManagedReplicaLogicalLogMetadata(
+    internal readonly record struct ManagedReplicaLogicalLogMetadata(
         string Format,
         bool CheckpointTransition,
         IReadOnlyList<ManagedReplicaLogicalLogRange> Ranges);
@@ -4179,14 +4460,14 @@ internal static class ManagedReplicaBootstrapper
         IReadOnlyList<ulong> MaterializedPageIds,
         bool IsPartial);
 
-    private readonly record struct PullHeader(
+    internal readonly record struct PullHeader(
         string Revision,
         ulong DatabasePages,
         PullStreamKind StreamKind,
         PullApplyMode ApplyMode,
         RemotePullProtocol Protocol,
         ManagedReplicaLogicalLogMetadata? LogicalMetadata);
-    private readonly record struct PullPage(ulong PageId, byte[] Data);
+    internal readonly record struct PullPage(ulong PageId, byte[] Data);
     private readonly record struct RoaringContainer(
         ushort Key,
         int Cardinality,
@@ -4332,6 +4613,35 @@ internal static class ManagedReplicaBootstrapper
             _offset += length;
         }
     }
+}
+
+/// <summary>
+/// Signals that local state (metadata, pending/acknowledged local changes) advanced past the
+/// snapshot a <see cref="ManagedReplicaBootstrapper.ManagedReplicaStagedChanges"/> response was
+/// negotiated against, between <see cref="ManagedReplicaBootstrapper.WaitForRemoteChangesAsync"/>
+/// capturing it and <see cref="ManagedReplicaBootstrapper.ApplyRemoteChangesAsync"/> re-validating
+/// it under the exclusive apply lease (see <c>TryUseCurrentLocalStateAsPullBase</c>). The staged
+/// response is never applied on top of a base it was not actually built from -- doing so could
+/// silently regress metadata (rewind <c>Revision</c>) or discard an intervening local change
+/// instead of reconciling it. Callers must discard the staged response and call
+/// <see cref="ManagedReplicaBootstrapper.WaitForRemoteChangesAsync"/> again against
+/// <see cref="FreshMetadata"/>, <see cref="FreshPendingLocalChanges"/>, and
+/// <see cref="FreshAcknowledgedLocalChanges"/>, rather than retrying the stale response or
+/// refetching from inside an apply-time lease.
+/// </summary>
+internal sealed class ManagedReplicaStaleChangesException(
+    ManagedReplicaBootstrapper.ManagedReplicaMetadata freshMetadata,
+    IReadOnlyList<ReplicaLocalChange> freshPendingLocalChanges,
+    IReadOnlyList<ReplicaLocalChange> freshAcknowledgedLocalChanges)
+    : Exception(
+        "Managed embedded replica local state advanced past the snapshot the staged remote changes "
+        + "were negotiated against; discard them and wait for remote changes again.")
+{
+    internal ManagedReplicaBootstrapper.ManagedReplicaMetadata FreshMetadata { get; } = freshMetadata;
+
+    internal IReadOnlyList<ReplicaLocalChange> FreshPendingLocalChanges { get; } = freshPendingLocalChanges;
+
+    internal IReadOnlyList<ReplicaLocalChange> FreshAcknowledgedLocalChanges { get; } = freshAcknowledgedLocalChanges;
 }
 
 /// <summary>The local on-disk state of a managed embedded replica, as determined purely from

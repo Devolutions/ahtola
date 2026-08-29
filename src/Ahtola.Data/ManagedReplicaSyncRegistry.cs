@@ -175,9 +175,15 @@ internal static class ManagedReplicaSyncRegistry
         {
             try
             {
-                completion.TrySetResult(
-                    await PublishAsync(stagedOperation, cancellationToken, clearInFlightSync: true)
-                        .ConfigureAwait(false));
+                // Unlike PublishAsync/PublishExclusiveAsync, this deliberately does NOT itself wrap
+                // stagedOperation in one publication window: SyncAsync's staged operation runs its
+                // network-bound phases (push, then the long-poll wait for remote changes) entirely
+                // without any publication gate held, and calls PublishExclusiveAsync itself --
+                // possibly more than once -- only around the short local-mutating phases (push's
+                // own rare conflict-restore branch; the actual apply). Coalescing concurrent
+                // SyncAsync callers for this path into one shared in-flight task is this method's
+                // only job; deciding when to gate is entirely the staged operation's business.
+                completion.TrySetResult(await stagedOperation(cancellationToken).ConfigureAwait(false));
             }
             catch (OperationCanceledException exception) when (exception.CancellationToken == cancellationToken)
             {
@@ -186,6 +192,11 @@ internal static class ManagedReplicaSyncRegistry
             catch (Exception exception)
             {
                 completion.TrySetException(exception);
+            }
+            finally
+            {
+                lock (_gate)
+                    _inFlightSync = null;
             }
         }
 
@@ -200,8 +211,7 @@ internal static class ManagedReplicaSyncRegistry
                     await stagedOperation(token).ConfigureAwait(false);
                     return true;
                 },
-                cancellationToken,
-                clearInFlightSync: false);
+                cancellationToken);
         }
 
         /// <summary>
@@ -215,13 +225,12 @@ internal static class ManagedReplicaSyncRegistry
             CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(stagedOperation);
-            return PublishAsync(stagedOperation, cancellationToken, clearInFlightSync: false);
+            return PublishAsync(stagedOperation, cancellationToken);
         }
 
         private async Task<T> PublishAsync<T>(
             Func<CancellationToken, Task<T>> stagedOperation,
-            CancellationToken cancellationToken,
-            bool clearInFlightSync)
+            CancellationToken cancellationToken)
         {
             var request = new PublicationRequest();
             try
@@ -276,8 +285,6 @@ internal static class ManagedReplicaSyncRegistry
                     {
                         _publicationActive = false;
                         _publicationPending = false;
-                        if (clearInFlightSync)
-                            _inFlightSync = null;
                         SignalStateChangedNoLock();
                         RetireIfUnusedNoLock();
                     }
