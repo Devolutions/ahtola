@@ -420,6 +420,45 @@ public sealed class MvccSelectDualCursorRoutingTests
     }
 
     [Test]
+    public async Task SchemaAdmissionRechecksCommitGenerationAfterClassicWriterWait()
+    {
+        var fileSystem = new Ahtola.Core.Storage.InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile(
+            "mvcc-schema-wait-generation.db",
+            fileSystem);
+        using var schemaWriter = database.Connect();
+        using var classicWriter = database.Connect();
+        using var concurrentWriter = database.Connect();
+        Execute(schemaWriter, "CREATE TABLE t(v INTEGER);");
+        Execute(schemaWriter, "PRAGMA journal_mode=mvcc;");
+        schemaWriter.BusyTimeout = TimeSpan.FromSeconds(2);
+        Execute(classicWriter, "BEGIN;");
+        Execute(classicWriter, "INSERT INTO t VALUES (99);");
+        Execute(schemaWriter, "BEGIN CONCURRENT;");
+
+        var schemaChange = Task.Run(
+            () => Capture(() => Execute(schemaWriter, "CREATE TABLE added(v INTEGER);")));
+        await Task.Delay(100);
+        schemaChange.IsCompleted.Should().BeFalse();
+
+        Execute(concurrentWriter, "BEGIN CONCURRENT;");
+        Execute(concurrentWriter, "INSERT INTO t VALUES (2);");
+        Execute(concurrentWriter, "COMMIT;");
+        Execute(classicWriter, "ROLLBACK;");
+
+        var staleSchema = await schemaChange.WaitAsync(TimeSpan.FromSeconds(5));
+        staleSchema.Should().NotBeNull();
+        staleSchema!.Message.Should().ContainEquivalentOf("locked");
+        Execute(schemaWriter, "ROLLBACK;");
+        Execute(schemaWriter, "BEGIN CONCURRENT;");
+        Execute(schemaWriter, "CREATE TABLE added(v INTEGER);");
+        Execute(schemaWriter, "COMMIT;");
+
+        ReadEmbeddedScalar(schemaWriter, "SELECT COUNT(*) FROM t WHERE v=2;")
+            .Should().Be(1L);
+    }
+
+    [Test]
     public async Task MvccBeginRegistersBeforeCatalogCloneCanRaceSchemaPublication()
     {
         var fileSystem = new Ahtola.Core.Storage.InMemoryFileSystem();
