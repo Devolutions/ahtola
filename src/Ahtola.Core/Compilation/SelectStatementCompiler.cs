@@ -42,9 +42,11 @@ internal sealed class SelectStatementCompiler
             return $"{target.TableName} USING COVERING INDEX {name}";
         }
 
-        // Multi-index OR unions use joined names (idx_a+idx_b).
-        if (target.IndexName.Contains('+', StringComparison.Ordinal))
+        if (target.AccessKind == ScanAccessKind.MultiIndexOr)
             return $"{target.TableName} USING MULTI-INDEX OR {target.IndexName}";
+
+        if (target.AccessKind == ScanAccessKind.MultiIndexAnd)
+            return $"{target.TableName} USING MULTI-INDEX AND {target.IndexName}";
 
         return $"{target.TableName} USING INDEX {target.IndexName}";
     }

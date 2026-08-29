@@ -28,7 +28,7 @@ scope decision; it does not mean Ahtola implements every newer Turso feature.
 | 5 | `select-validation-parity` | 10 sqltests closed | `core/translate/planner.rs`, `expr/`, `select.rs` | Done |
 | 6 | `window-group-pipeline` | 9 sqltests closed | `core/translate/window.rs` | Done |
 | 7 | `join-coalescing-parity` | 4 sqltests closed | `core/translate/planner.rs`, `plan.rs`, `select.rs` | Done |
-| 8 | `planner-access-path-depth` | Documented runtime limit | `core/translate/optimizer/`, `planner.rs`, `main_loop/` | Planned |
+| 8 | `planner-access-path-depth` | Access-path depth completed | `core/translate/optimizer/`, `planner.rs`, `main_loop/` | Done |
 | 9 | `mvcc-page-native-depth` | Documented runtime limit | `core/mvcc/` | Done |
 | 10 | `sync-engine-depth` | Wait/apply lifecycle split landed; passive checkpoint hook available | `sync/engine/src/` | Partial |
 
@@ -165,17 +165,26 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 
 ### 8. Planner access-path depth
 
-- [ ] Add multi-index AND intersection with rowid-set cardinality costing and
+- [x] Add multi-index AND intersection with rowid-set cardinality costing and
   a full-scan fallback.
-- [ ] Read STAT4 samples and use histogram selectivity only when schema and
+- [x] Read STAT4 samples and use histogram selectivity only when schema and
   collation metadata match.
-- [ ] Build transient automatic indexes for profitable inner join inputs.
-- [ ] Replace materialized durable-index probes with lazy pager/index cursors
+- [x] Build transient automatic indexes for profitable inner join inputs.
+- [x] Replace materialized durable-index probes with lazy pager/index cursors
   where a covering or rowid lookup is proven.
-- [ ] Preserve deterministic plans without statistics and all existing outer
+- [x] Preserve deterministic plans without statistics and all existing outer
   join barriers.
-- [ ] Extend EXPLAIN QUERY PLAN, selectivity tests, and bounded benchmarks for
+- [x] Extend EXPLAIN QUERY PLAN, selectivity tests, and bounded benchmarks for
   every new path.
+
+The managed planner mirrors Turso's `multi_index.rs` row-set costing and
+automatic-index eligibility, while keeping LEFT/RIGHT/FULL, NATURAL, and USING
+subtrees opaque. Committed rowid-table joins now seek the SQLite index b-tree
+directly and defer the table fetch unless the index covers the row; transaction,
+MVCC, unsupported-shape, and unsupported-collation cases retain the materialized
+fallback. The pinned Turso release has no STAT4 reader, so Ahtola's histogram
+extension validates the standard `sqlite_stat4` schema, current `sqlite_stat1`
+row count, built-in collation metadata, and sample record before using it.
 
 ### 9. Page-native MVCC depth
 

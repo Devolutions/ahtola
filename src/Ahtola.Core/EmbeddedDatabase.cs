@@ -252,6 +252,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private static readonly AsyncLocal<EmbeddedDatabase?> RecursiveTriggerCallbackDatabase = new();
     internal const string SqliteSequenceTableName = "sqlite_sequence";
     internal const string SqliteStat1TableName = "sqlite_stat1";
+    internal const string SqliteStat4TableName = "sqlite_stat4";
     private const string TursoSequenceBackingTablePrefix = "__turso_internal_seq_";
     private const string TursoAutoIncrementSequencePrefix = "__turso_internal_autoincrement_";
     private static readonly ConditionalWeakTable<IFileSystem, FileCatalogWriteLockScope> FileCatalogWriteLocks = new();
@@ -5701,13 +5702,22 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var statistics = GetOrCreateSqliteStat1Table(catalog);
+        var histogramStatistics = GetOrCreateSqliteStat4Table(catalog);
         foreach (var target in targets)
         {
             DeleteStatistics(statistics, target.Table.Name, target.Index?.Name);
+            DeletePlannerStatistics(histogramStatistics, target.Table.Name, target.Index?.Name);
             if (target.Index is not null)
+            {
                 AddIndexStatistic(statistics, target.Table, target.Index);
+                AddIndexStat4Samples(histogramStatistics, target.Table, target.Index);
+            }
             else
+            {
                 AddTableStatistics(statistics, target.Table);
+                foreach (var index in target.Table.Indexes)
+                    AddIndexStat4Samples(histogramStatistics, target.Table, index);
+            }
         }
 
         return new ExecutionResult([], [], 0, Changed: true);
@@ -15750,7 +15760,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (canUseCompiledRoute)
         {
             var compiledIndex = false;
-            if ((!context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
+            if (!context.CancellationToken.CanBeCanceled
+                && TryPlanManagedAndIndexIntersection(select, context) is { } intersectionPlan)
+            {
+                compiledIndex = TryCompileManagedAndIndexIntersectionSelect(
+                    select,
+                    intersectionPlan,
+                    parameters,
+                    context,
+                    outerRow,
+                    materializeRows: true,
+                    out compiled);
+            }
+            else if ((!context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
                 && TryPlanManagedIndexScan(select, context) is { } indexPlan)
             {
                 compiledIndex = TryCompileManagedIndexSelect(
@@ -16028,7 +16050,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             rowIds,
             indexLabel,
             plan.Table.ColumnDefinitions,
-            BuildQualifiedColumnDefinitions(qualifier, plan.Table.ColumnDefinitions));
+            BuildQualifiedColumnDefinitions(qualifier, plan.Table.ColumnDefinitions),
+            AccessKind: ScanAccessKind.MultiIndexOr);
 
         // WHERE was consumed while building the union positions.
         var compileForScan = select with { Where = null };
@@ -19080,15 +19103,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
         description = string.Empty;
         if (join.Right is not NamedTableSource named
             || !context.Tables.TryGetValue(named.Name, out var table)
-            || table.Indexes.FirstOrDefault(index =>
-                string.Equals(index.Name, selection.Candidate.Name, StringComparison.OrdinalIgnoreCase)) is not { } index
-            || index.IsPartial
-            || index.IsMethodIndex
-            || index.Columns.Any(static column => column.IsExpression)
             || selection.EqualityTerms.Count == 0
             || selection.EqualityTerms.Count > selection.Candidate.Columns.Count)
         {
             return false;
+        }
+
+        EmbeddedIndex? index = null;
+        if (!selection.Candidate.Automatic)
+        {
+            index = table.Indexes.FirstOrDefault(candidate =>
+                string.Equals(candidate.Name, selection.Candidate.Name, StringComparison.OrdinalIgnoreCase));
+            if (index is null
+                || index.IsPartial
+                || index.IsMethodIndex
+                || index.Columns.Any(static column => column.IsExpression))
+            {
+                return false;
+            }
         }
 
         var keys = new EquiJoinKey[selection.EqualityTerms.Count];
@@ -19114,14 +19146,40 @@ public sealed partial class EmbeddedDatabase : IDisposable
             keys[position] = key;
         }
 
-        (VdbeCursorSource Source, IReadOnlyList<SqlValue[]> Keys) Materialize()
+        (VdbeCursorSource Source, IReadOnlyList<SqlValue[]> Keys) MaterializeDurable()
         {
             var visibleRows = GetNamedTableRows(
                 named,
                 context,
                 maximumRows: null,
                 outerRow).Rows;
-            var entries = GetManagedIndexEntries(table, index, visibleRows, context);
+            var entries = GetManagedIndexEntries(table, index!, visibleRows, context);
+            var rows = entries.Select(static entry => entry.Row.Values).ToArray();
+            var rowIds = table.HasRowid
+                ? entries.Select(static entry => entry.Row.RowId ?? 0L).ToArray()
+                : null;
+            return (
+                new VdbeCursorSource(rows, rowIds),
+                entries.Select(static entry => entry.Key).ToArray());
+        }
+
+        (VdbeCursorSource Source, IReadOnlyList<SqlValue[]> Keys) MaterializeAutomatic()
+        {
+            var visibleRows = GetNamedTableRows(
+                named,
+                context,
+                maximumRows: null,
+                outerRow).Rows;
+            var entries = new List<(SourceRow Row, SqlValue[] Key)>(visibleRows.Count);
+            for (var position = 0; position < visibleRows.Count; position++)
+            {
+                var row = visibleRows[position];
+                var key = new SqlValue[keys.Length];
+                for (var keyPosition = 0; keyPosition < key.Length; keyPosition++)
+                    key[keyPosition] = row.Values[selection.Candidate.Columns[keyPosition].ColumnOrdinal];
+                entries.Add((row, key));
+            }
+
             var rows = entries.Select(static entry => entry.Row.Values).ToArray();
             var rowIds = table.HasRowid
                 ? entries.Select(static entry => entry.Row.RowId ?? 0L).ToArray()
@@ -19167,22 +19225,98 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return 0;
         }
 
+        string? CanonicalizeAutomaticKey(SqlValue[] values)
+        {
+            string? key = null;
+            for (var position = 0; position < values.Length; position++)
+            {
+                var segment = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
+                    values[position],
+                    convertTextToNumeric: false,
+                    convertNumericToText: false,
+                    selection.Candidate.Columns[position].Collation);
+                if (segment is null)
+                    return null;
+                key = key is null
+                    ? segment.Length + ":" + segment
+                    : key + segment.Length + ":" + segment;
+            }
+
+            return key;
+        }
+
         var prefix = string.Join(
             ", ",
             selection.Candidate.Columns
                 .Take(keys.Length)
                 .Select(column => $"{table.Columns[column.ColumnOrdinal]}=?"));
-        var searchDescription = $"SEARCH {table.Name} USING INDEX {index.Name} ({prefix})";
+        var usingClause = selection.Candidate.Automatic
+            ? "USING AUTOMATIC COVERING INDEX"
+            : selection.Candidate.Covering
+                ? $"USING COVERING INDEX {index!.Name}"
+                : $"USING INDEX {index!.Name}";
+        var searchDescription = $"SEARCH {table.Name} {usingClause} ({prefix})";
+        if (selection.Candidate.Automatic)
+        {
+            plan = new VdbeJoinAutomaticIndexPlan(
+                table.Name,
+                searchDescription,
+                table.Columns.Length,
+                MaterializeAutomatic,
+                BuildSeekKey,
+                CanonicalizeAutomaticKey,
+                _joinIndexSeekMetrics);
+            description = $"automatic-index-seek {table.Name} ({prefix})";
+            return true;
+        }
+
+        if (context.ConcurrentMvStore is null
+            && context.ConcurrentMvccTxId is null
+            && !context.InTransaction
+            && _fileStore?.TryOpenIndexAccessor(
+                table,
+                index!,
+                keys.Length,
+                selection.Candidate.Covering,
+                sharedSnapshot: null,
+                out var accessor) == true)
+        {
+            IEnumerable<VdbeJoinRow> SeekPager(SqlValue[] seekKey)
+            {
+                foreach (var row in accessor.Seek(
+                             seekKey,
+                             _joinIndexSeekMetrics.IndexPageRead,
+                             _joinIndexSeekMetrics.KeyCompared,
+                             _joinIndexSeekMetrics.TableRowFetched))
+                {
+                    yield return new VdbeJoinRow(row.Values, [row.RowId]);
+                }
+            }
+
+            plan = new VdbeJoinPagerIndexSeekPlan(
+                table.Name,
+                index!.Name,
+                searchDescription,
+                table.Columns.Length,
+                BuildSeekKey,
+                SeekPager,
+                accessor.Open,
+                accessor.Dispose,
+                _joinIndexSeekMetrics);
+            description = $"pager-index-seek {table.Name} {usingClause} ({prefix})";
+            return true;
+        }
+
         plan = new VdbeJoinIndexScanPlan(
             table.Name,
-            index.Name,
+            index!.Name,
             searchDescription,
             table.Columns.Length,
-            Materialize,
+            MaterializeDurable,
             BuildSeekKey,
             ComparePrefix,
             _joinIndexSeekMetrics);
-        description = $"index-seek {table.Name} USING INDEX {index.Name} ({prefix})";
+        description = $"materialized-index-seek {table.Name} {usingClause} ({prefix})";
         return true;
     }
 
@@ -22656,6 +22790,23 @@ out bool hasReturning)
     {
         var compilationContext = EnsureAutoIncrementStatementState(context);
         ValidateStatementIndexDirectives(statement.Inner, compilationContext);
+        if (statement.Inner is SelectStatement intersectionSelect
+            && HasExplainSafeBounds(intersectionSelect)
+            && TryPlanManagedAndIndexIntersection(
+                intersectionSelect,
+                compilationContext) is { } intersectionPlan
+            && TryCompileManagedAndIndexIntersectionSelect(
+                intersectionSelect,
+                intersectionPlan,
+                parameters,
+                compilationContext,
+                outerRow: null,
+                materializeRows: false,
+                out var compiledIntersection))
+        {
+            return DescribeProgram(compiledIntersection.Program);
+        }
+
         if (statement.Inner is SelectStatement plannedSelect
             && HasExplainSafeBounds(plannedSelect)
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
@@ -22781,6 +22932,23 @@ out bool hasReturning)
                         SqlValue.Integer(0),
                         SqlValue.Integer(0),
                         SqlValue.Text(FormatMethodIndexExplainDetail(methodPlan)),
+                    ],
+                ],
+                0);
+        }
+        if (statement.Inner is SelectStatement intersectionSelect
+            && TryPlanManagedAndIndexIntersection(
+                intersectionSelect,
+                compilationContext) is { } intersectionPlan)
+        {
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    [
+                        SqlValue.Integer(1),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text(FormatManagedAndIndexIntersectionExplainDetail(intersectionPlan)),
                     ],
                 ],
                 0);
@@ -22917,7 +23085,7 @@ out bool hasReturning)
 
         void Collect(VdbeJoinPlanNode node)
         {
-            if (node is VdbeJoinIndexScanPlan index)
+            if (node is IVdbeJoinSeekPlan index)
             {
                 searches.Add(index.SearchDescription);
                 return;
@@ -23941,7 +24109,7 @@ out bool hasReturning)
     /// When ANALYZE has populated <c>sqlite_stat1</c>, equality SEARCH gains a selectivity
     /// bonus from the leading-prefix average-rows figure (lower avg ⇒ higher score).
     /// </summary>
-    private static int ScoreManagedIndexPlan(
+    private int ScoreManagedIndexPlan(
         ManagedIndexScanPlan plan,
         SelectStatement statement,
         bool ordered,
@@ -23966,6 +24134,17 @@ out bool hasReturning)
             {
                 // Cap bonus so stats refine ranking without drowning structural signals.
                 score += Math.Min(300, 300 / leadingAverage);
+            }
+
+            if (statement.Where is not null
+                && TryEstimateStat4EqualityRows(
+                    context,
+                    plan.Table,
+                    plan.Index,
+                    statement.Where,
+                    out var stat4Rows))
+            {
+                score += Math.Min(600, 600 / Math.Max(1, (int)Math.Ceiling(stat4Rows)));
             }
         }
 
@@ -25097,8 +25276,11 @@ out bool hasReturning)
             && limit is >= 0
             ? limit
             : null;
-        var indexPlan = TryPlanManagedIndexScan(statement, context);
-        var orUnionPlan = indexPlan is null
+        var intersectionPlan = TryPlanManagedAndIndexIntersection(statement, context);
+        var indexPlan = intersectionPlan is null
+            ? TryPlanManagedIndexScan(statement, context)
+            : null;
+        var orUnionPlan = intersectionPlan is null && indexPlan is null
             ? TryPlanManagedOrIndexUnion(statement, context)
             : null;
         var streamProjectionRows = CanStreamProjectionRows(statement, context, outerRow)
@@ -25108,7 +25290,13 @@ out bool hasReturning)
         // A managed index plan wins over the transient probe: the index path defines
         // row order (SQLite parity, INDEXED BY), while the probe only prunes a plain scan.
         // Top-level OR equality branches can each SEARCH a different index and union positions.
-        var source = indexPlan is not null
+        var source = intersectionPlan is not null
+            ? GetManagedAndIndexIntersectionRows(
+                intersectionPlan,
+                parameters,
+                context,
+                outerRow)
+            : indexPlan is not null
             ? GetManagedIndexRows(indexPlan, context, outerRow, sourceLimit)
             : orUnionPlan is not null
                 ? GetManagedOrIndexUnionRows(orUnionPlan, parameters, context, outerRow)

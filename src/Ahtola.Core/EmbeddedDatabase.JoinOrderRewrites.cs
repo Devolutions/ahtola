@@ -22,8 +22,9 @@ namespace Ahtola.Core;
 /// <c>FULL</c>, <c>NATURAL</c>, or carries <c>USING</c>. Semi/anti joins decline the rewrite
 /// outright. This is deliberately stricter than Turso's <c>required_lhs_by_table</c> /
 /// <c>left_join_illegal_map</c> legality bitmask (join.rs:1258-1324): the fine-grained scheme
-/// only pays off together with per-table access-method search, which needs index-seek join
-/// leaves this engine does not have. Freezing barrier subtrees is a provably safe subset.
+/// only pays off with finer null-extension provenance than the managed row shape currently
+/// carries. Freezing barrier subtrees remains the provably safe subset even though eligible
+/// inner leaves now support persisted and automatic index seeks.
 /// </para>
 /// <para>
 /// <b>Projection order.</b> Reordering permutes the physical value slots of a joined row. The
@@ -72,6 +73,7 @@ public sealed partial class EmbeddedDatabase
         Interlocked.Exchange(ref _joinOrderDeclines, 0);
         Interlocked.Exchange(ref _joinOrderPushedWhereTerms, 0);
         _joinIndexSeekMetrics.Reset();
+        _plannerAccessPathMetrics.Reset();
     }
 
     /// <summary>
@@ -273,11 +275,21 @@ public sealed partial class EmbeddedDatabase
         var members = new JoinSegmentMember[infos.Length];
         for (var index = 0; index < infos.Length; index++)
         {
+            var indexCandidates = infos[index].IndexCandidates;
+            if (DescribeAutomaticJoinIndexCandidate(
+                    sources[index],
+                    infos[index],
+                    terms,
+                    index) is { } automatic)
+            {
+                indexCandidates = [.. indexCandidates, automatic];
+            }
+
             members[index] = new JoinSegmentMember(
                 index,
                 infos[index].RowCount,
                 infos[index].Width,
-                infos[index].IndexCandidates);
+                indexCandidates);
         }
 
         Interlocked.Increment(ref _joinOrderSegmentsConsidered);
@@ -297,7 +309,7 @@ public sealed partial class EmbeddedDatabase
                 return false;
         }
 
-        var synthesized = SynthesizeJoinOrder(rewrittenMembers, infos, placements, plan, state);
+        var synthesized = SynthesizeJoinOrder(rewrittenMembers, infos, members, placements, plan, state);
         var slotMap = BuildJoinOrderSlotMap(rewrittenMembers, infos, plan.MemberOrder);
 
         Interlocked.Increment(ref _joinOrderSegmentsReordered);
@@ -366,6 +378,7 @@ public sealed partial class EmbeddedDatabase
     private static TableSource SynthesizeJoinOrder(
         JoinOrderRewrittenSource[] members,
         JoinOrderMemberInfo[] infos,
+        JoinSegmentMember[] planMembers,
         List<JoinOrderTermPlacement> placements,
         JoinOrderPlan plan,
         JoinOrderRewriteState state)
@@ -395,7 +408,7 @@ public sealed partial class EmbeddedDatabase
             if (plan.IndexAccesses[step] is { } indexAccess)
             {
                 state.IndexSeeks[joined] = new CompiledJoinIndexSelection(
-                    infos[member].IndexCandidates[indexAccess.CandidateIndex],
+                    planMembers[member].IndexCandidates![indexAccess.CandidateIndex],
                     indexAccess.EqualityTermIndices.Select(index => placements[index].Expression).ToArray());
             }
 
@@ -569,10 +582,102 @@ public sealed partial class EmbeddedDatabase
                 Enumerable.Range(0, table.Columns.Length).All(indexedColumns.Contains),
                 table.Columns.Length,
                 table.RowidAliasColumnIndex >= 0,
-                named.IndexDirective is IndexedByDirective));
+                named.IndexDirective is IndexedByDirective,
+                Automatic: false,
+                LazyCursor: context.ConcurrentMvStore is null
+                    && context.ConcurrentMvccTxId is null
+                    && !context.InTransaction
+                    && _fileStore?.CanOpenIndexAccessor(table, index) == true));
         }
 
         return candidates;
+    }
+
+    private static JoinIndexCandidate? DescribeAutomaticJoinIndexCandidate(
+        TableSource source,
+        JoinOrderMemberInfo info,
+        IReadOnlyList<JoinPredicateTerm> terms,
+        int member)
+    {
+        if (source is not NamedTableSource { IndexDirective: null }
+            || info.Table is not { } table)
+        {
+            return null;
+        }
+
+        var memberBit = 1UL << member;
+        var columns = new List<JoinIndexColumn>();
+        var rowsPerPrefix = new List<double>();
+        foreach (var term in terms)
+        {
+            int ordinal;
+            double matchRows;
+            if (term.EqualityRightMask == memberBit
+                && term.EqualityRightColumnOrdinal >= 0
+                && !term.EqualityLeftConvertsTextToNumeric
+                && !term.EqualityLeftConvertsNumericToText
+                && !term.EqualityRightConvertsTextToNumeric
+                && !term.EqualityRightConvertsNumericToText)
+            {
+                ordinal = term.EqualityRightColumnOrdinal;
+                matchRows = term.EqualityRightMatchRows;
+            }
+            else if (term.EqualityLeftMask == memberBit
+                     && term.EqualityLeftColumnOrdinal >= 0
+                     && !term.EqualityLeftConvertsTextToNumeric
+                     && !term.EqualityLeftConvertsNumericToText)
+            {
+                if (term.EqualityRightConvertsTextToNumeric
+                    || term.EqualityRightConvertsNumericToText)
+                {
+                    continue;
+                }
+
+                ordinal = term.EqualityLeftColumnOrdinal;
+                matchRows = term.EqualityLeftMatchRows;
+            }
+            else
+            {
+                continue;
+            }
+
+            if (term.EqualityCollation is not { } collation
+                || !IsHashableJoinKeyCollation(collation)
+                || !string.Equals(
+                    NormalizeDeclaredCollation(table.ColumnDefinitions[ordinal].Collation) ?? "BINARY",
+                    collation,
+                    StringComparison.OrdinalIgnoreCase)
+                || table.Indexes.Any(index => index.Columns.Any(column => column.ColumnIndex == ordinal))
+                || columns.Any(column => column.ColumnOrdinal == ordinal))
+            {
+                continue;
+            }
+
+            columns.Add(new JoinIndexColumn(ordinal, collation.ToUpperInvariant(), Descending: false));
+            var previous = rowsPerPrefix.Count == 0
+                ? Math.Max(1.0, info.RowCount)
+                : rowsPerPrefix[^1];
+            rowsPerPrefix.Add(Math.Max(
+                1.0,
+                Math.Min(
+                    Math.Max(1.0, matchRows),
+                    previous * JoinCostParams.SelectivityEqualityUnindexed)));
+        }
+
+        if (columns.Count == 0)
+            return null;
+
+        return new JoinIndexCandidate(
+            $"automatic_{table.Name}",
+            columns,
+            rowsPerPrefix,
+            Unique: false,
+            Covering: true,
+            table.Columns.Length,
+            table.RowidAliasColumnIndex >= 0,
+            Forced: false,
+            Automatic: true,
+            LazyCursor: false);
     }
 
     /// <summary>

@@ -489,6 +489,8 @@ internal static class JoinOrderEnumerator
             output,
             indexAccess);
         var candidate = segment.Members[member].IndexCandidates![indexAccess.CandidateIndex];
+        if (candidate.Automatic && best.Shape != JoinStepShape.HashBuildRight)
+            return best;
         return candidate.Forced || seek.StepCost < best.StepCost - CostEpsilon ? seek : best;
     }
 
@@ -502,8 +504,13 @@ internal static class JoinOrderEnumerator
         var uniquePointLookup = candidate.Unique
             && access.EqualityTermIndices.Length == candidate.Columns.Count;
         var rowsPerSeek = uniquePointLookup ? 1.0 : access.RowsPerSeek;
-        var cost = JoinCostModel.EstimateManagedIndexViewBuildCost(member.RowCount)
-            + JoinCostModel.EstimateIndexSeekCost(
+        var cost = candidate.Automatic
+            ? JoinCostModel.EstimateAutomaticIndexCost(
+                member.RowCount,
+                leftCardinality,
+                rowsPerSeek)
+            : (candidate.LazyCursor ? 0.0 : JoinCostModel.EstimateManagedIndexViewBuildCost(member.RowCount))
+                + JoinCostModel.EstimateIndexSeekCost(
                 member.RowCount,
                 candidate.Columns.Count,
                 candidate.TableColumnCount,
@@ -562,16 +569,22 @@ internal static class JoinOrderEnumerator
             var rowsPerSeek = candidate.Unique && termIndices.Count == candidate.Columns.Count
                 ? 1.0
                 : Math.Max(1.0, candidate.RowsPerPrefix[termIndices.Count - 1]);
-            var cost = JoinCostModel.EstimateManagedIndexViewBuildCost(
-                    segment.Members[member].RowCount)
-                + JoinCostModel.EstimateIndexSeekCost(
+            var cost = candidate.Automatic
+                ? JoinCostModel.EstimateAutomaticIndexCost(
                     segment.Members[member].RowCount,
-                    candidate.Columns.Count,
-                    candidate.TableColumnCount,
-                    candidate.HasRowIdAlias,
-                    candidate.Covering,
                     leftCardinality,
-                    rowsPerSeek);
+                    rowsPerSeek)
+                : (candidate.LazyCursor
+                        ? 0.0
+                        : JoinCostModel.EstimateManagedIndexViewBuildCost(segment.Members[member].RowCount))
+                    + JoinCostModel.EstimateIndexSeekCost(
+                        segment.Members[member].RowCount,
+                        candidate.Columns.Count,
+                        candidate.TableColumnCount,
+                        candidate.HasRowIdAlias,
+                        candidate.Covering,
+                        leftCardinality,
+                        rowsPerSeek);
             if (cost < bestCost - CostEpsilon
                 || Math.Abs(cost - bestCost) <= CostEpsilon
                     && best is not null

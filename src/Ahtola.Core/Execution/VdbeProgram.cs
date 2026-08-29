@@ -969,6 +969,10 @@ public sealed class VdbeJoinIndexSeekMetrics
     private long _seeksAttempted;
     private long _keyComparisons;
     private long _candidateRowsVisited;
+    private long _automaticIndexesBuilt;
+    private long _durableCursorPlans;
+    private long _indexPagesRead;
+    private long _tableRowsFetched;
 
     public long PlansCreated => Interlocked.Read(ref _plansCreated);
 
@@ -980,17 +984,33 @@ public sealed class VdbeJoinIndexSeekMetrics
 
     public long CandidateRowsVisited => Interlocked.Read(ref _candidateRowsVisited);
 
-    internal void PlanCreated(int rowCount)
+    public long AutomaticIndexesBuilt => Interlocked.Read(ref _automaticIndexesBuilt);
+
+    public long DurableCursorPlans => Interlocked.Read(ref _durableCursorPlans);
+
+    public long IndexPagesRead => Interlocked.Read(ref _indexPagesRead);
+
+    public long TableRowsFetched => Interlocked.Read(ref _tableRowsFetched);
+
+    internal void PlanCreated(int rowCount, bool automatic = false)
     {
         Interlocked.Increment(ref _plansCreated);
         Interlocked.Add(ref _indexRowsMaterialized, rowCount);
+        if (automatic)
+            Interlocked.Increment(ref _automaticIndexesBuilt);
     }
+
+    internal void DurableCursorPlanCreated() => Interlocked.Increment(ref _durableCursorPlans);
 
     internal void SeekAttempted() => Interlocked.Increment(ref _seeksAttempted);
 
     internal void KeyCompared() => Interlocked.Increment(ref _keyComparisons);
 
     internal void CandidateVisited() => Interlocked.Increment(ref _candidateRowsVisited);
+
+    internal void IndexPageRead() => Interlocked.Increment(ref _indexPagesRead);
+
+    internal void TableRowFetched() => Interlocked.Increment(ref _tableRowsFetched);
 
     internal void Reset()
     {
@@ -999,19 +1019,34 @@ public sealed class VdbeJoinIndexSeekMetrics
         Interlocked.Exchange(ref _seeksAttempted, 0);
         Interlocked.Exchange(ref _keyComparisons, 0);
         Interlocked.Exchange(ref _candidateRowsVisited, 0);
+        Interlocked.Exchange(ref _automaticIndexesBuilt, 0);
+        Interlocked.Exchange(ref _durableCursorPlans, 0);
+        Interlocked.Exchange(ref _indexPagesRead, 0);
+        Interlocked.Exchange(ref _tableRowsFetched, 0);
     }
 }
 
+internal interface IVdbeJoinSeekPlan : IDisposable
+{
+    string SearchDescription { get; }
+
+    void Open();
+
+    IEnumerable<VdbeJoinRow> Seek(VdbeJoinRow outer);
+}
+
 /// <summary>
-/// Statement-scoped persisted-index view. Keys and base rows are aligned in durable index order;
-/// every outer row performs a lower-bound search followed by an equality-bounded walk.
+/// Statement-scoped materialized index view. Keys and base rows are aligned in index order;
+/// every outer row performs a lower-bound search followed by an equality-bounded walk. It is the
+/// fallback for non-durable snapshots and the build-once representation of automatic indexes.
 /// </summary>
-public sealed class VdbeJoinIndexScanPlan : VdbeJoinPlanNode
+public sealed class VdbeJoinIndexScanPlan : VdbeJoinPlanNode, IVdbeJoinSeekPlan
 {
     private readonly Lazy<(VdbeCursorSource Source, IReadOnlyList<SqlValue[]> Keys)> _rows;
     private readonly Func<VdbeJoinRow, SqlValue[]?> _buildSeekKey;
     private readonly Func<SqlValue[], SqlValue[], int> _comparePrefix;
     private readonly VdbeJoinIndexSeekMetrics _metrics;
+    private readonly bool _automatic;
 
     public VdbeJoinIndexScanPlan(
         string tableName,
@@ -1031,7 +1066,8 @@ public sealed class VdbeJoinIndexScanPlan : VdbeJoinPlanNode
             () => (source, keys),
             buildSeekKey,
             comparePrefix,
-            metrics)
+            metrics,
+            automatic: false)
     {
     }
 
@@ -1043,7 +1079,8 @@ public sealed class VdbeJoinIndexScanPlan : VdbeJoinPlanNode
         Func<(VdbeCursorSource Source, IReadOnlyList<SqlValue[]> Keys)> materialize,
         Func<VdbeJoinRow, SqlValue[]?> buildSeekKey,
         Func<SqlValue[], SqlValue[], int> comparePrefix,
-        VdbeJoinIndexSeekMetrics metrics)
+        VdbeJoinIndexSeekMetrics metrics,
+        bool automatic = false)
         : base(columnCount, sourceCount: 1)
     {
         ArgumentException.ThrowIfNullOrEmpty(tableName);
@@ -1060,6 +1097,7 @@ public sealed class VdbeJoinIndexScanPlan : VdbeJoinPlanNode
         _buildSeekKey = buildSeekKey;
         _comparePrefix = comparePrefix;
         _metrics = metrics;
+        _automatic = automatic;
         _rows = new Lazy<(VdbeCursorSource Source, IReadOnlyList<SqlValue[]> Keys)>(
             () =>
             {
@@ -1072,7 +1110,7 @@ public sealed class VdbeJoinIndexScanPlan : VdbeJoinPlanNode
                         "Index keys must align with base rows.");
                 }
 
-                _metrics.PlanCreated(rows.Source.Rows.Count);
+                _metrics.PlanCreated(rows.Source.Rows.Count, _automatic);
                 return rows;
             },
             LazyThreadSafetyMode.ExecutionAndPublication);
@@ -1103,7 +1141,7 @@ public sealed class VdbeJoinIndexScanPlan : VdbeJoinPlanNode
         }
     }
 
-    internal IEnumerable<VdbeJoinRow> Seek(VdbeJoinRow outer)
+    public IEnumerable<VdbeJoinRow> Seek(VdbeJoinRow outer)
     {
         _metrics.SeekAttempted();
         var seekKey = _buildSeekKey(outer);
@@ -1135,6 +1173,193 @@ public sealed class VdbeJoinIndexScanPlan : VdbeJoinPlanNode
                 [rows.Source.RowIds is null ? null : rows.Source.RowIds[index]]);
         }
     }
+
+    public void Dispose()
+    {
+    }
+
+    public void Open()
+    {
+    }
+}
+
+internal sealed class VdbeJoinAutomaticIndexPlan : VdbeJoinPlanNode, IVdbeJoinSeekPlan
+{
+    private readonly Lazy<(
+        VdbeCursorSource Source,
+        IReadOnlyDictionary<string, List<int>> Buckets)> _index;
+    private readonly Func<VdbeJoinRow, SqlValue[]?> _buildSeekKey;
+    private readonly Func<SqlValue[], string?> _canonicalizeKey;
+    private readonly VdbeJoinIndexSeekMetrics _metrics;
+
+    public VdbeJoinAutomaticIndexPlan(
+        string tableName,
+        string searchDescription,
+        int columnCount,
+        Func<(VdbeCursorSource Source, IReadOnlyList<SqlValue[]> Keys)> materialize,
+        Func<VdbeJoinRow, SqlValue[]?> buildSeekKey,
+        Func<SqlValue[], string?> canonicalizeKey,
+        VdbeJoinIndexSeekMetrics metrics)
+        : base(columnCount, sourceCount: 1)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(tableName);
+        ArgumentException.ThrowIfNullOrEmpty(searchDescription);
+        ArgumentNullException.ThrowIfNull(materialize);
+        ArgumentNullException.ThrowIfNull(buildSeekKey);
+        ArgumentNullException.ThrowIfNull(canonicalizeKey);
+        ArgumentNullException.ThrowIfNull(metrics);
+        TableName = tableName;
+        SearchDescription = searchDescription;
+        _buildSeekKey = buildSeekKey;
+        _canonicalizeKey = canonicalizeKey;
+        _metrics = metrics;
+        _index = new Lazy<(
+            VdbeCursorSource Source,
+            IReadOnlyDictionary<string, List<int>> Buckets)>(
+            () =>
+            {
+                var rows = materialize();
+                if (rows.Source.Rows.Count != rows.Keys.Count)
+                    throw new InvalidOperationException("Automatic-index keys must align with source rows.");
+                var buckets = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+                for (var position = 0; position < rows.Keys.Count; position++)
+                {
+                    var key = _canonicalizeKey(rows.Keys[position]);
+                    if (key is null)
+                        continue;
+                    if (!buckets.TryGetValue(key, out var bucket))
+                    {
+                        bucket = [];
+                        buckets.Add(key, bucket);
+                    }
+                    bucket.Add(position);
+                }
+
+                _metrics.PlanCreated(rows.Source.Rows.Count, automatic: true);
+                return (rows.Source, buckets);
+            },
+            LazyThreadSafetyMode.ExecutionAndPublication);
+    }
+
+    public string TableName { get; }
+
+    public string SearchDescription { get; }
+
+    internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows)
+        => Enumerate(maximumRows).ToArray();
+
+    internal override IEnumerable<VdbeJoinRow> Enumerate(int? maximumRows)
+    {
+        var source = _index.Value.Source;
+        var count = maximumRows is { } maximum
+            ? Math.Min(source.Rows.Count, maximum)
+            : source.Rows.Count;
+        for (var position = 0; position < count; position++)
+        {
+            yield return new VdbeJoinRow(
+                [.. source.Rows[position]],
+                [source.RowIds is null ? null : source.RowIds[position]]);
+        }
+    }
+
+    public IEnumerable<VdbeJoinRow> Seek(VdbeJoinRow outer)
+    {
+        _metrics.SeekAttempted();
+        var values = _buildSeekKey(outer);
+        if (values is null || _canonicalizeKey(values) is not { } key)
+            yield break;
+
+        var index = _index.Value;
+        if (!index.Buckets.TryGetValue(key, out var positions))
+            yield break;
+        foreach (var position in positions)
+        {
+            _metrics.CandidateVisited();
+            yield return new VdbeJoinRow(
+                [.. index.Source.Rows[position]],
+                [index.Source.RowIds is null ? null : index.Source.RowIds[position]]);
+        }
+    }
+
+    public void Dispose()
+    {
+    }
+
+    public void Open()
+    {
+    }
+}
+
+internal sealed class VdbeJoinPagerIndexSeekPlan : VdbeJoinPlanNode, IVdbeJoinSeekPlan
+{
+    private readonly Func<VdbeJoinRow, SqlValue[]?> _buildSeekKey;
+    private readonly Func<SqlValue[], IEnumerable<VdbeJoinRow>> _seek;
+    private readonly Action _open;
+    private readonly Action _close;
+    private readonly VdbeJoinIndexSeekMetrics _metrics;
+    private int _started;
+
+    public VdbeJoinPagerIndexSeekPlan(
+        string tableName,
+        string indexName,
+        string searchDescription,
+        int columnCount,
+        Func<VdbeJoinRow, SqlValue[]?> buildSeekKey,
+        Func<SqlValue[], IEnumerable<VdbeJoinRow>> seek,
+        Action open,
+        Action close,
+        VdbeJoinIndexSeekMetrics metrics)
+        : base(columnCount, sourceCount: 1)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(tableName);
+        ArgumentException.ThrowIfNullOrEmpty(indexName);
+        ArgumentException.ThrowIfNullOrEmpty(searchDescription);
+        ArgumentNullException.ThrowIfNull(buildSeekKey);
+        ArgumentNullException.ThrowIfNull(seek);
+        ArgumentNullException.ThrowIfNull(open);
+        ArgumentNullException.ThrowIfNull(close);
+        ArgumentNullException.ThrowIfNull(metrics);
+        TableName = tableName;
+        IndexName = indexName;
+        SearchDescription = searchDescription;
+        _buildSeekKey = buildSeekKey;
+        _seek = seek;
+        _open = open;
+        _close = close;
+        _metrics = metrics;
+    }
+
+    public string TableName { get; }
+
+    public string IndexName { get; }
+
+    public string SearchDescription { get; }
+
+    internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows)
+        => Enumerate(maximumRows).ToArray();
+
+    internal override IEnumerable<VdbeJoinRow> Enumerate(int? maximumRows)
+        => throw new InvalidOperationException("A pager index seek requires an outer-row key.");
+
+    public IEnumerable<VdbeJoinRow> Seek(VdbeJoinRow outer)
+    {
+        _metrics.SeekAttempted();
+        var seekKey = _buildSeekKey(outer);
+        if (seekKey is null)
+            yield break;
+
+        if (Interlocked.Exchange(ref _started, 1) == 0)
+            _metrics.DurableCursorPlanCreated();
+        foreach (var row in _seek(seekKey))
+        {
+            _metrics.CandidateVisited();
+            yield return row;
+        }
+    }
+
+    public void Dispose() => _close();
+
+    public void Open() => _open();
 }
 
 /// <summary>
@@ -1213,7 +1438,7 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
         int? maximumRows,
         VdbeJoinExecutionContext context)
     {
-        if (Right is VdbeJoinIndexScanPlan indexSeek)
+        if (Right is IVdbeJoinSeekPlan indexSeek)
             return EnumerateIndexSeekRight(indexSeek, maximumRows, context);
 
         if (EquiProbe is not null)
@@ -1227,37 +1452,45 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
     }
 
     private IEnumerable<VdbeJoinRow> EnumerateIndexSeekRight(
-        VdbeJoinIndexScanPlan indexSeek,
+        IVdbeJoinSeekPlan indexSeek,
         int? maximumRows,
         VdbeJoinExecutionContext context)
     {
         if (Kind is not (VdbeJoinKind.Inner or VdbeJoinKind.Left))
             throw new InvalidOperationException("An index-seek right input requires an INNER or LEFT join.");
 
-        var emitted = 0;
-        foreach (var left in Left.Enumerate(maximumRows: null, context))
+        try
         {
-            var matched = false;
-            foreach (var right in indexSeek.Seek(left))
+            indexSeek.Open();
+            var emitted = 0;
+            foreach (var left in Left.Enumerate(maximumRows: null, context))
             {
-                var combined = Combine(left, right);
-                if (Condition is not null && !Condition(left, right, combined))
-                    continue;
+                var matched = false;
+                foreach (var right in indexSeek.Seek(left))
+                {
+                    var combined = Combine(left, right);
+                    if (Condition is not null && !Condition(left, right, combined))
+                        continue;
 
-                matched = true;
-                yield return combined;
-                emitted++;
-                if (maximumRows is { } maximum && emitted >= maximum)
-                    yield break;
-            }
+                    matched = true;
+                    yield return combined;
+                    emitted++;
+                    if (maximumRows is { } maximum && emitted >= maximum)
+                        yield break;
+                }
 
-            if (Kind == VdbeJoinKind.Left && !matched)
-            {
-                yield return Combine(left, NullRow(Right));
-                emitted++;
-                if (maximumRows is { } maximum && emitted >= maximum)
-                    yield break;
+                if (Kind == VdbeJoinKind.Left && !matched)
+                {
+                    yield return Combine(left, NullRow(Right));
+                    emitted++;
+                    if (maximumRows is { } maximum && emitted >= maximum)
+                        yield break;
+                }
             }
+        }
+        finally
+        {
+            indexSeek.Dispose();
         }
     }
 

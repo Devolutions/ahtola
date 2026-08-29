@@ -2,6 +2,13 @@ using Ahtola.Core.Execution;
 
 namespace Ahtola.Core.Compilation;
 
+internal enum ScanAccessKind
+{
+    Default,
+    MultiIndexOr,
+    MultiIndexAnd,
+}
+
 /// <summary>
 /// Describes a single base table that a <see cref="SelectStatement"/> can scan
 /// directly. The caller supplies the live row list plus a column resolver so the
@@ -23,6 +30,7 @@ namespace Ahtola.Core.Compilation;
 /// Optional equality prefix for SEARCH plans: emit SeekGE/IdxGE on these table-column
 /// ordinals instead of Rewind, then residual WHERE Filter.
 /// </param>
+/// <param name="AccessKind">The explicit multi-index shape used by EXPLAIN formatting.</param>
 internal sealed record ScanTarget(
     string TableName,
     string Qualifier,
@@ -33,7 +41,8 @@ internal sealed record ScanTarget(
     string? IndexName = null,
     IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null,
     IReadOnlyDictionary<string, EmbeddedColumn>? QualifiedColumnDefinitions = null,
-    IndexSeekPrefix? IndexSeek = null)
+    IndexSeekPrefix? IndexSeek = null,
+    ScanAccessKind AccessKind = ScanAccessKind.Default)
 {
     public bool HasRowId => RowIds is not null;
 

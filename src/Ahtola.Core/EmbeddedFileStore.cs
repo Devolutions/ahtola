@@ -13,6 +13,42 @@ internal sealed record EmbeddedFileCatalog(
     Dictionary<string, TriggerDefinition> Triggers,
     Dictionary<string, EmbeddedDatabase.VirtualTableDefinition> VirtualTables);
 
+internal sealed record EmbeddedFileIndexSeekRow(SqlValue[] Values, long RowId);
+
+internal sealed class EmbeddedFileIndexAccessor(
+    Func<
+        SqlValue[],
+        Action?,
+        Action?,
+        Action?,
+        IEnumerable<EmbeddedFileIndexSeekRow>> seek,
+    Action open,
+    Action close) : IDisposable
+{
+    public void Open() => open();
+
+    public IEnumerable<EmbeddedFileIndexSeekRow> Seek(
+        SqlValue[] prefix,
+        Action? pageRead = null,
+        Action? keyCompared = null,
+        Action? tableRowFetched = null)
+        => seek(prefix, pageRead, keyCompared, tableRowFetched);
+
+    public void Dispose() => close();
+}
+
+internal sealed class EmbeddedFileReadSnapshot(
+    EmbeddedFileStore owner,
+    SqlitePagerReadTransaction transaction,
+    ISqliteBtreePageIo pageIo) : IDisposable
+{
+    internal EmbeddedFileStore Owner { get; } = owner;
+
+    internal ISqliteBtreePageIo PageIo { get; } = pageIo;
+
+    public void Dispose() => transaction.Dispose();
+}
+
 internal static class ManagedVirtualTableSchemaSql
 {
     private const string PayloadMarker = "/*ahtola-managed-vtab:";
@@ -267,6 +303,196 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// A cheap race-free signal that the committed view may have changed; never rescans the WAL.
     /// </summary>
     internal long CommittedViewGeneration => _pager.CommittedViewGeneration;
+
+    internal bool CanOpenIndexAccessor(EmbeddedTable table, EmbeddedIndex index)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(index);
+        return !_disposed
+            && table.HasRowid
+            && !index.IsMethodIndex
+            && index.Columns.Count > 0
+            && index.Columns.All(static column => !column.IsExpression)
+            && _committedTables is not null
+            && _committedTables.TryGetValue(table.Name, out var committed)
+            && ReferenceEquals(committed, table)
+            && _tableRootPages.ContainsKey(table.Name)
+            && _indexRootPages.ContainsKey(index.Name);
+    }
+
+    internal bool TryOpenReadSnapshot(
+        EmbeddedTable table,
+        out EmbeddedFileReadSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        snapshot = null!;
+        if (_disposed
+            || _committedTables is null
+            || !_committedTables.TryGetValue(table.Name, out var committed)
+            || !ReferenceEquals(committed, table)
+            || !_tableRootPages.ContainsKey(table.Name))
+        {
+            return false;
+        }
+
+        var transaction = _pager.BeginReadTransaction();
+        try
+        {
+            var pageIo = new SqliteStagedBtreePageIo(
+                transaction.ReadPage,
+                transaction.PageCount,
+                _pageSize,
+                _usableSpace);
+            snapshot = new EmbeddedFileReadSnapshot(this, transaction, pageIo);
+            return true;
+        }
+        catch
+        {
+            transaction.Dispose();
+            throw;
+        }
+    }
+
+    internal bool TryOpenIndexAccessor(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        int prefixLength,
+        bool covering,
+        EmbeddedFileReadSnapshot? sharedSnapshot,
+        out EmbeddedFileIndexAccessor accessor)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(index);
+        accessor = null!;
+        if (!CanOpenIndexAccessor(table, index)
+            || prefixLength < 1
+            || prefixLength > index.Columns.Count
+            || !_tableRootPages.TryGetValue(table.Name, out var tableRootPage)
+            || !_indexRootPages.TryGetValue(index.Name, out var indexRootPage))
+        {
+            return false;
+        }
+
+        var persistedIndex = table.Indexes.FirstOrDefault(candidate =>
+            ReferenceEquals(candidate, index)
+            || string.Equals(candidate.Name, index.Name, StringComparison.OrdinalIgnoreCase));
+        if (persistedIndex is null)
+            return false;
+
+        var comparer = CreateIndexComparer(table, persistedIndex);
+        var snapshotGate = new object();
+        SqlitePagerReadTransaction? snapshot = null;
+        ISqliteBtreePageIo? pageIo = null;
+        if (sharedSnapshot is not null)
+        {
+            if (!ReferenceEquals(sharedSnapshot.Owner, this))
+                throw new ArgumentException("The shared read snapshot belongs to another file store.", nameof(sharedSnapshot));
+            pageIo = sharedSnapshot.PageIo;
+        }
+
+        ISqliteBtreePageIo GetPageIo()
+        {
+            lock (snapshotGate)
+            {
+                if (pageIo is not null)
+                    return pageIo;
+                snapshot = _pager.BeginReadTransaction();
+                pageIo = new SqliteStagedBtreePageIo(
+                    snapshot.ReadPage,
+                    snapshot.PageCount,
+                    _pageSize,
+                    _usableSpace);
+                return pageIo;
+            }
+        }
+
+        void CloseSnapshot()
+        {
+            if (sharedSnapshot is not null)
+                return;
+            lock (snapshotGate)
+            {
+                snapshot?.Dispose();
+                snapshot = null;
+                pageIo = null;
+            }
+        }
+
+        accessor = new EmbeddedFileIndexAccessor(
+            (prefix, pageRead, keyCompared, tableRowFetched) => SeekCommittedIndex(
+                table,
+                persistedIndex,
+                tableRootPage,
+                indexRootPage,
+                prefixLength,
+                covering,
+                GetPageIo(),
+                comparer,
+                prefix,
+                pageRead,
+                keyCompared,
+                tableRowFetched),
+            sharedSnapshot is null ? () => _ = GetPageIo() : static () => { },
+            CloseSnapshot);
+        return true;
+    }
+
+    private IEnumerable<EmbeddedFileIndexSeekRow> SeekCommittedIndex(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        uint tableRootPage,
+        uint indexRootPage,
+        int prefixLength,
+        bool covering,
+        ISqliteBtreePageIo pageIo,
+        SqliteIndexRecordComparer comparer,
+        SqlValue[] prefix,
+        Action? pageRead,
+        Action? keyCompared,
+        Action? tableRowFetched)
+    {
+        if (prefix.Length != prefixLength)
+            throw new ArgumentException("The index seek key does not match the planned prefix length.", nameof(prefix));
+
+        var indexCursor = new SqliteIndexBtreeCursor(pageIo, comparer, _textEncoding);
+        var tableCursor = covering ? null : new SqliteTableBtreeCursor(pageIo);
+        foreach (var record in indexCursor.SeekPrefix(indexRootPage, prefix, pageRead, keyCompared))
+        {
+            var indexValues = SqliteRecordCodec.Decode(record, _textEncoding);
+            if (indexValues.Length <= index.Columns.Count
+                || indexValues[^1].Kind != SqlValueKind.Integer)
+            {
+                throw new InvalidDataException(
+                    $"SQLite index '{index.Name}' record is missing its rowid suffix.");
+            }
+
+            var rowId = indexValues[^1].AsInteger();
+            SqlValue[] row;
+            if (covering)
+            {
+                row = new SqlValue[table.Columns.Length];
+                Array.Fill(row, SqlValue.Null);
+                for (var position = 0; position < index.Columns.Count; position++)
+                    row[index.Columns[position].ColumnIndex] = indexValues[position];
+            }
+            else
+            {
+                if (!tableCursor!.TrySeek(tableRootPage, rowId, out var tableRecord))
+                {
+                    throw new InvalidDataException(
+                        $"SQLite index '{index.Name}' references missing rowid {rowId} in table '{table.Name}'.");
+                }
+
+                tableRowFetched?.Invoke();
+                row = RestoreRowidTableRecord(table, SqliteRecordCodec.Decode(tableRecord, _textEncoding));
+            }
+
+            if (table.RowidAliasColumnIndex >= 0)
+                row[table.RowidAliasColumnIndex] = SqlValue.Integer(rowId);
+            EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, row);
+            yield return new EmbeddedFileIndexSeekRow(row, rowId);
+        }
+    }
 
     private EmbeddedFileCatalog Load()
     {
@@ -1358,7 +1584,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         return SqliteRecordCodec.Decode(payload, _textEncoding);
     }
 
-    private static SqlValue[] RestoreRowidTableRecord(
+    internal static SqlValue[] RestoreRowidTableRecord(
         EmbeddedTable table,
         IReadOnlyList<SqlValue> storedValues)
     {

@@ -10,7 +10,7 @@ namespace Ahtola.Core.Compilation.JoinOrdering;
 /// </param>
 /// <param name="RowCount">Estimated base cardinality, read from <c>sqlite_stat1</c>.</param>
 /// <param name="ColumnWidth">Number of value slots this member contributes to a joined row.</param>
-/// <param name="IndexCandidates">Persisted indexes whose leading-prefix statistics are available.</param>
+/// <param name="IndexCandidates">Persisted or automatic indexes available to this join step.</param>
 internal sealed record JoinSegmentMember(
     int OriginalIndex,
     double RowCount,
@@ -18,8 +18,8 @@ internal sealed record JoinSegmentMember(
     IReadOnlyList<JoinIndexCandidate>? IndexCandidates = null);
 
 /// <summary>
-/// One ordinary persisted B-tree index usable as an outer-bound join access. <c>Forced</c> is
-/// true when SQL named this index through mandatory <c>INDEXED BY</c>.
+/// One persisted or automatic index usable as an outer-bound join access. <c>Forced</c> is true
+/// when SQL named a persisted index through mandatory <c>INDEXED BY</c>.
 /// </summary>
 internal sealed record JoinIndexCandidate(
     string Name,
@@ -29,7 +29,9 @@ internal sealed record JoinIndexCandidate(
     bool Covering,
     int TableColumnCount,
     bool HasRowIdAlias,
-    bool Forced = false);
+    bool Forced = false,
+    bool Automatic = false,
+    bool LazyCursor = false);
 
 /// <summary>One key column in persisted index order.</summary>
 internal readonly record struct JoinIndexColumn(
@@ -82,7 +84,7 @@ internal sealed record JoinPredicateTerm(
     string? EqualityCollation = null);
 
 /// <summary>
-/// Exact persisted index and equality terms selected for one <c>IndexSeekRight</c> step.
+/// Exact index and equality terms selected for one <c>IndexSeekRight</c> step.
 /// </summary>
 internal sealed record JoinIndexAccessChoice(
     int CandidateIndex,
