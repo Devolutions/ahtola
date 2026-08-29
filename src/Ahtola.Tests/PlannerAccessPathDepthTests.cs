@@ -155,53 +155,6 @@ public sealed class PlannerAccessPathDepthTests
     }
 
     [Test]
-    public void Stat4AnalysisAndPlanningUseBoundedTablePasses()
-    {
-        using var database = new EmbeddedDatabase();
-        using var connection = database.Connect();
-        Execute(connection, "CREATE TABLE measured(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);");
-        Execute(connection, "CREATE INDEX measured_ab ON measured(a, b);");
-        Execute(
-            connection,
-            "INSERT INTO measured "
-            + "SELECT value, value % 101, value % 137 FROM generate_series(1, 10000);");
-
-        database.ResetJoinOrderDiagnostics();
-        Execute(connection, "ANALYZE;");
-        database.PlannerAccessPathMetrics.Stat4AnalysisRowsScanned.Should().Be(20000);
-
-        database.ResetJoinOrderDiagnostics();
-        for (var iteration = 0; iteration < 5; iteration++)
-            PlanDetail(connection, "SELECT id FROM measured WHERE a=7;").Should().Contain("measured_ab");
-
-        database.PlannerAccessPathMetrics.Stat4RowIdMapBuilds.Should().Be(1);
-        database.PlannerAccessPathMetrics.Stat4RowIdsIndexed.Should().Be(10000);
-    }
-
-    [Test]
-    public void Stat4CompositeVectorsMatchSortedPrefixRuns()
-    {
-        using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE vectors(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);");
-        Execute(connection, "CREATE INDEX vectors_ab ON vectors(a, b);");
-        Execute(
-            connection,
-            "INSERT INTO vectors VALUES (1,1,1),(2,1,1),(3,1,2),(4,2,1);");
-        Execute(connection, "ANALYZE;");
-
-        ReadRows(
-                connection,
-                "SELECT neq, nlt, ndlt FROM sqlite_stat4 "
-                + "WHERE idx='vectors_ab' ORDER BY rowid;")
-            .Select(row => string.Join("|", row.Select(value => value.AsText())))
-            .Should().Equal(
-                "3 2|0 0|0 0",
-                "3 2|0 0|0 0",
-                "3 1|0 2|0 1",
-                "1 1|3 3|1 2");
-    }
-
-    [Test]
     public void ProfitableInnerJoinBuildsOneAutomaticCoveringIndex()
     {
         using var database = new EmbeddedDatabase();

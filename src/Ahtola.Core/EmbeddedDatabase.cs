@@ -51548,8 +51548,6 @@ internal sealed class EmbeddedTable
     private InsertConflictAlgorithm? _effectivePrimaryKeyConflictAlgorithm;
     private int[]? _cachedRowidScanOrder;
     private long _cachedRowidScanOrderRevision = -1;
-    private Dictionary<long, int>? _cachedRowidPositions;
-    private long _cachedRowidPositionsRevision = -1;
     private readonly Dictionary<string, (long Revision, int[] Order)> _cachedIndexScanOrders =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -52310,34 +52308,6 @@ internal sealed class EmbeddedTable
 
         foreach (var index in _cachedRowidScanOrder)
             yield return index;
-    }
-
-    internal bool TryGetRowPosition(long rowId, out int position, out int indexedRows)
-    {
-        indexedRows = 0;
-        if (_cachedRowidPositions is null
-            || _cachedRowidPositionsRevision != Rows.Revision
-            || _cachedRowidPositions.Count != RowIds.Count)
-        {
-            if (RowIds.Count != Rows.Count)
-                throw new InvalidOperationException($"Table '{Name}' has inconsistent row identity metadata.");
-
-            var positions = new Dictionary<long, int>(RowIds.Count);
-            for (var index = 0; index < RowIds.Count; index++)
-            {
-                if (!positions.TryAdd(RowIds[index], index))
-                {
-                    position = -1;
-                    return false;
-                }
-            }
-
-            _cachedRowidPositions = positions;
-            _cachedRowidPositionsRevision = Rows.Revision;
-            indexedRows = RowIds.Count;
-        }
-
-        return _cachedRowidPositions.TryGetValue(rowId, out position);
     }
 
     internal IReadOnlyList<int> GetOrCreateIndexScanOrder(

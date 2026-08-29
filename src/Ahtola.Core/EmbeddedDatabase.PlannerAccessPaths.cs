@@ -155,68 +155,57 @@ public sealed partial class EmbeddedDatabase
 
         var samplePositions = SelectStat4SamplePositions(table, index, entries);
         var textEncoding = GetTextEncoding();
-        var equalCountsBySample = samplePositions
-            .Select(_ => new long[index.Columns.Count])
-            .ToArray();
-        var lessCountsBySample = samplePositions
-            .Select(_ => new long[index.Columns.Count])
-            .ToArray();
-        var distinctLessCountsBySample = samplePositions
-            .Select(_ => new long[index.Columns.Count])
-            .ToArray();
-        for (var prefixLength = 1; prefixLength <= index.Columns.Count; prefixLength++)
+        foreach (var samplePosition in samplePositions)
         {
-            _plannerAccessPathMetrics.RecordStat4AnalysisRowsScanned(entries.Count);
-            var sampleIndex = 0;
-            var runStart = 0;
-            var distinctBefore = 0L;
-            while (runStart < entries.Count)
+            var sample = entries[samplePosition];
+            var equalCounts = new long[index.Columns.Count];
+            var lessCounts = new long[index.Columns.Count];
+            var distinctLessCounts = new long[index.Columns.Count];
+            for (var prefixLength = 1; prefixLength <= index.Columns.Count; prefixLength++)
             {
-                var runEnd = runStart + 1;
-                while (runEnd < entries.Count
-                       && IndexPrefixesEqual(
-                           table,
-                           index,
-                           entries[runStart].Key,
-                           entries[runEnd].Key,
-                           prefixLength))
+                SqlValue[]? previous = null;
+                for (var entryIndex = 0; entryIndex < entries.Count; entryIndex++)
                 {
-                    runEnd++;
-                }
+                    var current = entries[entryIndex].Key;
+                    var comparison = CompareIndexStatisticKeyPrefix(
+                        table,
+                        index,
+                        current,
+                        sample.Key,
+                        prefixLength);
+                    if (comparison < 0)
+                    {
+                        lessCounts[prefixLength - 1]++;
+                        if (previous is null
+                            || !IndexPrefixesEqual(
+                                table,
+                                index,
+                                previous,
+                                current,
+                                prefixLength))
+                        {
+                            distinctLessCounts[prefixLength - 1]++;
+                        }
+                    }
+                    else if (comparison == 0)
+                    {
+                        equalCounts[prefixLength - 1]++;
+                    }
 
-                while (sampleIndex < samplePositions.Count
-                       && samplePositions[sampleIndex] < runEnd)
-                {
-                    equalCountsBySample[sampleIndex][prefixLength - 1] = runEnd - runStart;
-                    lessCountsBySample[sampleIndex][prefixLength - 1] = runStart;
-                    distinctLessCountsBySample[sampleIndex][prefixLength - 1] = distinctBefore;
-                    sampleIndex++;
+                    previous = current;
                 }
-
-                distinctBefore++;
-                runStart = runEnd;
             }
-        }
 
-        var usedStatisticsRowIds = new HashSet<long>(statistics.RowIds);
-        var lastStatisticsRowId = statistics.RowIds.Count == 0 ? 0 : statistics.RowIds.Max();
-        for (var sampleIndex = 0; sampleIndex < samplePositions.Count; sampleIndex++)
-        {
-            var sample = entries[samplePositions[sampleIndex]];
             var recordValues = new SqlValue[index.Columns.Count + 1];
             Array.Copy(sample.Key, recordValues, sample.Key.Length);
             recordValues[^1] = SqlValue.Integer(sample.RowId);
-            var statisticsRowId = NextAutoRowId(lastStatisticsRowId, usedStatisticsRowIds);
-            usedStatisticsRowIds.Add(statisticsRowId);
-            lastStatisticsRowId = statisticsRowId;
             AddStat4Row(
                 statistics,
-                statisticsRowId,
                 table.Name,
                 index.Name,
-                JoinStatVector(equalCountsBySample[sampleIndex]),
-                JoinStatVector(lessCountsBySample[sampleIndex]),
-                JoinStatVector(distinctLessCountsBySample[sampleIndex]),
+                JoinStatVector(equalCounts),
+                JoinStatVector(lessCounts),
+                JoinStatVector(distinctLessCounts),
                 SqliteRecordCodec.Encode(recordValues, textEncoding));
         }
     }
@@ -295,7 +284,6 @@ public sealed partial class EmbeddedDatabase
 
     private static void AddStat4Row(
         EmbeddedTable statistics,
-        long rowId,
         string tableName,
         string indexName,
         string equal,
@@ -303,6 +291,9 @@ public sealed partial class EmbeddedDatabase
         string distinctLess,
         byte[] sample)
     {
+        var rowId = statistics.RowIds.Count == 0
+            ? 1
+            : NextAutoRowId(statistics.RowIds.Max(), new HashSet<long>(statistics.RowIds));
         statistics.Rows.Add(
         [
             SqlValue.Text(tableName),
@@ -758,15 +749,9 @@ public sealed partial class EmbeddedDatabase
             }
 
             var sampleRowId = sample[^1].AsInteger();
-            if (!table.TryGetRowPosition(
-                    sampleRowId,
-                    out var sampleRowPosition,
-                    out var indexedRows))
-            {
+            var sampleRowPosition = table.RowIds.IndexOf(sampleRowId);
+            if (sampleRowPosition < 0)
                 return false;
-            }
-            if (indexedRows != 0)
-                _plannerAccessPathMetrics.RecordStat4RowIdMapBuilt(indexedRows);
             var currentKey = IndexExpressionSemantics.ProjectKey(
                 index,
                 table,
@@ -849,9 +834,6 @@ internal sealed class PlannerAccessPathMetrics
     private long _intersectionIndexPagesRead;
     private long _intersectionKeyComparisons;
     private long _stat4EstimatesUsed;
-    private long _stat4AnalysisRowsScanned;
-    private long _stat4RowIdMapBuilds;
-    private long _stat4RowIdsIndexed;
     private double _lastStat4EstimatedRows;
 
     public long IntersectionsExecuted => Interlocked.Read(ref _intersectionsExecuted);
@@ -865,12 +847,6 @@ internal sealed class PlannerAccessPathMetrics
     public long IntersectionKeyComparisons => Interlocked.Read(ref _intersectionKeyComparisons);
 
     public long Stat4EstimatesUsed => Interlocked.Read(ref _stat4EstimatesUsed);
-
-    public long Stat4AnalysisRowsScanned => Interlocked.Read(ref _stat4AnalysisRowsScanned);
-
-    public long Stat4RowIdMapBuilds => Interlocked.Read(ref _stat4RowIdMapBuilds);
-
-    public long Stat4RowIdsIndexed => Interlocked.Read(ref _stat4RowIdsIndexed);
 
     public double LastStat4EstimatedRows => Volatile.Read(ref _lastStat4EstimatedRows);
 
@@ -892,15 +868,6 @@ internal sealed class PlannerAccessPathMetrics
         Interlocked.Increment(ref _stat4EstimatesUsed);
     }
 
-    internal void RecordStat4AnalysisRowsScanned(int rows)
-        => Interlocked.Add(ref _stat4AnalysisRowsScanned, rows);
-
-    internal void RecordStat4RowIdMapBuilt(int rows)
-    {
-        Interlocked.Increment(ref _stat4RowIdMapBuilds);
-        Interlocked.Add(ref _stat4RowIdsIndexed, rows);
-    }
-
     internal void Reset()
     {
         Interlocked.Exchange(ref _intersectionsExecuted, 0);
@@ -909,9 +876,6 @@ internal sealed class PlannerAccessPathMetrics
         Interlocked.Exchange(ref _intersectionIndexPagesRead, 0);
         Interlocked.Exchange(ref _intersectionKeyComparisons, 0);
         Interlocked.Exchange(ref _stat4EstimatesUsed, 0);
-        Interlocked.Exchange(ref _stat4AnalysisRowsScanned, 0);
-        Interlocked.Exchange(ref _stat4RowIdMapBuilds, 0);
-        Interlocked.Exchange(ref _stat4RowIdsIndexed, 0);
         Volatile.Write(ref _lastStat4EstimatedRows, 0);
     }
 }
