@@ -237,6 +237,17 @@ internal sealed class MvccLogicalLog : IDisposable
         }
     }
 
+    /// <summary>
+    /// Appends a durable inclusive checkpoint watermark. A zero-operation frame
+    /// is reserved for this purpose; recovery skips transaction frames at or
+    /// below the greatest validated watermark, mirroring Turso's
+    /// <c>persistent_tx_ts_max</c> replay floor.
+    /// </summary>
+    internal void AppendCheckpointWatermark(
+        ulong durableTimestamp,
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+        => AppendCommit(durableTimestamp, [], synchronousMode);
+
     /// <summary>Replay all frames into <paramref name="store"/> (fresh store expected).</summary>
     internal void ReplayInto(MvStore store)
     {
@@ -248,75 +259,18 @@ internal sealed class MvccLogicalLog : IDisposable
             if (file.Length <= LogHeaderSize)
                 return;
 
+            // First validate the complete prefix and discover the greatest
+            // checkpoint watermark. Applying during this pass would replay
+            // already-materialized frames before a later marker is encountered.
             long position = LogHeaderSize;
-            Span<byte> header = stackalloc byte[TxHeaderSize];
+            ulong durableTimestamp = 0;
             while (position + TxHeaderSize + TxTrailerSize <= file.Length)
             {
-                ReadExact(file, position, header);
-                int payloadSize;
-                uint opCount;
-                ulong commitTs;
-                try
-                {
-                    (payloadSize, opCount, commitTs) = MvccLogicalLogFormat.ReadFrameHeader(header);
-                }
-                catch (InvalidDataException exception)
-                {
-                    throw new InvalidDataException(
-                        $"Invalid MVCC log frame at offset {position}: {exception.Message}",
-                        exception);
-                }
-
-                var storedPayloadSize = _encryption is null
-                    ? payloadSize
-                    : MvccLogicalLogFormat.GetEncryptedPayloadSize(payloadSize);
-                var frameLen = checked(TxHeaderSize + storedPayloadSize + TxTrailerSize);
-                if (position + frameLen > file.Length)
-                {
-                    if (_encryption is not null
-                        && IsCompletePlaintextFrame(file, position, payloadSize))
-                    {
-                        throw new InvalidDataException(
-                            "Encrypted MVCC storage contains a plaintext logical-log frame. "
-                            + "Automatic migration is not safe; checkpoint the log without encryption first.");
-                    }
-                    if (ContainsCompleteStoredFrame(file, position))
-                    {
-                        throw new InvalidDataException(
-                            "MVCC logical-log payload length does not match its complete frame boundary. "
-                            + "The authenticated frame metadata was tampered with.");
-                    }
-                    break; // torn tail — stop (fail-closed leave partial unrecovered)
-                }
-
-                var frame = new byte[frameLen];
-                ReadExact(file, position, frame);
-                var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(
-                    frame.AsSpan(TxHeaderSize + storedPayloadSize, 4));
-                var end = BinaryPrimitives.ReadUInt32LittleEndian(
-                    frame.AsSpan(TxHeaderSize + storedPayloadSize + 4, 4));
-                if (end != MvccLogicalLogFormat.EndMagic)
-                    throw new InvalidDataException("MVCC log frame end magic mismatch.");
-                var actualCrc = Crc32C.Compute(frame.AsSpan(0, TxHeaderSize + storedPayloadSize));
-                if (actualCrc != expectedCrc)
-                    throw new InvalidDataException("MVCC log frame CRC mismatch.");
-
-                var payload = frame.AsSpan(TxHeaderSize, storedPayloadSize);
-                var plaintext = _encryption is null
-                    ? payload.ToArray()
-                    : _encryption.DecryptPayload(
-                        payload,
-                        payloadSize,
-                        _salt,
-                        opCount,
-                        commitTs,
-                        _version);
-                var ops = DecodeOps(
-                    plaintext,
-                    (int)opCount,
-                    _version);
-                store.ApplyRecoveredCommit(commitTs, ops);
-                position += frameLen;
+                if (!TryReadValidatedFrame(file, position, out var validated))
+                    break;
+                if (validated.OpCount == 0)
+                    durableTimestamp = Math.Max(durableTimestamp, validated.CommitTimestamp);
+                position += validated.Length;
             }
 
             // A short final frame is a torn append, not a valid durability
@@ -329,7 +283,26 @@ internal sealed class MvccLogicalLog : IDisposable
                 file.FlushToDisk();
             }
 
-            _offset = position;
+            var validatedEnd = position;
+            if (durableTimestamp != 0)
+                store.ApplyRecoveredWatermark(durableTimestamp);
+            position = LogHeaderSize;
+            while (position < validatedEnd)
+            {
+                if (!TryReadValidatedFrame(file, position, out var validated))
+                {
+                    throw new InvalidDataException(
+                        "MVCC logical-log validated prefix changed during recovery.");
+                }
+                if (validated.OpCount != 0
+                    && validated.CommitTimestamp > durableTimestamp)
+                {
+                    store.ApplyRecoveredCommit(validated.CommitTimestamp, validated.Operations);
+                }
+                position += validated.Length;
+            }
+
+            _offset = validatedEnd;
         }
     }
 
@@ -542,6 +515,82 @@ internal sealed class MvccLogicalLog : IDisposable
         return BinaryPrimitives.ReadUInt64LittleEndian(bytes);
     }
 
+    private bool TryReadValidatedFrame(
+        IFile file,
+        long position,
+        out ValidatedLogicalFrame validated)
+    {
+        Span<byte> header = stackalloc byte[TxHeaderSize];
+        ReadExact(file, position, header);
+        int payloadSize;
+        uint opCount;
+        ulong commitTs;
+        try
+        {
+            (payloadSize, opCount, commitTs) = MvccLogicalLogFormat.ReadFrameHeader(header);
+        }
+        catch (InvalidDataException exception)
+        {
+            throw new InvalidDataException(
+                $"Invalid MVCC log frame at offset {position}: {exception.Message}",
+                exception);
+        }
+
+        var storedPayloadSize = _encryption is null
+            ? payloadSize
+            : MvccLogicalLogFormat.GetEncryptedPayloadSize(payloadSize);
+        var frameLength = checked(TxHeaderSize + storedPayloadSize + TxTrailerSize);
+        if (position + frameLength > file.Length)
+        {
+            if (_encryption is not null
+                && IsCompletePlaintextFrame(file, position, payloadSize))
+            {
+                throw new InvalidDataException(
+                    "Encrypted MVCC storage contains a plaintext logical-log frame. "
+                    + "Automatic migration is not safe; checkpoint the log without encryption first.");
+            }
+            if (ContainsCompleteStoredFrame(file, position))
+            {
+                throw new InvalidDataException(
+                    "MVCC logical-log payload length does not match its complete frame boundary. "
+                    + "The authenticated frame metadata was tampered with.");
+            }
+
+            validated = default;
+            return false;
+        }
+
+        var frame = new byte[frameLength];
+        ReadExact(file, position, frame);
+        var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(
+            frame.AsSpan(TxHeaderSize + storedPayloadSize, 4));
+        var end = BinaryPrimitives.ReadUInt32LittleEndian(
+            frame.AsSpan(TxHeaderSize + storedPayloadSize + 4, 4));
+        if (end != MvccLogicalLogFormat.EndMagic)
+            throw new InvalidDataException("MVCC log frame end magic mismatch.");
+        var actualCrc = Crc32C.Compute(frame.AsSpan(0, TxHeaderSize + storedPayloadSize));
+        if (actualCrc != expectedCrc)
+            throw new InvalidDataException("MVCC log frame CRC mismatch.");
+
+        var payload = frame.AsSpan(TxHeaderSize, storedPayloadSize);
+        var plaintext = _encryption is null
+            ? payload.ToArray()
+            : _encryption.DecryptPayload(
+                payload,
+                payloadSize,
+                _salt,
+                opCount,
+                commitTs,
+                _version);
+        var operations = DecodeOps(plaintext, checked((int)opCount), _version);
+        validated = new ValidatedLogicalFrame(
+            frameLength,
+            opCount,
+            commitTs,
+            operations);
+        return true;
+    }
+
     private static bool IsCompletePlaintextFrame(IFile file, long position, int payloadSize)
     {
         var frameLength = checked(TxHeaderSize + payloadSize + TxTrailerSize);
@@ -575,6 +624,12 @@ internal sealed class MvccLogicalLog : IDisposable
 
     private static bool RequiresVersion4(IReadOnlyList<MvccLogOp> ops)
         => ops.Any(static op => !op.RowId.Key.IsInteger);
+
+    private readonly record struct ValidatedLogicalFrame(
+        int Length,
+        uint OpCount,
+        ulong CommitTimestamp,
+        IReadOnlyList<MvccLogOp> Operations);
 
     private static byte[] EncodeOps(IReadOnlyList<MvccLogOp> ops, byte version)
     {

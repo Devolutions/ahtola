@@ -47,6 +47,15 @@ internal sealed class MvccRowVersion
     /// <summary>True when this version only marks a base-row delete (no payload).</summary>
     internal bool IsTombstone { get; }
 
+    /// <summary>
+    /// Managed checkpoint generation whose durable base image contains this
+    /// version's effect. Zero means the version is still logical-log-only.
+    /// </summary>
+    internal ulong MaterializedAt { get; set; }
+
     internal MvccRowVersion Clone()
-        => new(VersionId, Begin, End, (SqlValue[])Cells.Clone(), IsTombstone);
+        => new(VersionId, Begin, End, (SqlValue[])Cells.Clone(), IsTombstone)
+        {
+            MaterializedAt = MaterializedAt,
+        };
 }

@@ -28,9 +28,9 @@ scope decision; it does not mean Ahtola implements every newer Turso feature.
 | 5 | `select-validation-parity` | 10 sqltests closed | `core/translate/planner.rs`, `expr/`, `select.rs` | Done |
 | 6 | `window-group-pipeline` | 9 sqltests closed | `core/translate/window.rs` | Done |
 | 7 | `join-coalescing-parity` | 4 sqltests closed | `core/translate/planner.rs`, `plan.rs`, `select.rs` | Done |
-| 8 | `planner-access-path-depth` | Documented runtime limit | `core/translate/optimizer/`, `planner.rs`, `main_loop/` | Planned |
-| 9 | `mvcc-page-native-depth` | Documented runtime limit | `core/mvcc/` | Planned |
-| 10 | `sync-engine-depth` | Documented runtime limit | `sync/engine/src/` | Blocked by rank 9 |
+| 8 | `planner-access-path-depth` | Access-path depth completed | `core/translate/optimizer/`, `planner.rs`, `main_loop/` | Done |
+| 9 | `mvcc-page-native-depth` | Documented runtime limit | `core/mvcc/` | Done |
+| 10 | `sync-engine-depth` | Split wait/apply lifecycle and crash-safe checkpoint policy | `sync/engine/src/` | Done |
 
 The sqltest counts overlap by subsystem only in implementation, not in this
 classification: ranks 1-7 account for 133 distinct expected-failure entries.
@@ -47,6 +47,23 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   exposed case was not in the 135-entry baseline).
 - Current expected-failure count: 2, both intentional STORED-generated-column
   differences. There are no actionable sqltest failures in the baseline.
+- 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
+  validated STAT4 selectivity, automatic covering indexes, and direct durable
+  index-btree seeks.
+- 2026-08-29: closed `mvcc-page-native-depth` with generation-scoped schema
+  identities, lazy typed cursors, crash-ordered checkpointing, recovery
+  watermarks, and reader-generation-aware GC.
+- 2026-08-29: closed `sync-engine-depth` with a split wait/apply lifecycle,
+  bounded stale-base retries, one-shot staged changes, and crash-safe
+  page-replacement checkpoint evidence.
+- 2026-08-29: `sync-engine-depth` -- landed the managed equivalent of Turso's
+  `wait_changes_from_remote` -> opaque staged changes -> `apply_changes_from_remote`
+  split (`ManagedReplicaBootstrapper.WaitForRemoteChangesAsync` /
+  `ApplyRemoteChangesAsync` / `ManagedReplicaStagedChanges`), and refactored
+  `AhtolaConnection.SyncAsync`'s host publication gate to close/reopen sibling
+  connections only around push and the local apply, never around the network
+  long-poll in between. See the detailed TODOs below for what remains blocked
+  on the parallel MVCC branch.
 
 ## Detailed TODOs
 
@@ -157,48 +174,110 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 
 ### 8. Planner access-path depth
 
-- [ ] Add multi-index AND intersection with rowid-set cardinality costing and
+- [x] Add multi-index AND intersection with rowid-set cardinality costing and
   a full-scan fallback.
-- [ ] Read STAT4 samples and use histogram selectivity only when schema and
+- [x] Read STAT4 samples and use histogram selectivity only when schema and
   collation metadata match.
-- [ ] Build transient automatic indexes for profitable inner join inputs.
-- [ ] Replace materialized durable-index probes with lazy pager/index cursors
+- [x] Build transient automatic indexes for profitable inner join inputs.
+- [x] Replace materialized durable-index probes with lazy pager/index cursors
   where a covering or rowid lookup is proven.
-- [ ] Preserve deterministic plans without statistics and all existing outer
+- [x] Preserve deterministic plans without statistics and all existing outer
   join barriers.
-- [ ] Extend EXPLAIN QUERY PLAN, selectivity tests, and bounded benchmarks for
+- [x] Extend EXPLAIN QUERY PLAN, selectivity tests, and bounded benchmarks for
   every new path.
+
+The managed planner mirrors Turso's `multi_index.rs` row-set costing and
+automatic-index eligibility, while keeping LEFT/RIGHT/FULL, NATURAL, and USING
+subtrees opaque. Committed rowid-table joins now seek the SQLite index b-tree
+directly and defer the table fetch unless the index covers the row; transaction,
+MVCC, unsupported-shape, and unsupported-collation cases retain the materialized
+fallback. The pinned Turso release has no STAT4 reader, so Ahtola's histogram
+extension validates the standard `sqlite_stat4` schema, current `sqlite_stat1`
+row count, built-in collation metadata, and sample record before using it.
 
 ### 9. Page-native MVCC depth
 
-- [ ] Version `sqlite_schema` identities and schema generations so concurrent
+- [x] Version `sqlite_schema` identities and schema generations so concurrent
   DDL can commit or conflict without exposing discarded catalog changes.
-- [ ] Replace materialized table/index overlays with lazy typed dual cursors
+- [x] Replace materialized table/index overlays with lazy typed dual cursors
   over base B-trees and version chains.
-- [ ] Preserve statement snapshots while peer commits advance the shared
+- [x] Preserve statement snapshots while peer commits advance the shared
   store.
-- [ ] Port Turso checkpoint phases onto managed I/O: lock, collect,
-  materialize, page-WAL persist, backfill, logical-log retirement, WAL reset,
-  then version GC.
-- [ ] Keep recovery evidence valid at every injected crash boundary.
-- [ ] Add deterministic schema-cookie, multi-connection, cursor, checkpoint,
+- [x] Port Turso checkpoint phases onto managed I/O: lock, collect,
+  materialize, page-WAL persist, backfill, recovery-watermark publication,
+  logical-log retirement, WAL reset, then version GC.
+- [x] Keep recovery evidence valid at every injected crash boundary.
+- [x] Add deterministic schema-cookie, multi-connection, cursor, checkpoint,
   reopen, and oldest-snapshot GC tests.
+
+The managed port follows the pinned Turso `v0.8.0-pre.7` implementation:
+`core/mvcc/database/mod.rs` (`MVTableId`, schema-generation begin/commit
+checks, low-water mark GC), `core/mvcc/cursor.rs` (`MvccLazyCursor` and
+two-peek table/index merging), and
+`core/mvcc/database/checkpoint_state_machine.rs` (publish, backfill,
+logical-log retirement, WAL reset, then GC). Managed I/O completes each phase
+synchronously. A pager-first schema publish and pre-DDL retirement checkpoint
+keep discarded catalogs out of the logical log, while inclusive checkpoint
+watermark frames make every crash boundary replay-safe.
 
 ### 10. Managed sync-engine depth
 
-- [ ] Port the passive synced-prefix/history checkpoint policy without
-  weakening ambiguous-push recovery.
-- [ ] Complete wait-for-changes cancellation, timeout, reconnect, and revision
-  ordering.
-- [ ] Negotiate physical and logical protocols explicitly and qualify them
-  against the pinned reference server.
-- [ ] Evaluate compressed page sets only through a pure-managed,
+- [x] Port the passive synced-prefix/history checkpoint policy without
+  weakening ambiguous-push recovery. Turso's page-stream apply protects its
+  revert database by passively backfilling the synced WAL prefix before replay.
+  Ahtola's page protocol uses the stronger format-appropriate
+  `ManagedReplicaRevertWal.CaptureAndCheckpoint`: it publishes a complete
+  pre-checkpoint page image before folding WAL into the main store, then keeps
+  that recovery bundle through ambiguous push outcomes. The Core-only
+  `SqliteWalWriterCheckpointCoordinator.CheckpointPassiveValidated` also
+  exposes an inclusive safe backfill watermark bound to WAL salts and the
+  WAL-index change counter for callers that need non-resetting passive evidence.
+  The MVCC-logical path does not use Turso's separate revert-WAL page replay and
+  therefore does not invent a page-frame watermark for logical transactions.
+- [x] Complete wait-for-changes cancellation, timeout, reconnect, and revision
+  ordering. Ported Turso's `wait_changes_from_remote` -> opaque staged changes
+  -> `apply_changes_from_remote` split
+  (`ManagedReplicaBootstrapper.WaitForRemoteChangesAsync` /
+  `ApplyRemoteChangesAsync` / `ManagedReplicaStagedChanges`): waiting stages
+  and validates a response without touching local state or holding any
+  publication gate; applying consumes the staged result exactly once (fails
+  closed on cross-replica, duplicate-apply, and disposed-result misuse) and
+  throws a dedicated `ManagedReplicaStaleChangesException` when the remote-facing
+  base advanced past the snapshot the response was negotiated against.
+  Local-only journal advancement is rebased onto the staged response without
+  another pull; genuinely stale bases retry with a finite backoff and bound.
+  `AhtolaConnection.SyncAsync`
+  now runs push and the local apply as their own short publication windows,
+  with the network long-poll for remote changes in between holding no gate at
+  all, so sibling connections to the same replica keep serving local reads and
+  writes for however long the remote takes to answer. Cancellation, timeout,
+  and no-change (up-to-date) responses were already exercised end-to-end and
+  remain covered; reconnect/redirect handling in the HTTP transport itself was
+  untouched (no protocol-layer change was needed for this split).
+- [x] Negotiate physical and logical protocols explicitly and qualify them
+  against the pinned reference server. Already in place before this workstream
+  (raw `PageUpdatesEncodingReq=0`, persisted Pages/MvccLogical detection,
+  stream/apply mode parsing, LML3 logical replay) and unaffected by the
+  wait/apply split, which reuses the exact same request/response parsing code.
+- [x] Evaluate compressed page sets only through a pure-managed,
   NativeAOT/trim-safe dependency; otherwise keep explicit raw negotiation and
-  fail closed.
-- [ ] Preserve sparse-bootstrap publication, encryption exclusions, conflict
-  quarantine, and one push flight per physical identity.
-- [ ] Add canned-server protocol tests, every-boundary fault injection, and
-  cross-process publication tests.
+  fail closed. No pure-managed, trim-safe zstd implementation is available, so
+  the existing explicit raw-encoding request and fail-closed zstd rejection
+  stand as the deliberate, documented choice; the wait/apply split changes
+  nothing about encoding negotiation.
+- [x] Preserve sparse-bootstrap publication, encryption exclusions, conflict
+  quarantine, and one push flight per physical identity. Verified unchanged
+  by the full existing `ManagedReplicaPublicationRaceTests` /
+  `ManagedEmbeddedReplicaPushRecoveryTests` /
+  `ManagedReplicaBootstrapCatchUpDurabilityTests` suites, including the
+  cross-process conflict-during-network-wait races.
+- [x] Add canned-server protocol tests, every-boundary fault injection, and
+  cross-process publication tests. Added direct unit tests for the new staged
+  wait/apply primitives (cross-replica, duplicate-apply, disposed-result,
+  stale-revision retry, no-change response, cancellation mid-long-poll) plus
+  an integration test proving `SyncAsync` no longer blocks sibling reads/writes
+  during the long-poll (`ManagedReplicaWaitApplySplitTests.cs`); reran the full
+  existing canned-server and cross-process publication-race suites unchanged.
 
 ## Definition of done
 

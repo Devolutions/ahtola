@@ -137,10 +137,30 @@ public sealed class MvccStoreUnitTests
     }
 
     [Test]
-    public void ActiveTransactionPreventsCheckpointLease()
+    public void ActiveReadOnlyTransactionCanRemainPinnedDuringCheckpoint()
     {
         var store = new MvStore();
         var transaction = store.BeginTransaction();
+
+        store.TryAcquireCheckpoint(out var lease).Should().BeTrue();
+        lease.Should().NotBeNull();
+        ((Action)(() => store.Insert(
+                transaction.Id,
+                new MvccRowId(store.GetOrCreateTableId("t"), 1),
+                [SqlValue.Integer(1)])))
+            .Should().Throw<EmbeddedBusyException>();
+        lease!.Dispose();
+
+        store.Rollback(transaction.Id);
+    }
+
+    [Test]
+    public void ActiveWriterPreventsCheckpointLease()
+    {
+        var store = new MvStore();
+        var transaction = store.BeginTransaction();
+        var table = store.GetOrCreateTableId(transaction.Id, "t");
+        store.Insert(transaction.Id, new MvccRowId(table, 1), [SqlValue.Integer(1)]);
 
         store.TryAcquireCheckpoint(out var lease).Should().BeFalse();
         lease.Should().BeNull();
@@ -280,5 +300,81 @@ public sealed class MvccStoreUnitTests
             .Select(row => row.Key.Integer)
             .Should()
             .Equal(1L);
+    }
+
+    [Test]
+    public void SchemaIdentityChangesOnlyWhenPreparedCatalogIsPublished()
+    {
+        var store = new MvStore(schemaGeneration: 7);
+        var transaction = store.BeginTransaction(expectedSchemaGeneration: 7);
+        var oldIdentity = store.GetOrCreateTableId(transaction.Id, "items");
+
+        store.BeginSchemaChange(transaction.Id);
+        var provisionalIdentity = store.GetOrCreateTableId(transaction.Id, "items");
+        provisionalIdentity.Should().NotBe(oldIdentity);
+        store.SchemaGeneration.Should().Be(7);
+
+        store.CancelSchemaChange(transaction.Id);
+        store.SchemaGeneration.Should().Be(7);
+        store.GetOrCreateTableId(transaction.Id, "items").Should().Be(oldIdentity);
+
+        store.BeginSchemaChange(transaction.Id);
+        var committedIdentity = store.GetOrCreateTableId(transaction.Id, "items");
+        store.PrepareSchemaCommit(transaction.Id);
+        store.SchemaGeneration.Should().Be(7);
+        store.CompleteSchemaCommit(transaction.Id);
+
+        store.SchemaGeneration.Should().Be(8);
+        store.GetOrCreateTableId("items").Should().NotBe(oldIdentity);
+        store.GetOrCreateTableId("items").Should().NotBe(committedIdentity);
+    }
+
+    [Test]
+    public void ExpectedSchemaGenerationRejectsAStaleBegin()
+    {
+        var store = new MvStore(schemaGeneration: 3);
+
+        ((Action)(() => store.BeginTransaction(expectedSchemaGeneration: 2)))
+            .Should().Throw<EmbeddedCatalogSnapshotStaleException>();
+        var current = store.BeginTransaction(expectedSchemaGeneration: 3);
+        current.BeginSchemaGeneration.Should().Be(3);
+        store.Rollback(current.Id);
+    }
+
+    [Test]
+    public void CheckpointGcRetainsHistoryUntilTheOldestSnapshotEnds()
+    {
+        var store = new MvStore();
+        var table = store.GetOrCreateTableId("t");
+        var seed = store.BeginTransaction();
+        store.Insert(seed.Id, new MvccRowId(table, 1), [SqlValue.Text("old")]);
+        store.Commit(seed.Id);
+
+        var oldest = store.BeginTransaction();
+        var writer = store.BeginTransaction();
+        store.Update(writer.Id, new MvccRowId(table, 1), [SqlValue.Text("new")]).Should().BeTrue();
+        store.Commit(writer.Id);
+        store.VersionCount.Should().Be(2);
+
+        store.TryAcquireCheckpoint(out var firstLease).Should().BeTrue();
+        using (firstLease)
+        {
+            var snapshot = store.CollectCheckpointSnapshot();
+            store.GarbageCollectAfterCheckpoint(snapshot);
+        }
+
+        store.TryRead(oldest.Id, new MvccRowId(table, 1), out var oldCells).Should().BeTrue();
+        oldCells![0].Should().Be(SqlValue.Text("old"));
+        store.VersionCount.Should().Be(2);
+
+        store.Rollback(oldest.Id);
+        store.TryAcquireCheckpoint(out var secondLease).Should().BeTrue();
+        using (secondLease)
+        {
+            var snapshot = store.CollectCheckpointSnapshot();
+            store.GarbageCollectAfterCheckpoint(snapshot);
+        }
+
+        store.VersionCount.Should().Be(0);
     }
 }

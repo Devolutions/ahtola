@@ -338,13 +338,15 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   ephemeral tables, and opaque aggregate state do not yet spill. Prefer modest
   databases and explicit transactions for writes (managed writes are slower
   than native SQLite and the gap grows with table size).
-- **Planner** — `ANALYZE` / `sqlite_stat1` feed index scoring, System-R DP join
-  reordering for up to eight freely reorderable INNER members (greedy above
-  that), hash-build selection, and durable secondary-index equality seeks bound
-  by preceding outer rows. OUTER/NATURAL/USING barriers remain
-  correctness-preserving. Multi-index AND intersection, STAT4 histograms,
-  transient join auto-indexes, and direct pager-cursor join seeks are still
-  deferred. Prefer `ORDER BY` when order matters (`GROUP BY` is
+- **Planner** — `ANALYZE` / `sqlite_stat1` and validated `sqlite_stat4`
+  histograms feed index scoring, System-R DP join reordering for up to eight
+  freely reorderable INNER members (greedy above that), hash-build selection,
+  costed multi-index AND intersections, and transient automatic covering
+  indexes. Committed file-backed rowid-table joins seek durable SQLite index
+  b-trees directly; transaction-local, MVCC, WITHOUT ROWID, partial/expression,
+  custom-collation, and unsupported range shapes retain deterministic
+  materialized/scan fallbacks. OUTER/NATURAL/USING barriers remain
+  correctness-preserving. Prefer `ORDER BY` when order matters (`GROUP BY` is
   first-encounter order).
 - **File-backed platforms** — desktop physical files support Windows, 64-bit
   Linux, and macOS. Browser WebAssembly uses the separate OPFS package and its
@@ -371,11 +373,14 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   can read a DB still held by native SQLite/Turso (e.g. winget `index.db`) without
   taking main-file locks.
 - **MVCC** — process-local `PRAGMA journal_mode=mvcc` + `BEGIN CONCURRENT` with
-  typed rowid/composite-key and materialized-index overlays, a durable logical
-  log, and a synchronous page-WAL checkpoint sequence (`PRAGMA wal_checkpoint`
-  in MVCC mode). Not cross-process; concurrent DDL remains exclusive while
-  active MVCC snapshots exist, and lazy per-page cursor/checkpoint parity is
-  still deferred — see [docs/mvcc-port-contract.md](docs/mvcc-port-contract.md).
+  generation-scoped schema/table identities, typed rowid/composite-key lazy
+  base/version cursors, a sorted secondary-index overlay, a durable logical log,
+  and a crash-ordered page-WAL checkpoint state machine
+  (`PRAGMA wal_checkpoint` in MVCC mode). Checkpoint GC honors each reader's
+  pinned materialization generation, and recovery watermarks advance the
+  logical clock after interrupted log retirement. It is not cross-process;
+  schema publication fails busy while a peer concurrent snapshot is active.
+  See [docs/mvcc-port-contract.md](docs/mvcc-port-contract.md).
 - **Managed virtual-table subset** — statically registered `fts5`, `rtree`, and
   `rtree_i32` modules persist module-owned state in the managed catalog, but are
   not full SQLite FTS5/R-Tree implementations and do not create interoperable
@@ -397,9 +402,17 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   catch-up is durably marked complete; a crash in between is detected and the
   catch-up resumed on the next open. See
   [docs/replica-bootstrap-publication.md](docs/replica-bootstrap-publication.md).
+- **Managed replica sync** — physical-page and MVCC-logical protocols are
+  detected and persisted explicitly. `SyncAsync` pushes first, waits for remote
+  changes without closing sibling hosts, then applies one-shot staged changes
+  under the publication and cross-process leases. Local journal advancement is
+  rebased without another network pull; genuinely stale remote bases retry with
+  a bound. Page replacement retains crash-safe revert evidence. Pulls request
+  raw pages explicitly and reject zstd responses because no approved
+  pure-managed, trim-safe zstd implementation is shipped.
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
-  is null), the full sync engine / advanced replica protocols,
-  `CREATE SEQUENCE`, and typed-value extensions.
+  is null), zstd-compressed replica page sets, `CREATE SEQUENCE`, and
+  typed-value extensions.
 - **Native / Sync companions** — not shipped. Connection-string paths that need
   them fail closed. OS P/Invoke in the pager for locks/WAL is intentional engine
   code, not a Rust SDK binding.

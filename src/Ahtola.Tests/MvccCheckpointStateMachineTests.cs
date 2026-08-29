@@ -7,8 +7,9 @@ using Ahtola.Data.Sqlite;
 namespace Ahtola.Tests;
 
 /// <summary>
-/// Managed MVCC checkpoint skeleton (Turso <c>CheckpointStateMachine</c> phases):
-/// materialize store → catalog, truncate logical log, GC, cold reopen.
+/// Managed MVCC checkpoint phases from Turso's <c>CheckpointStateMachine</c>:
+/// collect, materialize, page-WAL persist, backfill, publish recovery evidence,
+/// retire/reset, and GC.
 /// </summary>
 public sealed class MvccCheckpointStateMachineTests
 {
@@ -111,7 +112,12 @@ public sealed class MvccCheckpointStateMachineTests
         store.Commit(tx.Id);
 
         store.VersionChainCount.Should().BeGreaterThan(0);
-        store.GarbageCollectAfterCheckpoint();
+        store.TryAcquireCheckpoint(out var lease).Should().BeTrue();
+        using (lease)
+        {
+            var snapshot = store.CollectCheckpointSnapshot();
+            store.GarbageCollectAfterCheckpoint(snapshot);
+        }
         store.VersionChainCount.Should().Be(0);
     }
 
@@ -138,7 +144,7 @@ public sealed class MvccCheckpointStateMachineTests
 
             Assert.Throws<IOException>(() => database.RunMvccCheckpoint("TRUNCATE"));
 
-            ReadFileLength(fileSystem, path + "-log").Should().Be(logLength);
+            ReadFileLength(fileSystem, path + "-log").Should().BeGreaterThan(logLength);
             AssertCommittedWal(fileSystem, path + "-wal");
 
             // A failed durability phase must release process-local admission.
@@ -222,7 +228,7 @@ public sealed class MvccCheckpointStateMachineTests
     }
 
     [Test]
-    public void ActiveConcurrentReaderPreventsLogicalLogRetirement()
+    public void ActiveConcurrentReaderKeepsItsSnapshotAcrossCheckpoint()
     {
         var fileSystem = new InMemoryFileSystem();
         const string path = "mvcc-reader-floor.db";
@@ -232,21 +238,23 @@ public sealed class MvccCheckpointStateMachineTests
         using var reader = database.Connect();
         Execute(writer, "CREATE TABLE t(v INTEGER);");
         Execute(writer, "PRAGMA journal_mode=mvcc;");
+        Execute(reader, "BEGIN CONCURRENT;");
         Execute(writer, "BEGIN CONCURRENT;");
         Execute(writer, "INSERT INTO t VALUES (91);");
         Execute(writer, "COMMIT;");
 
         var logLength = ReadFileLength(fileSystem, path + "-log");
-        Execute(reader, "BEGIN CONCURRENT;");
-
-        var blocked = database.RunMvccCheckpoint("TRUNCATE");
-        blocked.Busy.Should().BeTrue();
-        blocked.CompletedThrough.Should().Be(MvccCheckpointPhase.AcquireLock);
-        ReadFileLength(fileSystem, path + "-log").Should().Be(logLength);
+        var checkpoint = database.RunMvccCheckpoint("TRUNCATE");
+        checkpoint.Busy.Should().BeFalse();
+        checkpoint.CompletedThrough.Should().Be(MvccCheckpointPhase.Complete);
+        ReadFileLength(fileSystem, path + "-log").Should().BeLessThan(logLength);
+        ReadScalar(reader, "SELECT COUNT(*) FROM t WHERE v = 91;").Should().Be(0);
+        database.MvStore!.VersionCount.Should().BeGreaterThan(0);
 
         Execute(reader, "ROLLBACK;");
         database.RunMvccCheckpoint("TRUNCATE").Busy.Should().BeFalse();
         ReadFileLength(fileSystem, path + "-log").Should().Be(56);
+        database.MvStore!.VersionCount.Should().Be(0);
     }
 
     [Test]
@@ -327,6 +335,106 @@ public sealed class MvccCheckpointStateMachineTests
         reopened.MvStore!.LogicalLog!.RequiresVersion4Upgrade.Should().BeTrue();
         reopened.RunMvccCheckpoint("PASSIVE").Busy.Should().BeFalse();
         reopened.MvStore!.LogicalLog!.RequiresVersion4Upgrade.Should().BeFalse();
+    }
+
+    [TestCase(nameof(MvccCheckpointPhase.AcquireLock))]
+    [TestCase(nameof(MvccCheckpointPhase.Collect))]
+    [TestCase(nameof(MvccCheckpointPhase.Materialize))]
+    [TestCase(nameof(MvccCheckpointPhase.PersistPageWal))]
+    [TestCase(nameof(MvccCheckpointPhase.Backfill))]
+    [TestCase(nameof(MvccCheckpointPhase.PublishRecoveryWatermark))]
+    [TestCase(nameof(MvccCheckpointPhase.RetireLogicalLog))]
+    [TestCase(nameof(MvccCheckpointPhase.ResetWal))]
+    [TestCase(nameof(MvccCheckpointPhase.GarbageCollect))]
+    [TestCase(nameof(MvccCheckpointPhase.Complete))]
+    public void EveryCheckpointPhaseBoundaryColdReopensWithoutLosingTheCommit(string phaseName)
+    {
+        var phase = Enum.Parse<MvccCheckpointPhase>(phaseName);
+        var fileSystem = new InMemoryFileSystem();
+        var path = $"mvcc-phase-{phaseName}.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(v INTEGER);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO t VALUES (107);");
+            Execute(connection, "COMMIT;");
+
+            try
+            {
+                MvccCheckpointFaultInjection.AfterPhaseForTesting = completed =>
+                {
+                    if (completed == phase)
+                        throw new IOException($"Injected crash after {completed}.");
+                };
+                Assert.Throws<IOException>(() => database.RunMvccCheckpoint("TRUNCATE"));
+            }
+            finally
+            {
+                MvccCheckpointFaultInjection.AfterPhaseForTesting = null;
+            }
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadScalar(reopenedConnection, "SELECT v FROM t;").Should().Be(107L);
+        reopened.RunMvccCheckpoint("TRUNCATE").Busy.Should().BeFalse();
+    }
+
+    [Test]
+    public void RecoveryWatermarkAdvancesClockBeforeTheNextLogicalCommit()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "mvcc-watermark-clock.db";
+        ulong watermark;
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(v INTEGER);");
+            Execute(connection, "PRAGMA journal_mode=mvcc;");
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO t VALUES (1);");
+            Execute(connection, "COMMIT;");
+            watermark = database.MvStore!.LastCommittedTimestamp;
+
+            try
+            {
+                MvccCheckpointFaultInjection.AfterPhaseForTesting = phase =>
+                {
+                    if (phase == MvccCheckpointPhase.PublishRecoveryWatermark)
+                        throw new IOException("Injected crash after checkpoint watermark publication.");
+                };
+                Assert.Throws<IOException>(() => database.RunMvccCheckpoint("TRUNCATE"));
+            }
+            finally
+            {
+                MvccCheckpointFaultInjection.AfterPhaseForTesting = null;
+            }
+        }
+
+        using (var reopened = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = reopened.Connect())
+        {
+            reopened.MvStore!.LastCommittedTimestamp.Should().Be(watermark);
+            Execute(connection, "BEGIN CONCURRENT;");
+            Execute(connection, "INSERT INTO t VALUES (2);");
+            Execute(connection, "COMMIT;");
+            reopened.MvStore!.LastCommittedTimestamp.Should().BeGreaterThan(watermark);
+        }
+
+        using var final = EmbeddedDatabase.OpenFile(path, fileSystem);
+        var table = final.MvStore!.GetOrCreateTableId("t");
+        var reader = final.MvStore.BeginTransaction();
+        final.MvStore.TryRead(
+                reader.Id,
+                new MvccRowId(table, 2),
+                out var cells)
+            .Should().BeTrue();
+        cells![0].Should().Be(SqlValue.Integer(2));
+        final.MvStore.Rollback(reader.Id);
     }
 
     private static object? Scalar(SqliteConnection connection, string sql)

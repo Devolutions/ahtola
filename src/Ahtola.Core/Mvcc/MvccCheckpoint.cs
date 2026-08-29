@@ -9,11 +9,11 @@ internal enum MvccCheckpointPhase : byte
 {
     Prepare = 0,
     AcquireLock = 1,
-    BuildSnapshot = 2,
-    MaterializeRows = 3,
-    CommitPager = 4,
-    BackfillMainStore = 5,
-    SyncMainStore = 6,
+    Collect = 2,
+    Materialize = 3,
+    PersistPageWal = 4,
+    Backfill = 5,
+    PublishRecoveryWatermark = 6,
     RetireLogicalLog = 7,
     ResetWal = 8,
     GarbageCollect = 9,
@@ -26,6 +26,16 @@ internal readonly record struct MvccCheckpointResult(
     long LogFramesBefore,
     long CheckpointedFrames,
     MvccCheckpointPhase CompletedThrough);
+
+/// <summary>
+/// Stable committed input collected while the checkpoint admission lease is held.
+/// The timestamp is an inclusive logical-log retirement boundary.
+/// </summary>
+internal sealed record MvccCheckpointSnapshot(
+    IReadOnlyList<(MvccRowId RowId, SqlValue[] Cells)> LiveRows,
+    IReadOnlyCollection<MvccRowId> DeletedRows,
+    ulong DurableTimestamp,
+    ulong MaterializationGeneration);
 
 /// <summary>
 /// Synchronous managed port of Turso's checkpoint durability sequence:
@@ -46,6 +56,16 @@ internal static class MvccCheckpoint
     internal static bool IsPassive(string? mode)
         => mode is null
             || mode.Equals("PASSIVE", StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>Deterministic phase boundary hook used by crash/reopen tests.</summary>
+internal static class MvccCheckpointFaultInjection
+{
+    [field: ThreadStatic]
+    internal static Action<MvccCheckpointPhase>? AfterPhaseForTesting { get; set; }
+
+    internal static void Hit(MvccCheckpointPhase phase)
+        => AfterPhaseForTesting?.Invoke(phase);
 }
 
 /// <summary>

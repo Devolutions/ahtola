@@ -2,13 +2,18 @@ namespace Ahtola.Core.Mvcc;
 
 /// <summary>
 /// Merges a classic base-table snapshot with MVCC version-store overlays for one
-/// transaction (Turso dual-cursor isolation spirit). Base rows that the store
-/// has invalidated (deleted/updated for this reader) are suppressed; store-only
-/// inserts appear as additional rows.
+/// transaction (Turso <c>core/mvcc/cursor.rs::MvccLazyCursor</c>). Base rows
+/// invalidated for this reader are suppressed; store-only inserts appear as
+/// additional rows.
 /// </summary>
 internal static class MvccDualCursor
 {
     internal readonly record struct Row(MvccKey Key, SqlValue[] Cells);
+
+    internal readonly record struct IndexRow(
+        MvccKey TableKey,
+        SqlValue[] IndexKey,
+        SqlValue[] Cells);
 
     /// <summary>
     /// Lazily overlays an ordered base image with the ordered MVCC range. This
@@ -115,5 +120,118 @@ internal static class MvccDualCursor
                 MvccKeyComparer.Integer)
             .Select(static row => (row.Key.Integer, row.Cells))
             .ToArray();
+    }
+
+    /// <summary>
+    /// Lazily merges a base index cursor with visible version-chain entries. Base
+    /// entries shadowed by a visible table-key effect are skipped before index-key
+    /// comparison, so updates that move between index keys are emitted only at
+    /// their new position.
+    /// </summary>
+    internal static IEnumerable<IndexRow> EnumerateVisibleIndexRows(
+        MvStore store,
+        MvccTxId txId,
+        long tableId,
+        IEnumerable<IndexRow> baseRows,
+        Func<MvccVisibleRow, IndexRow?> projectOverlay,
+        IComparer<IndexRow> indexComparer,
+        IComparer<MvccKey> tableKeyComparer)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(baseRows);
+        ArgumentNullException.ThrowIfNull(projectOverlay);
+        ArgumentNullException.ThrowIfNull(indexComparer);
+        ArgumentNullException.ThrowIfNull(tableKeyComparer);
+
+        using var baseCursor = EnumerateUnshadowedBaseIndexRows(
+            store,
+            txId,
+            tableId,
+            baseRows).GetEnumerator();
+        using var overlayCursor = EnumerateOverlayIndexRows(
+            store,
+            txId,
+            tableId,
+            projectOverlay,
+            indexComparer,
+            tableKeyComparer).GetEnumerator();
+        var hasBase = baseCursor.MoveNext();
+        var hasOverlay = overlayCursor.MoveNext();
+        while (hasBase || hasOverlay)
+        {
+            if (!hasOverlay)
+            {
+                yield return baseCursor.Current;
+                hasBase = baseCursor.MoveNext();
+                continue;
+            }
+
+            if (!hasBase)
+            {
+                yield return overlayCursor.Current;
+                hasOverlay = overlayCursor.MoveNext();
+                continue;
+            }
+
+            var comparison = indexComparer.Compare(baseCursor.Current, overlayCursor.Current);
+            if (comparison < 0)
+            {
+                yield return baseCursor.Current;
+                hasBase = baseCursor.MoveNext();
+                continue;
+            }
+
+            yield return overlayCursor.Current;
+            hasOverlay = overlayCursor.MoveNext();
+            if (comparison == 0)
+                hasBase = baseCursor.MoveNext();
+        }
+    }
+
+    private static IEnumerable<IndexRow> EnumerateUnshadowedBaseIndexRows(
+        MvStore store,
+        MvccTxId txId,
+        long tableId,
+        IEnumerable<IndexRow> baseRows)
+    {
+        foreach (var row in baseRows)
+        {
+            if (store.TryReadVisibleEffect(
+                    txId,
+                    new MvccRowId(tableId, row.TableKey),
+                    out _,
+                    out _))
+            {
+                continue;
+            }
+
+            yield return new IndexRow(
+                row.TableKey,
+                (SqlValue[])row.IndexKey.Clone(),
+                (SqlValue[])row.Cells.Clone());
+        }
+    }
+
+    private static IEnumerable<IndexRow> EnumerateOverlayIndexRows(
+        MvStore store,
+        MvccTxId txId,
+        long tableId,
+        Func<MvccVisibleRow, IndexRow?> projectOverlay,
+        IComparer<IndexRow> indexComparer,
+        IComparer<MvccKey> tableKeyComparer)
+    {
+        var projected = new List<IndexRow>();
+        foreach (var visible in store.EnumerateVisible(
+                     txId,
+                     tableId,
+                     tableKeyComparer))
+        {
+            if (!visible.IsDelete && projectOverlay(visible) is { } candidate)
+                projected.Add(candidate);
+        }
+
+        projected.Sort(indexComparer);
+        foreach (var row in projected)
+            yield return row;
     }
 }

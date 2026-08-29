@@ -24,8 +24,8 @@ internal enum JoinStepShape
     HashBuildLeft,
 
     /// <summary>
-    /// The right member is positioned once per accumulated outer row through a durable index's
-    /// contiguous equality prefix.
+    /// The right member is positioned once per accumulated outer row through a durable or
+    /// automatic index's contiguous equality prefix.
     /// </summary>
     IndexSeekRight,
 }
@@ -147,14 +147,32 @@ internal static class JoinCostModel
     }
 
     /// <summary>
-    /// One-time incremental cost of reconstructing the managed, MVCC-visible index view used by
-    /// join seeks. Turso seeks an already-open B-tree; Ahtola currently projects and sorts the
-    /// visible base rows once per statement, so that O(N log N) work must not be hidden.
+    /// One-time incremental cost of reconstructing the managed, MVCC-visible fallback index view
+    /// used when a committed pager cursor is unavailable. The O(N log N) work must not be hidden.
     /// </summary>
     public static double EstimateManagedIndexViewBuildCost(double rowCount)
     {
         var rows = Sanitize(rowCount);
         return EstimateSortCost(rows) + rows * JoinCostParams.CpuCostPerRow;
+    }
+
+    /// <summary>
+    /// Build-once cost for an automatic equality index. This mirrors Turso's
+    /// <c>estimate_ephemeral_index_build_cost</c>: scan the input once, insert each
+    /// row into the transient lookup, then probe it once per accumulated outer row.
+    /// </summary>
+    public static double EstimateAutomaticIndexCost(
+        double baseRowCount,
+        double inputCardinality,
+        double rowsPerSeek)
+    {
+        var rows = Sanitize(baseRowCount);
+        var probes = Math.Max(1.0, Sanitize(inputCardinality));
+        var matches = Math.Max(0.0, Sanitize(rowsPerSeek));
+        return EstimateFullScanCost(rows, scanCount: 1.0)
+            + rows * (JoinCostParams.HashCpuCost + JoinCostParams.HashInsertCost)
+            + probes * (JoinCostParams.HashCpuCost + JoinCostParams.HashLookupCost)
+            + probes * matches * JoinCostParams.CpuCostPerRow;
     }
 
     /// <summary>

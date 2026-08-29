@@ -527,7 +527,7 @@
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-23 by the cost-based N-way join-order stage (src/Ahtola.Core/EmbeddedDatabase.JoinOrderRewrites.cs + src/Ahtola.Core/Compilation/JoinOrdering/*), then extended with executable durable index-seek choices. Maximal plain-INNER segments are ordered by a System-R subset DP for up to 8 members and greedy build-up above that. Per-step choices now include nested-loop, either hash-build side, and outer-row-bound persisted-index seeks; estimate_index_cost (cost.rs:171-236) uses accumulated outer cardinality and sqlite_stat1 leading-prefix averages, plus the managed executor's one-time O(N log N) MVCC index-view reconstruction cost. Usable mandatory INDEXED BY candidates force the named seek; unusable hints retain evaluator semantics. LEFT/RIGHT/FULL/NATURAL/USING remain strict barriers. Evidence: JoinOrderOptimizerTests (including indexed DP-vs-brute-force permutation oracle), PlannerStat1JoinCostTests, IndexSeekJoinTests, EXPLAIN/EQP search text, JoinOrderDiagnostics and VdbeJoinIndexSeekMetrics. Residual: STAT4 histograms; multi-index AND intersection; direct pager/B-tree cursor seeks; bloom filters and auto-indexes; Turso required_lhs_by_table outer-join interleaving; general WHERE-term decomposition beyond single-member root-segment comparison pushdown.",
+      "notes": "Closed 2026-08-23 by the cost-based N-way join-order stage (src/Ahtola.Core/EmbeddedDatabase.JoinOrderRewrites.cs + src/Ahtola.Core/Compilation/JoinOrdering/*), then extended by planner-access-path-depth. Maximal plain-INNER segments are ordered by a System-R subset DP for up to 8 members and greedy build-up above that. Per-step choices include nested-loop, either hash-build side, build-once automatic indexes, and outer-row-bound persisted-index seeks. Committed file-backed rowid tables use lazy pager/index cursors with covering reconstruction or deferred rowid-table fetch; transaction/MVCC and unsupported shapes retain the materialized fallback. Usable mandatory INDEXED BY candidates force the named seek; unusable hints retain evaluator semantics. LEFT/RIGHT/FULL/NATURAL/USING remain strict barriers. Evidence: JoinOrderOptimizerTests, PlannerStat1JoinCostTests, IndexSeekJoinTests, PlannerAccessPathDepthTests, EXPLAIN/EQP search text, JoinOrderDiagnostics and VdbeJoinIndexSeekMetrics. Residual: bloom filters; Turso required_lhs_by_table outer-join interleaving; general WHERE-term decomposition beyond single-member root-segment comparison pushdown.",
       "status": "closed"
     },
     {
@@ -539,7 +539,7 @@
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 for the managed single-table planner surface and extended for plain-INNER joins. TryPlanManagedIndexScan scores competing single-table indexes. JoinOrderEnumerator now costs ordinary persisted indexes whose contiguous leading equality prefix is bound by the current outer mask, using sqlite_stat1 prefix averages and the Turso estimate_index_cost formula, and threads the exact candidate into VdbeJoinIndexScanPlan. Evidence: CompiledSortedScanExecutionTests, JoinOrderOptimizerTests, IndexSeekJoinTests. Residual optimization: AND multi-index intersection, STAT4 histograms, and direct pager/B-tree cursor reuse.",
+      "notes": "Closed 2026-08-06 for the managed single-table planner surface and extended by planner-access-path-depth. TryPlanManagedIndexScan scores competing single-table indexes with current validated sqlite_stat4 samples where available. Top-level selective AND terms may intersect distinct rowid sets when their cost beats the full-scan and single-index baselines. JoinOrderEnumerator costs persisted and automatic indexes whose contiguous equality prefix is bound by the current outer mask; committed file-backed rowid tables seek the persisted SQLite b-tree directly. Evidence: CompiledSortedScanExecutionTests, JoinOrderOptimizerTests, IndexSeekJoinTests, PlannerAccessPathDepthTests.",
       "status": "closed"
     },
     {
@@ -551,7 +551,7 @@
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 for the managed OR-union surface. Top-level equality OR branches SEARCH distinct indexes, union positions in the evaluator, compile Rewind over the union, and EQP/OpenRead report MULTI-INDEX OR. Evidence: CompiledSortedScanExecutionTests.OrClauseUsesMultiIndexUnion. Residual: VDBE bitmap-union opcodes and AND multi-index intersection remain optional perf extensions.",
+      "notes": "Closed 2026-08-06 for the managed OR-union surface. Top-level equality OR branches SEARCH distinct indexes, union positions in the evaluator, compile Rewind over the union, and EQP/OpenRead report MULTI-INDEX OR. The planner-access-path-depth workstream added the corresponding costed MULTI-INDEX AND rowid-set intersection. Evidence: CompiledSortedScanExecutionTests.OrClauseUsesMultiIndexUnion and PlannerAccessPathDepthTests. Residual: dedicated VDBE bitmap-union/intersection opcodes.",
       "status": "closed"
     },
     {
@@ -1188,15 +1188,15 @@
       "id": "compile-analyze-stat-tables",
       "layer": "compilation",
       "kind": "parity",
-      "turso_ref": "turso-src/core/translate/analyze.rs (ANALYZE, sqlite_stat1/stat4 planner statistics)",
-      "ahtola_ref": "none (Managed ANALYZE reports planner statistics not implemented)",
+      "turso_ref": "turso-src/core/translate/analyze.rs and core/stats.rs (ANALYZE and sqlite_stat1; pinned v0.8.0-pre.7 has no sqlite_stat4 reader)",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.cs::ExecuteAnalyze; src/Ahtola.Core/EmbeddedDatabase.PlannerAccessPaths.cs (sqlite_stat4 generation, validation, and equality histogram estimates)",
       "severity": "s3-perf",
       "effort": "M",
       "conformance_links": [
         "snapshot_tests/analyze/stat1_rows.sqltest::analyze-indexed-table-does-not-insert-null-stat1-row",
         "join/memory.sqltest::correlated-subquery-hash-join-reuse"
       ],
-      "notes": "Closed 2026-08-06 for the sqlite_stat1 scope. ANALYZE deletes and rebuilds sqlite_stat1 rows, including table/index stats used by managed backup/adapters, and the previously linked stat cases pass. Cost-model consumption and any sqlite_stat4-equivalent planner statistics remain covered by compile-no-access-method-selection.",
+      "notes": "Closed 2026-08-06 for sqlite_stat1 and extended by planner-access-path-depth with standard sqlite_stat4 rows. ANALYZE deterministically samples supported ordinary indexes; the planner consumes equality histograms only when sqlite_stat4 has the standard six-column schema, sqlite_stat1 row counts are current, the index still matches, built-in collation semantics are not overridden, and every vector/sample record validates. Missing, stale, malformed, custom-collation, and unsupported-index cases fall back to deterministic stat1 or hardcoded selectivity. Managed snapshots preserve both statistics tables. Evidence: PlannerAccessPathDepthTests.",
       "status": "closed"
     },
     {
