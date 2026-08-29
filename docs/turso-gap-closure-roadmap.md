@@ -30,7 +30,7 @@ scope decision; it does not mean Ahtola implements every newer Turso feature.
 | 7 | `join-coalescing-parity` | 4 sqltests closed | `core/translate/planner.rs`, `plan.rs`, `select.rs` | Done |
 | 8 | `planner-access-path-depth` | Access-path depth completed | `core/translate/optimizer/`, `planner.rs`, `main_loop/` | Done |
 | 9 | `mvcc-page-native-depth` | Documented runtime limit | `core/mvcc/` | Done |
-| 10 | `sync-engine-depth` | Wait/apply lifecycle split landed; passive checkpoint hook available | `sync/engine/src/` | Partial |
+| 10 | `sync-engine-depth` | Split wait/apply lifecycle and crash-safe checkpoint policy | `sync/engine/src/` | Done |
 
 The sqltest counts overlap by subsystem only in implementation, not in this
 classification: ranks 1-7 account for 133 distinct expected-failure entries.
@@ -47,6 +47,15 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   exposed case was not in the 135-entry baseline).
 - Current expected-failure count: 2, both intentional STORED-generated-column
   differences. There are no actionable sqltest failures in the baseline.
+- 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
+  validated STAT4 selectivity, automatic covering indexes, and direct durable
+  index-btree seeks.
+- 2026-08-29: closed `mvcc-page-native-depth` with generation-scoped schema
+  identities, lazy typed cursors, crash-ordered checkpointing, recovery
+  watermarks, and reader-generation-aware GC.
+- 2026-08-29: closed `sync-engine-depth` with a split wait/apply lifecycle,
+  bounded stale-base retries, one-shot staged changes, and crash-safe
+  page-replacement checkpoint evidence.
 - 2026-08-29: `sync-engine-depth` -- landed the managed equivalent of Turso's
   `wait_changes_from_remote` -> opaque staged changes -> `apply_changes_from_remote`
   split (`ManagedReplicaBootstrapper.WaitForRemoteChangesAsync` /
@@ -213,23 +222,18 @@ watermark frames make every crash boundary replay-safe.
 
 ### 10. Managed sync-engine depth
 
-- [ ] Port the passive synced-prefix/history checkpoint policy without
-  weakening ambiguous-push recovery. Blocked on the parallel page-native MVCC
-  branch: Turso's `checkpoint_passive` (`sync/engine/src/database_sync_engine.rs`)
-  checkpoints only the already-synced WAL prefix
-  (`revert_since_wal_watermark`), which is a bounded, WAL-frame-based concept
-  that only exists once the MVCC logical protocol has a real logical log/WAL
-  to bound. The page protocol already has a *functionally* equivalent, tested
-  safety net for its own on-disk format: `ManagedReplicaRevertWal.CaptureAndCheckpoint`
-  captures a full pre-checkpoint page image before checkpointing WAL into the
-  main store, so a push that turns out to conflict can still restore the exact
-  pre-push database. Needed from the MVCC branch before this item can close:
-  an `Ahtola.Core/Mvcc` primitive that checkpoints up to a caller-supplied WAL
-  watermark while leaving frames above it (and their revert evidence) intact --
-  the managed equivalent of Turso's `revert_since_wal_watermark` /
-  `CheckpointMode::Passive { upper_bound_inclusive }`. No fail-closed seam was
-  added speculatively ahead of that primitive existing; see the sync-engine
-  session's report to the MVCC session for the exact requirement.
+- [x] Port the passive synced-prefix/history checkpoint policy without
+  weakening ambiguous-push recovery. Turso's page-stream apply protects its
+  revert database by passively backfilling the synced WAL prefix before replay.
+  Ahtola's page protocol uses the stronger format-appropriate
+  `ManagedReplicaRevertWal.CaptureAndCheckpoint`: it publishes a complete
+  pre-checkpoint page image before folding WAL into the main store, then keeps
+  that recovery bundle through ambiguous push outcomes. The Core-only
+  `SqliteWalWriterCheckpointCoordinator.CheckpointPassiveValidated` also
+  exposes an inclusive safe backfill watermark bound to WAL salts and the
+  WAL-index change counter for callers that need non-resetting passive evidence.
+  The MVCC-logical path does not use Turso's separate revert-WAL page replay and
+  therefore does not invent a page-frame watermark for logical transactions.
 - [x] Complete wait-for-changes cancellation, timeout, reconnect, and revision
   ordering. Ported Turso's `wait_changes_from_remote` -> opaque staged changes
   -> `apply_changes_from_remote` split
@@ -238,9 +242,11 @@ watermark frames make every crash boundary replay-safe.
   and validates a response without touching local state or holding any
   publication gate; applying consumes the staged result exactly once (fails
   closed on cross-replica, duplicate-apply, and disposed-result misuse) and
-  throws a dedicated `ManagedReplicaStaleChangesException` -- instead of
-  silently retrying a network fetch under a lease -- when local state advanced
-  past the snapshot the response was negotiated against. `AhtolaConnection.SyncAsync`
+  throws a dedicated `ManagedReplicaStaleChangesException` when the remote-facing
+  base advanced past the snapshot the response was negotiated against.
+  Local-only journal advancement is rebased onto the staged response without
+  another pull; genuinely stale bases retry with a finite backoff and bound.
+  `AhtolaConnection.SyncAsync`
   now runs push and the local apply as their own short publication windows,
   with the network long-poll for remote changes in between holding no gate at
   all, so sibling connections to the same replica keep serving local reads and
