@@ -21,6 +21,31 @@ internal static class ManagedReplicaBootstrapper
     private const int MaxTableMapEntries = 100_000;
     private const int MaxStringBytes = 64 * 1024;
     private const int MaxLogicalBodyLength = 256 * 1024 * 1024;
+
+    /// <summary>
+    /// Maximum number of cheap, local-only re-checks <see cref="RebaseOntoCurrentLocalStateOrThrowAsync"/>
+    /// performs while a staged response's remote-facing identity (revision, database hash,
+    /// revert/push state, journal watermark) stays compatible but the pending/acknowledged local
+    /// change lists keep advancing (an ordinary sibling connection committing writes). Each
+    /// attempt is a handful of local file reads under the already-held apply lease -- no network,
+    /// no host close/reopen -- so this bound exists only to guarantee eventual termination if a
+    /// sibling never stops writing, not because any single attempt is expensive.
+    /// </summary>
+    private const int MaxLocalJournalRebaseAttempts = 20;
+
+    /// <summary>Delay between <see cref="RebaseOntoCurrentLocalStateOrThrowAsync"/> attempts.</summary>
+    private static readonly TimeSpan LocalJournalRebaseDelay = TimeSpan.FromMilliseconds(5);
+
+    /// <summary>
+    /// Maximum number of full network re-fetches <see cref="WaitAndApplyRemoteChangesAsync"/>
+    /// performs when a staged response's remote-facing identity genuinely changed underneath it
+    /// (a competing sync/bootstrap-catch-up won the apply race) rather than merely the local
+    /// journal advancing. Unlike a local rebase attempt, each of these repeats the full
+    /// long-poll network round trip and a publication gate close/reopen, so this bound is much
+    /// smaller and paired with a backoff between attempts.
+    /// </summary>
+    private const int MaxRemoteRefetchRetryAttempts = 8;
+
     private static readonly byte[] SqliteHeader = "SQLite format 3\0"u8.ToArray();
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly IReadOnlyDictionary<ulong, string> EmptyTableMap = new Dictionary<ulong, string>();
@@ -868,56 +893,82 @@ internal static class ManagedReplicaBootstrapper
     /// </param>
     /// <param name="cancellationToken">Cancels the pull.</param>
     /// <remarks>
-    /// Composed from the same <see cref="WaitForRemoteChangesAsync"/> / <see cref="ApplyRemoteChangesAsync"/>
-    /// primitives a caller that wants the network long-poll to run without holding any in-process
-    /// publication gate uses directly (see <c>ManagedReplicaConnectionHost.RunSyncCycleAsync</c>).
-    /// This fused overload simply loops the two back-to-back -- retrying the whole cycle, in
-    /// place, whenever <see cref="ApplyRemoteChangesAsync"/> reports the staged response is stale
-    /// -- for callers (explicit conflict-rebase, and every existing test) that want one call
-    /// covering both halves. Mirrors Turso's <c>wait_changes_from_remote</c> -&gt;
+    /// Thin wrapper over <see cref="WaitAndApplyRemoteChangesAsync"/>, applying directly (no extra
+    /// gate) for callers (explicit conflict-rebase, and every existing test) that want one call
+    /// covering the whole wait/apply cycle. Mirrors Turso's <c>wait_changes_from_remote</c> -&gt;
     /// <c>apply_changes_from_remote</c> split (turso-src/sync/engine/src/database_sync_engine.rs)
     /// collapsed back into one step.
     /// </remarks>
-    internal static async Task<ManagedReplicaPullOutcome> CheckForUpdatesAsync(
+    internal static Task<ManagedReplicaPullOutcome> CheckForUpdatesAsync(
         AhtolaReplicaOptions options, ManagedReplicaMetadata metadata, AhtolaSyncOptions syncOptions,
         IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
         IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
         ManagedReplicaConflictState? expectedConflictState,
         CancellationToken cancellationToken)
+        => WaitAndApplyRemoteChangesAsync(
+            options, metadata, syncOptions, pendingLocalChanges, acknowledgedLocalChanges,
+            (staged, token) => ApplyRemoteChangesAsync(options, staged, syncOptions, expectedConflictState, token),
+            cancellationToken);
+
+    /// <summary>
+    /// Runs the wait/apply cycle to completion: waits for remote changes, then applies the staged
+    /// response via <paramref name="applyStagedChangesAsync"/> (a caller-supplied delegate so a
+    /// caller such as <c>ManagedReplicaConnectionHost</c> can wrap only the apply step in whatever
+    /// publication gate its local concurrency model needs, without gating the network wait too).
+    /// When applying throws <see cref="ManagedReplicaStaleChangesException"/> -- the remote-facing
+    /// identity a staged response depended on genuinely changed underneath it, e.g. a competing
+    /// sync/bootstrap-catch-up won the apply race -- this discards the response and performs a
+    /// full network re-fetch against the fresh snapshot the exception carries, up to
+    /// <see cref="MaxRemoteRefetchRetryAttempts"/> times, with a short backoff between attempts so
+    /// repeated contention does not hammer the remote or thrash host close/reopen cycles. Exceeding
+    /// the bound throws a clear <see cref="AhtolaException"/> rather than retrying forever: unlike
+    /// the cheap, local-only rebase <see cref="ApplyRemoteChangesAsync"/> performs internally for a
+    /// merely-advancing local journal, every attempt here repeats the full long-poll round trip, so
+    /// an unbounded loop here would mean an unbounded number of network requests and publication
+    /// gate acquisitions when a genuinely competing operation keeps winning.
+    /// </summary>
+    internal static async Task<ManagedReplicaPullOutcome> WaitAndApplyRemoteChangesAsync(
+        AhtolaReplicaOptions options,
+        ManagedReplicaMetadata metadata,
+        AhtolaSyncOptions syncOptions,
+        IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+        IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
+        Func<ManagedReplicaStagedChanges, CancellationToken, Task<ManagedReplicaPullOutcome>> applyStagedChangesAsync,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(pendingLocalChanges);
         ArgumentNullException.ThrowIfNull(acknowledgedLocalChanges);
-        // The whole pull-and-apply cycle below is retried, in place, whenever the apply lease
-        // reveals that local state already moved past the snapshot (metadata, pending local
-        // changes) this iteration's request/response were negotiated against -- see
-        // ManagedReplicaStaleChangesException / TryUseCurrentLocalStateAsPullBase. That can only
-        // happen when a concurrent CheckForUpdatesAsync/ApplyRemoteChangesAsync call (another
-        // sync/bootstrap-catch-up racing through the very same per-path apply lease, or -- today,
-        // before the cross-process OS lock lands -- a second process) commits its own apply while
-        // this call was waiting on the network or the lease, both of which are deliberately
-        // outside the lease's scope (see ManagedReplicaApplyLock). Retrying here, before any
-        // apply, means a stale response can never be applied on top of a base it was not actually
-        // built from: doing so could silently regress metadata (rewind Revision) or discard an
-        // intervening local change instead of reconciling it.
-        while (true)
+        ArgumentNullException.ThrowIfNull(applyStagedChangesAsync);
+
+        for (var attempt = 0; ; attempt++)
         {
             using var staged = await WaitForRemoteChangesAsync(
                     options, metadata, syncOptions, pendingLocalChanges, acknowledgedLocalChanges, cancellationToken)
                 .ConfigureAwait(false);
             try
             {
-                return await ApplyRemoteChangesAsync(
-                        options, staged, syncOptions, expectedConflictState, cancellationToken)
-                    .ConfigureAwait(false);
+                return await applyStagedChangesAsync(staged, cancellationToken).ConfigureAwait(false);
             }
             catch (ManagedReplicaStaleChangesException stale)
             {
+                if (attempt >= MaxRemoteRefetchRetryAttempts)
+                {
+                    throw new AhtolaException(
+                        $"Managed embedded replica synchronization could not converge after {attempt + 1} "
+                        + "remote re-fetch attempts; a competing operation keeps applying changes before "
+                        + "this one can. Retry synchronization once the competing activity settles.");
+                }
+
                 metadata = stale.FreshMetadata;
                 pendingLocalChanges = stale.FreshPendingLocalChanges;
                 acknowledgedLocalChanges = stale.FreshAcknowledgedLocalChanges;
+                await Task.Delay(ComputeRemoteRefetchBackoff(attempt), cancellationToken).ConfigureAwait(false);
             }
         }
     }
+
+    private static TimeSpan ComputeRemoteRefetchBackoff(int attempt)
+        => TimeSpan.FromMilliseconds(Math.Min(50 * (attempt + 1), 500));
 
     /// <summary>
     /// Waits for the remote's next pull-updates response and stages it without touching any local
@@ -1106,6 +1157,62 @@ internal static class ManagedReplicaBootstrapper
                 .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Re-validates the local baseline a staged response was negotiated against while the
+    /// exclusive apply lease is held, tolerating a benign, common race: an ordinary sibling
+    /// connection committing a write (via the WAL, not through this lease) while the wait or a
+    /// prior rebase attempt was in flight. When the remote-facing identity the staged response
+    /// actually depends on -- revision, database file hash, revert/push state, and journal
+    /// watermark -- is unchanged but the pending/acknowledged local-change lists differ (grew,
+    /// shrank, or were pruned), this rebases onto the fresh local baseline and re-checks, up to
+    /// <see cref="MaxLocalJournalRebaseAttempts"/> times: each attempt is local file reads only
+    /// (no network, no host close/reopen), so replaying the additional local changes onto the
+    /// response the network already delivered is both cheap and correct (the reconciliation paths
+    /// downstream already replay whatever pending/acknowledged lists they are given). A genuine
+    /// change to the remote-facing identity -- or the local journal never settling within the
+    /// bound -- throws <see cref="ManagedReplicaStaleChangesException"/> exactly as a single-shot
+    /// check would, so the caller discards the staged response and performs a full network
+    /// re-fetch (see <see cref="WaitAndApplyRemoteChangesAsync"/>) against the fresh snapshot.
+    /// </summary>
+    private static async Task<(ManagedReplicaMetadata Metadata, IReadOnlyList<ReplicaLocalChange> PendingLocalChanges, IReadOnlyList<ReplicaLocalChange> AcknowledgedLocalChanges)>
+        RebaseOntoCurrentLocalStateOrThrowAsync(
+            string databasePath,
+            ManagedReplicaMetadata metadata,
+            IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
+            IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
+            CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            if (TryUseCurrentLocalStateAsPullBase(
+                    databasePath, metadata, pendingLocalChanges, acknowledgedLocalChanges,
+                    out var freshMetadata,
+                    out var freshPendingLocalChanges,
+                    out var freshAcknowledgedLocalChanges))
+            {
+                return (metadata, pendingLocalChanges, acknowledgedLocalChanges);
+            }
+
+            var remoteFacingIdentityUnchanged =
+                string.Equals(freshMetadata.Revision, metadata.Revision, StringComparison.Ordinal)
+                && string.Equals(freshMetadata.DatabaseSha256, metadata.DatabaseSha256, StringComparison.Ordinal)
+                && freshMetadata.RevertState == metadata.RevertState
+                && freshMetadata.PushState == metadata.PushState
+                && freshMetadata.JournalBaseWatermark == metadata.JournalBaseWatermark;
+
+            if (!remoteFacingIdentityUnchanged || attempt >= MaxLocalJournalRebaseAttempts)
+            {
+                throw new ManagedReplicaStaleChangesException(
+                    freshMetadata, freshPendingLocalChanges, freshAcknowledgedLocalChanges);
+            }
+
+            metadata = freshMetadata;
+            pendingLocalChanges = freshPendingLocalChanges;
+            acknowledgedLocalChanges = freshAcknowledgedLocalChanges;
+            await Task.Delay(LocalJournalRebaseDelay, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     private static async Task<ManagedReplicaPullOutcome> ApplyStagedLogicalChangesAsync(
         AhtolaReplicaOptions options,
         ManagedReplicaStagedChanges staged,
@@ -1137,21 +1244,15 @@ internal static class ManagedReplicaBootstrapper
         // The request that produced this staged response (and the response itself) were
         // negotiated against `metadata` and `pendingLocalChanges` as they stood BEFORE the network
         // round trip and the wait for this lease -- both entirely outside its scope by design.
-        // Re-validate that base is still current now that the lease is actually held: if another
-        // caller already advanced local state in the meantime, this response is stale relative to
-        // it and must never be applied. Unlike the historical fused retry loop, this never retries
-        // the network round trip itself -- it throws so the caller discards the staged response
-        // and waits for remote changes again, instead of silently regressing metadata or
-        // discarding an intervening local change.
-        if (!TryUseCurrentLocalStateAsPullBase(
-                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
-                out var freshMetadata,
-                out var freshPendingLocalChanges,
-                out var freshAcknowledgedLocalChanges))
-        {
-            throw new ManagedReplicaStaleChangesException(
-                freshMetadata, freshPendingLocalChanges, freshAcknowledgedLocalChanges);
-        }
+        // Re-validate that base is still current now that the lease is actually held: if only the
+        // local journal advanced (an ordinary sibling write), rebase onto it and keep applying
+        // this same response; if the remote-facing identity itself changed, or the journal never
+        // settles, this throws so the caller discards the staged response and waits for remote
+        // changes again, instead of silently regressing metadata or discarding an intervening
+        // local change.
+        (metadata, pendingLocalChanges, acknowledgedLocalChanges) = await RebaseOntoCurrentLocalStateOrThrowAsync(
+                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges, cancellationToken)
+            .ConfigureAwait(false);
         ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
 
         var (outcome, statistics, replayed) = await ApplyLogicalUpdatesAsync(
@@ -1187,15 +1288,9 @@ internal static class ManagedReplicaBootstrapper
         ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired);
         cancellationToken.ThrowIfCancellationRequested();
         ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
-        if (!TryUseCurrentLocalStateAsPullBase(
-                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
-                out var freshMetadata,
-                out var freshPendingLocalChanges,
-                out var freshAcknowledgedLocalChanges))
-        {
-            throw new ManagedReplicaStaleChangesException(
-                freshMetadata, freshPendingLocalChanges, freshAcknowledgedLocalChanges);
-        }
+        (metadata, pendingLocalChanges, acknowledgedLocalChanges) = await RebaseOntoCurrentLocalStateOrThrowAsync(
+                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges, cancellationToken)
+            .ConfigureAwait(false);
         ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
         return new ManagedReplicaPullOutcome(
@@ -1230,15 +1325,9 @@ internal static class ManagedReplicaBootstrapper
         cancellationToken.ThrowIfCancellationRequested();
         ManagedReplicaConflictState.ValidatePullPublication(options.Path, expectedConflictState);
 
-        if (!TryUseCurrentLocalStateAsPullBase(
-                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges,
-                out var freshMetadata,
-                out var freshPendingLocalChanges,
-                out var freshAcknowledgedLocalChanges))
-        {
-            throw new ManagedReplicaStaleChangesException(
-                freshMetadata, freshPendingLocalChanges, freshAcknowledgedLocalChanges);
-        }
+        (metadata, pendingLocalChanges, acknowledgedLocalChanges) = await RebaseOntoCurrentLocalStateOrThrowAsync(
+                options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges, cancellationToken)
+            .ConfigureAwait(false);
         ManagedReplicaRevertWal.EnsureSynchronizationReady(options.Path, metadata);
 
         // The response turned out to be a Pages stream (Incremental or ReplaceBase) even though

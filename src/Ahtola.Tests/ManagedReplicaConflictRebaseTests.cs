@@ -1307,7 +1307,12 @@ public sealed class ManagedReplicaConflictRebaseTests
         // Between the request and the apply, a concurrent participant acknowledges the first
         // journal entry. The staleness check must reload BOTH the pending and the acknowledged
         // history: refreshing only the pending set would leave the acknowledged entry in neither
-        // replay list, and the protected rebuild would silently drop its row.
+        // replay list, and the protected rebuild would silently drop its row. Since the
+        // acknowledge only advances local journal state -- metadata's revision, database hash,
+        // revert/push state, and journal watermark are all untouched -- this is exactly the
+        // benign case the apply lease rebases onto in place (see
+        // ManagedReplicaBootstrapper.RebaseOntoCurrentLocalStateOrThrowAsync) rather than
+        // discarding the response and re-fetching from the remote.
         var path = NewReplicaPath("conflict-stale-retry-acknowledged");
         var image = CreateLogicalSourceImage(path + ".source");
         var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
@@ -1320,7 +1325,6 @@ public sealed class ManagedReplicaConflictRebaseTests
         [
             CreatePagePullResponse("revision-42", image, protocol: 2),
             CreateLogicalPullResponse("revision-42", []),
-            CreateLogicalPullResponse("revision-43", logicalBody, [rangeMessage]),
             CreateLogicalPullResponse("revision-43", logicalBody, [rangeMessage]),
         ]);
         var options = CreateOptions(path, handler);
@@ -1359,8 +1363,12 @@ public sealed class ManagedReplicaConflictRebaseTests
                     CancellationToken.None);
                 result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
             }
-            interleaved.Should().BeGreaterThan(1, "the stale response must have been discarded and re-pulled");
-            handler.PullCallCount.Should().Be(4);
+            interleaved.Should().Be(
+                1,
+                "the acknowledge only advances local journal state, so the apply lease rebases onto the "
+                + "refreshed journal in place instead of discarding the response and re-pulling from the "
+                + "remote");
+            handler.PullCallCount.Should().Be(3);
             using var reopened = AhtolaConnection.CreateReplica(options);
             reopened.Open();
             ReadJournalEventValues(reopened).Should().Equal(
@@ -1368,6 +1376,92 @@ public sealed class ManagedReplicaConflictRebaseTests
                 "the acknowledged write must be replayed from the refreshed acknowledged history");
             ReadScalar(reopened, "SELECT x FROM remote_items WHERE id = 2;").Should().Be("remote");
             ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.JournalBaseWatermark.Should().Be(2);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public async Task SiblingConnectionWriteBeforeTheApplyIsRebasedWithoutAnExtraPullOrHostChurn()
+    {
+        // The same benign race as the previous test, but end-to-end through a second, genuinely
+        // independent AhtolaConnection instead of a raw journal acknowledge: a sibling connection
+        // commits an ordinary local write after the pull request/response this call replays were
+        // captured, but before CheckForUpdatesAsync's apply lease re-validates the local baseline
+        // against them -- exactly the ordering a real concurrent sibling write racing the network
+        // long-poll produces, sequenced deterministically here instead of via a timing-dependent
+        // concurrent write. Only the pending local-change journal advances -- the remote-facing
+        // identity the staged response depends on (revision, database hash, revert/push state,
+        // journal watermark) does not -- so the apply lease must rebase onto the fresh journal in
+        // place instead of discarding the response and re-pulling from the remote, bounding both
+        // network traffic and host close/reopen churn to exactly what this one pull needs.
+        var path = NewReplicaPath("conflict-stale-retry-sibling-write");
+        var image = CreateLogicalSourceImage(path + ".source");
+        var (logicalBody, rangeMessage) = BuildSimpleLogicalPullBody(
+            tableName: "remote_items",
+            rowId: 2,
+            columnValue: "remote",
+            schemaSql: "CREATE TABLE remote_items(id INTEGER PRIMARY KEY, x TEXT)",
+            salt: 7222UL);
+        var handler = ConflictHandler.NoPush(
+        [
+            CreatePagePullResponse("revision-42", image, protocol: 2),
+            CreateLogicalPullResponse("revision-42", []),
+            CreateLogicalPullResponse("revision-43", logicalBody, [rangeMessage]),
+        ]);
+        var options = CreateOptions(path, handler);
+        try
+        {
+            IReadOnlyList<ReplicaLocalChange> pendingChanges;
+            ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata;
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+                connection.ExecuteNonQuery("INSERT INTO journal_events VALUES (10);");
+                pendingChanges = ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes;
+                metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            }
+            pendingChanges.Select(change => change.Sequence).Should().Equal(1L);
+
+            // A second, independent connection commits an ordinary write after pendingChanges/
+            // metadata above were captured as this pull's request base, but before
+            // CheckForUpdatesAsync (below) ever re-validates that base against fresh disk state.
+            using (var sibling = AhtolaConnection.CreateReplica(options))
+            {
+                sibling.Open();
+                sibling.ExecuteNonQuery("INSERT INTO journal_events VALUES (20);");
+            }
+
+            var applyLockAcquisitions = 0;
+            using (ManagedReplicaFaultInjection.Push(boundary =>
+            {
+                if (boundary == ManagedReplicaDurableBoundary.ReplicaApplyLockAcquired)
+                    Interlocked.Increment(ref applyLockAcquisitions);
+            }))
+            {
+                var result = await ManagedReplicaBootstrapper.CheckForUpdatesAsync(
+                    options, metadata, new AhtolaSyncOptions(), pendingChanges, [], CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            }
+
+            applyLockAcquisitions.Should().Be(
+                1,
+                "the sibling connection's write only advances the local journal, so the apply lease "
+                + "rebases onto it in place instead of discarding the response and re-pulling from "
+                + "the remote");
+            handler.PullCallCount.Should().Be(
+                3,
+                "bootstrap plus catch-up plus exactly one explicit pull -- no extra re-fetch for the "
+                + "sibling connection's write");
+
+            using var reopened = AhtolaConnection.CreateReplica(options);
+            reopened.Open();
+            ReadJournalEventValues(reopened).Should().Equal(
+                [10, 20],
+                "the sibling connection's write must survive the rebase, not be lost or overwritten");
+            ReadScalar(reopened, "SELECT x FROM remote_items WHERE id = 2;").Should().Be("remote");
         }
         finally
         {

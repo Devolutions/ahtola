@@ -707,18 +707,21 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         metadata = ManagedReplicaBootstrapper.EnsureLegacyRemoteBaseSnapshot(
             replicaOptions.Path,
             metadata);
-        var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0
-            || _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark).Count != 0;
-        var retainedMaterializer = _materializationLease?.FileSystem;
 
         // Push local changes, then (when a partial bootstrap is still catching up) complete the
         // partial image. Both can mutate the local database file directly, so both run gated --
         // every host on this path closed for their duration -- exactly as before the wait/apply
         // split below. Unlike before, that gate is now its own short publication window instead of
-        // spanning the network wait for remote changes too.
+        // spanning the network wait for remote changes too. hasTrackedLocalChanges and the
+        // retained materializer are read INSIDE PreparePushAndPartialReplicaAsync, once the gate
+        // is actually held, not here: acquiring the gate is no longer instantaneous now that the
+        // network wait for remote changes runs ungated, so an intervening publication (another
+        // host's own sync, bootstrap catch-up, or partial-image completion) can advance the
+        // journal or dispose/replace _materializationLease while this call is still waiting its
+        // turn. Reading them here, before the gate, would risk handing PreparePushAndPartialReplicaAsync
+        // a stale bool or an already-disposed file system.
         var (metadataAfterPush, pushedChangeCount) = await _syncEntry.PublishExclusiveAsync(
-                token => PreparePushAndPartialReplicaAsync(
-                    replicaOptions, metadata, syncOptions, hasTrackedLocalChanges, retainedMaterializer, token),
+                token => PreparePushAndPartialReplicaAsync(replicaOptions, metadata, syncOptions, token),
                 cancellationToken)
             .ConfigureAwait(false);
         metadata = metadataAfterPush;
@@ -727,43 +730,21 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         var pendingLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes;
         var acknowledgedLocalChanges = _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark);
 
-        AhtolaSyncResult result;
-        while (true)
-        {
-            // Wait for remote changes: a pure network long-poll, entirely outside any publication
-            // gate, so sibling connections to this replica keep serving local reads and writes for
-            // however long the remote takes to answer. Mirrors Turso's wait_changes_from_remote
-            // (turso-src/sync/engine/src/database_sync_engine.rs); see
-            // ManagedReplicaBootstrapper.WaitForRemoteChangesAsync.
-            using var staged = await ManagedReplicaBootstrapper.WaitForRemoteChangesAsync(
-                    replicaOptions, metadata, syncOptions, pendingLocalChanges, acknowledgedLocalChanges,
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            try
-            {
-                // Apply the staged response: gated, since it mutates the local database file.
-                // Mirrors Turso's apply_changes_from_remote; see
-                // ManagedReplicaBootstrapper.ApplyRemoteChangesAsync.
-                var outcome = await _syncEntry.PublishExclusiveAsync(
-                        token => ManagedReplicaBootstrapper.ApplyRemoteChangesAsync(
-                            replicaOptions, staged, syncOptions, expectedConflictState: null, token),
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                result = outcome.Result;
-                break;
-            }
-            catch (ManagedReplicaStaleChangesException stale)
-            {
-                // Local state (metadata/journal) advanced past the snapshot the staged response
-                // was negotiated against -- discard it and wait for remote changes again against
-                // the fresh snapshot, exactly as the original fused retry loop did, but without
-                // ever refetching over the network while a publication gate is held.
-                metadata = stale.FreshMetadata;
-                pendingLocalChanges = stale.FreshPendingLocalChanges;
-                acknowledgedLocalChanges = stale.FreshAcknowledgedLocalChanges;
-            }
-        }
+        // Wait for remote changes and apply them, retrying (bounded, with backoff) when the staged
+        // response turns out to be stale relative to local state. The wait itself runs entirely
+        // outside any publication gate -- see ManagedReplicaBootstrapper.WaitAndApplyRemoteChangesAsync
+        // -- while the apply runs gated, since it mutates the local database file. Mirrors Turso's
+        // wait_changes_from_remote -> apply_changes_from_remote split
+        // (turso-src/sync/engine/src/database_sync_engine.rs).
+        var outcome = await ManagedReplicaBootstrapper.WaitAndApplyRemoteChangesAsync(
+                replicaOptions, metadata, syncOptions, pendingLocalChanges, acknowledgedLocalChanges,
+                (staged, token) => _syncEntry.PublishExclusiveAsync(
+                    applyToken => ManagedReplicaBootstrapper.ApplyRemoteChangesAsync(
+                        replicaOptions, staged, syncOptions, expectedConflictState: null, applyToken),
+                    token),
+                cancellationToken)
+            .ConfigureAwait(false);
+        var result = outcome.Result;
 
         _metadata = ManagedReplicaBootstrapper.LoadMetadata(replicaOptions.Path);
         if (result.Outcome == AhtolaSyncOutcome.RemoteChangesApplied && _metadata is { } published)
@@ -786,15 +767,27 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
     /// publication unit, distinct from the apply publication unit that follows the ungated wait
     /// for remote changes.
     /// </summary>
+    /// <remarks>
+    /// Reads <c>_materializationLease</c> and the change journal itself, rather than receiving them
+    /// as parameters computed before the publication gate was requested: this method only ever runs
+    /// once the gate is actually held, so these reads reflect whatever the most recent prior
+    /// publication (another host's own sync, bootstrap catch-up, or partial-image completion) left
+    /// in place. Reading them earlier, in <see cref="SynchronizeAsync"/> before the gate is even
+    /// requested, could observe a retained materializer that an intervening publication then
+    /// disposes before this operation gets its turn -- a use-after-dispose -- or a
+    /// tracked-local-changes snapshot that is stale by the time it is actually acted upon.
+    /// </remarks>
     private async Task<(ManagedReplicaBootstrapper.ManagedReplicaMetadata Metadata, long PushedChangeCount)>
         PreparePushAndPartialReplicaAsync(
             AhtolaReplicaOptions replicaOptions,
             ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
             AhtolaSyncOptions syncOptions,
-            bool hasTrackedLocalChanges,
-            ManagedReplicaPageMaterializingFileSystem? retainedMaterializer,
             CancellationToken cancellationToken)
     {
+        var hasTrackedLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0
+            || _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark).Count != 0;
+        var retainedMaterializer = _materializationLease?.FileSystem;
+
         var push = await PushLocalChangesAsync(
                 replicaOptions,
                 metadata,
@@ -959,10 +952,12 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         {
             if (reusedRetainedLease)
             {
-                database = ManagedDatabaseAdapter.OpenFile(
+                var reopened = ManagedDatabaseAdapter.OpenFile(
                     _options.Path,
                     retainedLease!.FileSystem,
                     readOnly: false);
+                _ = reopened.Connect();
+                database = reopened;
                 materializationLease = retainedLease;
             }
             else

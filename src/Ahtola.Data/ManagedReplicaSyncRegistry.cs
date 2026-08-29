@@ -173,6 +173,9 @@ internal static class ManagedReplicaSyncRegistry
             Func<CancellationToken, Task<AhtolaSyncResult>> stagedOperation,
             CancellationToken cancellationToken)
         {
+            AhtolaSyncResult? result = null;
+            Exception? failure = null;
+            var canceled = false;
             try
             {
                 // Unlike PublishAsync/PublishExclusiveAsync, this deliberately does NOT itself wrap
@@ -183,21 +186,43 @@ internal static class ManagedReplicaSyncRegistry
                 // own rare conflict-restore branch; the actual apply). Coalescing concurrent
                 // SyncAsync callers for this path into one shared in-flight task is this method's
                 // only job; deciding when to gate is entirely the staged operation's business.
-                completion.TrySetResult(await stagedOperation(cancellationToken).ConfigureAwait(false));
+                result = await stagedOperation(cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException exception) when (exception.CancellationToken == cancellationToken)
             {
-                completion.TrySetCanceled(cancellationToken);
+                canceled = true;
             }
             catch (Exception exception)
             {
-                completion.TrySetException(exception);
+                failure = exception;
             }
-            finally
+
+            // Clear the in-flight slot BEFORE completing the TaskCompletionSource below.
+            // TrySetResult/TrySetException/TrySetCanceled make completion.Task observably complete
+            // (IsCompleted becomes true synchronously, even though continuations queued with
+            // RunContinuationsAsynchronously run later) the instant they are called. If
+            // _inFlightSync stayed pointing at that task past this point, a SyncAsync call
+            // arriving in the resulting window would see a non-null _inFlightSync, join it via the
+            // read in SynchronizeAsync, and receive this ALREADY-COMPLETED result without
+            // performing any new work at all -- silently skipping a sync its caller explicitly
+            // requested. The identity check guards against a stale write if this slot were ever
+            // touched from elsewhere. Retirement is re-checked here too: with RetireIfUnusedNoLock
+            // now refusing to retire while _inFlightSync is set, clearing it may be the very last
+            // condition standing between an already-unreferenced entry and retirement.
+            lock (_gate)
             {
-                lock (_gate)
+                if (ReferenceEquals(_inFlightSync, completion.Task))
                     _inFlightSync = null;
+                SignalStateChangedNoLock();
+                RetireIfUnusedNoLock();
             }
+
+            if (canceled)
+                completion.TrySetCanceled(cancellationToken);
+            else if (failure is not null)
+                completion.TrySetException(failure);
+            else
+                completion.TrySetResult(result!);
         }
 
         public Task PublishAsync(
@@ -301,6 +326,24 @@ internal static class ManagedReplicaSyncRegistry
                 Task stateChanged;
                 lock (_gate)
                 {
+                    if (_retired)
+                    {
+                        // Defense in depth: RetireIfUnusedNoLock now refuses to retire while
+                        // _inFlightSync is set, so an entry with a sync (push/wait/apply cycle)
+                        // still in flight should never reach retirement in the first place, and no
+                        // publication should ever observe _retired here. If it ever does, some
+                        // other path let an in-flight operation survive past this entry's removal
+                        // from the registry -- failing loudly is far safer than silently closing
+                        // and reopening zero coordinated hosts and running the staged operation
+                        // (e.g. an apply that mutates the physical file) with no protection against
+                        // a brand-new, unrelated Entry that may now be governing the very same
+                        // physical replica path.
+                        throw new InvalidOperationException(
+                            "Managed embedded replica sync coordination entry was already retired and "
+                            + "cannot accept new publication work; an operation raced a retired registry "
+                            + "entry and must not proceed.");
+                    }
+
                     if (!request.OwnsPublication && !_publicationPending && !_publicationActive)
                     {
                         _publicationPending = true;
@@ -338,7 +381,8 @@ internal static class ManagedReplicaSyncRegistry
                 || _hosts.Count != 0
                 || _activeLocalOperations != 0
                 || _publicationPending
-                || _publicationActive)
+                || _publicationActive
+                || _inFlightSync is not null)
             {
                 return;
             }
