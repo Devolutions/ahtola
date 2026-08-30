@@ -20,7 +20,8 @@ internal sealed class ManagedIndexMethodPlannerContext
         long? limit,
         Func<string, bool> isShadowedFunction,
         Func<Expression, bool> isHoistableArgument,
-        bool allowsRowTruncation = false)
+        bool allowsRowTruncation = false,
+        IReadOnlyList<Expression>? resultExpressions = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
         ArgumentException.ThrowIfNullOrWhiteSpace(qualifier);
@@ -37,6 +38,7 @@ internal sealed class ManagedIndexMethodPlannerContext
         IsShadowedFunction = isShadowedFunction;
         IsHoistableArgument = isHoistableArgument;
         AllowsRowTruncation = allowsRowTruncation;
+        ResultExpressions = resultExpressions;
     }
 
     /// <summary>The base table the candidate index belongs to, unqualified.</summary>
@@ -88,6 +90,9 @@ internal sealed class ManagedIndexMethodPlannerContext
     /// </para>
     /// </remarks>
     public bool AllowsRowTruncation { get; }
+
+    /// <summary>Resolved SELECT-list expressions, used by methods whose ranked projection is a pattern.</summary>
+    public IReadOnlyList<Expression>? ResultExpressions { get; }
 }
 
 /// <summary>
@@ -177,6 +182,9 @@ internal static class ManagedIndexPatternShapes
     /// <summary>True when the shape carries a pushed-down LIMIT.</summary>
     public static bool HasLimit(ManagedIndexPatternShape shape)
         => shape is ManagedIndexPatternShape.MatchLimit
+            or ManagedIndexPatternShape.CombinedLimit
+            or ManagedIndexPatternShape.CombinedOrderedLimit
+            or ManagedIndexPatternShape.Score
             or ManagedIndexPatternShape.ScoreOrderedLimit
             or ManagedIndexPatternShape.KnnLimit;
 
@@ -185,6 +193,9 @@ internal static class ManagedIndexPatternShapes
         => shape switch
         {
             ManagedIndexPatternShape.MatchLimit => ManagedIndexPatternShape.Match,
+            ManagedIndexPatternShape.CombinedLimit => ManagedIndexPatternShape.Combined,
+            ManagedIndexPatternShape.CombinedOrderedLimit => ManagedIndexPatternShape.CombinedOrdered,
+            ManagedIndexPatternShape.Score => ManagedIndexPatternShape.ScoreOrdered,
             ManagedIndexPatternShape.ScoreOrderedLimit => ManagedIndexPatternShape.ScoreOrdered,
             ManagedIndexPatternShape.KnnLimit => ManagedIndexPatternShape.Knn,
             _ => shape,

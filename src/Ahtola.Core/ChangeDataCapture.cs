@@ -640,7 +640,7 @@ public sealed partial class EmbeddedConnection
     }
 
     private EmbeddedDatabase.SchemaCatalog CurrentMainCatalog()
-        => GetTransactionState(_database)?.Catalog ?? _database.SnapshotCatalog();
+        => GetTransactionState(_database)?.Catalog ?? _database.LiveCatalog;
 
     private void ExecuteCdcProvisioningSql(string sql)
     {

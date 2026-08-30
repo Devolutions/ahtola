@@ -152,6 +152,12 @@ public enum SqliteAuthorizerAction
     /// <summary><c>SQLITE_ANALYZE</c></summary>
     Analyze = 28,
 
+    /// <summary><c>SQLITE_CREATE_VTABLE</c></summary>
+    CreateVTable = 29,
+
+    /// <summary><c>SQLITE_DROP_VTABLE</c></summary>
+    DropVTable = 30,
+
     /// <summary><c>SQLITE_FUNCTION</c></summary>
     Function = 31,
 

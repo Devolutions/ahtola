@@ -32,7 +32,7 @@ public sealed class ManagedIndexMethodPlannerTests
         ExplainDetail(
                 connection,
                 "SELECT id FROM docs ORDER BY fts_score(title, body, 'term7') DESC LIMIT 3;")
-            .Should().Contain("pattern=ScoreOrderedLimit");
+            .Should().Contain("pattern=Score");
 
         // Filtering by match and ranking by relevance on the same call is the one shape whose
         // truncation order is the statement's own order, so the LIMIT may be pushed into the method.
@@ -40,19 +40,19 @@ public sealed class ManagedIndexMethodPlannerTests
                 connection,
                 "SELECT id FROM docs WHERE fts_match(title, body, 'term7') "
                 + "ORDER BY fts_score(title, body, 'term7') DESC LIMIT 3;")
-            .Should().Contain("pattern=MatchLimit");
+            .Should().Contain("pattern=CombinedOrderedLimit");
     }
 
     [Test]
-    public void AMatchLimitIsNotPushedDownWhenTheStatementDoesNotRankByRelevance()
+    public void AnUnorderedMatchLimitUsesTheUnboundedMatchShape()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         SeedLargeCorpus(connection);
 
-        // A bare LIMIT keeps the first rows in scan order, which is ascending rowid — not the best
-        // scoring ones. Truncating by relevance would answer with a different set of rows than the
-        // scan this plan is allowed to replace.
+        // The method cursor is relevance ordered, while an unordered SQL scan observes rowid order.
+        // Keep the method scan unbounded and let the outer pipeline apply LIMIT after restoring that
+        // base order.
         ExplainDetail(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'term7') LIMIT 3;")
             .Should().Contain("pattern=Match").And.NotContain("pattern=MatchLimit");
 
@@ -63,20 +63,15 @@ public sealed class ManagedIndexMethodPlannerTests
             .Should().Contain("pattern=Match").And.NotContain("pattern=MatchLimit");
 
         // The residual `id > 0` follows the match call, so it cannot short-circuit past it — the
-        // scalar path always reaches `fts_match` first — and MatchLimit's own `!hasResidualPredicate`
-        // requirement is unaffected by *where* a residual sits. But ORDER BY is a separate phase that
-        // only runs for rows surviving the *whole* WHERE clause, so this same residual could suppress
-        // every row before ORDER BY's fts_score ever ran on the scalar path; ScoreOrderedLimit is
-        // declined for exactly that reason. What is left is the unlimited Match pattern: it still
-        // filters by the match call, and the ordinary pipeline applies the residual, the ordering,
-        // and the LIMIT over whatever Match returns.
+        // scalar path always reaches `fts_match` first. The unlimited combined pattern still filters
+        // and supplies scores, while the ordinary pipeline applies the residual and LIMIT.
         ExplainDetail(
                 connection,
                 "SELECT id FROM docs WHERE fts_match(title, body, 'term7') AND id > 0 "
                 + "ORDER BY fts_score(title, body, 'term7') DESC LIMIT 3;")
-            .Should().Contain("pattern=Match")
+            .Should().Contain("pattern=CombinedOrdered")
             .And.NotContain("pattern=MatchLimit")
-            .And.NotContain("pattern=ScoreOrdered");
+            .And.NotContain("pattern=CombinedOrderedLimit");
     }
 
     [Test]
@@ -118,7 +113,7 @@ public sealed class ManagedIndexMethodPlannerTests
     }
 
     [Test]
-    public void AMismatchedColumnListIsNotBoundToTheIndex()
+    public void ColumnSetsBindRegardlessOfArgumentOrder()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -128,7 +123,7 @@ public sealed class ManagedIndexMethodPlannerTests
         ExplainDetail(connection, "SELECT id FROM docs WHERE fts_match(body, 'term7');")
             .Should().NotContain("INDEX METHOD");
         ExplainDetail(connection, "SELECT id FROM docs WHERE fts_match(body, title, 'term7');")
-            .Should().NotContain("INDEX METHOD");
+            .Should().Contain("INDEX METHOD");
     }
 
     [Test]
@@ -205,8 +200,10 @@ public sealed class ManagedIndexMethodPlannerTests
         var attachment = ManagedIndexMethodRegistry.Resolve("fts").Attach(configuration);
         using var cursor = attachment.Open(new ArrayManagedIndexSource());
 
-        var match = cursor.EstimateCost(new ManagedIndexMethodCostContext(3, 10_000, null, []));
-        var limited = cursor.EstimateCost(new ManagedIndexMethodCostContext(2, 10_000, 5, []));
+        attachment.Definition.TryFindPattern(ManagedIndexPatternShape.Match, out var matchPattern).Should().BeTrue();
+        attachment.Definition.TryFindPattern(ManagedIndexPatternShape.MatchLimit, out var limitedPattern).Should().BeTrue();
+        var match = cursor.EstimateCost(new ManagedIndexMethodCostContext(matchPattern, 10_000, null, []));
+        var limited = cursor.EstimateCost(new ManagedIndexMethodCostContext(limitedPattern, 10_000, 5, []));
 
         match.Should().NotBeNull();
         limited.Should().NotBeNull();
@@ -224,12 +221,15 @@ public sealed class ManagedIndexMethodPlannerTests
         var definition = ManagedIndexMethodRegistry.Resolve("fts").Attach(configuration).Definition;
 
         definition.Patterns.Select(static pattern => pattern.Shape).Should().Equal(
-            ManagedIndexPatternShape.ScoreOrderedLimit,
-            ManagedIndexPatternShape.ScoreOrdered,
+            ManagedIndexPatternShape.Score,
+            ManagedIndexPatternShape.CombinedOrderedLimit,
+            ManagedIndexPatternShape.CombinedOrdered,
+            ManagedIndexPatternShape.CombinedLimit,
+            ManagedIndexPatternShape.Combined,
             ManagedIndexPatternShape.MatchLimit,
             ManagedIndexPatternShape.Match);
         definition.MvccSupport.Should().Be(ManagedIndexMethodMvccSupport.TransactionalBackingStore);
-        definition.ResultsMaterialized.Should().BeTrue();
+        definition.ResultsMaterialized.Should().BeFalse();
         definition.BackingBtree.Should().BeTrue();
         definition.StorageVersion.Should().Be(ManagedFtsIndexMethod.StateVersion);
     }

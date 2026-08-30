@@ -82,6 +82,17 @@ internal static class SqlAuthorization
                         break;
                     }
 
+                case CreateVirtualTableStatement createVirtual:
+                    {
+                        var (schema, name) = Split(createVirtual.Name);
+                        Require(
+                            SqliteAuthorizerAction.CreateVTable,
+                            name,
+                            createVirtual.ModuleName,
+                            schema ?? "main");
+                        break;
+                    }
+
                 case CreateTableAsSelectStatement createAs:
                     {
                         var (schema, name) = Split(createAs.Name);
@@ -103,6 +114,8 @@ internal static class SqlAuthorization
                         Require(
                             isView
                                 ? IsTemp(schema) ? SqliteAuthorizerAction.DropTempView : SqliteAuthorizerAction.DropView
+                                : Catalog(schema).VirtualTables.ContainsKey(name)
+                                    ? SqliteAuthorizerAction.DropVTable
                                 : IsTemp(schema) ? SqliteAuthorizerAction.DropTempTable : SqliteAuthorizerAction.DropTable,
                             name,
                             null,
@@ -223,6 +236,9 @@ internal static class SqlAuthorization
                     break;
                 case ReindexStatement reindex:
                     Require(SqliteAuthorizerAction.Reindex, reindex.Target, null, null);
+                    break;
+                case OptimizeIndexStatement optimize:
+                    Require(SqliteAuthorizerAction.Reindex, optimize.IndexName, null, null);
                     break;
                 case AnalyzeStatement analyze:
                     Require(SqliteAuthorizerAction.Analyze, analyze.Target, null, null);

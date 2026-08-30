@@ -57,13 +57,20 @@ internal static class ManagedIndexMethodSemantics
     {
         var method = ManagedIndexMethodRegistry.Resolve(
             index.Method ?? throw new InvalidOperationException("Index is not a method index."));
+        if (!method.SupportsColumnParameters
+            && index.Columns.Any(static column => column.MethodParameters is { Count: > 0 }))
+        {
+            throw new EmbeddedSqlException(
+                $"index method '{method.Name}' does not support per-column WITH parameters");
+        }
         var columns = new ManagedIndexMethodColumn[index.Columns.Count];
         for (var position = 0; position < index.Columns.Count; position++)
         {
             var column = index.Columns[position];
             columns[position] = new ManagedIndexMethodColumn(
                 table.Columns[column.ColumnIndex],
-                column.ColumnIndex);
+                column.ColumnIndex,
+                column.MethodParameters);
         }
 
         return method.Attach(new ManagedIndexMethodConfiguration(

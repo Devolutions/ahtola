@@ -31,7 +31,8 @@ internal static class EmbeddedIndexFactory
                     table.Columns[columnIndex],
                     columnIndex,
                     term.Collation ?? table.ColumnDefinitions[columnIndex].Collation,
-                    term.Descending);
+                    term.Descending,
+                    MethodParameters: term.MethodParameters);
                 continue;
             }
 
@@ -55,7 +56,8 @@ internal static class EmbeddedIndexFactory
                     table.Columns[literalColumnIndex],
                     literalColumnIndex,
                     term.Collation ?? table.ColumnDefinitions[literalColumnIndex].Collation,
-                    term.Descending);
+                    term.Descending,
+                    MethodParameters: term.MethodParameters);
                 continue;
             }
 
@@ -69,7 +71,8 @@ internal static class EmbeddedIndexFactory
                 term.Collation,
                 term.Descending,
                 expression,
-                expressionSql);
+                expressionSql,
+                term.MethodParameters);
         }
 
         var definition = new EmbeddedIndex(
@@ -103,6 +106,12 @@ internal static class IndexSqlFormatter
                 definition += " COLLATE " + FormatIdentifier(collation);
             if (term.Descending)
                 definition += " DESC";
+            if (index.Method is not null && term.MethodParameters is { Count: > 0 })
+            {
+                definition += " WITH ("
+                    + Indexing.ManagedIndexMethodParameterFormatter.Format(term.MethodParameters)
+                    + ")";
+            }
             return definition;
         });
         var unique = index.Unique ? "UNIQUE " : string.Empty;
@@ -165,6 +174,7 @@ internal static class IndexExpressionSemantics
                     GetCollationName(table, left),
                     GetCollationName(table, right),
                     StringComparison.OrdinalIgnoreCase)
+                || !MethodParametersEqual(left.MethodParameters, right.MethodParameters)
                 || (left.IsExpression
                     ? !ExpressionsEqual(left.Expression, right.Expression)
                     : left.ColumnIndex != right.ColumnIndex))

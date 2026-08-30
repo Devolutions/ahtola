@@ -78,7 +78,9 @@ internal sealed record ScanTarget(
 internal sealed record CompiledSelect(
     VdbeProgram Program,
     IReadOnlyList<VdbeCursorSource> CursorSources,
-    IReadOnlyList<int>? ParameterIndices = null);
+    IReadOnlyList<int>? ParameterIndices = null,
+    IReadOnlyList<VdbeVirtualTableBinding?>? VirtualTableBindings = null,
+    bool StreamResults = false);
 
 /// <summary>
 /// Equality prefix for a managed index SEARCH: table-column ordinals aligned with

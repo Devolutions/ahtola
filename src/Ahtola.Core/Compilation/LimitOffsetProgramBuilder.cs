@@ -241,6 +241,7 @@ public static class LimitOffsetProgramBuilder
             FilterInstruction x => new FilterInstruction(x.Cursor, x.Predicate, Pc(x.FalseTarget), x.Description),
             FilterRowIdInstruction x => new FilterRowIdInstruction(x.Cursor, x.Predicate, Pc(x.FalseTarget), x.Description),
             FilterRegistersInstruction x => new FilterRegistersInstruction(x.Row, x.Predicate, Pc(x.FalseTarget), x.Description),
+            VFilterInstruction x => new VFilterInstruction(x.Cursor, x.Plan, x.Arguments, Pc(x.EmptyTarget)),
             DistinctGateInstruction x => new DistinctGateInstruction(
                 x.Values,
                 x.Equality,
@@ -261,6 +262,7 @@ public static class LimitOffsetProgramBuilder
                 x.ValueRegister,
                 x.Batch),
             NextInstruction x => new NextInstruction(x.Cursor, Pc(x.LoopTarget)),
+            VNextInstruction x => new VNextInstruction(x.Cursor, Pc(x.LoopTarget)),
             SorterSortInstruction x => new SorterSortInstruction(x.Sorter, Pc(x.EmptyTarget)),
             SorterNextInstruction x => new SorterNextInstruction(x.Sorter, Pc(x.LoopTarget)),
             WindowBufferComputeInstruction x => new WindowBufferComputeInstruction(x.Buffer, Pc(x.EmptyTarget)),
@@ -274,8 +276,10 @@ public static class LimitOffsetProgramBuilder
                 or CopyInstruction
                 or OpenReadCursorInstruction
                 or OpenWriteCursorInstruction
+                or VOpenInstruction
                 or CloseCursorInstruction
                 or ColumnInstruction
+                or VColumnInstruction
                 or RowIdInstruction
                 or DeleteInstruction
                 or InsertInstruction
@@ -297,6 +301,7 @@ public static class LimitOffsetProgramBuilder
                 or NumericAffinityInstruction
                 or CompareInstruction
                 or CastInstruction
+                or ProjectRegistersInstruction
                 or GroupKeyInstruction
                 or RowSetInsertInstruction
                 or GuardedRowInstruction

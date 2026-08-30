@@ -78,7 +78,18 @@ internal static class ManagedVirtualTableSchemaSql
     {
         var marker = sql.LastIndexOf(PayloadMarker, StringComparison.Ordinal);
         if (marker <= 0 || !sql.EndsWith(PayloadTerminator, StringComparison.Ordinal))
+        {
+            var payloadlessStatement = SqlParser.Parse(sql, SqlParameterMap.Parse(sql));
+            if (payloadlessStatement is CreateVirtualTableStatement payloadlessDeclaration
+                && (payloadlessDeclaration.ModuleName.Equals("rtree", StringComparison.OrdinalIgnoreCase)
+                    || payloadlessDeclaration.ModuleName.Equals("rtree_i32", StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new EmbeddedSqlException(
+                    "foreign SQLite R-Tree shadow-table layouts are not supported by the managed catalog; "
+                    + "the CREATE VIRTUAL TABLE declaration is missing an Ahtola persistence payload");
+            }
             throw new EmbeddedSqlException("managed virtual-table sqlite_schema SQL is missing its persistence payload");
+        }
 
         var declarationSql = sql[..marker].TrimEnd();
         var statement = SqlParser.Parse(declarationSql, SqlParameterMap.Parse(declarationSql));

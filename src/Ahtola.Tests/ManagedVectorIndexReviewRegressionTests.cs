@@ -580,9 +580,9 @@ public sealed class ManagedVectorIndexReviewRegressionTests
             "SELECT id FROM docs ORDER BY fts_score(title, body, 'alpha') DESC LIMIT 6;";
         var scanned = indexed.Replace("FROM docs", "FROM plain", StringComparison.Ordinal);
 
-        QueryIntegers(connection, indexed).Should().Equal(
-            QueryIntegers(connection, scanned),
-            "tied rows must arrive in the order an ordinary table scan would produce them");
+        QueryIntegers(connection, scanned).Should().Equal(
+            [1, 2, 3, 4, 5, 6],
+            "Turso's unbound fts_score fallback is REAL 0.0 for every row");
         QueryIntegers(connection, indexed).Should().Equal(7, 1, 2, 3, 4, 5);
     }
 

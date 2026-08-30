@@ -104,6 +104,11 @@ internal sealed class SqlParser
             return new AnalyzeStatement(ParseOptionalMaintenanceTarget());
         if (ConsumeKeyword("REINDEX"))
             return new ReindexStatement(ParseOptionalMaintenanceTarget());
+        if (ConsumeKeyword("OPTIMIZE"))
+        {
+            ExpectKeyword("INDEX");
+            return new OptimizeIndexStatement(ParseOptionalMaintenanceTarget());
+        }
         if (ConsumeKeyword("VACUUM"))
             return ParseVacuum();
         if (IsQueryStart())
@@ -826,7 +831,7 @@ internal sealed class SqlParser
         var arguments = new List<string>();
         if (Consume(TokenKind.LeftParen))
         {
-            var argument = new StringBuilder();
+            var argumentStart = _lexer.Current.Offset;
             var depth = 0;
             while (_lexer.Current.Kind != TokenKind.RightParen || depth != 0)
             {
@@ -834,9 +839,9 @@ internal sealed class SqlParser
                     throw Error("unterminated virtual-table module argument list");
                 if (_lexer.Current.Kind == TokenKind.Comma && depth == 0)
                 {
-                    arguments.Add(argument.ToString().Trim());
-                    argument.Clear();
+                    arguments.Add(_sql[argumentStart.._lexer.Current.Offset].Trim());
                     _lexer.Next();
+                    argumentStart = _lexer.Current.Offset;
                     continue;
                 }
 
@@ -845,14 +850,11 @@ internal sealed class SqlParser
                 else if (_lexer.Current.Kind == TokenKind.RightParen)
                     depth--;
 
-                if (argument.Length != 0)
-                    argument.Append(' ');
-                argument.Append(_lexer.Current.Text);
                 _lexer.Next();
             }
 
-            if (argument.Length != 0)
-                arguments.Add(argument.ToString().Trim());
+            if (_lexer.Current.Offset > argumentStart)
+                arguments.Add(_sql[argumentStart.._lexer.Current.Offset].Trim());
             Expect(TokenKind.RightParen);
         }
 
@@ -1294,7 +1296,7 @@ internal sealed class SqlParser
         var columns = new List<IndexedColumnDefinition>();
         do
         {
-            columns.Add(ParseIndexedColumn());
+            columns.Add(ParseIndexedColumn(allowMethodParameters: method is not null));
         }
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
@@ -1365,7 +1367,7 @@ internal sealed class SqlParser
         {
             var key = ExpectIdentifier();
             Expect(TokenKind.Equal);
-            var value = ParseIndexMethodParameterLiteral(key);
+            var value = ParseIndexMethodParameterLiteral(key, allowIdentifierText: false);
             if (!seen.Add(key))
                 throw Error($"Duplicate index method parameter '{key}'.");
             if (parameters.Count >= Indexing.ManagedIndexMethodLimits.MaxParameters)
@@ -1383,7 +1385,7 @@ internal sealed class SqlParser
 
     // Index method parameters are literals only, matching Turso's resolve_index_method_parameters
     // (core/translate/index.rs:1170): no expressions, no parameters, no function calls.
-    private SqlValue ParseIndexMethodParameterLiteral(string key)
+    private SqlValue ParseIndexMethodParameterLiteral(string key, bool allowIdentifierText)
     {
         var negate = false;
         if (Consume(TokenKind.Minus))
@@ -1417,18 +1419,25 @@ internal sealed class SqlParser
             case TokenKind.Blob when !negate:
                 _lexer.Next();
                 return SqlValue.Blob(Convert.FromHexString(token.Text));
+            case TokenKind.Identifier when !negate && allowIdentifierText:
+                _lexer.Next();
+                return SqlValue.Text(token.Text);
             default:
                 throw Error($"Index method parameter '{key}' requires a literal value.");
         }
     }
 
-    private IndexedColumnDefinition ParseIndexedColumn()
+    private IndexedColumnDefinition ParseIndexedColumn(bool allowMethodParameters = false)
     {
         var startOffset = _lexer.Current.Offset;
         var expression = ParseExpression();
         var expressionSql = _sql[startOffset.._lexer.Current.Offset].Trim();
         if (expressionSql.Length == 0)
             throw Error("Index requires an expression.");
+
+        IReadOnlyList<Indexing.ManagedIndexMethodParameter>? methodParameters = null;
+        if (allowMethodParameters && ConsumeKeyword("WITH"))
+            methodParameters = ParseIndexMethodColumnParameters();
 
         var descending = false;
         if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
@@ -1456,7 +1465,11 @@ internal sealed class SqlParser
 
         if (expression is ColumnExpression { Qualifier: null } column)
         {
-            var definition = new IndexedColumnDefinition(column.Name, collation, descending);
+            var definition = new IndexedColumnDefinition(
+                column.Name,
+                collation,
+                descending,
+                MethodParameters: methodParameters);
             var columnSpan = _spans?.GetName(column);
             if (columnSpan is not null)
                 _spans!.RecordName(definition, columnSpan.Value);
@@ -1469,7 +1482,35 @@ internal sealed class SqlParser
             collation,
             descending,
             expression,
-            expressionSql);
+            expressionSql,
+            methodParameters);
+    }
+
+    private IReadOnlyList<Indexing.ManagedIndexMethodParameter> ParseIndexMethodColumnParameters()
+    {
+        var parenthesized = Consume(TokenKind.LeftParen);
+        var parameters = new List<Indexing.ManagedIndexMethodParameter>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        do
+        {
+            var key = ExpectIdentifier();
+            Expect(TokenKind.Equal);
+            var value = ParseIndexMethodParameterLiteral(key, allowIdentifierText: true);
+            if (!seen.Add(key))
+                throw Error($"Duplicate index method column parameter '{key}'.");
+            if (parameters.Count >= Indexing.ManagedIndexMethodLimits.MaxParameters)
+            {
+                throw Error(
+                    $"An index method column accepts at most {Indexing.ManagedIndexMethodLimits.MaxParameters} WITH parameters.");
+            }
+
+            parameters.Add(new Indexing.ManagedIndexMethodParameter(key, value));
+        }
+        while (parenthesized && Consume(TokenKind.Comma));
+
+        if (parenthesized)
+            Expect(TokenKind.RightParen);
+        return parameters;
     }
 
     private ParsedStatement ParseAlterTable()

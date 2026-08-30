@@ -370,6 +370,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 readOnly: readOnly,
                 initialPageSize: initialPageSize,
                 foreignReadOnly: foreignReadOnly);
+            EmbeddedDatabase? database = null;
             try
             {
                 // The store now owns the physical database before this second pager
@@ -377,7 +378,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 // A foreign read-only open holds no ownership, but the version read
                 // is a self-contained snapshot and only feeds catalog-cache reuse.
                 var catalogVersion = ReadFileCatalogVersion(effectiveFileSystem, path, foreignReadOnly);
-                var database = new EmbeddedDatabase(
+                database = new EmbeddedDatabase(
                     store,
                     catalog,
                     path,
@@ -393,7 +394,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
             catch
             {
-                store.Dispose();
+                if (database is not null)
+                    database.Dispose();
+                else
+                {
+                    DisconnectVirtualTables(catalog.VirtualTables.Values);
+                    store.Dispose();
+                }
                 throw;
             }
         }
@@ -405,8 +412,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ThrowIfRecursiveTriggerCallbackReentry();
         lock (_gate)
         {
-            foreach (var virtualTable in _virtualTables.Values)
-                virtualTable.Table.Destroy();
+            DisconnectVirtualTables(_virtualTables.Values);
             _virtualTables.Clear();
 
             if (_mvStore is not null && _fileSystem is not null && !string.IsNullOrEmpty(_databasePath))
@@ -605,6 +611,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private sealed record LimitedDmlCandidate(int Position, SqlValue[] OrderValues);
 
+    private sealed record VirtualTableMutation(
+        IReadOnlyList<SqlValue> Arguments,
+        SqlValue[] ReturningValues,
+        long ReturningRowId);
+
+    private sealed record VirtualDmlCandidate(SourceRow Target, SourceRow Evaluation, int Position);
+
     private enum TriggerMutationKind
     {
         Insert,
@@ -693,6 +706,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ConcurrentMvccIdentityTracker? ConcurrentMvccIdentityTracker = null,
         SqliteTextEncoding MvccTextEncoding = SqliteTextEncoding.Utf8,
         IReadOnlyDictionary<string, VirtualTableDefinition>? VirtualTables = null,
+        ManagedVirtualTableTransaction? VirtualTableTransaction = null,
         ChangeDataCaptureSession? ChangeDataCapture = null,
         VdbeExecutionOptions? VdbeExecutionOptions = null,
         CteMutationState? CteMutationState = null,
@@ -1118,17 +1132,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // snapshot and atomically publish all managed catalog state together.
     internal sealed class SchemaCatalog
     {
+        private bool _ownsVirtualTableInstances;
+
         public SchemaCatalog(
             Dictionary<string, EmbeddedTable> tables,
             Dictionary<string, ViewDefinition> views,
             Dictionary<string, TriggerDefinition> triggers,
-            Dictionary<string, VirtualTableDefinition>? virtualTables = null)
+            Dictionary<string, VirtualTableDefinition>? virtualTables = null,
+            bool ownsVirtualTableInstances = false)
         {
             Tables = tables;
             Views = views;
             Triggers = triggers;
             VirtualTables = virtualTables ?? new Dictionary<string, VirtualTableDefinition>(
                 StringComparer.OrdinalIgnoreCase);
+            _ownsVirtualTableInstances = ownsVirtualTableInstances;
         }
 
         public Dictionary<string, EmbeddedTable> Tables { get; }
@@ -1139,14 +1157,42 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         public Dictionary<string, VirtualTableDefinition> VirtualTables { get; }
 
-        public SchemaCatalog Clone() => new(
-            CloneTables(Tables),
-            new Dictionary<string, ViewDefinition>(Views, StringComparer.OrdinalIgnoreCase),
-            new Dictionary<string, TriggerDefinition>(Triggers, StringComparer.OrdinalIgnoreCase),
-            VirtualTables.ToDictionary(
-                static entry => entry.Key,
-                static entry => entry.Value.CreateSnapshot(),
-                StringComparer.OrdinalIgnoreCase));
+        public SchemaCatalog Clone()
+        {
+            var virtualTables = new Dictionary<string, VirtualTableDefinition>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (var entry in VirtualTables)
+                    virtualTables.Add(entry.Key, entry.Value.CreateSnapshot());
+
+                return new SchemaCatalog(
+                    CloneTables(Tables),
+                    new Dictionary<string, ViewDefinition>(Views, StringComparer.OrdinalIgnoreCase),
+                    new Dictionary<string, TriggerDefinition>(Triggers, StringComparer.OrdinalIgnoreCase),
+                    virtualTables,
+                    ownsVirtualTableInstances: true);
+            }
+            catch
+            {
+                DisconnectVirtualTables(virtualTables.Values);
+                throw;
+            }
+        }
+
+        public void RelinquishVirtualTableOwnership() => _ownsVirtualTableInstances = false;
+
+        public void DisconnectOwnedVirtualTables(ManagedVirtualTableTransaction? transaction = null)
+        {
+            if (!_ownsVirtualTableInstances)
+                return;
+
+            _ownsVirtualTableInstances = false;
+            foreach (var definition in VirtualTables.Values)
+            {
+                if (transaction?.IsParticipating(definition.Table) != true)
+                    definition.Table.DisconnectInstance();
+            }
+        }
     }
 
     internal sealed record VirtualTableDefinition(
@@ -1169,6 +1215,130 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         public VirtualTableDefinition WithCurrentPersistencePayload()
             => this with { PersistencePayload = Table.GetPersistencePayload() };
+    }
+
+    internal sealed class ManagedVirtualTableTransaction
+    {
+        private readonly List<ManagedVirtualTable> _participants = [];
+        private readonly HashSet<ManagedVirtualTable> _participantSet =
+            new(ReferenceEqualityComparer.Instance);
+        private readonly HashSet<ManagedVirtualTable> _synchronized =
+            new(ReferenceEqualityComparer.Instance);
+
+        public void Begin(VirtualTableDefinition definition)
+        {
+            var table = definition.Table;
+            if (_participantSet.Contains(table))
+                return;
+
+            table.Begin();
+            _participantSet.Add(table);
+            _participants.Add(table);
+        }
+
+        public int CreateCheckpoint() => _participants.Count;
+
+        public bool IsParticipating(ManagedVirtualTable table)
+            => _participantSet.Contains(table);
+
+        public void Sync(SchemaCatalog catalog)
+        {
+            _ = catalog;
+            foreach (var table in _participants)
+            {
+                if (!_synchronized.Add(table))
+                    continue;
+
+                table.Sync();
+            }
+        }
+
+        public void Commit(SchemaCatalog catalog)
+        {
+            var retained = new HashSet<ManagedVirtualTable>(
+                catalog.VirtualTables.Values.Select(static definition => definition.Table),
+                ReferenceEqualityComparer.Instance);
+            Complete(commit: true, retained);
+        }
+
+        public void Rollback(SchemaCatalog catalog)
+        {
+            _ = catalog;
+            Complete(commit: false, retained: null);
+        }
+
+        public void RollbackTo(int checkpoint)
+        {
+            if (checkpoint >= _participants.Count)
+                return;
+            if (checkpoint < 0)
+                throw new ArgumentOutOfRangeException(nameof(checkpoint));
+
+            ExceptionDispatchInfo? failure = null;
+            for (var index = _participants.Count - 1; index >= checkpoint; index--)
+            {
+                var table = _participants[index];
+                _participants.RemoveAt(index);
+                _participantSet.Remove(table);
+                _synchronized.Remove(table);
+                try
+                {
+                    table.Rollback();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+
+                try
+                {
+                    table.DisconnectInstance();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
+
+            failure?.Throw();
+        }
+
+        private void Complete(bool commit, HashSet<ManagedVirtualTable>? retained)
+        {
+            var participants = _participants.ToArray();
+            _participants.Clear();
+            _participantSet.Clear();
+            _synchronized.Clear();
+
+            ExceptionDispatchInfo? failure = null;
+            foreach (var table in participants)
+            {
+                try
+                {
+                    if (commit)
+                        table.Commit();
+                    else
+                        table.Rollback();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+
+                if (retained?.Contains(table) == true)
+                    continue;
+                try
+                {
+                    table.DisconnectInstance();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
+
+            failure?.Throw();
+        }
     }
 
     internal sealed class AutoIncrementStatementState
@@ -1506,7 +1676,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
         ChangeDataCaptureSession? changeDataCapture = null,
         VdbeExecutionOptions? vdbeExecutionOptions = null,
-        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
+        ManagedVirtualTableTransaction? virtualTableTransaction = null)
     {
         var result = ExecuteCore(
             statement,
@@ -1525,7 +1696,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             externalTables,
             changeDataCapture,
             vdbeExecutionOptions,
-            synchronousMode);
+            synchronousMode,
+            virtualTableTransaction);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -1566,7 +1738,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
         ChangeDataCaptureSession? changeDataCapture = null,
         VdbeExecutionOptions? vdbeExecutionOptions = null,
-        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
+        ManagedVirtualTableTransaction? virtualTableTransaction = null)
     {
         synchronousMode.Validate(nameof(synchronousMode));
         ThrowIfRecursiveTriggerCallbackReentry();
@@ -1593,7 +1766,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 externalTables,
                 changeDataCapture,
                 vdbeExecutionOptions,
-                synchronousMode));
+                synchronousMode,
+                virtualTableTransaction));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -1620,75 +1794,114 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     // installed gate forces the clone-and-publish shape here.
                     var commitGate = hooks?.CommitGate;
                     var statementMayMutate = MayMutate(statement, _views);
-                    if ((cancellationToken.CanBeCanceled || commitGate is not null) && statementMayMutate)
+                    var ownsVirtualTableTransaction = virtualTableTransaction is null;
+                    var statementVirtualTableTransaction =
+                        virtualTableTransaction ?? new ManagedVirtualTableTransaction();
+                    if ((cancellationToken.CanBeCanceled
+                            || commitGate is not null
+                            || _virtualTables.Count != 0)
+                        && statementMayMutate)
                     {
                         var cancellableWorking = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
-                        ExecutionResult cancellableResult;
+                        var virtualTableCommitCompleted = false;
                         try
                         {
-                            cancellableResult = Execute(
-                                statement,
-                                parameters,
-                                cancellableWorking,
-                                lastInsertRowId,
-                                foreignKeysEnabled,
-                                recursiveTriggersEnabled,
-                                deferForeignKeys,
-                                inTransaction,
-                                cancellationToken,
-                                compilationEnabled,
-                                tempTriggers,
-                                hooks,
-                                ignoreCheckConstraints,
-                                executeTableList,
-                                externalTables,
-                                changeDataCapture: changeDataCapture,
-                                vdbeExecutionOptions: vdbeExecutionOptions);
-                        }
-                        catch (EmbeddedConflictFailException)
-                        {
-                            cancellationToken.ThrowIfCancellationRequested();
-                            // ON CONFLICT FAIL keeps the rows written before the failure, so this is still
-                            // a commit and the hook still gets to veto it.
-                            if (commitGate is not null && !commitGate())
-                                throw new EmbeddedCommitVetoException();
-                            if (_fileStore is null)
-                                PublishCatalog(cancellableWorking);
-                            else
-                                PersistFileCatalog(
-                                    cancellableWorking,
-                                    busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
-                            throw;
-                        }
-
-                        cancellationToken.ThrowIfCancellationRequested();
-                        if (!cancellableResult.Changed)
-                            return cancellableResult;
-
-                        if (commitGate is not null && !commitGate())
-                            throw new EmbeddedCommitVetoException();
-
-                        if (_fileStore is null)
-                        {
-                            if (MayChangeSchema(statement))
+                            ExecutionResult cancellableResult;
+                            try
                             {
-                                _inMemoryPragmaHeader = _inMemoryPragmaHeader with
-                                {
-                                    SchemaVersion = unchecked(_inMemoryPragmaHeader.SchemaVersion + 1),
-                                };
+                                cancellableResult = Execute(
+                                    statement,
+                                    parameters,
+                                    cancellableWorking,
+                                    lastInsertRowId,
+                                    foreignKeysEnabled,
+                                    recursiveTriggersEnabled,
+                                    deferForeignKeys,
+                                    inTransaction,
+                                    cancellationToken,
+                                    compilationEnabled,
+                                    tempTriggers,
+                                    hooks,
+                                    ignoreCheckConstraints,
+                                    executeTableList,
+                                    externalTables,
+                                    changeDataCapture: changeDataCapture,
+                                    vdbeExecutionOptions: vdbeExecutionOptions,
+                                    virtualTableTransaction: statementVirtualTableTransaction);
+                            }
+                            catch (EmbeddedConflictFailException)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                // ON CONFLICT FAIL keeps the rows written before the failure, so this is still
+                                // a commit and the hook still gets to veto it.
+                                if (ownsVirtualTableTransaction)
+                                    statementVirtualTableTransaction.Sync(cancellableWorking);
+                                if (commitGate is not null && !commitGate())
+                                    throw new EmbeddedCommitVetoException();
+                                if (_fileStore is null)
+                                    PublishCatalog(cancellableWorking);
+                                else
+                                    PersistFileCatalog(
+                                        cancellableWorking,
+                                        busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
+                                if (ownsVirtualTableTransaction)
+                                    statementVirtualTableTransaction.Commit(cancellableWorking);
+                                virtualTableCommitCompleted = true;
+                                throw;
                             }
 
-                            PublishCatalog(cancellableWorking);
-                        }
-                        else
-                        {
-                            PersistFileCatalog(
-                                cancellableWorking,
-                                forceFullRewrite: cancellableResult.ForceFullCatalogRewrite,
-                                busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
-                        }
+                            cancellationToken.ThrowIfCancellationRequested();
+                            if (!cancellableResult.Changed)
+                            {
+                                if (ownsVirtualTableTransaction)
+                                {
+                                    statementVirtualTableTransaction.Sync(cancellableWorking);
+                                    statementVirtualTableTransaction.Commit(cancellableWorking);
+                                }
+                                virtualTableCommitCompleted = true;
+                                return cancellableResult;
+                            }
 
-                        return cancellableResult;
+                            if (ownsVirtualTableTransaction)
+                                statementVirtualTableTransaction.Sync(cancellableWorking);
+                            if (commitGate is not null && !commitGate())
+                                throw new EmbeddedCommitVetoException();
+
+                            if (_fileStore is null)
+                            {
+                                if (MayChangeSchema(statement))
+                                {
+                                    _inMemoryPragmaHeader = _inMemoryPragmaHeader with
+                                    {
+                                        SchemaVersion = unchecked(_inMemoryPragmaHeader.SchemaVersion + 1),
+                                    };
+                                }
+
+                                PublishCatalog(cancellableWorking);
+                            }
+                            else
+                            {
+                                PersistFileCatalog(
+                                    cancellableWorking,
+                                    forceFullRewrite: cancellableResult.ForceFullCatalogRewrite,
+                                    busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
+                            }
+
+                            if (ownsVirtualTableTransaction)
+                                statementVirtualTableTransaction.Commit(cancellableWorking);
+                            virtualTableCommitCompleted = true;
+                            return cancellableResult;
+                        }
+                        catch
+                        {
+                            if (ownsVirtualTableTransaction && !virtualTableCommitCompleted)
+                                statementVirtualTableTransaction.Rollback(cancellableWorking);
+                            throw;
+                        }
+                        finally
+                        {
+                            cancellableWorking.DisconnectOwnedVirtualTables();
+                        }
                     }
 
                     if (_fileStore is null)
@@ -1758,57 +1971,65 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             vdbeExecutionOptions: vdbeExecutionOptions);
 
                     var working = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
-                    ExecutionResult result;
                     try
                     {
-                        result = Execute(
-                            statement,
-                            parameters,
-                            working,
-                            lastInsertRowId,
-                            foreignKeysEnabled,
-                            recursiveTriggersEnabled,
-                            deferForeignKeys,
-                            inTransaction,
-                            cancellationToken,
-                            compilationEnabled,
-                            tempTriggers,
-                            hooks,
-                            ignoreCheckConstraints,
-                            executeTableList,
-                            externalTables,
-                            changeDataCapture: changeDataCapture,
-                            vdbeExecutionOptions: vdbeExecutionOptions);
-                    }
-                    catch (EmbeddedConflictFailException)
-                    {
-                        PersistFileCatalog(
-                            working,
-                            busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
-                        throw;
-                    }
-                    if (result.Changed)
-                    {
-                        PersistFileCatalog(
-                            working,
-                            forceFullRewrite: result.ForceFullCatalogRewrite,
-                            busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
-                    }
-                    else if (!inTransaction)
-                    {
-                        // A mutating autocommit statement that produced no change (most
-                        // importantly a conflicting INSERT OR IGNORE returning changes()==0)
-                        // decided its outcome against the heap clone. If another connection
-                        // committed meanwhile (e.g. deleted the conflicting row), that decision
-                        // is stale: native SQLite serializes the conflicting write through the
-                        // write lock against the live btree, so a loser retries and can win.
-                        // Force the same stale-check the persist path runs so a changed durable
-                        // version reloads the catalog and re-executes this statement instead of
-                        // silently returning the stale outcome (ENGINE #17 migrations lock).
-                        EnsureFileCatalogVersionCurrent(GetRemainingBusyTimeout(busyRetryDeadline));
-                    }
+                        ExecutionResult result;
+                        try
+                        {
+                            result = Execute(
+                                statement,
+                                parameters,
+                                working,
+                                lastInsertRowId,
+                                foreignKeysEnabled,
+                                recursiveTriggersEnabled,
+                                deferForeignKeys,
+                                inTransaction,
+                                cancellationToken,
+                                compilationEnabled,
+                                tempTriggers,
+                                hooks,
+                                ignoreCheckConstraints,
+                                executeTableList,
+                                externalTables,
+                                changeDataCapture: changeDataCapture,
+                                vdbeExecutionOptions: vdbeExecutionOptions,
+                                virtualTableTransaction: virtualTableTransaction);
+                        }
+                        catch (EmbeddedConflictFailException)
+                        {
+                            PersistFileCatalog(
+                                working,
+                                busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
+                            throw;
+                        }
+                        if (result.Changed)
+                        {
+                            PersistFileCatalog(
+                                working,
+                                forceFullRewrite: result.ForceFullCatalogRewrite,
+                                busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
+                        }
+                        else if (!inTransaction)
+                        {
+                            // A mutating autocommit statement that produced no change (most
+                            // importantly a conflicting INSERT OR IGNORE returning changes()==0)
+                            // decided its outcome against the heap clone. If another connection
+                            // committed meanwhile (e.g. deleted the conflicting row), that decision
+                            // is stale: native SQLite serializes the conflicting write through the
+                            // write lock against the live btree, so a loser retries and can win.
+                            // Force the same stale-check the persist path runs so a changed durable
+                            // version reloads the catalog and re-executes this statement instead of
+                            // silently returning the stale outcome (ENGINE #17 migrations lock).
+                            EnsureFileCatalogVersionCurrent(GetRemainingBusyTimeout(busyRetryDeadline));
+                        }
 
-                    return result;
+                        return result;
+                    }
+                    finally
+                    {
+                        working.DisconnectOwnedVirtualTables();
+                    }
                 }
             }
             catch (EmbeddedCatalogSnapshotStaleException)
@@ -1876,6 +2097,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ConcurrentBaseTables: outer.ConcurrentBaseTables,
                 ConcurrentMvccIdentityTracker: outer.ConcurrentMvccIdentityTracker,
                 MvccTextEncoding: outer.MvccTextEncoding,
+                VirtualTables: catalog.VirtualTables,
+                VirtualTableTransaction: outer.VirtualTableTransaction,
                 ChangeDataCapture: outer.ChangeDataCapture);
             return statement switch
             {
@@ -2007,7 +2230,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
             or AlterTableAlterColumnStatement or AlterTableDropColumnStatement
             or InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement
-            or AnalyzeStatement or ReindexStatement or VacuumStatement
+            or AnalyzeStatement or ReindexStatement or OptimizeIndexStatement or VacuumStatement
             or PragmaHeaderIntegerStatement { Value: not null }
             or PragmaJournalModeStatement { Mode: not null }
             or PragmaMaxPageCountStatement)
@@ -2409,7 +2632,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 _tables,
                 new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
                 _views,
-                _triggers);
+                _triggers,
+                VirtualTables: _virtualTables,
+                Database: this);
             ValidateQueryIndexDirectives(statement, context);
             return DescribeQuery(statement, context);
         }
@@ -2423,7 +2648,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 catalog.Tables,
                 new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
                 catalog.Views,
-                catalog.Triggers);
+                catalog.Triggers,
+                VirtualTables: catalog.VirtualTables,
+                Database: this);
             ValidateQueryIndexDirectives(statement, context);
             return DescribeQuery(statement, context);
         }
@@ -2525,7 +2752,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             return kind switch
             {
-                ManagedSchemaObjectKind.Table => _tables.ContainsKey(name),
+                ManagedSchemaObjectKind.Table => _tables.ContainsKey(name) || _virtualTables.ContainsKey(name),
                 ManagedSchemaObjectKind.View => _views.ContainsKey(name),
                 ManagedSchemaObjectKind.Trigger => _triggers.ContainsKey(name),
                 ManagedSchemaObjectKind.Index => _tables.Values.Any(table =>
@@ -2584,7 +2811,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog)
     {
         if (!catalog.Tables.TryGetValue(tableName, out var table))
-            throw new EmbeddedSqlException($"no such table: {tableName}");
+        {
+            if (!catalog.VirtualTables.TryGetValue(tableName, out var virtualTable))
+                throw new EmbeddedSqlException($"no such table: {tableName}");
+
+            var visibleColumns = virtualTable.Table.Schema.VisibleColumns
+                .Select(static column => column.Name)
+                .ToArray();
+            var virtualOutputColumns = BuildOutputColumns(tableName, visibleColumns);
+            return GetColumnNames(returning, virtualOutputColumns, virtualOutputColumns);
+        }
 
         var outputColumns = BuildOutputColumns(tableName, table.Columns);
         return GetColumnNames(returning, outputColumns, outputColumns);
@@ -2613,33 +2849,42 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (_readOnly)
                 throw new EmbeddedSqlException("attempt to write a readonly database");
 
+            SchemaCatalog? ownedPublishCatalog = null;
             var publishCatalog = catalog;
-            if (concurrent && _mvStore is not null)
+            try
             {
-                // Pooled connections each hold a process-local catalog. Reload the
-                // durable image (if any) then fold the shared store's committed rows
-                // so concurrent writers do not clobber each other.
-                if (_fileStore is not null)
-                    TryReloadFileCatalogIfChanged();
-                publishCatalog = containsSchemaChanges
-                    ? catalog.Clone()
-                    : MergeConcurrentCatalogFromStoreLocked(catalog);
-            }
-            else if (_version != version)
-            {
-                throw new EmbeddedSqlException("database is locked");
-            }
+                if (concurrent && _mvStore is not null)
+                {
+                    // Pooled connections each hold a process-local catalog. Reload the
+                    // durable image (if any) then fold the shared store's committed rows
+                    // so concurrent writers do not clobber each other.
+                    if (_fileStore is not null)
+                        TryReloadFileCatalogIfChanged();
+                    ownedPublishCatalog = containsSchemaChanges
+                        ? catalog.Clone()
+                        : MergeConcurrentCatalogFromStoreLocked(catalog);
+                    publishCatalog = ownedPublishCatalog;
+                }
+                else if (_version != version)
+                {
+                    throw new EmbeddedSqlException("database is locked");
+                }
 
-            if (_fileStore is null)
-            {
-                if (pragmaHeader is { } metadata)
-                    _inMemoryPragmaHeader = metadata;
-                PublishCatalog(publishCatalog);
-                return;
-            }
+                if (_fileStore is null)
+                {
+                    if (pragmaHeader is { } metadata)
+                        _inMemoryPragmaHeader = metadata;
+                    PublishCatalog(publishCatalog);
+                    return;
+                }
 
-            _fileStore.SetSynchronousMode(synchronousMode);
-            PersistFileCatalog(publishCatalog, pragmaHeader, forceFullRewrite, busyTimeout);
+                _fileStore.SetSynchronousMode(synchronousMode);
+                PersistFileCatalog(publishCatalog, pragmaHeader, forceFullRewrite, busyTimeout);
+            }
+            finally
+            {
+                ownedPublishCatalog?.DisconnectOwnedVirtualTables();
+            }
         }
     }
 
@@ -2684,88 +2929,96 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var store = _mvStore
             ?? throw new InvalidOperationException("MVCC store required for concurrent merge.");
         var merged = LiveCatalog.Clone();
-        var liveRows = checkpointSnapshot?.LiveRows
-            ?? store.SnapshotLiveCommittedRows();
-        var deleted = checkpointSnapshot?.DeletedRows
-            ?? store.SnapshotCommittedDeletes();
-        var touchedTableIds = liveRows.Select(r => r.RowId.TableId)
-            .Concat(deleted.Select(d => d.TableId))
-            .ToHashSet();
-
-        foreach (var tableId in touchedTableIds)
+        try
         {
-            if (!store.TryGetTableName(tableId, out var tableName) || tableName is null)
-                continue;
-
-            if (!merged.Tables.TryGetValue(tableName, out var target))
-            {
-                if (!txCatalog.Tables.TryGetValue(tableName, out var created))
-                    continue;
-                merged.Tables[tableName] = created.Clone();
-                target = merged.Tables[tableName];
-            }
-
-            var liveForTable = liveRows
-                .Where(row => row.RowId.TableId == tableId)
-                .ToDictionary(row => row.RowId.Key, row => row.Cells);
-            var deletedForTable = deleted
-                .Where(row => row.TableId == tableId)
-                .Select(row => row.Key)
+            var liveRows = checkpointSnapshot?.LiveRows
+                ?? store.SnapshotLiveCommittedRows();
+            var deleted = checkpointSnapshot?.DeletedRows
+                ?? store.SnapshotCommittedDeletes();
+            var touchedTableIds = liveRows.Select(r => r.RowId.TableId)
+                .Concat(deleted.Select(d => d.TableId))
                 .ToHashSet();
 
-            var nextRows = new List<SqlValue[]>();
-            var nextIds = new List<long>();
-            var nextSyntheticId = target.RowIds.Count == 0
-                ? 1L
-                : checked(target.RowIds.Max() + 1);
-            for (var i = 0; i < target.Rows.Count; i++)
+            foreach (var tableId in touchedTableIds)
             {
-                var rowId = i < target.RowIds.Count ? target.RowIds[i] : nextSyntheticId++;
-                var key = GetMvccTableKey(target, target.Rows[i], rowId);
-                if (deletedForTable.Contains(key))
+                if (!store.TryGetTableName(tableId, out var tableName) || tableName is null)
                     continue;
-                if (liveForTable.TryGetValue(key, out var cells))
+
+                if (!merged.Tables.TryGetValue(tableName, out var target))
                 {
-                    nextRows.Add(cells);
-                    nextIds.Add(rowId);
-                    liveForTable.Remove(key);
-                    continue;
+                    if (!txCatalog.Tables.TryGetValue(tableName, out var created))
+                        continue;
+                    merged.Tables[tableName] = created.Clone();
+                    target = merged.Tables[tableName];
                 }
 
-                nextRows.Add(target.Rows[i]);
-                nextIds.Add(rowId);
+                var liveForTable = liveRows
+                    .Where(row => row.RowId.TableId == tableId)
+                    .ToDictionary(row => row.RowId.Key, row => row.Cells);
+                var deletedForTable = deleted
+                    .Where(row => row.TableId == tableId)
+                    .Select(row => row.Key)
+                    .ToHashSet();
+
+                var nextRows = new List<SqlValue[]>();
+                var nextIds = new List<long>();
+                var nextSyntheticId = target.RowIds.Count == 0
+                    ? 1L
+                    : checked(target.RowIds.Max() + 1);
+                for (var i = 0; i < target.Rows.Count; i++)
+                {
+                    var rowId = i < target.RowIds.Count ? target.RowIds[i] : nextSyntheticId++;
+                    var key = GetMvccTableKey(target, target.Rows[i], rowId);
+                    if (deletedForTable.Contains(key))
+                        continue;
+                    if (liveForTable.TryGetValue(key, out var cells))
+                    {
+                        nextRows.Add(cells);
+                        nextIds.Add(rowId);
+                        liveForTable.Remove(key);
+                        continue;
+                    }
+
+                    nextRows.Add(target.Rows[i]);
+                    nextIds.Add(rowId);
+                }
+
+                foreach (var (key, cells) in liveForTable)
+                {
+                    nextRows.Add(cells);
+                    nextIds.Add(target.HasRowid ? key.Integer : nextSyntheticId++);
+                }
+
+                target.Rows.Clear();
+                target.RowIds.Clear();
+                for (var i = 0; i < nextRows.Count; i++)
+                {
+                    target.Rows.Add(nextRows[i]);
+                    target.RowIds.Add(nextIds[i]);
+                }
+
+                if (!target.HasRowid)
+                    SortWithoutRowid(target);
             }
 
-            foreach (var (key, cells) in liveForTable)
+            foreach (var (name, table) in txCatalog.Tables)
             {
-                nextRows.Add(cells);
-                nextIds.Add(target.HasRowid ? key.Integer : nextSyntheticId++);
+                if (!merged.Tables.ContainsKey(name))
+                    merged.Tables[name] = table.Clone();
             }
 
-            target.Rows.Clear();
-            target.RowIds.Clear();
-            for (var i = 0; i < nextRows.Count; i++)
-            {
-                target.Rows.Add(nextRows[i]);
-                target.RowIds.Add(nextIds[i]);
-            }
+            foreach (var (name, view) in txCatalog.Views)
+                merged.Views[name] = view;
+            foreach (var (name, trigger) in txCatalog.Triggers)
+                merged.Triggers[name] = trigger;
 
-            if (!target.HasRowid)
-                SortWithoutRowid(target);
+            return merged;
         }
-
-        foreach (var (name, table) in txCatalog.Tables)
+        catch
         {
-            if (!merged.Tables.ContainsKey(name))
-                merged.Tables[name] = table.Clone();
+            merged.DisconnectOwnedVirtualTables();
+            throw;
         }
-
-        foreach (var (name, view) in txCatalog.Views)
-            merged.Views[name] = view;
-        foreach (var (name, trigger) in txCatalog.Triggers)
-            merged.Triggers[name] = trigger;
-
-        return merged;
     }
 
     private MvccKey GetMvccTableKey(EmbeddedTable table, SqlValue[] row, long rowId)
@@ -3128,88 +3381,95 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 var merged = MergeConcurrentCatalogFromStoreLocked(
                     LiveCatalog,
                     snapshot);
-                stateMachine.Enter(MvccCheckpointPhase.Materialize);
-                MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.Materialize);
-
-                if (_fileStore is null)
+                try
                 {
-                    PublishCatalog(merged);
-                }
-                else
-                {
-                    PersistFileCatalog(
-                        merged,
-                        pragmaHeader: null,
-                        forceFullRewrite: false,
-                        busyTimeout,
-                        checkpointAfterCommit: false);
-                }
+                    stateMachine.Enter(MvccCheckpointPhase.Materialize);
+                    MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.Materialize);
 
-                stateMachine.Enter(MvccCheckpointPhase.PersistPageWal);
-                MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.PersistPageWal);
-
-                if (_fileStore is not null)
-                {
-                    try
+                    if (_fileStore is null)
                     {
-                        _ = _fileStore.BackfillMvccCheckpoint(busyTimeout);
+                        PublishCatalog(merged);
                     }
-                    catch (SqlitePagerBusyException)
+                    else
                     {
-                        return stateMachine.Result(busy: true, logBefore, checkpointedFrames: 0);
+                        PersistFileCatalog(
+                            merged,
+                            pragmaHeader: null,
+                            forceFullRewrite: false,
+                            busyTimeout,
+                            checkpointAfterCommit: false);
                     }
-                }
 
-                stateMachine.Enter(MvccCheckpointPhase.Backfill);
-                MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.Backfill);
+                    stateMachine.Enter(MvccCheckpointPhase.PersistPageWal);
+                    MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.PersistPageWal);
 
-                var checkpointed = 0L;
-                if (log is not null && logBefore != 0)
-                {
-                    log.AppendCheckpointWatermark(
-                        snapshot.DurableTimestamp,
-                        synchronousMode);
-                }
-                stateMachine.Enter(MvccCheckpointPhase.PublishRecoveryWatermark);
-                MvccCheckpointFaultInjection.Hit(
-                    MvccCheckpointPhase.PublishRecoveryWatermark);
-
-                if (log is not null)
-                {
-                    log.TruncateAfterCheckpoint(synchronousMode);
-                    if (requiresLogUpgrade)
-                        log.UpgradeToVersion4AfterCheckpoint(synchronousMode);
-                    checkpointed = logBefore;
-                }
-                stateMachine.Enter(MvccCheckpointPhase.RetireLogicalLog);
-                MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.RetireLogicalLog);
-
-                if (wantTruncate && _fileStore is not null)
-                {
-                    try
+                    if (_fileStore is not null)
                     {
-                        _ = _fileStore.ResetMvccCheckpointWal(busyTimeout);
+                        try
+                        {
+                            _ = _fileStore.BackfillMvccCheckpoint(busyTimeout);
+                        }
+                        catch (SqlitePagerBusyException)
+                        {
+                            return stateMachine.Result(busy: true, logBefore, checkpointedFrames: 0);
+                        }
                     }
-                    catch (SqlitePagerBusyException)
+
+                    stateMachine.Enter(MvccCheckpointPhase.Backfill);
+                    MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.Backfill);
+
+                    var checkpointed = 0L;
+                    if (log is not null && logBefore != 0)
                     {
-                        // The main store and logical log are already durable. Retain the
-                        // validated WAL for a later restart rather than losing reader data.
-                        return stateMachine.Result(busy: true, logBefore, checkpointed);
+                        log.AppendCheckpointWatermark(
+                            snapshot.DurableTimestamp,
+                            synchronousMode);
                     }
+                    stateMachine.Enter(MvccCheckpointPhase.PublishRecoveryWatermark);
+                    MvccCheckpointFaultInjection.Hit(
+                        MvccCheckpointPhase.PublishRecoveryWatermark);
+
+                    if (log is not null)
+                    {
+                        log.TruncateAfterCheckpoint(synchronousMode);
+                        if (requiresLogUpgrade)
+                            log.UpgradeToVersion4AfterCheckpoint(synchronousMode);
+                        checkpointed = logBefore;
+                    }
+                    stateMachine.Enter(MvccCheckpointPhase.RetireLogicalLog);
+                    MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.RetireLogicalLog);
+
+                    if (wantTruncate && _fileStore is not null)
+                    {
+                        try
+                        {
+                            _ = _fileStore.ResetMvccCheckpointWal(busyTimeout);
+                        }
+                        catch (SqlitePagerBusyException)
+                        {
+                            // The main store and logical log are already durable. Retain the
+                            // validated WAL for a later restart rather than losing reader data.
+                            return stateMachine.Result(busy: true, logBefore, checkpointed);
+                        }
+                    }
+                    stateMachine.Enter(MvccCheckpointPhase.ResetWal);
+                    MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.ResetWal);
+
+                    store.GarbageCollectAfterCheckpoint(snapshot);
+                    stateMachine.Enter(MvccCheckpointPhase.GarbageCollect);
+                    MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.GarbageCollect);
+
+                    stateMachine.Enter(MvccCheckpointPhase.Complete);
+                    MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.Complete);
+                    return stateMachine.Result(
+                        busy: false,
+                        logBefore,
+                        checkpointedFrames: checkpointed);
                 }
-                stateMachine.Enter(MvccCheckpointPhase.ResetWal);
-                MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.ResetWal);
-
-                store.GarbageCollectAfterCheckpoint(snapshot);
-                stateMachine.Enter(MvccCheckpointPhase.GarbageCollect);
-                MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.GarbageCollect);
-
-                stateMachine.Enter(MvccCheckpointPhase.Complete);
-                MvccCheckpointFaultInjection.Hit(MvccCheckpointPhase.Complete);
-                return stateMachine.Result(
-                    busy: false,
-                    logBefore,
-                    checkpointedFrames: checkpointed);
+                finally
+                {
+                    merged.DisconnectOwnedVirtualTables();
+                }
             }
         }
     }
@@ -3624,6 +3884,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             _fileSystem!,
             out var catalog,
             readOnly: _readOnly);
+        var replacementCatalog = new SchemaCatalog(
+            catalog.Tables,
+            catalog.Views,
+            catalog.Triggers,
+            catalog.VirtualTables,
+            ownsVirtualTableInstances: true);
         try
         {
             var loadedVersion = ReadFileCatalogVersion(_fileSystem!, _databasePath);
@@ -3637,17 +3903,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var previous = _fileStore!;
             _fileStore = replacement;
             replacement = null;
-            PublishCatalog(new SchemaCatalog(
-                catalog.Tables,
-                catalog.Views,
-                catalog.Triggers,
-                catalog.VirtualTables),
-                loadedVersion);
+            PublishCatalog(replacementCatalog, loadedVersion);
             previous.Dispose();
             return true;
         }
         finally
         {
+            replacementCatalog.DisconnectOwnedVirtualTables();
             replacement?.Dispose();
         }
     }
@@ -3770,22 +4032,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
             out var catalog,
             readOnly: true,
             foreignReadOnly: true);
+        var replacementCatalog = new SchemaCatalog(
+            catalog.Tables,
+            catalog.Views,
+            catalog.Triggers,
+            catalog.VirtualTables,
+            ownsVirtualTableInstances: true);
         try
         {
             var previous = _fileStore;
             _fileStore = replacement;
             replacement = null;
             _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath, foreignReadOnly: true);
-            PublishCatalog(new SchemaCatalog(
-                catalog.Tables,
-                catalog.Views,
-                catalog.Triggers,
-                catalog.VirtualTables));
+            PublishCatalog(replacementCatalog);
             _foreignViewToken = _fileStore.CaptureCommittedViewToken();
             previous.Dispose();
         }
         finally
         {
+            replacementCatalog.DisconnectOwnedVirtualTables();
             replacement?.Dispose();
         }
     }
@@ -3848,21 +4113,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     _fileSystem,
                     out var catalog,
                     readOnly: _readOnly);
+                var replacementCatalog = new SchemaCatalog(
+                    catalog.Tables,
+                    catalog.Views,
+                    catalog.Triggers,
+                    catalog.VirtualTables,
+                    ownsVirtualTableInstances: true);
                 try
                 {
                     var previous = _fileStore;
                     _fileStore = replacement;
                     replacement = null;
                     _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
-                    PublishCatalog(new SchemaCatalog(
-                        catalog.Tables,
-                        catalog.Views,
-                        catalog.Triggers,
-                        catalog.VirtualTables));
+                    PublishCatalog(replacementCatalog);
                     previous.Dispose();
                 }
                 finally
                 {
+                    replacementCatalog.DisconnectOwnedVirtualTables();
                     replacement?.Dispose();
                 }
             }
@@ -3915,6 +4183,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     _fileSystem,
                     out var catalog,
                     readOnly: _readOnly);
+                var replacementCatalog = new SchemaCatalog(
+                    catalog.Tables,
+                    catalog.Views,
+                    catalog.Triggers,
+                    catalog.VirtualTables,
+                    ownsVirtualTableInstances: true);
                 try
                 {
                     var loadedVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
@@ -3927,17 +4201,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     var previous = _fileStore;
                     _fileStore = replacement;
                     replacement = null;
-                    PublishCatalog(
-                        new SchemaCatalog(
-                            catalog.Tables,
-                            catalog.Views,
-                            catalog.Triggers,
-                            catalog.VirtualTables),
-                        loadedVersion);
+                    PublishCatalog(replacementCatalog, loadedVersion);
                     previous.Dispose();
                 }
                 finally
                 {
+                    replacementCatalog.DisconnectOwnedVirtualTables();
                     replacement?.Dispose();
                 }
             }
@@ -3946,10 +4215,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private void PublishCatalog(SchemaCatalog catalog, FileCatalogVersion? fileCatalogVersion = null)
     {
+        var previousVirtualTables = _virtualTables;
         _tables = catalog.Tables;
         _views = catalog.Views;
         _triggers = catalog.Triggers;
         _virtualTables = catalog.VirtualTables;
+        catalog.RelinquishVirtualTableOwnership();
+        DisconnectReplacedVirtualTables(previousVirtualTables, _virtualTables);
         if (fileCatalogVersion is { } version)
             _fileCatalogVersion = version;
         else if (_fileStore is null)
@@ -3965,6 +4237,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (!_foreignReadOnly)
                 _ownedViewToken = _fileStore.CaptureCommittedViewToken();
         }
+    }
+
+    private static void DisconnectReplacedVirtualTables(
+        IReadOnlyDictionary<string, VirtualTableDefinition> previous,
+        IReadOnlyDictionary<string, VirtualTableDefinition> replacement)
+    {
+        var retained = new HashSet<ManagedVirtualTable>(
+            replacement.Values.Select(static definition => definition.Table),
+            ReferenceEqualityComparer.Instance);
+        foreach (var definition in previous.Values)
+        {
+            if (!retained.Contains(definition.Table))
+                definition.Table.DisconnectInstance();
+        }
+    }
+
+    private static void DisconnectVirtualTables(IEnumerable<VirtualTableDefinition> definitions)
+    {
+        foreach (var definition in definitions)
+            definition.Table.DisconnectInstance();
     }
 
     private static FileCatalogVersion ReadFileCatalogVersion(
@@ -4267,7 +4559,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         MvStore? concurrentMvStore = null,
         MvccTxId? concurrentMvccTxId = null,
         ChangeDataCaptureSession? changeDataCapture = null,
-        VdbeExecutionOptions? vdbeExecutionOptions = null)
+        VdbeExecutionOptions? vdbeExecutionOptions = null,
+        ManagedVirtualTableTransaction? virtualTableTransaction = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -4295,7 +4588,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 concurrentMvStore,
                 concurrentMvccTxId,
                 changeDataCapture,
-                vdbeExecutionOptions));
+                vdbeExecutionOptions,
+                virtualTableTransaction));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -4303,6 +4597,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (_readOnly && statementMayMutate)
             throw new EmbeddedSqlException("attempt to write a readonly database");
 
+        var ownsVirtualTableTransaction = virtualTableTransaction is null;
+        virtualTableTransaction ??= new ManagedVirtualTableTransaction();
         var cdcSchemaBefore = changeDataCapture is not null
             && MayChangeSchema(statement)
                 ? catalog.Clone()
@@ -4334,103 +4630,123 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ConcurrentMvccIdentityTracker: concurrentMvStore is null ? null : new ConcurrentMvccIdentityTracker(),
             MvccTextEncoding: GetTextEncoding(),
             VirtualTables: catalog.VirtualTables,
+            VirtualTableTransaction: virtualTableTransaction,
             ChangeDataCapture: changeDataCapture,
             VdbeExecutionOptions: vdbeExecutionOptions,
             CteMutationState: statement is QueryStatement && statementMayMutate
                 ? new CteMutationState()
                 : null,
             Database: this);
-        EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
-        var result = statement switch
+        try
         {
-            CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
-            CreateVirtualTableStatement createVirtual => ExecuteCreateVirtualTable(
-                createVirtual,
-                catalog,
-                context.InTransaction),
-            CreateTableAsSelectStatement => throw new InvalidOperationException(
-                "CREATE TABLE AS SELECT must be materialized by the owning connection."),
-            DropTableStatement drop => ExecuteDmlWithAutoIncrementState(
-                context,
-                scoped => scoped.ForeignKeysEnabled
-                    ? ExecuteWithForeignKeyStatement(
-                        scoped,
-                        () => ExecuteDropTable(drop, catalog, scoped))
-                    : ExecuteDropTable(drop, catalog, scoped)),
-            CreateIndexStatement createIndex => ExecuteCreateIndex(createIndex, catalog),
-            DropIndexStatement dropIndex => ExecuteDropIndex(dropIndex, tables),
-            CreateViewStatement createView => ExecuteCreateView(createView, catalog),
-            DropViewStatement dropView => ExecuteDropView(dropView, catalog),
-            CreateTriggerStatement createTrigger => ExecuteCreateTrigger(createTrigger, catalog, context),
-            DropTriggerStatement dropTrigger => ExecuteDropTrigger(dropTrigger, catalog),
-            AlterTableAddColumnStatement addColumn => ExecuteAlterTableAddColumn(addColumn, parameters, context),
-            AlterTableRenameStatement rename => ExecuteAlterTableRename(rename, catalog, context),
-            AlterTableRenameColumnStatement renameColumn => ExecuteAlterTableRenameColumn(
-                renameColumn,
-                catalog,
-                context),
-            AlterTableAlterColumnStatement alterColumn => ExecuteAlterTableAlterColumn(
-                alterColumn,
-                catalog,
-                parameters,
-                context),
-            AlterTableDropColumnStatement dropColumn => ExecuteAlterTableDropColumn(dropColumn, catalog, context),
-            InsertStatement insert => ExecuteDmlWithAutoIncrementState(
-                context,
-                scoped => ExecuteInsert(insert, parameters, scoped)),
-            UpdateStatement update => ExecuteDmlWithAutoIncrementState(
-                context,
-                scoped => ExecuteUpdate(update, parameters, scoped)),
-            DeleteStatement delete => ExecuteDmlWithAutoIncrementState(
-                context,
-                scoped => ExecuteDelete(delete, parameters, scoped)),
-            WithDmlStatement with => ExecuteDmlWithAutoIncrementState(
-                context,
-                scoped => ExecuteWithDml(with, parameters, scoped)),
-            ValuesClause values => ExecuteValuesStatement(values, parameters, context, null),
-            QueryStatement query => ExecutePotentiallyMutatingQuery(
-                query,
-                parameters,
-                context,
-                statementMayMutate),
-            PragmaTableInfoStatement tableInfo => ExecutePragmaTableInfo(tableInfo, context),
-            PragmaTableXInfoStatement tableXInfo => ExecutePragmaTableXInfo(tableXInfo, context),
-            PragmaIndexListStatement indexList => ExecutePragmaIndexList(indexList, tables),
-            PragmaIndexInfoStatement indexInfo => ExecutePragmaIndexInfo(indexInfo, tables),
-            PragmaIndexXInfoStatement indexXInfo => ExecutePragmaIndexXInfo(indexXInfo, tables),
-            PragmaForeignKeyListStatement foreignKeyList => ExecutePragmaForeignKeyList(foreignKeyList, tables),
-            PragmaForeignKeyCheckStatement foreignKeyCheck => ExecutePragmaForeignKeyCheck(foreignKeyCheck, tables),
-            PragmaIntegrityCheckStatement integrityCheck => ExecutePragmaIntegrityCheck(
-                integrityCheck,
-                tables,
-                parameters,
-                context),
-            PragmaTableListStatement tableList => ExecutePragmaTableList(
-                catalog,
-                tableList.Schema ?? "main",
-                tableList.Filter),
-            PragmaDatabaseListStatement => ExecutePragmaDatabaseList(),
-            PragmaEncodingStatement => ExecutePragmaEncoding(),
-            PragmaPageCountStatement => ExecutePragmaPageCount(),
-            PragmaFreelistCountStatement => ExecutePragmaFreelistCount(),
-            AnalyzeStatement analyze => ExecuteAnalyze(analyze, catalog),
-            ReindexStatement reindex => ExecuteReindex(reindex, catalog),
-            ExplainStatement explain => ExecuteExplain(explain, parameters, context),
-            ExplainQueryPlanStatement explainQueryPlan => ExecuteExplainQueryPlan(explainQueryPlan, parameters, context),
-            BeginStatement => ExecutionResult.Empty,
-            CommitStatement => ExecutionResult.Empty,
-            RollbackStatement => ExecutionResult.Empty,
-            SavepointStatement => ExecutionResult.Empty,
-            ReleaseSavepointStatement => ExecutionResult.Empty,
-            RollbackToSavepointStatement => ExecutionResult.Empty,
-            _ => throw new EmbeddedSqlException($"Unsupported statement type {statement.GetType().Name}."),
-        };
-        if (cdcSchemaBefore is not null && result.Changed)
-            changeDataCapture!.RecordSchemaChanges(context, cdcSchemaBefore, catalog, statement);
-        if (!inTransaction && changeDataCapture?.CompleteAutocommit(context) == true && !result.Changed)
-            result = result with { Changed = true };
+            EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
+            var result = statement switch
+            {
+                CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
+                CreateVirtualTableStatement createVirtual => ExecuteCreateVirtualTable(
+                    createVirtual,
+                    catalog,
+                    context.InTransaction),
+                CreateTableAsSelectStatement => throw new InvalidOperationException(
+                    "CREATE TABLE AS SELECT must be materialized by the owning connection."),
+                DropTableStatement drop => ExecuteDmlWithAutoIncrementState(
+                    context,
+                    scoped => scoped.ForeignKeysEnabled
+                        ? ExecuteWithForeignKeyStatement(
+                            scoped,
+                            () => ExecuteDropTable(drop, catalog, scoped))
+                        : ExecuteDropTable(drop, catalog, scoped)),
+                CreateIndexStatement createIndex => ExecuteCreateIndex(createIndex, catalog),
+                DropIndexStatement dropIndex => ExecuteDropIndex(dropIndex, tables),
+                CreateViewStatement createView => ExecuteCreateView(createView, catalog),
+                DropViewStatement dropView => ExecuteDropView(dropView, catalog),
+                CreateTriggerStatement createTrigger => ExecuteCreateTrigger(createTrigger, catalog, context),
+                DropTriggerStatement dropTrigger => ExecuteDropTrigger(dropTrigger, catalog),
+                AlterTableAddColumnStatement addColumn => ExecuteAlterTableAddColumn(addColumn, parameters, context),
+                AlterTableRenameStatement rename => ExecuteAlterTableRename(rename, catalog, context),
+                AlterTableRenameColumnStatement renameColumn => ExecuteAlterTableRenameColumn(
+                    renameColumn,
+                    catalog,
+                    context),
+                AlterTableAlterColumnStatement alterColumn => ExecuteAlterTableAlterColumn(
+                    alterColumn,
+                    catalog,
+                    parameters,
+                    context),
+                AlterTableDropColumnStatement dropColumn => ExecuteAlterTableDropColumn(dropColumn, catalog, context),
+                InsertStatement insert => ExecuteDmlWithAutoIncrementState(
+                    context,
+                    scoped => ExecuteInsert(insert, parameters, scoped)),
+                UpdateStatement update => ExecuteDmlWithAutoIncrementState(
+                    context,
+                    scoped => ExecuteUpdate(update, parameters, scoped)),
+                DeleteStatement delete => ExecuteDmlWithAutoIncrementState(
+                    context,
+                    scoped => ExecuteDelete(delete, parameters, scoped)),
+                WithDmlStatement with => ExecuteDmlWithAutoIncrementState(
+                    context,
+                    scoped => ExecuteWithDml(with, parameters, scoped)),
+                ValuesClause values => ExecuteValuesStatement(values, parameters, context, null),
+                QueryStatement query => ExecutePotentiallyMutatingQuery(
+                    query,
+                    parameters,
+                    context,
+                    statementMayMutate),
+                PragmaTableInfoStatement tableInfo => ExecutePragmaTableInfo(tableInfo, context),
+                PragmaTableXInfoStatement tableXInfo => ExecutePragmaTableXInfo(tableXInfo, context),
+                PragmaIndexListStatement indexList => ExecutePragmaIndexList(indexList, tables),
+                PragmaIndexInfoStatement indexInfo => ExecutePragmaIndexInfo(indexInfo, tables),
+                PragmaIndexXInfoStatement indexXInfo => ExecutePragmaIndexXInfo(indexXInfo, tables),
+                PragmaForeignKeyListStatement foreignKeyList => ExecutePragmaForeignKeyList(foreignKeyList, tables),
+                PragmaForeignKeyCheckStatement foreignKeyCheck => ExecutePragmaForeignKeyCheck(foreignKeyCheck, tables),
+                PragmaIntegrityCheckStatement integrityCheck => ExecutePragmaIntegrityCheck(
+                    integrityCheck,
+                    parameters,
+                    context),
+                PragmaTableListStatement tableList => ExecutePragmaTableList(
+                    catalog,
+                    tableList.Schema ?? "main",
+                    tableList.Filter),
+                PragmaDatabaseListStatement => ExecutePragmaDatabaseList(),
+                PragmaEncodingStatement => ExecutePragmaEncoding(),
+                PragmaPageCountStatement => ExecutePragmaPageCount(),
+                PragmaFreelistCountStatement => ExecutePragmaFreelistCount(),
+                AnalyzeStatement analyze => ExecuteAnalyze(analyze, catalog),
+                ReindexStatement reindex => ExecuteReindex(reindex, catalog),
+                OptimizeIndexStatement optimize => ExecuteOptimizeIndex(optimize, catalog),
+                ExplainStatement explain => ExecuteExplain(explain, parameters, context),
+                ExplainQueryPlanStatement explainQueryPlan => ExecuteExplainQueryPlan(explainQueryPlan, parameters, context),
+                BeginStatement => ExecutionResult.Empty,
+                CommitStatement => ExecutionResult.Empty,
+                RollbackStatement => ExecutionResult.Empty,
+                SavepointStatement => ExecutionResult.Empty,
+                ReleaseSavepointStatement => ExecutionResult.Empty,
+                RollbackToSavepointStatement => ExecutionResult.Empty,
+                _ => throw new EmbeddedSqlException($"Unsupported statement type {statement.GetType().Name}."),
+            };
+            if (cdcSchemaBefore is not null && result.Changed)
+                changeDataCapture!.RecordSchemaChanges(context, cdcSchemaBefore, catalog, statement);
+            if (!inTransaction && changeDataCapture?.CompleteAutocommit(context) == true && !result.Changed)
+                result = result with { Changed = true };
 
-        return result;
+            if (ownsVirtualTableTransaction)
+            {
+                virtualTableTransaction.Sync(catalog);
+                virtualTableTransaction.Commit(catalog);
+            }
+
+            return result;
+        }
+        catch
+        {
+            if (ownsVirtualTableTransaction)
+                virtualTableTransaction.Rollback(catalog);
+            throw;
+        }
+        finally
+        {
+            cdcSchemaBefore?.DisconnectOwnedVirtualTables();
+        }
     }
 
     private static ExecutionResult ExecutePragmaTableInfo(
@@ -4439,6 +4755,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
         {
+            if (context.VirtualTables is not null
+                && context.VirtualTables.TryGetValue(statement.TableName, out var virtualTable))
+            {
+                return new ExecutionResult(
+                    ["cid", "name", "type", "notnull", "dflt_value", "pk"],
+                    BuildPragmaVirtualTableColumnRows(virtualTable.Table.Schema, includeHidden: false),
+                    0);
+            }
             if (TryDescribeSchemaTable(statement.TableName, includeHidden: false, out var schemaRows))
             {
                 return new ExecutionResult(
@@ -4473,6 +4797,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
         {
+            if (context.VirtualTables is not null
+                && context.VirtualTables.TryGetValue(statement.TableName, out var virtualTable))
+            {
+                return new ExecutionResult(
+                    ["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"],
+                    BuildPragmaVirtualTableColumnRows(virtualTable.Table.Schema, includeHidden: true),
+                    0);
+            }
             if (TryDescribeSchemaTable(statement.TableName, includeHidden: true, out var schemaRows))
             {
                 return new ExecutionResult(
@@ -4499,6 +4831,41 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"],
             BuildPragmaColumnRows(table, includeGeneratedColumns: true),
             0);
+    }
+
+    private static SqlValue[][] BuildPragmaVirtualTableColumnRows(
+        ManagedVirtualTableSchema schema,
+        bool includeHidden)
+    {
+        var rows = new List<SqlValue[]>();
+        for (var index = 0; index < schema.Columns.Count; index++)
+        {
+            var column = schema.Columns[index];
+            if (column.IsHidden && !includeHidden)
+                continue;
+
+            var row = new List<SqlValue>
+            {
+                SqlValue.Integer(index),
+                SqlValue.Text(column.Name),
+                SqlValue.Text(column.DeclaredType ?? column.Affinity switch
+                {
+                    ManagedVirtualTableAffinity.Integer => "INTEGER",
+                    ManagedVirtualTableAffinity.Real => "REAL",
+                    ManagedVirtualTableAffinity.Text => "TEXT",
+                    ManagedVirtualTableAffinity.Numeric => "NUMERIC",
+                    _ => string.Empty,
+                }),
+                SqlValue.Integer(0),
+                SqlValue.Null,
+                SqlValue.Integer(0),
+            };
+            if (includeHidden)
+                row.Add(SqlValue.Integer(column.IsHidden ? 1 : 0));
+            rows.Add(row.ToArray());
+        }
+
+        return rows.ToArray();
     }
 
     // SQLite's table-valued PRAGMA functions resolve a view's columns from the view's
@@ -4630,6 +4997,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         catalog.Views,
                         catalog.Triggers));
             AddRow(name, "view", columns.Count, 0, 0);
+        }
+
+        foreach (var (name, virtualTable) in catalog.VirtualTables.OrderBy(
+                     pair => pair.Key,
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            AddRow(name, "virtual", virtualTable.Table.Schema.Columns.Count, 0, 0);
         }
 
         return new ExecutionResult(["schema", "name", "type", "ncol", "wr", "strict"], rows.ToArray(), 0);
@@ -4995,20 +5369,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// </remarks>
     private ExecutionResult ExecutePragmaIntegrityCheck(
         PragmaIntegrityCheckStatement statement,
-        IReadOnlyDictionary<string, EmbeddedTable> tables,
         SqlValue[] parameters,
         QueryContext context)
     {
         var columns = new[] { statement.Quick ? "quick_check" : "integrity_check" };
-        if (statement.TableName is { } requested && !tables.ContainsKey(requested))
+        if (statement.TableName is { } requested
+            && !context.Tables.ContainsKey(requested)
+            && (context.VirtualTables is null || !context.VirtualTables.ContainsKey(requested)))
+        {
             throw new EmbeddedSqlException($"no such table: {requested}");
+        }
 
         var maxErrors = statement.MaxErrors ?? DefaultIntegrityCheckErrorLimit;
         if (maxErrors <= 0)
             return new ExecutionResult(columns, [], 0);
 
         var problems = new List<string>();
-        foreach (var (tableName, table) in tables)
+        foreach (var (tableName, table) in context.Tables)
         {
             if (statement.TableName is { } selected
                 && !selected.Equals(tableName, StringComparison.OrdinalIgnoreCase))
@@ -5019,6 +5396,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 break;
 
             AppendIntegrityRowProblems(tableName, table, parameters, context, maxErrors, problems);
+        }
+
+        if (context.VirtualTables is not null)
+        {
+            foreach (var (tableName, virtualTable) in context.VirtualTables)
+            {
+                if (statement.TableName is { } selected
+                    && !selected.Equals(tableName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                foreach (var problem in virtualTable.Table.CheckIntegrity())
+                {
+                    if (problems.Count >= maxErrors)
+                        break;
+                    problems.Add(problem);
+                }
+            }
         }
 
         var rows = problems.Count == 0
@@ -5194,18 +5590,39 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"there is already an object named {statement.Name}");
         }
 
-        var table = ManagedVirtualTableModuleRegistry.Resolve(statement.ModuleName).Create(
-            new ManagedVirtualTableCreateContext(statement.Name, statement.Arguments));
-        ArgumentNullException.ThrowIfNull(table);
-        catalog.VirtualTables.Add(
-            statement.Name,
-            new VirtualTableDefinition(
-                statement.Name,
-                statement.ModuleName,
-                statement.Arguments.ToArray(),
-                table.GetPersistencePayload(),
-                table));
+        var context = new ManagedVirtualTableCreateContext(statement.Name, statement.Arguments);
+        var program = new VdbeProgram(
+            registerCount: 0,
+            cursorCount: 0,
+            [
+                new VCreateInstruction(
+                    statement.ModuleName,
+                    context,
+                    table =>
+                    {
+                        var payload = table.GetPersistencePayload();
+                        catalog.VirtualTables.Add(
+                            statement.Name,
+                            new VirtualTableDefinition(
+                                statement.Name,
+                                statement.ModuleName,
+                                statement.Arguments.ToArray(),
+                                payload,
+                                table));
+                    }),
+                new HaltInstruction(),
+            ]);
+        RunVirtualTableLifecycleProgram(program);
         return new ExecutionResult([], [], 0, true);
+    }
+
+    private static void RunVirtualTableLifecycleProgram(
+        VdbeProgram program,
+        IReadOnlyList<VdbeVirtualTableBinding?>? bindings = null)
+    {
+        using var runtime = new ResumableStatement(program, virtualTableBindings: bindings);
+        if (runtime.StepResumable() != ResumableStatementStepResult.Done)
+            throw new InvalidOperationException("A managed virtual-table lifecycle program yielded unexpectedly.");
     }
 
     // SQLite resolves functions in CHECK constraints when the CREATE TABLE statement is
@@ -5306,9 +5723,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (catalog.Views.ContainsKey(statement.Name))
             throw new EmbeddedSqlException($"use DROP VIEW to delete view {statement.Name}");
 
-        if (catalog.VirtualTables.Remove(statement.Name, out var virtualTable))
+        if (catalog.VirtualTables.TryGetValue(statement.Name, out var virtualTable))
         {
-            virtualTable.Table.Destroy();
+            var cursor = new Cursor(0);
+            RunVirtualTableLifecycleProgram(
+                new VdbeProgram(
+                    registerCount: 0,
+                    cursorCount: 1,
+                    [
+                        new VDestroyInstruction(cursor, statement.Name),
+                        new HaltInstruction(),
+                    ]),
+                [new VdbeVirtualTableBinding(virtualTable.Table)]);
+            catalog.VirtualTables.Remove(statement.Name);
             RemoveTriggersForTable(catalog, statement.Name);
             return new ExecutionResult([], [], 0, true);
         }
@@ -5543,6 +5970,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"table {statement.TableName} may not be indexed");
         if (IsSqliteSequenceTable(statement.TableName))
             throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be indexed");
+        if (catalog.VirtualTables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException("virtual tables may not be indexed");
         if (catalog.Views.ContainsKey(statement.TableName))
             throw new EmbeddedSqlException($"views may not be indexed");
         if (!tables.TryGetValue(statement.TableName, out var table))
@@ -5676,6 +6105,47 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 0,
                 Changed: true,
                 ForceFullCatalogRewrite: true);
+    }
+
+    private ExecutionResult ExecuteOptimizeIndex(OptimizeIndexStatement statement, SchemaCatalog catalog)
+    {
+        var selected = new List<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>();
+        if (statement.IndexName is null)
+        {
+            foreach (var (tableName, table) in catalog.Tables)
+            {
+                foreach (var index in table.Indexes)
+                {
+                    if (index.IsMethodIndex)
+                        selected.Add((tableName, table, index));
+                }
+            }
+        }
+        else if (TryFindIndex(catalog.Tables, statement.IndexName, out var table, out var index))
+        {
+            if (!index.IsMethodIndex)
+                return ExecutionResult.Empty;
+
+            var tableName = catalog.Tables.Single(entry => ReferenceEquals(entry.Value, table)).Key;
+            selected.Add((tableName, table, index));
+        }
+        else
+        {
+            throw new EmbeddedSqlException($"no such index: {statement.IndexName}");
+        }
+
+        foreach (var (tableName, table, index) in selected)
+        {
+            var attachment = ManagedIndexMethodSemantics.GetAttachment(tableName, table, index);
+            Indexing.ManagedIndexMethodMvcc.Ensure(attachment.Definition, IsMvccEnabled, forWrite: true);
+            using var cursor = attachment.Open(new EmbeddedTableIndexSource(table));
+            cursor.OpenWrite();
+            cursor.Optimize();
+        }
+
+        return selected.Count == 0
+            ? ExecutionResult.Empty
+            : new ExecutionResult([], [], 0, Changed: true);
     }
 
     private static void AddAllIndexes(
@@ -6269,6 +6739,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // semantics — turso-src/core/translate/trigger.rs checks get_trigger only).
         var targetsTable = tables.ContainsKey(statement.TableName);
         var targetsView = catalog.Views.ContainsKey(statement.TableName);
+        if (catalog.VirtualTables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException("cannot create triggers on virtual tables");
         // A temp trigger may watch a table in another schema. That table lives in a database this
         // instance cannot see, so the owning connection validates the target before routing here.
         if (statement.TargetSchema is null)
@@ -6328,6 +6800,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         if (IsSqliteSequenceTable(statement.TableName) && context.Tables.ContainsKey(statement.TableName))
             throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
+        if (context.VirtualTables?.ContainsKey(statement.TableName) == true)
+            throw new EmbeddedSqlException("virtual tables may not be altered");
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
         if (statement.Column.GeneratedStored)
@@ -6461,7 +6935,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         SchemaValidation = true,
                     });
 
-                virtualTable.Table.Rename(statement.NewName);
+                var cursor = new Cursor(0);
+                RunVirtualTableLifecycleProgram(
+                    new VdbeProgram(
+                        registerCount: 1,
+                        cursorCount: 1,
+                        [
+                            new LoadConstantInstruction(new Register(0), SqlValue.Text(statement.NewName)),
+                            new VRenameInstruction(cursor, new Register(0)),
+                            new HaltInstruction(),
+                        ]),
+                    [new VdbeVirtualTableBinding(virtualTable.Table)]);
                 catalog.VirtualTables.Remove(statement.TableName);
                 catalog.VirtualTables.Add(
                     statement.NewName,
@@ -6479,7 +6963,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
             finally
             {
-                virtualCandidateTable.Destroy();
+                virtualCandidateTable.DisconnectInstance();
             }
             return new ExecutionResult([], [], 0, true);
         }
@@ -6782,6 +7266,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var tables = catalog.Tables;
         if (IsSqliteSequenceTable(statement.TableName) && tables.ContainsKey(statement.TableName))
             throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
+        if (catalog.VirtualTables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException($"cannot rename columns of virtual table \"{statement.TableName}\"");
         if (!tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
@@ -6968,6 +7454,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
         }
+        if (catalog.VirtualTables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException("virtual tables may not be altered");
         if (!catalog.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
@@ -7317,6 +7805,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
         }
+        if (catalog.VirtualTables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException($"cannot drop column from virtual table \"{statement.TableName}\"");
         if (!catalog.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
@@ -8473,41 +8963,62 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        if (statement.Source is not null
-            || statement.Returning is not null
-            || statement.Upsert is not null
-            || statement.ConflictAlgorithm is not null)
-        {
-            throw new EmbeddedSqlException(
-                "managed virtual-table INSERT does not support INSERT ... SELECT, RETURNING, or conflict clauses");
-        }
+        if (statement.Upsert is not null)
+            throw new EmbeddedSqlException($"UPSERT not implemented for virtual table \"{statement.TableName}\"");
 
         var schema = definition.Table.Schema;
         var columns = statement.Columns ?? schema.VisibleColumns.Select(static column => column.Name).ToArray();
         var assignments = ResolveVirtualTableInsertColumns(schema, columns);
-        var mutations = new List<IReadOnlyList<SqlValue>>(statement.Rows.Count);
-        foreach (var row in statement.Rows)
+        var sourceResult = statement.Source is null
+            ? null
+            : ExecuteQuery(statement.Source, parameters, context, outerRow: null);
+        if (sourceResult is not null && sourceResult.Columns.Length != assignments.Length)
         {
-            if (row.Length != assignments.Length)
+            throw new EmbeddedSqlException(
+                $"{sourceResult.Columns.Length} values for {assignments.Length} columns");
+        }
+        var sourceRows = sourceResult?.Rows;
+        var inputCount = sourceRows?.Count ?? statement.Rows.Count;
+        var mutations = new List<VirtualTableMutation>(inputCount);
+        for (var rowIndex = 0; rowIndex < inputCount; rowIndex++)
+        {
+            var sourceValues = sourceRows is null ? null : sourceRows[rowIndex];
+            var expressionValues = sourceRows is null ? statement.Rows[rowIndex] : null;
+            var suppliedCount = sourceValues?.Length ?? expressionValues!.Length;
+            if (suppliedCount != assignments.Length)
             {
                 throw new EmbeddedSqlException(
-                    $"table {statement.TableName} has {columns.Length} columns but {row.Length} values were supplied");
+                    $"table {statement.TableName} has {columns.Length} columns but {suppliedCount} values were supplied");
             }
 
             var values = Enumerable.Repeat(SqlValue.Null, schema.Columns.Count).ToArray();
             long? newRowId = null;
-            for (var index = 0; index < row.Length; index++)
+            for (var index = 0; index < suppliedCount; index++)
             {
-                var value = Evaluate(row[index], parameters, null, context);
+                var value = sourceValues is null
+                    ? Evaluate(expressionValues![index], parameters, null, context)
+                    : sourceValues[index];
                 if (assignments[index] < 0)
                     newRowId = ManagedFts5Table.ReadRowId(value, "new rowid");
                 else
                     values[assignments[index]] = value;
             }
-            mutations.Add(BuildVirtualTableUpdateArguments(null, newRowId, values));
+
+            if (definition.Table is ManagedRTreeTable)
+                ApplyVirtualTableColumnAffinities(schema, values);
+            mutations.Add(new VirtualTableMutation(
+                BuildVirtualTableUpdateArguments(null, newRowId, values),
+                values,
+                newRowId ?? -1));
         }
 
-        return ExecuteVirtualTableMutations(context.VirtualTables!, definition, mutations);
+        return ExecuteVirtualTableMutations(
+            context,
+            definition,
+            mutations,
+            ToVirtualTableConflictMode(statement.ConflictAlgorithm),
+            statement.Returning,
+            parameters);
     }
 
     private ExecutionResult ExecuteVirtualTableUpdate(
@@ -8516,16 +9027,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        if (statement.Returning is not null
-            || statement.EffectiveOrderBy.Count != 0
-            || statement.Limit is not null
-            || statement.Offset is not null
-            || statement.From is not null
-            || statement.ConflictAlgorithm is not null)
-        {
-            throw new EmbeddedSqlException(
-                "managed virtual-table UPDATE does not support RETURNING, ORDER BY/LIMIT, FROM, or conflict clauses");
-        }
+        if (statement.Returning is not null)
+            throw new EmbeddedSqlException("UPDATE RETURNING is not available on virtual tables");
 
         var source = new NamedTableSource(statement.TableName, statement.Alias);
         var rows = GetVirtualTableRows(
@@ -8535,25 +9038,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
             context,
             maximumRows: null,
             outerRow: null,
-            statement.Where,
+            statement.From is null ? statement.Where : null,
             []);
         var assignments = ResolveVirtualTableInsertColumns(
             definition.Table.Schema,
             statement.Assignments.Select(static assignment => assignment.Column).ToArray());
-        var mutations = new List<IReadOnlyList<SqlValue>>();
-        foreach (var row in rows.Rows)
-        {
-            if (statement.Where is not null
-                && !IsVirtualTableResidualTrue(
-                    statement.Where,
-                    rows.OmittedVirtualTablePredicates,
-                    parameters,
-                    row,
-                    context))
-            {
-                continue;
-            }
+        foreach (var assignment in statement.Assignments)
+            ValidateAssignmentArity(assignment, context);
+        var candidates = BuildVirtualUpdateCandidates(statement, rows, parameters, context);
+        candidates = SelectLimitedVirtualDmlCandidates(
+            candidates,
+            statement.EffectiveOrderBy,
+            statement.Limit,
+            statement.Offset,
+            parameters,
+            context);
 
+        var mutations = new List<VirtualTableMutation>();
+        foreach (var candidate in candidates)
+        {
+            var row = candidate.Target;
             var values = row.Values.ToArray();
             if (definition.Table is ManagedFts5Table)
             {
@@ -8564,11 +9068,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 }
             }
             var newRowId = row.RowId;
+            var assignmentValues = new Dictionary<Expression, SqlValue[]>(ReferenceEqualityComparer.Instance);
             for (var index = 0; index < statement.Assignments.Count; index++)
             {
-                var value = Evaluate(statement.Assignments[index].Value, parameters, row, context);
+                var assignment = statement.Assignments[index];
+                var value = EvaluateAssignmentValue(
+                    new ResolvedAssignment(
+                        assignments[index],
+                        assignment.Value,
+                        assignment.ValueIndex,
+                        assignment.ValueCount),
+                    assignmentValues,
+                    parameters,
+                    candidate.Evaluation,
+                    context);
                 if (assignments[index] < 0)
                 {
+                    if (definition.Table is ManagedRTreeTable)
+                        continue;
                     newRowId = ManagedFts5Table.ReadRowId(value, "new rowid")
                         ?? throw new EmbeddedSqlException("datatype mismatch");
                 }
@@ -8577,10 +9094,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     values[assignments[index]] = value;
                 }
             }
-            mutations.Add(BuildVirtualTableUpdateArguments(row.RowId, newRowId, values));
+            mutations.Add(new VirtualTableMutation(
+                BuildVirtualTableUpdateArguments(row.RowId, newRowId, values),
+                values,
+                newRowId ?? row.RowId ?? -1));
         }
 
-        return ExecuteVirtualTableMutations(context.VirtualTables!, definition, mutations);
+        return ExecuteVirtualTableMutations(
+            context,
+            definition,
+            mutations,
+            ToVirtualTableConflictMode(statement.ConflictAlgorithm));
     }
 
     private ExecutionResult ExecuteVirtualTableDelete(
@@ -8589,14 +9113,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        if (statement.Returning is not null
-            || statement.EffectiveOrderBy.Count != 0
-            || statement.Limit is not null
-            || statement.Offset is not null)
-        {
-            throw new EmbeddedSqlException(
-                "managed virtual-table DELETE does not support RETURNING or ORDER BY/LIMIT");
-        }
+        if (statement.Returning is not null)
+            throw new EmbeddedSqlException("DELETE RETURNING is not available on virtual tables");
 
         var source = new NamedTableSource(statement.TableName, statement.Alias);
         var rows = GetVirtualTableRows(
@@ -8608,7 +9126,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             outerRow: null,
             statement.Where,
             []);
-        var mutations = rows.Rows
+        IReadOnlyList<VirtualDmlCandidate> candidates = rows.Rows
             .Where(row => statement.Where is null
                 || IsVirtualTableResidualTrue(
                     statement.Where,
@@ -8616,10 +9134,260 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     parameters,
                     row,
                     context))
-            .Select(row => BuildVirtualTableUpdateArguments(row.RowId, null, row.Values))
+            .Select((row, index) => new VirtualDmlCandidate(row, row, index))
             .ToArray();
-        return ExecuteVirtualTableMutations(context.VirtualTables!, definition, mutations);
+        candidates = SelectLimitedVirtualDmlCandidates(
+            candidates,
+            statement.EffectiveOrderBy,
+            statement.Limit,
+            statement.Offset,
+            parameters,
+            context);
+        var mutations = candidates
+            .Select(candidate => new VirtualTableMutation(
+                BuildVirtualTableUpdateArguments(candidate.Target.RowId, null, candidate.Target.Values),
+                candidate.Target.Values,
+                candidate.Target.RowId ?? -1))
+            .ToArray();
+        return ExecuteVirtualTableMutations(
+            context,
+            definition,
+            mutations,
+            ManagedVirtualTableConflictMode.Abort);
     }
+
+    private List<VirtualDmlCandidate> BuildVirtualUpdateCandidates(
+        UpdateStatement statement,
+        SourceData targetData,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var candidates = new List<VirtualDmlCandidate>();
+        if (statement.From is null)
+        {
+            for (var index = 0; index < targetData.Rows.Count; index++)
+            {
+                var row = targetData.Rows[index];
+                if (statement.Where is null
+                    || IsVirtualTableResidualTrue(
+                        statement.Where,
+                        targetData.OmittedVirtualTablePredicates,
+                        parameters,
+                        row,
+                        context))
+                {
+                    candidates.Add(new VirtualDmlCandidate(row, row, index));
+                }
+            }
+            return candidates;
+        }
+
+        RejectDuplicateUpdateFromQualifiers(statement.From, context);
+        RejectAmbiguousUpdateFromCoalescedColumns(statement.From, context);
+        var sourceData = GetSourceRows(
+            statement.From,
+            parameters,
+            context,
+            maximumRows: null,
+            outerRow: null);
+        var targetWidth = targetData.Columns.Length;
+        var joined = new JoinTableSource(
+            new NamedTableSource(statement.TableName, statement.TargetQualifier),
+            statement.From,
+            Condition: null,
+            JoinKind.Inner);
+        var outputColumns = GetOutputColumns(joined, context);
+        var columnDefinitions = GetSourceColumnDefinitions(joined, context);
+        var qualifiedColumnDefinitions = GetSourceQualifiedColumnDefinitions(joined, context);
+        var ambiguousQualifiedColumns = GetAmbiguousQualifiedColumns(joined, context);
+
+        for (var targetIndex = 0; targetIndex < targetData.Rows.Count; targetIndex++)
+        {
+            var target = targetData.Rows[targetIndex];
+            foreach (var sourceRow in sourceData.Rows)
+            {
+                context.CheckInterrupt();
+                var combined = new SourceRow(
+                    [.. target.Columns, .. sourceRow.Columns],
+                    [.. target.Values, .. sourceRow.Values],
+                    CombineQualifiedColumns(target.QualifiedColumns, sourceRow.QualifiedColumns, targetWidth),
+                    OutputColumns: outputColumns,
+                    RowId: target.RowId,
+                    RowIdQualifier: statement.TargetQualifier,
+                    QualifiedRowIds: CombineQualifiedRowIds(
+                        GetQualifiedRowIds(target),
+                        GetQualifiedRowIds(sourceRow)),
+                    ColumnDefinitions: columnDefinitions,
+                    QualifiedColumnDefinitions: qualifiedColumnDefinitions,
+                    AmbiguousQualifiedColumns: ambiguousQualifiedColumns,
+                    QualifiedMethodIndexSources: CombineMethodIndexSources(
+                        GetMethodIndexSources(target),
+                        GetMethodIndexSources(sourceRow)),
+                    QualifiedFts5Sources: CombineFts5Sources(
+                        GetFts5Sources(target),
+                        GetFts5Sources(sourceRow)));
+                if (statement.Where is not null
+                    && !IsTrue(Evaluate(statement.Where, parameters, combined, context)))
+                {
+                    continue;
+                }
+
+                candidates.Add(new VirtualDmlCandidate(target, combined, targetIndex));
+                break;
+            }
+        }
+
+        return candidates;
+    }
+
+    private List<VirtualDmlCandidate> SelectLimitedVirtualDmlCandidates(
+        IReadOnlyList<VirtualDmlCandidate> candidates,
+        IReadOnlyList<OrderByTerm> orderBy,
+        Expression? limitExpression,
+        Expression? offsetExpression,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (orderBy.Count == 0 && limitExpression is null && offsetExpression is null)
+            return candidates.ToList();
+
+        ValidateOrderByCollations(orderBy);
+        var limit = limitExpression is null
+            ? -1
+            : RequireLimitInteger(Evaluate(limitExpression, parameters, null, context));
+        var offset = offsetExpression is null
+            ? 0
+            : Math.Max(0, RequireLimitInteger(Evaluate(offsetExpression, parameters, null, context)));
+        if (limit == 0)
+            return [];
+
+        var decorated = candidates.Select(candidate => (
+            Candidate: candidate,
+            Keys: orderBy.Select(term => Evaluate(
+                term.Expression,
+                parameters,
+                candidate.Evaluation,
+                context)).ToArray())).ToList();
+        if (orderBy.Count != 0)
+        {
+            decorated.Sort((left, right) =>
+            {
+                for (var index = 0; index < orderBy.Count; index++)
+                {
+                    var comparison = CompareForOrdering(
+                        left.Keys[index],
+                        right.Keys[index],
+                        orderBy[index],
+                        GetCollation(orderBy[index].Expression));
+                    if (comparison != 0)
+                        return comparison;
+                }
+
+                return left.Candidate.Position.CompareTo(right.Candidate.Position);
+            });
+        }
+
+        return decorated
+            .Skip(offset > int.MaxValue ? int.MaxValue : (int)offset)
+            .Take(limit < 0 || limit > int.MaxValue ? int.MaxValue : (int)limit)
+            .Select(static item => item.Candidate)
+            .ToList();
+    }
+
+    private static void ApplyVirtualTableColumnAffinities(
+        ManagedVirtualTableSchema schema,
+        SqlValue[] values)
+    {
+        for (var index = 0; index < values.Length; index++)
+        {
+            values[index] = EmbeddedTable.ApplyColumnAffinity(
+                schema.Columns[index].Affinity switch
+                {
+                    ManagedVirtualTableAffinity.Text => ColumnAffinity.Text,
+                    ManagedVirtualTableAffinity.Numeric => ColumnAffinity.Numeric,
+                    ManagedVirtualTableAffinity.Integer => ColumnAffinity.Integer,
+                    ManagedVirtualTableAffinity.Real => ColumnAffinity.Real,
+                    _ => ColumnAffinity.Blob,
+                },
+                values[index]);
+        }
+    }
+
+    private ExecutionResult BuildVirtualTableReturningResult(
+        IReadOnlyList<Projection> returning,
+        VirtualTableDefinition definition,
+        IReadOnlyList<SqlValue[]> affectedRows,
+        IReadOnlyList<long> affectedRowIds,
+        int rowsAffected,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var schema = definition.Table.Schema;
+        var visibleIndexes = schema.Columns
+            .Select((column, index) => (column, index))
+            .Where(static item => !item.column.IsHidden)
+            .Select(static item => item.index)
+            .ToArray();
+        var visibleColumns = visibleIndexes.Select(index => schema.Columns[index].Name).ToArray();
+        var outputColumns = BuildOutputColumns(definition.Name, visibleColumns);
+        foreach (var projection in returning)
+        {
+            if (projection.Expression is QualifiedStarExpression)
+                throw new EmbeddedSqlException("RETURNING may not use TABLE.* wildcards");
+            if (projection.Expression is not StarExpression
+                && (ContainsAggregate(projection.Expression) || ContainsWindowFunction(projection.Expression)))
+            {
+                throw new EmbeddedSqlException("aggregate and window functions are not allowed in RETURNING");
+            }
+        }
+
+        var columnNames = GetColumnNames(returning, outputColumns, outputColumns);
+        var resultRows = new List<SqlValue[]>(affectedRows.Count);
+        var allColumns = schema.Columns.Select(static column => column.Name).ToArray();
+        for (var rowIndex = 0; rowIndex < affectedRows.Count; rowIndex++)
+        {
+            var values = affectedRows[rowIndex];
+            var rowId = affectedRowIds[rowIndex];
+            var row = new SourceRow(
+                allColumns,
+                values,
+                BuildQualifiedColumns(definition.Name, allColumns),
+                OutputColumns: outputColumns,
+                RowId: rowId,
+                RowIdQualifier: definition.Name,
+                QualifiedRowIds: new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [definition.Name] = rowId,
+                });
+            var output = new List<SqlValue>();
+            foreach (var projection in returning)
+            {
+                if (projection.Expression is StarExpression)
+                {
+                    foreach (var index in visibleIndexes)
+                        output.Add(values[index]);
+                }
+                else
+                {
+                    output.Add(Evaluate(projection.Expression, parameters, row, context));
+                }
+            }
+            resultRows.Add(output.ToArray());
+        }
+
+        return new ExecutionResult(columnNames, resultRows, rowsAffected, rowsAffected != 0);
+    }
+
+    private static ManagedVirtualTableConflictMode ToVirtualTableConflictMode(
+        InsertConflictAlgorithm? algorithm)
+        => algorithm switch
+        {
+            InsertConflictAlgorithm.Rollback => ManagedVirtualTableConflictMode.Rollback,
+            InsertConflictAlgorithm.Fail => ManagedVirtualTableConflictMode.Fail,
+            InsertConflictAlgorithm.Ignore => ManagedVirtualTableConflictMode.Ignore,
+            InsertConflictAlgorithm.Replace => ManagedVirtualTableConflictMode.Replace,
+            _ => ManagedVirtualTableConflictMode.Abort,
+        };
 
     private static int[] ResolveVirtualTableInsertColumns(
         ManagedVirtualTableSchema schema,
@@ -8694,65 +9462,119 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return arguments;
     }
 
-    private static ExecutionResult ExecuteVirtualTableMutations(
-        IReadOnlyDictionary<string, VirtualTableDefinition> virtualTables,
+    private ExecutionResult ExecuteVirtualTableMutations(
+        QueryContext context,
         VirtualTableDefinition definition,
-        IReadOnlyList<IReadOnlyList<SqlValue>> mutations)
+        IReadOnlyList<VirtualTableMutation> mutations,
+        ManagedVirtualTableConflictMode conflictMode,
+        IReadOnlyList<Projection>? returning = null,
+        SqlValue[]? parameters = null)
     {
         if (mutations.Count == 0)
-            return ExecutionResult.Empty;
-
-        var cursor = new Cursor(0);
-        var instructions = new List<VdbeInstruction>
         {
-            new VBeginInstruction(cursor),
-            new VOpenInstruction(cursor),
-        };
+            return returning is null
+                ? ExecutionResult.Empty
+                : BuildVirtualTableReturningResult(
+                    returning,
+                    definition,
+                    [],
+                    [],
+                    0,
+                    parameters ?? [],
+                    context);
+        }
+
+        context.VirtualTableTransaction?.Begin(definition);
+        var mutableVirtualTables = context.VirtualTables as Dictionary<string, VirtualTableDefinition>
+            ?? throw new InvalidOperationException("Managed virtual-table catalog must be mutable.");
+        var rowsAffected = 0;
+        long? lastInsertRowId = null;
+        var returnedRows = returning is null ? null : new List<SqlValue[]>();
+        var returnedRowIds = returning is null ? null : new List<long>();
         foreach (var mutation in mutations)
         {
-            for (var index = 0; index < mutation.Count; index++)
-                instructions.Add(new LoadConstantInstruction(new Register(index), mutation[index]));
+            var cursor = new Cursor(0);
+            var instructions = new List<VdbeInstruction>
+            {
+                new VOpenInstruction(cursor),
+            };
+            for (var index = 0; index < mutation.Arguments.Count; index++)
+                instructions.Add(new LoadConstantInstruction(new Register(index), mutation.Arguments[index]));
             instructions.Add(new VUpdateInstruction(
                 cursor,
-                new RegisterRange(new Register(0), mutation.Count),
-                new Register(mutation.Count)));
-        }
-        instructions.Add(new VSyncInstruction(cursor));
-        instructions.Add(new VCommitInstruction(cursor));
-        instructions.Add(new HaltInstruction());
+                new RegisterRange(new Register(0), mutation.Arguments.Count),
+                new Register(mutation.Arguments.Count),
+                conflictMode));
+            instructions.Add(new HaltInstruction());
 
-        var program = new VdbeProgram(
-            registerCount: mutations[0].Count + 1,
-            cursorCount: 1,
-            instructions: instructions);
-        try
-        {
+            var program = new VdbeProgram(
+                registerCount: mutation.Arguments.Count + 1,
+                cursorCount: 1,
+                instructions: instructions);
             using var statement = new ResumableStatement(
                 program,
                 virtualTableBindings: [new VdbeVirtualTableBinding(definition.Table)]);
-            if (statement.StepResumable() != ResumableStatementStepResult.Done)
-                throw new InvalidOperationException("A managed virtual-table mutation program yielded unexpectedly.");
-
-            var mutableVirtualTables = virtualTables as Dictionary<string, VirtualTableDefinition>
-                ?? throw new InvalidOperationException("Managed virtual-table catalog must be mutable.");
-            mutableVirtualTables[definition.Name] = definition.WithCurrentPersistencePayload();
-            return new ExecutionResult([], [], statement.RowsAffected, true)
+            try
             {
-                LastInsertRowId = statement.LastInsertRowId,
+                if (statement.StepResumable() != ResumableStatementStepResult.Done)
+                    throw new InvalidOperationException("A managed virtual-table mutation program yielded unexpectedly.");
+            }
+            catch (EmbeddedSqlException exception)
+                when (exception.ConflictAlgorithm == InsertConflictAlgorithm.Fail)
+            {
+                mutableVirtualTables[definition.Name] = definition.WithCurrentPersistencePayload();
+                throw new EmbeddedConflictFailException(
+                    exception,
+                    lastInsertRowId ?? context.LastInsertRowId);
+            }
+            catch (EmbeddedSqlException exception)
+                when (exception.ConflictAlgorithm == InsertConflictAlgorithm.Rollback)
+            {
+                throw new EmbeddedConflictRollbackException(
+                    exception,
+                    lastInsertRowId ?? context.LastInsertRowId);
+            }
+
+            if (statement.RowsAffected == 0)
+                continue;
+
+            rowsAffected = checked(rowsAffected + statement.RowsAffected);
+            if (mutation.Arguments[0].Kind == SqlValueKind.Null
+                && statement.LastInsertRowId is { } insertedRowId)
+            {
+                lastInsertRowId = insertedRowId;
+            }
+            if (returnedRows is not null)
+            {
+                returnedRows.Add(mutation.ReturningValues);
+                returnedRowIds!.Add(mutation.ReturningRowId);
+            }
+        }
+        mutableVirtualTables[definition.Name] = definition.WithCurrentPersistencePayload();
+
+        if (returning is not null)
+        {
+            return BuildVirtualTableReturningResult(
+                returning,
+                definition,
+                returnedRows!,
+                returnedRowIds!,
+                rowsAffected,
+                parameters ?? [],
+                context) with
+            {
+                LastInsertRowId = lastInsertRowId,
             };
         }
-        catch
+
+        return new ExecutionResult([], [], rowsAffected, rowsAffected != 0)
         {
-            definition.Table.Rollback();
-            throw;
-        }
+            LastInsertRowId = lastInsertRowId,
+        };
     }
 
     private ExecutionResult ExecuteInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
-        if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName), out var virtualTable))
-            return ExecuteVirtualTableInsert(statement, virtualTable, parameters, context);
-
         if (context.InsideTrigger && context.TriggerConflictAlgorithm is { } triggerConflictAlgorithm)
             statement = statement with { ConflictAlgorithm = triggerConflictAlgorithm };
         else if (context.InsideTrigger
@@ -8762,6 +9584,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             statement = statement with { ConflictAlgorithm = conflictOverride };
             context = context with { InheritedTriggerConflict = true };
         }
+        if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName), out var virtualTable))
+            return ExecuteVirtualTableInsert(statement, virtualTable, parameters, context);
+
         var mayReplaceRows = statement.ConflictAlgorithm == InsertConflictAlgorithm.Replace
             || context.Tables.TryGetValue(statement.TableName, out var triggerTable)
                 && triggerTable.HasNonDefaultConflictAlgorithms;
@@ -15782,6 +16607,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 Rows = streamingRows.Materialize(),
             };
         }
+        else if (result.Rows is StreamingVdbeRows vdbeRows)
+        {
+            result = result with
+            {
+                Rows = vdbeRows.Materialize(),
+            };
+        }
 
         if (!result.Rows.Any(row => row.Any(value => value.IsJson)))
             return result;
@@ -15807,6 +16639,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         context.CheckInterrupt();
         select = ConsumeTursoFullOuterDuplicateEquijoinWhere(select);
+        select = BindTableValuedFunctionSources(select, context);
         ValidateSelectIndexDirectives(select, context);
         select = StripUnusableForcedIndexForCountStar(select, context);
         select = ResolveSelectBindings(select, context, outerRow);
@@ -15887,16 +16720,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return ExecuteSelect(select, parameters, context, outerRow);
     }
 
-    // The evaluator streams this subset so callback failures and cancellation stay observable at the
-    // same row boundary as SQLite. Execution and EXPLAIN QUERY PLAN share this gate so the latter
-    // never reports a bytecode route that execution deliberately declines.
+    // Ordinary callback-capable scans stay on the evaluator's deferred projection path. Direct managed
+    // virtual-table/TVF scans are the exception: their compiled runtime itself streams one cursor row per
+    // Step, so cancellation and callback failures remain observable at the same boundary.
     private bool CanUseCompiledSelectRoute(
         SelectStatement select,
         QueryContext context,
         SourceRow? outerRow)
-        => context.ConcurrentMvStore is null
-            && (!context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
-            && !CanStreamProjectionRows(select, context, outerRow);
+    {
+        var isVirtualTableScan = select.Source is TableValuedFunctionSource
+            || select.Source is NamedTableSource named
+                && TryGetVirtualTable(context, named, out _);
+        return context.ConcurrentMvStore is null
+            && (isVirtualTableScan || !context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
+            && (isVirtualTableScan || !CanStreamProjectionRows(select, context, outerRow));
+    }
 
     // True when any node of the FROM tree is one of the internal semi/anti joins introduced by
     // the correlated-subquery rewrite. Those have no bytecode lowering, so the whole select
@@ -15923,6 +16761,20 @@ public sealed partial class EmbeddedDatabase : IDisposable
         select = ConsumeTursoFullOuterDuplicateEquijoinWhere(select);
         select = ResolveNamedWindows(select);
         context = EnterCollationSource(context, select.Source);
+
+        // fts_score() needs the current source identity and hidden rowid in every query position.
+        // Predicate delegates emitted by several compiled scan routes receive only declared column
+        // values, so lowering the call there would evaluate the scalar fallback (0.0) while the
+        // identical projection evaluates against the bound corpus. Keep the whole SELECT on the
+        // evaluator until compiled rows carry method-index source bindings as first-class metadata.
+        if (SelectContainsCorpusDependentMethodFunction(select))
+        {
+            compiled = null!;
+            return false;
+        }
+
+        if (TryCompileVirtualTableSelect(select, parameters, context, outerRow, out compiled))
+            return true;
 
         // A statement the optimizer can serve from a managed index method stays on the evaluator,
         // which is the only path that runs a method cursor. Without this the bytecode compiler would
@@ -15955,6 +16807,36 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return TryCompileGeneralJoinSelect(select, parameters, context, outerRow, out compiled);
         }
 
+        return TryCompileSelectRemainder(select, parameters, context, outerRow, out compiled);
+    }
+
+    private static bool SelectContainsCorpusDependentMethodFunction(SelectStatement select)
+    {
+        static bool Contains(Expression? expression)
+            => expression is not null
+                && IndexExpressionSemantics.ContainsFunction(
+                    expression,
+                    static (name, _) => EmbeddedTable.IsCorpusDependentMethodFunction(name));
+
+        return select.Projections.Any(projection => Contains(projection.Expression))
+            || Contains(select.Where)
+            || select.GroupBy.Any(Contains)
+            || Contains(select.Having)
+            || select.NamedWindows.Any(window =>
+                window.Specification.PartitionBy.Any(Contains)
+                || window.Specification.OrderBy.Any(term => Contains(term.Expression)))
+            || select.OrderBy.Any(term => Contains(term.Expression))
+            || Contains(select.Limit)
+            || Contains(select.Offset);
+    }
+
+    private bool TryCompileSelectRemainder(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+    {
         // A bare star over a lowerable derived query is the same result stream with only a metadata
         // boundary. Reuse the child's program so nested compounds remain fully compiled.
         if (TryCompileDerivedPassThroughSelect(select, parameters, context, outerRow, out compiled))
@@ -16745,7 +17627,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 : new CompiledSelect(
                     gatedDistinct,
                     compiledDistinct.CursorSources,
-                    compiledDistinct.ParameterIndices);
+                    compiledDistinct.ParameterIndices,
+                    compiledDistinct.VirtualTableBindings,
+                    compiledDistinct.StreamResults);
             return true;
         }
 
@@ -16803,7 +17687,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     : new CompiledSelect(
                         gatedAggregate,
                         compiledAggregate.CursorSources,
-                        compiledAggregate.ParameterIndices);
+                        compiledAggregate.ParameterIndices,
+                        compiledAggregate.VirtualTableBindings,
+                        compiledAggregate.StreamResults);
                 return true;
             }
 
@@ -16859,7 +17745,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 : new CompiledSelect(
                     gatedAggregate,
                     compiledAggregate.CursorSources,
-                    compiledAggregate.ParameterIndices);
+                    compiledAggregate.ParameterIndices,
+                    compiledAggregate.VirtualTableBindings,
+                    compiledAggregate.StreamResults);
             return true;
         }
 
@@ -16897,7 +17785,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var gated = LimitOffsetProgramBuilder.Apply(compiledBase.Program, offset, limit);
         compiled = ReferenceEquals(gated, compiledBase.Program)
             ? compiledBase
-            : new CompiledSelect(gated, compiledBase.CursorSources, compiledBase.ParameterIndices);
+            : new CompiledSelect(
+                gated,
+                compiledBase.CursorSources,
+                compiledBase.ParameterIndices,
+                compiledBase.VirtualTableBindings,
+                compiledBase.StreamResults);
         return true;
     }
 
@@ -17218,7 +18111,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var gated = LimitOffsetProgramBuilder.Apply(compiledBase.Program, offset, limit);
         compiled = ReferenceEquals(gated, compiledBase.Program)
             ? compiledBase
-            : new CompiledSelect(gated, compiledBase.CursorSources);
+            : new CompiledSelect(
+                gated,
+                compiledBase.CursorSources,
+                compiledBase.ParameterIndices,
+                compiledBase.VirtualTableBindings,
+                compiledBase.StreamResults);
         return true;
     }
 
@@ -17623,6 +18521,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? outerRow,
         out CompiledSelect compiled)
     {
+        if (select.Source is TableValuedFunctionSource
+            || select.Source is NamedTableSource named
+                && TryGetVirtualTable(context, named, out _))
+        {
+            compiled = null!;
+            return false;
+        }
+
         if (TryPlanManagedIndexScan(select, context) is { } indexPlan)
         {
             if (IsAggregateSelect(select)
@@ -21721,23 +22627,30 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CancellationToken cancellationToken = default,
         VdbeExecutionOptions? executionOptions = null)
     {
-        using var runtime = ResumableStatement.CreateWithExecutionOptions(
+        var runtime = ResumableStatement.CreateWithExecutionOptions(
             compiled.Program,
             executionOptions ?? VdbeExecutionOptions.Default,
             compiled.CursorSources,
-            parameterBinding: parameterBinding);
-        var rows = new List<SqlValue[]>();
-        while (true)
+            parameterBinding: parameterBinding,
+            virtualTableBindings: compiled.VirtualTableBindings);
+        if (compiled.StreamResults)
+            return new ExecutionResult(columns, new StreamingVdbeRows(runtime, cancellationToken), 0);
+
+        using (runtime)
         {
-            switch (runtime.StepResumable(cancellationToken))
+            var rows = new List<SqlValue[]>();
+            while (true)
             {
-                case ResumableStatementStepResult.Row:
-                    rows.Add([.. runtime.CurrentRow!]);
-                    break;
-                case ResumableStatementStepResult.Done:
-                    return new ExecutionResult(columns, rows, 0);
-                default:
-                    throw new EmbeddedSqlException("Compiled program yielded during evaluation.");
+                switch (runtime.StepResumable(cancellationToken))
+                {
+                    case ResumableStatementStepResult.Row:
+                        rows.Add([.. runtime.CurrentRow!]);
+                        break;
+                    case ResumableStatementStepResult.Done:
+                        return new ExecutionResult(columns, rows, 0);
+                    default:
+                        throw new EmbeddedSqlException("Compiled program yielded during evaluation.");
+                }
             }
         }
     }
@@ -22859,6 +23772,8 @@ out bool hasReturning)
         QueryContext context)
     {
         var compilationContext = EnsureAutoIncrementStatementState(context);
+        if (statement.Inner is SelectStatement tableValuedSelect)
+            statement = statement with { Inner = BindTableValuedFunctionSources(tableValuedSelect, compilationContext) };
         ValidateStatementIndexDirectives(statement.Inner, compilationContext);
         if (statement.Inner is SelectStatement intersectionSelect
             && HasExplainSafeBounds(intersectionSelect)
@@ -22900,6 +23815,62 @@ out bool hasReturning)
 
         switch (statement.Inner)
         {
+            case CreateVirtualTableStatement createVirtual:
+                return DescribeProgram(new VdbeProgram(
+                    registerCount: 0,
+                    cursorCount: 0,
+                    [
+                        new VCreateInstruction(
+                            createVirtual.ModuleName,
+                            new ManagedVirtualTableCreateContext(
+                                createVirtual.Name,
+                                createVirtual.Arguments),
+                            static _ => { }),
+                        new HaltInstruction(),
+                    ]));
+            case DropTableStatement dropVirtual
+                when compilationContext.VirtualTables?.ContainsKey(dropVirtual.Name) == true:
+                return DescribeProgram(new VdbeProgram(
+                    registerCount: 0,
+                    cursorCount: 1,
+                    [
+                        new VDestroyInstruction(new Cursor(0), dropVirtual.Name),
+                        new HaltInstruction(),
+                    ]));
+            case AlterTableRenameStatement renameVirtual
+                when compilationContext.VirtualTables?.ContainsKey(renameVirtual.TableName) == true:
+                return DescribeProgram(new VdbeProgram(
+                    registerCount: 1,
+                    cursorCount: 1,
+                    [
+                        new LoadConstantInstruction(new Register(0), SqlValue.Text(renameVirtual.NewName)),
+                        new VRenameInstruction(new Cursor(0), new Register(0)),
+                        new HaltInstruction(),
+                    ]));
+            case InsertStatement insertVirtual
+                when TryGetVirtualTable(
+                    compilationContext,
+                    new NamedTableSource(insertVirtual.TableName),
+                    out var insertDefinition):
+                return DescribeProgram(BuildVirtualTableMutationExplainProgram(
+                    insertDefinition,
+                    ToVirtualTableConflictMode(insertVirtual.ConflictAlgorithm)));
+            case UpdateStatement updateVirtual
+                when TryGetVirtualTable(
+                    compilationContext,
+                    new NamedTableSource(updateVirtual.TableName, updateVirtual.Alias),
+                    out var updateDefinition):
+                return DescribeProgram(BuildVirtualTableMutationExplainProgram(
+                    updateDefinition,
+                    ToVirtualTableConflictMode(updateVirtual.ConflictAlgorithm)));
+            case DeleteStatement deleteVirtual
+                when TryGetVirtualTable(
+                    compilationContext,
+                    new NamedTableSource(deleteVirtual.TableName, deleteVirtual.Alias),
+                    out var deleteDefinition):
+                return DescribeProgram(BuildVirtualTableMutationExplainProgram(
+                    deleteDefinition,
+                    ManagedVirtualTableConflictMode.Abort));
             case SelectStatement select
                 when HasExplainSafeBounds(select)
                     && TryCompileSelect(
@@ -22982,6 +23953,25 @@ out bool hasReturning)
             "EXPLAIN is only supported for statements lowered to the bytecode compiler.");
     }
 
+    private static VdbeProgram BuildVirtualTableMutationExplainProgram(
+        VirtualTableDefinition definition,
+        ManagedVirtualTableConflictMode conflictMode)
+    {
+        var argumentCount = definition.Table.Schema.Columns.Count + 2;
+        return new VdbeProgram(
+            registerCount: argumentCount + 1,
+            cursorCount: 1,
+            [
+                new VOpenInstruction(new Cursor(0)),
+                new VUpdateInstruction(
+                    new Cursor(0),
+                    new RegisterRange(new Register(0), argumentCount),
+                    new Register(argumentCount),
+                    conflictMode),
+                new HaltInstruction(),
+            ]);
+    }
+
     internal static string[] ExplainColumns() => ["addr", "opcode", "p1", "p2", "p3", "p4", "comment"];
 
     private ExecutionResult ExecuteExplainQueryPlan(
@@ -22990,7 +23980,37 @@ out bool hasReturning)
         QueryContext context)
     {
         var compilationContext = EnsureAutoIncrementStatementState(context);
+        if (statement.Inner is SelectStatement tableValuedSelect)
+            statement = statement with { Inner = BindTableValuedFunctionSources(tableValuedSelect, compilationContext) };
         ValidateStatementIndexDirectives(statement.Inner, compilationContext);
+        if (statement.Inner is SelectStatement
+            {
+                Source: NamedTableSource virtualSource,
+            } virtualSelect
+            && TryGetVirtualTable(compilationContext, virtualSource, out var virtualTable))
+        {
+            var plannerInput = ExtractVirtualTablePlannerInput(
+                virtualSource,
+                virtualTable.Table.Schema,
+                virtualSelect.Where,
+                virtualSelect.OrderBy,
+                virtualSelect.Limit,
+                virtualSelect.Offset);
+            var virtualPlan = virtualTable.Table.BestIndex(
+                plannerInput.Constraints,
+                plannerInput.OrderBy);
+            virtualPlan.ValidateFor(plannerInput.Constraints);
+            var virtualDetail = $"SCAN {virtualSource.Alias ?? virtualSource.Name} VIRTUAL TABLE INDEX {virtualPlan.IndexNumber}:";
+            if (!string.IsNullOrEmpty(virtualPlan.IndexString))
+                virtualDetail += virtualPlan.IndexString;
+            virtualDetail += string.Create(
+                CultureInfo.InvariantCulture,
+                $" (rows~{virtualPlan.EstimatedRows} cost~{virtualPlan.EstimatedCost:0.###}{(virtualSelect.OrderBy.Count != 0 ? virtualPlan.OrderByConsumed && plannerInput.OrderBy.Count == virtualSelect.OrderBy.Count ? " order=consumed" : " order=sort" : string.Empty)})");
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [[SqlValue.Integer(2), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text(virtualDetail)]],
+                0);
+        }
         if (statement.Inner is SelectStatement methodIndexSelect
             && TryPlanMethodIndexScanForSelect(methodIndexSelect, compilationContext, out var methodPlan))
         {
@@ -23266,6 +24286,18 @@ out bool hasReturning)
                 openWrite.ColumnCount,
                 openWrite.TableName,
                 $"open write cursor {openWrite.Cursor.Index} on {openWrite.TableName} ({openWrite.ColumnCount} cols)"),
+            VOpenInstruction => VdbeExplain.Describe(instruction),
+            VFilterInstruction => VdbeExplain.Describe(instruction),
+            VColumnInstruction => VdbeExplain.Describe(instruction),
+            VUpdateInstruction => VdbeExplain.Describe(instruction),
+            VNextInstruction => VdbeExplain.Describe(instruction),
+            VCreateInstruction => VdbeExplain.Describe(instruction),
+            VDestroyInstruction => VdbeExplain.Describe(instruction),
+            VRenameInstruction => VdbeExplain.Describe(instruction),
+            VBeginInstruction => VdbeExplain.Describe(instruction),
+            VSyncInstruction => VdbeExplain.Describe(instruction),
+            VCommitInstruction => VdbeExplain.Describe(instruction),
+            VRollbackInstruction => VdbeExplain.Describe(instruction),
             CloseCursorInstruction close => (close.Cursor.Index, 0, 0, null, $"close cursor {close.Cursor.Index}"),
             RewindCursorInstruction rewind => (
                 rewind.Cursor.Index,
@@ -25398,7 +26430,8 @@ out bool hasReturning)
                         ReadMethodIndexLimit(statement),
                         // Only this call site knows the whole statement, so it is the only one that
                         // can prove a method may return just the rows its pushed-down LIMIT keeps.
-                        AllowsMethodIndexRowTruncation(statement)));
+                        AllowsMethodIndexRowTruncation(statement),
+                        statement.Projections.Select(static projection => projection.Expression).ToArray()));
         var selectedRows = new List<SourceRow>();
         var selectedRowLimit = !streamProjectionRows
             && !hasAggregate
@@ -25619,7 +26652,7 @@ out bool hasReturning)
                 0);
         }
 
-        if (statement.OrderBy.Count > 0)
+        if (statement.OrderBy.Count > 0 && !source.OrderByConsumed)
         {
             var effectiveOrderBy = TruncateOrderByAfterUniqueRowid(
                 resolvedOrderBy,
@@ -28489,7 +29522,8 @@ out bool hasReturning)
         Expression? sourcePredicate = null,
         IReadOnlyList<OrderByTerm>? sourceOrderBy = null,
         long? sourceMethodLimit = null,
-        bool sourceAllowsMethodTruncation = false)
+        bool sourceAllowsMethodTruncation = false,
+        IReadOnlyList<Expression>? sourceResultExpressions = null)
     {
         if (source is null)
             return new SourceData([], [new SourceRow([], [], Parent: outerRow)]);
@@ -28525,7 +29559,8 @@ out bool hasReturning)
                     sourceOrderBy,
                     sourceMethodLimit ?? maximumRows,
                     out var methodIndexPlan,
-                    sourceAllowsMethodTruncation)
+                    sourceAllowsMethodTruncation,
+                    sourceResultExpressions)
                 => GetMethodIndexRows(methodIndexPlan, parameters, context, maximumRows, outerRow),
             NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare)
                 => GetSourceRows(bare, parameters, context, maximumRows, outerRow),
@@ -29314,8 +30349,25 @@ out bool hasReturning)
             return new SourceData(GetSourceColumns(source, context), []);
         }
 
+        var leftConstraintPredicate = source.Condition is null
+            ? leftPredicate
+            : leftPredicate is null
+                ? source.Condition
+                : new BinaryExpression(leftPredicate, BinaryOperator.And, source.Condition);
         var leftIsReverseCorrelatedTableFunction = IsReverseCorrelatedTableFunctionJoin(source, context);
-        var left = leftIsReverseCorrelatedTableFunction
+        var leftIsReverseCorrelatedVirtualTable = source.Kind == JoinKind.Inner
+            && source.Left is NamedTableSource leftVirtualSource
+            && !(source.Right is NamedTableSource rightNamed
+                && TryGetVirtualTable(context, rightNamed, out _))
+            && source.Right is not TableValuedFunctionSource
+            && ShouldUseCorrelatedVirtualTablePlan(
+                leftVirtualSource,
+                leftConstraintPredicate,
+                sourceOrderBy ?? [],
+                context);
+        var leftIsReverseCorrelatedSource =
+            leftIsReverseCorrelatedTableFunction || leftIsReverseCorrelatedVirtualTable;
+        var left = leftIsReverseCorrelatedSource
             ? new SourceData(GetSourceColumns(source.Left, context), [])
             : GetSideSourceRows(
                 source.Left,
@@ -29324,8 +30376,23 @@ out bool hasReturning)
                 context,
                 outerRow,
                 sourceOrderBy);
-        var rightIsCorrelatedTableFunction = source.Right is TableValuedFunctionSource { Arguments.Count: > 0 };
-        var right = rightIsCorrelatedTableFunction
+        var rightConstraintPredicate = source.Condition is null
+            ? rightPredicate
+            : rightPredicate is null
+                ? source.Condition
+                : new BinaryExpression(rightPredicate, BinaryOperator.And, source.Condition);
+        var rightIsCorrelatedTableFunction = !leftIsReverseCorrelatedSource
+            && source.Right is TableValuedFunctionSource { Arguments.Count: > 0 };
+        var rightIsCorrelatedVirtualTable = !leftIsReverseCorrelatedSource
+            && source.Kind == JoinKind.Inner
+            && source.Right is NamedTableSource rightVirtualSource
+            && ShouldUseCorrelatedVirtualTablePlan(
+                rightVirtualSource,
+                rightConstraintPredicate,
+                sourceOrderBy ?? [],
+                context);
+        var rightIsCorrelatedSource = rightIsCorrelatedTableFunction || rightIsCorrelatedVirtualTable;
+        var right = rightIsCorrelatedSource
             ? new SourceData(GetSourceColumns(source.Right, context), [])
             : GetSideSourceRows(
                 source.Right,
@@ -29347,7 +30414,7 @@ out bool hasReturning)
         var ambiguousQualifiedColumns = GetAmbiguousQualifiedColumns(source, context);
         var leftWidth = left.Columns.Length;
         var joinPairs = BuildJoinPairs(source, context);
-        var joinHashIndex = rightIsCorrelatedTableFunction ? null : TryBuildJoinHashIndex(source, right, context);
+        var joinHashIndex = rightIsCorrelatedSource ? null : TryBuildJoinHashIndex(source, right, context);
         IEnumerable<int>? allRightIndices = null;
 
         var rows = new List<SourceRow>();
@@ -29399,13 +30466,13 @@ out bool hasReturning)
                     GetFts5Sources(leftRow),
                     GetFts5Sources(rightRow)));
 
-        if (leftIsReverseCorrelatedTableFunction)
+        if (leftIsReverseCorrelatedSource)
         {
             foreach (var rightRow in right.Rows)
             {
                 var rowsForRight = GetSideSourceRows(
                     source.Left,
-                    leftPredicate,
+                    leftConstraintPredicate,
                     parameters,
                     context,
                     rightRow,
@@ -29438,10 +30505,10 @@ out bool hasReturning)
         var rightMatched = new bool[right.Rows.Count];
         foreach (var leftRow in left.Rows)
         {
-            var rowsForLeft = rightIsCorrelatedTableFunction
+            var rowsForLeft = rightIsCorrelatedSource
                 ? GetSideSourceRows(
                     source.Right,
-                    rightPredicate,
+                    rightConstraintPredicate,
                     parameters,
                     context,
                     leftRow,
@@ -29451,7 +30518,7 @@ out bool hasReturning)
             var matched = false;
             var candidateIndices = joinHashIndex is not null
                 ? joinHashIndex.Probe(leftRow)
-                : rightIsCorrelatedTableFunction
+                : rightIsCorrelatedSource
                     ? Enumerable.Range(0, rowsForLeft.Rows.Count)
                     : allRightIndices ??= Enumerable.Range(0, rowsForLeft.Rows.Count);
             foreach (var rightIndex in candidateIndices)
@@ -29471,7 +30538,7 @@ out bool hasReturning)
                 }
 
                 matched = true;
-                if (!rightIsCorrelatedTableFunction)
+                if (!rightIsCorrelatedSource)
                     rightMatched[rightIndex] = true;
                 rows.Add(row);
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
@@ -29511,7 +30578,7 @@ out bool hasReturning)
             }
         }
 
-        if (!rightIsCorrelatedTableFunction && source.Kind is JoinKind.Right or JoinKind.Full)
+        if (!rightIsCorrelatedSource && source.Kind is JoinKind.Right or JoinKind.Full)
         {
             for (var rightIndex = 0; rightIndex < right.Rows.Count; rightIndex++)
             {
@@ -31018,43 +32085,55 @@ out bool hasReturning)
     {
         var module = TableValuedFunctionRegistry.Resolve(source.Name);
         var schema = module.Schema;
-        var arguments = new SqlValue[schema.HiddenColumns.Count];
-        var supplied = new bool[schema.HiddenColumns.Count];
-        for (var index = 0; index < arguments.Length; index++)
+        var table = new TableValuedFunctionVirtualTable(module, source.Schema, context);
+        var constraints = new List<ManagedVirtualTableConstraint>();
+        var constraintArguments = new List<SqlValue>();
+        for (var index = 0; index < schema.HiddenColumns.Count; index++)
         {
             if (index < source.Arguments.Count)
             {
-                arguments[index] = Evaluate(source.Arguments[index], parameters, outerRow, context);
-                supplied[index] = true;
-            }
-            else
-            {
-                arguments[index] = SqlValue.Null;
+                constraints.Add(new ManagedVirtualTableConstraint(
+                    schema.VisibleColumns.Count + index,
+                    ManagedVirtualTableConstraintOperator.Equal));
+                constraintArguments.Add(Evaluate(source.Arguments[index], parameters, outerRow, context));
             }
         }
-
-        var produced = module.Enumerate(new TableValuedFunctionCall(
-            arguments,
-            supplied,
-            source.Schema,
-            maximumRows,
-            context));
+        if (maximumRows is { } limit)
+        {
+            constraints.Add(new ManagedVirtualTableConstraint(-1, ManagedVirtualTableConstraintOperator.Limit));
+            constraintArguments.Add(SqlValue.Integer(limit));
+        }
+        var plan = table.BestIndex(constraints, []);
+        plan.ValidateFor(constraints);
 
         var qualifier = source.Alias ?? source.Name;
         var columns = schema.AllColumns.ToArray();
         var qualifiedColumns = BuildQualifiedColumns(qualifier, schema.AllColumns);
         var outputColumns = BuildOutputColumns(qualifier, schema.VisibleColumns);
-        var rows = new List<SourceRow>(produced.Count);
-        foreach (var values in produced)
+        return new SourceData(columns, new LazyReadOnlyList<SourceRow>(EnumerateRows()));
+
+        IEnumerable<SourceRow> EnumerateRows()
         {
-            context.CheckInterrupt();
-            if (maximumRows is { } limit && rows.Count >= limit)
-                break;
-
-            rows.Add(new SourceRow(columns, values, qualifiedColumns, outerRow, outputColumns));
+            using var cursor = table.Open();
+            if (!cursor.Filter(plan, constraintArguments))
+                yield break;
+            while (!cursor.Eof)
+            {
+                context.CheckInterrupt();
+                var values = new SqlValue[columns.Length];
+                for (var index = 0; index < values.Length; index++)
+                    values[index] = cursor.Column(index);
+                yield return new SourceRow(
+                    columns,
+                    values,
+                    qualifiedColumns,
+                    outerRow,
+                    outputColumns,
+                    cursor.RowId,
+                    qualifier);
+                cursor.Next();
+            }
         }
-
-        return new SourceData(columns, rows);
     }
 
     private SourceData GetVirtualTableRows(
@@ -31068,11 +32147,17 @@ out bool hasReturning)
         IReadOnlyList<OrderByTerm> sourceOrderBy)
     {
         var schema = definition.Table.Schema;
-        var plannerInput = ExtractVirtualTablePlannerInput(source, schema, sourcePredicate, sourceOrderBy);
+        var plannerInput = ExtractVirtualTablePlannerInput(
+            source,
+            schema,
+            sourcePredicate,
+            sourceOrderBy,
+            availableOuterRow: outerRow);
         var plan = definition.Table.BestIndex(plannerInput.Constraints, plannerInput.OrderBy);
         plan.ValidateFor(plannerInput.Constraints);
         var arguments = BuildVirtualTableFilterArguments(plan, plannerInput.Expressions, parameters, outerRow, context);
         var omittedPredicates = plannerInput.Predicates
+            .Take(plannerInput.PredicateCount)
             .Where((_, index) => plan.ConstraintUsages[index].Omit)
             .ToArray();
 
@@ -31157,7 +32242,10 @@ out bool hasReturning)
         NamedTableSource source,
         ManagedVirtualTableSchema schema,
         Expression? predicate,
-        IReadOnlyList<OrderByTerm> orderBy)
+        IReadOnlyList<OrderByTerm> orderBy,
+        Expression? limit = null,
+        Expression? offset = null,
+        SourceRow? availableOuterRow = null)
     {
         var columnIndexes = schema.Columns
             .Select((column, index) => (column.Name, Index: index))
@@ -31169,7 +32257,13 @@ out bool hasReturning)
         {
             foreach (var conjunct in EnumerateConjuncts(predicate))
             {
-                if (TryExtractVirtualTableConstraint(source, columnIndexes, conjunct, out var constraint, out var argument))
+                if (TryExtractVirtualTableConstraint(
+                        source,
+                        columnIndexes,
+                        conjunct,
+                        availableOuterRow,
+                        out var constraint,
+                        out var argument))
                 {
                     constraints.Add(constraint);
                     expressions.Add(argument);
@@ -31177,11 +32271,16 @@ out bool hasReturning)
                 }
             }
         }
+        var predicateCount = constraints.Count;
+
+        AddSyntheticConstraint(limit, ManagedVirtualTableConstraintOperator.Limit);
+        AddSyntheticConstraint(offset, ManagedVirtualTableConstraintOperator.Offset);
 
         var orders = new List<ManagedVirtualTableOrderBy>();
         foreach (var term in orderBy)
         {
-            if (TryGetVirtualTableColumnIndex(source, columnIndexes, term.Expression, out var columnIndex))
+            if (term.NullPlacement == NullPlacement.Default
+                && TryGetVirtualTableColumnIndex(source, columnIndexes, term.Expression, out var columnIndex))
                 orders.Add(new ManagedVirtualTableOrderBy(columnIndex, term.Descending));
             else
             {
@@ -31190,37 +32289,63 @@ out bool hasReturning)
             }
         }
 
-        return new VirtualTablePlannerInput(constraints, expressions, predicates, orders);
+        return new VirtualTablePlannerInput(constraints, expressions, predicates, orders, predicateCount);
+
+        void AddSyntheticConstraint(Expression? expression, ManagedVirtualTableConstraintOperator operation)
+        {
+            if (expression is null || !IsSafeVirtualTableArgument(expression))
+                return;
+
+            constraints.Add(new ManagedVirtualTableConstraint(
+                -1,
+                operation,
+                IsVirtualTableArgumentUsable(expression, availableOuterRow)));
+            expressions.Add(expression);
+            predicates.Add(expression);
+        }
     }
 
     private static bool TryExtractVirtualTableConstraint(
         NamedTableSource source,
         IReadOnlyDictionary<string, int> columnIndexes,
         Expression predicate,
+        SourceRow? availableOuterRow,
         out ManagedVirtualTableConstraint constraint,
         out Expression argument)
     {
         if (predicate is LikeExpression { Negated: false, Escape: null } like
             && TryGetVirtualTableColumnIndex(source, columnIndexes, like.Value, out var likeColumn)
-            && !ReferencesVirtualTableColumn(source, columnIndexes, like.Pattern))
+            && !ReferencesVirtualTableColumn(source, columnIndexes, like.Pattern)
+            && IsSafeVirtualTableArgument(like.Pattern))
         {
-            constraint = new ManagedVirtualTableConstraint(likeColumn, ManagedVirtualTableConstraintOperator.Like);
+            constraint = new ManagedVirtualTableConstraint(
+                likeColumn,
+                ManagedVirtualTableConstraintOperator.Like,
+                IsVirtualTableArgumentUsable(like.Pattern, availableOuterRow));
             argument = like.Pattern;
             return true;
         }
         if (predicate is GlobExpression { Negated: false } glob
             && TryGetVirtualTableColumnIndex(source, columnIndexes, glob.Value, out var globColumn)
-            && !ReferencesVirtualTableColumn(source, columnIndexes, glob.Pattern))
+            && !ReferencesVirtualTableColumn(source, columnIndexes, glob.Pattern)
+            && IsSafeVirtualTableArgument(glob.Pattern))
         {
-            constraint = new ManagedVirtualTableConstraint(globColumn, ManagedVirtualTableConstraintOperator.Glob);
+            constraint = new ManagedVirtualTableConstraint(
+                globColumn,
+                ManagedVirtualTableConstraintOperator.Glob,
+                IsVirtualTableArgumentUsable(glob.Pattern, availableOuterRow));
             argument = glob.Pattern;
             return true;
         }
         if (predicate is FunctionExpression { Name: "MATCH", Arguments.Count: 2 } match
             && TryGetVirtualTableColumnIndex(source, columnIndexes, match.Arguments[1], out var matchColumn)
-            && !ReferencesVirtualTableColumn(source, columnIndexes, match.Arguments[0]))
+            && !ReferencesVirtualTableColumn(source, columnIndexes, match.Arguments[0])
+            && IsSafeVirtualTableArgument(match.Arguments[0]))
         {
-            constraint = new ManagedVirtualTableConstraint(matchColumn, ManagedVirtualTableConstraintOperator.Match);
+            constraint = new ManagedVirtualTableConstraint(
+                matchColumn,
+                ManagedVirtualTableConstraintOperator.Match,
+                IsVirtualTableArgumentUsable(match.Arguments[0], availableOuterRow));
             argument = match.Arguments[0];
             return true;
         }
@@ -31228,17 +32353,41 @@ out bool hasReturning)
             && TryMapVirtualTableOperator(binary.Operator, out var operation))
         {
             if (TryGetVirtualTableColumnIndex(source, columnIndexes, binary.Left, out var leftColumn)
-                && !ReferencesVirtualTableColumn(source, columnIndexes, binary.Right))
+                && !ReferencesVirtualTableColumn(source, columnIndexes, binary.Right)
+                && IsSafeVirtualTableArgument(binary.Right))
             {
-                constraint = new ManagedVirtualTableConstraint(leftColumn, operation);
+                operation = binary.Right is LiteralExpression { Value.Kind: SqlValueKind.Null }
+                    ? operation switch
+                    {
+                        ManagedVirtualTableConstraintOperator.Is => ManagedVirtualTableConstraintOperator.IsNull,
+                        ManagedVirtualTableConstraintOperator.IsNot => ManagedVirtualTableConstraintOperator.IsNotNull,
+                        _ => operation,
+                    }
+                    : operation;
+                constraint = new ManagedVirtualTableConstraint(
+                    leftColumn,
+                    operation,
+                    IsVirtualTableArgumentUsable(binary.Right, availableOuterRow));
                 argument = binary.Right;
                 return true;
             }
             if (TryGetVirtualTableColumnIndex(source, columnIndexes, binary.Right, out var rightColumn)
                 && !ReferencesVirtualTableColumn(source, columnIndexes, binary.Left)
+                && IsSafeVirtualTableArgument(binary.Left)
                 && TryReverseVirtualTableOperator(operation, out var reversed))
             {
-                constraint = new ManagedVirtualTableConstraint(rightColumn, reversed);
+                reversed = binary.Left is LiteralExpression { Value.Kind: SqlValueKind.Null }
+                    ? reversed switch
+                    {
+                        ManagedVirtualTableConstraintOperator.Is => ManagedVirtualTableConstraintOperator.IsNull,
+                        ManagedVirtualTableConstraintOperator.IsNot => ManagedVirtualTableConstraintOperator.IsNotNull,
+                        _ => reversed,
+                    }
+                    : reversed;
+                constraint = new ManagedVirtualTableConstraint(
+                    rightColumn,
+                    reversed,
+                    IsVirtualTableArgumentUsable(binary.Left, availableOuterRow));
                 argument = binary.Left;
                 return true;
             }
@@ -31247,6 +32396,80 @@ out bool hasReturning)
         constraint = default;
         argument = null!;
         return false;
+    }
+
+    private static bool IsSafeVirtualTableArgument(Expression expression)
+        => expression switch
+        {
+            LiteralExpression or ParameterExpression or ColumnExpression => true,
+            UnaryExpression unary when unary.Operator is UnaryOperator.Plus or UnaryOperator.Negate
+                => IsSafeVirtualTableArgument(unary.Operand),
+            CastExpression cast => IsSafeVirtualTableArgument(cast.Expression),
+            CollationExpression collation => IsSafeVirtualTableArgument(collation.Expression),
+            _ => false,
+        };
+
+    private static bool IsVirtualTableArgumentUsable(Expression expression, SourceRow? availableOuterRow)
+    {
+        var containsColumn = false;
+        Visit(expression);
+        return !containsColumn || availableOuterRow is not null;
+
+        void Visit(Expression current)
+        {
+            switch (current)
+            {
+                case ColumnExpression:
+                    containsColumn = true;
+                    break;
+                case UnaryExpression unary:
+                    Visit(unary.Operand);
+                    break;
+                case CastExpression cast:
+                    Visit(cast.Expression);
+                    break;
+                case CollationExpression collation:
+                    Visit(collation.Expression);
+                    break;
+            }
+        }
+    }
+
+    private bool ShouldUseCorrelatedVirtualTablePlan(
+            NamedTableSource source,
+            Expression? predicate,
+            IReadOnlyList<OrderByTerm> orderBy,
+            QueryContext context)
+    {
+        if (predicate is null || !TryGetVirtualTable(context, source, out var definition))
+            return false;
+
+        var unavailable = ExtractVirtualTablePlannerInput(
+            source,
+            definition.Table.Schema,
+            predicate,
+            orderBy);
+        if (!unavailable.Constraints.Any(static constraint => !constraint.Usable))
+            return false;
+
+        ManagedVirtualTablePlan unavailablePlan;
+        try
+        {
+            unavailablePlan = definition.Table.BestIndex(unavailable.Constraints, unavailable.OrderBy);
+            unavailablePlan.ValidateFor(unavailable.Constraints);
+        }
+        catch (EmbeddedSqlException)
+        {
+            return true;
+        }
+
+        var availableConstraints = unavailable.Constraints
+            .Select(static constraint => constraint with { Usable = true })
+            .ToArray();
+        var availablePlan = definition.Table.BestIndex(availableConstraints, unavailable.OrderBy);
+        availablePlan.ValidateFor(availableConstraints);
+        return availablePlan.EstimatedCost < unavailablePlan.EstimatedCost
+            || availablePlan.EstimatedRows < unavailablePlan.EstimatedRows;
     }
 
     private static IEnumerable<Expression> EnumerateConjuncts(Expression expression)
@@ -31287,6 +32510,16 @@ out bool hasReturning)
             return true;
         }
 
+        if (expression is ColumnExpression rowId
+            && (rowId.Qualifier is null
+                || string.Equals(rowId.Qualifier, source.Alias ?? source.Name, StringComparison.OrdinalIgnoreCase))
+            && EmbeddedTable.IsRowidAliasName(rowId.UnqualifiedName ?? rowId.Name)
+            && !columnIndexes.ContainsKey(rowId.UnqualifiedName ?? rowId.Name))
+        {
+            columnIndex = -1;
+            return true;
+        }
+
         columnIndex = default;
         return false;
     }
@@ -31317,6 +32550,9 @@ out bool hasReturning)
         virtualOperation = operation switch
         {
             BinaryOperator.Equal => ManagedVirtualTableConstraintOperator.Equal,
+            BinaryOperator.NotEqual => ManagedVirtualTableConstraintOperator.NotEqual,
+            BinaryOperator.Is => ManagedVirtualTableConstraintOperator.Is,
+            BinaryOperator.IsNot => ManagedVirtualTableConstraintOperator.IsNot,
             BinaryOperator.GreaterThan => ManagedVirtualTableConstraintOperator.GreaterThan,
             BinaryOperator.GreaterThanOrEqual => ManagedVirtualTableConstraintOperator.GreaterThanOrEqual,
             BinaryOperator.LessThan => ManagedVirtualTableConstraintOperator.LessThan,
@@ -31324,6 +32560,9 @@ out bool hasReturning)
             _ => default,
         };
         return operation is BinaryOperator.Equal
+            or BinaryOperator.NotEqual
+            or BinaryOperator.Is
+            or BinaryOperator.IsNot
             or BinaryOperator.GreaterThan
             or BinaryOperator.GreaterThanOrEqual
             or BinaryOperator.LessThan
@@ -31337,6 +32576,9 @@ out bool hasReturning)
         reversed = operation switch
         {
             ManagedVirtualTableConstraintOperator.Equal => ManagedVirtualTableConstraintOperator.Equal,
+            ManagedVirtualTableConstraintOperator.NotEqual => ManagedVirtualTableConstraintOperator.NotEqual,
+            ManagedVirtualTableConstraintOperator.Is => ManagedVirtualTableConstraintOperator.Is,
+            ManagedVirtualTableConstraintOperator.IsNot => ManagedVirtualTableConstraintOperator.IsNot,
             ManagedVirtualTableConstraintOperator.GreaterThan => ManagedVirtualTableConstraintOperator.LessThan,
             ManagedVirtualTableConstraintOperator.GreaterThanOrEqual => ManagedVirtualTableConstraintOperator.LessThanOrEqual,
             ManagedVirtualTableConstraintOperator.LessThan => ManagedVirtualTableConstraintOperator.GreaterThan,
@@ -31344,6 +32586,9 @@ out bool hasReturning)
             _ => default,
         };
         return operation is ManagedVirtualTableConstraintOperator.Equal
+            or ManagedVirtualTableConstraintOperator.NotEqual
+            or ManagedVirtualTableConstraintOperator.Is
+            or ManagedVirtualTableConstraintOperator.IsNot
             or ManagedVirtualTableConstraintOperator.GreaterThan
             or ManagedVirtualTableConstraintOperator.GreaterThanOrEqual
             or ManagedVirtualTableConstraintOperator.LessThan
@@ -31354,7 +32599,8 @@ out bool hasReturning)
         IReadOnlyList<ManagedVirtualTableConstraint> Constraints,
         IReadOnlyList<Expression> Expressions,
         IReadOnlyList<Expression> Predicates,
-        IReadOnlyList<ManagedVirtualTableOrderBy> OrderBy);
+        IReadOnlyList<ManagedVirtualTableOrderBy> OrderBy,
+        int PredicateCount);
 
     private static IReadOnlyList<QueryAffinityColumn> BuildTableValuedFunctionAffinities(
         TableValuedFunctionSource source)
@@ -36215,6 +37461,8 @@ out bool hasReturning)
             return EvaluateIif(function, parameters, row, context);
         if (!builtinIsShadowed && normalizedName == "LIKELIHOOD")
             ValidateLikelihood(function);
+        if (!builtinIsShadowed && normalizedName == "MATCH")
+            return EvaluateFtsMatchOperator(function, parameters, row, context);
 
         var arguments = function.Arguments.Select(argument => Evaluate(argument, parameters, row, context)).ToArray();
         if (!context.IndexExpression
@@ -36361,17 +37609,43 @@ out bool hasReturning)
             "VECTOR_SLICE" => SqliteVectorFunctions.Slice(arguments),
             "FTS_MATCH" => EvaluateFtsMatch(function, arguments, row, context),
             "FTS_SCORE" => EvaluateFtsScore(function, arguments, row, context),
-            "FTS_HIGHLIGHT" => Search.ManagedFtsFunctions.Highlight(
-                arguments,
-                ResolveBoundFtsTokenizer(function, row, context)),
+            "FTS_HIGHLIGHT" => Search.ManagedFtsFunctions.Highlight(arguments),
+            "FTS_HIGHLIGHT_LEGACY" => Search.ManagedFtsFunctions.HighlightLegacy(arguments),
             "FTS_SNIPPET" => Search.ManagedFtsFunctions.Snippet(
                 arguments,
                 ResolveBoundFtsTokenizer(function, row, context)),
             "BM25" => EvaluateFts5Bm25(function, arguments, row),
             "HIGHLIGHT" => EvaluateFts5Highlight(function, arguments, row),
             "SNIPPET" => EvaluateFts5Snippet(function, arguments, row),
+            "RTREECHECK" => EvaluateRTreeCheck(arguments, context),
+            "RTREENODE" => Spatial.ManagedRTreeFunctions.Node(arguments),
+            "RTREEDEPTH" => Spatial.ManagedRTreeFunctions.Depth(arguments),
             _ => throw new EmbeddedSqlException($"no such function: {function.Name}"),
         };
+    }
+
+    private static SqlValue EvaluateRTreeCheck(
+        IReadOnlyList<SqlValue> arguments,
+        QueryContext context)
+    {
+        if (arguments.Count is < 1 or > 2)
+            throw new EmbeddedSqlException("wrong number of arguments to function rtreecheck()");
+        if (arguments.Any(static argument => argument.Kind == SqlValueKind.Null))
+            throw new EmbeddedSqlException("SQL logic error");
+
+        var schema = arguments.Count == 2 ? ToSqlText(arguments[0]) : "main";
+        var tableName = ToSqlText(arguments[^1]);
+        if (!(schema.Equals("main", StringComparison.OrdinalIgnoreCase)
+                || schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+            || context.VirtualTables is null
+            || !context.VirtualTables.TryGetValue(tableName, out var definition)
+            || definition.Table is not ManagedRTreeTable)
+        {
+            throw new EmbeddedSqlException("SQL logic error");
+        }
+
+        var problems = definition.Table.CheckIntegrity();
+        return SqlValue.Text(problems.Count == 0 ? "ok" : string.Join('\n', problems));
     }
 
     private SqlValue EvaluateIif(
@@ -41099,6 +42373,9 @@ out bool hasReturning)
     /// compares equal to 12 and is still stored as text in a NUMERIC column. The math builtins use
     /// that stricter rule instead and yield NULL; see <c>TryGetMathOperand</c>.
     /// </summary>
+    internal static SqlValue ApplySqliteNumericAffinity(SqlValue value)
+        => ApplyNumericAffinity(value);
+
     private static SqlValue ApplyNumericAffinity(SqlValue value)
     {
         switch (value.Kind)
@@ -45064,14 +46341,20 @@ public sealed partial class EmbeddedConnection : IDisposable
 
         public void Commit()
         {
-            foreach (var pair in _foreignWrites)
+            foreach (var pair in _foreignWrites.ToArray())
             {
                 if (!pair.Value.Changed)
+                {
+                    pair.Value.Catalog.DisconnectOwnedVirtualTables();
+                    _foreignWrites.Remove(pair.Key);
                     continue;
+                }
 
                 if (connection.GetTransactionState(pair.Key) is { } transaction)
                 {
+                    var previous = transaction.Catalog;
                     transaction.Catalog = pair.Value.Catalog;
+                    previous.DisconnectOwnedVirtualTables(transaction.VirtualTableTransaction);
                     transaction.HasChanges = true;
                     transaction.ForceFullCatalogRewrite |= pair.Value.ForceFullCatalogRewrite;
                     if (!ReferenceEquals(pair.Key, connection._tempDatabase))
@@ -45086,8 +46369,14 @@ public sealed partial class EmbeddedConnection : IDisposable
                 }
                 if (ReferenceEquals(pair.Key, connection._tempDatabase))
                     connection._tempInitialized = true;
+                _foreignWrites.Remove(pair.Key);
             }
+        }
 
+        public void Abandon()
+        {
+            foreach (var write in _foreignWrites.Values)
+                write.Catalog.DisconnectOwnedVirtualTables();
             _foreignWrites.Clear();
         }
 
@@ -45237,36 +46526,48 @@ public sealed partial class EmbeddedConnection : IDisposable
             return null;
 
         var candidateCatalog = sourceCatalog.Clone();
-        var includeUnqualifiedReferences = !sourceCatalog.Tables.ContainsKey(rename.TableName);
-        var changed = false;
-        foreach (var trigger in sourceCatalog.Triggers.Values)
+        try
         {
-            var rewritten = AlterTableSqlRewriter.RenameTableReferences(
-                trigger.Sql,
-                rename.TableName,
-                rename.NewName,
-                targetSchema: "main",
-                includeUnqualifiedReferences);
-            if (rewritten is null || string.Equals(rewritten, trigger.Sql, StringComparison.Ordinal))
-                continue;
-
-            var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
-            var watchesRenamedMainTable = trigger.TargetSchema?.Equals(
-                "main",
-                StringComparison.OrdinalIgnoreCase) == true
-                && string.Equals(trigger.TableName, rename.TableName, StringComparison.OrdinalIgnoreCase);
-            candidateCatalog.Triggers[trigger.Name] = trigger with
+            var includeUnqualifiedReferences = !sourceCatalog.Tables.ContainsKey(rename.TableName);
+            var changed = false;
+            foreach (var trigger in sourceCatalog.Triggers.Values)
             {
-                TableName = watchesRenamedMainTable ? rename.NewName : trigger.TableName,
-                UpdateOfColumns = parsed.UpdateOfColumns,
-                When = parsed.When,
-                Body = parsed.Body,
-                Sql = parsed.Sql,
-            };
-            changed = true;
-        }
+                var rewritten = AlterTableSqlRewriter.RenameTableReferences(
+                    trigger.Sql,
+                    rename.TableName,
+                    rename.NewName,
+                    targetSchema: "main",
+                    includeUnqualifiedReferences);
+                if (rewritten is null || string.Equals(rewritten, trigger.Sql, StringComparison.Ordinal))
+                    continue;
 
-        return changed ? new PendingTempTriggerCatalogRewrite(candidateCatalog) : null;
+                var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+                var watchesRenamedMainTable = trigger.TargetSchema?.Equals(
+                    "main",
+                    StringComparison.OrdinalIgnoreCase) == true
+                    && string.Equals(trigger.TableName, rename.TableName, StringComparison.OrdinalIgnoreCase);
+                candidateCatalog.Triggers[trigger.Name] = trigger with
+                {
+                    TableName = watchesRenamedMainTable ? rename.NewName : trigger.TableName,
+                    UpdateOfColumns = parsed.UpdateOfColumns,
+                    When = parsed.When,
+                    Body = parsed.Body,
+                    Sql = parsed.Sql,
+                };
+                changed = true;
+            }
+
+            if (changed)
+                return new PendingTempTriggerCatalogRewrite(candidateCatalog);
+
+            candidateCatalog.DisconnectOwnedVirtualTables();
+            return null;
+        }
+        catch
+        {
+            candidateCatalog.DisconnectOwnedVirtualTables();
+            throw;
+        }
     }
 
     private void ValidateTempTableOwnedTriggers(CancellationToken cancellationToken)
@@ -45342,51 +46643,63 @@ public sealed partial class EmbeddedConnection : IDisposable
             renamedTable.Columns.ToArray());
         var rewriteSchema = CreateTempTriggerRenameColumnSchema(primarySchema, tempCatalog, alteredSchema);
         var candidateCatalog = tempCatalog.Clone();
-        var changed = false;
-        foreach (var trigger in tempCatalog.Triggers.Values)
+        try
         {
-            string? rewritten;
-            try
+            var changed = false;
+            foreach (var trigger in tempCatalog.Triggers.Values)
             {
-                rewritten = RenameColumnRewriter.RewriteSchemaObject(
-                    trigger.Sql,
-                    oldName,
-                    rename.NewName,
-                    rename.QuoteNewName,
-                    rewriteSchema);
-            }
-            catch (RenameColumnRewriteException exception)
-            {
-                throw new EmbeddedSqlException(
-                    $"error in trigger {trigger.Name} after rename: {exception.Message}",
-                    exception);
+                string? rewritten;
+                try
+                {
+                    rewritten = RenameColumnRewriter.RewriteSchemaObject(
+                        trigger.Sql,
+                        oldName,
+                        rename.NewName,
+                        rename.QuoteNewName,
+                        rewriteSchema);
+                }
+                catch (RenameColumnRewriteException exception)
+                {
+                    throw new EmbeddedSqlException(
+                        $"error in trigger {trigger.Name} after rename: {exception.Message}",
+                        exception);
+                }
+
+                if (rewritten is null)
+                    continue;
+
+                var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+                candidateCatalog.Triggers[trigger.Name] = trigger with
+                {
+                    UpdateOfColumns = parsed.UpdateOfColumns,
+                    When = parsed.When,
+                    Body = parsed.Body,
+                    Sql = parsed.Sql,
+                };
+                changed = true;
             }
 
-            if (rewritten is null)
-                continue;
-
-            var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
-            candidateCatalog.Triggers[trigger.Name] = trigger with
+            if (alteredSchema.Equals("main", StringComparison.OrdinalIgnoreCase))
             {
-                UpdateOfColumns = parsed.UpdateOfColumns,
-                When = parsed.When,
-                Body = parsed.Body,
-                Sql = parsed.Sql,
-            };
-            changed = true;
+                ValidateTempTriggersAfterMainColumnRename(
+                    rename,
+                    renamedTable,
+                    primaryCatalog,
+                    tempCatalog,
+                    candidateCatalog,
+                    cancellationToken);
+            }
+            if (changed)
+                return new PendingTempTriggerCatalogRewrite(candidateCatalog);
+
+            candidateCatalog.DisconnectOwnedVirtualTables();
+            return null;
         }
-
-        if (alteredSchema.Equals("main", StringComparison.OrdinalIgnoreCase))
+        catch
         {
-            ValidateTempTriggersAfterMainColumnRename(
-                rename,
-                renamedTable,
-                primaryCatalog,
-                tempCatalog,
-                candidateCatalog,
-                cancellationToken);
+            candidateCatalog.DisconnectOwnedVirtualTables();
+            throw;
         }
-        return changed ? new PendingTempTriggerCatalogRewrite(candidateCatalog) : null;
     }
 
     private void ValidateTempTriggersAfterMainColumnRename(
@@ -45457,61 +46770,75 @@ public sealed partial class EmbeddedConnection : IDisposable
             return;
         }
 
-        var mainCatalog = GetTransactionState(_database)?.Catalog ?? _database.SnapshotCatalog();
-        var tempCatalog = GetTransactionState(_tempDatabase)?.Catalog ?? _tempDatabase.SnapshotCatalog();
-        var alteredCatalog = ReferenceEquals(routed.Database, _database) ? mainCatalog : tempCatalog;
-        if (tempCatalog.Triggers.Count == 0
-            || !alteredCatalog.Tables.TryGetValue(drop.TableName, out var originalTable))
+        var ownedMainCatalog = GetTransactionState(_database) is null
+            ? _database.SnapshotCatalog()
+            : null;
+        var ownedTempCatalog = GetTransactionState(_tempDatabase) is null
+            ? _tempDatabase.SnapshotCatalog()
+            : null;
+        var mainCatalog = GetTransactionState(_database)?.Catalog ?? ownedMainCatalog!;
+        var tempCatalog = GetTransactionState(_tempDatabase)?.Catalog ?? ownedTempCatalog!;
+        try
         {
-            return;
+            var alteredCatalog = ReferenceEquals(routed.Database, _database) ? mainCatalog : tempCatalog;
+            if (tempCatalog.Triggers.Count == 0
+                || !alteredCatalog.Tables.TryGetValue(drop.TableName, out var originalTable))
+            {
+                return;
+            }
+
+            var replacement = originalTable.CreateWithoutColumn(drop.ColumnName, cancellationToken);
+            var candidateMainTables = new Dictionary<string, EmbeddedTable>(mainCatalog.Tables, StringComparer.OrdinalIgnoreCase);
+            var candidateTempTables = new Dictionary<string, EmbeddedTable>(tempCatalog.Tables, StringComparer.OrdinalIgnoreCase);
+            (ReferenceEquals(routed.Database, _database) ? candidateMainTables : candidateTempTables)[drop.TableName] = replacement;
+
+            var currentContext = CreateTempFirstValidationContext(
+                mainCatalog.Tables,
+                mainCatalog.Views,
+                tempCatalog.Tables,
+                tempCatalog.Views,
+                tempCatalog.Triggers);
+            var candidateContext = CreateTempFirstValidationContext(
+                candidateMainTables,
+                mainCatalog.Views,
+                candidateTempTables,
+                tempCatalog.Views,
+                tempCatalog.Triggers);
+            foreach (var trigger in tempCatalog.Triggers.Values)
+            {
+                // Explicitly qualified body statements are routed by the connection at execution time.
+                // This preflight only models unqualified temp-first resolution.
+                if (trigger.TargetSchema is not null
+                    || trigger.Body.Any(ContainsSchemaQualification))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    _tempDatabase.ValidateTriggerSchema(trigger, currentContext, cancellationToken);
+                }
+                catch (EmbeddedSqlException exception)
+                {
+                    throw new EmbeddedSqlException($"error in trigger {trigger.Name}: {exception.Message}", exception);
+                }
+
+                try
+                {
+                    _tempDatabase.ValidateTriggerSchema(trigger, candidateContext, cancellationToken);
+                }
+                catch (EmbeddedSqlException exception)
+                {
+                    throw new EmbeddedSqlException(
+                        $"error in trigger {trigger.Name} after drop column: {exception.Message}",
+                        exception);
+                }
+            }
         }
-
-        var replacement = originalTable.CreateWithoutColumn(drop.ColumnName, cancellationToken);
-        var candidateMainTables = new Dictionary<string, EmbeddedTable>(mainCatalog.Tables, StringComparer.OrdinalIgnoreCase);
-        var candidateTempTables = new Dictionary<string, EmbeddedTable>(tempCatalog.Tables, StringComparer.OrdinalIgnoreCase);
-        (ReferenceEquals(routed.Database, _database) ? candidateMainTables : candidateTempTables)[drop.TableName] = replacement;
-
-        var currentContext = CreateTempFirstValidationContext(
-            mainCatalog.Tables,
-            mainCatalog.Views,
-            tempCatalog.Tables,
-            tempCatalog.Views,
-            tempCatalog.Triggers);
-        var candidateContext = CreateTempFirstValidationContext(
-            candidateMainTables,
-            mainCatalog.Views,
-            candidateTempTables,
-            tempCatalog.Views,
-            tempCatalog.Triggers);
-        foreach (var trigger in tempCatalog.Triggers.Values)
+        finally
         {
-            // Explicitly qualified body statements are routed by the connection at execution time.
-            // This preflight only models unqualified temp-first resolution.
-            if (trigger.TargetSchema is not null
-                || trigger.Body.Any(ContainsSchemaQualification))
-            {
-                continue;
-            }
-
-            try
-            {
-                _tempDatabase.ValidateTriggerSchema(trigger, currentContext, cancellationToken);
-            }
-            catch (EmbeddedSqlException exception)
-            {
-                throw new EmbeddedSqlException($"error in trigger {trigger.Name}: {exception.Message}", exception);
-            }
-
-            try
-            {
-                _tempDatabase.ValidateTriggerSchema(trigger, candidateContext, cancellationToken);
-            }
-            catch (EmbeddedSqlException exception)
-            {
-                throw new EmbeddedSqlException(
-                    $"error in trigger {trigger.Name} after drop column: {exception.Message}",
-                    exception);
-            }
+            ownedMainCatalog?.DisconnectOwnedVirtualTables();
+            ownedTempCatalog?.DisconnectOwnedVirtualTables();
         }
     }
 
@@ -45675,7 +47002,9 @@ public sealed partial class EmbeddedConnection : IDisposable
     {
         if (GetTransactionState(_tempDatabase) is { } state)
         {
+            var previous = state.Catalog;
             state.Catalog = pending.Catalog;
+            previous.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
             state.HasChanges = true;
             state.PragmaHeader = state.PragmaHeader with
             {
@@ -45761,6 +47090,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         public bool HasSchemaChanges { get; set; }
         public bool ForceFullCatalogRewrite { get; set; }
         public HashSet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations { get; } = [];
+        public EmbeddedDatabase.ManagedVirtualTableTransaction VirtualTableTransaction { get; } = new();
     }
 
     private readonly record struct RoutedStatement(
@@ -46362,6 +47692,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 return ExecuteDetach(detach);
             case ReindexStatement reindex when IsMultiDatabaseReindex(reindex):
                 return ExecuteMultiDatabaseReindex(reindex, cancellationToken);
+            case OptimizeIndexStatement { IndexName: null } optimize:
+                return ExecuteMultiDatabaseOptimize(optimize, cancellationToken);
             case PragmaDatabaseListStatement databaseList:
                 ValidatePragmaSchema(databaseList.Schema);
                 return ExecutePragmaDatabaseList();
@@ -46449,6 +47781,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 routed.Database.TransactionLock.ThrowIfReadBlocked(this, BusyTimeout);
                 TransactionDatabaseState? transactionState = null;
                 EmbeddedDatabase.SchemaCatalog? statementCatalog = null;
+                int? virtualTableTransactionCheckpoint = null;
+                var retainVirtualTableParticipation = false;
                 HashSet<EmbeddedDatabase.ForeignKeyViolation>? deferredBefore = null;
                 var tempTriggers = CreateTempTriggerBridge(routed.Database, out var tempTriggerSession);
                 var changeDataCapture = _changeDataCapture;
@@ -46456,6 +47790,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                 var changeDataCaptureSnapshot = changeDataCapture?.Snapshot();
                 var pendingTempTriggerRewrite = PrepareTempTriggerTableRename(routed, cancellationToken)
                     ?? PrepareTempTriggerColumnRename(routed, cancellationToken);
+                var pendingTempTriggerPublished = false;
                 ValidateTempTriggersAfterDropColumn(routed, cancellationToken);
                 MvStore? concurrentStore = null;
                 MvccTxId? concurrentTxId = null;
@@ -46464,6 +47799,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                 {
                     ExecutionResult result;
                     transactionState = GetTransactionState(routed.Database);
+                    if (transactionState is not null && routedMayMutate)
+                    {
+                        virtualTableTransactionCheckpoint =
+                            transactionState.VirtualTableTransaction.CreateCheckpoint();
+                    }
                     if (transactionState is not null
                         && _foreignKeys
                         && routedMayMutate)
@@ -46504,7 +47844,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 concurrentMvStore: concurrentStore,
                                 concurrentMvccTxId: concurrentTxId,
                                 changeDataCapture: changeDataCapture,
-                                vdbeExecutionOptions: vdbeExecutionOptions);
+                                vdbeExecutionOptions: vdbeExecutionOptions,
+                                virtualTableTransaction: transactionState?.VirtualTableTransaction);
                         }
                         else if (transactionState is null)
                         {
@@ -46567,7 +47908,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 concurrentMvStore: concurrentStore,
                                 concurrentMvccTxId: concurrentTxId,
                                 changeDataCapture: changeDataCapture,
-                                vdbeExecutionOptions: vdbeExecutionOptions);
+                                vdbeExecutionOptions: vdbeExecutionOptions,
+                                virtualTableTransaction: transactionState.VirtualTableTransaction);
                             if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not
@@ -46597,9 +47939,13 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     ?? throw new InvalidOperationException(
                                         "A transactional mutation lost its statement catalog."),
                                 deferredBefore);
+                            var previousCatalog = transactionState.Catalog;
                             transactionState.Catalog = statementCatalog
                                 ?? throw new InvalidOperationException(
                                     "A transactional mutation lost its statement catalog.");
+                            previousCatalog.DisconnectOwnedVirtualTables(
+                                transactionState.VirtualTableTransaction);
+                            retainVirtualTableParticipation = true;
                             transactionState.HasChanges = true;
                             transactionState.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
                             if (!ReferenceEquals(routed.Database, _tempDatabase))
@@ -46630,7 +47976,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                         _tempInitialized = true;
 
                     if (result.Changed && pendingTempTriggerRewrite is not null)
+                    {
                         PublishTempTriggerCatalogRewrite(pendingTempTriggerRewrite);
+                        pendingTempTriggerPublished = true;
+                    }
 
                     ReleaseConcurrentStatementSavepoint(
                         concurrentStore,
@@ -46690,8 +48039,12 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 ?? throw new InvalidOperationException(
                                     "A partial transactional mutation lost its statement catalog."),
                             deferredBefore);
+                        var previousCatalog = transactionState.Catalog;
                         transactionState.Catalog = statementCatalog
                             ?? throw new InvalidOperationException("A partial transactional mutation lost its statement catalog.");
+                        previousCatalog.DisconnectOwnedVirtualTables(
+                            transactionState.VirtualTableTransaction);
+                        retainVirtualTableParticipation = true;
                         transactionState.HasChanges = true;
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
@@ -46719,9 +48072,13 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 ?? throw new InvalidOperationException(
                                     "A partial recursive trigger mutation lost its statement catalog."),
                             deferredBefore);
+                        var previousCatalog = transactionState.Catalog;
                         transactionState.Catalog = statementCatalog
                             ?? throw new InvalidOperationException(
                                 "A partial recursive trigger mutation lost its statement catalog.");
+                        previousCatalog.DisconnectOwnedVirtualTables(
+                            transactionState.VirtualTableTransaction);
+                        retainVirtualTableParticipation = true;
                         transactionState.HasChanges = true;
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
@@ -46775,6 +48132,23 @@ public sealed partial class EmbeddedConnection : IDisposable
                         mvccStatementSavepoint);
                     ReleaseConcurrentSchemaGateIfUnused();
                     throw;
+                }
+                finally
+                {
+                    tempTriggerSession?.Abandon();
+                    if (!retainVirtualTableParticipation
+                        && virtualTableTransactionCheckpoint is { } checkpoint
+                        && transactionState is not null)
+                    {
+                        transactionState.VirtualTableTransaction.RollbackTo(checkpoint);
+                    }
+                    if (statementCatalog is not null
+                        && !ReferenceEquals(transactionState?.Catalog, statementCatalog))
+                    {
+                        statementCatalog.DisconnectOwnedVirtualTables();
+                    }
+                    if (!pendingTempTriggerPublished)
+                        pendingTempTriggerRewrite?.Catalog.DisconnectOwnedVirtualTables();
                 }
         }
     }
@@ -47241,6 +48615,9 @@ public sealed partial class EmbeddedConnection : IDisposable
         return statement switch
         {
             CreateTableStatement create => RouteNamedStatement(create.Name, name => create with { Name = name }),
+            CreateVirtualTableStatement createVirtual => RouteNamedStatement(
+                createVirtual.Name,
+                name => createVirtual with { Name = name }),
             CreateTriggerStatement createTrigger => RouteCreateTrigger(createTrigger),
             CreateViewStatement createView => RouteCreateView(createView),
             DropTableStatement drop => RouteExistingNamedStatement(
@@ -47326,6 +48703,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                 => RouteSchema(schema, string.Empty, _ => tableList),
             AnalyzeStatement analyze => RouteAnalyze(analyze),
             ReindexStatement reindex => RouteReindex(reindex),
+            OptimizeIndexStatement optimize => RouteOptimizeIndex(optimize),
             WithDmlStatement with => RouteDataStatement(with),
             InsertStatement insert => RouteDataStatement(insert),
             UpdateStatement update => RouteDataStatement(update),
@@ -47428,6 +48806,19 @@ public sealed partial class EmbeddedConnection : IDisposable
         return RouteSchema(schema, statement.Target, name => statement with { Target = name });
     }
 
+    private RoutedStatement RouteOptimizeIndex(OptimizeIndexStatement statement)
+    {
+        if (statement.IndexName is null)
+            return new RoutedStatement(_database, statement, IsAttached: false);
+        if (ManagedSchemaName.TrySplit(statement.IndexName, out var schema, out var localName))
+            return RouteSchema(schema, localName, name => statement with { IndexName = name });
+
+        schema = FindExistingObjectSchema(statement.IndexName, ManagedSchemaObjectKind.Index);
+        return schema is null
+            ? new RoutedStatement(_database, statement, IsAttached: false)
+            : RouteSchema(schema, statement.IndexName, name => statement with { IndexName = name });
+    }
+
     private bool HasCollationAnywhere(string name)
     {
         if (_database.HasCollation(name) || _tempDatabase.HasCollation(name))
@@ -47495,27 +48886,37 @@ public sealed partial class EmbeddedConnection : IDisposable
                 }
                 else
                 {
-                    var catalog = state.Catalog.Clone();
-                    result = database.Execute(
-                        local,
-                        Array.Empty<SqlValue>(),
-                        catalog,
-                        _lastInsertRowId,
-                        _foreignKeys,
-                        _recursiveTriggers,
-                        _deferForeignKeys,
-                        inTransaction: true,
-                        cancellationToken);
-                    if (result.Changed || result.ForceFullCatalogRewrite)
+                    EmbeddedDatabase.SchemaCatalog? catalog = state.Catalog.Clone();
+                    try
                     {
-                        state.Catalog = catalog;
-                        state.HasChanges = true;
-                        state.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
-                        if (!ReferenceEquals(database, _tempDatabase))
-                            _transactionWriteDatabase = database;
-                    }
+                        result = database.Execute(
+                            local,
+                            Array.Empty<SqlValue>(),
+                            catalog,
+                            _lastInsertRowId,
+                            _foreignKeys,
+                            _recursiveTriggers,
+                            _deferForeignKeys,
+                            inTransaction: true,
+                            cancellationToken);
+                        if (result.Changed || result.ForceFullCatalogRewrite)
+                        {
+                            var previous = state.Catalog;
+                            state.Catalog = catalog;
+                            previous.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
+                            catalog = null;
+                            state.HasChanges = true;
+                            state.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
+                            if (!ReferenceEquals(database, _tempDatabase))
+                                _transactionWriteDatabase = database;
+                        }
 
-                    database.RecordChangeCounters(local, result);
+                        database.RecordChangeCounters(local, result);
+                    }
+                    finally
+                    {
+                        catalog?.DisconnectOwnedVirtualTables();
+                    }
                 }
 
                 changed |= result.Changed;
@@ -47529,6 +48930,82 @@ public sealed partial class EmbeddedConnection : IDisposable
         }
 
         return new ExecutionResult([], [], 0, changed, forceRewrite);
+    }
+
+    private ExecutionResult ExecuteMultiDatabaseOptimize(
+        OptimizeIndexStatement statement,
+        CancellationToken cancellationToken)
+    {
+        if (_queryOnly)
+            throw new EmbeddedSqlException("attempt to write a readonly database");
+
+        var changed = false;
+        foreach (var database in EnumerateReindexDatabases())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            database.TransactionLock.ThrowIfReadBlocked(this, BusyTimeout);
+            var mutationReserved = ReserveTransactionMutation(database, statement);
+            try
+            {
+                var state = GetTransactionState(database);
+                ExecutionResult result;
+                if (state is null)
+                {
+                    result = database.Execute(
+                        statement,
+                        Array.Empty<SqlValue>(),
+                        _lastInsertRowId,
+                        _foreignKeys,
+                        _recursiveTriggers,
+                        _deferForeignKeys,
+                        inTransaction: false,
+                        cancellationToken,
+                        synchronousMode: GetSynchronousMode(database));
+                }
+                else
+                {
+                    EmbeddedDatabase.SchemaCatalog? catalog = state.Catalog.Clone();
+                    try
+                    {
+                        result = database.Execute(
+                            statement,
+                            Array.Empty<SqlValue>(),
+                            catalog,
+                            _lastInsertRowId,
+                            _foreignKeys,
+                            _recursiveTriggers,
+                            _deferForeignKeys,
+                            inTransaction: true,
+                            cancellationToken);
+                        if (result.Changed)
+                        {
+                            var previous = state.Catalog;
+                            state.Catalog = catalog;
+                            previous.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
+                            catalog = null;
+                            state.HasChanges = true;
+                            if (!ReferenceEquals(database, _tempDatabase))
+                                _transactionWriteDatabase = database;
+                        }
+
+                        database.RecordChangeCounters(statement, result);
+                    }
+                    finally
+                    {
+                        catalog?.DisconnectOwnedVirtualTables();
+                    }
+                }
+
+                changed |= result.Changed;
+            }
+            finally
+            {
+                if (mutationReserved)
+                    ReleaseTransactionMutation(database);
+            }
+        }
+
+        return new ExecutionResult([], [], 0, changed);
     }
 
     private IEnumerable<EmbeddedDatabase> EnumerateReindexDatabases()
@@ -47637,7 +49114,8 @@ Func<string, ParsedStatement> rewrite)
         ManagedSchemaObjectKind kind)
         => kind switch
         {
-            ManagedSchemaObjectKind.Table => catalog.Tables.ContainsKey(objectName),
+            ManagedSchemaObjectKind.Table => catalog.Tables.ContainsKey(objectName)
+                || catalog.VirtualTables.ContainsKey(objectName),
             ManagedSchemaObjectKind.View => catalog.Views.ContainsKey(objectName),
             ManagedSchemaObjectKind.Trigger => catalog.Triggers.ContainsKey(objectName),
             ManagedSchemaObjectKind.Index => catalog.Tables.Values.Any(table =>
@@ -48005,7 +49483,7 @@ Func<string, ParsedStatement> rewrite)
 
         var sourceCatalog = getCatalog(sourceDatabase);
         var targetCatalog = getCatalog(targetDatabase);
-        var sourceTables = sourceCatalog.Clone().Tables;
+        var sourceTables = CloneExternalTables(sourceCatalog);
         var externalTables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
         var sourceNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in sourceTables)
@@ -48068,9 +49546,16 @@ Func<string, ParsedStatement> rewrite)
             attachment.Database,
             update with { TableName = targetTableName },
             IsAttached: true,
-            ExternalTables: mainCatalog.Clone().Tables);
+            ExternalTables: CloneExternalTables(mainCatalog));
         return true;
     }
+
+    private static Dictionary<string, EmbeddedTable> CloneExternalTables(
+        EmbeddedDatabase.SchemaCatalog catalog)
+        => catalog.Tables.ToDictionary(
+            static entry => entry.Key,
+            static entry => entry.Value.Clone(),
+            StringComparer.OrdinalIgnoreCase);
 
     private RoutedStatement RouteForSchemas(ParsedStatement statement, HashSet<string> schemas)
     {
@@ -49248,6 +50733,7 @@ Func<string, ParsedStatement> rewrite)
             AlterTableAlterColumnStatement alterColumn => ManagedSchemaName.TrySplit(alterColumn.TableName, out _, out _),
             AlterTableDropColumnStatement dropColumn => ManagedSchemaName.TrySplit(dropColumn.TableName, out _, out _),
             ReindexStatement { Target: { } target } => ManagedSchemaName.TrySplit(target, out _, out _),
+            OptimizeIndexStatement { IndexName: { } indexName } => ManagedSchemaName.TrySplit(indexName, out _, out _),
             InsertStatement insert => ManagedSchemaName.TrySplit(insert.TableName, out _, out _)
                 || insert.Rows.SelectMany(row => row).Any(ExpressionContainsSchemaQualification)
                 || (insert.Source is not null && QueryContainsSchemaQualification(insert.Source))
@@ -49574,6 +51060,8 @@ Func<string, ParsedStatement> rewrite)
         {
             foreach (var (database, txId) in mvccTxs)
                 database.MvStore?.Rollback(txId);
+            foreach (var state in states.Values)
+                state.Catalog.DisconnectOwnedVirtualTables();
             foreach (var database in states.Keys)
                 database.EndTransaction();
             ReleaseTransactionWriteReservations();
@@ -49947,6 +51435,9 @@ Func<string, ParsedStatement> rewrite)
             .Where(pair => pair.Value.HasChanges)
             .ToArray();
 
+        foreach (var state in _transactionDatabases.Values)
+            state.VirtualTableTransaction.Sync(state.Catalog);
+
         // SQLite only consults the commit hook when the transaction actually has something to
         // commit, and a veto turns the commit into a rollback.
         if (changed.Length != 0 && _hooks.CommitHook is { } commitHook && !InvokeHook(commitHook))
@@ -50058,7 +51549,15 @@ Func<string, ParsedStatement> rewrite)
         }
 
         CommitTemporaryTransaction(tempChange);
-        ResetTransactionState();
+        try
+        {
+            foreach (var state in _transactionDatabases.Values)
+                state.VirtualTableTransaction.Commit(state.Catalog);
+        }
+        finally
+        {
+            ResetTransactionState(rollbackVirtualTables: false);
+        }
         deferredMaintenanceFailure?.Throw();
     }
 
@@ -50934,21 +52433,37 @@ Func<string, ParsedStatement> rewrite)
         foreach (var (database, txId) in _mvccTransactions)
             database.MvStore?.BeginNamedSavepoint(txId, name);
 
-        _savepoints.Add(new SavepointEntry(
-            name,
-            _transactionDatabases!.ToDictionary(
-                pair => pair.Key,
-                pair => new SavepointDatabaseState(
-                    pair.Value.Catalog.Clone(),
-                    pair.Value.HasChanges,
-                    pair.Value.PragmaHeader,
-                    pair.Value.HasSnapshotPragmaHeader,
-                    pair.Value.HasSchemaChanges,
-                    pair.Value.ForceFullCatalogRewrite,
-                    new HashSet<EmbeddedDatabase.ForeignKeyViolation>(
-                        pair.Value.PendingDeferredViolations))),
-            _transactionWriteDatabase,
-            _changeDataCapture?.Snapshot()));
+        var snapshots = new Dictionary<EmbeddedDatabase, SavepointDatabaseState>();
+        try
+        {
+            foreach (var pair in _transactionDatabases!)
+            {
+                snapshots.Add(
+                    pair.Key,
+                    new SavepointDatabaseState(
+                        pair.Value.Catalog.Clone(),
+                        pair.Value.HasChanges,
+                        pair.Value.PragmaHeader,
+                        pair.Value.HasSnapshotPragmaHeader,
+                        pair.Value.HasSchemaChanges,
+                        pair.Value.ForceFullCatalogRewrite,
+                        pair.Value.VirtualTableTransaction.CreateCheckpoint(),
+                        new HashSet<EmbeddedDatabase.ForeignKeyViolation>(
+                            pair.Value.PendingDeferredViolations)));
+            }
+
+            _savepoints.Add(new SavepointEntry(
+                name,
+                snapshots,
+                _transactionWriteDatabase,
+                _changeDataCapture?.Snapshot()));
+        }
+        catch
+        {
+            foreach (var state in snapshots.Values)
+                state.Catalog.DisconnectOwnedVirtualTables();
+            throw;
+        }
     }
 
     private void ReleaseSavepoint(string name)
@@ -50967,6 +52482,11 @@ Func<string, ParsedStatement> rewrite)
 
         // RELEASE removes the named savepoint and every savepoint created after it,
         // keeping their changes in the enclosing scope.
+        for (var removed = index; removed < _savepoints.Count; removed++)
+        {
+            foreach (var state in _savepoints[removed].Databases.Values)
+                state.Catalog.DisconnectOwnedVirtualTables();
+        }
         _savepoints.RemoveRange(index, _savepoints.Count - index);
     }
 
@@ -50982,7 +52502,10 @@ Func<string, ParsedStatement> rewrite)
         foreach (var (database, savedState) in savepoint.Databases)
         {
             var state = _transactionDatabases[database];
+            var replacedCatalog = state.Catalog;
+            state.VirtualTableTransaction.RollbackTo(savedState.VirtualTableTransactionCheckpoint);
             state.Catalog = savedState.Catalog.Clone();
+            replacedCatalog.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
             state.HasChanges = savedState.HasChanges;
             state.PragmaHeader = savedState.PragmaHeader;
             state.HasSnapshotPragmaHeader = savedState.HasSnapshotPragmaHeader;
@@ -51005,7 +52528,14 @@ Func<string, ParsedStatement> rewrite)
 
         // ROLLBACK TO keeps the named savepoint but cancels any created after it.
         if (index + 1 < _savepoints.Count)
+        {
+            for (var removed = index + 1; removed < _savepoints.Count; removed++)
+            {
+                foreach (var state in _savepoints[removed].Databases.Values)
+                    state.Catalog.DisconnectOwnedVirtualTables();
+            }
             _savepoints.RemoveRange(index + 1, _savepoints.Count - index - 1);
+        }
     }
 
     private int FindSavepointIndex(string name)
@@ -51032,7 +52562,7 @@ Func<string, ParsedStatement> rewrite)
             database.MvStore?.CancelSchemaChange(txId);
     }
 
-    private void ResetTransactionState()
+    private void ResetTransactionState(bool rollbackVirtualTables = true)
     {
         var transactionDatabases = _transactionDatabases;
         _transactionDatabases = null;
@@ -51047,6 +52577,23 @@ Func<string, ParsedStatement> rewrite)
             _mvccTransactions.Clear();
         }
 
+        if (transactionDatabases is not null)
+        {
+            if (rollbackVirtualTables)
+            {
+                foreach (var state in transactionDatabases.Values)
+                    state.VirtualTableTransaction.Rollback(state.Catalog);
+            }
+
+            foreach (var state in transactionDatabases.Values)
+                state.Catalog.DisconnectOwnedVirtualTables();
+        }
+
+        foreach (var savepoint in _savepoints)
+        {
+            foreach (var state in savepoint.Databases.Values)
+                state.Catalog.DisconnectOwnedVirtualTables();
+        }
         _savepoints.Clear();
         _changeDataCapture?.ResetTransaction();
         _deferForeignKeys = false;
@@ -51071,6 +52618,7 @@ Func<string, ParsedStatement> rewrite)
         bool HasSnapshotPragmaHeader,
         bool HasSchemaChanges,
         bool ForceFullCatalogRewrite,
+        int VirtualTableTransactionCheckpoint,
         IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations);
 
     private void ThrowIfRecursiveTriggerCallbackReentry()
@@ -51200,9 +52748,12 @@ public sealed class EmbeddedStatement : IDisposable
             || EmbeddedDatabase.TryGetReturning(_statement, out _, out _))
         {
             ExecuteIfNeeded();
-            return _result!.Rows is StreamingProjectionRows streamingRows
-                ? streamingRows.HasAny()
-                : _result.Rows.Count > 0;
+            return _result!.Rows switch
+            {
+                StreamingProjectionRows streamingRows => streamingRows.HasAny(),
+                StreamingVdbeRows vdbeRows => vdbeRows.HasAny(),
+                _ => _result.Rows.Count > 0,
+            };
         }
 
         return false;
@@ -51241,11 +52792,34 @@ public sealed class EmbeddedStatement : IDisposable
     public StatementStepResult Step(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        cancellationToken.ThrowIfCancellationRequested();
+        if (cancellationToken.IsCancellationRequested)
+        {
+            DisposeStreamingRows();
+            ReleaseReaderLease();
+            cancellationToken.ThrowIfCancellationRequested();
+        }
         ExecuteIfNeeded(cancellationToken);
 
         var nextRowIndex = _rowIndex + 1;
-        if (_result!.Rows is StreamingProjectionRows streamingRows)
+        if (_result!.Rows is StreamingVdbeRows vdbeRows)
+        {
+            try
+            {
+                _currentRow = null;
+                if (vdbeRows.TryGetRow(nextRowIndex, cancellationToken, out var row))
+                {
+                    _currentRow = row;
+                    _rowIndex = nextRowIndex;
+                    return StatementStepResult.Row;
+                }
+            }
+            catch
+            {
+                ReleaseReaderLease();
+                throw;
+            }
+        }
+        else if (_result.Rows is StreamingProjectionRows streamingRows)
         {
             while (nextRowIndex < streamingRows.SourceCount && !streamingRows.IsComplete)
             {
@@ -51358,6 +52932,7 @@ public sealed class EmbeddedStatement : IDisposable
     {
         ThrowIfDisposed();
         ReleaseReaderLease();
+        DisposeStreamingRows();
         _result = null;
         _currentRow = null;
         _rowIndex = -1;
@@ -51382,6 +52957,7 @@ public sealed class EmbeddedStatement : IDisposable
     public void Dispose()
     {
         ReleaseReaderLease();
+        DisposeStreamingRows();
         _disposed = true;
         _result = null;
         _currentRow = null;
@@ -51430,14 +53006,23 @@ public sealed class EmbeddedStatement : IDisposable
             : _connection.OpenStatementReaderLease();
         try
         {
-            _result = _connection.Execute(_statement, _boundValues, cancellationToken);
-            if (!mayMutate)
-                cancellationToken.ThrowIfCancellationRequested();
-            if (HasPotentialRows(_result.Rows))
+            try
             {
-                _readerLease = executionLease
-                    ?? _connection.OpenStatementReaderLease();
-                executionLease = null;
+                _result = _connection.Execute(_statement, _boundValues, cancellationToken);
+                if (!mayMutate)
+                    cancellationToken.ThrowIfCancellationRequested();
+                if (HasPotentialRows(_result.Rows))
+                {
+                    _readerLease = executionLease
+                        ?? _connection.OpenStatementReaderLease();
+                    executionLease = null;
+                }
+            }
+            catch
+            {
+                DisposeStreamingRows();
+                _result = null;
+                throw;
             }
         }
         finally
@@ -51453,9 +53038,18 @@ public sealed class EmbeddedStatement : IDisposable
     }
 
     private static bool HasPotentialRows(IReadOnlyList<SqlValue[]> rows)
-        => rows is StreamingProjectionRows streamingRows
-            ? streamingRows.SourceCount != 0
-            : rows.Count != 0;
+        => rows switch
+        {
+            StreamingProjectionRows streamingRows => streamingRows.SourceCount != 0,
+            StreamingVdbeRows => true,
+            _ => rows.Count != 0,
+        };
+
+    private void DisposeStreamingRows()
+    {
+        if (_result?.Rows is IDisposable disposable)
+            disposable.Dispose();
+    }
 
     private void ReleaseReaderLease()
     {
@@ -54859,7 +56453,7 @@ internal sealed record SourceData(
     IReadOnlyList<Expression>? OmittedVirtualTablePredicates = null,
     bool OrderByConsumed = false);
 
-internal sealed class LazyReadOnlyList<T>(IEnumerable<T> source) : IReadOnlyList<T>
+internal sealed class LazyReadOnlyList<T>(IEnumerable<T> source) : IReadOnlyList<T>, IDisposable
 {
     private readonly object _gate = new();
     private readonly List<T> _cache = [];
@@ -54927,14 +56521,34 @@ internal sealed class LazyReadOnlyList<T>(IEnumerable<T> source) : IReadOnlyList
     {
         if (_source is null)
             return false;
-        if (_source.MoveNext())
+        try
         {
-            _cache.Add(_source.Current);
-            return true;
+            if (_source.MoveNext())
+            {
+                _cache.Add(_source.Current);
+                return true;
+            }
+        }
+        catch
+        {
+            DisposeSourceLocked();
+            throw;
         }
 
-        _source.Dispose();
-        _source = null;
+        DisposeSourceLocked();
         return false;
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+            DisposeSourceLocked();
+    }
+
+    private void DisposeSourceLocked()
+    {
+        var source = _source;
+        _source = null;
+        source?.Dispose();
     }
 }

@@ -17,7 +17,21 @@ CREATE INDEX [IF NOT EXISTS] name ON table USING method ( col [, col …] )
 
 DROP INDEX [IF EXISTS] name;      -- releases all method state
 REINDEX name;                     -- drops derived state and rebuilds it from the base rows
+OPTIMIZE INDEX [name];            -- compacts one/all method indexes transactionally
 ```
+
+The managed FTS method also accepts Turso's documented field-local tokenizer form:
+
+```sql
+CREATE INDEX docs_fts ON docs USING fts (
+    title WITH tokenizer=simple,
+    body  WITH (tokenizer=ngram, min_gram=2, max_gram=3)
+);
+```
+
+Field-local options are represented in the parsed/catalog model and survive file reopen; they are
+not accepted-and-ignored text. Other managed methods reject field-local options unless they
+explicitly opt in.
 
 Method indexes deliberately reject the shapes Turso also rejects
 (`turso-src/core/schema.rs:5847-5853`):
@@ -46,10 +60,17 @@ tries to create or collide with such a name fails with `object name reserved for
 
 | Function | Arity | Semantics |
 | --- | --- | --- |
-| `fts_match(col…, query)` | varargs | Boolean match. Always evaluated row-locally, so it answers identically with or without the index. When a method index **on that row's own source** covers exactly those columns, that index's tokenizer, `detail` and `columnsize` settings are used. |
-| `fts_score(col…, query)` | varargs | Okapi BM25. When a method index on that row's own source covers exactly those columns, the score is computed from that index's corpus (IDF, average column length, configured weights). Otherwise it degrades to a documented single-document corpus. |
-| `fts_highlight(text, query, before, after)` | 4 | Wraps every matching token, using tokenizer source offsets so untouched text is byte-identical. |
+| `fts_match(col…, query)` | varargs | Boolean method-grammar match. A `NULL` query returns integer `0`. A covering index contributes its configured tokenizers; without one, the pinned `default` tokenizer is used. Only TEXT column values participate. |
+| `fts_score(col…, query)` | varargs | Positive, float-precision BM25 (higher is better) when a covering method index supplies corpus statistics; otherwise REAL `0.0`, matching Turso's scalar fallback. |
+| `fts_highlight(text…, before, after, query)` | varargs (minimum 4) | Concatenates non-NULL text inputs with spaces and wraps matching tokens. A NULL tag/query returns NULL. |
+| `fts_highlight_legacy(text, query, before, after)` | 4 | Compatibility spelling for Ahtola's former argument order; `fts_highlight` itself is never interpreted ambiguously. |
 | `fts_snippet(text, query, before, after, ellipsis, tokens)` | 6 | Densest window of `tokens` tokens containing matches, with matches wrapped and elisions marked. |
+
+For a base table carrying an FTS method index, SQL also rewrites `col MATCH query`,
+`(col1,col2) MATCH query`, and `NOT MATCH` to the method `fts_match` surface. A MATCH attached to a
+base table with no FTS method index still raises `unable to use function MATCH in the requested
+context`. A virtual-table MATCH is not rewritten and continues through FTS5's `BestIndex`/`Filter`
+path and SQLite query grammar.
 
 ### Binding, determinism and shadowing
 
@@ -70,40 +91,53 @@ would let the *presence* of an index change the *meaning* of a query.
    ?) FROM docs AS d JOIN (SELECT id FROM notes AS d) AS n ON n.id = d.id` scored the outer rows
    against `notes` — so the registry survives only as a fallback for callers that have no row at all
    (EXPLAIN), and it refuses to answer for any qualifier it saw bound to two different tables.
-2. **A shadowing connection callback suppresses everything.** Registering a scalar function named
+2. **Column order is irrelevant, configuration is not.** A call's resolved columns are compared as
+   an unordered set. Tokenizers and weights are remapped by column name, so
+   `fts_score(body,title,?)` retains the weights declared for `title` and `body`. If two covering
+   indexes have observably different tokenizers, weights, detail, or column-size behavior, planning
+   declines and scalar binding stays unbound. Identically configured duplicates use cost/currentness
+   first and the lexical index name as the final tie-break.
+3. **A shadowing connection callback suppresses everything.** Registering a scalar function named
    `fts_match`, `fts_score`, `fts_highlight` or `fts_snippet` on the connection replaces the built-in
    for every call. When that happens the planner declines every method plan and the scalar path stops
    consulting the index, so the user's callback is the only semantics in play.
-3. **`fts_score` is non-deterministic.** Its value depends on the corpus and on the covering index's
-   configuration, not only on its arguments, so it is rejected in index expressions, partial index
-   `WHERE` clauses, generated columns and `CHECK` constraints. `fts_match`, `fts_highlight` and
-   `fts_snippet` are pure functions of their arguments and remain usable wherever a builtin scalar is.
+4. **The function registry follows pinned Turso and marks all FTS scalars deterministic.** One
+   intentional correctness boundary remains: `fts_score` is rejected in `CHECK` constraints because
+   Ahtola's index-aware scalar can read a live corpus while that same statement mutates it. Stored
+   index/generated expressions use Turso's deterministic registration; an unbound score is `0.0`.
 
 
 ### Query grammar
 
-The method grammar (`ManagedFtsQueryLanguage`) is a superset of the `fts5` virtual table's grammar
-(`ManagedFtsQueryParser`, which is untouched so the shipped `fts5` module cannot regress):
+`USING fts` has a dedicated Tantivy-compatible profile. It is deliberately separate from the
+SQLite grammar used by `CREATE VIRTUAL TABLE ... USING fts5`; changing one does not change the
+other.
 
 ```
 term            fox
-prefix          fox*
+adjacency       database search                              (OR)
+boolean         database AND search | database NOT nosql
 phrase          "quick brown"
-column filter   title:fox        body:"quick brown"
-anchor          ^fox             (only matches the first token of a column)
-proximity       NEAR/3(quick fox)   (default distance 10)
-boolean         a AND b | a OR b | NOT a | -a | (a b)     (adjacency implies AND)
+prefix          data*
+column filter   title:fox | body:"quick brown"
+boost           title:database^2 body:database
 ```
+
+Operators are the uppercase `AND`, `OR`, and `NOT` spellings used by Tantivy. Parentheses group
+expressions; a leading `-` is also exclusion. A trailing finite non-negative `^number` multiplies
+that subtree's score. Ahtola's earlier `^term` anchor and `NEAR/n(...)` extensions remain available
+only to the legacy internal profile, not to SQL method queries. Managed FTS5 retains SQLite's
+implicit-AND, phrase-concatenation, column-filter, anchor, and `NEAR(...)` grammar.
 
 ### `WITH` keys
 
 | Key | Values | Default |
 | --- | --- | --- |
-| `tokenizer` | `unicode61`, `simple` (alias), `ascii`, `whitespace`, `raw`, `ngram`, `trigram` | `unicode61` |
-| `weights` | `'col=weight, col=weight'` (non-negative finite doubles, no duplicate column) | `1.0` per column |
-| `min_gram` / `max_gram` | integers, `1 ≤ min ≤ max ≤ 16`; **accepted only with `tokenizer = 'ngram'`** | `3` / `3` |
-| `columnsize` | `0` or `1`; `0` disables per-column BM25 length normalization | `1` |
-| `detail` | `full`, `columns`, `none` | `full` |
+| `tokenizer` | Pinned: `default`, `raw`, `simple`, `whitespace`, `ngram`; explicit Ahtola extensions: `unicode61`, `ascii`, `trigram` | `default` |
+| `weights` | `'col=weight, col=weight'` (non-negative finite float boosts, no duplicate column) | `1.0` per column |
+| `min_gram` / `max_gram` | integers, `1 ≤ min ≤ max ≤ 16`; **accepted only with `tokenizer = 'ngram'`** | `2` / `3` |
+| `columnsize` (Ahtola extension) | `0` or `1`; `0` disables per-column BM25 length normalization | `1` |
+| `detail` (Ahtola extension) | `full`, `columns`, `none` | `full` |
 
 Unknown keys are a hard error, matching the `fts_with_keys_all_validated_and_consumed` intent
 (`turso-src/core/index_method/fts.rs:1640-1649`). Every accepted key is *implemented*; nothing is
@@ -113,7 +147,7 @@ parsed and then ignored:
   tokenizer`), and on `trigram` — whose gram size is fixed at 3 — it is rejected as well.
 - `columnsize = 0` genuinely disables length normalization; BM25 degrades to the unnormalized
   saturation curve. Any value other than `0` or `1` is rejected.
-- `detail = 'columns'` stops recording token positions, so phrase, `NEAR` and initial-token-anchored
+- `detail = 'columns'` stops recording token positions, so phrase and legacy `NEAR`/anchor
   (`^term`) queries fail with `… does not record positions, so … queries are unavailable` rather
   than silently returning wrong rows. It does keep the metadata a column-specific question needs: a
   compact per-column occurrence count is stored alongside the column mask, so `col:term` matches
@@ -125,19 +159,22 @@ parsed and then ignored:
 
 ### Tokenization and offsets
 
-Folding is performed one source rune at a time and records the exact UTF-16 span each folded unit
-came from. Consequently a combining mark that folds away never shifts the offsets that follow it, a
-surrogate pair is never split, and `fts_highlight`/`fts_snippet` reproduce the original document
-byte for byte. Gram tokenizers slice *folded units*, not UTF-16 code units, and their positions are
-the index of the unit a gram starts at, so grams of one size sit at consecutive positions.
+The pinned tokenizer behavior is distinct:
 
-Query text goes through the same tokenizer as the index. A bare term that produces several tokens
-becomes an adjacent phrase over them — `foo.bar` under `ascii`, a run of overlapping grams under
-`trigram` — which is what makes a whole-word query match a gram index at all. Keyword boundaries
-agree with the tokenizer's word characters, including the underscore, so `NOT_A_TERM` is one term
-rather than the `NOT` operator applied to `_A_TERM`. A gram tokenizer has no notion of a term
-prefix, so a trailing `*` collapses into the same substring match; a term shorter than `min_gram`
-cannot be sliced and therefore never matches.
+- `default`: Unicode alphanumeric runs, lowercase, and Tantivy's remove-long filter (only terms
+  shorter than 40 UTF-8 bytes survive);
+- `raw`: one exact, case-sensitive whole-field token;
+- `simple`: split Unicode punctuation/whitespace and preserve case;
+- `whitespace`: split only whitespace and preserve punctuation/case;
+- `ngram`: lowercase 2- and 3-character sliding grams by default.
+
+The explicitly named `unicode61`, `ascii`, and `trigram` extensions retain their previous managed
+behavior. Offset-bearing tokenization keeps highlight/snippet source spans exact.
+
+Query text goes through the tokenizer of each searched field. For heterogeneous field tokenizers,
+an unqualified operand is analyzed once per field and ORs those field-specific queries, just as
+Tantivy's default-field parser does. A gram tokenizer has no separate prefix notion; a term shorter
+than `min_gram` cannot be sliced and therefore never matches.
 
 ### Ranking
 
@@ -148,9 +185,11 @@ score = Σ_terms Σ_cols  w_col · IDF(t) · tf_col·(k1+1) / (tf_col + k1·(1 �
 IDF(t) = ln(1 + (N − n + 0.5) / (n + 0.5))
 ```
 
-Results are ordered by score descending and, on exact ties, by **ascending rowid**, so rankings are
-byte-for-byte reproducible. Phrase and `NEAR` matches are scored as a single pseudo-term attributed
-to the heaviest selected column, which keeps the score monotone in the configured weights.
+Scores are quantized to Tantivy's observable `f32` precision, are positive (higher is better), and
+ordered descending with ascending-rowid tie-breaking. Field and query `^boost` factors multiply
+term/phrase/prefix contributions. The managed phrase implementation remains an approximation of
+Tantivy's internal phrase scorer; ordering and monotonic boost behavior are covered, but exact
+cross-engine score bits are not promised.
 
 ### Posting generations
 
@@ -180,13 +219,18 @@ A method index has two durable parts:
    comment: `/*ahtola-index-method:<version>:<base64>*/`. This is the same mechanism already shipped
    for managed virtual tables (`ManagedVirtualTableSchemaSql`), so it is written and rolled back by
    the same pager/WAL transaction that writes the rest of `sqlite_schema`. The header carries the
-   storage version, column count, tokenizer identity and column weights.
+   storage version, column count, global and per-field tokenizer identities/gram windows, and
+   column weights. Field-local declarations also live in canonical CREATE text and are revalidated
+   against the version-2 envelope on reopen.
 
 **The postings are derived state, not durable state.** The inverted index (term dictionary, term
 frequencies, positions, column masks, generation-stamped tombstones) is reconstructed from the base
 rows and kept in the catalog snapshot that the engine already isolates per connection, transaction
 and savepoint. That is why atomicity is *inherited* rather than reimplemented: rolling a statement,
 transaction or savepoint back restores the rows, and the derived state reconciles against them.
+State version 2 records field-local analyzers. A version-1 declaration is accepted only when its
+stored global tokenizer still agrees with the explicit/current declaration; an old implicit
+`unicode61` default is not silently reinterpreted as the new pinned `default`.
 
 ### Keeping the derived state current
 
@@ -254,7 +298,7 @@ the same contract already documented for the managed `fts5`/`rtree` virtual tabl
 | trailing comment that merely *looks* like an envelope on an ordinary index | left untouched; the declaration round-trips byte for byte |
 
 The envelope is only decoded once the candidate declaration has been parsed and proven to be a
-`USING`-method index. An ordinary `CREATE INDEX … (col) /*ahtola-index-method:1:…*/` keeps its
+`USING`-method index. An ordinary `CREATE INDEX … (col) /*ahtola-index-method:2:…*/` keeps its
 comment: it is the user's SQL text, not method state.
 
 ## Planning and execution
@@ -272,38 +316,39 @@ look like.
 
 | Pattern | Recognized shape | Filters rows? |
 | --- | --- | --- |
-| `ScoreOrderedLimit` | `… ORDER BY fts_score(cols…, ?) DESC LIMIT n` (sole ordering term) | no |
-| `ScoreOrdered` | `… ORDER BY fts_score(cols…, ?) DESC` | no |
-| `MatchLimit` | `… WHERE fts_match(cols…, ?) ORDER BY fts_score(same cols, same ?) DESC LIMIT n` (sole ordering term, no residual conjunct) | yes |
+| `Score` | `… ORDER BY fts_score(cols…, ?) DESC LIMIT n` (sole ordering term) | no |
+| `CombinedOrderedLimit` | score projection + matching predicate on the same query, score order, limit | yes |
+| `CombinedOrdered` | score projection + matching predicate on the same query and score order | yes |
+| `CombinedLimit` | declared compatibility shape; not selected because unordered LIMIT must follow rowid order | yes |
+| `Combined` | score projection + matching predicate on the same query | yes |
+| `MatchLimit` | declared compatibility shape; not selected because unordered LIMIT must follow rowid order | yes |
 | `Match` | `… WHERE fts_match(cols…, ?)` | yes |
 | `Knn` | `… ORDER BY <distance>(col, ?) ASC` (vector method) | no |
 | `KnnLimit` | `… ORDER BY <distance>(col, ?) ASC LIMIT n` (vector method, sole ordering term) | no |
 
-A call binds to an index only when the argument columns are exactly the index's columns, in
-declaration order, resolving to that source, and the query argument is safe to evaluate once for
+A call binds to an index only when the argument columns are exactly the index's columns as an
+unordered resolved set, resolving to that source, and the query argument is safe to evaluate once for
 the whole scan: it must not depend on the scanned row, and every call inside it must be a
 deterministic built-in that no connection-registered callback shadows. A non-deterministic built-in
 (`random()`, `changes()`, `datetime('now')`), a registered scalar callback — even one taking no
 columns at all — `CURRENT_TIMESTAMP`, and any unmodelled node shape all keep the call on the
 ordinary per-row scalar path.
 
-`MatchLimit` is deliberately narrow. A filtering pattern's pushed-down LIMIT truncates the row set
-itself, keeping the best-scoring rows, so it is only correct when the statement's own ordering *is*
-that relevance ordering. `… WHERE fts_match(…) LIMIT 5` wants the first five matches in scan order
-(ascending rowid) and `… ORDER BY id LIMIT 5` wants the five lowest ids among *all* matches; a
-residual conjunct applied after truncation could return fewer rows than the LIMIT asked for while
-further matches still exist. Each of those falls back to the unlimited `Match` pattern and lets the
-ordinary filter/order/limit pipeline run. The core enforces this independently of what a method
-claims: a `FiltersRows` pattern that carries a limit is demoted to its unlimited form unless the
-whole statement shape proved truncation safe.
+The seven FTS declarations mirror `FTS_PATTERN_*` in pinned Turso. Because the managed FTS cursor is
+relevance ordered, unordered queries always select the unlimited `Match`/`Combined` shapes; the core
+restores base rowid order and lets residual predicates and the ordinary pipeline apply `LIMIT`.
+`MatchLimit` and `CombinedLimit` remain declared for compatibility but are not selected. Globally
+ranked shapes use a bounded top-k heap only when the complete score order is consumed. This avoids
+Turso's formerly unsafe "first segment hits" interpretation for unordered limits while preserving
+SQL results.
 
 The chosen path is accepted only when `EstimateCost` beats a full scan (`rows` reads). The
 original `WHERE` predicate is **never** marked omitted, so choosing the index can filter and rank
 but can never change the answer — including on joins, subqueries, aliases and collations.
 
-Four rules keep "the plan cannot change the answer" true:
+Five rules keep "the plan cannot change the answer" true:
 
-1. **Ranking never removes rows, unless the method proves otherwise.** A `FiltersRows = false`
+1. **Ranking never removes rows.** A `FiltersRows = false`
    pattern (score ordering, KNN) must still produce every base row, so the executor emits the ranked
    rows first and then appends every base row the method did not rank, in **ascending rowid order** —
    the order an ordinary table scan produces, because a table b-tree cursor rewinds to its smallest
@@ -331,6 +376,9 @@ Four rules keep "the plan cannot change the answer" true:
 4. **The advertised plan is the executed plan.** A `SELECT` with a viable method-index path is not
    lowered to bytecode, because the bytecode compiler has no method cursor. Without that gate
    `EXPLAIN QUERY PLAN` would report a method scan that execution silently replaced with a sort.
+5. **Duplicate coverage must be semantically unambiguous.** Differently configured indexes covering
+   the same resolved set make the method plan decline. Equivalent duplicates use a lexical-name
+   final tie-break rather than catalog insertion order.
 
 ### Cost model
 
@@ -396,13 +444,19 @@ Maintenance values use Turso's layout: index columns in declaration order, rowid
 | `MaxParameters` (`WITH` keys) | 32 |
 | `MaxStateBytes` | 16 MiB |
 | `MaxStateEncodedChars` | base64 bound checked before the decode allocates |
-| `MaxTermLength` | 256 UTF-16 code units (longer tokens are truncated) |
+| `default` term limit | terms must be shorter than 40 UTF-8 bytes (Tantivy remove-long behavior) |
+| `unicode61` / `ascii` extension term limit | 256 UTF-16 code units (longer terms are truncated) |
 | `MaxPrefixTerms` | 4096 **live** terms per prefix wildcard (stale terms are purged before the limit is enforced) |
 | `MaxQueryTerms` | 256 |
 | `MaxQueryDepth` | 64 |
-| `MaxMatchRows` | 1,000,000 (a consequence of `ResultsMaterialized = true`) |
 | `MaxPositionsPerDocument` | 1,000,000 |
 | `MaxNearDistance` | 1024 |
+| `MaxHighlightSpans` | 1,000,000 |
+| `MaxHighlightPrefixTerms` | 64 |
+
+There is no total-match ceiling. Unordered cursor shapes enumerate matches and ordered LIMIT shapes
+retain only a bounded top-k heap. Unlimited consumers may naturally materialize their full SQL
+result, but `LIMIT 1` cannot fail merely because more than one million rows match.
 
 Merge policy constants are ported from `turso-src/core/index_method/fts.rs:73-91`:
 `DeletedDocumentsCompactionThreshold = 0.30`, `MaxSynchronousCompactionDocuments = 64_000`.
@@ -438,15 +492,17 @@ the cache.
 2. **No cross-connection read-state cache** (`fts.rs:1489-1580`).
 3. **`MvccSupport = TransactionalBackingStore`**, not Turso's `Unsupported` (`fts.rs:1847`), because
    all durable state is ordinary transactional storage.
-4. **`ResultsMaterialized = true`**, not `false` (`fts.rs:1846`); the ranked rowid array is
-   materialized at `QueryStart`, bounded by `MaxMatchRows`.
-5. **Patterns are a typed enum**, not parsed `ast::Select` fragments (`mod.rs:74`), which keeps the
+4. **Patterns are a typed enum**, not parsed `ast::Select` fragments (`mod.rs:74`), which keeps the
    AOT footprint flat and avoids a parse-at-attach step.
-6. **Postings are derived, not persisted.** Turso persists a Tantivy directory; Ahtola rebuilds from
+5. **Postings are derived, not persisted.** Turso persists a Tantivy directory; Ahtola rebuilds from
    the base rows, which makes rollback, savepoint, crash recovery and `VACUUM` correct by
    construction and makes stale state impossible.
-7. **Extended query grammar**: column filters, `^` anchors and `NEAR/n` are supported; Turso's FTS
-   inherits Tantivy's grammar instead.
+6. **Exact score bits are not promised.** Ahtola implements positive BM25 in managed code and rounds
+   public scores to `f32`, but does not reproduce Tantivy's segment internals. Ranking direction,
+   boosts, phrases/prefixes and deterministic tie-breaking are the compatibility contract.
+7. **`fts_score` is schema-nondeterministic.** Its runtime value can observe the covering index's
+   corpus and configuration, so Ahtola rejects it in expression indexes, partial-index predicates,
+   generated columns, and CHECK constraints rather than persisting the unbound `0.0` fallback.
 
 ## The vector index method
 

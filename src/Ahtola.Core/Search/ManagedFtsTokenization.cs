@@ -7,16 +7,16 @@ namespace Ahtola.Core.Search;
 /// <summary>The tokenizers a managed FTS method index can be configured with.</summary>
 internal enum ManagedFtsTokenizerKind
 {
-    /// <summary>Unicode letter/digit runs, NFD folded, marks stripped, lowercased. The default.</summary>
+    /// <summary>Ahtola extension: Unicode letter/digit runs, NFD folded, marks stripped, lowercased.</summary>
     Unicode61 = 0,
 
     /// <summary>ASCII alphanumeric runs, lowercased. Non-ASCII characters separate tokens.</summary>
     Ascii = 1,
 
-    /// <summary>Whitespace-delimited runs, lowercased, punctuation retained inside the token.</summary>
+    /// <summary>Whitespace-delimited runs with punctuation and casing preserved.</summary>
     Whitespace = 2,
 
-    /// <summary>Whitespace-delimited runs with no case folding at all.</summary>
+    /// <summary>The complete field as one exact, case-sensitive token.</summary>
     Raw = 3,
 
     /// <summary>Sliding character n-grams over the folded text, bounded by min_gram/max_gram.</summary>
@@ -24,6 +24,12 @@ internal enum ManagedFtsTokenizerKind
 
     /// <summary>Sliding character 3-grams. Equivalent to <see cref="Ngram"/> with min=max=3.</summary>
     Trigram = 5,
+
+    /// <summary>Tantivy's default analyzer: Unicode alphanumeric runs, lowercased, with 40-character terms removed.</summary>
+    Default = 6,
+
+    /// <summary>Unicode alphanumeric runs with casing preserved.</summary>
+    Simple = 7,
 }
 
 /// <summary>How much per-posting detail an FTS index records.</summary>
@@ -41,8 +47,8 @@ internal enum ManagedFtsDetailLevel
 
 /// <summary>Immutable tokenizer configuration resolved from the index's <c>WITH</c> clause.</summary>
 internal sealed record ManagedFtsTokenizerOptions(
-    ManagedFtsTokenizerKind Kind = ManagedFtsTokenizerKind.Unicode61,
-    int MinGram = 3,
+    ManagedFtsTokenizerKind Kind = ManagedFtsTokenizerKind.Default,
+    int MinGram = 2,
     int MaxGram = 3)
 {
     /// <summary>Smallest accepted n-gram size.</summary>
@@ -68,7 +74,9 @@ internal sealed record ManagedFtsTokenizerOptions(
     public static ManagedFtsTokenizerKind ParseKind(string name)
         => name.ToLowerInvariant() switch
         {
-            "unicode61" or "simple" => ManagedFtsTokenizerKind.Unicode61,
+            "default" => ManagedFtsTokenizerKind.Default,
+            "simple" => ManagedFtsTokenizerKind.Simple,
+            "unicode61" => ManagedFtsTokenizerKind.Unicode61,
             "ascii" => ManagedFtsTokenizerKind.Ascii,
             "whitespace" => ManagedFtsTokenizerKind.Whitespace,
             "raw" => ManagedFtsTokenizerKind.Raw,
@@ -80,6 +88,8 @@ internal sealed record ManagedFtsTokenizerOptions(
     public static string FormatKind(ManagedFtsTokenizerKind kind)
         => kind switch
         {
+            ManagedFtsTokenizerKind.Default => "default",
+            ManagedFtsTokenizerKind.Simple => "simple",
             ManagedFtsTokenizerKind.Unicode61 => "unicode61",
             ManagedFtsTokenizerKind.Ascii => "ascii",
             ManagedFtsTokenizerKind.Whitespace => "whitespace",
@@ -109,6 +119,9 @@ internal readonly record struct ManagedFtsFoldedUnit(string Text, int SourceOffs
 /// </summary>
 internal static class ManagedFtsTokenization
 {
+    /// <summary>Tantivy's default remove-long filter keeps terms shorter than 40 UTF-8 bytes.</summary>
+    public const int DefaultTermByteLimit = 40;
+
     /// <summary>Longest token retained, in UTF-16 code units. Longer tokens are truncated.</summary>
     public const int MaxTermLength = 256;
 
@@ -119,10 +132,20 @@ internal static class ManagedFtsTokenization
 
         return options.Kind switch
         {
+            ManagedFtsTokenizerKind.Default => RemoveLongTerms(
+                TokenizeUnicodeRuns(text, lowercase: true),
+                DefaultTermByteLimit),
+            ManagedFtsTokenizerKind.Simple => TokenizeUnicodeRuns(text, lowercase: false),
             ManagedFtsTokenizerKind.Unicode61 => Truncate(ManagedFtsTokenizer.Tokenize(text)),
-            ManagedFtsTokenizerKind.Ascii => TokenizeRuns(text, IsAsciiTokenChar, lowercase: true),
-            ManagedFtsTokenizerKind.Whitespace => TokenizeRuns(text, static value => !char.IsWhiteSpace(value), lowercase: true),
-            ManagedFtsTokenizerKind.Raw => TokenizeRuns(text, static value => !char.IsWhiteSpace(value), lowercase: false),
+            ManagedFtsTokenizerKind.Ascii => Truncate(
+                TokenizeRuns(text, IsAsciiTokenChar, lowercase: true)),
+            ManagedFtsTokenizerKind.Whitespace => TokenizeRuns(
+                text,
+                static value => !char.IsWhiteSpace(value),
+                lowercase: false),
+            ManagedFtsTokenizerKind.Raw => text.Length == 0
+                ? []
+                : [new ManagedFtsToken(text, 0, text.Length, 0)],
             ManagedFtsTokenizerKind.Ngram or ManagedFtsTokenizerKind.Trigram => TokenizeGrams(text, options),
             _ => throw new ArgumentOutOfRangeException(nameof(options)),
         };
@@ -154,7 +177,9 @@ internal static class ManagedFtsTokenization
         }
 
         var (minGram, maxGram) = options.EffectiveGrams;
-        var units = FoldWithOffsets(text);
+        var units = options.Kind == ManagedFtsTokenizerKind.Trigram
+            ? FoldWithOffsets(text)
+            : LowerWithOffsets(text);
         if (units.Count == 0)
             return [];
 
@@ -183,9 +208,13 @@ internal static class ManagedFtsTokenization
         ArgumentNullException.ThrowIfNull(term);
         return options.Kind switch
         {
-            ManagedFtsTokenizerKind.Raw => Clamp(term),
-            ManagedFtsTokenizerKind.Whitespace or ManagedFtsTokenizerKind.Ascii => Clamp(term.ToLowerInvariant()),
-            _ => Clamp(Fold(term)),
+            ManagedFtsTokenizerKind.Raw => term,
+            ManagedFtsTokenizerKind.Simple or ManagedFtsTokenizerKind.Whitespace => term,
+            ManagedFtsTokenizerKind.Default => term.ToLowerInvariant(),
+            ManagedFtsTokenizerKind.Ascii or ManagedFtsTokenizerKind.Ngram
+                or ManagedFtsTokenizerKind.Trigram => Clamp(term.ToLowerInvariant()),
+            ManagedFtsTokenizerKind.Unicode61 => Clamp(Fold(term)),
+            _ => throw new ArgumentOutOfRangeException(nameof(options)),
         };
     }
 
@@ -262,6 +291,26 @@ internal static class ManagedFtsTokenization
         return truncated;
     }
 
+    private static IReadOnlyList<ManagedFtsToken> RemoveLongTerms(
+        IReadOnlyList<ManagedFtsToken> tokens,
+        int byteLimit)
+    {
+        List<ManagedFtsToken>? filtered = null;
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            var token = tokens[index];
+            if (Encoding.UTF8.GetByteCount(token.Text) < byteLimit)
+            {
+                filtered?.Add(token);
+                continue;
+            }
+
+            filtered ??= tokens.Take(index).ToList();
+        }
+
+        return filtered ?? tokens;
+    }
+
     private static IReadOnlyList<ManagedFtsToken> TokenizeRuns(string text, Func<char, bool> isTokenChar, bool lowercase)
     {
         var tokens = new List<ManagedFtsToken>();
@@ -289,10 +338,39 @@ internal static class ManagedFtsTokenization
         return tokens;
     }
 
+    private static IReadOnlyList<ManagedFtsToken> TokenizeUnicodeRuns(string text, bool lowercase)
+    {
+        var tokens = new List<ManagedFtsToken>();
+        var start = -1;
+        var position = 0;
+        var offset = 0;
+        while (offset < text.Length)
+        {
+            var status = Rune.DecodeFromUtf16(text.AsSpan(offset), out var rune, out var consumed);
+            var isToken = status == OperationStatus.Done && Rune.IsLetterOrDigit(rune);
+            if (isToken)
+            {
+                if (start < 0)
+                    start = offset;
+            }
+            else if (start >= 0)
+            {
+                tokens.Add(CreateRunToken(text, start, offset - start, position++, lowercase));
+                start = -1;
+            }
+
+            offset += status == OperationStatus.Done ? consumed : 1;
+        }
+
+        if (start >= 0)
+            tokens.Add(CreateRunToken(text, start, text.Length - start, position, lowercase));
+        return tokens;
+    }
+
     private static ManagedFtsToken CreateRunToken(string text, int offset, int length, int position, bool lowercase)
     {
         var raw = text.Substring(offset, length);
-        var normalized = Clamp(lowercase ? raw.ToLowerInvariant() : raw);
+        var normalized = lowercase ? raw.ToLowerInvariant() : raw;
         return new ManagedFtsToken(normalized, offset, length, position);
     }
 
@@ -306,7 +384,9 @@ internal static class ManagedFtsTokenization
         var (minGram, maxGram) = options.EffectiveGrams;
         ValidateGramBounds(minGram, maxGram);
 
-        var units = FoldWithOffsets(text);
+        var units = options.Kind == ManagedFtsTokenizerKind.Trigram
+            ? FoldWithOffsets(text)
+            : LowerWithOffsets(text);
         var tokens = new List<ManagedFtsToken>();
         for (var size = minGram; size <= maxGram; size++)
         {
@@ -327,6 +407,33 @@ internal static class ManagedFtsTokenization
         }
 
         return tokens;
+    }
+
+    private static List<ManagedFtsFoldedUnit> LowerWithOffsets(string text)
+    {
+        var units = new List<ManagedFtsFoldedUnit>(text.Length);
+        var offset = 0;
+        while (offset < text.Length)
+        {
+            var status = Rune.DecodeFromUtf16(text.AsSpan(offset), out _, out var consumed);
+            if (status != OperationStatus.Done)
+            {
+                units.Add(new ManagedFtsFoldedUnit(
+                    text.Substring(offset, 1).ToLowerInvariant(),
+                    offset,
+                    1));
+                offset++;
+                continue;
+            }
+
+            units.Add(new ManagedFtsFoldedUnit(
+                text.Substring(offset, consumed).ToLowerInvariant(),
+                offset,
+                consumed));
+            offset += consumed;
+        }
+
+        return units;
     }
 
     /// <summary>Validates gram bounds with the one diagnostic both the parser and DDL use.</summary>

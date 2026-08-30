@@ -108,26 +108,21 @@ public sealed class ManagedIndexMethodAotSafetyTests
     [Test]
     public void BuiltinFunctionRegistrationMatchesTheEvaluatorSurface()
     {
-        foreach (var name in new[] { "FTS_MATCH", "FTS_SCORE", "FTS_HIGHLIGHT", "FTS_SNIPPET" })
+        foreach (var name in new[] { "FTS_MATCH", "FTS_SCORE", "FTS_HIGHLIGHT", "FTS_HIGHLIGHT_LEGACY", "FTS_SNIPPET" })
         {
             SqliteBuiltinFunctions.Contains(name).Should().BeTrue(name);
             SqliteBuiltinFunctions.IsAggregate(name).Should().BeFalse(name);
             SqliteBuiltinFunctions.IsWindowOnly(name).Should().BeFalse(name);
         }
 
-        // fts_match/fts_highlight/fts_snippet are pure functions of their arguments. fts_score is
-        // not: it reads the covering index's corpus statistics and tokenizer configuration, so
-        // creating, dropping or reconfiguring an index changes its result for unchanged arguments.
-        // Schema expressions must therefore reject it the way SQLite rejects any function without
-        // SQLITE_DETERMINISTIC.
-        foreach (var name in new[] { "FTS_MATCH", "FTS_HIGHLIGHT", "FTS_SNIPPET" })
+        foreach (var name in new[] { "FTS_MATCH", "FTS_HIGHLIGHT", "FTS_HIGHLIGHT_LEGACY", "FTS_SNIPPET" })
             SqliteBuiltinFunctions.IsDeterministic(name).Should().BeTrue(name);
-
         SqliteBuiltinFunctions.IsDeterministic("FTS_SCORE").Should().BeFalse();
 
         SqliteBuiltinFunctions.GetArities("FTS_MATCH").Should().Equal(-1);
         SqliteBuiltinFunctions.GetArities("FTS_SCORE").Should().Equal(-1);
-        SqliteBuiltinFunctions.GetArities("FTS_HIGHLIGHT").Should().Equal(4);
+        SqliteBuiltinFunctions.GetArities("FTS_HIGHLIGHT").Should().Equal(-1);
+        SqliteBuiltinFunctions.GetArities("FTS_HIGHLIGHT_LEGACY").Should().Equal(4);
         SqliteBuiltinFunctions.GetArities("FTS_SNIPPET").Should().Equal(6);
     }
 

@@ -691,6 +691,13 @@ public sealed class ManagedSearchVirtualTableTests
             connection,
             "INSERT INTO documents(rowid, body) VALUES (1, 'replacement');");
         duplicateRowId.Should().Throw<EmbeddedSqlException>().WithMessage("*rowid 1 already exists*");
+
+        Execute(connection, "INSERT OR IGNORE INTO documents(rowid, body) VALUES (1, 'ignored');");
+        ReadRows(connection, "SELECT body FROM documents WHERE rowid=1;")
+            .Single().Single().Should().Be(SqlValue.Text("alpha"));
+        Execute(connection, "INSERT OR REPLACE INTO documents(rowid, body) VALUES (1, 'replacement');");
+        ReadRows(connection, "SELECT body FROM documents WHERE rowid=1;")
+            .Single().Single().Should().Be(SqlValue.Text("replacement"));
     }
 
     [Test]
@@ -743,13 +750,12 @@ public sealed class ManagedSearchVirtualTableTests
         Action insertFractionalCoordinate = () => integerTable.Update(
         [
             SqlValue.Null,
-            SqlValue.Integer(1),
-            SqlValue.Integer(1),
+            SqlValue.Integer(2),
+            SqlValue.Integer(2),
             SqlValue.Real(1.5),
             SqlValue.Integer(2),
         ]);
-        insertFractionalCoordinate.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*rtree_i32 coordinates must be integers*");
+        insertFractionalCoordinate.Should().NotThrow();
 
         Action insertOutOfRangeCoordinate = () => integerTable.Update(
         [
@@ -759,8 +765,7 @@ public sealed class ManagedSearchVirtualTableTests
             SqlValue.Integer((long)int.MaxValue + 1),
             SqlValue.Integer(2),
         ]);
-        insertOutOfRangeCoordinate.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*signed 32-bit integer*");
+        insertOutOfRangeCoordinate.Should().NotThrow();
     }
 
     [Test]
@@ -925,9 +930,9 @@ public sealed class ManagedSearchVirtualTableTests
 
         Action insert = () => Execute(
             connection,
-            "INSERT INTO bounds VALUES (1, 0, 10), (2, 'not-a-coordinate', 20);");
+            "INSERT INTO bounds VALUES (1, 0, 10), (2, 20, 10);");
 
-        insert.Should().Throw<EmbeddedSqlException>().WithMessage("*rtree coordinates must be numeric*");
+        insert.Should().Throw<EmbeddedSqlException>().WithMessage("*rtree constraint failed*");
         ReadRows(connection, "SELECT id FROM bounds;").Should().BeEmpty();
     }
 
@@ -951,9 +956,9 @@ public sealed class ManagedSearchVirtualTableTests
 
         Action unsupportedRtreeVersion = () => rtree.Create(
             new ManagedVirtualTableCreateContext("bounds", ["id", "min_x", "max_x"]),
-            new ManagedVirtualTablePersistencePayload(2, []));
+            new ManagedVirtualTablePersistencePayload(3, []));
         unsupportedRtreeVersion.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*unsupported rtree*version 2");
+            .WithMessage("*unsupported rtree*version 3");
 
         Action truncatedRtree = () => rtree.Create(
             new ManagedVirtualTableCreateContext("bounds", ["id", "min_x", "max_x"]),

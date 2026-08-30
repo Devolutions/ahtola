@@ -33,13 +33,13 @@ internal enum ManagedIndexPatternShape
     /// <summary>WHERE match(cols…, ?) LIMIT ?.</summary>
     MatchLimit = 1,
 
-    /// <summary>SELECT score(cols…, ?) … (no ordering).</summary>
+    /// <summary>Pinned FTS score-only ORDER BY DESC LIMIT pattern.</summary>
     Score = 2,
 
-    /// <summary>SELECT score(cols…, ?) … ORDER BY score DESC.</summary>
+    /// <summary>Legacy generic score-order shape retained for compatibility with older adapters.</summary>
     ScoreOrdered = 3,
 
-    /// <summary>SELECT score(cols…, ?) … ORDER BY score DESC LIMIT ?.</summary>
+    /// <summary>Legacy generic limited score-order shape retained for compatibility.</summary>
     ScoreOrderedLimit = 4,
 
     /// <summary>Reserved for the vector method: ORDER BY distance(col, ?) ASC.</summary>
@@ -47,6 +47,18 @@ internal enum ManagedIndexPatternShape
 
     /// <summary>Reserved for the vector method: ORDER BY distance(col, ?) ASC LIMIT ?.</summary>
     KnnLimit = 6,
+
+    /// <summary>SELECT score(cols…, ?) … WHERE match(cols…, ?) with no ordering or limit.</summary>
+    Combined = 7,
+
+    /// <summary>Combined score/match with an unordered LIMIT.</summary>
+    CombinedLimit = 8,
+
+    /// <summary>Combined score/match ordered by score descending.</summary>
+    CombinedOrdered = 9,
+
+    /// <summary>Combined score/match ordered by score descending with LIMIT.</summary>
+    CombinedOrderedLimit = 10,
 }
 
 /// <summary>
@@ -76,8 +88,11 @@ internal enum ManagedIndexUnrankedMergePolicy
     MergeByDescendingRank = 1,
 }
 
-/// <summary>One column bound to a method index, in <c>CREATE INDEX</c> declaration order.</summary>
-internal sealed record ManagedIndexMethodColumn(string Name, int ColumnIndex);
+/// <summary>One column bound to a method index, in declaration order, with optional field options.</summary>
+internal sealed record ManagedIndexMethodColumn(
+    string Name,
+    int ColumnIndex,
+    IReadOnlyList<ManagedIndexMethodParameter>? Parameters = null);
 
 /// <summary>One <c>WITH (key = literal)</c> entry captured by the parser.</summary>
 internal sealed record ManagedIndexMethodParameter(string Name, SqlValue Value);
@@ -294,6 +309,9 @@ internal abstract class ManagedIndexMethod
 {
     public abstract string Name { get; }
 
+    /// <summary>Whether this method accepts field-local <c>WITH</c> options.</summary>
+    public virtual bool SupportsColumnParameters => false;
+
     /// <summary>Validates the configuration and produces the immutable attachment for one index.</summary>
     public abstract ManagedIndexMethodAttachment Attach(ManagedIndexMethodConfiguration configuration);
 }
@@ -349,6 +367,18 @@ internal abstract class ManagedIndexMethodAttachment
     /// cannot leave method state behind.
     /// </summary>
     public abstract ManagedIndexMethodAttachment Fork();
+
+    /// <summary>
+    /// True when either attachment may answer the same scalar/prefilter call without changing its
+    /// observable result. The conservative default treats independently configured indexes as
+    /// interchangeable when they implement the same method; methods whose configuration changes
+    /// scalar semantics override this with a stronger comparison.
+    /// </summary>
+    public virtual bool HasEquivalentQuerySemantics(ManagedIndexMethodAttachment other)
+        => string.Equals(
+            Definition.MethodName,
+            other.Definition.MethodName,
+            StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>

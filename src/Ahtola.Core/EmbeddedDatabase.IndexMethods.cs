@@ -208,7 +208,8 @@ public sealed partial class EmbeddedDatabase
         IReadOnlyList<OrderByTerm>? orderBy,
         long? maximumRows,
         out ManagedIndexMethodScanPlan plan,
-        bool allowsRowTruncation = false)
+        bool allowsRowTruncation = false,
+        IReadOnlyList<Expression>? resultExpressions = null)
     {
         plan = null!;
         if (source.IndexDirective is not null)
@@ -219,6 +220,7 @@ public sealed partial class EmbeddedDatabase
         var qualifier = source.Alias ?? source.Name;
         ManagedIndexMethodScanPlan? best = null;
         var bestSteadyState = 0.0;
+        ManagedIndexMethodAttachment? matchedSemantics = null;
         foreach (var index in table.Indexes)
         {
             if (!index.IsMethodIndex)
@@ -239,9 +241,21 @@ public sealed partial class EmbeddedDatabase
                 maximumRows,
                 IsShadowedMethodFunction,
                 IsHoistableArgument,
-                allowsRowTruncation);
+                allowsRowTruncation,
+                resultExpressions);
             if (!attachment.Planner.TryMatch(plannerContext, out var match))
                 continue;
+
+            if (matchedSemantics is not null
+                && !matchedSemantics.HasEquivalentQuerySemantics(attachment))
+            {
+                // Two indexes can cover the same call while assigning different tokenizers,
+                // boosts or posting detail to it. Choosing either for prefiltering and another (or
+                // neither) for scalar evaluation changes the answer, so the only safe plan is the
+                // ordinary row-local path.
+                return false;
+            }
+            matchedSemantics ??= attachment;
 
             // Last line of defence, independent of what the method claimed: a pattern that filters
             // rows and truncates to a pushed-down LIMIT returns *only* its best rows, so honoring
@@ -320,7 +334,13 @@ public sealed partial class EmbeddedDatabase
             // whichever the catalog happens to list first.
             if (best is null
                 || steadyState < bestSteadyState
-                || (steadyState == bestSteadyState && candidate.EstimatedCost < best.EstimatedCost))
+                || (steadyState == bestSteadyState && candidate.EstimatedCost < best.EstimatedCost)
+                || (steadyState == bestSteadyState
+                    && candidate.EstimatedCost == best.EstimatedCost
+                    && string.Compare(
+                        candidate.Index.Name,
+                        best.Index.Name,
+                        StringComparison.OrdinalIgnoreCase) < 0))
             {
                 best = candidate;
                 bestSteadyState = steadyState;
@@ -546,6 +566,21 @@ public sealed partial class EmbeddedDatabase
             ranked = binding.Execute(plan.PatternIndex, queryValue, limit);
         }
 
+        // MATCH-only and unordered combined patterns are filtering access paths, not ordering
+        // paths. Their method cursor happens to rank hits by relevance, but SQL without a consumed
+        // ORDER BY observes the base b-tree's rowid order (including which rows an outer LIMIT
+        // keeps). Restore that order before any residual predicate or outer LIMIT sees the rows.
+        if (plan.FiltersRows
+            && plan.Shape is not ManagedIndexPatternShape.CombinedOrdered
+                and not ManagedIndexPatternShape.CombinedOrderedLimit)
+        {
+            ranked = ranked.OrderBy(static hit => hit.RowId).ToArray();
+        }
+
+        // Only a limit explicitly carried by the selected method pattern may truncate the source.
+        // Applying the SELECT's LIMIT to an unlimited MATCH scan here would run it before residual
+        // predicates and could discard later rows that the residual would have kept.
+        var sourceMaximumRows = plan.Limit is null ? null : maximumRows;
         var rows = new List<SourceRow>(Math.Min(ranked.Count + 1, 1024));
         var emitted = new HashSet<long>();
 
@@ -595,7 +630,7 @@ public sealed partial class EmbeddedDatabase
             foreach (var (_, rowId) in merged)
             {
                 context.CheckInterrupt();
-                if (maximumRows is { } cap && rows.Count >= cap)
+                if (sourceMaximumRows is { } cap && rows.Count >= cap)
                     break;
                 if (!rowPositions.TryGetValue(rowId, out var position))
                     continue;
@@ -609,7 +644,7 @@ public sealed partial class EmbeddedDatabase
         foreach (var hit in ranked)
         {
             context.CheckInterrupt();
-            if (maximumRows is { } cap && rows.Count >= cap)
+            if (sourceMaximumRows is { } cap && rows.Count >= cap)
                 return new SourceData(table.Columns, rows);
             if (!rowPositions.TryGetValue(hit.RowId, out var position) || !emitted.Add(hit.RowId))
                 continue;
@@ -628,7 +663,7 @@ public sealed partial class EmbeddedDatabase
         foreach (var rowId in orderedRowIds)
         {
             context.CheckInterrupt();
-            if (maximumRows is { } cap && rows.Count >= cap)
+            if (sourceMaximumRows is { } cap && rows.Count >= cap)
                 break;
             if (!emitted.Add(rowId) || !rowPositions.TryGetValue(rowId, out var position))
                 continue;
@@ -744,7 +779,8 @@ public sealed partial class EmbeddedDatabase
                 ResolveOrderBy(select.OrderBy, select.Projections),
                 ReadMethodIndexLimit(select),
                 out plan,
-                AllowsMethodIndexRowTruncation(select));
+                AllowsMethodIndexRowTruncation(select),
+                select.Projections.Select(static projection => projection.Expression).ToArray());
     }
 
     /// <summary>
@@ -770,7 +806,7 @@ public sealed partial class EmbeddedDatabase
             && select.GroupBy.Count == 0
             && select.Having is null
             && select.NamedWindows.Count == 0
-            && select.OrderBy.Count == 1
+            && select.OrderBy.Count <= 1
             && ReadMethodIndexLimit(select) is not null
             && !select.Projections.Any(projection => ContainsAggregate(projection.Expression))
             && !select.OrderBy.Any(term => ContainsAggregate(term.Expression))

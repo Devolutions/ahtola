@@ -45,9 +45,11 @@ internal static class SqliteBuiltinFunctions
         "VECTOR_EXTRACT", "VECTOR_DISTANCE_COS", "VECTOR_DISTANCE_L2",
         "VECTOR_DISTANCE_JACCARD", "VECTOR_DISTANCE_DOT", "VECTOR_CONCAT", "VECTOR_SLICE",
         // Managed full-text index method surface (Ahtola.Core.Search.ManagedFtsFunctions).
-        "FTS_MATCH", "FTS_SCORE", "FTS_HIGHLIGHT", "FTS_SNIPPET",
+        "FTS_MATCH", "FTS_SCORE", "FTS_HIGHLIGHT", "FTS_HIGHLIGHT_LEGACY", "FTS_SNIPPET",
         // SQLite FTS5 auxiliary functions. These require a row from an fts5 virtual table.
         "BM25", "HIGHLIGHT", "SNIPPET",
+        // SQLite R-Tree diagnostics.
+        "RTREECHECK", "RTREENODE", "RTREEDEPTH",
     };
 
     private static readonly HashSet<string> WindowOnlyNames = new(StringComparer.Ordinal)
@@ -95,15 +97,11 @@ internal static class SqliteBuiltinFunctions
         "UUID7_TIMESTAMP_MS",
         "UUID_STR",
         "UUID_BLOB",
-        // fts_score() is a function of the whole indexed corpus and of the covering index's
-        // configuration, not just of its arguments: adding, dropping or reconfiguring an index
-        // changes the BM25 statistics behind it. Schema expressions (index terms, partial index
-        // WHERE clauses, generated columns, CHECK constraints) must therefore reject it, exactly
-        // the way SQLite rejects any function it did not mark SQLITE_DETERMINISTIC.
         "FTS_SCORE",
         "BM25",
         "HIGHLIGHT",
         "SNIPPET",
+        "RTREECHECK",
     };
 
     public static bool Contains(string name)
@@ -175,7 +173,7 @@ internal static class SqliteBuiltinFunctions
         if (normalized is "LIKE" or "SUBSTR" or "SUBSTRING" or "LPAD" or "RPAD")
             return [2, 3];
         if (normalized is "TRIM" or "BTRIM" or "LTRIM" or "RTRIM" or "ROUND" or "LOG"
-            or "UNHEX" or "JSON_ARRAY_LENGTH" or "JSON_TYPE" or "JSON_PRETTY")
+            or "UNHEX" or "JSON_ARRAY_LENGTH" or "JSON_TYPE" or "JSON_PRETTY" or "RTREECHECK")
         {
             return [1, 2];
         }
@@ -195,7 +193,7 @@ internal static class SqliteBuiltinFunctions
             or "GLOB" or "INSTR" or "STRPOS" or "NULLIF" or "IFNULL" or "LIKELIHOOD" or "TIMEDIFF"
             or "JSON_PATCH" or "JSONB_PATCH"
             or "VECTOR_DISTANCE_COS" or "VECTOR_DISTANCE_L2" or "VECTOR_DISTANCE_JACCARD"
-            or "VECTOR_DISTANCE_DOT")
+            or "VECTOR_DISTANCE_DOT" or "RTREENODE")
         {
             return [2];
         }
@@ -203,13 +201,13 @@ internal static class SqliteBuiltinFunctions
         if (normalized is "REPLACE" or "VECTOR_SLICE")
             return [3];
 
-        if (normalized is "FTS_HIGHLIGHT" or "HIGHLIGHT")
+        if (normalized is "HIGHLIGHT" or "FTS_HIGHLIGHT_LEGACY")
             return [4];
 
         if (normalized is "FTS_SNIPPET" or "SNIPPET")
             return [6];
 
-        if (normalized is "FTS_MATCH" or "FTS_SCORE" or "BM25")
+        if (normalized is "FTS_MATCH" or "FTS_SCORE" or "FTS_HIGHLIGHT" or "BM25")
             return [-1];
 
         if (normalized is "COALESCE" or "CHAR" or "CHR" or "CONCAT" or "CONCAT_WS" or "IF" or "IIF" or "FORMAT"

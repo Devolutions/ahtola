@@ -26,15 +26,107 @@ public sealed partial class EmbeddedDatabase
         IReadOnlyList<SqlValue> arguments,
         SourceRow? row,
         QueryContext context)
-        => ManagedFtsFunctions.Match(
+    {
+        var bound = ResolveBoundFtsIndex(function, row, context);
+        return ManagedFtsFunctions.Match(
             arguments,
             CollectArgumentColumnNames(function),
-            ResolveBoundFtsScalarOptions(ResolveBoundFtsIndex(function, row, context)));
+            ResolveBoundFtsScalarOptions(bound));
+    }
+
+    /// <summary>
+    /// Routes SQL's <c>col MATCH query</c> and <c>(col1,col2) MATCH query</c> spellings to the
+    /// Turso-method scalar only when those columns resolve to an FTS method index. FTS5 MATCH remains
+    /// a virtual-table constraint and a non-FTS MATCH continues to fail closed.
+    /// </summary>
+    private SqlValue EvaluateFtsMatchOperator(
+        FunctionExpression function,
+        SqlValue[] parameters,
+        SourceRow? row,
+        QueryContext context)
+    {
+        if (function.Arguments.Count != 2)
+            throw new EmbeddedSqlException("unable to use function MATCH in the requested context");
+        if (row is null)
+            throw new EmbeddedSqlException("no such function: MATCH");
+
+        var columnExpressions = function.Arguments[1] is RowValueExpression tuple
+            ? tuple.Values
+            : [function.Arguments[1]];
+        if (columnExpressions.Any(static expression =>
+                expression is not ColumnExpression { BooleanKeyword: null }))
+        {
+            throw new EmbeddedSqlException("no such function: MATCH");
+        }
+        var rewrittenArguments = new Expression[columnExpressions.Count + 1];
+        for (var index = 0; index < columnExpressions.Count; index++)
+            rewrittenArguments[index] = columnExpressions[index];
+        rewrittenArguments[^1] = function.Arguments[0];
+
+        var rewritten = new FunctionExpression(
+            ManagedFtsPlannerAdapter.MatchFunction,
+            rewrittenArguments,
+            CountStar: false);
+        if (ResolveBoundFtsIndex(rewritten, row, context) is null
+            && !CanRouteFtsMatchOperator(columnExpressions, row, context))
+        {
+            throw new EmbeddedSqlException("unable to use function MATCH in the requested context");
+        }
+
+        var values = rewrittenArguments
+            .Select(argument => Evaluate(argument, parameters, row, context))
+            .ToArray();
+        return EvaluateFtsMatch(rewritten, values, row, context);
+    }
+
+    private static bool CanRouteFtsMatchOperator(
+        IReadOnlyList<Expression> columnExpressions,
+        SourceRow? row,
+        QueryContext context)
+    {
+        if (row is null || columnExpressions.Count == 0)
+            return false;
+
+        var names = new string[columnExpressions.Count];
+        string? qualifier = null;
+        for (var index = 0; index < columnExpressions.Count; index++)
+        {
+            if (columnExpressions[index] is not ColumnExpression { BooleanKeyword: null } column)
+                return false;
+            names[index] = column.UnqualifiedName ?? column.Name;
+            if (column.Qualifier is null)
+                continue;
+            if (qualifier is not null
+                && !string.Equals(qualifier, column.Qualifier, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            qualifier = column.Qualifier;
+        }
+
+        EmbeddedTable table;
+        if (qualifier is not null)
+        {
+            if (!TryResolveSourceTable(qualifier, row, context, out _, out table)
+                && !TryResolveQualifiedFtsSource(qualifier, row, context, names, out _, out table))
+            {
+                return false;
+            }
+        }
+        else if (!TryResolveUnqualifiedFtsSource(row, context, names, out _, out table))
+        {
+            return false;
+        }
+
+        return table.Indexes.Any(static index =>
+            index.IsMethodIndex
+            && string.Equals(index.Method, "fts", StringComparison.OrdinalIgnoreCase));
+    }
 
     /// <summary>
     /// Evaluates <c>fts_score</c>. When a method index on the row's own source covers the exact
     /// column list, the score comes from that index's corpus so ranking is stable across access
-    /// paths; otherwise it degrades to a documented single-document BM25.
+    /// paths; otherwise it returns Turso's REAL <c>0.0</c> fallback.
     /// </summary>
     private SqlValue EvaluateFtsScore(
         FunctionExpression function,
@@ -43,14 +135,18 @@ public sealed partial class EmbeddedDatabase
         QueryContext context)
     {
         var bound = ResolveBoundFtsIndex(function, row, context);
-        if (bound is not null
-            && arguments.Count >= 2
-            && arguments[^1].Kind == SqlValueKind.Text
-            && bound.RowId is { } rowId)
+        if (bound is not null && arguments.Count >= 2)
         {
+            if (arguments[^1].Kind == SqlValueKind.Null)
+                return SqlValue.Real(0.0);
+            if (arguments[^1].Kind != SqlValueKind.Text)
+                throw new EmbeddedSqlException("fts_score() requires a text query");
+            if (bound.RowId is not { } rowId)
+                return SqlValue.Real(0.0);
+
             var binding = context.MethodIndexCache.GetOrOpen(bound.TableName, bound.Table, bound.Index);
             if (binding.Attachment.Definition.TryFindPattern(
-                    ManagedIndexPatternShape.ScoreOrdered,
+                    ManagedIndexPatternShape.Score,
                     out var patternIndex))
             {
                 return binding.TryGetRank(patternIndex, arguments[^1], rowId, out var rank)
@@ -66,9 +162,8 @@ public sealed partial class EmbeddedDatabase
     }
 
     /// <summary>
-    /// The tokenizer <c>fts_highlight</c>/<c>fts_snippet</c> must use for a given text argument.
-    /// Both take a single column, so they bind to whichever index on that column's own source
-    /// covers it; without a binding they fall back to the documented default tokenizer.
+    /// The tokenizer the Ahtola-only <c>fts_snippet</c> extension uses for its text argument.
+    /// Pinned <c>fts_highlight</c> always uses Turso's standalone default analyzer.
     /// </summary>
     private ManagedFtsTokenizerOptions? ResolveBoundFtsTokenizer(
         FunctionExpression function,
@@ -92,6 +187,7 @@ public sealed partial class EmbeddedDatabase
 
         var name = column.UnqualifiedName ?? column.Name;
         ManagedFtsIndexAttachment? bound = null;
+        ManagedFtsTokenizerOptions? boundTokenizer = null;
         foreach (var candidate in table.Indexes)
         {
             if (!candidate.IsMethodIndex
@@ -100,17 +196,17 @@ public sealed partial class EmbeddedDatabase
                 continue;
             }
 
-            var covers = false;
-            foreach (var indexColumn in candidate.Columns)
+            var indexPosition = -1;
+            for (var position = 0; position < candidate.Columns.Count; position++)
             {
-                if (string.Equals(indexColumn.Name, name, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(candidate.Columns[position].Name, name, StringComparison.OrdinalIgnoreCase))
                 {
-                    covers = true;
+                    indexPosition = position;
                     break;
                 }
             }
 
-            if (!covers)
+            if (indexPosition < 0)
                 continue;
 
             var attachment = ManagedIndexMethodSemantics.GetAttachment(tableName, table, candidate)
@@ -120,32 +216,44 @@ public sealed partial class EmbeddedDatabase
 
             // Two indexes with different tokenizers covering the same column make the choice
             // arbitrary; stay with the default rather than pick one silently.
-            if (bound is not null && bound.Options.Tokenizer != attachment.Options.Tokenizer)
+            var tokenizer = attachment.Options.ColumnTokenizers[indexPosition];
+            if (bound is not null && boundTokenizer != tokenizer)
                 return null;
 
             bound = attachment;
+            boundTokenizer = tokenizer;
         }
 
-        return bound?.Options.Tokenizer;
+        return boundTokenizer;
     }
 
-    private ManagedFtsScalarOptions? ResolveBoundFtsScalarOptions(BoundFtsIndex? bound)
-        => bound is null
-            ? null
-            : ManagedIndexMethodSemantics.GetAttachment(bound.TableName, bound.Table, bound.Index)
-                as ManagedFtsIndexAttachment is { } attachment
-                ? new ManagedFtsScalarOptions(
-                    attachment.Options.Tokenizer,
-                    attachment.Options.Detail,
-                    attachment.Options.ColumnSize)
-                : null;
+    private static ManagedFtsScalarOptions? ResolveBoundFtsScalarOptions(BoundFtsIndex? bound)
+    {
+        if (bound is null
+            || ManagedIndexMethodSemantics.GetAttachment(bound.TableName, bound.Table, bound.Index)
+                is not ManagedFtsIndexAttachment attachment)
+        {
+            return null;
+        }
+
+        var tokenizers = new ManagedFtsTokenizerOptions[bound.ArgumentToIndexColumn.Count];
+        for (var argument = 0; argument < tokenizers.Length; argument++)
+            tokenizers[argument] = attachment.Options.ColumnTokenizers[bound.ArgumentToIndexColumn[argument]];
+
+        return new ManagedFtsScalarOptions(
+            attachment.Options.Tokenizer,
+            attachment.Options.Detail,
+            attachment.Options.ColumnSize,
+            tokenizers);
+    }
 
     /// <summary>The method index a scalar <c>fts_*</c> call is bound to, plus the row it applies to.</summary>
     private sealed record BoundFtsIndex(
         string TableName,
         EmbeddedTable Table,
         EmbeddedIndex Index,
-        long? RowId);
+        long? RowId,
+        IReadOnlyList<int> ArgumentToIndexColumn);
 
     /// <summary>
     /// Resolves the one method index a scalar <c>fts_*</c> call is bound to.
@@ -200,19 +308,28 @@ public sealed partial class EmbeddedDatabase
 
         // Unqualified arguments belong to the source that produced this row.
         qualifier ??= row.RowIdQualifier;
-        if (qualifier is null)
+        string tableName;
+        EmbeddedTable table;
+        if (qualifier is not null)
+        {
+            if (!TryResolveSourceTable(qualifier, row, context, out tableName, out table)
+                && !TryResolveQualifiedFtsSource(qualifier, row, context, names, out tableName, out table))
+            {
+                return null;
+            }
+        }
+        else if (!TryResolveUnqualifiedFtsSource(row, context, names, out tableName, out table))
+        {
             return null;
+        }
 
-        var rowId = row.GetRowIdForQualifier(qualifier);
-        if (rowId is null)
-            return null;
-
-        if (!TryResolveSourceTable(qualifier, row, context, out var tableName, out var table))
-            return null;
+        var rowId = qualifier is null ? row.RowId : row.GetRowIdForQualifier(qualifier);
         if (!table.HasMethodIndexes)
             return null;
 
         EmbeddedIndex? bound = null;
+        ManagedFtsIndexAttachment? boundAttachment = null;
+        int[]? boundMapping = null;
         foreach (var candidate in table.Indexes)
         {
             if (!candidate.IsMethodIndex
@@ -222,26 +339,120 @@ public sealed partial class EmbeddedDatabase
                 continue;
             }
 
+            var mapping = new int[columnCount];
+            var seen = new bool[columnCount];
             var equal = true;
-            for (var position = 0; position < columnCount; position++)
+            for (var argument = 0; argument < columnCount; argument++)
             {
-                if (!string.Equals(candidate.Columns[position].Name, names[position], StringComparison.OrdinalIgnoreCase))
+                var indexPosition = -1;
+                for (var position = 0; position < candidate.Columns.Count; position++)
+                {
+                    if (string.Equals(candidate.Columns[position].Name, names[argument], StringComparison.OrdinalIgnoreCase))
+                    {
+                        indexPosition = position;
+                        break;
+                    }
+                }
+
+                if (indexPosition < 0 || seen[indexPosition])
                 {
                     equal = false;
                     break;
                 }
+
+                seen[indexPosition] = true;
+                mapping[argument] = indexPosition;
             }
 
             if (!equal)
                 continue;
 
-            // More than one covering index makes the choice arbitrary; stay with scalar semantics.
-            if (bound is not null)
-                return null;
+            var attachment = ManagedIndexMethodSemantics.GetAttachment(tableName, table, candidate)
+                as ManagedFtsIndexAttachment;
+            if (attachment is null)
+                continue;
 
-            bound = candidate;
+            // Equal configurations are interchangeable. Differing tokenizers, field weights or
+            // detail options are observably different, so neither scalar binding nor prefiltering
+            // may pick one by catalog order.
+            if (boundAttachment is not null
+                && !boundAttachment.HasEquivalentQuerySemantics(attachment))
+            {
+                return null;
+            }
+
+            if (bound is null
+                || string.Compare(candidate.Name, bound.Name, StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                bound = candidate;
+                boundAttachment = attachment;
+                boundMapping = mapping;
+            }
         }
 
-        return bound is null ? null : new BoundFtsIndex(tableName, table, bound, rowId);
+        return bound is null
+            ? null
+            : new BoundFtsIndex(tableName, table, bound, rowId, boundMapping!);
+    }
+
+    private static bool TryResolveUnqualifiedFtsSource(
+        SourceRow row,
+        QueryContext context,
+        IReadOnlyList<string> names,
+        out string tableName,
+        out EmbeddedTable table)
+    {
+        tableName = string.Empty;
+        table = null!;
+        foreach (var (candidateName, candidate) in context.Tables)
+        {
+            if (!candidate.HasMethodIndexes
+                || candidate.Columns.Length != row.Columns.Length
+                || !candidate.Columns.SequenceEqual(row.Columns, StringComparer.OrdinalIgnoreCase)
+                || names.Any(name => !candidate.Columns.Contains(name, StringComparer.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            if (table is not null)
+                return false;
+            tableName = candidateName;
+            table = candidate;
+        }
+
+        return table is not null;
+    }
+
+    private static bool TryResolveQualifiedFtsSource(
+        string qualifier,
+        SourceRow row,
+        QueryContext context,
+        IReadOnlyList<string> names,
+        out string tableName,
+        out EmbeddedTable table)
+    {
+        tableName = string.Empty;
+        table = null!;
+        if (row.QualifiedColumns is null
+            || names.Any(name => !row.QualifiedColumns.ContainsKey(qualifier + "." + name)))
+        {
+            return false;
+        }
+
+        foreach (var (candidateName, candidate) in context.Tables)
+        {
+            if (!candidate.HasMethodIndexes
+                || names.Any(name => !candidate.Columns.Contains(name, StringComparer.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            if (table is not null)
+                return false;
+            tableName = candidateName;
+            table = candidate;
+        }
+
+        return table is not null;
     }
 }

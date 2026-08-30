@@ -20,7 +20,8 @@ public enum ManagedVirtualTableAffinity
 public sealed record ManagedVirtualTableColumn(
     string Name,
     ManagedVirtualTableAffinity Affinity = ManagedVirtualTableAffinity.Blob,
-    bool IsHidden = false);
+    bool IsHidden = false,
+    string? DeclaredType = null);
 
 /// <summary>
 /// Immutable column shape returned by a managed virtual-table module. Hidden columns remain
@@ -65,7 +66,26 @@ public enum ManagedVirtualTableConstraintOperator
     IsNotNull,
     Limit,
     Offset,
+    NotEqual,
+    Is,
+    IsNot,
 }
+
+/// <summary>
+/// Conflict policy supplied to a virtual table's update callback. This is the managed equivalent
+/// of SQLite's <c>sqlite3_vtab_on_conflict()</c> and Turso's VUpdate conflict action.
+/// </summary>
+public enum ManagedVirtualTableConflictMode
+{
+    Rollback,
+    Abort,
+    Fail,
+    Ignore,
+    Replace,
+}
+
+/// <summary>The outcome of one managed virtual-table update callback.</summary>
+public readonly record struct ManagedVirtualTableUpdateResult(long? RowId, bool Changed = true);
 
 /// <summary>One planner-visible predicate on a virtual-table column.</summary>
 public readonly record struct ManagedVirtualTableConstraint(
@@ -78,7 +98,10 @@ public readonly record struct ManagedVirtualTableOrderBy(int ColumnIndex, bool D
 
 /// <summary>
 /// Maps a constraint received by <see cref="ManagedVirtualTable.BestIndex"/> to the argument
-/// vector supplied to <see cref="ManagedVirtualTableCursor.Filter"/>.
+/// vector supplied to <see cref="ManagedVirtualTableCursor.Filter"/>. Zero leaves the constraint
+/// without a filter argument; positive indexes must be unique, contiguous, one-based, and assigned
+/// only to usable constraints. <see cref="Omit"/> may be used without an argument only for
+/// <c>IS NULL</c>/<c>IS NOT NULL</c>, whose operator carries the complete predicate.
 /// </summary>
 public readonly record struct ManagedVirtualTableConstraintUsage(int ArgumentIndex, bool Omit = false)
 {
@@ -86,7 +109,11 @@ public readonly record struct ManagedVirtualTableConstraintUsage(int ArgumentInd
     public static ManagedVirtualTableConstraintUsage Unused => new(0);
 }
 
-/// <summary>Module-selected scan strategy, mirroring Turso's <c>IndexInfo</c>.</summary>
+/// <summary>
+/// Module-selected scan strategy, mirroring Turso's <c>IndexInfo</c>. Estimated cost and row
+/// count participate in managed join/access planning. <see cref="OrderByConsumed"/> is honored
+/// only when every requested ordering term was passed to <see cref="ManagedVirtualTable.BestIndex"/>.
+/// </summary>
 public sealed class ManagedVirtualTablePlan
 {
     private readonly ReadOnlyCollection<ManagedVirtualTableConstraintUsage> _constraintUsages;
@@ -114,10 +141,15 @@ public sealed class ManagedVirtualTablePlan
     }
 
     public IReadOnlyList<ManagedVirtualTableConstraintUsage> ConstraintUsages => _constraintUsages;
+    /// <summary>Module-defined numeric plan identifier supplied unchanged to <c>Filter</c>.</summary>
     public int IndexNumber { get; }
+    /// <summary>Module-defined plan description supplied unchanged to <c>Filter</c> and EXPLAIN.</summary>
     public string? IndexString { get; }
+    /// <summary>Whether the module produces the complete requested ordering.</summary>
     public bool OrderByConsumed { get; }
+    /// <summary>Estimated work used when comparing managed access and correlated join shapes.</summary>
     public double EstimatedCost { get; }
+    /// <summary>Estimated output cardinality used by managed join planning.</summary>
     public long EstimatedRows { get; }
 
     internal void ValidateFor(IReadOnlyList<ManagedVirtualTableConstraint> constraints)
@@ -129,17 +161,39 @@ public sealed class ManagedVirtualTablePlan
         }
 
         var usedArguments = new HashSet<int>();
-        foreach (var usage in ConstraintUsages)
+        for (var constraintIndex = 0; constraintIndex < ConstraintUsages.Count; constraintIndex++)
         {
+            var usage = ConstraintUsages[constraintIndex];
             if (usage.ArgumentIndex < 0)
                 throw new InvalidOperationException("A virtual-table constraint argument index cannot be negative.");
-            if (usage.Omit && usage.ArgumentIndex == 0)
+            if (usage.ArgumentIndex > constraints.Count)
+                throw new InvalidOperationException("A virtual-table constraint argument index is out of range.");
+            if (usage.Omit
+                && usage.ArgumentIndex == 0
+                && constraints[constraintIndex].Operator is not (
+                    ManagedVirtualTableConstraintOperator.IsNull
+                    or ManagedVirtualTableConstraintOperator.IsNotNull))
             {
                 throw new InvalidOperationException(
                     "A virtual-table plan can omit a constraint only when it receives that constraint's filter argument.");
             }
+            if (!constraints[constraintIndex].Usable
+                && (usage.ArgumentIndex != 0 || usage.Omit))
+            {
+                throw new InvalidOperationException(
+                    "A virtual-table plan cannot consume or omit an unusable constraint.");
+            }
             if (usage.ArgumentIndex > 0 && !usedArguments.Add(usage.ArgumentIndex))
                 throw new InvalidOperationException("A virtual-table plan cannot assign one filter argument to multiple constraints.");
+        }
+
+        for (var argumentIndex = 1; argumentIndex <= usedArguments.Count; argumentIndex++)
+        {
+            if (!usedArguments.Contains(argumentIndex))
+            {
+                throw new InvalidOperationException(
+                    "Virtual-table filter argument indexes must be contiguous and one-based.");
+            }
         }
     }
 }
@@ -204,6 +258,8 @@ public abstract class ManagedVirtualTableModule
 /// </summary>
 public abstract class ManagedVirtualTable
 {
+    private int _lifecycleEnded;
+
     public abstract ManagedVirtualTableSchema Schema { get; }
 
     public abstract ManagedVirtualTablePlan BestIndex(
@@ -228,16 +284,57 @@ public abstract class ManagedVirtualTable
         => throw new EmbeddedSqlException("attempt to write a readonly virtual table");
 
     /// <summary>
-    /// Begins one autocommit virtual-table mutation statement. Explicit SQL transactions and
-    /// savepoints are not supported for managed virtual-table mutations because the generic ABI
-    /// has no reversible module-state contract.
+    /// Applies one VUpdate while exposing the statement's conflict policy. Existing modules that
+    /// only override <see cref="Update(IReadOnlyList{SqlValue})"/> retain their behavior.
     /// </summary>
+    public virtual ManagedVirtualTableUpdateResult Update(
+        IReadOnlyList<SqlValue> arguments,
+        ManagedVirtualTableConflictMode conflictMode)
+        => new(Update(arguments));
+
+    /// <summary>Begins participation in the current SQL transaction.</summary>
     public virtual void Begin() { }
+    /// <summary>Synchronizes pending changes immediately before the SQL transaction commits.</summary>
     public virtual void Sync() { }
+    /// <summary>Completes a successfully committed SQL transaction.</summary>
     public virtual void Commit() { }
+    /// <summary>Rolls back participation in the current SQL transaction.</summary>
     public virtual void Rollback() { }
     public virtual void Rename(string newName) { }
+    /// <summary>
+    /// Releases this connection's instance without deleting persistent module state. Catalog
+    /// replacement, rollback, reload, and database close invoke this callback exactly once.
+    /// </summary>
+    public virtual void Disconnect() { }
+    /// <summary>Deletes persistent module state for <c>DROP TABLE</c>.</summary>
     public virtual void Destroy() { }
+
+    /// <summary>Returns module-owned invariant failures for PRAGMA integrity_check.</summary>
+    public virtual IReadOnlyList<string> CheckIntegrity() => [];
+
+    internal bool LifecycleEnded => Volatile.Read(ref _lifecycleEnded) != 0;
+
+    internal void DisconnectInstance()
+    {
+        if (Interlocked.Exchange(ref _lifecycleEnded, 1) == 0)
+            Disconnect();
+    }
+
+    internal void DestroyInstance()
+    {
+        if (Interlocked.CompareExchange(ref _lifecycleEnded, 1, 0) != 0)
+            return;
+
+        try
+        {
+            Destroy();
+        }
+        catch
+        {
+            Volatile.Write(ref _lifecycleEnded, 0);
+            throw;
+        }
+    }
 }
 
 /// <summary>Small deterministic binary writer shared by the built-in module payloads.</summary>
