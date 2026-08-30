@@ -1181,13 +1181,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         public void RelinquishVirtualTableOwnership() => _ownsVirtualTableInstances = false;
 
-        public void DisconnectOwnedVirtualTables()
+        public void DisconnectOwnedVirtualTables(ManagedVirtualTableTransaction? transaction = null)
         {
             if (!_ownsVirtualTableInstances)
                 return;
 
             _ownsVirtualTableInstances = false;
-            DisconnectVirtualTables(VirtualTables.Values);
+            foreach (var definition in VirtualTables.Values)
+            {
+                if (transaction?.IsParticipating(definition.Table) != true)
+                    definition.Table.DisconnectInstance();
+            }
         }
     }
 
@@ -1215,65 +1219,125 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     internal sealed class ManagedVirtualTableTransaction
     {
-        private readonly HashSet<string> _participants = new(StringComparer.OrdinalIgnoreCase);
-        private readonly HashSet<string> _synchronized = new(StringComparer.OrdinalIgnoreCase);
+        private readonly List<ManagedVirtualTable> _participants = [];
+        private readonly HashSet<ManagedVirtualTable> _participantSet =
+            new(ReferenceEqualityComparer.Instance);
+        private readonly HashSet<ManagedVirtualTable> _synchronized =
+            new(ReferenceEqualityComparer.Instance);
 
         public void Begin(VirtualTableDefinition definition)
         {
-            if (_participants.Contains(definition.Name))
-            {
-                _synchronized.Remove(definition.Name);
+            var table = definition.Table;
+            if (_participantSet.Contains(table))
                 return;
-            }
 
-            definition.Table.Begin();
-            _participants.Add(definition.Name);
+            table.Begin();
+            _participantSet.Add(table);
+            _participants.Add(table);
         }
+
+        public int CreateCheckpoint() => _participants.Count;
+
+        public bool IsParticipating(ManagedVirtualTable table)
+            => _participantSet.Contains(table);
 
         public void Sync(SchemaCatalog catalog)
         {
-            foreach (var name in _participants)
+            _ = catalog;
+            foreach (var table in _participants)
             {
-                if (_synchronized.Contains(name)
-                    || !catalog.VirtualTables.TryGetValue(name, out var definition)
-                    || definition.Table.LifecycleEnded)
-                {
+                if (!_synchronized.Add(table))
                     continue;
-                }
 
-                definition.Table.Sync();
-                _synchronized.Add(name);
+                table.Sync();
             }
         }
 
         public void Commit(SchemaCatalog catalog)
         {
-            foreach (var name in _participants)
-            {
-                if (catalog.VirtualTables.TryGetValue(name, out var definition)
-                    && !definition.Table.LifecycleEnded)
-                {
-                    definition.Table.Commit();
-                }
-            }
-
-            _participants.Clear();
-            _synchronized.Clear();
+            var retained = new HashSet<ManagedVirtualTable>(
+                catalog.VirtualTables.Values.Select(static definition => definition.Table),
+                ReferenceEqualityComparer.Instance);
+            Complete(commit: true, retained);
         }
 
         public void Rollback(SchemaCatalog catalog)
         {
-            foreach (var name in _participants)
+            _ = catalog;
+            Complete(commit: false, retained: null);
+        }
+
+        public void RollbackTo(int checkpoint)
+        {
+            if (checkpoint >= _participants.Count)
+                return;
+            if (checkpoint < 0)
+                throw new ArgumentOutOfRangeException(nameof(checkpoint));
+
+            ExceptionDispatchInfo? failure = null;
+            for (var index = _participants.Count - 1; index >= checkpoint; index--)
             {
-                if (catalog.VirtualTables.TryGetValue(name, out var definition)
-                    && !definition.Table.LifecycleEnded)
+                var table = _participants[index];
+                _participants.RemoveAt(index);
+                _participantSet.Remove(table);
+                _synchronized.Remove(table);
+                try
                 {
-                    definition.Table.Rollback();
+                    table.Rollback();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+
+                try
+                {
+                    table.DisconnectInstance();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
                 }
             }
 
+            failure?.Throw();
+        }
+
+        private void Complete(bool commit, HashSet<ManagedVirtualTable>? retained)
+        {
+            var participants = _participants.ToArray();
             _participants.Clear();
+            _participantSet.Clear();
             _synchronized.Clear();
+
+            ExceptionDispatchInfo? failure = null;
+            foreach (var table in participants)
+            {
+                try
+                {
+                    if (commit)
+                        table.Commit();
+                    else
+                        table.Rollback();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+
+                if (retained?.Contains(table) == true)
+                    continue;
+                try
+                {
+                    table.DisconnectInstance();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
+
+            failure?.Throw();
         }
     }
 
@@ -2568,7 +2632,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 _tables,
                 new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
                 _views,
-                _triggers);
+                _triggers,
+                VirtualTables: _virtualTables,
+                Database: this);
             ValidateQueryIndexDirectives(statement, context);
             return DescribeQuery(statement, context);
         }
@@ -2582,7 +2648,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 catalog.Tables,
                 new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
                 catalog.Views,
-                catalog.Triggers);
+                catalog.Triggers,
+                VirtualTables: catalog.VirtualTables,
+                Database: this);
             ValidateQueryIndexDirectives(statement, context);
             return DescribeQuery(statement, context);
         }
@@ -16694,6 +16762,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         select = ResolveNamedWindows(select);
         context = EnterCollationSource(context, select.Source);
 
+        // fts_score() needs the current source identity and hidden rowid in every query position.
+        // Predicate delegates emitted by several compiled scan routes receive only declared column
+        // values, so lowering the call there would evaluate the scalar fallback (0.0) while the
+        // identical projection evaluates against the bound corpus. Keep the whole SELECT on the
+        // evaluator until compiled rows carry method-index source bindings as first-class metadata.
+        if (SelectContainsCorpusDependentMethodFunction(select))
+        {
+            compiled = null!;
+            return false;
+        }
+
         if (TryCompileVirtualTableSelect(select, parameters, context, outerRow, out compiled))
             return true;
 
@@ -16729,6 +16808,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         return TryCompileSelectRemainder(select, parameters, context, outerRow, out compiled);
+    }
+
+    private static bool SelectContainsCorpusDependentMethodFunction(SelectStatement select)
+    {
+        static bool Contains(Expression? expression)
+            => expression is not null
+                && IndexExpressionSemantics.ContainsFunction(
+                    expression,
+                    static (name, _) => EmbeddedTable.IsCorpusDependentMethodFunction(name));
+
+        return select.Projections.Any(projection => Contains(projection.Expression))
+            || Contains(select.Where)
+            || select.GroupBy.Any(Contains)
+            || Contains(select.Having)
+            || select.NamedWindows.Any(window =>
+                window.Specification.PartitionBy.Any(Contains)
+                || window.Specification.OrderBy.Any(term => Contains(term.Expression)))
+            || select.OrderBy.Any(term => Contains(term.Expression))
+            || Contains(select.Limit)
+            || Contains(select.Offset);
     }
 
     private bool TryCompileSelectRemainder(
@@ -46255,7 +46354,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                 {
                     var previous = transaction.Catalog;
                     transaction.Catalog = pair.Value.Catalog;
-                    previous.DisconnectOwnedVirtualTables();
+                    previous.DisconnectOwnedVirtualTables(transaction.VirtualTableTransaction);
                     transaction.HasChanges = true;
                     transaction.ForceFullCatalogRewrite |= pair.Value.ForceFullCatalogRewrite;
                     if (!ReferenceEquals(pair.Key, connection._tempDatabase))
@@ -46905,7 +47004,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         {
             var previous = state.Catalog;
             state.Catalog = pending.Catalog;
-            previous.DisconnectOwnedVirtualTables();
+            previous.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
             state.HasChanges = true;
             state.PragmaHeader = state.PragmaHeader with
             {
@@ -47682,6 +47781,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 routed.Database.TransactionLock.ThrowIfReadBlocked(this, BusyTimeout);
                 TransactionDatabaseState? transactionState = null;
                 EmbeddedDatabase.SchemaCatalog? statementCatalog = null;
+                int? virtualTableTransactionCheckpoint = null;
+                var retainVirtualTableParticipation = false;
                 HashSet<EmbeddedDatabase.ForeignKeyViolation>? deferredBefore = null;
                 var tempTriggers = CreateTempTriggerBridge(routed.Database, out var tempTriggerSession);
                 var changeDataCapture = _changeDataCapture;
@@ -47698,6 +47799,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                 {
                     ExecutionResult result;
                     transactionState = GetTransactionState(routed.Database);
+                    if (transactionState is not null && routedMayMutate)
+                    {
+                        virtualTableTransactionCheckpoint =
+                            transactionState.VirtualTableTransaction.CreateCheckpoint();
+                    }
                     if (transactionState is not null
                         && _foreignKeys
                         && routedMayMutate)
@@ -47837,7 +47943,9 @@ public sealed partial class EmbeddedConnection : IDisposable
                             transactionState.Catalog = statementCatalog
                                 ?? throw new InvalidOperationException(
                                     "A transactional mutation lost its statement catalog.");
-                            previousCatalog.DisconnectOwnedVirtualTables();
+                            previousCatalog.DisconnectOwnedVirtualTables(
+                                transactionState.VirtualTableTransaction);
+                            retainVirtualTableParticipation = true;
                             transactionState.HasChanges = true;
                             transactionState.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
                             if (!ReferenceEquals(routed.Database, _tempDatabase))
@@ -47934,7 +48042,9 @@ public sealed partial class EmbeddedConnection : IDisposable
                         var previousCatalog = transactionState.Catalog;
                         transactionState.Catalog = statementCatalog
                             ?? throw new InvalidOperationException("A partial transactional mutation lost its statement catalog.");
-                        previousCatalog.DisconnectOwnedVirtualTables();
+                        previousCatalog.DisconnectOwnedVirtualTables(
+                            transactionState.VirtualTableTransaction);
+                        retainVirtualTableParticipation = true;
                         transactionState.HasChanges = true;
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
@@ -47966,7 +48076,9 @@ public sealed partial class EmbeddedConnection : IDisposable
                         transactionState.Catalog = statementCatalog
                             ?? throw new InvalidOperationException(
                                 "A partial recursive trigger mutation lost its statement catalog.");
-                        previousCatalog.DisconnectOwnedVirtualTables();
+                        previousCatalog.DisconnectOwnedVirtualTables(
+                            transactionState.VirtualTableTransaction);
+                        retainVirtualTableParticipation = true;
                         transactionState.HasChanges = true;
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
@@ -48024,6 +48136,12 @@ public sealed partial class EmbeddedConnection : IDisposable
                 finally
                 {
                     tempTriggerSession?.Abandon();
+                    if (!retainVirtualTableParticipation
+                        && virtualTableTransactionCheckpoint is { } checkpoint
+                        && transactionState is not null)
+                    {
+                        transactionState.VirtualTableTransaction.RollbackTo(checkpoint);
+                    }
                     if (statementCatalog is not null
                         && !ReferenceEquals(transactionState?.Catalog, statementCatalog))
                     {
@@ -48785,7 +48903,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                         {
                             var previous = state.Catalog;
                             state.Catalog = catalog;
-                            previous.DisconnectOwnedVirtualTables();
+                            previous.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
                             catalog = null;
                             state.HasChanges = true;
                             state.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
@@ -48863,7 +48981,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                         {
                             var previous = state.Catalog;
                             state.Catalog = catalog;
-                            previous.DisconnectOwnedVirtualTables();
+                            previous.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
                             catalog = null;
                             state.HasChanges = true;
                             if (!ReferenceEquals(database, _tempDatabase))
@@ -52329,6 +52447,7 @@ Func<string, ParsedStatement> rewrite)
                         pair.Value.HasSnapshotPragmaHeader,
                         pair.Value.HasSchemaChanges,
                         pair.Value.ForceFullCatalogRewrite,
+                        pair.Value.VirtualTableTransaction.CreateCheckpoint(),
                         new HashSet<EmbeddedDatabase.ForeignKeyViolation>(
                             pair.Value.PendingDeferredViolations)));
             }
@@ -52384,8 +52503,9 @@ Func<string, ParsedStatement> rewrite)
         {
             var state = _transactionDatabases[database];
             var replacedCatalog = state.Catalog;
+            state.VirtualTableTransaction.RollbackTo(savedState.VirtualTableTransactionCheckpoint);
             state.Catalog = savedState.Catalog.Clone();
-            replacedCatalog.DisconnectOwnedVirtualTables();
+            replacedCatalog.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
             state.HasChanges = savedState.HasChanges;
             state.PragmaHeader = savedState.PragmaHeader;
             state.HasSnapshotPragmaHeader = savedState.HasSnapshotPragmaHeader;
@@ -52498,6 +52618,7 @@ Func<string, ParsedStatement> rewrite)
         bool HasSnapshotPragmaHeader,
         bool HasSchemaChanges,
         bool ForceFullCatalogRewrite,
+        int VirtualTableTransactionCheckpoint,
         IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations);
 
     private void ThrowIfRecursiveTriggerCallbackReentry()

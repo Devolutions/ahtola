@@ -128,28 +128,42 @@ internal sealed class ManagedRTreeIndex
 
     private Node? _root;
     private readonly Dictionary<long, ManagedRTreeBounds> _entries = [];
+    private readonly Dictionary<long, Node> _leafByRowId = [];
 
     public int Count => _entries.Count;
 
     internal int LastSearchVisitedNodes { get; private set; }
+    internal long TreeInsertionCount { get; private set; }
+    internal long RemoveOperationCount { get; private set; }
+    internal int LastRemoveReinsertedEntries { get; private set; }
 
     public void Upsert(long rowId, ManagedRTreeBounds bounds)
     {
         ArgumentNullException.ThrowIfNull(bounds);
-        if (_entries.Remove(rowId))
-            RebuildTree();
+        if (_entries.ContainsKey(rowId))
+            Remove(rowId);
 
         InsertNew(rowId, bounds);
     }
 
     public bool Remove(long rowId)
     {
-        if (!_entries.Remove(rowId))
+        LastRemoveReinsertedEntries = 0;
+        if (!_entries.ContainsKey(rowId) || !_leafByRowId.TryGetValue(rowId, out var leaf))
             return false;
 
-        // Rebuilding is a deterministic CondenseTree: every surviving leaf is reinserted and no
-        // underfull interior node or stale bounding rectangle can survive a delete.
-        RebuildTree();
+        var entryIndex = leaf.Entries.FindIndex(entry => entry.RowId == rowId);
+        if (entryIndex < 0)
+            throw new InvalidOperationException("R-Tree leaf map is inconsistent.");
+
+        _entries.Remove(rowId);
+        _leafByRowId.Remove(rowId);
+        leaf.Entries.RemoveAt(entryIndex);
+        RemoveOperationCount++;
+        var orphaned = CondenseTree(leaf);
+        LastRemoveReinsertedEntries = orphaned.Count;
+        foreach (var entry in orphaned.OrderBy(static entry => entry.RowId))
+            InsertExisting(entry);
         return true;
     }
 
@@ -246,30 +260,89 @@ internal sealed class ManagedRTreeIndex
     private void InsertNew(long rowId, ManagedRTreeBounds bounds)
     {
         var entry = new Entry(rowId, bounds);
-        if (_root is null)
-        {
-            _root = Node.Leaf(entry);
-        }
-        else
-        {
-            if (_root.Bounds!.Dimensions != bounds.Dimensions)
-                throw new ArgumentException("R-Tree entries must use one dimension count.", nameof(bounds));
-
-            var sibling = Insert(_root, entry);
-            if (sibling is not null)
-                _root = Node.Parent(_root, sibling);
-        }
-
+        InsertExisting(entry);
         _entries.Add(rowId, bounds);
     }
 
-    private void RebuildTree()
+    private void InsertExisting(Entry entry)
     {
-        var entries = _entries.OrderBy(static entry => entry.Key).ToArray();
-        _root = null;
-        _entries.Clear();
-        foreach (var (rowId, bounds) in entries)
-            InsertNew(rowId, bounds);
+        TreeInsertionCount++;
+        if (_root is null)
+        {
+            _root = Node.Leaf(entry);
+            _leafByRowId[entry.RowId] = _root;
+        }
+        else
+        {
+            if (_root.Bounds!.Dimensions != entry.Bounds.Dimensions)
+                throw new ArgumentException("R-Tree entries must use one dimension count.", nameof(entry));
+
+            var sibling = Insert(_root, entry);
+            if (sibling is not null)
+                _root = Node.CreateParent(_root, sibling);
+        }
+    }
+
+    /// <summary>
+    /// Implements Guttman's CondenseTree: detach each underfull node on the path to the root and
+    /// reinsert only the leaf entries from those detached subtrees. A delete therefore touches one
+    /// root-to-leaf path plus the entries made homeless by underflow, rather than rebuilding every
+    /// surviving row.
+    /// </summary>
+    private List<Entry> CondenseTree(Node leaf)
+    {
+        var orphaned = new List<Entry>();
+        var node = leaf;
+        while (!ReferenceEquals(node, _root))
+        {
+            var parent = node.Parent
+                ?? throw new InvalidOperationException("R-Tree non-root node has no parent.");
+            if (node.Count < MinimumEntries)
+            {
+                if (!parent.Children.Remove(node))
+                    throw new InvalidOperationException("R-Tree parent does not contain its child.");
+                CollectLeafEntries(node, orphaned);
+            }
+            else
+            {
+                node.RefreshBounds();
+            }
+
+            parent.RefreshBounds();
+            node = parent;
+        }
+
+        if (_root is { IsLeaf: false, Count: 1 })
+        {
+            _root = _root.Children[0];
+            _root.Parent = null;
+        }
+        else if (_root is { Count: 0 })
+        {
+            _root = null;
+        }
+        else
+        {
+            _root?.RefreshBounds();
+        }
+
+        return orphaned;
+    }
+
+    private void CollectLeafEntries(Node node, List<Entry> entries)
+    {
+        if (node.IsLeaf)
+        {
+            foreach (var entry in node.Entries)
+            {
+                _leafByRowId.Remove(entry.RowId);
+                entries.Add(entry);
+            }
+            return;
+        }
+
+        foreach (var child in node.Children)
+            CollectLeafEntries(child, entries);
     }
 
     private void Search(
@@ -343,18 +416,22 @@ internal sealed class ManagedRTreeIndex
             _ => throw new ArgumentOutOfRangeException(nameof(operation)),
         };
 
-    private static Node? Insert(Node node, Entry entry)
+    private Node? Insert(Node node, Entry entry)
     {
         if (node.IsLeaf)
         {
             node.Entries.Add(entry);
+            _leafByRowId[entry.RowId] = node;
         }
         else
         {
             var child = SelectChild(node.Children, entry.Bounds);
             var sibling = Insert(child, entry);
             if (sibling is not null)
+            {
+                sibling.Parent = node;
                 node.Children.Add(sibling);
+            }
         }
 
         node.RefreshBounds();
@@ -379,7 +456,7 @@ internal sealed class ManagedRTreeIndex
         return enlarged - existing;
     }
 
-    private static Node Split(Node node)
+    private Node Split(Node node)
     {
         var items = node.IsLeaf
             ? node.Entries.Select(static entry => new SplitItem(entry, null)).ToList()
@@ -413,6 +490,13 @@ internal sealed class ManagedRTreeIndex
         }
 
         node.ReplaceWith(first);
+        if (node.IsLeaf)
+        {
+            foreach (var entry in node.Entries)
+                _leafByRowId[entry.RowId] = node;
+            foreach (var entry in second.Entries)
+                _leafByRowId[entry.RowId] = second;
+        }
         return second;
     }
 
@@ -478,7 +562,10 @@ internal sealed class ManagedRTreeIndex
         if (node.IsLeaf)
             node.Entries.Add(item.Entry!);
         else
+        {
+            item.Child!.Parent = node;
             node.Children.Add(item.Child!);
+        }
         node.RefreshBounds();
     }
 
@@ -529,6 +616,7 @@ internal sealed class ManagedRTreeIndex
         public bool IsLeaf { get; } = isLeaf;
         public List<Entry> Entries { get; } = [];
         public List<Node> Children { get; } = [];
+        public Node? Parent { get; set; }
         public ManagedRTreeBounds? Bounds { get; private set; }
         public int Count => IsLeaf ? Entries.Count : Children.Count;
         public long FirstRowId => IsLeaf
@@ -543,11 +631,13 @@ internal sealed class ManagedRTreeIndex
             return node;
         }
 
-        public static Node Parent(Node left, Node right)
+        public static Node CreateParent(Node left, Node right)
         {
             var node = new Node(isLeaf: false);
             node.Children.Add(left);
             node.Children.Add(right);
+            left.Parent = node;
+            right.Parent = node;
             node.RefreshBounds();
             return node;
         }
@@ -558,6 +648,8 @@ internal sealed class ManagedRTreeIndex
             Children.Clear();
             Entries.AddRange(source.Entries);
             Children.AddRange(source.Children);
+            foreach (var child in Children)
+                child.Parent = this;
             RefreshBounds();
         }
 

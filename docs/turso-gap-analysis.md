@@ -984,7 +984,7 @@ than absent subsystems.
 | `func-array-postgres-family` | missing | s3-perf | L | 0 | 0 | Postgres-style ARRAY(...)/array_element/array_append/etc. scalar family, always compiled (not behind a cargo feature flag) but not part of stock SQLite semantics and not… |
 | `func-extension-format-btrim` | extension | s4-intentional | S | 0 | 0 | FORMAT (an alias for PRINTF, matching real SQLite's built-in but not present as a distinct entry in Turso's from_str dispatch table) and BTRIM (Postgres-style alias for T… |
 | `func-extension-uuid-family` | extension | s4-intentional | S | 0 | 0 | Ahtola registers a full UUID v4/v7 generation family (text and blob forms, plus gen_random_uuid() for Postgres compatibility) that has no counterpart anywhere in turso-sr… |
-| `func-fts-scalar-family` | partial | s3-perf | L | 0 | 0 | Reconciled 2026-08-29 with pinned v0.8.0-pre.7: method query grammar, pinned tokenizers, MATCH forms, NULL/TEXT-only behavior, varargs highlight, unordered column binding, boosts, seven plans, streaming/top-k and OPTIMIZE are managed. `fts_score` is registered deterministic like Turso; CHECK constraints remain an explicit corpus-mutation safety exception. Tantivy storage/exact score bits remain out of scope. |
+| `func-fts-scalar-family` | partial | s3-perf | L | 0 | 0 | Reconciled 2026-08-29 with pinned v0.8.0-pre.7: method query grammar, pinned tokenizers, MATCH forms, NULL/TEXT-only behavior, varargs highlight, unordered column binding, boosts, seven declared plans, rowid-ordered matching, ranked top-k and OPTIMIZE are managed. Corpus-aware `fts_score` is schema-nondeterministic and rejected from indexes, generated columns, partial predicates, and CHECK constraints. Tantivy storage/exact score bits remain out of scope. |
 | `func-gcd-lcm-missing` | missing | s3-perf | S | 0 | 0 | gcd()/lcm() (Turso/SQLite-3.41+-style math helpers) have no hits anywhere in src/Ahtola.Core or Ahtola.Core/EmbeddedDatabase.MathFunctions.cs. Not covered by the vendored… |
 | `func-numeric-boolean-ip-helpers-missing` | missing | s4-intentional | M | 0 | 0 | Internal-flavored helper functions supporting Turso's typed BOOLEAN/NUMERIC column extensions and validated IP address type; no SQLite equivalent and no corpus coverage.… |
 | `func-octet-length-missing` | missing | s1-correctness | S | 0 | 0 | octet_length is absent from SqliteBuiltinFunctions.Names and from EmbeddedDatabase.StringFunctions.cs / EmbeddedDatabase.cs (no case-insensitive hit for 'octet' anywhere… |
@@ -1426,9 +1426,9 @@ defects, all now closed with regression coverage in
   rows score against their own source.
 - A connection scalar callback that shadows `fts_match`/`fts_score`/`fts_highlight`/
   `fts_snippet` suppresses method planning and index-aware scalar behavior.
-- The FTS registry now follows pinned Turso's deterministic flags. `fts_score`
-  remains rejected only in CHECK constraints as an explicit live-corpus safety
-  boundary.
+- Row-local FTS scalars remain deterministic, while corpus-aware `fts_score`
+  is schema-nondeterministic and rejected from indexes, generated columns,
+  partial predicates, and CHECK constraints.
 - Attachments are cached only after publication and dropped on every failure;
   `REINDEX`/`Optimize` build detached and publish atomically; `DROP INDEX` runs
   `Destroy`.
@@ -1469,7 +1469,8 @@ defects, all now closed with regression coverage in
 - Covering columns bind as an unordered resolved set and remap configuration by
   name. Differently configured duplicate indexes force a scan; equivalent
   duplicates select deterministically.
-- Unordered plans stream from the method cursor; ranked LIMIT uses bounded top-k.
+- Unordered plans restore base rowid order and apply LIMIT after residuals; only
+  a completely consumed ranked order uses bounded top-k.
   There is no one-million-match failure. Query/position/prefix/highlight bounds
   remain explicit denial-of-service guards.
 - Named and bare `OPTIMIZE INDEX` invoke the managed method transactionally;

@@ -473,6 +473,27 @@ public class TableValuedFunctionTests
             .Should().Equal(["cte"]);
     }
 
+    [Test]
+    public void TriggerBodyTableValuedFunctionsResolveNewPseudoColumns()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(
+            connection,
+            """
+            CREATE TABLE source(payload TEXT);
+            CREATE TABLE extracted(value INTEGER);
+            CREATE TRIGGER expand_payload AFTER INSERT ON source BEGIN
+              INSERT INTO extracted(value)
+              SELECT value FROM json_each(NEW.payload);
+            END;
+            INSERT INTO source VALUES ('[7,8,9]');
+            """);
+
+        Rows(connection, "SELECT value FROM extracted ORDER BY value;")
+            .Should().Equal(["7", "8", "9"]);
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         foreach (var statement in connection.PrepareScript(sql))

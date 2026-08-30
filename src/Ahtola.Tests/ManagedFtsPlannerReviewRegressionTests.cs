@@ -153,6 +153,66 @@ public sealed class ManagedFtsPlannerReviewRegressionTests
     }
 
     [Test]
+    public void CorpusScoreIsIdenticalInProjectionPredicateAndDerivedTable()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        SeedCorpus(connection);
+
+        const string score = "fts_score(title, body, 'fox')";
+        var projected = Query(
+                connection,
+                $"SELECT id, {score} AS score FROM docs ORDER BY id;")
+            .Where(static row => row[1].AsReal() > 0)
+            .ToArray();
+        var filtered = Query(
+            connection,
+            $"SELECT id, {score} AS score FROM docs WHERE {score} > 0 ORDER BY id;");
+        var derived = Query(
+            connection,
+            $"SELECT id, score FROM (SELECT id, {score} AS score FROM docs) AS ranked "
+            + "WHERE score > 0 ORDER BY id;");
+
+        projected.Select(static row => row[0].AsInteger()).Should().Equal(40, 80, 120);
+        filtered.Should().BeEquivalentTo(projected, options => options.WithStrictOrdering());
+        derived.Should().BeEquivalentTo(projected, options => options.WithStrictOrdering());
+    }
+
+    [Test]
+    public void UnorderedMatchLimitPreservesBaseRowIdOrder()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        SeedCorpus(connection);
+        Execute(connection, "UPDATE docs SET body = 'fox fox fox fox fox' WHERE id = 80;");
+
+        const string indexed = "SELECT id FROM docs WHERE fts_match(title, body, 'fox') LIMIT 2;";
+        const string scanned = "SELECT id FROM docs NOT INDEXED WHERE fts_match(title, body, 'fox') LIMIT 2;";
+
+        ExplainDetail(connection, indexed).Should().Contain("pattern=Match").And.NotContain("MatchLimit");
+        QueryIntegers(connection, indexed).Should().Equal(40, 80);
+        QueryIntegers(connection, indexed).Should().Equal(QueryIntegers(connection, scanned));
+    }
+
+    [Test]
+    public void UnorderedMatchLimitRunsAfterResidualPredicates()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        SeedCorpus(connection);
+        Execute(connection, "UPDATE docs SET body = 'fox fox fox fox fox' WHERE id = 40;");
+
+        const string indexed =
+            "SELECT id FROM docs WHERE fts_match(title, body, 'fox') AND id > 40 LIMIT 1;";
+        const string scanned =
+            "SELECT id FROM docs NOT INDEXED WHERE fts_match(title, body, 'fox') AND id > 40 LIMIT 1;";
+
+        ExplainDetail(connection, indexed).Should().Contain("pattern=Match").And.NotContain("MatchLimit");
+        QueryIntegers(connection, indexed).Should().Equal(80);
+        QueryIntegers(connection, indexed).Should().Equal(QueryIntegers(connection, scanned));
+    }
+
+    [Test]
     public void AllZeroColumnWeightsTieBreakByRowIdOnBothPathsAndAtAnyLimit()
     {
         using var database = new EmbeddedDatabase();

@@ -65,7 +65,12 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
                 && orderedScoreExpression is not null
                 && descending
                 && context.OrderBy is { Count: 1 };
-            var canLimit = context.Limit is not null
+            // An unordered MATCH must preserve the base table's rowid scan order. The FTS cursor
+            // returns relevance order, so truncating that cursor would choose a different subset
+            // than the scalar/NOT INDEXED path. Only a complete score ordering makes top-k
+            // truncation part of the query's semantics.
+            var canLimit = scoreOrdered
+                && context.Limit is not null
                 && context.AllowsRowTruncation
                 && !hasResidualPredicate;
             var shape = sameScore
@@ -73,12 +78,8 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
                     ? canLimit
                         ? ManagedIndexPatternShape.CombinedOrderedLimit
                         : ManagedIndexPatternShape.CombinedOrdered
-                    : canLimit && context.OrderBy is not { Count: > 0 }
-                        ? ManagedIndexPatternShape.CombinedLimit
-                        : ManagedIndexPatternShape.Combined
-                : canLimit && context.OrderBy is not { Count: > 0 }
-                    ? ManagedIndexPatternShape.MatchLimit
-                    : ManagedIndexPatternShape.Match;
+                    : ManagedIndexPatternShape.Combined
+                : ManagedIndexPatternShape.Match;
 
             match = new ManagedIndexMethodPatternMatch(
                 shape,

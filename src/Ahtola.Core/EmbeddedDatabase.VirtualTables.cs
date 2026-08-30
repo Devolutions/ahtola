@@ -14,6 +14,12 @@ public sealed partial class EmbeddedDatabase
         out CompiledSelect compiled)
     {
         compiled = null!;
+        // Trigger pseudo-columns live in TriggerRow rather than the ordinary outer-row chain.
+        // Keep trigger-body virtual scans on the evaluator until the compiled binding model can
+        // carry NEW/OLD values into virtual-table filter arguments.
+        if (context.InsideTrigger)
+            return false;
+
         ManagedVirtualTable table;
         ManagedVirtualTableSchema schema;
         NamedTableSource planningSource;

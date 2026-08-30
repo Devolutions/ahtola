@@ -228,7 +228,8 @@ public sealed class ManagedFtsTursoParityTests
         Execute(connection, "INSERT INTO docs VALUES (1,123),(2,'123');");
         QueryIntegers(connection, "SELECT id FROM docs WHERE fts_match(body,'123') ORDER BY id;")
             .Should().Equal(2);
-        SqliteBuiltinFunctions.IsDeterministic("FTS_SCORE").Should().BeTrue();
+        SqliteBuiltinFunctions.IsDeterministic("FTS_SCORE").Should().BeFalse(
+            "corpus-aware scoring is not safe to persist in schema expressions");
     }
 
     [Test]
@@ -279,7 +280,7 @@ public sealed class ManagedFtsTursoParityTests
     }
 
     [Test]
-    public void PlannerExposesAllSevenPinnedFtsShapes()
+    public void PlannerUsesUnboundedShapesForUnorderedLimitsAndTopKForRankedLimits()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -299,9 +300,9 @@ public sealed class ManagedFtsTursoParityTests
             ("SELECT id FROM docs ORDER BY fts_score(title,body,'needle') DESC LIMIT 2", "Score"),
             ("SELECT id,fts_score(title,body,'needle') FROM docs WHERE fts_match(title,body,'needle') ORDER BY fts_score(title,body,'needle') DESC LIMIT 2", "CombinedOrderedLimit"),
             ("SELECT id,fts_score(title,body,'needle') FROM docs WHERE fts_match(title,body,'needle') ORDER BY fts_score(title,body,'needle') DESC", "CombinedOrdered"),
-            ("SELECT id,fts_score(title,body,'needle') FROM docs WHERE fts_match(title,body,'needle') LIMIT 2", "CombinedLimit"),
+            ("SELECT id,fts_score(title,body,'needle') FROM docs WHERE fts_match(title,body,'needle') LIMIT 2", "Combined"),
             ("SELECT id,fts_score(title,body,'needle') FROM docs WHERE fts_match(title,body,'needle')", "Combined"),
-            ("SELECT id FROM docs WHERE fts_match(title,body,'needle') LIMIT 2", "MatchLimit"),
+            ("SELECT id FROM docs WHERE fts_match(title,body,'needle') LIMIT 2", "Match"),
             ("SELECT id FROM docs WHERE fts_match(title,body,'needle')", "Match"),
         };
 

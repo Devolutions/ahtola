@@ -422,10 +422,6 @@ internal sealed class ManagedRTreeTable : ManagedVirtualTable
         foreach (var (rowId, row) in rows)
             _rows.Add(rowId, row);
         RebuildIndex();
-
-        var problems = CheckIntegrity();
-        if (problems.Count != 0)
-            throw new EmbeddedSqlException($"invalid rtree persistence payload: {problems[0]}");
     }
 
     private Dictionary<long, Row> ReadVersionOne(ReadOnlySpan<byte> bytes)

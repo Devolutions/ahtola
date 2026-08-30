@@ -102,7 +102,7 @@ public sealed class ManagedVirtualTableTests
     }
 
     [Test]
-    public void ResumableVirtualCursorCancellationFaultsAndDisposesImmediately()
+    public void ResumableVirtualCursorCancellationPreservesStateUntilReset()
     {
         var table = new TestTable();
         var program = new VdbeProgram(
@@ -126,7 +126,12 @@ public sealed class ManagedVirtualTableTests
         Action step = () => statement.StepResumable(cancellation.Token);
 
         step.Should().Throw<OperationCanceledException>();
-        statement.State.Should().Be(ResumableStatementState.Faulted);
+        statement.State.Should().Be(ResumableStatementState.Row);
+        table.CursorDisposed.Should().BeFalse();
+
+        statement.Reset();
+
+        statement.State.Should().Be(ResumableStatementState.Ready);
         table.CursorDisposed.Should().BeTrue();
     }
 
@@ -380,6 +385,15 @@ public sealed class ManagedVirtualTableTests
         Module.SyncCalls.Should().Be(3);
         Module.CommitCalls.Should().Be(3);
         Module.RollbackCalls.Should().Be(0);
+        Module.Instances.Where(static instance => instance.BeginCalls != 0)
+            .Should().AllSatisfy(static instance =>
+            {
+                instance.BeginCalls.Should().Be(1);
+                instance.SyncCalls.Should().Be(1);
+                instance.CommitCalls.Should().Be(1);
+                instance.RollbackCalls.Should().Be(0);
+                instance.DisconnectCalls.Should().BeLessThanOrEqualTo(1);
+            });
         Module.Updates.Should().HaveCount(3);
         Module.Updates[0].Should().Equal(SqlValue.Null, SqlValue.Null, SqlValue.Integer(7), SqlValue.Null);
         Module.Updates[1].Should().Equal(
@@ -433,7 +447,7 @@ public sealed class ManagedVirtualTableTests
     }
 
     [Test]
-    public void ExplicitTransactionHooksRunOnceAtTheRealBoundary()
+    public void EveryClonedParticipantIsCompletedAtTheRealCommitOrSavepointRollbackBoundary()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -448,10 +462,32 @@ public sealed class ManagedVirtualTableTests
         Execute(connection, "INSERT INTO entries(value) VALUES (9);");
         Execute(connection, "COMMIT;");
 
-        Module.BeginCalls.Should().Be(1);
-        Module.SyncCalls.Should().Be(1);
-        Module.CommitCalls.Should().Be(1);
-        Module.RollbackCalls.Should().Be(0);
+        var participants = Module.Instances.Where(static instance => instance.BeginCalls != 0).ToArray();
+        participants.Should().HaveCount(3);
+        participants.Should().AllSatisfy(static instance =>
+        {
+            instance.BeginCalls.Should().Be(1);
+            (instance.CommitCalls + instance.RollbackCalls).Should().Be(1);
+        });
+        participants.Single(instance =>
+                instance.Updates.Any(update => update[2] == SqlValue.Integer(8)))
+            .Should().Match<TestTable>(instance =>
+                instance.SyncCalls == 0
+                && instance.CommitCalls == 0
+                && instance.RollbackCalls == 1
+                && instance.DisconnectCalls == 1);
+        var committed = participants.Where(instance =>
+            instance.Updates.Any(update => update[2] != SqlValue.Integer(8))).ToArray();
+        committed
+            .Should().AllSatisfy(static instance =>
+            {
+                instance.SyncCalls.Should().Be(1);
+                instance.CommitCalls.Should().Be(1);
+                instance.RollbackCalls.Should().Be(0);
+                instance.DisconnectCalls.Should().BeLessThanOrEqualTo(1);
+            });
+        committed.Count(static instance => instance.DisconnectCalls == 1).Should().Be(1);
+        committed.Count(static instance => instance.DisconnectCalls == 0).Should().Be(1);
     }
 
     [Test]
@@ -466,10 +502,19 @@ public sealed class ManagedVirtualTableTests
         Execute(connection, "INSERT INTO entries(value) VALUES (8);");
         Execute(connection, "ROLLBACK;");
 
-        Module.BeginCalls.Should().Be(1);
+        Module.BeginCalls.Should().Be(2);
         Module.SyncCalls.Should().Be(0);
         Module.CommitCalls.Should().Be(0);
-        Module.RollbackCalls.Should().Be(1);
+        Module.RollbackCalls.Should().Be(2);
+        Module.Instances.Where(static instance => instance.BeginCalls != 0)
+            .Should().HaveCount(2).And.AllSatisfy(static instance =>
+            {
+                instance.BeginCalls.Should().Be(1);
+                instance.SyncCalls.Should().Be(0);
+                instance.CommitCalls.Should().Be(0);
+                instance.RollbackCalls.Should().Be(1);
+                instance.DisconnectCalls.Should().Be(1);
+            });
         ReadRows(connection, "SELECT value FROM entries;").Should().HaveCount(2);
     }
 

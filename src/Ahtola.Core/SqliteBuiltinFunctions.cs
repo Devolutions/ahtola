@@ -97,6 +97,7 @@ internal static class SqliteBuiltinFunctions
         "UUID7_TIMESTAMP_MS",
         "UUID_STR",
         "UUID_BLOB",
+        "FTS_SCORE",
         "BM25",
         "HIGHLIGHT",
         "SNIPPET",

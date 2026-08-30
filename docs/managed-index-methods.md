@@ -319,9 +319,9 @@ look like.
 | `Score` | `… ORDER BY fts_score(cols…, ?) DESC LIMIT n` (sole ordering term) | no |
 | `CombinedOrderedLimit` | score projection + matching predicate on the same query, score order, limit | yes |
 | `CombinedOrdered` | score projection + matching predicate on the same query and score order | yes |
-| `CombinedLimit` | score projection + matching predicate on the same query and unordered limit | yes |
+| `CombinedLimit` | declared compatibility shape; not selected because unordered LIMIT must follow rowid order | yes |
 | `Combined` | score projection + matching predicate on the same query | yes |
-| `MatchLimit` | `… WHERE fts_match(cols…, ?) LIMIT n` with no residual/order | yes |
+| `MatchLimit` | declared compatibility shape; not selected because unordered LIMIT must follow rowid order | yes |
 | `Match` | `… WHERE fts_match(cols…, ?)` | yes |
 | `Knn` | `… ORDER BY <distance>(col, ?) ASC` (vector method) | no |
 | `KnnLimit` | `… ORDER BY <distance>(col, ?) ASC LIMIT n` (vector method, sole ordering term) | no |
@@ -334,12 +334,13 @@ deterministic built-in that no connection-registered callback shadows. A non-det
 columns at all — `CURRENT_TIMESTAMP`, and any unmodelled node shape all keep the call on the
 ordinary per-row scalar path.
 
-The seven FTS shapes mirror `FTS_PATTERN_*` in pinned Turso. Unordered `Match`/`Combined` shapes use
-the cursor stream and never invoke the relevance top-k collector. Their limited forms are selected
-only for a plain projection with no residual predicate or ordering; a residual or `ORDER BY id`
-degrades to the corresponding unlimited shape and lets the ordinary pipeline perform the cut.
-Globally ranked shapes use a bounded top-k heap. This deliberately avoids Turso's formerly unsafe
-"first segment hits" interpretation for unordered limits while preserving SQL results.
+The seven FTS declarations mirror `FTS_PATTERN_*` in pinned Turso. Because the managed FTS cursor is
+relevance ordered, unordered queries always select the unlimited `Match`/`Combined` shapes; the core
+restores base rowid order and lets residual predicates and the ordinary pipeline apply `LIMIT`.
+`MatchLimit` and `CombinedLimit` remain declared for compatibility but are not selected. Globally
+ranked shapes use a bounded top-k heap only when the complete score order is consumed. This avoids
+Turso's formerly unsafe "first segment hits" interpretation for unordered limits while preserving
+SQL results.
 
 The chosen path is accepted only when `EstimateCost` beats a full scan (`rows` reads). The
 original `WHERE` predicate is **never** marked omitted, so choosing the index can filter and rank
@@ -499,9 +500,9 @@ the cache.
 6. **Exact score bits are not promised.** Ahtola implements positive BM25 in managed code and rounds
    public scores to `f32`, but does not reproduce Tantivy's segment internals. Ranking direction,
    boosts, phrases/prefixes and deterministic tie-breaking are the compatibility contract.
-7. **CHECK-only deterministic exception.** Turso marks `fts_score` deterministic. Ahtola's registry
-   does too, but rejects it in CHECK constraints because the index-aware scalar can observe the
-   corpus being mutated by the checked statement.
+7. **`fts_score` is schema-nondeterministic.** Its runtime value can observe the covering index's
+   corpus and configuration, so Ahtola rejects it in expression indexes, partial-index predicates,
+   generated columns, and CHECK constraints rather than persisting the unbound `0.0` fallback.
 
 ## The vector index method
 

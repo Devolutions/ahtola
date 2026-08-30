@@ -40,7 +40,9 @@ source-offset rendering.
 `ManagedRTreeBounds` and `ManagedRTreeIndex` provide inclusive
 N-dimensional bounds and deterministic spatial storage. Searches descend only
 into node rectangles that can satisfy the active axis constraints; deletion
-performs deterministic condense-by-reinsertion. The module adapters own
+performs incremental deterministic CondenseTree reinsertion of only underflowed
+subtrees. Persistence decoding validates its shape, rowids, coordinates, and
+bounds while full tree traversal is reserved for explicit integrity diagnostics. The module adapters own
 virtual-table schema validation, `VUpdate` argument conversion, auxiliary
 values, and transaction snapshots; the reusable components do not own catalog
 state.

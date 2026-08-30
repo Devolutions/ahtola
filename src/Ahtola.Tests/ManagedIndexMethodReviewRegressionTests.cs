@@ -262,25 +262,40 @@ public sealed class ManagedIndexMethodReviewRegressionTests
     }
 
     // ---------------------------------------------------------------------------------------
-    // Finding 5: Turso exposes every FTS scalar as deterministic.
+    // Finding 5: corpus-dependent scoring is not safe in persistent schema expressions.
     // ---------------------------------------------------------------------------------------
 
     [Test]
-    public void DeterministicRegistryAllowsStoredScoringExceptForLiveCheckConstraints()
+    public void CorpusScoringIsRejectedFromPersistentSchemaExpressions()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, CreateDocuments);
 
-        Execute(connection, "CREATE INDEX score_expression ON docs(fts_score(title, body, 'x'));");
-        Execute(connection, "CREATE INDEX score_partial ON docs(id) WHERE fts_score(title, body, 'x') > 0;");
-        Execute(
-            connection,
-            "CREATE TABLE gen(id INTEGER PRIMARY KEY, a TEXT, b TEXT, s REAL GENERATED ALWAYS AS (fts_score(a, b, 'x')) VIRTUAL);");
-        ShouldThrow(
-            connection,
-            "CREATE TABLE chk(id INTEGER PRIMARY KEY, a TEXT, b TEXT, CHECK (fts_score(a, b, 'x') >= 0));")
-            .Message.Should().Contain("non-deterministic functions are prohibited in CHECK constraints");
+        foreach (var (sql, message) in new[]
+                 {
+                     (
+                         "CREATE INDEX score_expression ON docs(fts_score(title, body, 'x'));",
+                         "non-deterministic functions are prohibited in index expressions"),
+                     (
+                         "CREATE INDEX score_partial ON docs(id) WHERE fts_score(title, body, 'x') > 0;",
+                         "non-deterministic functions are prohibited in partial index WHERE clauses"),
+                     (
+                         "CREATE TABLE virtual_gen(id INTEGER PRIMARY KEY, a TEXT, b TEXT, "
+                         + "s REAL GENERATED ALWAYS AS (fts_score(a, b, 'x')) VIRTUAL);",
+                         "non-deterministic functions prohibited in generated columns"),
+                     (
+                         "CREATE TABLE stored_gen(id INTEGER PRIMARY KEY, a TEXT, b TEXT, "
+                         + "s REAL GENERATED ALWAYS AS (fts_score(a, b, 'x')) STORED);",
+                         "non-deterministic functions prohibited in generated columns"),
+                     (
+                         "CREATE TABLE chk(id INTEGER PRIMARY KEY, a TEXT, b TEXT, "
+                         + "CHECK (fts_score(a, b, 'x') >= 0));",
+                         "non-deterministic functions are prohibited in CHECK constraints"),
+                 })
+        {
+            ShouldThrow(connection, sql).Message.Should().Contain(message);
+        }
     }
 
     [Test]

@@ -236,8 +236,7 @@ public sealed class ResumableStatement : IDisposable
     public ResumableStatementStepResult StepResumable(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        if (cancellationToken.IsCancellationRequested)
-            FailExecution(new OperationCanceledException(cancellationToken));
+        cancellationToken.ThrowIfCancellationRequested();
 
         if (State == ResumableStatementState.Yielded)
         {
@@ -256,8 +255,7 @@ public sealed class ResumableStatement : IDisposable
         _currentRow = null;
         while (_instructionPointer.Offset < Program.Instructions.Count)
         {
-            if (cancellationToken.IsCancellationRequested)
-                FailExecution(new OperationCanceledException(cancellationToken));
+            cancellationToken.ThrowIfCancellationRequested();
             var instruction = Program.Instructions[_instructionPointer.Offset];
             _hasExecutedInstruction = true;
             switch (instruction)

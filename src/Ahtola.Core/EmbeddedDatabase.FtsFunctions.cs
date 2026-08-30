@@ -134,13 +134,6 @@ public sealed partial class EmbeddedDatabase
         SourceRow? row,
         QueryContext context)
     {
-        if (context.IndexExpression || context.SchemaValidation)
-        {
-            return ManagedFtsFunctions.Score(
-                arguments,
-                CollectArgumentColumnNames(function));
-        }
-
         var bound = ResolveBoundFtsIndex(function, row, context);
         if (bound is not null && arguments.Count >= 2)
         {

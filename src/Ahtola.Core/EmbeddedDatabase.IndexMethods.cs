@@ -566,6 +566,21 @@ public sealed partial class EmbeddedDatabase
             ranked = binding.Execute(plan.PatternIndex, queryValue, limit);
         }
 
+        // MATCH-only and unordered combined patterns are filtering access paths, not ordering
+        // paths. Their method cursor happens to rank hits by relevance, but SQL without a consumed
+        // ORDER BY observes the base b-tree's rowid order (including which rows an outer LIMIT
+        // keeps). Restore that order before any residual predicate or outer LIMIT sees the rows.
+        if (plan.FiltersRows
+            && plan.Shape is not ManagedIndexPatternShape.CombinedOrdered
+                and not ManagedIndexPatternShape.CombinedOrderedLimit)
+        {
+            ranked = ranked.OrderBy(static hit => hit.RowId).ToArray();
+        }
+
+        // Only a limit explicitly carried by the selected method pattern may truncate the source.
+        // Applying the SELECT's LIMIT to an unlimited MATCH scan here would run it before residual
+        // predicates and could discard later rows that the residual would have kept.
+        var sourceMaximumRows = plan.Limit is null ? null : maximumRows;
         var rows = new List<SourceRow>(Math.Min(ranked.Count + 1, 1024));
         var emitted = new HashSet<long>();
 
@@ -615,7 +630,7 @@ public sealed partial class EmbeddedDatabase
             foreach (var (_, rowId) in merged)
             {
                 context.CheckInterrupt();
-                if (maximumRows is { } cap && rows.Count >= cap)
+                if (sourceMaximumRows is { } cap && rows.Count >= cap)
                     break;
                 if (!rowPositions.TryGetValue(rowId, out var position))
                     continue;
@@ -629,7 +644,7 @@ public sealed partial class EmbeddedDatabase
         foreach (var hit in ranked)
         {
             context.CheckInterrupt();
-            if (maximumRows is { } cap && rows.Count >= cap)
+            if (sourceMaximumRows is { } cap && rows.Count >= cap)
                 return new SourceData(table.Columns, rows);
             if (!rowPositions.TryGetValue(hit.RowId, out var position) || !emitted.Add(hit.RowId))
                 continue;
@@ -648,7 +663,7 @@ public sealed partial class EmbeddedDatabase
         foreach (var rowId in orderedRowIds)
         {
             context.CheckInterrupt();
-            if (maximumRows is { } cap && rows.Count >= cap)
+            if (sourceMaximumRows is { } cap && rows.Count >= cap)
                 break;
             if (!emitted.Add(rowId) || !rowPositions.TryGetValue(rowId, out var position))
                 continue;

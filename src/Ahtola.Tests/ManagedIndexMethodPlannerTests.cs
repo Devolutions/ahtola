@@ -44,16 +44,17 @@ public sealed class ManagedIndexMethodPlannerTests
     }
 
     [Test]
-    public void AnUnorderedMatchLimitUsesTheDedicatedStreamingShape()
+    public void AnUnorderedMatchLimitUsesTheUnboundedMatchShape()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         SeedLargeCorpus(connection);
 
-        // The method's unordered pattern does not rank before truncating, so a bare LIMIT can stream
-        // directly without accidentally keeping the highest-scoring rows.
+        // The method cursor is relevance ordered, while an unordered SQL scan observes rowid order.
+        // Keep the method scan unbounded and let the outer pipeline apply LIMIT after restoring that
+        // base order.
         ExplainDetail(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'term7') LIMIT 3;")
-            .Should().Contain("pattern=MatchLimit");
+            .Should().Contain("pattern=Match").And.NotContain("pattern=MatchLimit");
 
         // ORDER BY id asks for the three lowest ids among *all* matches.
         ExplainDetail(
@@ -62,9 +63,8 @@ public sealed class ManagedIndexMethodPlannerTests
             .Should().Contain("pattern=Match").And.NotContain("pattern=MatchLimit");
 
         // The residual `id > 0` follows the match call, so it cannot short-circuit past it — the
-        // scalar path always reaches `fts_match` first — and MatchLimit's own `!hasResidualPredicate`
-        // requirement is unaffected by *where* a residual sits. The unlimited combined pattern still
-        // filters and supplies scores, while the ordinary pipeline applies the residual and LIMIT.
+        // scalar path always reaches `fts_match` first. The unlimited combined pattern still filters
+        // and supplies scores, while the ordinary pipeline applies the residual and LIMIT.
         ExplainDetail(
                 connection,
                 "SELECT id FROM docs WHERE fts_match(title, body, 'term7') AND id > 0 "
