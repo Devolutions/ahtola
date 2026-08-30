@@ -34,17 +34,16 @@ conformance coverage, e.g. virtual tables, sync engine, typed values).
 Ahtola's port is **architecturally faithful but functionally narrower** than
 Turso v0.7.2. The managed engine reproduces Turso's program model (register
 machine, cursors, sorter, aggregates, compound selects, window buffers) with
-deliberate opcode consolidation — 74 `VdbeOpcode` values against 204 Turso
+deliberate opcode consolidation — 119 `VdbeOpcode` values against 204 Turso
 `Insn` variants — and verified parity in the comparison/arithmetic/sorter cores.
 The gaps concentrate in four areas:
 
 1. **Planner/compiler depth** (compilation layer, 38 entries): no subquery
    flattening or decorrelation, no cost-based join ordering, no partial or
-   expression indexes, single-table fast paths only. This is the largest
-   functional deficit after DDL-by-treewalker.
+   expression indexes, and only selected compiled source shapes.
 2. **VDBE execution machinery** (35 entries): no trigger subprogram opcodes
-   (`Program`/`Gosub`/`Return`), no virtual-table family, no hash-join/bloom
-   family, no general ephemeral tables, seek/index-cursor families partial,
+   (`Gosub`/`Return`), no native/loadable virtual-table ABI, no hash-join/bloom
+   family, partial ephemeral and seek/index-cursor families,
    write-time affinity enforcement (`TypeCheck`) scattered — the root cause of
    the largest wrong-values conformance cluster.
 3. **Parser surface** (22 entries): dominated by one astonishingly cheap fix —
@@ -257,14 +256,14 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 29 | `IfNot` | consolidated | JumpIf / JumpIfNotTrue |  |
 | 30 | `OpenRead` | direct | OpenReadCursor |  |
 | 31 | `VOpen` | direct | `VOpenInstruction` | `vdbe-virtual-table-opcodes` |
-| 32 | `VCreate` | treewalker | `ExecuteCreateVirtualTable` | `vdbe-virtual-table-opcodes` |
+| 32 | `VCreate` | direct | `VCreateInstruction` | `vdbe-virtual-table-opcodes` |
 | 33 | `VFilter` | direct | `VFilterInstruction` | `vdbe-virtual-table-opcodes` |
 | 34 | `VColumn` | direct | `VColumnInstruction` | `vdbe-virtual-table-opcodes` |
 | 35 | `VUpdate` | direct | `VUpdateInstruction` | `vdbe-virtual-table-opcodes` |
 | 36 | `VNext` | direct | `VNextInstruction` | `vdbe-virtual-table-opcodes` |
-| 37 | `VDestroy` | treewalker | `ExecuteDropTable` | `vdbe-virtual-table-opcodes` |
+| 37 | `VDestroy` | direct | `VDestroyInstruction` | `vdbe-virtual-table-opcodes` |
 | 38 | `VBegin` | direct | `VBeginInstruction` | `vdbe-virtual-table-opcodes` |
-| 39 | `VRename` | treewalker | `ExecuteAlterTableRename` | `vdbe-virtual-table-opcodes` |
+| 39 | `VRename` | direct | `VRenameInstruction` | `vdbe-virtual-table-opcodes` |
 | 40 | `OpenPseudo` | missing | — | `vdbe-open-ephemeral` |
 | 41 | `Rewind` | direct | Rewind |  |
 | 42 | `Last` | direct | Last |  |
@@ -437,7 +436,7 @@ Status totals: bydesign 25, consolidated 40, direct 26, divergent 10, missing 10
 
 | ID | Kind | Severity | Effort | Mapped fails | Cited | Summary |
 | --- | --- | --- | --- | ---: | ---: | --- |
-| `vdbe-ddl-executed-by-treewalker` | divergent | s4-intentional | L | 178 | 0 | Ahtola executes every DDL statement in the tree-walking evaluator, never as a VDBE program — the 11 DDL opcodes have no counterpart by design. Consequences (schema-versio… |
+| `vdbe-ddl-executed-by-treewalker` | divergent | s4-intentional | L | 178 | 0 | Ahtola retains tree-walked catalog publication for ordinary DDL. Managed virtual-table create/drop/rename now execute their module callback through VCreate/VDestroy/VRename, while the surrounding catalog rewrite remains statement-atomic managed code. |
 | `vdbe-trigger-subprogram-machinery` | missing | s2-capability | L | 111 | 0 | No subprogram or subroutine machinery: triggers cannot fire from compiled DML because there is no Program opcode to invoke a sub-program with its own register frame, and… |
 | `vdbe-insert-update-flag-semantics` | partial | s2-capability | M | 31 | 1 | Ahtola models UPDATE as its own opcode plus delegate mutation, with change counting present. Missing flag semantics: REQUIRE_SEEK (position-before-write), UPDATE_ROWID_CH… |
 | `vdbe-typecheck-on-write` | partial | s1-correctness | M | 31 | 15 | Turso centralizes write-time coercion in TypeCheck; Ahtola scatters it across write delegates and the compiler's NumericAffinityInstruction emission. The 148-case wrong-v… |
@@ -471,7 +470,7 @@ Status totals: bydesign 25, consolidated 40, direct 26, divergent 10, missing 10
 | `vdbe-schema-cookie-opcodes` | missing | s2-capability | M | 0 | 0 | No cookie opcodes: user_version/application_id read-write and schema-cookie validation (stale-schema detection, 'database schema has changed' errors) are not modeled at t… |
 | `vdbe-sequence-opcode-family` | missing | s4-intentional | M | 0 | 0 | Turso's CREATE SEQUENCE extension (8 opcodes), not SQLite syntax. Note: distinct from AUTOINCREMENT support (sqlite_sequence), which Ahtola partially has — see vdbe-newro… |
 | `vdbe-typed-value-opcode-family` | missing | s4-intentional | L | 0 | 0 | Turso's typed-values extension (arrays/structs/unions/UDTs) — 17 opcodes, none SQLite. Ahtola has not adopted the extension; no conformance corpus coverage. Record as ups… |
-| `vdbe-virtual-table-opcodes` | partial | s2-capability | L | 0 | 0 | Managed VOpen/VFilter/VColumn/VUpdate/VNext/VBegin instructions and tree-walker create/drop/rename now support statically registered modules with durable private payloads. The native extension ABI, arbitrary loadable modules, and Turso index-method parity remain out of scope. |
+| `vdbe-virtual-table-opcodes` | parity | s4-intentional | L | 0 | 0 | Managed VOpen/VFilter/VColumn/VNext production scans, VUpdate, lifecycle/transaction instructions, constraint-cost-order planning, and shared streaming TVF cursors support statically registered modules with durable private payloads. The native extension ABI and arbitrary loadable modules remain intentionally out of scope. |
 
 ## 4. Compilation / translate layer
 The largest layer by entry count (38). Turso's `core/translate/` is a full
@@ -952,10 +951,10 @@ The distribution is wildly skewed by one entry:
 | `parser-bracket-quoted-identifiers` | missing | s2-capability | S | 3 | 1 | Square-bracket quoted identifiers not lexed. |
 | `parser-pragma-unrecognized-name-hard-rejection` | missing | s2-capability | M | 2 | 14 | The turso-parser grammar's `Stmt::Pragma` accepts *any* identifier as `name`, with an arbitrary optional body (`= value`, `(value)`, or none); SQLite's own behavior for a… |
 | `parser-begin-commit-transaction-name` | missing | s2-capability | S | 0 | 1 | SQLite's grammar for BEGIN/COMMIT/END admits an optional transaction name after the TRANSACTION keyword (`trans_opt ::= \| TRANSACTION \| TRANSACTION nm`), which is accep… |
-| `parser-create-virtual-table-not-parsed` | partial | s2-capability | L | 0 | 0 | Ahtola now parses `CREATE VIRTUAL TABLE` into `CreateVirtualTableStatement` with module name and raw argument strings. The managed contract is intentionally limited to statically registered modules; no native/loadable module ABI is exposed. |
+| `parser-create-virtual-table-not-parsed` | partial | s2-capability | L | 0 | 0 | Ahtola parses `CREATE VIRTUAL TABLE` into `CreateVirtualTableStatement` with lossless raw module arguments and dispatches statically registered modules. Managed R-Tree now covers SQLite declaration, coercion, DML, planner, transaction, metadata, integrity, and diagnostic-function semantics. The remaining intentional boundary is the native/loadable module ABI and portable FTS5/R-Tree shadow storage. |
 | `parser-trailing-named-constraint-without-body` | divergent | s3-perf | S | 0 | 3 | SQLite's own LALR grammar happens to accept a dangling `CONSTRAINT c` at the very end of a column/ADD COLUMN definition with no constraint keyword following it (an accept… |
 | `parser-turso-only-ddl-extensions-absent` | missing | s4-intentional | L | 0 | 0 | Turso's ast.rs Stmt enum includes several experimental statement kinds that are not part of SQLite's own grammar: CREATE MATERIALIZED VIEW, CREATE/DROP TYPE (custom scala… |
-| `parser-turso-only-sequence-and-optimize-statements` | missing | s4-intentional | M | 0 | 0 | CREATE/DROP SEQUENCE (standalone integer sequences, distinct from AUTOINCREMENT) and OPTIMIZE INDEX are Turso-only statement kinds with no SQLite equivalent and no hits i… |
+| `parser-turso-only-sequence-and-optimize-statements` | partial | s4-intentional | M | 0 | 0 | `OPTIMIZE INDEX [name]` is implemented for managed index methods; CREATE/DROP SEQUENCE remain intentionally out of scope. |
 
 ## 6. Built-in functions layer
 24 entries but only 41 mapped failure lines — the function surface is largely
@@ -985,7 +984,7 @@ than absent subsystems.
 | `func-array-postgres-family` | missing | s3-perf | L | 0 | 0 | Postgres-style ARRAY(...)/array_element/array_append/etc. scalar family, always compiled (not behind a cargo feature flag) but not part of stock SQLite semantics and not… |
 | `func-extension-format-btrim` | extension | s4-intentional | S | 0 | 0 | FORMAT (an alias for PRINTF, matching real SQLite's built-in but not present as a distinct entry in Turso's from_str dispatch table) and BTRIM (Postgres-style alias for T… |
 | `func-extension-uuid-family` | extension | s4-intentional | S | 0 | 0 | Ahtola registers a full UUID v4/v7 generation family (text and blob forms, plus gen_random_uuid() for Postgres compatibility) that has no counterpart anywhere in turso-sr… |
-| `func-fts-scalar-family` | partial | s3-perf | L | 0 | 0 | Closed 2026-08-24: `fts_match` (row-local, deterministic), `fts_score` (corpus- and configuration-dependent BM25 with per-column weights and rowid tie-break — registered **non-deterministic**, so it is rejected in index expressions, partial index WHERE clauses, generated columns and CHECK constraints), `fts_highlight`, and `fts_snippet` ship as builtin scalars over a pure-managed inverted index (no Tantivy). All four bind by resolved source identity and are suppressed by a shadowing connection callback. FTS5-specific auxiliary functions and command syntax remain out of scope. |
+| `func-fts-scalar-family` | partial | s3-perf | L | 0 | 0 | Reconciled 2026-08-29 with pinned v0.8.0-pre.7: method query grammar, pinned tokenizers, MATCH forms, NULL/TEXT-only behavior, varargs highlight, unordered column binding, boosts, seven plans, streaming/top-k and OPTIMIZE are managed. `fts_score` is registered deterministic like Turso; CHECK constraints remain an explicit corpus-mutation safety exception. Tantivy storage/exact score bits remain out of scope. |
 | `func-gcd-lcm-missing` | missing | s3-perf | S | 0 | 0 | gcd()/lcm() (Turso/SQLite-3.41+-style math helpers) have no hits anywhere in src/Ahtola.Core or Ahtola.Core/EmbeddedDatabase.MathFunctions.cs. Not covered by the vendored… |
 | `func-numeric-boolean-ip-helpers-missing` | missing | s4-intentional | M | 0 | 0 | Internal-flavored helper functions supporting Turso's typed BOOLEAN/NUMERIC column extensions and validated IP address type; no SQLite equivalent and no corpus coverage.… |
 | `func-octet-length-missing` | missing | s1-correctness | S | 0 | 0 | octet_length is absent from SqliteBuiltinFunctions.Names and from EmbeddedDatabase.StringFunctions.cs / EmbeddedDatabase.cs (no case-insensitive hit for 'octet' anywhere… |
@@ -1287,7 +1286,7 @@ vacuum, hot-journal↔WAL recovery coverage.
 
 **Wave 5 — upstream-extension policy decisions (not porting bugs).**
 Typed values (`vdbe-typed-value-opcode-family`, 17 opcodes), `CREATE SEQUENCE`
-family (8), materialized views, CDC, virtual tables, sync engine. Each needs
+family (8), materialized views, CDC, loadable/native virtual tables, sync engine. Each needs
 an adopt/skip decision recorded by flipping the entry's `status`/`severity`
 (s2 → s4-intentional) in the inventory.
 
@@ -1370,15 +1369,16 @@ foundation and the first method, `fts`. It closes `vdbe-index-method-opcodes` an
 `func-fts-scalar-family` and records the new
 `index-method-fts-persistence-divergence` entry.
 
-**What landed.** `CREATE INDEX … USING fts (cols) WITH (…)` with the full Turso
+**What landed.** `CREATE INDEX … USING fts (cols) WITH (…)` with the Turso
 rejection matrix; the `ManagedIndexMethod`/`Attachment`/`Cursor`/`Definition`/
 `CostEstimate` foundation with explicit MVCC capability declaration; VDBE opcodes
-107–115 appended without renumbering; planner pattern matching with cost comparison,
-rowid seek-back, ORDER BY score and LIMIT pushdown, and `EXPLAIN QUERY PLAN`
-evidence; and a pure-managed inverted index with positions, column masks, boolean/
-phrase/prefix/`NEAR`/column-filter/anchor queries, deterministic BM25 with column
-weights, tombstones and compaction, plus `fts_match`, `fts_score`, `fts_highlight`
-and `fts_snippet`.
+107–115 appended without renumbering; all seven pinned FTS planner shapes with cost
+comparison, rowid seek-back, safe ORDER BY/LIMIT pushdown, and `EXPLAIN QUERY PLAN`
+evidence; and a pure-managed inverted index with positions, column masks, the
+Tantivy-style method grammar, pinned tokenizer names, float-precision BM25/boosts,
+tombstones and compaction, plus `fts_match`, `fts_score`, pinned varargs
+`fts_highlight`, `MATCH` rewrites, and `OPTIMIZE INDEX`. The separate managed FTS5
+module retains SQLite grammar and auxiliary-function behavior.
 
 **Honest residuals.**
 
@@ -1392,8 +1392,10 @@ and `fts_snippet`.
 - Under the concurrent MVCC overlay the planner deliberately falls back to an
   ordinary scan (the overlay row set differs from the base snapshot the derived
   state is built from); the scalar path still answers correctly.
-- Ranking diverges from Turso's Tantivy scorer by construction; phrase and `NEAR`
-  hits are attributed to the heaviest selected column.
+- Ranking remains a managed approximation of Tantivy's segment scorer. Scores use
+  Tantivy's positive/higher-is-better direction and observable `f32` precision,
+  with field/query boosts and deterministic rowid tie-breaking, but exact score
+  bits across engines are not promised.
 - `managed-vector-index` is now implemented as `CREATE INDEX … USING vector`. It
   is **not** a port of Turso's `toy_vector_sparse_ivf`, which is a jaccard-only
   sparse component inverted index pruned by three unbounded heuristics with no
@@ -1424,8 +1426,9 @@ defects, all now closed with regression coverage in
   rows score against their own source.
 - A connection scalar callback that shadows `fts_match`/`fts_score`/`fts_highlight`/
   `fts_snippet` suppresses method planning and index-aware scalar behavior.
-- `fts_score` is registered **non-deterministic** and rejected in index expressions,
-  partial index `WHERE` clauses, generated columns and `CHECK` constraints.
+- The FTS registry now follows pinned Turso's deterministic flags. `fts_score`
+  remains rejected only in CHECK constraints as an explicit live-corpus safety
+  boundary.
 - Attachments are cached only after publication and dropped on every failure;
   `REINDEX`/`Optimize` build detached and publish atomically; `DROP INDEX` runs
   `Destroy`.
@@ -1441,8 +1444,8 @@ defects, all now closed with regression coverage in
 - Maintenance is **revision aware**: `RowStore.Revision` plus a per-table mutation
   journal fed by `ReportRowChange` makes an unchanged table `O(1)` and a small DML
   `O(changed rows)`; a cold cursor prices the rebuild it will be forced to do.
-- Keyword boundaries agree with the tokenizer (underscores included) and bare terms
-  are normalized through the configured tokenizer.
+- Query terms are analyzed with each field's configured tokenizer; method adjacency
+  is OR and FTS5's separate grammar remains implicit-AND.
 - Method cursors participate in the real transaction lifecycle: every DML shape
   (including trigger bodies and FK cascades) maintains the index, `PreCommit` runs
   inside the commit, and rollback/savepoint restore leaves no method-visible state.
@@ -1453,14 +1456,42 @@ defects, all now closed with regression coverage in
 - A `SELECT` with a viable method plan is no longer lowered to bytecode, so the plan
   `EXPLAIN QUERY PLAN` advertises is the plan that executes.
 
+**Pinned FTS parity follow-up (2026-08-29).**
+
+- Method adjacency is OR; uppercase `AND`/`NOT`, phrases, prefixes, column filters
+  and `^boost` use a dedicated grammar. FTS5 still uses SQLite implicit-AND grammar.
+- `default`, `raw`, `simple`, `whitespace`, and `ngram` match pinned tokenizer
+  names/semantics (`ngram` defaults to 2..3); `unicode61`, `ascii`, and `trigram`
+  remain explicitly named Ahtola extensions. Field-local tokenizer declarations
+  are parsed, modeled, persisted in canonical SQL, and honored.
+- Scalar parity includes NULL `fts_match` = integer 0, unbound `fts_score` = REAL
+  0.0, TEXT-only indexing, and `fts_highlight(text..., before, after, query)`.
+- Covering columns bind as an unordered resolved set and remap configuration by
+  name. Differently configured duplicate indexes force a scan; equivalent
+  duplicates select deterministically.
+- Unordered plans stream from the method cursor; ranked LIMIT uses bounded top-k.
+  There is no one-million-match failure. Query/position/prefix/highlight bounds
+  remain explicit denial-of-service guards.
+- Named and bare `OPTIMIZE INDEX` invoke the managed method transactionally;
+  rollback, savepoint rollback, and reopen behavior is covered.
+- Turso marks every FTS scalar deterministic and Ahtola's registry now agrees.
+  Ahtola intentionally retains one correctness boundary: corpus-aware `fts_score`
+  is rejected in CHECK constraints while the checked statement could mutate the
+  same corpus.
+
 **Current residual (honest, not scoreboard).** Inventory is **216 closed · 0 open**,
 and the live conformance expected-failures file contains two intentional
 Turso-negative markers for STORED generated columns. “Closed” still includes
 intentional scope and closed-with-residual notes: recursive b-tree
 balancing can still fall back to a catalog rewrite, the general planner lacks
 STAT4/multi-index-AND/direct persisted join cursors, and MVCC lacks Turso's lazy
-per-page checkpoint state machine. The managed vtab/FTS/R-Tree subset has
-landed, but portable SQLite shadow-table storage, the full sync/history engine,
+per-page checkpoint state machine. The managed vtab/FTS/R-Tree SQL subset has
+landed (including streaming VOpen/VFilter/VColumn/VNext SELECTs, direct
+VCreate/VDestroy/VRename lifecycle execution, conflict-aware VUpdate,
+constraint/cost/order planning, shared table-valued-function cursors, R-Tree
+float32/int32 conversion, axis-pruned scans, auxiliary columns, metadata,
+integrity functions, and transaction/savepoint durability), but portable SQLite shadow-table storage,
+the full sync/history engine,
 typed values, sequences, and native extension ABIs remain explicit product
 boundaries rather than hidden open entries.
 
@@ -1530,8 +1561,10 @@ architectural boundary:
    scripts reject unsafe rebuild operations before emitting destructive SQL.
 
 These completion claims intentionally exclude the general planner, recursive
-b-tree allocator, lazy MVCC checkpoint, generic vtab planner, portable
-FTS5/R-Tree storage, and embedded sync-history rewrites.
+b-tree allocator, lazy MVCC checkpoint, native/loadable vtab modules, portable
+FTS5/R-Tree shadow storage, and embedded sync-history rewrites. Foreign SQLite
+R-Tree shadow layouts are rejected explicitly; Ahtola does not claim two-way
+file interoperability for payload-backed virtual tables.
 
 
 ## Appendix A — Inventory JSON schema

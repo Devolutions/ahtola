@@ -12,12 +12,16 @@ public sealed class ManagedFtsSearchEngineTests
     {
         Tokens("Crème brûlée; π=3", ManagedFtsTokenizerKind.Unicode61)
             .Should().Equal("creme", "brulee", "π", "3");
+        Tokens("Hello, World!", ManagedFtsTokenizerKind.Default)
+            .Should().Equal("hello", "world");
+        Tokens("Hello, World!", ManagedFtsTokenizerKind.Simple)
+            .Should().Equal("Hello", "World");
         Tokens("Crème brûlée", ManagedFtsTokenizerKind.Ascii)
             .Should().Equal("cr", "me", "br", "l", "e");
         Tokens("Hello, World!", ManagedFtsTokenizerKind.Whitespace)
-            .Should().Equal("hello,", "world!");
-        Tokens("Hello, World!", ManagedFtsTokenizerKind.Raw)
             .Should().Equal("Hello,", "World!");
+        Tokens("Hello, World!", ManagedFtsTokenizerKind.Raw)
+            .Should().Equal("Hello, World!");
         Tokens("abcd", ManagedFtsTokenizerKind.Trigram)
             .Should().Equal("abc", "bcd");
     }
@@ -26,7 +30,9 @@ public sealed class ManagedFtsSearchEngineTests
     public void TermsAreTruncatedToTheDocumentedMaximum()
     {
         var token = ManagedFtsTokenization
-            .Tokenize(new string('a', ManagedFtsTokenization.MaxTermLength + 50), ManagedFtsTokenizerOptions.Default)
+            .Tokenize(
+                new string('a', ManagedFtsTokenization.MaxTermLength + 50),
+                new ManagedFtsTokenizerOptions(ManagedFtsTokenizerKind.Unicode61))
             .Single();
 
         token.Text.Length.Should().Be(ManagedFtsTokenization.MaxTermLength);
@@ -187,7 +193,8 @@ public sealed class ManagedFtsSearchEngineTests
     public void HighlightAndSnippetPreserveTheOriginalText()
     {
         var highlighted = ManagedFtsFunctions.Highlight(
-            [SqlValue.Text("Crème brûlée and more"), SqlValue.Text("creme"), SqlValue.Text("<"), SqlValue.Text(">")]);
+            [SqlValue.Text("Crème brûlée and more"), SqlValue.Text("<"), SqlValue.Text(">"), SqlValue.Text("creme")],
+            new ManagedFtsTokenizerOptions(ManagedFtsTokenizerKind.Unicode61));
         highlighted.AsText().Should().Be("<Crème> brûlée and more");
 
         var snippet = ManagedFtsFunctions.Snippet(
@@ -203,11 +210,13 @@ public sealed class ManagedFtsSearchEngineTests
     }
 
     [Test]
-    public void NullArgumentsPropagateAsNull()
+    public void NullArgumentsFollowPinnedScalarRules()
     {
-        ManagedFtsFunctions.Match([SqlValue.Text("a"), SqlValue.Null], [null]).Kind.Should().Be(SqlValueKind.Null);
-        ManagedFtsFunctions.Score([SqlValue.Text("a"), SqlValue.Null], [null]).Kind.Should().Be(SqlValueKind.Null);
-        ManagedFtsFunctions.Highlight([SqlValue.Null, SqlValue.Text("a"), SqlValue.Text(""), SqlValue.Text("")])
+        ManagedFtsFunctions.Match([SqlValue.Text("a"), SqlValue.Null], [null])
+            .Should().Be(SqlValue.Integer(0));
+        ManagedFtsFunctions.Score([SqlValue.Text("a"), SqlValue.Null], [null])
+            .Should().Be(SqlValue.Real(0.0));
+        ManagedFtsFunctions.Highlight([SqlValue.Text("a"), SqlValue.Null, SqlValue.Text(""), SqlValue.Text("")])
             .Kind.Should().Be(SqlValueKind.Null);
     }
 

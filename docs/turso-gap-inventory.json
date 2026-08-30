@@ -92,13 +92,13 @@
     {
       "id": "vdbe-virtual-table-opcodes",
       "layer": "vdbe",
-      "kind": "partial",
-      "turso_ref": "turso-src/core/vdbe/insn.rs::Insn::VOpen, VFilter, VColumn, VNext, VUpdate, VDestroy, VBegin, VRename (turso-src/core/vtab.rs)",
-      "ahtola_ref": "src/Ahtola.Core/Execution/VdbeProgram.cs::VOpenInstruction/VFilterInstruction/VColumnInstruction/VUpdateInstruction/VNextInstruction/VBeginInstruction; src/Ahtola.Core/EmbeddedDatabase.cs::ExecuteCreateVirtualTable/ExecuteDropTable/ExecuteAlterTableRename",
+      "kind": "parity",
+      "turso_ref": "turso-src/core/vdbe/insn.rs::Insn::VOpen, VCreate, VFilter, VColumn, VNext, VUpdate, VDestroy, VBegin, VRename (turso-src/core/vtab.rs)",
+      "ahtola_ref": "src/Ahtola.Core/Execution/VdbeProgram.cs::VOpenInstruction/VCreateInstruction/VFilterInstruction/VColumnInstruction/VUpdateInstruction/VNextInstruction/VDestroyInstruction/VBeginInstruction/VRenameInstruction; src/Ahtola.Core/EmbeddedDatabase.VirtualTables.cs::TryCompileVirtualTableSelect; src/Ahtola.Core/EmbeddedDatabase.cs::ExecuteCreateVirtualTable/ExecuteDropTable/ExecuteAlterTableRename",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "P1 durable managed virtual tables (2026-08-18): direct, statically registered modules now run through VOpen/VFilter/VColumn/VUpdate/VNext/VBegin and tree-walker CREATE/DROP/RENAME. File-backed catalogs persist rootpage-zero CREATE VIRTUAL TABLE declarations plus opaque module-owned payloads; reopen, VACUUM INTO, statement failure, transactions, and savepoints restore them. This remains a managed subset: no native extension ABI, arbitrary loadable modules, FTS5 shadow tables, or Turso index-method parity.",
+      "notes": "P1 durable managed virtual tables (2026-08-18), completed generic execution/planning and R-Tree semantics 2026-08-30: direct, statically registered modules run production scans through streaming VOpen/VFilter/VColumn/VNext bytecode, mutations through conflict-aware VUpdate, and schema callbacks through VCreate/VDestroy/VRename. Constraint extraction covers equality, inequality, IS/NULL, MATCH/LIKE/GLOB, LIMIT/OFFSET and rowid aliases; correlated constraints carry accurate usability, residuals remain unless omitted, estimates influence correlated access, complete OrderByConsumed plans suppress sorting, and EXPLAIN reports plan estimates. Built-in table-valued functions use the same managed cursor/planner abstraction with lazy bounded series generation. Managed rtree/rtree_i32 cover SQLite's 1-5D and +aux declarations (100 total columns), numeric conversion and float32 outward rounding/int32 wrapping, authoritative id/rowid behavior, all conflict policies, INSERT SELECT/DEFAULT/RETURNING, UPDATE FROM and managed ORDER BY/LIMIT DML, axis-pruned plans, metadata, transaction/savepoint lifecycle, rtreecheck/rtreenode/rtreedepth, and integrity validation. File-backed catalogs use a validated version-2 payload with typed auxiliaries and version-1 upgrade. This remains an explicit managed-storage boundary: no native extension ABI or geometry callback registration, and no SQLite FTS5/R-Tree shadow-table representation. Foreign R-Tree shadow layouts fail closed; stock SQLite cannot query an Ahtola payload-backed R-Tree.",
       "status": "closed"
     },
     {
@@ -1490,13 +1490,13 @@
     {
       "id": "parser-turso-only-sequence-and-optimize-statements",
       "layer": "parser",
-      "kind": "missing",
+      "kind": "partial",
       "turso_ref": "turso-src/sqlite/parser/src/ast.rs::Stmt::CreateSequence / DropSequence / Stmt::Optimize { idx_name } (Turso-only, non-SQLite extensions)",
-      "ahtola_ref": "none — no corresponding statement types exist in src/Ahtola.Core/Parsing/SqlAst.cs",
+      "ahtola_ref": "src/Ahtola.Core/Parsing/SqlAst.cs::OptimizeIndexStatement; src/Ahtola.Core/Parsing/SqlParser.cs; src/Ahtola.Core/EmbeddedDatabase.cs::ExecuteOptimizeIndex",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as an unadopted Turso-only grammar extension. CREATE/DROP SEQUENCE and OPTIMIZE INDEX have no SQLite equivalent or vendored conformance coverage.",
+      "notes": "Updated 2026-08-29: named and bare OPTIMIZE INDEX are implemented for managed index methods and execute through each method's transactional Optimize hook. CREATE/DROP SEQUENCE remain intentionally unadopted Turso-only extensions.",
       "status": "closed"
     },
     {
@@ -1732,7 +1732,7 @@
       "severity": "s3-perf",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Reopened and re-closed 2026-08-24 by managed-index-methods-fts, then hardened the same day by the managed FTS/index-method review. fts_match, fts_score, fts_highlight and fts_snippet ship as builtin scalars backed by a pure-managed inverted index; there is no Tantivy and no native code. All four bind by resolved source identity (qualifier plus the row's own rowid), never by column-name similarity, so an unrelated table's index cannot change scalar behavior and joined rows score against their own source. A connection scalar callback that shadows any of the four suppresses method planning and index-aware scalar behavior entirely. fts_score is corpus- and configuration-dependent, so it is registered non-deterministic and rejected in index expressions, partial index WHERE clauses, generated columns and CHECK constraints; the other three remain pure functions of their arguments. The covering index's tokenizer, detail and columnsize settings are applied on the scalar path too, so a construct the index cannot answer fails identically on both paths. See docs/managed-index-methods.md.",
+      "notes": "Reconciled again against pinned v0.8.0-pre.7 on 2026-08-29. fts_match, fts_score and the pinned varargs fts_highlight(text..., before, after, query) ship over a pure-managed inverted index; fts_highlight_legacy and fts_snippet are explicit Ahtola extensions. Method queries use a distinct Tantivy-compatible grammar (adjacency OR, AND/NOT, field phrases/prefixes and boosts), while managed FTS5 keeps SQLite grammar. Tokenizers default/raw/simple/whitespace/ngram, default ngram 2..3, TEXT-only indexing, NULL match=0, unbound score=REAL 0.0, unordered column-set binding, duplicate-index ambiguity checks and all seven pinned FTS plan shapes are implemented. The registry follows Turso and marks FTS scalars deterministic; Ahtola intentionally still rejects corpus-aware fts_score in CHECK constraints because evaluating it while the checked statement mutates that corpus has no stable meaning. See docs/managed-index-methods.md.",
       "status": "closed"
     },
     {

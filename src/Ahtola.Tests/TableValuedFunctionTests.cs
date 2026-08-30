@@ -239,6 +239,8 @@ public class TableValuedFunctionTests
         Rows(connection, "SELECT start, stop, step FROM generate_series(1,2);").Should().Equal(["1|2|1", "1|2|1"]);
         Rows(connection, "SELECT start, stop, step FROM generate_series(1) LIMIT 1;")
             .Should().Equal(["1|4294967295|1"]);
+        Rows(connection, "SELECT value FROM generate_series(1) LIMIT 2 OFFSET 3;")
+            .Should().Equal(["4", "5"]);
 
         // A zero step counts by one rather than erroring or looping forever, and the
         // hidden step column reports the effective 1.
@@ -252,6 +254,25 @@ public class TableValuedFunctionTests
             .Should().Equal(["1", "2", "3"]);
         Rows(connection, "SELECT value FROM generate_series WHERE start=1 AND stop=10 AND step=3;")
             .Should().Equal(["1", "4", "7", "10"]);
+    }
+
+    [Test]
+    public void BoundedSeriesUsesTheSharedStreamingVirtualCursorProgram()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Rows(connection, "EXPLAIN SELECT value FROM generate_series(1) LIMIT 2;")
+            .Select(static row => row.Split('|')[1])
+            .Should().ContainInOrder("VOpen", "VFilter", "VColumn", "VNext");
+        Rows(connection, "EXPLAIN SELECT value FROM generate_series WHERE start=1 LIMIT 1;")
+            .Select(static row => row.Split('|')[1])
+            .Should().ContainInOrder("VOpen", "VFilter", "VColumn", "VNext");
+
+        using var statement = connection.Prepare("SELECT value FROM generate_series(1);");
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(1));
+        statement.Dispose();
     }
 
     /// <summary>

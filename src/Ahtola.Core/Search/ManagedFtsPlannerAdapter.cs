@@ -45,27 +45,43 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
                 return false;
         }
 
-        var scoreExpression = FindOrderByScore(context, out var descending);
+        var orderedScoreExpression = FindOrderByScore(context, out var descending);
+        var projectedScoreExpression = FindProjectedScore(context);
+        var scoreExpression = orderedScoreExpression ?? projectedScoreExpression;
         var matchExpression = FindMatchPredicate(
             context,
             out var hasResidualPredicate,
             out var hasPrecedingResidualPredicate);
 
-        // The one shape whose truncation order is the statement's own order: filter by match, rank
-        // by relevance, and stop at the limit. It needs the ORDER BY to be relevance on exactly the
-        // same call, no residual conjunct to shrink the truncated set afterwards, and a statement
-        // shape that cannot reintroduce or re-rank a truncated row.
-        if (matchExpression is not null
-            && scoreExpression is not null
-            && descending
-            && context.Limit is not null
-            && context.OrderBy is { Count: 1 }
-            && context.AllowsRowTruncation
-            && !hasResidualPredicate
-            && scoreExpression.Equals(matchExpression))
+        if (matchExpression is not null)
         {
+            // A preceding conjunct may short-circuit before MATCH evaluates its query argument.
+            // Hoisting it into an index scan would surface errors the scalar execution never reaches.
+            if (hasPrecedingResidualPredicate)
+                return false;
+
+            var sameScore = scoreExpression is not null && scoreExpression.Equals(matchExpression);
+            var scoreOrdered = sameScore
+                && orderedScoreExpression is not null
+                && descending
+                && context.OrderBy is { Count: 1 };
+            var canLimit = context.Limit is not null
+                && context.AllowsRowTruncation
+                && !hasResidualPredicate;
+            var shape = sameScore
+                ? scoreOrdered
+                    ? canLimit
+                        ? ManagedIndexPatternShape.CombinedOrderedLimit
+                        : ManagedIndexPatternShape.CombinedOrdered
+                    : canLimit && context.OrderBy is not { Count: > 0 }
+                        ? ManagedIndexPatternShape.CombinedLimit
+                        : ManagedIndexPatternShape.Combined
+                : canLimit && context.OrderBy is not { Count: > 0 }
+                    ? ManagedIndexPatternShape.MatchLimit
+                    : ManagedIndexPatternShape.Match;
+
             match = new ManagedIndexMethodPatternMatch(
-                ManagedIndexPatternShape.MatchLimit,
+                shape,
                 matchExpression,
                 FiltersRows: true,
                 ValidateArgument: ValidateMatchArgument,
@@ -73,70 +89,26 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
             return true;
         }
 
-        // ORDER BY runs after WHERE has already decided which rows survive at all, so it is a
-        // separate evaluation phase rather than another conjunct that short-circuiting can skip
-        // over. That means ANY residual predicate — before or after a match call in the source
-        // text, it makes no difference here — can filter out every row before this hoisted score
-        // argument would ever be reached by ORDER BY on the scalar path, leaving an error-prone
-        // argument unevaluated there. Only two shapes are provably safe from that: no predicate at
-        // all, or a predicate that IS this exact argument's own fts_match call and nothing else, so
-        // WHERE itself evaluates the argument (as part of deciding whether the row survives) before
-        // ORDER BY could ever be reached — an error in it surfaces through that match evaluation
-        // regardless of whether the row would have survived.
-        if (scoreExpression is not null
-            && descending
-            && (context.Predicate is null
-                || (matchExpression is not null
-                    && !hasResidualPredicate
-                    && scoreExpression.Equals(matchExpression))))
+        // Pinned pattern 0 is the globally ranked score-only top-k shape. Without a literal LIMIT
+        // there is no cheaper access path: SQL must still retain every row at the scalar 0.0
+        // fallback, so leave the statement on its ordinary scan.
+        if (orderedScoreExpression is null
+            || !descending
+            || context.Limit is null
+            || context.OrderBy is not { Count: 1 }
+            || !context.AllowsRowTruncation
+            || context.Predicate is not null)
         {
-            // Ranking never removes rows, so a score-ordered plan must still produce every base row.
-            // Only a pushed-down LIMIT makes it worth taking, and a secondary ORDER BY term blocks
-            // that pushdown because it could reorder rows the method already truncated away.
-            var shape = context.Limit is not null && context.OrderBy is { Count: 1 }
-                ? ManagedIndexPatternShape.ScoreOrderedLimit
-                : ManagedIndexPatternShape.ScoreOrdered;
-            match = new ManagedIndexMethodPatternMatch(
-                shape,
-                scoreExpression,
-                FiltersRows: false,
-                ValidateArgument: ValidateScoreArgument,
-                // The scalar path scores a row the index did not rank as 0.0 (see
-                // EvaluateFtsScore), so merging on that same fallback rank reproduces the scalar
-                // evaluator's own (score DESC, rowid ASC) tie-break instead of the index's ranked
-                // hits winning ties against unranked rows purely by having been listed first.
-                UnrankedMergePolicy: ManagedIndexUnrankedMergePolicy.MergeByDescendingRank,
-                UnrankedRank: 0.0);
-            return true;
+            return false;
         }
 
-        if (matchExpression is null)
-            return false;
-
-        // A residual conjunct that precedes the match call in left-to-right order can short-circuit
-        // the scalar path past it entirely — `AND` never evaluates its right operand once the left
-        // one is false — so the match's own query argument is never evaluated and never raises.
-        // Planning here would evaluate that argument unconditionally up front and could raise an
-        // error the scalar path would have silently avoided by never reaching the call. Declining
-        // leaves the whole predicate to the ordinary per-row pipeline, which reproduces that same
-        // short-circuit. A residual that only follows the match call cannot cause this: the scalar
-        // path always reaches the match call first, so the pattern below still filters correctly.
-        if (hasPrecedingResidualPredicate)
-            return false;
-
-        // Any other LIMIT is left to the ordinary pipeline. A pushed-down LIMIT on a filtering
-        // pattern truncates the row set itself, and the rows it keeps are the best-scoring ones:
-        //   * `... WHERE fts_match(…) LIMIT 5` wants the first five matches in scan order, not the
-        //     five best-scoring ones, and a scan produces rows in ascending rowid order;
-        //   * `... ORDER BY id LIMIT 5` wants the five lowest ids among *all* matches;
-        //   * a residual conjunct applied after truncation can only shrink the truncated set, so it
-        //     would return fewer rows than the LIMIT asked for while further matches still exist.
-        // The unlimited Match pattern still filters; only the truncation is given up.
         match = new ManagedIndexMethodPatternMatch(
-            ManagedIndexPatternShape.Match,
-            matchExpression,
-            FiltersRows: true,
-            ValidateArgument: ValidateMatchArgument);
+            ManagedIndexPatternShape.Score,
+            orderedScoreExpression,
+            FiltersRows: false,
+            ValidateArgument: ValidateScoreArgument,
+            UnrankedMergePolicy: ManagedIndexUnrankedMergePolicy.MergeByDescendingRank,
+            UnrankedRank: 0.0);
         return true;
     }
 
@@ -218,9 +190,9 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
 
             if (matched is null
                 && conjunct is FunctionExpression function
-                && MatchesIndexCall(function, MatchFunction, context))
+                && TryGetIndexCallQuery(function, MatchFunction, context, out var query))
             {
-                matched = function.Arguments[^1];
+                matched = query;
                 continue;
             }
 
@@ -235,6 +207,23 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
         return matched;
     }
 
+    private static Expression? FindProjectedScore(ManagedIndexMethodPlannerContext context)
+    {
+        if (context.ResultExpressions is null)
+            return null;
+
+        foreach (var expression in context.ResultExpressions)
+        {
+            if (expression is FunctionExpression function
+                && TryGetIndexCallQuery(function, ScoreFunction, context, out var query))
+            {
+                return query;
+            }
+        }
+
+        return null;
+    }
+
     /// <summary>Finds a leading <c>ORDER BY fts_score(cols…, query) DESC</c> term.</summary>
     private static Expression? FindOrderByScore(ManagedIndexMethodPlannerContext context, out bool descending)
     {
@@ -244,37 +233,62 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
 
         var term = context.OrderBy[0];
         if (term.Expression is not FunctionExpression function
-            || !MatchesIndexCall(function, ScoreFunction, context))
+            || !TryGetIndexCallQuery(function, ScoreFunction, context, out var query))
         {
             return null;
         }
 
         descending = term.Descending;
-        return function.Arguments[^1];
+        return query;
     }
 
     /// <summary>
-    /// True when a call names the index's method function with exactly the index's columns, in
-    /// declaration order, all resolving to this source. Anything else (a different column set, a
+    /// True when a call names the index's method function with exactly the index's columns as an
+    /// unordered set, all resolving to this source. Anything else (a different column set, a
     /// different table, an expression argument) leaves the call to the scalar evaluator.
     /// </summary>
-    private static bool MatchesIndexCall(
+    private static bool TryGetIndexCallQuery(
         FunctionExpression function,
         string expectedName,
-        ManagedIndexMethodPlannerContext context)
+        ManagedIndexMethodPlannerContext context,
+        out Expression query)
     {
-        if (!string.Equals(function.Name, expectedName, StringComparison.OrdinalIgnoreCase)
-            || function.Window is not null
+        query = null!;
+        if (function.Window is not null
             || function.Filter is not null
-            || function.Distinct
-            || function.Arguments.Count != context.Columns.Count + 1)
+            || function.Distinct)
         {
             return false;
         }
 
-        for (var position = 0; position < context.Columns.Count; position++)
+        IReadOnlyList<Expression> columns;
+        if (string.Equals(function.Name, expectedName, StringComparison.OrdinalIgnoreCase)
+            && function.Arguments.Count == context.Columns.Count + 1)
         {
-            if (function.Arguments[position] is not ColumnExpression { BooleanKeyword: null } column)
+            columns = function.Arguments.Take(function.Arguments.Count - 1).ToArray();
+            query = function.Arguments[^1];
+        }
+        else if (string.Equals(expectedName, MatchFunction, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(function.Name, "MATCH", StringComparison.OrdinalIgnoreCase)
+            && function.Arguments.Count == 2)
+        {
+            columns = function.Arguments[1] is RowValueExpression tuple
+                ? tuple.Values
+                : [function.Arguments[1]];
+            query = function.Arguments[0];
+        }
+        else
+        {
+            return false;
+        }
+
+        if (columns.Count != context.Columns.Count)
+            return false;
+
+        var matchedColumns = new bool[context.Columns.Count];
+        foreach (var argument in columns)
+        {
+            if (argument is not ColumnExpression { BooleanKeyword: null } column)
                 return false;
 
             // An unqualified column in a multi-source query could belong to any of them; the caller
@@ -286,17 +300,24 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
                 return false;
             }
 
-            if (!string.Equals(
-                    column.UnqualifiedName ?? column.Name,
-                    context.Columns[position].Name,
-                    StringComparison.OrdinalIgnoreCase))
+            var name = column.UnqualifiedName ?? column.Name;
+            var found = -1;
+            for (var position = 0; position < context.Columns.Count; position++)
             {
-                return false;
+                if (string.Equals(name, context.Columns[position].Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    found = position;
+                    break;
+                }
             }
+
+            if (found < 0 || matchedColumns[found])
+                return false;
+            matchedColumns[found] = true;
         }
 
         // The query argument must not depend on the scanned row, and must be safe to evaluate once
         // for the whole scan, or the method could not hoist it out of the per-row scalar path.
-        return context.IsHoistableArgument(function.Arguments[^1]);
+        return context.IsHoistableArgument(query);
     }
 }

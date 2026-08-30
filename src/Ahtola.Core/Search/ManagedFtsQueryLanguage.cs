@@ -12,9 +12,6 @@ internal static class ManagedFtsLimits
     /// <summary>Maximum parser recursion depth.</summary>
     public const int MaxQueryDepth = 64;
 
-    /// <summary>Maximum rows a single materialized match may produce.</summary>
-    public const int MaxMatchRows = 1_000_000;
-
     /// <summary>Maximum recorded token positions in one document.</summary>
     public const int MaxPositionsPerDocument = 1_000_000;
 
@@ -35,10 +32,11 @@ internal static class ManagedFtsLimits
 internal enum ManagedFtsQuerySyntax
 {
     Managed,
+    TursoMethod,
     SqliteFts5,
 }
 
-/// <summary>The extended managed FTS query grammar used by method indexes and managed FTS5.</summary>
+/// <summary>The parsed query tree shared by the separate Turso-method and SQLite FTS5 grammars.</summary>
 /// <remarks>
 /// A superset of <see cref="ManagedFtsQueryParser"/>. The additions are column filters
 /// (<c>col:term</c>), initial-token anchors (<c>^term</c>) and bounded proximity groups.
@@ -75,6 +73,8 @@ internal sealed record ManagedFtsOrNode(ManagedFtsNode Left, ManagedFtsNode Righ
 
 internal sealed record ManagedFtsNotNode(ManagedFtsNode Operand) : ManagedFtsNode;
 
+internal sealed record ManagedFtsBoostNode(ManagedFtsNode Operand, float Factor) : ManagedFtsNode;
+
 /// <summary>
 /// Recursive-descent parser for the extended managed FTS query grammar. Every recursion and term
 /// count is bounded by <see cref="ManagedFtsLimits"/> so a hostile query cannot exhaust the stack
@@ -86,6 +86,8 @@ internal sealed class ManagedFtsQueryLanguage
     private readonly ManagedFtsTokenizerOptions _options;
     private readonly Func<string, bool> _isKnownColumn;
     private readonly ManagedFtsQuerySyntax _syntax;
+    private readonly IReadOnlyList<string>? _methodColumns;
+    private readonly IReadOnlyList<ManagedFtsTokenizerOptions>? _methodTokenizers;
     private int _offset;
     private int _depth;
     private int _termCount;
@@ -94,12 +96,16 @@ internal sealed class ManagedFtsQueryLanguage
         string text,
         ManagedFtsTokenizerOptions options,
         Func<string, bool> isKnownColumn,
-        ManagedFtsQuerySyntax syntax)
+        ManagedFtsQuerySyntax syntax,
+        IReadOnlyList<string>? methodColumns = null,
+        IReadOnlyList<ManagedFtsTokenizerOptions>? methodTokenizers = null)
     {
         _text = text;
         _options = options;
         _isKnownColumn = isKnownColumn;
         _syntax = syntax;
+        _methodColumns = methodColumns;
+        _methodTokenizers = methodTokenizers;
     }
 
     public static ManagedFtsNode Parse(
@@ -120,17 +126,61 @@ internal sealed class ManagedFtsQueryLanguage
         return NormalizeOmitted(node);
     }
 
+    /// <summary>
+    /// Parses the Tantivy query-parser profile used by <c>CREATE INDEX ... USING fts</c>. Each
+    /// unqualified operand is analyzed once per indexed field so per-column tokenizers remain
+    /// observable without leaking this grammar into SQLite-compatible FTS5.
+    /// </summary>
+    public static ManagedFtsNode ParseMethod(
+        string query,
+        IReadOnlyList<string> columnNames,
+        IReadOnlyList<ManagedFtsTokenizerOptions> columnTokenizers)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(columnNames);
+        ArgumentNullException.ThrowIfNull(columnTokenizers);
+        if (columnNames.Count == 0 || columnNames.Count != columnTokenizers.Count)
+            throw new ArgumentException("One tokenizer per FTS method-index column is required.");
+
+        var parser = new ManagedFtsQueryLanguage(
+            query,
+            columnTokenizers[0],
+            name => columnNames.Contains(name, StringComparer.OrdinalIgnoreCase),
+            ManagedFtsQuerySyntax.TursoMethod,
+            columnNames,
+            columnTokenizers);
+        if (query.AsSpan().Trim().Length == 0)
+            throw new EmbeddedSqlException("fts query is empty");
+
+        var node = parser.ParseOr();
+        parser.ExpectEnd();
+        return NormalizeOmitted(node);
+    }
+
     private ManagedFtsNode ParseOr()
     {
         using var _ = Descend();
-        var expression = _syntax == ManagedFtsQuerySyntax.SqliteFts5
-            ? ParseFts5ExplicitAnd()
-            : ParseManagedAnd();
-        while (TryReadKeyword("OR"))
+        var expression = _syntax switch
         {
-            var right = _syntax == ManagedFtsQuerySyntax.SqliteFts5
-                ? ParseFts5ExplicitAnd()
-                : ParseManagedAnd();
+            ManagedFtsQuerySyntax.SqliteFts5 => ParseFts5ExplicitAnd(),
+            ManagedFtsQuerySyntax.TursoMethod => ParseTursoAnd(),
+            _ => ParseManagedAnd(),
+        };
+        while (true)
+        {
+            var explicitOr = TryReadKeyword("OR");
+            if (!explicitOr
+                && (_syntax != ManagedFtsQuerySyntax.TursoMethod || !IsTursoOperandStart()))
+            {
+                break;
+            }
+
+            var right = _syntax switch
+            {
+                ManagedFtsQuerySyntax.SqliteFts5 => ParseFts5ExplicitAnd(),
+                ManagedFtsQuerySyntax.TursoMethod => ParseTursoAnd(),
+                _ => ParseManagedAnd(),
+            };
             expression = new ManagedFtsOrNode(
                 _syntax == ManagedFtsQuerySyntax.SqliteFts5
                     ? NormalizeOmitted(expression)
@@ -141,6 +191,40 @@ internal sealed class ManagedFtsQueryLanguage
         }
 
         return expression;
+    }
+
+    private ManagedFtsNode ParseTursoAnd()
+    {
+        using var _ = Descend();
+        var expression = ParseTursoUnary();
+        while (true)
+        {
+            if (TryReadKeyword("AND"))
+            {
+                expression = new ManagedFtsAndNode(expression, ParseTursoUnary());
+                continue;
+            }
+
+            if (TryReadKeyword("NOT"))
+            {
+                expression = new ManagedFtsAndNode(
+                    expression,
+                    new ManagedFtsNotNode(ParseTursoUnary()));
+                continue;
+            }
+
+            return expression;
+        }
+    }
+
+    private ManagedFtsNode ParseTursoUnary()
+    {
+        using var _ = Descend();
+        SkipWhitespace();
+        if (TryReadKeyword("NOT") || TryRead('-'))
+            return new ManagedFtsNotNode(ParseTursoUnary());
+
+        return ParsePrimary();
     }
 
     private ManagedFtsNode ParseManagedAnd()
@@ -234,20 +318,29 @@ internal sealed class ManagedFtsQueryLanguage
             var expression = ParseOr();
             if (!TryRead(')'))
                 throw Error("Expected ')' to close FTS expression.");
-            return expression;
+            return ParseBoost(expression);
         }
 
         var column = TryReadColumnPrefix();
-        if (IsKeywordAtOffset("NEAR")
+        if (_syntax == ManagedFtsQuerySyntax.TursoMethod
+            && IsKeywordAtOffset("NEAR")
+            && IsManagedNearAtOffset())
+        {
+            throw Error("NEAR is not part of the Turso FTS query grammar.");
+        }
+        if (_syntax != ManagedFtsQuerySyntax.TursoMethod
+            && IsKeywordAtOffset("NEAR")
             && (_syntax != ManagedFtsQuerySyntax.SqliteFts5 || IsFts5NearAtOffset()))
-            return ParseNear(column);
+        {
+            return ParseBoost(ParseNear(column));
+        }
 
-        var anchored = TryRead('^');
+        var anchored = _syntax != ManagedFtsQuerySyntax.TursoMethod && TryRead('^');
         if (_syntax == ManagedFtsQuerySyntax.SqliteFts5)
             return ParseFts5Phrase(column, anchored);
 
         if (TryRead('"'))
-            return ParsePhrase(column, anchored);
+            return ParseBoost(ParsePhrase(column, anchored));
 
         var term = ReadWord();
         if (term.Length == 0)
@@ -257,7 +350,7 @@ internal sealed class ManagedFtsQueryLanguage
         if (TryRead('*'))
             throw Error("An FTS prefix term can contain only one trailing '*'.");
 
-        return BuildTermNode(term, prefix, column, anchored);
+        return ParseBoost(BuildTermNode(term, prefix, column, anchored));
     }
 
     /// <summary>
@@ -274,14 +367,44 @@ internal sealed class ManagedFtsQueryLanguage
     /// </remarks>
     private ManagedFtsNode BuildTermNode(string term, bool prefix, string? column, bool anchored)
     {
-        var tokens = ManagedFtsTokenization.TokenizeQueryText(term, _options);
+        if (_syntax == ManagedFtsQuerySyntax.TursoMethod
+            && column is null
+            && _methodColumns is not null
+            && _methodTokenizers is not null)
+        {
+            ManagedFtsNode? expression = null;
+            for (var index = 0; index < _methodColumns.Count; index++)
+            {
+                var field = BuildTermNode(
+                    term,
+                    prefix,
+                    _methodColumns[index],
+                    anchored,
+                    _methodTokenizers[index]);
+                expression = expression is null ? field : new ManagedFtsOrNode(expression, field);
+            }
+
+            return expression ?? new ManagedFtsNoMatchNode();
+        }
+
+        return BuildTermNode(term, prefix, column, anchored, ResolveTokenizer(column));
+    }
+
+    private ManagedFtsNode BuildTermNode(
+        string term,
+        bool prefix,
+        string? column,
+        bool anchored,
+        ManagedFtsTokenizerOptions options)
+    {
+        var tokens = ManagedFtsTokenization.TokenizeQueryText(term, options);
         if (tokens.Count == 0)
         {
             // The tokenizer discarded every character (punctuation only, for example). Keep the
             // folded text so the term simply fails to match instead of silently matching everything.
             CountTerm();
             return new ManagedFtsTermNode(
-                ManagedFtsTokenization.NormalizeTerm(term, _options),
+                ManagedFtsTokenization.NormalizeTerm(term, options),
                 prefix,
                 column,
                 anchored);
@@ -292,15 +415,15 @@ internal sealed class ManagedFtsQueryLanguage
             CountTerm();
             return new ManagedFtsTermNode(
                 tokens[0],
-                prefix && !_options.IsGramTokenizer,
+                prefix && !options.IsGramTokenizer,
                 column,
                 anchored);
         }
 
-        if (prefix && !_options.IsGramTokenizer)
+        if (prefix && !options.IsGramTokenizer)
         {
             throw new EmbeddedSqlException(
-                $"fts prefix term '{term}*' expands to {tokens.Count} tokens under the '{ManagedFtsTokenizerOptions.FormatKind(_options.Kind)}' tokenizer; quote it as a phrase instead");
+                $"fts prefix term '{term}*' expands to {tokens.Count} tokens under the '{ManagedFtsTokenizerOptions.FormatKind(options.Kind)}' tokenizer; quote it as a phrase instead");
         }
 
         var terms = new string[tokens.Count];
@@ -517,7 +640,37 @@ internal sealed class ManagedFtsQueryLanguage
         if (prefix && _syntax != ManagedFtsQuerySyntax.SqliteFts5)
             throw Error("A prefix wildcard is valid only after an unquoted FTS term.");
 
-        var tokens = ManagedFtsTokenization.TokenizeQueryText(phraseText, _options);
+        if (_syntax == ManagedFtsQuerySyntax.TursoMethod
+            && column is null
+            && _methodColumns is not null
+            && _methodTokenizers is not null)
+        {
+            ManagedFtsNode? expression = null;
+            for (var index = 0; index < _methodColumns.Count; index++)
+            {
+                var field = BuildPhraseNode(
+                    phraseText,
+                    _methodColumns[index],
+                    anchored,
+                    _methodTokenizers[index],
+                    prefix);
+                expression = expression is null ? field : new ManagedFtsOrNode(expression, field);
+            }
+
+            return expression ?? new ManagedFtsNoMatchNode();
+        }
+
+        return BuildPhraseNode(phraseText, column, anchored, ResolveTokenizer(column), prefix);
+    }
+
+    private ManagedFtsNode BuildPhraseNode(
+        string phraseText,
+        string? column,
+        bool anchored,
+        ManagedFtsTokenizerOptions options,
+        bool prefix)
+    {
+        var tokens = ManagedFtsTokenization.TokenizeQueryText(phraseText, options);
         if (tokens.Count == 0)
             throw Error("An FTS phrase must contain at least one token.");
 
@@ -542,6 +695,55 @@ internal sealed class ManagedFtsQueryLanguage
                 .ToArray(),
             column,
             anchored);
+    }
+
+    private ManagedFtsNode ParseBoost(ManagedFtsNode node)
+    {
+        if (_syntax != ManagedFtsQuerySyntax.TursoMethod
+            || _offset >= _text.Length
+            || _text[_offset] != '^')
+        {
+            return node;
+        }
+
+        _offset++;
+        var start = _offset;
+        while (_offset < _text.Length
+            && (char.IsAsciiDigit(_text[_offset])
+                || _text[_offset] is '.' or '+' or '-'
+                || _text[_offset] is 'e' or 'E'))
+        {
+            _offset++;
+        }
+
+        var text = _text[start.._offset];
+        if (!float.TryParse(
+                text,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var factor)
+            || float.IsNaN(factor)
+            || float.IsInfinity(factor)
+            || factor < 0.0f)
+        {
+            throw Error("An FTS boost must be a finite non-negative number.");
+        }
+
+        return new ManagedFtsBoostNode(node, factor);
+    }
+
+    private ManagedFtsTokenizerOptions ResolveTokenizer(string? column)
+    {
+        if (column is null || _methodColumns is null || _methodTokenizers is null)
+            return _options;
+
+        for (var index = 0; index < _methodColumns.Count; index++)
+        {
+            if (string.Equals(_methodColumns[index], column, StringComparison.OrdinalIgnoreCase))
+                return _methodTokenizers[index];
+        }
+
+        return _options;
     }
 
     private string? TryReadColumnPrefix()
@@ -571,6 +773,17 @@ internal sealed class ManagedFtsQueryLanguage
         return !IsKeywordAtOffset("OR");
     }
 
+    private bool IsTursoOperandStart()
+    {
+        SkipWhitespace();
+        if (_offset >= _text.Length || _text[_offset] == ')')
+            return false;
+
+        return !IsKeywordAtOffset("AND")
+            && !IsKeywordAtOffset("OR")
+            && !IsKeywordAtOffset("NOT");
+    }
+
     private bool IsFts5ImplicitOperandStart()
     {
         SkipWhitespace();
@@ -588,7 +801,8 @@ internal sealed class ManagedFtsQueryLanguage
         var start = _offset;
         while (_offset < _text.Length
             && !char.IsWhiteSpace(_text[_offset])
-            && _text[_offset] is not ('(' or ')' or '"' or '*' or '-' or ':' or '^'))
+            && _text[_offset] is not ('(' or ')' or '"' or '*' or ':' or '^')
+            && (_syntax == ManagedFtsQuerySyntax.TursoMethod || _text[_offset] != '-'))
         {
             _offset++;
         }
@@ -658,7 +872,7 @@ internal sealed class ManagedFtsQueryLanguage
         => _offset + keyword.Length <= _text.Length
             && _text.AsSpan(_offset, keyword.Length).Equals(
                 keyword,
-                _syntax == ManagedFtsQuerySyntax.SqliteFts5
+                _syntax is ManagedFtsQuerySyntax.SqliteFts5 or ManagedFtsQuerySyntax.TursoMethod
                     ? StringComparison.Ordinal
                     : StringComparison.OrdinalIgnoreCase)
             && (_offset + keyword.Length == _text.Length
@@ -671,6 +885,15 @@ internal sealed class ManagedFtsQueryLanguage
             next++;
 
         return next < _text.Length && _text[next] == '(';
+    }
+
+    private bool IsManagedNearAtOffset()
+    {
+        var next = _offset + "NEAR".Length;
+        while (next < _text.Length && char.IsWhiteSpace(_text[next]))
+            next++;
+
+        return next < _text.Length && _text[next] is '(' or '/';
     }
 
     private bool IsKeywordContinuation(char value)

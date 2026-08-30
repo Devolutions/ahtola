@@ -50,7 +50,7 @@ internal sealed class ManagedFtsSearchIndex
     public const int MaxSynchronousCompactionDocuments = 64_000;
 
     private readonly int _columnCount;
-    private readonly ManagedFtsTokenizerOptions _tokenizer;
+    private readonly ManagedFtsTokenizerOptions[] _columnTokenizers;
     private readonly double[] _columnWeights;
     private readonly ManagedFtsDetailLevel _detail;
     private readonly bool _columnSize;
@@ -69,16 +69,35 @@ internal sealed class ManagedFtsSearchIndex
         ManagedFtsDetailLevel detail = ManagedFtsDetailLevel.Full,
         bool columnSize = true,
         ManagedFtsScoringProfile scoringProfile = ManagedFtsScoringProfile.Managed)
+        : this(
+            columnCount,
+            Enumerable.Repeat(tokenizer, columnCount).ToArray(),
+            columnWeights,
+            detail,
+            columnSize,
+            scoringProfile)
+    {
+    }
+
+    public ManagedFtsSearchIndex(
+        int columnCount,
+        IReadOnlyList<ManagedFtsTokenizerOptions> columnTokenizers,
+        IReadOnlyList<double> columnWeights,
+        ManagedFtsDetailLevel detail = ManagedFtsDetailLevel.Full,
+        bool columnSize = true,
+        ManagedFtsScoringProfile scoringProfile = ManagedFtsScoringProfile.Managed)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(columnCount, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(columnCount, sizeof(uint) * 8);
-        ArgumentNullException.ThrowIfNull(tokenizer);
+        ArgumentNullException.ThrowIfNull(columnTokenizers);
         ArgumentNullException.ThrowIfNull(columnWeights);
+        if (columnTokenizers.Count != columnCount)
+            throw new ArgumentException("One tokenizer per indexed column is required.", nameof(columnTokenizers));
         if (columnWeights.Count != columnCount)
             throw new ArgumentException("One weight per indexed column is required.", nameof(columnWeights));
 
         _columnCount = columnCount;
-        _tokenizer = tokenizer;
+        _columnTokenizers = columnTokenizers.ToArray();
         _columnWeights = columnWeights.ToArray();
         _detail = detail;
         _columnSize = columnSize;
@@ -166,11 +185,20 @@ internal sealed class ManagedFtsSearchIndex
         var totalPositions = 0;
         for (var column = 0; column < _columnCount; column++)
         {
-            var text = ReadText(columnValues[column]);
+            // Turso's method hands only Value::Text fields to Tantivy. SQLite FTS5 keeps its own
+            // historical coercion behavior, so the separate compatibility profile still indexes
+            // blobs/numbers through ReadText.
+            if (_scoringProfile != ManagedFtsScoringProfile.SqliteFts5
+                && columnValues[column].Kind != SqlValueKind.Text)
+                continue;
+
+            var text = _scoringProfile == ManagedFtsScoringProfile.SqliteFts5
+                ? ReadText(columnValues[column])
+                : columnValues[column].AsText();
             if (text.Length == 0)
                 continue;
 
-            var tokens = ManagedFtsTokenization.Tokenize(text, _tokenizer);
+            var tokens = ManagedFtsTokenization.Tokenize(text, _columnTokenizers[column]);
             lengths[column] = tokens.Count;
             foreach (var token in tokens)
             {
@@ -324,22 +352,63 @@ internal sealed class ManagedFtsSearchIndex
 
         var accumulator = new Dictionary<long, double>();
         var matches = Evaluate(query, accumulator, columnWeights);
-        if (matches.Count > ManagedFtsLimits.MaxMatchRows)
-            throw new EmbeddedSqlException($"fts query matches more than {ManagedFtsLimits.MaxMatchRows} rows");
+        if (limit is { } maximum)
+        {
+            if (maximum <= 0)
+                return [];
+
+            // Keep only the best k entries while walking the match set. A LIMIT 1 query therefore
+            // allocates O(1) ranked-hit storage even when millions of documents match.
+            var queue = new PriorityQueue<ManagedFtsHit, ManagedFtsHit>(WorstHitComparer.Instance);
+            foreach (var rowId in matches)
+            {
+                var hit = CreateHit(rowId, accumulator);
+                queue.Enqueue(hit, hit);
+                if (queue.Count > maximum)
+                    queue.Dequeue();
+            }
+
+            var bounded = new List<ManagedFtsHit>(queue.Count);
+            while (queue.TryDequeue(out var hit, out _))
+                bounded.Add(hit);
+            bounded.Sort(BestHitComparer.Instance);
+            return bounded;
+        }
 
         var hits = new List<ManagedFtsHit>(matches.Count);
         foreach (var rowId in matches)
-            hits.Add(new ManagedFtsHit(rowId, accumulator.TryGetValue(rowId, out var score) ? score : 0.0));
-
-        hits.Sort(static (left, right)
-            => left.Score == right.Score
-                ? left.RowId.CompareTo(right.RowId)
-                : right.Score.CompareTo(left.Score));
-
-        if (limit is { } max && max >= 0 && hits.Count > max)
-            hits.RemoveRange(max, hits.Count - max);
-
+            hits.Add(CreateHit(rowId, accumulator));
+        hits.Sort(BestHitComparer.Instance);
         return hits;
+    }
+
+    /// <summary>
+    /// Enumerates an unordered plan without building and sorting a second hit collection. Boolean
+    /// evaluation retains its bounded query structures, but result storage is proportional only to
+    /// what the caller drains.
+    /// </summary>
+    public IEnumerable<ManagedFtsHit> SearchUnordered(
+        ManagedFtsNode query,
+        IReadOnlyList<double> columnWeights,
+        bool includeScores,
+        int? limit = null)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(columnWeights);
+        if (columnWeights.Count != _columnCount)
+            throw new ArgumentException("One weight per indexed column is required.", nameof(columnWeights));
+        if (limit is <= 0)
+            yield break;
+
+        Dictionary<long, double>? accumulator = includeScores ? [] : null;
+        var matches = Evaluate(query, accumulator, columnWeights);
+        var emitted = 0;
+        foreach (var rowId in matches)
+        {
+            yield return CreateHit(rowId, accumulator);
+            if (limit is { } maximum && ++emitted >= maximum)
+                yield break;
+        }
     }
 
     /// <summary>True when the document matches, without computing a score.</summary>
@@ -363,7 +432,7 @@ internal sealed class ManagedFtsSearchIndex
         var accumulator = new Dictionary<long, double>();
         return Evaluate(query, accumulator, weights).Contains(rowId)
             && accumulator.TryGetValue(rowId, out var score)
-            ? score
+            ? NormalizeScore(score)
             : 0.0;
     }
 
@@ -384,8 +453,30 @@ internal sealed class ManagedFtsSearchIndex
                 Evaluate(or.Left, accumulator, columnWeights),
                 Evaluate(or.Right, accumulator, columnWeights)),
             ManagedFtsNotNode not => Exclude(EvaluateExclusion(not.Operand, columnWeights)),
+            ManagedFtsBoostNode boost => EvaluateBoost(boost, accumulator, columnWeights),
             _ => throw new ArgumentOutOfRangeException(nameof(node)),
         };
+
+    private HashSet<long> EvaluateBoost(
+        ManagedFtsBoostNode boost,
+        Dictionary<long, double>? accumulator,
+        IReadOnlyList<double> columnWeights)
+    {
+        if (accumulator is null)
+            return Evaluate(boost.Operand, null, columnWeights);
+
+        var boosted = new Dictionary<long, double>();
+        var matches = Evaluate(boost.Operand, boosted, columnWeights);
+        foreach (var (rowId, score) in boosted)
+        {
+            var contribution = NormalizeScore(score * boost.Factor);
+            accumulator[rowId] = accumulator.TryGetValue(rowId, out var existing)
+                ? NormalizeScore(existing + contribution)
+                : contribution;
+        }
+
+        return matches;
+    }
 
     /// <summary>
     /// Evaluates a negated branch for its row set alone, into a scratch accumulator that is thrown
@@ -1529,6 +1620,44 @@ internal sealed class ManagedFtsSearchIndex
             SqlValueKind.Blob => Encoding.UTF8.GetString(value.AsBlob().Span),
             _ => string.Empty,
         };
+
+    private ManagedFtsHit CreateHit(
+        long rowId,
+        IReadOnlyDictionary<long, double>? accumulator)
+        => new(
+            rowId,
+            accumulator is not null && accumulator.TryGetValue(rowId, out var score)
+                ? NormalizeScore(score)
+                : 0.0);
+
+    private double NormalizeScore(double score)
+        => _scoringProfile == ManagedFtsScoringProfile.Managed ? (double)(float)score : score;
+
+    private sealed class BestHitComparer : IComparer<ManagedFtsHit>
+    {
+        public static BestHitComparer Instance { get; } = new();
+
+        public int Compare(ManagedFtsHit left, ManagedFtsHit right)
+        {
+            var byScore = right.Score.CompareTo(left.Score);
+            return byScore != 0 ? byScore : left.RowId.CompareTo(right.RowId);
+        }
+    }
+
+    /// <summary>
+    /// PriorityQueue removes its smallest priority; this comparer therefore orders the least useful
+    /// hit first (lowest score, then greatest rowid) so the queue stays bounded to the best k.
+    /// </summary>
+    private sealed class WorstHitComparer : IComparer<ManagedFtsHit>
+    {
+        public static WorstHitComparer Instance { get; } = new();
+
+        public int Compare(ManagedFtsHit left, ManagedFtsHit right)
+        {
+            var byScore = left.Score.CompareTo(right.Score);
+            return byScore != 0 ? byScore : right.RowId.CompareTo(left.RowId);
+        }
+    }
 
     private sealed record Document(
         long RowId,

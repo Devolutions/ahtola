@@ -202,6 +202,9 @@ public sealed class ResumableStatement : IDisposable
     /// program, or <see langword="null"/> for UPDATE/DELETE and empty inserts.</summary>
     public long? LastInsertRowId { get; private set; }
 
+    /// <summary>The rowid returned by the most recently executed VUpdate.</summary>
+    public long? LastVirtualTableRowId { get; private set; }
+
     /// <summary>Whether the program currently has a transaction open through a
     /// <c>BeginTransaction</c> or <c>Savepoint</c> opcode that has not yet been committed or rolled back.
     /// This tracks the interpreter's register-scoped transaction state machine, not any durable store.</summary>
@@ -233,7 +236,8 @@ public sealed class ResumableStatement : IDisposable
     public ResumableStatementStepResult StepResumable(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        cancellationToken.ThrowIfCancellationRequested();
+        if (cancellationToken.IsCancellationRequested)
+            FailExecution(new OperationCanceledException(cancellationToken));
 
         if (State == ResumableStatementState.Yielded)
         {
@@ -252,7 +256,8 @@ public sealed class ResumableStatement : IDisposable
         _currentRow = null;
         while (_instructionPointer.Offset < Program.Instructions.Count)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            if (cancellationToken.IsCancellationRequested)
+                FailExecution(new OperationCanceledException(cancellationToken));
             var instruction = Program.Instructions[_instructionPointer.Offset];
             _hasExecutedInstruction = true;
             switch (instruction)
@@ -345,10 +350,17 @@ public sealed class ResumableStatement : IDisposable
                     break;
                 case VOpenInstruction vOpen:
                     {
-                        OpenCursor(vOpen.Cursor);
-                        _virtualCursors[vOpen.Cursor.Index] = RequireVirtualTable(vOpen.Cursor).Open();
-                        _cursorPositions[vOpen.Cursor.Index] = -1;
-                        AdvanceInstructionPointer();
+                        try
+                        {
+                            OpenCursor(vOpen.Cursor);
+                            _virtualCursors[vOpen.Cursor.Index] = RequireVirtualTable(vOpen.Cursor).Open();
+                            _cursorPositions[vOpen.Cursor.Index] = -1;
+                            AdvanceInstructionPointer();
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
                         break;
                     }
                 case OpenEphemeralInstruction openEphemeral:
@@ -455,8 +467,16 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case VColumnInstruction vColumn:
                     {
-                        _registers[vColumn.Destination.Index] = RequireVirtualCursor(vColumn.Cursor).Column(vColumn.ColumnIndex);
-                        AdvanceInstructionPointer();
+                        try
+                        {
+                            _registers[vColumn.Destination.Index] =
+                                RequireVirtualCursor(vColumn.Cursor).Column(vColumn.ColumnIndex);
+                            AdvanceInstructionPointer();
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
                         break;
                     }
                 case RowIdInstruction rowId:
@@ -493,12 +513,19 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case VFilterInstruction vFilter:
                     {
-                        var cursor = RequireVirtualCursor(vFilter.Cursor);
-                        var positioned = cursor.Filter(vFilter.Plan, ReadRegisters(vFilter.Arguments));
-                        if (positioned && !cursor.Eof)
-                            AdvanceInstructionPointer();
-                        else
-                            _instructionPointer = vFilter.EmptyTarget;
+                        try
+                        {
+                            var cursor = RequireVirtualCursor(vFilter.Cursor);
+                            var positioned = cursor.Filter(vFilter.Plan, ReadRegisters(vFilter.Arguments));
+                            if (positioned && !cursor.Eof)
+                                AdvanceInstructionPointer();
+                            else
+                                _instructionPointer = vFilter.EmptyTarget;
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
                         break;
                     }
                 case IndexMethodCreateInstruction methodCreate:
@@ -901,12 +928,49 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case VNextInstruction vNext:
                     {
-                        var cursor = RequireVirtualCursor(vNext.Cursor);
-                        cursor.Next();
-                        if (!cursor.Eof)
-                            _instructionPointer = vNext.LoopTarget;
-                        else
-                            AdvanceInstructionPointer();
+                        try
+                        {
+                            var cursor = RequireVirtualCursor(vNext.Cursor);
+                            cursor.Next();
+                            if (!cursor.Eof)
+                                _instructionPointer = vNext.LoopTarget;
+                            else
+                                AdvanceInstructionPointer();
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
+                        break;
+                    }
+                case VCreateInstruction vCreate:
+                    {
+                        var table = ManagedVirtualTableModuleRegistry.Resolve(vCreate.ModuleName).Create(vCreate.Context);
+                        ArgumentNullException.ThrowIfNull(table);
+                        try
+                        {
+                            vCreate.Publish(table);
+                        }
+                        catch
+                        {
+                            table.DisconnectInstance();
+                            throw;
+                        }
+
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case VDestroyInstruction vDestroy:
+                    RequireVirtualTable(vDestroy.Cursor).DestroyInstance();
+                    AdvanceInstructionPointer();
+                    break;
+                case VRenameInstruction vRename:
+                    {
+                        var value = _registers[vRename.NewName.Index];
+                        if (value.Kind != SqlValueKind.Text)
+                            throw new InvalidOperationException("VRename requires a text table name.");
+                        RequireVirtualTable(vRename.Cursor).Rename(value.AsText());
+                        AdvanceInstructionPointer();
                         break;
                     }
                 case PrevInstruction prev:
@@ -961,14 +1025,28 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case VUpdateInstruction vUpdate:
                     {
-                        var arguments = ReadRegisters(vUpdate.Arguments);
-                        var rowId = RequireVirtualTable(vUpdate.Cursor).Update(arguments);
-                        if (vUpdate.NewRowIdDestination is { } destination)
-                            _registers[destination.Index] = rowId is { } value ? SqlValue.Integer(value) : SqlValue.Null;
-                        if (arguments[0].Kind == SqlValueKind.Null && rowId is { } insertedRowId)
-                            LastInsertRowId = insertedRowId;
-                        RowsAffected = checked(RowsAffected + 1);
-                        AdvanceInstructionPointer();
+                        try
+                        {
+                            var arguments = ReadRegisters(vUpdate.Arguments);
+                            var result = RequireVirtualTable(vUpdate.Cursor).Update(arguments, vUpdate.ConflictMode);
+                            var rowId = result.RowId;
+                            LastVirtualTableRowId = rowId;
+                            if (vUpdate.NewRowIdDestination is { } destination)
+                                _registers[destination.Index] = rowId is { } value ? SqlValue.Integer(value) : SqlValue.Null;
+                            if (result.Changed
+                                && arguments[0].Kind == SqlValueKind.Null
+                                && rowId is { } insertedRowId)
+                            {
+                                LastInsertRowId = insertedRowId;
+                            }
+                            if (result.Changed)
+                                RowsAffected = checked(RowsAffected + 1);
+                            AdvanceInstructionPointer();
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
                         break;
                     }
                 case VBeginInstruction vBegin:
@@ -1613,6 +1691,7 @@ public sealed class ResumableStatement : IDisposable
             _fkDeferredViolations = 0;
         RowsAffected = 0;
         LastInsertRowId = null;
+        LastVirtualTableRowId = null;
         // The parameter binding is intentionally preserved across Reset, mirroring SQLite's
         // sqlite3_reset (which rewinds execution but keeps bindings), so a program re-runs with the same
         // parameters. Rebind replaces it explicitly.
@@ -2564,6 +2643,22 @@ public sealed class ResumableStatement : IDisposable
     {
         if (cursor.Index >= Program.CursorCount)
             throw new ArgumentOutOfRangeException(nameof(cursor));
+    }
+
+    private void FailExecution(Exception executionFailure)
+    {
+        State = ResumableStatementState.Faulted;
+        try
+        {
+            Array.Clear(_openCursors);
+            DisposeExecutionResources();
+        }
+        catch (Exception cleanupFailure)
+        {
+            throw new AggregateException(executionFailure, cleanupFailure);
+        }
+
+        ExceptionDispatchInfo.Capture(executionFailure).Throw();
     }
 
     private void ThrowIfDisposed()

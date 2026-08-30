@@ -217,7 +217,7 @@ public sealed class ManagedFtsPlannerReviewRegressionTests
             SeedCorpus(connection);
 
             const string sql = "SELECT id FROM docs ORDER BY fts_score(title, body, 'fox') DESC LIMIT 5;";
-            ExplainDetail(connection, sql).Should().Contain("pattern=ScoreOrderedLimit");
+            ExplainDetail(connection, sql).Should().Contain("pattern=Score");
 
             var before = EmbeddedDatabase.MethodIndexScansExecuted;
             QueryIntegers(connection, sql).Should().HaveCount(5);
@@ -230,7 +230,7 @@ public sealed class ManagedFtsPlannerReviewRegressionTests
             SeedCorpus(connection, "title=0,body=0");
 
             const string sql = "SELECT id FROM docs ORDER BY fts_score(title, body, 'fox') DESC LIMIT 3;";
-            ExplainDetail(connection, sql).Should().Contain("pattern=ScoreOrderedLimit");
+            ExplainDetail(connection, sql).Should().Contain("pattern=Score");
 
             var before = EmbeddedDatabase.MethodIndexScansExecuted;
             QueryIntegers(connection, sql).Should().Equal(1, 2, 3);

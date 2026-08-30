@@ -68,7 +68,7 @@ public sealed class ManagedFtsReviewRegressionTests
     }
 
     [Test]
-    public void ColumnDetailIsRejectedEndToEndForAnAnchoredQuery()
+    public void TursoMethodGrammarRejectsTheManagedAnchorExtension()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -82,7 +82,7 @@ public sealed class ManagedFtsReviewRegressionTests
 
         ManagedIndexMethodTestHarness
             .ShouldThrow(connection, "SELECT id FROM docs WHERE fts_match(title, body, '^cat');")
-            .Message.Should().Contain("does not record positions");
+            .Message.Should().Contain("Expected an FTS term");
     }
 
     [Test]
@@ -223,7 +223,7 @@ public sealed class ManagedFtsReviewRegressionTests
                 .Select(static index => $"t{index}*"));
 
         var highlight = () => ManagedFtsFunctions.Highlight(
-            [SqlValue.Text("t1 t2 t3"), SqlValue.Text(query), SqlValue.Text("["), SqlValue.Text("]")]);
+            [SqlValue.Text("t1 t2 t3"), SqlValue.Text("["), SqlValue.Text("]"), SqlValue.Text(query)]);
 
         highlight.Should().Throw<EmbeddedSqlException>().WithMessage("*prefix terms*");
     }

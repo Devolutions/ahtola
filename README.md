@@ -382,9 +382,17 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   schema publication fails busy while a peer concurrent snapshot is active.
   See [docs/mvcc-port-contract.md](docs/mvcc-port-contract.md).
 - **Managed virtual-table subset** — statically registered `fts5`, `rtree`, and
-  `rtree_i32` modules persist module-owned state in the managed catalog, but are
-  not full SQLite FTS5/R-Tree implementations and do not create interoperable
-  FTS/R-Tree shadow tables.
+  `rtree_i32` modules persist module-owned state in the managed catalog. R-Tree
+  covers SQLite's 1–5D declarations, `+aux` columns (100 total columns),
+  float32 outward rounding/int32 conversion, conflict-aware DML, spatial plans,
+  transactions, metadata, and integrity helpers. Direct scans and lifecycle
+  callbacks execute through resumable `V*` bytecode; built-in table-valued
+  functions share the same planner/cursor contract and stream bounded series.
+  Native geometry callbacks and
+  SQLite `%_node`/`%_parent`/`%_rowid` file interoperability remain out of scope;
+  foreign shadow layouts fail closed. FTS5 storage is likewise not a portable
+  shadow-table representation. See
+  [docs/managed-vtab-fts-rtree-integration.md](docs/managed-vtab-fts-rtree-integration.md).
 - **SQL CDC** — `PRAGMA capture_data_changes_conn` implements Turso v0.7.2's
   per-connection V1/V2 CDC tables and transactional COMMIT records. It is
   independent of the managed replica's private journal and does not provide a

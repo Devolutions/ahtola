@@ -10,16 +10,28 @@ namespace Ahtola.Core.Search;
 internal sealed record ManagedFtsScalarOptions(
     ManagedFtsTokenizerOptions Tokenizer,
     ManagedFtsDetailLevel Detail = ManagedFtsDetailLevel.Full,
-    bool ColumnSize = true)
+    bool ColumnSize = true,
+    IReadOnlyList<ManagedFtsTokenizerOptions>? ColumnTokenizers = null)
 {
     public static ManagedFtsScalarOptions Default { get; } = new(ManagedFtsTokenizerOptions.Default);
+
+    public IReadOnlyList<ManagedFtsTokenizerOptions> ResolveColumnTokenizers(int columnCount)
+    {
+        if (ColumnTokenizers is { } configured)
+        {
+            if (configured.Count != columnCount)
+                throw new ArgumentException("One tokenizer per FTS column is required.");
+            return configured;
+        }
+
+        return Enumerable.Repeat(Tokenizer, columnCount).ToArray();
+    }
 }
 
 /// <summary>
 /// The <c>fts_*</c> SQL surface. <c>fts_match</c>, <c>fts_highlight</c> and <c>fts_snippet</c> are
-/// pure functions of their arguments. <c>fts_score</c> additionally depends on the corpus statistics
-/// of the covering method index, which is why it is registered as non-deterministic and rejected in
-/// schema expressions.
+/// pure scalar functions in Turso's registry. A planned <c>fts_score</c> may additionally read the
+/// corpus statistics of its unambiguous covering method index.
 /// </summary>
 internal static class ManagedFtsFunctions
 {
@@ -34,56 +46,64 @@ internal static class ManagedFtsFunctions
     {
         var (columns, query) = Split("fts_match", arguments);
         if (query is null)
-            return SqlValue.Null;
+            return SqlValue.Integer(0);
 
         var resolved = options ?? ManagedFtsScalarOptions.Default;
         var index = BuildSingleDocumentIndex(columns, columnNames, resolved);
-        var node = ManagedFtsQueryLanguage.Parse(
-            query,
-            resolved.Tokenizer,
-            name => ResolveName(columnNames, name) is not null);
+        var node = ParseMethodQuery(query, columnNames, resolved);
         return SqlValue.Integer(index.Matches(node, 0) ? 1 : 0);
     }
 
     /// <summary>
-    /// <c>fts_score(col…, query)</c> evaluated without a bound index: BM25 over a corpus of one.
-    /// The corpus-aware form is produced by the engine when a method index covers the call.
+    /// <c>fts_score(col…, query)</c> evaluated without a bound index: Turso's REAL <c>0.0</c>
+    /// fallback. The corpus-aware form is produced by the engine when a method index covers the call.
     /// </summary>
     public static SqlValue Score(
         IReadOnlyList<SqlValue> arguments,
         IReadOnlyList<string?> columnNames,
         ManagedFtsScalarOptions? options = null)
     {
-        var (columns, query) = Split("fts_score", arguments);
-        if (query is null)
-            return SqlValue.Null;
-
-        var resolved = options ?? ManagedFtsScalarOptions.Default;
-        var index = BuildSingleDocumentIndex(columns, columnNames, resolved);
-        var node = ManagedFtsQueryLanguage.Parse(
-            query,
-            resolved.Tokenizer,
-            name => ResolveName(columnNames, name) is not null);
-        return SqlValue.Real(index.Score(node, 0));
+        ArgumentNullException.ThrowIfNull(arguments);
+        _ = columnNames;
+        _ = options;
+        return SqlValue.Real(0.0);
     }
 
     /// <summary>
-    /// <c>fts_highlight(text, query, before, after)</c>: wraps every matching token occurrence.
+    /// <c>fts_highlight(text..., before, after, query)</c>: wraps every matching token occurrence.
     /// Offsets come from the tokenizer, so the untouched source text is reproduced exactly.
     /// </summary>
     public static SqlValue Highlight(
         IReadOnlyList<SqlValue> arguments,
         ManagedFtsTokenizerOptions? tokenizer = null)
     {
-        if (arguments.Count != 4)
+        if (arguments.Count < 4)
             throw new EmbeddedSqlException("wrong number of arguments to function fts_highlight()");
-        if (arguments[0].Kind == SqlValueKind.Null || arguments[1].Kind == SqlValueKind.Null)
+        var textCount = arguments.Count - 3;
+        if (arguments[textCount].Kind == SqlValueKind.Null
+            || arguments[textCount + 1].Kind == SqlValueKind.Null
+            || arguments[textCount + 2].Kind == SqlValueKind.Null)
+        {
             return SqlValue.Null;
+        }
 
-        var text = ManagedFtsSearchIndex.ReadText(arguments[0]);
-        var query = ManagedFtsSearchIndex.ReadText(arguments[1]);
-        var before = ManagedFtsSearchIndex.ReadText(arguments[2]);
-        var after = ManagedFtsSearchIndex.ReadText(arguments[3]);
+        var combined = new StringBuilder();
+        for (var index = 0; index < textCount; index++)
+        {
+            if (arguments[index].Kind == SqlValueKind.Null)
+                continue;
+            if (combined.Length > 0)
+                combined.Append(' ');
+            combined.Append(ManagedFtsSearchIndex.ReadText(arguments[index]));
+        }
+
+        var text = combined.ToString();
+        var before = ManagedFtsSearchIndex.ReadText(arguments[textCount]);
+        var after = ManagedFtsSearchIndex.ReadText(arguments[textCount + 1]);
+        var query = ManagedFtsSearchIndex.ReadText(arguments[textCount + 2]);
+        if (text.Length == 0 || query.Length == 0)
+            return SqlValue.Text(text);
+
         var options = tokenizer ?? ManagedFtsTokenizerOptions.Default;
         var tokens = ManagedFtsTokenization.Tokenize(text, options);
         var spans = CollectMatchedSpans(tokens, query, options);
@@ -93,6 +113,23 @@ internal static class ManagedFtsFunctions
         var builder = new StringBuilder(text.Length + (spans.Count * (before.Length + after.Length)));
         AppendRange(builder, text, 0, text.Length, spans, before, after);
         return SqlValue.Text(builder.ToString());
+    }
+
+    /// <summary>Compatibility spelling for Ahtola's former four-argument ordering.</summary>
+    public static SqlValue HighlightLegacy(
+        IReadOnlyList<SqlValue> arguments,
+        ManagedFtsTokenizerOptions? tokenizer = null)
+    {
+        if (arguments.Count != 4)
+            throw new EmbeddedSqlException("wrong number of arguments to function fts_highlight_legacy()");
+
+        return Highlight(
+        [
+            arguments[0],
+            arguments[2],
+            arguments[3],
+            arguments[1],
+        ], tokenizer);
     }
 
     internal static SqlValue HighlightFts5(
@@ -364,7 +401,11 @@ internal static class ManagedFtsFunctions
         string query,
         ManagedFtsTokenizerOptions options)
     {
-        var node = ManagedFtsQueryLanguage.Parse(query, options, static _ => true);
+        var node = ManagedFtsQueryLanguage.Parse(
+            query,
+            options,
+            static _ => true,
+            ManagedFtsQuerySyntax.TursoMethod);
         return CollectMatchedSpans(tokens, node, columnName: null);
     }
 
@@ -463,6 +504,9 @@ internal static class ManagedFtsFunctions
                 CollectMatchedSpans(tokens, lookup, or.Right, columnName, destination, ref prefixTerms);
                 return;
             case ManagedFtsNotNode:
+                return;
+            case ManagedFtsBoostNode boost:
+                CollectMatchedSpans(tokens, lookup, boost.Operand, columnName, destination, ref prefixTerms);
                 return;
             default:
                 throw new ArgumentOutOfRangeException(nameof(node));
@@ -797,6 +841,7 @@ internal static class ManagedFtsFunctions
     {
         var weights = new double[columns.Count];
         Array.Fill(weights, 1.0);
+        var tokenizers = options.ResolveColumnTokenizers(columns.Count);
 
         // The single-document index mirrors the covering index's detail and columnsize settings, so
         // a construct the real index cannot answer (a phrase against detail = 'columns', a column
@@ -804,7 +849,7 @@ internal static class ManagedFtsFunctions
         // would succeed or fail depending on which access path the planner picked.
         var index = new ManagedFtsSearchIndex(
             columns.Count,
-            options.Tokenizer,
+            tokenizers,
             weights,
             options.Detail,
             options.ColumnSize)
@@ -813,6 +858,27 @@ internal static class ManagedFtsFunctions
         };
         index.Upsert(0, [], columns.ToArray());
         return index;
+    }
+
+    private static ManagedFtsNode ParseMethodQuery(
+        string query,
+        IReadOnlyList<string?> columnNames,
+        ManagedFtsScalarOptions options)
+    {
+        var tokenizers = options.ResolveColumnTokenizers(columnNames.Count);
+        if (columnNames.All(static name => name is not null))
+        {
+            return ManagedFtsQueryLanguage.ParseMethod(
+                query,
+                columnNames.Select(static name => name!).ToArray(),
+                tokenizers);
+        }
+
+        return ManagedFtsQueryLanguage.Parse(
+            query,
+            options.Tokenizer,
+            name => ResolveName(columnNames, name) is not null,
+            ManagedFtsQuerySyntax.TursoMethod);
     }
 
     private static int? ResolveName(IReadOnlyList<string?> columnNames, string name)

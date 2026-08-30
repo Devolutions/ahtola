@@ -35,34 +35,41 @@ internal sealed class GenerateSeriesModule : TableValuedFunctionModule
 
         // The hidden columns report the effective bounds, so an omitted stop or step reads
         // back as the default SQLite applied rather than as NULL.
-        SqlValue[] bounds = [SqlValue.Integer(start), SqlValue.Integer(stop), SqlValue.Integer(step)];
-        var rows = new List<SqlValue[]>();
-        if (step > 0)
-        {
-            for (var current = start; current <= stop && (call.MaximumRows is null || rows.Count < call.MaximumRows.Value);)
-            {
-                call.CheckInterrupt();
-                rows.Add(BuildRow(current, bounds));
-                if (current > long.MaxValue - step)
-                    break;
+        return new LazyReadOnlyList<SqlValue[]>(EnumerateRows());
 
-                current += step;
+        IEnumerable<SqlValue[]> EnumerateRows()
+        {
+            SqlValue[] bounds = [SqlValue.Integer(start), SqlValue.Integer(stop), SqlValue.Integer(step)];
+            var emitted = 0L;
+            if (step > 0)
+            {
+                for (var current = start;
+                     current <= stop && (call.MaximumRows is null || emitted < call.MaximumRows.Value);)
+                {
+                    call.CheckInterrupt();
+                    yield return BuildRow(current, bounds);
+                    emitted++;
+                    if (current > long.MaxValue - step)
+                        yield break;
+
+                    current += step;
+                }
+            }
+            else
+            {
+                for (var current = start;
+                     current >= stop && (call.MaximumRows is null || emitted < call.MaximumRows.Value);)
+                {
+                    call.CheckInterrupt();
+                    yield return BuildRow(current, bounds);
+                    emitted++;
+                    if (current < long.MinValue - step)
+                        yield break;
+
+                    current += step;
+                }
             }
         }
-        else
-        {
-            for (var current = start; current >= stop && (call.MaximumRows is null || rows.Count < call.MaximumRows.Value);)
-            {
-                call.CheckInterrupt();
-                rows.Add(BuildRow(current, bounds));
-                if (current < long.MinValue - step)
-                    break;
-
-                current += step;
-            }
-        }
-
-        return rows;
     }
 
     private static SqlValue[] BuildRow(long value, SqlValue[] bounds)

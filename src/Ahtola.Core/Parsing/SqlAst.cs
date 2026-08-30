@@ -64,7 +64,8 @@ internal sealed record IndexedColumnDefinition(
     string? Collation,
     bool Descending,
     Expression? Expression = null,
-    string? ExpressionSql = null)
+    string? ExpressionSql = null,
+    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null)
 {
     public bool IsExpression => Expression is not null;
 }
@@ -397,6 +398,9 @@ internal enum ReindexTargetKind
 internal sealed record ReindexStatement(
     string? Target,
     ReindexTargetKind TargetKind = ReindexTargetKind.Automatic) : ParsedStatement;
+
+/// <summary>Turso <c>OPTIMIZE INDEX [name]</c>; a null name optimizes every method index.</summary>
+internal sealed record OptimizeIndexStatement(string? IndexName) : ParsedStatement;
 
 internal sealed record VacuumStatement(string? Schema, Expression? Into) : ParsedStatement;
 
@@ -800,7 +804,8 @@ internal sealed record EmbeddedIndexColumn(
     string? Collation,
     bool Descending,
     Expression? Expression = null,
-    string? ExpressionSql = null)
+    string? ExpressionSql = null,
+    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null)
 {
     public bool IsExpression => Expression is not null;
 }

@@ -34,6 +34,7 @@ public sealed class VdbeIndexMethodOpcodeTests
             (1, "the quick brown fox"),
             (2, "a lazy dog"),
             (3, "fox fox fox"));
+        var pattern = Pattern(binding, ManagedIndexPatternShape.CombinedOrdered);
 
         VdbeInstruction[] instructions =
         [
@@ -42,7 +43,7 @@ public sealed class VdbeIndexMethodOpcodeTests
             new IndexMethodQueryInstruction(
                 new Cursor(0),
                 binding,
-                PatternIndex: 3,
+                PatternIndex: pattern,
                 new RegisterRange(new Register(0), 1),
                 new ProgramCounter(8)),
             new IndexMethodRowIdInstruction(new Cursor(0), new Register(1)),
@@ -72,6 +73,7 @@ public sealed class VdbeIndexMethodOpcodeTests
     public void QueryBranchesToTheEmptyTargetWhenNothingMatches()
     {
         var binding = CreateBinding((1, "only tulips here"));
+        var pattern = Pattern(binding, ManagedIndexPatternShape.Match);
 
         VdbeInstruction[] instructions =
         [
@@ -80,7 +82,7 @@ public sealed class VdbeIndexMethodOpcodeTests
             new IndexMethodQueryInstruction(
                 new Cursor(0),
                 binding,
-                PatternIndex: 3,
+                PatternIndex: pattern,
                 new RegisterRange(new Register(0), 1),
                 new ProgramCounter(5)),
             new IndexMethodRowIdInstruction(new Cursor(0), new Register(1)),
@@ -100,6 +102,7 @@ public sealed class VdbeIndexMethodOpcodeTests
     public void InsertAndDeleteMaintainTheMethodState()
     {
         var binding = CreateBinding((1, "alpha"));
+        var pattern = Pattern(binding, ManagedIndexPatternShape.Match);
 
         VdbeInstruction[] instructions =
         [
@@ -111,7 +114,7 @@ public sealed class VdbeIndexMethodOpcodeTests
             new IndexMethodQueryInstruction(
                 new Cursor(0),
                 binding,
-                PatternIndex: 3,
+                PatternIndex: pattern,
                 new RegisterRange(new Register(2), 1),
                 new ProgramCounter(9)),
             new IndexMethodRowIdInstruction(new Cursor(0), new Register(3)),
@@ -167,6 +170,7 @@ public sealed class VdbeIndexMethodOpcodeTests
     public void ExplainRendersEveryIndexMethodOpcode()
     {
         var binding = CreateBinding((1, "alpha"));
+        var pattern = Pattern(binding, ManagedIndexPatternShape.Match);
 
         VdbeInstruction[] instructions =
         [
@@ -175,7 +179,7 @@ public sealed class VdbeIndexMethodOpcodeTests
             new IndexMethodQueryInstruction(
                 new Cursor(0),
                 binding,
-                PatternIndex: 3,
+                PatternIndex: pattern,
                 new RegisterRange(new Register(0), 1),
                 new ProgramCounter(7)),
             new IndexMethodColumnInstruction(new Cursor(0), ColumnIndex: 0, new Register(1)),
@@ -190,7 +194,7 @@ public sealed class VdbeIndexMethodOpcodeTests
         var text = string.Join("\n", rows.Select(static row => $"{row[1].AsText()} {row[6].AsText()}"));
 
         text.Should().Contain("IndexMethodCreate create fts index t_fts");
-        text.Should().Contain("IndexMethodQuery query fts idx=t_fts pattern=3");
+        text.Should().Contain($"IndexMethodQuery query fts idx=t_fts pattern={pattern}");
         text.Should().Contain("IndexMethodColumn read index-method column 0");
         text.Should().Contain("IndexMethodRowId read index-method rowid");
         text.Should().Contain("IndexMethodInsert index-method insert");
@@ -305,6 +309,12 @@ public sealed class VdbeIndexMethodOpcodeTests
         using var statement = connection.Prepare($"SELECT vector32('{literal}');");
         statement.Step();
         return statement.GetValue(0);
+    }
+
+    private static int Pattern(VdbeIndexMethodBinding binding, ManagedIndexPatternShape shape)
+    {
+        binding.Attachment.Definition.TryFindPattern(shape, out var pattern).Should().BeTrue();
+        return pattern;
     }
 
     private static VdbeIndexMethodBinding CreateBinding(params (long RowId, string Body)[] documents)

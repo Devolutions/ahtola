@@ -262,24 +262,25 @@ public sealed class ManagedIndexMethodReviewRegressionTests
     }
 
     // ---------------------------------------------------------------------------------------
-    // Finding 5: fts_score is corpus and configuration dependent, so schema expressions reject it.
+    // Finding 5: Turso exposes every FTS scalar as deterministic.
     // ---------------------------------------------------------------------------------------
 
     [Test]
-    public void SchemaExpressionsRejectCorpusDependentScoring()
+    public void DeterministicRegistryAllowsStoredScoringExceptForLiveCheckConstraints()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, CreateDocuments);
 
-        ShouldThrow(connection, "CREATE INDEX bad ON docs(fts_score(title, body, 'x'));");
-        ShouldThrow(connection, "CREATE INDEX bad ON docs(id) WHERE fts_score(title, body, 'x') > 0;");
-        ShouldThrow(
+        Execute(connection, "CREATE INDEX score_expression ON docs(fts_score(title, body, 'x'));");
+        Execute(connection, "CREATE INDEX score_partial ON docs(id) WHERE fts_score(title, body, 'x') > 0;");
+        Execute(
             connection,
             "CREATE TABLE gen(id INTEGER PRIMARY KEY, a TEXT, b TEXT, s REAL GENERATED ALWAYS AS (fts_score(a, b, 'x')) VIRTUAL);");
         ShouldThrow(
             connection,
-            "CREATE TABLE chk(id INTEGER PRIMARY KEY, a TEXT, b TEXT, CHECK (fts_score(a, b, 'x') >= 0));");
+            "CREATE TABLE chk(id INTEGER PRIMARY KEY, a TEXT, b TEXT, CHECK (fts_score(a, b, 'x') >= 0));")
+            .Message.Should().Contain("non-deterministic functions are prohibited in CHECK constraints");
     }
 
     [Test]
@@ -312,7 +313,7 @@ public sealed class ManagedIndexMethodReviewRegressionTests
             .Message.Should().Contain("unknown fts index parameter");
 
         // A cached half-built attachment would make this second attempt reuse the rejected options.
-        Execute(connection, "CREATE INDEX docs_fts ON docs USING fts (title, body);");
+        Execute(connection, "CREATE INDEX docs_fts ON docs USING fts (title, body) WITH (tokenizer = 'unicode61');");
         QueryIntegers(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'alpha');").Should().Equal(1);
     }
 
@@ -322,10 +323,10 @@ public sealed class ManagedIndexMethodReviewRegressionTests
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, CreateDocuments);
-        Execute(connection, "CREATE INDEX docs_fts ON docs USING fts (title, body);");
+        Execute(connection, "CREATE INDEX docs_fts ON docs USING fts (title, body) WITH (tokenizer = 'unicode61');");
         Execute(connection, "INSERT INTO docs VALUES (1, 'Ünïcode', 'accented body');");
 
-        // unicode61 folds accents, so the folded spelling matches.
+        // The explicitly named Ahtola unicode61 extension folds accents.
         QueryIntegers(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'unicode');").Should().Equal(1);
 
         Execute(connection, "DROP INDEX docs_fts;");
@@ -442,7 +443,7 @@ public sealed class ManagedIndexMethodReviewRegressionTests
         var attachment = AttachFts("body", ("tokenizer", SqlValue.Text("ngram")), ("min_gram", SqlValue.Integer(2)), ("max_gram", SqlValue.Integer(4)));
 
         // Round trip is accepted.
-        attachment.LoadState(1, attachment.SaveState());
+        attachment.LoadState(ManagedFtsIndexMethod.StateVersion, attachment.SaveState());
 
         Mutate(attachment, buffer => buffer[4] = (byte)ManagedFtsTokenizerKind.Ascii)
             .Should().Throw<EmbeddedSqlException>().WithMessage("*tokenizer does not match*");
@@ -456,10 +457,12 @@ public sealed class ManagedIndexMethodReviewRegressionTests
             .Should().Throw<EmbeddedSqlException>().WithMessage("*invalid columnsize flag*");
         Mutate(attachment, buffer => buffer[14] = 0)
             .Should().Throw<EmbeddedSqlException>().WithMessage("*columnsize does not match*");
-        Mutate(attachment, buffer => buffer[^1] = 0x7F)
+        Mutate(
+                attachment,
+                buffer => BitConverter.GetBytes(double.NaN).CopyTo(buffer, 15))
             .Should().Throw<EmbeddedSqlException>().WithMessage("*weight*");
 
-        var empty = () => attachment.LoadState(1, []);
+        var empty = () => attachment.LoadState(ManagedFtsIndexMethod.StateVersion, []);
         empty.Should().Throw<EmbeddedSqlException>().WithMessage("*empty state*");
     }
 
@@ -552,7 +555,7 @@ public sealed class ManagedIndexMethodReviewRegressionTests
 
         var highlighted = QueryTexts(
             connection,
-            "SELECT fts_highlight(body, 'rocks', '[', ']') FROM docs WHERE id = 1;")[0];
+            "SELECT fts_highlight(body, '[', ']', 'rocks') FROM docs WHERE id = 1;")[0];
 
         highlighted.Should().Be("Ame\u0301lie 😀 [rocks]");
     }
@@ -643,13 +646,14 @@ public sealed class ManagedIndexMethodReviewRegressionTests
         var source = ArrayManagedIndexSource.FromText(
             Enumerable.Range(1, 500).Select(id => ((long)id, $"term{id}")).ToArray());
         using var cursor = attachment.Open(source);
+        attachment.Definition.TryFindPattern(ManagedIndexPatternShape.Match, out var pattern).Should().BeTrue();
 
-        var cold = cursor.EstimateCost(new ManagedIndexMethodCostContext(3, 500, null, []));
+        var cold = cursor.EstimateCost(new ManagedIndexMethodCostContext(pattern, 500, null, []));
         cold.Should().NotBeNull();
         cold!.Value.EstimatedCost.Should().BeGreaterThanOrEqualTo(500);
 
         cursor.OpenRead();
-        var warm = cursor.EstimateCost(new ManagedIndexMethodCostContext(3, 500, null, []));
+        var warm = cursor.EstimateCost(new ManagedIndexMethodCostContext(pattern, 500, null, []));
         warm.Should().NotBeNull();
         warm!.Value.EstimatedCost.Should().BeLessThan(cold.Value.EstimatedCost);
     }
@@ -710,8 +714,10 @@ public sealed class ManagedIndexMethodReviewRegressionTests
         Execute(connection, "INSERT INTO docs VALUES (1, 'x', 'not_a_term here'), (2, 'y', 'here alone');");
 
         // 'NOT_A_TERM' must read as one term, not as the NOT operator applied to '_A_TERM'.
-        QueryIntegers(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'NOT_A_TERM');")
+        QueryIntegers(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'not_a_term');")
             .Should().Equal(1);
+        QueryIntegers(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'NOT_A_TERM');")
+            .Should().BeEmpty();
 
         // Negative control: a real NOT with a boundary after it still negates.
         QueryIntegers(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'here NOT not_a_term') ORDER BY id;")
@@ -806,7 +812,7 @@ public sealed class ManagedIndexMethodReviewRegressionTests
     {
         var state = attachment.SaveState();
         corrupt(state);
-        return () => attachment.LoadState(1, state);
+        return () => attachment.LoadState(ManagedFtsIndexMethod.StateVersion, state);
     }
 
     private static string ExplainDetail(EmbeddedConnection connection, string sql)

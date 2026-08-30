@@ -62,16 +62,14 @@ public sealed class ManagedFtsIndexMethodTests
     }
 
     [Test]
-    public void NearProximityMatchesOnlyWithinTheRequestedDistance()
+    public void MethodGrammarDoesNotAdoptTheManagedNearExtension()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         SeedCorpus(connection);
 
-        QueryIntegers(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'NEAR/2(quick fox)') ORDER BY id;")
-            .Should().Equal(1, 3);
-        QueryIntegers(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'NEAR/1(quick dog)') ORDER BY id;")
-            .Should().BeEmpty();
+        ShouldThrow(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'NEAR/2(quick fox)');")
+            .Message.Should().Contain("Turso FTS query");
     }
 
     [Test]
@@ -158,7 +156,7 @@ public sealed class ManagedFtsIndexMethodTests
     }
 
     [Test]
-    public void ScoreFallsBackToASingleDocumentCorpusWithNoMethodIndex()
+    public void ScoreFallsBackToZeroWithNoMethodIndex()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -166,7 +164,7 @@ public sealed class ManagedFtsIndexMethodTests
         Execute(connection, "INSERT INTO plain VALUES (1, 'fox fox dog');");
 
         QueryIntegers(connection, "SELECT fts_match(body, 'fox') FROM plain;").Should().Equal(1);
-        QueryReals(connection, "SELECT fts_score(body, 'fox') FROM plain;").Single().Should().BeGreaterThan(0.0);
+        QueryReals(connection, "SELECT fts_score(body, 'fox') FROM plain;").Should().Equal(0.0);
         QueryIntegers(connection, "SELECT fts_match(body, 'cat') FROM plain;").Should().Equal(0);
     }
 
@@ -178,10 +176,10 @@ public sealed class ManagedFtsIndexMethodTests
         Execute(connection, "CREATE TABLE t(body TEXT);");
         Execute(connection, "INSERT INTO t VALUES ('The quick brown fox jumps over the lazy dog again and again');");
 
-        QueryTexts(connection, "SELECT fts_highlight('a quick fox', 'quick', '[', ']');")
+        QueryTexts(connection, "SELECT fts_highlight('a quick fox', '[', ']', 'quick');")
             .Single().Should().Be("a [quick] fox");
-        QueryTexts(connection, "SELECT fts_highlight('Crème brûlée', 'creme', '<', '>');")
-            .Single().Should().Be("<Crème> brûlée");
+        QueryTexts(connection, "SELECT fts_highlight('Crème brûlée', '<', '>', 'creme');")
+            .Single().Should().Be("Crème brûlée");
         QueryTexts(connection, "SELECT fts_snippet(body, 'lazy', '[', ']', '…', 5) FROM t;")
             .Single().Should().Contain("[lazy]").And.StartWith("…");
     }
@@ -377,7 +375,8 @@ public sealed class ManagedFtsIndexMethodTests
         Execute(rawConnection, "CREATE INDEX t_raw ON t USING fts (body) WITH (tokenizer = 'raw');");
         Execute(rawConnection, "INSERT INTO t VALUES (1, 'Mixed Case');");
 
-        QueryIntegers(rawConnection, "SELECT id FROM t WHERE fts_match(body, 'Mixed');").Should().Equal(1);
+        QueryIntegers(rawConnection, "SELECT id FROM t WHERE fts_match(body, '\"Mixed Case\"');").Should().Equal(1);
+        QueryIntegers(rawConnection, "SELECT id FROM t WHERE fts_match(body, 'Mixed');").Should().BeEmpty();
     }
 
     [Test]

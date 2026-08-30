@@ -325,6 +325,12 @@ public enum VdbeOpcode
 
     /// <summary>Apply one base-row delete to a managed index method.</summary>
     IndexMethodDelete = 115,
+    /// <summary>Create and publish a managed virtual-table instance (Turso <c>VCreate</c>).</summary>
+    VCreate = 116,
+    /// <summary>Destroy a managed virtual-table instance (Turso <c>VDestroy</c>).</summary>
+    VDestroy = 117,
+    /// <summary>Rename a managed virtual-table instance (Turso <c>VRename</c>).</summary>
+    VRename = 118,
 }
 
 /// <summary>Key-order seek comparison used by SeekGE/GT/LE/LT and IdxGE/GT/LE/LT.</summary>
@@ -2122,7 +2128,8 @@ public sealed record VColumnInstruction(Cursor Cursor, int ColumnIndex, Register
 public sealed record VUpdateInstruction(
     Cursor Cursor,
     RegisterRange Arguments,
-    Register? NewRowIdDestination = null) : VdbeInstruction
+    Register? NewRowIdDestination = null,
+    ManagedVirtualTableConflictMode ConflictMode = ManagedVirtualTableConflictMode.Abort) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.VUpdate;
 }
@@ -2131,6 +2138,30 @@ public sealed record VUpdateInstruction(
 public sealed record VNextInstruction(Cursor Cursor, ProgramCounter LoopTarget) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.VNext;
+}
+
+/// <summary>
+/// Creates a managed virtual table through its statically registered module and publishes it through
+/// the catalog callback supplied by the compiler.
+/// </summary>
+public sealed record VCreateInstruction(
+    string ModuleName,
+    ManagedVirtualTableCreateContext Context,
+    Action<ManagedVirtualTable> Publish) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VCreate;
+}
+
+/// <summary>Invokes the destructive lifecycle callback for the virtual table bound to a cursor slot.</summary>
+public sealed record VDestroyInstruction(Cursor Cursor, string TableName) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VDestroy;
+}
+
+/// <summary>Renames the virtual table bound to a cursor slot using a text value held in a register.</summary>
+public sealed record VRenameInstruction(Cursor Cursor, Register NewName) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.VRename;
 }
 
 public sealed record VBeginInstruction(Cursor Cursor) : VdbeInstruction
@@ -3720,10 +3751,40 @@ public sealed class VdbeProgram
 
                     if (vUpdate.NewRowIdDestination is { } destination)
                         ValidateRegister(destination, instructionIndex);
+                    if (!Enum.IsDefined(vUpdate.ConflictMode))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} has an invalid VUpdate conflict mode.");
+                    }
                     break;
                 case VNextInstruction vNext:
                     ValidateOpenCursor(vNext.Cursor, openCursors, instructionIndex);
                     ValidateJumpTarget(vNext.LoopTarget, instructionIndex);
+                    break;
+                case VCreateInstruction vCreate:
+                    if (string.IsNullOrWhiteSpace(vCreate.ModuleName)
+                        || vCreate.Context is null
+                        || string.IsNullOrWhiteSpace(vCreate.Context.TableName)
+                        || vCreate.Context.Arguments is null
+                        || vCreate.Publish is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} has an invalid VCreate binding.");
+                    }
+
+                    break;
+                case VDestroyInstruction vDestroy:
+                    ValidateCursor(vDestroy.Cursor, instructionIndex);
+                    if (string.IsNullOrWhiteSpace(vDestroy.TableName))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} has an empty VDestroy table name.");
+                    }
+
+                    break;
+                case VRenameInstruction vRename:
+                    ValidateCursor(vRename.Cursor, instructionIndex);
+                    ValidateRegister(vRename.NewName, instructionIndex);
                     break;
                 case VBeginInstruction vBegin:
                     ValidateCursor(vBegin.Cursor, instructionIndex);

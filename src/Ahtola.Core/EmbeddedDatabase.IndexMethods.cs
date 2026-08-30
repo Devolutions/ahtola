@@ -208,7 +208,8 @@ public sealed partial class EmbeddedDatabase
         IReadOnlyList<OrderByTerm>? orderBy,
         long? maximumRows,
         out ManagedIndexMethodScanPlan plan,
-        bool allowsRowTruncation = false)
+        bool allowsRowTruncation = false,
+        IReadOnlyList<Expression>? resultExpressions = null)
     {
         plan = null!;
         if (source.IndexDirective is not null)
@@ -219,6 +220,7 @@ public sealed partial class EmbeddedDatabase
         var qualifier = source.Alias ?? source.Name;
         ManagedIndexMethodScanPlan? best = null;
         var bestSteadyState = 0.0;
+        ManagedIndexMethodAttachment? matchedSemantics = null;
         foreach (var index in table.Indexes)
         {
             if (!index.IsMethodIndex)
@@ -239,9 +241,21 @@ public sealed partial class EmbeddedDatabase
                 maximumRows,
                 IsShadowedMethodFunction,
                 IsHoistableArgument,
-                allowsRowTruncation);
+                allowsRowTruncation,
+                resultExpressions);
             if (!attachment.Planner.TryMatch(plannerContext, out var match))
                 continue;
+
+            if (matchedSemantics is not null
+                && !matchedSemantics.HasEquivalentQuerySemantics(attachment))
+            {
+                // Two indexes can cover the same call while assigning different tokenizers,
+                // boosts or posting detail to it. Choosing either for prefiltering and another (or
+                // neither) for scalar evaluation changes the answer, so the only safe plan is the
+                // ordinary row-local path.
+                return false;
+            }
+            matchedSemantics ??= attachment;
 
             // Last line of defence, independent of what the method claimed: a pattern that filters
             // rows and truncates to a pushed-down LIMIT returns *only* its best rows, so honoring
@@ -320,7 +334,13 @@ public sealed partial class EmbeddedDatabase
             // whichever the catalog happens to list first.
             if (best is null
                 || steadyState < bestSteadyState
-                || (steadyState == bestSteadyState && candidate.EstimatedCost < best.EstimatedCost))
+                || (steadyState == bestSteadyState && candidate.EstimatedCost < best.EstimatedCost)
+                || (steadyState == bestSteadyState
+                    && candidate.EstimatedCost == best.EstimatedCost
+                    && string.Compare(
+                        candidate.Index.Name,
+                        best.Index.Name,
+                        StringComparison.OrdinalIgnoreCase) < 0))
             {
                 best = candidate;
                 bestSteadyState = steadyState;
@@ -744,7 +764,8 @@ public sealed partial class EmbeddedDatabase
                 ResolveOrderBy(select.OrderBy, select.Projections),
                 ReadMethodIndexLimit(select),
                 out plan,
-                AllowsMethodIndexRowTruncation(select));
+                AllowsMethodIndexRowTruncation(select),
+                select.Projections.Select(static projection => projection.Expression).ToArray());
     }
 
     /// <summary>
@@ -770,7 +791,7 @@ public sealed partial class EmbeddedDatabase
             && select.GroupBy.Count == 0
             && select.Having is null
             && select.NamedWindows.Count == 0
-            && select.OrderBy.Count == 1
+            && select.OrderBy.Count <= 1
             && ReadMethodIndexLimit(select) is not null
             && !select.Projections.Any(projection => ContainsAggregate(projection.Expression))
             && !select.OrderBy.Any(term => ContainsAggregate(term.Expression))

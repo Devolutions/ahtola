@@ -1,5 +1,6 @@
 using Ahtola.Core;
 using Ahtola.Core.Indexing;
+using Ahtola.Core.Search;
 using AwesomeAssertions;
 using static Ahtola.Tests.ManagedIndexMethodTestHarness;
 
@@ -211,7 +212,7 @@ public sealed class ManagedIndexMethodDurabilityTests
 
         var wrongColumns = attachment.SaveState();
         wrongColumns[0] = 9;
-        var mismatched = () => attachment.LoadState(1, wrongColumns);
+        var mismatched = () => attachment.LoadState(ManagedFtsIndexMethod.StateVersion, wrongColumns);
         mismatched.Should().Throw<EmbeddedSqlException>().WithMessage("*state declares 9 columns*");
     }
 
