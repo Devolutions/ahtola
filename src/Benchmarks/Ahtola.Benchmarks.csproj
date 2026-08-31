@@ -2,26 +2,22 @@
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
-        <!--
-          Single-TFM projects evaluate Directory.Build.props before TargetFramework
-          is defined, so $(AhtolaEntityFrameworkCoreVersion) resolves to the net10.0
-          pin. Track the repository default framework so that pin stays restorable.
-        -->
-        <TargetFramework>net10.0</TargetFramework>
+        <TargetFrameworks>$(AhtolaTargetFrameworks)</TargetFrameworks>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
     </PropertyGroup>
 
     <ItemGroup>
       <PackageReference Include="BenchmarkDotNet" Version="0.15.4" />
       <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.10" />
-      <PackageReference Include="System.Data.SQLite" Version="2.0.2" />
-      <PackageReference Include="SourceGear.sqlite3" version="3.50.4.2"/>
-      <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="$(AhtolaEntityFrameworkCoreVersion)" />
+      <PackageReference Include="SQLitePCLRaw.provider.e_sqlite3" Version="2.1.11" />
+      <PackageReference Include="SourceGear.sqlite3" Version="3.50.4.2" />
     </ItemGroup>
 
     <ItemGroup>
       <ProjectReference Include="..\Ahtola.Data\Ahtola.Data.csproj" />
+      <ProjectReference Include="..\Ahtola.Data.Sqlite\Ahtola.Data.Sqlite.csproj" />
     </ItemGroup>
 
 </Project>

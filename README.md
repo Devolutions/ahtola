@@ -455,11 +455,16 @@ Requires the .NET SDK and PowerShell 7+:
 ./build.ps1 validate-runtime  # packed consumer trim + NativeAOT publish
 ./build.ps1 validate-browser-trim  # browser trim analysis (ADO-only must be warning-free)
 ./build.ps1 validate-trim          # browser + desktop trimmed/NativeAOT trim analysis
+./build.ps1 benchmark -BenchmarkProfile write-short
 ```
 
 Contributor details — the full task list, validation gates, conformance suite,
 repo layout, and [managed testing capabilities](docs/testing-capabilities.md)
 live in [AGENTS.md](AGENTS.md) and [docs/](docs).
+
+The consolidated [performance suite](src/Benchmarks/README.md) ports applicable
+workloads from the pinned Turso benchmark corpus, compares managed Ahtola with
+Microsoft.Data.Sqlite, and supports historical Ahtola regression reports.
 
 ## License
 

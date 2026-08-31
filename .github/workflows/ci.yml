@@ -68,6 +68,10 @@ jobs:
         shell: pwsh
         run: ./scripts/tests/Test-AssertCodeCoverage.ps1
 
+      - name: Test benchmark result normalization
+        shell: pwsh
+        run: ./scripts/tests/Test-AhtolaBenchmarkResults.ps1
+
       - name: Test managed package closure validator
         shell: pwsh
         run: ./scripts/tests/Test-ValidateManagedPackageClosure.ps1
