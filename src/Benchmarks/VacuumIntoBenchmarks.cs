@@ -28,6 +28,7 @@ namespace Benchmarks;
 /// </para>
 /// </remarks>
 [MemoryDiagnoser]
+[BenchmarkCategory("Large")]
 [CategoriesColumn]
 [GroupBenchmarksBy(BenchmarkLogicalGroupRule.ByCategory)]
 public class VacuumIntoBenchmarks
@@ -63,7 +64,8 @@ public class VacuumIntoBenchmarks
         Directory.CreateDirectory(_root);
         _pristineSourcePath = Path.Combine(_root, "source.db");
 
-        BuildDeterministicFixture(_pristineSourcePath, RowCount);
+        var effectiveRowCount = BenchmarkRunContext.ScaleForSmoke(RowCount, 1_000);
+        BuildDeterministicFixture(_pristineSourcePath, effectiveRowCount);
 
         var length = new FileInfo(_pristineSourcePath).Length;
         Console.WriteLine(

@@ -7,5 +7,4 @@
     <Project Path="src/Devolutions.Ahtola.PowerShell/Devolutions.Ahtola.PowerShell.csproj" />
       <Project Path="src/Ahtola.Tests/Ahtola.Tests.csproj" />
   <Project Path="src/Benchmarks/Ahtola.Benchmarks.csproj" />
-  <Project Path="src/ConsumerBenchmarks/ConsumerBenchmarks.csproj" />
 </Solution>

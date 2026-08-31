@@ -1,0 +1,109 @@
+name: Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Benchmark profile
+        required: true
+        default: coverage
+        type: choice
+        options:
+          - smoke
+          - write-short
+          - coverage
+          - full
+          - large
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  benchmark:
+    name: Ahtola benchmark report
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Resolve benchmark profile
+        id: profile
+        shell: pwsh
+        run: |
+          $value = '${{ inputs.profile }}'
+          if ([string]::IsNullOrWhiteSpace($value)) {
+            $value = 'coverage'
+          }
+          "value=$value" >> $env:GITHUB_OUTPUT
+
+      - name: Restore historical benchmark
+        id: benchmark-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: artifacts/benchmark-history/${{ steps.profile.outputs.value }}
+          key: benchmark-history-windows-${{ steps.profile.outputs.value }}-${{ github.run_id }}
+          restore-keys: |
+            benchmark-history-windows-${{ steps.profile.outputs.value }}-
+
+      - name: Run benchmarks
+        id: run
+        shell: pwsh
+        run: |
+          $profile = '${{ steps.profile.outputs.value }}'
+          $baseline = "./artifacts/benchmark-history/$profile/results.json"
+          $arguments = @(
+            'benchmark',
+            '-Configuration', 'Release',
+            '-Framework', 'net10.0',
+            '-BenchmarkProfile', $profile
+          )
+          if (Test-Path -LiteralPath $baseline) {
+            $arguments += @('-BenchmarkBaseline', $baseline)
+          }
+          ./build.ps1 @arguments
+
+      - name: Publish benchmark summary
+        if: steps.run.outcome == 'success'
+        shell: pwsh
+        run: |
+          $result = Get-ChildItem ./artifacts/benchmarks -Filter results.json -Recurse |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if ($result) {
+            "## Ahtola performance results" | Add-Content $env:GITHUB_STEP_SUMMARY
+            "" | Add-Content $env:GITHUB_STEP_SUMMARY
+            "Profile artifacts: ``$($result.Directory.Name)``" | Add-Content $env:GITHUB_STEP_SUMMARY
+            $history = "./artifacts/benchmark-history/${{ steps.profile.outputs.value }}"
+            New-Item -ItemType Directory $history -Force | Out-Null
+            Copy-Item $result.FullName (Join-Path $history 'results.json') -Force
+          }
+
+      - name: Save benchmark history
+        if: steps.run.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts/benchmark-history/${{ steps.profile.outputs.value }}
+          key: benchmark-history-windows-${{ steps.profile.outputs.value }}-${{ github.run_id }}
+
+      - name: Upload benchmark reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ahtola-benchmarks-${{ github.run_id }}
+          path: artifacts/benchmarks/**
+          if-no-files-found: warn
+          retention-days: 30

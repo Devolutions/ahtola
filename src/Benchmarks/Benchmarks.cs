@@ -1,46 +1,43 @@
-using System.Data;
-using System.Data.SQLite;
-using System.Runtime.CompilerServices;
-using BenchmarkDotNet.Attributes;
-using Microsoft.Data.Sqlite;
-using SQLitePCL;
 using Ahtola;
+using BenchmarkDotNet.Attributes;
+using MdsConnection = Microsoft.Data.Sqlite.SqliteConnection;
 
 namespace Benchmarks;
 
 [MemoryDiagnoser]
+[CategoriesColumn]
 public class Benchmarks
 {
-    private SQLiteConnection _systemDataSqliteConnection;
-    private SqliteConnection _microsoftDataSqliteConnection;
-    private AhtolaConnection _ahtolaConnection;
+    private MdsConnection _sqlite = null!;
+    private AhtolaConnection _ahtola = null!;
 
     [GlobalSetup]
     public void Setup()
     {
-        _systemDataSqliteConnection = new SQLiteConnection("Data Source=:memory:");
-        _systemDataSqliteConnection.Open();
-
-        _microsoftDataSqliteConnection = new SqliteConnection("Data Source=:memory:");
-        _microsoftDataSqliteConnection.Open();
-
-        _ahtolaConnection = new AhtolaConnection("Data Source=:memory:");
-        _ahtolaConnection.Open();
-        CreateTable(_systemDataSqliteConnection);
-        CreateTable(_microsoftDataSqliteConnection);
-        CreateTable(_ahtolaConnection);
+        _sqlite = new MdsConnection("Data Source=:memory:");
+        _sqlite.Open();
+        _ahtola = new AhtolaConnection("Data Source=:memory:");
+        _ahtola.Open();
+        CreateTable(_sqlite);
+        CreateTable(_ahtola);
     }
 
-    [Benchmark]
-    public void AhtolaSelect() => Select(_ahtolaConnection);
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _sqlite.Dispose();
+        _ahtola.Dispose();
+    }
 
-    [Benchmark]
-    public void SystemSqliteSelect() => Select(_systemDataSqliteConnection);
+    [BenchmarkCategory("Read", "Smoke")]
+    [Benchmark(Baseline = true, Description = "SQLite two-row SELECT")]
+    public int SqliteSelect() => Select(_sqlite);
 
-    [Benchmark]
-    public void MicrososftSqliteSelect() => Select(_microsoftDataSqliteConnection);
+    [BenchmarkCategory("Read", "Smoke")]
+    [Benchmark(Description = "Ahtola two-row SELECT")]
+    public int AhtolaSelect() => Select(_ahtola);
 
-    private void CreateTable(IDbConnection connection)
+    private static void CreateTable(System.Data.Common.DbConnection connection)
     {
         using var createTableCommand = connection.CreateCommand();
         createTableCommand.CommandText = "CREATE TABLE t(a, b)";
@@ -51,8 +48,7 @@ public class Benchmarks
         insertCommand.ExecuteNonQuery();
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Select(IDbConnection connection)
+    private static int Select(System.Data.Common.DbConnection connection)
     {
         using var command = connection.CreateCommand();
         command.CommandText = "SELECT * FROM t;";
@@ -61,6 +57,6 @@ public class Benchmarks
         while (reader.Read())
             sum += reader.GetInt32(0);
 
-        GC.KeepAlive(sum);
+        return sum;
     }
 }

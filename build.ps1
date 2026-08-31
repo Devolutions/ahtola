@@ -38,6 +38,7 @@ param(
                 'validate-project-closure',
                 'validate-packed-closure',
                 'assert-package-version',
+                'benchmark',
                 'format-check'
             )]
             [string]$Task = 'build',
@@ -52,6 +53,13 @@ param(
     [string]$PackageOutput = './artifacts/managed-packages',
 
     [string]$PackageConsumerOutput = './artifacts/managed-package-consumer',
+
+    [ValidateSet('smoke', 'write-short', 'coverage', 'full', 'large', 'diagnostic')]
+    [string]$BenchmarkProfile = 'coverage',
+
+    [string]$BenchmarkFilter = '*',
+
+    [string]$BenchmarkBaseline,
 
     [int]$MinimumExecutedTests = 2500,
 
@@ -78,6 +86,7 @@ $EfCoreProject = './src/Ahtola.EntityFrameworkCore.Sqlite/Ahtola.EntityFramework
 $PowerShellProject = './src/Devolutions.Ahtola.PowerShell/Devolutions.Ahtola.PowerShell.csproj'
 $CoreProject = './src/Ahtola.Core/Ahtola.Core.csproj'
 $TestsProject = './src/Ahtola.Tests/Ahtola.Tests.csproj'
+$BenchmarkRunner = Join-Path $RepoRoot 'scripts/Invoke-AhtolaBenchmarks.ps1'
 $Solution = './Ahtola.slnx'
 $PowerShellModuleName = 'Devolutions.Ahtola.Sqlite'
 $PowerShellModuleOutput = "./artifacts/powershell-modules/$PowerShellModuleName"
@@ -651,6 +660,18 @@ function Invoke-FormatCheck {
     Invoke-DotNet @('format', $TestsProject, '--verify-no-changes')
 }
 
+function Invoke-Benchmarks {
+    $arguments = @(
+        '-Profile', $BenchmarkProfile,
+        '-Framework', $Framework,
+        '-Filter', $BenchmarkFilter
+    )
+    if (-not [string]::IsNullOrWhiteSpace($BenchmarkBaseline)) {
+        $arguments += @('-BaselinePath', $BenchmarkBaseline)
+    }
+    Invoke-PwshScript -Path $BenchmarkRunner -Arguments $arguments
+}
+
 switch ($Task) {
     'all' { Invoke-Build }
     'restore' { Invoke-Restore }
@@ -675,6 +696,7 @@ switch ($Task) {
         }
         'test' { Invoke-Test }
         'test-coverage' { Invoke-TestCoverage }
+        'benchmark' { Invoke-Benchmarks }
         'format-check' { Invoke-FormatCheck }
         default { throw "Unknown task '$Task'" }
     }
