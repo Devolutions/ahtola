@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Numerics;
 
 namespace Ahtola.Core.Compilation.JoinOrdering;
@@ -30,19 +31,17 @@ namespace Ahtola.Core.Compilation.JoinOrdering;
 internal static class JoinOrderEnumerator
 {
     /// <summary>
-    /// Largest segment the subset DP is allowed to enumerate. Chosen below Turso's
-    /// <c>GREEDY_JOIN_THRESHOLD = 12</c> because each managed candidate re-scores two hash
-    /// shapes per step, keeping the worst case (<c>2^8 · 8 · 8</c> state transitions) well
-    /// inside a prepare-time budget.
+    /// Largest segment the subset DP is allowed to enumerate. This matches Turso's
+    /// <c>GREEDY_JOIN_THRESHOLD = 12</c>; larger segments use the deterministic greedy
+    /// build-up below.
     /// </summary>
-    public const int DynamicProgrammingMemberCap = 8;
+    public const int DynamicProgrammingMemberCap = 12;
 
     /// <summary>
-    /// Hard ceiling on segment size. Member masks are <see cref="ulong"/>, and beyond this the
-    /// greedy build-up stops being worth its own quadratic cost, so the caller falls back to the
-    /// unmodified FROM order.
+    /// Hard ceiling on segment size. The managed planner supports the full 64-member SQLite
+    /// join mask; only the first twelve members ever enter subset-DP enumeration.
     /// </summary>
-    public const int MaximumMembers = 32;
+    public const int MaximumMembers = 64;
 
     private const double CostEpsilon = 1e-9;
 
@@ -407,18 +406,26 @@ internal static class JoinOrderEnumerator
         foreach (var term in segment.Terms)
         {
             if ((term.TableMask & ~candidateMask) != 0)
+            {
                 continue;
+            }
 
             // A term whose mask is already covered was attached at an earlier step; the only
             // exception is the very first step, which is where terms local to the leading member
             // (and constant terms) first become attachable to a join node.
             var alreadyApplied = (term.TableMask & ~placedMask) == 0 && BitOperations.PopCount(placedMask) >= 2;
             if (alreadyApplied)
-                continue;
-
-            if (TryGetEqualityMatchRows(term, placedMask, memberBit, out var matchRows))
             {
-                hasEqualityKey = true;
+                continue;
+            }
+
+            if (TryGetEqualityMatchRows(term, placedMask, memberBit, out var matchRows, out var hashable))
+            {
+                // Narrowing the cardinality estimate is safe for any resolved equality, but only
+                // a hashable one may make this step consider a hash-build shape below — a custom
+                // or overridden-built-in collation still reaches the index-seek-or-nested-loop
+                // branch (see the `!hasEqualityKey` check), never the hash cost comparison.
+                hasEqualityKey = hasEqualityKey || hashable;
                 rowsPerOuterRow = Math.Min(rowsPerOuterRow, Math.Max(matchRows, 0.0));
                 continue;
             }
@@ -607,8 +614,13 @@ internal static class JoinOrderEnumerator
         ulong memberBit,
         JoinIndexColumn indexColumn)
     {
+        // Seek binding uses EqualitySeekCollation (populated whenever the equality's operands
+        // structurally resolve) rather than EqualityCollation (populated only when also safe to
+        // hash) — DescribeJoinIndexCandidates already gates which indexes are even offered as
+        // candidates, so a custom or overridden-built-in collation can still bind a direct index
+        // seek here even though TryBuildAutomaticEquiJoinIndexCandidate will never hash it.
         if (!term.IsEquality
-            || !string.Equals(term.EqualityCollation, indexColumn.Collation, StringComparison.OrdinalIgnoreCase))
+            || !string.Equals(term.EqualitySeekCollation, indexColumn.Collation, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
@@ -629,15 +641,22 @@ internal static class JoinOrderEnumerator
     /// True when <paramref name="term"/> can serve as this step's hash key: one operand must be
     /// fully covered by the already-placed members and the other must be exactly the member
     /// being added, which is the same left/right split
-    /// <c>EmbeddedDatabase.TryCreateCompiledJoinEquiProbe</c> requires.
+    /// <c>EmbeddedDatabase.TryCreateCompiledJoinEquiProbe</c> requires. <paramref name="hashable"/>
+    /// additionally reports whether <see cref="JoinPredicateTerm.EqualityCollation"/> is set —
+    /// i.e. whether this same equality is also safe to key a hash-build step off of, as opposed
+    /// to only being usable for a direct index seek (<see cref="JoinPredicateTerm.EqualitySeekCollation"/>).
+    /// A custom or overridden-built-in collation match still narrows the cardinality estimate
+    /// (<paramref name="matchRows"/>) but must never make the caller consider a hash shape.
     /// </summary>
     private static bool TryGetEqualityMatchRows(
         JoinPredicateTerm term,
         ulong placedMask,
         ulong memberBit,
-        out double matchRows)
+        out double matchRows,
+        out bool hashable)
     {
         matchRows = 0.0;
+        hashable = term.EqualityCollation is not null;
         if (!term.IsEquality)
             return false;
 

@@ -17,6 +17,7 @@ public sealed class SqliteIndexRecordComparer
     private static readonly UnicodeEncoding StrictUtf16BigEndian = new(true, false, true);
 
     private readonly SqliteIndexComparisonTerm[] _terms;
+    private readonly bool[] _deferredTerms;
 
     /// <summary>Creates a comparer for records encoded using <paramref name="textEncoding"/>.</summary>
     public SqliteIndexRecordComparer(SqliteTextEncoding textEncoding = SqliteTextEncoding.Utf8)
@@ -51,9 +52,39 @@ public sealed class SqliteIndexRecordComparer
     }
 
     /// <summary>Creates a comparer for schema-aware leading index terms.</summary>
+    /// <param name="textEncoding">The database text encoding used to interpret text record fields.</param>
+    /// <param name="terms">The leading comparison terms, in record order.</param>
+    /// <param name="allowDeferredCustomCollation">
+    /// When <see langword="true"/>, a term whose collation is neither a
+    /// built-in nor bound to an application-defined comparison delegate is
+    /// accepted instead of rejected. Comparisons against a deferred term
+    /// always report equal, so this mode may only be used for structural
+    /// validation (page/record shape) while the required collation callback
+    /// is not yet registered — never for ordering, uniqueness, or content
+    /// decisions that stand in for the real comparison.
+    /// </param>
+    /// <param name="forceDeferCustomCollation">
+    /// When <see langword="true"/>, EVERY leading term is treated as
+    /// deferred — including a BINARY/NOCASE/RTRIM term — regardless of
+    /// whether a callback happens to be bound right now, implying
+    /// <paramref name="allowDeferredCustomCollation"/>. Use this for a
+    /// purely structural traversal (for example collecting a stale index
+    /// tree's non-root pages before a targeted rebuild) that must never
+    /// compare old physical ordering under ANY term's currently-registered
+    /// semantics: a plain built-in name can itself have been overridden via
+    /// <c>RegisterCollation("BINARY", ...)</c> and no longer agree with the
+    /// tree's existing on-disk order — exactly the same hazard a genuinely
+    /// custom-named collation poses, and exactly why a REINDEX is often
+    /// requested in the first place. Deferring only non-built-in terms would
+    /// let an overridden built-in leading term still invoke its (possibly
+    /// mismatched) comparator against stale physical order during what is
+    /// supposed to be a decode/validate-structure-only pass.
+    /// </param>
     public SqliteIndexRecordComparer(
         SqliteTextEncoding textEncoding,
-        IReadOnlyList<SqliteIndexComparisonTerm> terms)
+        IReadOnlyList<SqliteIndexComparisonTerm> terms,
+        bool allowDeferredCustomCollation = false,
+        bool forceDeferCustomCollation = false)
     {
         ArgumentNullException.ThrowIfNull(terms);
         TextEncoding = textEncoding is SqliteTextEncoding.Unset
@@ -61,21 +92,50 @@ public sealed class SqliteIndexRecordComparer
             : textEncoding;
         _ = GetTextEncoding(TextEncoding);
         _terms = terms.ToArray();
-        foreach (var term in _terms)
+        _deferredTerms = new bool[_terms.Length];
+        for (var index = 0; index < _terms.Length; index++)
         {
+            var term = _terms[index];
             ArgumentNullException.ThrowIfNull(term.Collation);
             if (!term.Collation.IsAvailable)
                 throw new NotSupportedException("SQLite index comparison requires concrete collation metadata.");
+            if (forceDeferCustomCollation)
+            {
+                // Defer ALL leading terms unconditionally — including a plain
+                // BINARY/NOCASE/RTRIM term — because a built-in name can itself
+                // have been overridden (see WithComparison / RegisterCollation)
+                // and would otherwise still invoke its bound delegate against
+                // stale physical order during what must be a structure-only
+                // decode/validate pass.
+                _deferredTerms[index] = true;
+                continue;
+            }
+
             if (!term.Collation.IsSupportedByManagedIndexWriter)
             {
-                throw new NotSupportedException(
-                    $"SQLite index comparison does not support application-defined collation {term.Collation.Name}.");
+                if (!allowDeferredCustomCollation)
+                {
+                    throw new NotSupportedException(
+                        $"SQLite index comparison does not support application-defined collation {term.Collation.Name}.");
+                }
+
+                _deferredTerms[index] = true;
             }
         }
     }
 
     /// <summary>The database text encoding used to interpret text record fields.</summary>
     public SqliteTextEncoding TextEncoding { get; }
+
+    /// <summary>
+    /// Whether this comparer was constructed with
+    /// <c>allowDeferredCustomCollation: true</c> and at least one term could
+    /// not be resolved to a built-in collation or a bound application-defined
+    /// delegate. A deferred comparer treats the unresolved term(s) as always
+    /// equal and must only be used to validate b-tree/record shape, never to
+    /// answer ordering, uniqueness, or content-equivalence questions.
+    /// </summary>
+    public bool HasDeferredTerms => Array.IndexOf(_deferredTerms, true) >= 0;
 
     internal bool HasSameSemantics(SqliteIndexRecordComparer other)
     {
@@ -102,6 +162,8 @@ public sealed class SqliteIndexRecordComparer
         var count = Math.Min(left.Length, right.Length);
         for (var index = 0; index < count; index++)
         {
+            if (index < _deferredTerms.Length && _deferredTerms[index])
+                continue;
             var term = index < _terms.Length
                 ? _terms[index]
                 : SqliteIndexComparisonTerm.BinaryAscending;
@@ -124,6 +186,8 @@ public sealed class SqliteIndexRecordComparer
         var count = Math.Min(left.Count, right.Count);
         for (var index = 0; index < count; index++)
         {
+            if (index < _deferredTerms.Length && _deferredTerms[index])
+                continue;
             var term = index < _terms.Length
                 ? _terms[index]
                 : SqliteIndexComparisonTerm.BinaryAscending;
@@ -174,6 +238,14 @@ public sealed class SqliteIndexRecordComparer
 
     private int CompareText(string left, string right, SqliteKeyCollation collation)
     {
+        // An explicitly bound application-defined delegate always takes
+        // priority, including when it overrides a built-in name (BINARY,
+        // NOCASE, RTRIM): the override was requested for this comparer
+        // instance, so built-in behavior only applies when no delegate is
+        // bound.
+        if (collation.Comparison is { } comparison)
+            return comparison(left, right);
+
         if (collation.IsNoCase)
             return CompareNoCaseText(left, right);
 

@@ -1,3 +1,5 @@
+using Ahtola.Core.Parsing;
+
 namespace Ahtola.Core.Compilation.JoinOrdering;
 
 /// <summary>
@@ -31,13 +33,23 @@ internal sealed record JoinIndexCandidate(
     bool HasRowIdAlias,
     bool Forced = false,
     bool Automatic = false,
-    bool LazyCursor = false);
+    bool LazyCursor = false,
+    bool IsPrimaryKey = false);
 
-/// <summary>One key column in persisted index order.</summary>
+/// <summary>
+/// One key column in persisted index order. <paramref name="ColumnOrdinal"/> is a real
+/// non-negative table-column ordinal for a plain column, or a negative "expression group"
+/// identity — stable only within one <see cref="EmbeddedTable"/>'s own indexes for one planning
+/// pass — for an expression column, letting <see cref="JoinOrderEnumerator"/> keep comparing
+/// plain <see cref="int"/>s without ever inspecting an AST. <paramref name="IndexExpression"/> is
+/// build-time-only matching metadata (populated for expression columns only) that the enumerator
+/// never reads.
+/// </summary>
 internal readonly record struct JoinIndexColumn(
     int ColumnOrdinal,
     string Collation,
-    bool Descending);
+    bool Descending,
+    Expression? IndexExpression = null);
 
 /// <summary>
 /// One AND-conjunct available to the segment, already resolved to the members it references.
@@ -66,7 +78,26 @@ internal readonly record struct JoinIndexColumn(
 /// <param name="EqualityLeftConvertsNumericToText">Whether comparison affinity textifies the left value.</param>
 /// <param name="EqualityRightConvertsTextToNumeric">Whether comparison affinity converts the right value.</param>
 /// <param name="EqualityRightConvertsNumericToText">Whether comparison affinity textifies the right value.</param>
-/// <param name="EqualityCollation">Resolved built-in comparison collation.</param>
+/// <param name="EqualityCollation">
+/// Resolved comparison collation, but only when it is also safe to hash — i.e.
+/// <c>IsHashableJoinKeyCollation</c> accepts it and it is not an unsafe compiled collation (see
+/// <c>IsUnsafeCompiledCollation</c>). Null whenever the equality resolved to a custom or
+/// overridden-built-in collation, so <c>TryCreateCompiledJoinEquiProbe</c> and automatic
+/// hash-index building never key off an arbitrary application-defined comparator. Use
+/// <see cref="EqualitySeekCollation"/> for direct index-seek binding instead — a custom
+/// collation can still be seeked through a matching persisted index even though it can never be
+/// hashed.
+/// </param>
+/// <param name="EqualitySeekCollation">
+/// Resolved comparison collation for direct index-seek binding (see
+/// <c>JoinOrderEnumerator.CanBindIndexColumn</c>), populated whenever the equality's operands
+/// structurally resolve regardless of hashability. Safe to use unconditionally for seek binding
+/// because a candidate index column is only ever offered by <c>DescribeJoinIndexCandidates</c>
+/// once its own collation has been proven ready for planning (built-in, or a custom/overridden
+/// collation with a registered callback whose durable order has been validated) — matching this
+/// value against that column's declared collation name can never bind an unready index. Equal to
+/// <see cref="EqualityCollation"/> whenever the latter is non-null.
+/// </param>
 internal sealed record JoinPredicateTerm(
     ulong TableMask,
     bool IsEquality,
@@ -81,7 +112,8 @@ internal sealed record JoinPredicateTerm(
     bool EqualityLeftConvertsNumericToText = false,
     bool EqualityRightConvertsTextToNumeric = false,
     bool EqualityRightConvertsNumericToText = false,
-    string? EqualityCollation = null);
+    string? EqualityCollation = null,
+    string? EqualitySeekCollation = null);
 
 /// <summary>
 /// Exact index and equality terms selected for one <c>IndexSeekRight</c> step.

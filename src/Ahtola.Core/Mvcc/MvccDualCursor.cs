@@ -135,7 +135,9 @@ internal static class MvccDualCursor
         IEnumerable<IndexRow> baseRows,
         Func<MvccVisibleRow, IndexRow?> projectOverlay,
         IComparer<IndexRow> indexComparer,
-        IComparer<MvccKey> tableKeyComparer)
+        IComparer<MvccKey> tableKeyComparer,
+        Action? baseRowSuppressed = null,
+        Action? overlayRowExamined = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(baseRows);
@@ -147,14 +149,16 @@ internal static class MvccDualCursor
             store,
             txId,
             tableId,
-            baseRows).GetEnumerator();
+            baseRows,
+            baseRowSuppressed).GetEnumerator();
         using var overlayCursor = EnumerateOverlayIndexRows(
             store,
             txId,
             tableId,
             projectOverlay,
             indexComparer,
-            tableKeyComparer).GetEnumerator();
+            tableKeyComparer,
+            overlayRowExamined).GetEnumerator();
         var hasBase = baseCursor.MoveNext();
         var hasOverlay = overlayCursor.MoveNext();
         while (hasBase || hasOverlay)
@@ -192,7 +196,8 @@ internal static class MvccDualCursor
         MvStore store,
         MvccTxId txId,
         long tableId,
-        IEnumerable<IndexRow> baseRows)
+        IEnumerable<IndexRow> baseRows,
+        Action? baseRowSuppressed)
     {
         foreach (var row in baseRows)
         {
@@ -202,6 +207,7 @@ internal static class MvccDualCursor
                     out _,
                     out _))
             {
+                baseRowSuppressed?.Invoke();
                 continue;
             }
 
@@ -218,7 +224,8 @@ internal static class MvccDualCursor
         long tableId,
         Func<MvccVisibleRow, IndexRow?> projectOverlay,
         IComparer<IndexRow> indexComparer,
-        IComparer<MvccKey> tableKeyComparer)
+        IComparer<MvccKey> tableKeyComparer,
+        Action? overlayRowExamined)
     {
         var projected = new List<IndexRow>();
         foreach (var visible in store.EnumerateVisible(
@@ -226,6 +233,7 @@ internal static class MvccDualCursor
                      tableId,
                      tableKeyComparer))
         {
+            overlayRowExamined?.Invoke();
             if (!visible.IsDelete && projectOverlay(visible) is { } candidate)
                 projected.Add(candidate);
         }

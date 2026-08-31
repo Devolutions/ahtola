@@ -63,7 +63,7 @@ public sealed class SqliteTableLeafPageView
         for (var index = 0; index < pointers.Count; index++)
         {
             var offset = pointers[index];
-            var cell = SqliteTableLeafCell.Decode(snapshot[offset..usableSpace], usableSpace);
+            var cell = SqliteTableLeafCell.Decode(snapshot.AsSpan(offset, usableSpace - offset), usableSpace);
             var end = checked(offset + cell.EncodedLength);
             if (end > usableSpace)
                 throw new InvalidDataException("SQLite table-leaf cell extends into reserved page space.");

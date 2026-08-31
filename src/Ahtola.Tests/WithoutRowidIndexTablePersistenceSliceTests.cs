@@ -133,8 +133,12 @@ public sealed class WithoutRowidIndexTablePersistenceSliceTests
             connection,
             "CREATE INDEX entry_value ON entry(value COLLATE custom_collation);");
 
+        // "custom_collation" is a valid application-defined collation name, but nothing has
+        // registered a callback for it on this connection, so CREATE INDEX must fail closed with
+        // the SQLite-style "no such collation sequence" message instead of the old unconditional
+        // "application-defined collations are rejected" wording (see CustomCollationIndexTests).
         rejected.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*application-defined collation 'CUSTOM_COLLATION'*");
+            .WithMessage("*no such collation sequence*custom_collation*");
         faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBeforeReject);
         faults.ClearScheduled();
         Scalar(connection, "SELECT value FROM entry WHERE code = 'saved';").AsText().Should().Be("durable");

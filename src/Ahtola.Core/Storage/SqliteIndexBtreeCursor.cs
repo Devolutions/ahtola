@@ -52,6 +52,76 @@ public sealed class SqliteIndexBtreeCursor
         return EnumerateNode(rootPage, seek, depth: 0, pageRead, keyCompared);
     }
 
+    /// <summary>
+    /// Enumerates every complete index record in ascending SQLite key order, with no equality
+    /// prefix filtering. Unlike <see cref="SeekPrefix"/>, this always descends into every child in
+    /// left-to-right order rather than binary-searching for a matching separator, so it visits
+    /// every leaf and interior separator exactly once — the natural in-order traversal a caller
+    /// merging a full ORDER BY-elision scan against an overlay needs, without materializing and
+    /// sorting the whole table in memory first.
+    /// </summary>
+    public IEnumerable<byte[]> ScanAscending(uint rootPage, Action? pageRead = null)
+    {
+        if (rootPage == 0 || rootPage > _io.PageCount)
+            throw new ArgumentOutOfRangeException(nameof(rootPage));
+
+        return EnumerateNodeAscending(rootPage, depth: 0, pageRead);
+    }
+
+    private IEnumerable<byte[]> EnumerateNodeAscending(uint pageNumber, int depth, Action? pageRead)
+    {
+        if (depth >= MaximumDepth)
+        {
+            throw new InvalidDataException(
+                $"SQLite index b-tree rooted above page {pageNumber} is deeper than {MaximumDepth} levels.");
+        }
+
+        var image = _io.ReadPage(pageNumber);
+        pageRead?.Invoke();
+        switch (SqliteBtreePageHeader.Parse(image).PageType)
+        {
+            case SqliteBtreePageType.IndexLeaf:
+                {
+                    var leaf = SqliteIndexLeafPageView.Parse(
+                        image,
+                        _io.UsableSpace,
+                        _textEncoding,
+                        overflowReader: _overflowReader,
+                        recordComparer: _comparer);
+                    for (var index = 0; index < leaf.Cells.Count; index++)
+                        yield return leaf.GetRecord(index);
+                    yield break;
+                }
+
+            case SqliteBtreePageType.IndexInterior:
+                {
+                    var interior = SqliteIndexInteriorPageView.Parse(
+                        image,
+                        _io.UsableSpace,
+                        _textEncoding,
+                        overflowReader: _overflowReader,
+                        recordComparer: _comparer);
+                    for (var childIndex = 0; childIndex <= interior.Cells.Count; childIndex++)
+                    {
+                        var childPage = childIndex == interior.Cells.Count
+                            ? interior.Header.RightMostChildPage
+                            : interior.Cells[childIndex].Cell.LeftChildPage;
+                        foreach (var record in EnumerateNodeAscending(childPage, depth + 1, pageRead))
+                            yield return record;
+
+                        if (childIndex < interior.Cells.Count)
+                            yield return interior.GetRecord(childIndex);
+                    }
+
+                    yield break;
+                }
+
+            default:
+                throw new InvalidDataException(
+                    $"SQLite page {pageNumber} is not part of an index b-tree.");
+        }
+    }
+
     private IEnumerable<byte[]> EnumerateNode(
         uint pageNumber,
         SqlValue[] prefix,

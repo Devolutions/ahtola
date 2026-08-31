@@ -1300,17 +1300,20 @@ public sealed class DurableIndexSemanticsTests
     }
 
     [Test]
-    public void CustomCollationRejectsBeforePublicationAndRichOrderCorruptionFailsReopen()
+    public void FunctionBasedIndexDefinitionsRejectBeforePublicationAndRichOrderCorruptionFailsReopen()
     {
+        // This test used to also assert that CREATE INDEX ... COLLATE reverse_text was rejected
+        // purely because the collation name was non-built-in. Under the custom-collation index
+        // phase that is no longer the contract: a *registered* custom collation is fully
+        // supported for secondary indexes (see CustomCollationIndexTests), so that sub-case moved
+        // out. Only the function-based rejections below (non-deterministic function, UDF-in-index
+        // expression, function-based built-in-collation override) remain unconditional.
         const string rejectedPath = "custom-index-reject.db";
         var faults = new DeterministicFaultInjector();
         var rejectedFileSystem = new InMemoryFileSystem(faults);
         using (var database = EmbeddedDatabase.OpenFile(rejectedPath, rejectedFileSystem))
         using (var connection = database.Connect())
         {
-            database.RegisterCollation(
-                "reverse_text",
-                (left, right) => string.CompareOrdinal(right, left));
             database.RegisterScalarFunction("managed_index_value", 1, values => values[0]);
             database.RegisterScalarFunction("lower", 1, values => values[0]);
             Execute(connection, "CREATE TABLE retained(id INTEGER PRIMARY KEY, value TEXT);");
@@ -1333,11 +1336,6 @@ public sealed class DurableIndexSemanticsTests
                 "CREATE INDEX rejected_override ON retained(lower(value));");
             overrideBuiltin.Should().Throw<EmbeddedSqlException>()
                 .WithMessage("*application-defined functions are prohibited*");
-            Action create = () => Execute(
-                connection,
-                "CREATE INDEX rejected_custom ON retained(value COLLATE reverse_text);");
-            create.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("*not a supported SQLite built-in collation*");
             faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBeforeReject);
             Query(connection, "PRAGMA index_list(retained);").Should().BeEmpty();
             faults.ClearScheduled();

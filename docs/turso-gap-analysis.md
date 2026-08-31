@@ -847,27 +847,30 @@ is documented in code:
   constants would rank a large build side as cheap, because `hash_lookup_cost`
   exceeds `hash_insert_cost`.
 
-The managed executor does not yet open the persisted B-tree directly, so seek
-cost also includes the one-time O(N log N) projection/sort that reconstructs
-its MVCC-visible index view. This keeps large unhinted joins on the cheaper hash
-shape. A usable mandatory `INDEXED BY` candidate still selects the named seek;
-an unusable hint declines to the directive-aware evaluator rather than silently
-substituting another access method.
+The original implementation reconstructed an O(N log N) MVCC-visible index
+view. The current executor instead opens generation/root-map-bound pager
+cursors for eligible committed, classic-transaction, and MVCC paths and merges
+ordered mutation/version effects lazily. Costing distinguishes that lazy path
+from a remaining materialized fallback. A usable mandatory `INDEXED BY`
+candidate still selects the named seek; an unusable hint declines rather than
+silently substituting another access method.
 
 **Shape selection.** Each step is scored against nested-loop cross scan,
 hash-build-right, hash-build-left, and every executable persisted-index seek.
 A seek requires a contiguous leading equality prefix whose other endpoints are
 already in the outer mask. Its comparison collation must equal the effective
 index collation, and affinity conversion may apply only to the outer probe key,
-never to stored index values. Partial, expression, method, custom/overridden
-collation, missing-statistics, `NOT INDEXED`, prefix-gap, and unsafe-affinity
-candidates decline. The full ON condition remains as a residual predicate.
+never to stored index values. Partial and expression indexes participate after
+implication/expression proofs; registered custom collations participate only
+after their callback and durable tree order are generation/version validated.
+Method indexes, missing-statistics, `NOT INDEXED`, prefix-gap, unsafe-affinity,
+and unresolved or stale collation candidates decline. The full ON condition
+remains as a residual predicate.
 
-`VdbeJoinIndexScanPlan` reconstructs one MVCC-visible index-ordered view per
-statement using the same durable index projection/sort machinery as managed
-index scans. Each outer row then performs a binary lower-bound probe and visits
-only the contiguous equal-prefix candidates; NULL probe keys visit none. This
-is a real bounded seek, but not yet a direct pager/B-tree cursor seek.
+Eligible plans use a direct pager/B-tree cursor and a two-peek merge with the
+classic transaction or MVCC overlay. Each outer row visits only the contiguous
+equal-prefix candidates; NULL probe keys visit none. `VdbeJoinIndexScanPlan`
+remains the deterministic fallback for shapes the direct accessor cannot prove.
 
 **WHERE accounting.** Comparison conjuncts of the statement's WHERE clause that
 reference exactly one member and compare it against a literal or parameter are
@@ -904,12 +907,11 @@ materialized index rows, probes, key comparisons, and candidate rows visited.
 fallbacks, plan shapes, and a work-bound assertion proving probes rather than
 outer-by-inner scans.
 
-**Residual gaps.** Multi-index AND intersection, direct pager/B-tree cursor
-reuse, STAT4 histograms, bloom filters, transient join auto-indexes, and Turso's
-finer-grained outer-join interleaving remain open. The per-member candidate list
-and per-step access-choice union are the extension point for a future
-`MultiIndexIntersectionRight`; its RowSet lifecycle, duplicate suppression,
-costing, and branch-shaped EXPLAIN are intentionally not mixed into this change.
+**Current residuals.** Multi-index AND intersection, STAT4 histograms,
+transient automatic covering indexes, and direct persisted cursors are now
+implemented. Bloom filters, custom-collated `WITHOUT ROWID` primary keys,
+unsupported range shapes, and Turso's finer-grained outer-join interleaving
+remain outside this direct-access closure.
 
 ## 5. Parser / dialect layer
 22 entries — the smallest gap *per failure-line* ratio in the inventory, which
@@ -1483,10 +1485,12 @@ defects, all now closed with regression coverage in
 **Current residual (honest, not scoreboard).** Inventory is **216 closed · 0 open**,
 and the live conformance expected-failures file contains two intentional
 Turso-negative markers for STORED generated columns. “Closed” still includes
-intentional scope and closed-with-residual notes: recursive b-tree
-balancing can still fall back to a catalog rewrite, the general planner lacks
-STAT4/multi-index-AND/direct persisted join cursors, and MVCC lacks Turso's lazy
-per-page checkpoint state machine. The managed vtab/FTS/R-Tree SQL subset has
+intentional scope and closed-with-residual notes: recursive b-tree balancing
+can still fall back to a catalog rewrite, while the planner now includes STAT4,
+multi-index AND, 12-member System-R DP, and direct persisted join cursors across
+committed, classic-transaction, and MVCC paths. The remaining MVCC
+implementation-shape difference is Turso's cooperative per-page checkpoint
+state machine. The managed vtab/FTS/R-Tree SQL subset has
 landed (including streaming VOpen/VFilter/VColumn/VNext SELECTs, direct
 VCreate/VDestroy/VRename lifecycle execution, conflict-aware VUpdate,
 constraint/cost/order planning, shared table-valued-function cursors, R-Tree

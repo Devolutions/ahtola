@@ -289,6 +289,152 @@ public sealed class ManagedMaintenanceStatementTests
         ReadInteger(reopenedConnection, "PRAGMA schema_version;").Should().Be(schemaVersion + 1);
     }
 
+    public enum ReindexCoexistingDml
+    {
+        Insert,
+        Update,
+        Delete,
+    }
+
+    /// <summary>
+    /// A targeted, in-place REINDEX (<c>EmbeddedFileStore.TryPersistTargetedIndexRebuild</c>)
+    /// only ever rewrites the selected index's own b-tree; it never re-derives or rewrites any
+    /// table's row storage. If it were persisted as the sole durable mutation whenever it shared
+    /// a transaction with row-level DML, the DML would apply correctly to the in-memory catalog
+    /// but never reach disk, so it would silently vanish the moment the store is reopened even
+    /// though the rebuilt index still (correctly) reflects the in-memory row. Commit must widen
+    /// to the full-catalog rewrite whenever anything besides the targeted rebuild changed.
+    /// </summary>
+    [TestCase(ReindexCoexistingDml.Insert)]
+    [TestCase(ReindexCoexistingDml.Update)]
+    [TestCase(ReindexCoexistingDml.Delete)]
+    public void TargetedReindexPersistsCoexistingDmlInTheSameTransactionAtomically(ReindexCoexistingDml dml)
+    {
+        var fileSystem = new InMemoryFileSystem();
+        var path = $"reindex-with-{dml.ToString().ToLowerInvariant()}.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(
+                connection,
+                """
+                CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT);
+                CREATE INDEX data_value ON data(value);
+                INSERT INTO data VALUES (1, 'one'), (2, 'two'), (3, 'three');
+                """);
+
+            Execute(connection, "BEGIN;");
+            switch (dml)
+            {
+                case ReindexCoexistingDml.Insert:
+                    Execute(connection, "INSERT INTO data VALUES (4, 'four');");
+                    break;
+                case ReindexCoexistingDml.Update:
+                    Execute(connection, "UPDATE data SET value = 'deux' WHERE id = 2;");
+                    break;
+                case ReindexCoexistingDml.Delete:
+                    Execute(connection, "DELETE FROM data WHERE id = 3;");
+                    break;
+            }
+            Execute(connection, "REINDEX data_value;");
+            Execute(connection, "COMMIT;");
+
+            AssertReindexCoexistingDmlApplied(connection, dml);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        AssertReindexCoexistingDmlApplied(reopenedConnection, dml);
+        ReadText(reopenedConnection, "PRAGMA integrity_check;").Should().Be("ok");
+    }
+
+    private static void AssertReindexCoexistingDmlApplied(EmbeddedConnection connection, ReindexCoexistingDml dml)
+    {
+        switch (dml)
+        {
+            case ReindexCoexistingDml.Insert:
+                ReadInteger(connection, "SELECT COUNT(*) FROM data;").Should().Be(4);
+                ReadText(connection, "SELECT value FROM data WHERE id = 4;").Should().Be("four");
+                // Index-driven lookup: proves the rebuilt data_value tree agrees with the
+                // inserted row rather than only the in-memory table.
+                ReadInteger(connection, "SELECT id FROM data WHERE value = 'four';").Should().Be(4);
+                break;
+            case ReindexCoexistingDml.Update:
+                ReadInteger(connection, "SELECT COUNT(*) FROM data;").Should().Be(3);
+                ReadText(connection, "SELECT value FROM data WHERE id = 2;").Should().Be("deux");
+                ReadInteger(connection, "SELECT id FROM data WHERE value = 'deux';").Should().Be(2);
+                ReadInteger(connection, "SELECT COUNT(*) FROM data WHERE value = 'two';").Should().Be(0);
+                break;
+            case ReindexCoexistingDml.Delete:
+                ReadInteger(connection, "SELECT COUNT(*) FROM data;").Should().Be(2);
+                ReadInteger(connection, "SELECT COUNT(*) FROM data WHERE id = 3;").Should().Be(0);
+                ReadInteger(connection, "SELECT COUNT(*) FROM data WHERE value = 'three';").Should().Be(0);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Distinct from <see cref="TargetedReindexPersistsCoexistingDmlInTheSameTransactionAtomically"/>
+    /// above: that test proves the statement's normal-completion path
+    /// (<c>transactionState.HasNonTargetedIndexRebuildChange</c> set right after
+    /// <c>HasChanges = true</c> when a statement changed something other than a pure targeted
+    /// index rebuild) widens commit off the targeted-rebuild-only persistence path. This test
+    /// proves the same for an *exception* path that still preserves a statement's partial row
+    /// changes: <c>EmbeddedConflictFailException</c> (ON CONFLICT FAIL). SQLite's OR FAIL
+    /// semantics abort only the current statement, not the whole transaction, and do not roll
+    /// back rows the statement already inserted before it hit the conflict -- so a multi-row
+    /// <c>INSERT OR FAIL</c> that inserts row 2 before conflicting on row 3 still leaves row 2
+    /// committed to this transaction. That preserved prefix is table DML, never a targeted index
+    /// rebuild. If the catch handler only set <c>HasChanges</c> without also setting
+    /// <c>HasNonTargetedIndexRebuildChange</c>, an earlier targeted <c>REINDEX</c> in the same
+    /// transaction would leave commit believing the sole durable mutation was the targeted
+    /// rebuild (<c>TargetedIndexRebuildNames</c> stays the only non-empty signal), so the
+    /// preserved partial INSERT would be visible in-memory before commit but silently vanish the
+    /// moment the store is reopened, because a targeted rebuild never rewrites table row storage.
+    /// </summary>
+    [Test]
+    public void TargetedReindexPersistsConflictFailPreservedPrefixInTheSameTransactionAtomically()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "reindex-with-conflict-fail-prefix.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(
+                connection,
+                """
+                CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT UNIQUE);
+                CREATE INDEX data_scratch ON data(id);
+                INSERT INTO data VALUES (1, 'one');
+                """);
+
+            Execute(connection, "BEGIN;");
+            Execute(connection, "REINDEX data_scratch;");
+            Assert.Throws<EmbeddedSqlException>(
+                () => Execute(
+                    connection,
+                    "INSERT OR FAIL INTO data VALUES (2, 'two'), (3, 'one');"));
+            Execute(connection, "COMMIT;");
+
+            // The failed statement's already-inserted row (id 2) is visible in-memory before
+            // reopen -- this much would already pass even with the bug, since the bug only drops
+            // the durable write on disk, not the in-memory catalog.
+            ReadInteger(connection, "SELECT COUNT(*) FROM data;").Should().Be(2);
+            ReadText(connection, "SELECT value FROM data WHERE id = 2;").Should().Be("two");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        // Without HasNonTargetedIndexRebuildChange on the EmbeddedConflictFailException path,
+        // this reopen would only show the original seed row: the preserved partial INSERT
+        // vanished because commit (incorrectly) took the targeted-index-rebuild-only persistence
+        // path, which never rewrites table row storage.
+        ReadInteger(reopenedConnection, "SELECT COUNT(*) FROM data;").Should().Be(2);
+        ReadText(reopenedConnection, "SELECT value FROM data WHERE id = 2;").Should().Be("two");
+        ReadInteger(reopenedConnection, "SELECT id FROM data WHERE id = 2;").Should().Be(2);
+        ReadText(reopenedConnection, "PRAGMA integrity_check;").Should().Be("ok");
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void ReindexWriteFailureRecoversWithoutPublishingAPartialTree(bool deleteJournal)

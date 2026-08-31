@@ -12,7 +12,11 @@ namespace Ahtola.Core.Storage;
 /// </remarks>
 public sealed record SqliteKeyCollation
 {
-    private SqliteKeyCollation(string? name) => Name = name;
+    private SqliteKeyCollation(string? name, Func<string, string, int>? comparison = null)
+    {
+        Name = name;
+        Comparison = comparison;
+    }
 
     /// <summary>A key term whose collation was not retained by its caller.</summary>
     public static SqliteKeyCollation Unavailable { get; } = new(name: null);
@@ -26,6 +30,16 @@ public sealed record SqliteKeyCollation
     /// </summary>
     public string? Name { get; }
 
+    /// <summary>
+    /// An optional connection/database-bound string comparison delegate that
+    /// reproduces an application-defined (non-built-in) collation. When
+    /// present, the managed index writer treats this collation as supported
+    /// even though it is not one of SQLite's built-in BINARY/NOCASE/RTRIM
+    /// sequences. The delegate is never serialized; only <see cref="Name"/>
+    /// is persisted to durable schema metadata.
+    /// </summary>
+    public Func<string, string, int>? Comparison { get; }
+
     /// <summary>Whether the source supplied a concrete collation name.</summary>
     public bool IsAvailable => Name is not null;
 
@@ -38,8 +52,20 @@ public sealed record SqliteKeyCollation
     /// <summary>Whether this is SQLite's built-in RTRIM collation.</summary>
     public bool IsRTrim => string.Equals(Name, "RTRIM", StringComparison.Ordinal);
 
-    /// <summary>Whether the managed index writer can reproduce this collation.</summary>
-    public bool IsSupportedByManagedIndexWriter => IsBinary || IsNoCase || IsRTrim;
+    /// <summary>
+    /// Whether this collation is one of SQLite's three built-in sequences,
+    /// regardless of whether an application has also registered a callback
+    /// under the same name (see <see cref="SqliteIndexRecordComparer"/> for
+    /// the "overridden built-in" safety rule).
+    /// </summary>
+    public bool IsBuiltIn => IsBinary || IsNoCase || IsRTrim;
+
+    /// <summary>
+    /// Whether the managed index writer can reproduce this collation: either
+    /// it is one of SQLite's built-ins, or a bound application-defined
+    /// comparison delegate is available for it.
+    /// </summary>
+    public bool IsSupportedByManagedIndexWriter => IsBuiltIn || Comparison is not null;
 
     /// <summary>Creates a descriptor for a concrete SQLite collation name.</summary>
     public static SqliteKeyCollation FromName(string name)
@@ -48,6 +74,19 @@ public sealed record SqliteKeyCollation
         return string.Equals(name, "BINARY", StringComparison.OrdinalIgnoreCase)
             ? Binary
             : new SqliteKeyCollation(name.ToUpperInvariant());
+    }
+
+    /// <summary>
+    /// Returns a copy of this descriptor bound to an application-defined
+    /// comparison delegate. Built-in BINARY/NOCASE/RTRIM collations may also
+    /// carry a bound delegate when the application has explicitly overridden
+    /// them; callers decide whether the override applies (see
+    /// <see cref="SqliteIndexRecordComparer"/>).
+    /// </summary>
+    public SqliteKeyCollation WithComparison(Func<string, string, int> comparison)
+    {
+        ArgumentNullException.ThrowIfNull(comparison);
+        return new SqliteKeyCollation(Name, comparison);
     }
 }
 

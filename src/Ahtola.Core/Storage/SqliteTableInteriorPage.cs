@@ -295,7 +295,7 @@ public sealed class SqliteTableInteriorPageView
         for (var index = 0; index < pointers.Count; index++)
         {
             var offset = pointers[index];
-            var cell = SqliteTableInteriorCell.Decode(snapshot[offset..usableSpace]);
+            var cell = SqliteTableInteriorCell.Decode(snapshot.AsSpan(offset, usableSpace - offset));
             var end = checked(offset + cell.EncodedLength);
             if (end > usableSpace)
                 throw new InvalidDataException("SQLite table-interior cell extends into reserved page space.");

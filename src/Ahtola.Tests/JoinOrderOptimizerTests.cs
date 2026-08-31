@@ -74,15 +74,15 @@ public sealed class JoinOrderOptimizerTests
     }
 
     [Test]
-    public void EightTableSegmentUsesTheSubsetDynamicProgram()
+    public void TwelveTableSegmentUsesTheSubsetDynamicProgram()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
-        Execute(connection, ChainScript(8, descendingSizes: true));
+        Execute(connection, ChainScript(12, descendingSizes: true));
         Execute(connection, "ANALYZE;");
 
-        var query = ChainSelect(8);
-        JoinDescription(connection, "EXPLAIN " + query).Should().Contain("scan order: t8,");
+        var query = ChainSelect(12);
+        JoinDescription(connection, "EXPLAIN " + query).Should().Contain("scan order: t12,");
         database.JoinOrderDiagnostics.DynamicProgrammingPlans.Should().Be(1);
         database.JoinOrderDiagnostics.GreedyPlans.Should().Be(0);
         Rows(connection, query).Should().HaveCount(6);
@@ -91,20 +91,20 @@ public sealed class JoinOrderOptimizerTests
     [Test]
     public void SegmentAboveTheDynamicProgrammingCapFallsBackToGreedy()
     {
-        JoinOrderEnumerator.DynamicProgrammingMemberCap.Should().Be(8);
+        JoinOrderEnumerator.DynamicProgrammingMemberCap.Should().Be(12);
 
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
-        Execute(connection, ChainScript(9, descendingSizes: true));
+        Execute(connection, ChainScript(13, descendingSizes: true));
         Execute(connection, "ANALYZE;");
 
-        var query = ChainSelect(9);
+        var query = ChainSelect(13);
         var description = JoinDescription(connection, "EXPLAIN " + query);
         database.JoinOrderDiagnostics.GreedyPlans.Should().Be(1);
         database.JoinOrderDiagnostics.DynamicProgrammingPlans.Should().Be(0);
 
         // Greedy still produces a genuine reorder, not a decline back to FROM order.
-        description.Should().Contain("scan order: t9,");
+        description.Should().Contain("scan order: t13,");
         Rows(connection, query).Should().HaveCount(6);
     }
 
@@ -712,7 +712,7 @@ public sealed class JoinOrderOptimizerTests
     public void GreedyFallbackProducesAValidOrderNoWorseThanTheFromOrder()
     {
         var random = new Random(4711);
-        for (var members = 9; members <= 12; members++)
+        for (var members = 13; members <= 16; members++)
         {
             var segment = RandomSegment(random, members);
             var plan = JoinOrderEnumerator.Compute(segment);
@@ -835,7 +835,8 @@ public sealed class JoinOrderOptimizerTests
                 Selectivity: JoinCostParams.SelectivityEqualityIndexed,
                 EqualityLeftColumnOrdinal: 0,
                 EqualityRightColumnOrdinal: 0,
-                EqualityCollation: "BINARY"),
+                EqualityCollation: "BINARY",
+                EqualitySeekCollation: "BINARY"),
         ]);
 
         var plan = JoinOrderEnumerator.EvaluateOrder(segment, [0, 1]);
@@ -907,7 +908,8 @@ public sealed class JoinOrderOptimizerTests
                 JoinCostParams.SelectivityEqualityIndexed,
                 EqualityLeftColumnOrdinal: 0,
                 EqualityRightColumnOrdinal: 0,
-                EqualityCollation: "BINARY"),
+                EqualityCollation: "BINARY",
+                EqualitySeekCollation: "BINARY"),
             new JoinPredicateTerm(
                 0b110,
                 true,
@@ -918,7 +920,8 @@ public sealed class JoinOrderOptimizerTests
                 JoinCostParams.SelectivityEqualityIndexed,
                 EqualityLeftColumnOrdinal: 0,
                 EqualityRightColumnOrdinal: 1,
-                EqualityCollation: "BINARY"),
+                EqualityCollation: "BINARY",
+                EqualitySeekCollation: "BINARY"),
         ]);
 
         var plan = JoinOrderEnumerator.Compute(segment);

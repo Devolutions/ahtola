@@ -370,7 +370,7 @@ public sealed class SqliteIndexInteriorPageView
         for (var index = 0; index < pointers.Count; index++)
         {
             var offset = pointers[index];
-            var cell = SqliteIndexInteriorCell.Decode(snapshot[offset..usableSpace], usableSpace);
+            var cell = SqliteIndexInteriorCell.Decode(snapshot.AsSpan(offset, usableSpace - offset), usableSpace);
             var end = checked(offset + cell.EncodedLength);
             if (end > usableSpace)
                 throw new InvalidDataException("SQLite index-interior cell extends into reserved page space.");
@@ -454,18 +454,25 @@ public sealed class SqliteIndexInteriorPageView
             return null;
 
         var records = new byte[cells.Count][];
-        byte[]? previousRecord = null;
+        SqlValue[]? previousDecoded = null;
+        // See the identical HasDeferredTerms comment in SqliteIndexLeafPageView.ReadAndValidateRecords:
+        // a deferred comparer's "equal" result is inconclusive (no collation callback registered
+        // yet), not a genuine duplicate, so the strict-order check must be skipped entirely.
+        var validateOrder = !comparer.HasDeferredTerms;
         for (var index = 0; index < cells.Count; index++)
         {
             var pageCell = cells[index];
             var record = pageCell.Cell.Key.FirstOverflowPage is null
                 ? pageCell.Cell.Key.LocalPayload.ToArray()
                 : overflowReader!.ReadPayload(pageCell.Cell.Key);
-            comparer.Validate(record);
-            if (previousRecord is not null && comparer.Compare(previousRecord, record) >= 0)
+            // See the identical comment in SqliteIndexLeafPageView.ReadAndValidateRecords:
+            // decode once and reuse the decoded values instead of decoding each record up
+            // to three times per cell via separate Validate/Compare calls.
+            var decoded = SqliteRecordCodec.Decode(record, comparer.TextEncoding);
+            if (validateOrder && previousDecoded is not null && comparer.Compare(previousDecoded, decoded) >= 0)
                 throw new InvalidDataException("SQLite index-interior records are not in strictly increasing configured order.");
 
-            previousRecord = record;
+            previousDecoded = decoded;
             records[index] = record;
         }
 

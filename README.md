@@ -339,15 +339,21 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   databases and explicit transactions for writes (managed writes are slower
   than native SQLite and the gap grows with table size).
 - **Planner** — `ANALYZE` / `sqlite_stat1` and validated `sqlite_stat4`
-  histograms feed index scoring, System-R DP join reordering for up to eight
-  freely reorderable INNER members (greedy above that), hash-build selection,
+  histograms feed index scoring, System-R DP join reordering for up to twelve
+  freely reorderable INNER members (deterministic greedy planning through
+  SQLite's 64-table limit above that), hash-build selection,
   costed multi-index AND intersections, and transient automatic covering
-  indexes. Committed file-backed rowid-table joins seek durable SQLite index
-  b-trees directly; transaction-local, MVCC, WITHOUT ROWID, partial/expression,
-  custom-collation, and unsupported range shapes retain deterministic
-  materialized/scan fallbacks. OUTER/NATURAL/USING barriers remain
-  correctness-preserving. Prefer `ORDER BY` when order matters (`GROUP BY` is
-  first-encounter order).
+  indexes. Eligible committed, transaction-local, and MVCC joins/scans seek
+  durable SQLite index b-trees directly, including partial and expression
+  indexes and `WITHOUT ROWID` primary/secondary indexes. Transaction and MVCC
+  paths merge their own ordered mutation/version overlays with a pinned pager
+  snapshot instead of rebuilding the index. Registered custom collations are
+  supported by secondary indexes and stay connection-bound; callback changes
+  are revalidated and require `REINDEX` when physical order changes.
+  Custom-collated `WITHOUT ROWID` primary keys and unsupported range shapes
+  retain deterministic fallbacks or fail closed. OUTER/NATURAL/USING barriers
+  remain correctness-preserving. Prefer `ORDER BY` when order matters
+  (`GROUP BY` is first-encounter order).
 - **File-backed platforms** — desktop physical files support Windows, 64-bit
   Linux, and macOS. Browser WebAssembly uses the separate OPFS package and its
   asynchronous data source (with an opt-in synchronous read-mirror profile, see

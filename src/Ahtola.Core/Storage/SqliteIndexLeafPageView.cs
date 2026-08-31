@@ -93,7 +93,7 @@ public sealed class SqliteIndexLeafPageView
         for (var index = 0; index < pointers.Count; index++)
         {
             var offset = pointers[index];
-            var cell = SqliteIndexLeafCell.Decode(snapshot[offset..usableSpace], usableSpace);
+            var cell = SqliteIndexLeafCell.Decode(snapshot.AsSpan(offset, usableSpace - offset), usableSpace);
             var end = checked(offset + cell.EncodedLength);
             if (end > usableSpace)
                 throw new InvalidDataException("SQLite index-leaf cell extends into reserved page space.");
@@ -170,19 +170,33 @@ public sealed class SqliteIndexLeafPageView
             return null;
 
         var records = new byte[cells.Count][];
-        byte[]? previousRecord = null;
+        SqlValue[]? previousDecoded = null;
+        // A deferred comparer (no collation callback registered yet) always reports "equal" for
+        // the term it cannot resolve, which is an inconclusive answer, not a genuine duplicate:
+        // per SqliteIndexRecordComparer's contract this mode exists solely to validate
+        // page/record shape while the required collation callback is unavailable, never to
+        // decide ordering. Skip the strict-order check entirely in that case; the real order is
+        // proven later, once RegisterCollation supplies the callback (EmbeddedFileStore
+        // revalidates order/content/uniqueness with the real comparer at that point).
+        var validateOrder = !comparer.HasDeferredTerms;
         for (var index = 0; index < cells.Count; index++)
         {
             var pageCell = cells[index];
             var record = pageCell.Cell.FirstOverflowPage is null
                 ? pageCell.Cell.LocalPayload.ToArray()
                 : overflowReader!.ReadPayload(pageCell.Cell);
-            comparer.Validate(record);
-            if (previousRecord is not null && comparer.Compare(previousRecord, record) >= 0)
+            // Decode once and reuse the decoded values for both this record's own
+            // validation and the ordering comparison against the previous record.
+            // Calling comparer.Validate(record) followed by comparer.Compare(previousRecord, record)
+            // would otherwise decode every record up to three times per cell (once to
+            // validate it, once as "previous", once as "current"), which dominates
+            // allocation on a fully-populated page.
+            var decoded = SqliteRecordCodec.Decode(record, comparer.TextEncoding);
+            if (validateOrder && previousDecoded is not null && comparer.Compare(previousDecoded, decoded) >= 0)
                 throw new InvalidDataException(
                     $"SQLite index-leaf records are not in strictly increasing declared order at cell {index}.");
 
-            previousRecord = record;
+            previousDecoded = decoded;
             records[index] = record;
         }
 
