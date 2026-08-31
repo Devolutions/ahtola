@@ -265,8 +265,59 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private readonly Dictionary<(string Name, int Arity), Func<IReadOnlyList<SqlValue>, SqlValue>> _scalarFunctions = new();
     private readonly Dictionary<(string Name, int Arity), ManagedAggregateFunction> _aggregateFunctions = new();
     private readonly Dictionary<string, Func<string, string, int>> _collations = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// In-memory-only "is this custom/overridden-collation index currently safe for
+    /// planning/writes" cache, keyed by index name, holding the file store's committed
+    /// generation at the time the index was last proven consistent with the active collation
+    /// callback plus that proof's outcome. Never persisted — usability is tracked purely in
+    /// memory (architecture item 4). Cleared whenever the collation registry or the attached
+    /// file store changes; see <see cref="RefreshCollationResolverBinding"/>. A cache miss (or
+    /// a stale generation) lazily re-derives the answer via
+    /// <see cref="EmbeddedFileStore.RevalidateIndexOrderAndContent"/> instead of trusting a
+    /// possibly outdated result, so REINDEX, a callback replacement, or an ordinary commit
+    /// that happens to touch the index all naturally invalidate it without any explicit
+    /// "mark clean" hook.
+    /// </summary>
+    private readonly Dictionary<string, (long Generation, long RegistryVersion, bool Clean)> _customCollationIndexClean = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// Monotonically increasing version bumped by <see cref="RefreshCollationResolverBinding"/>
+    /// (i.e. every registration, replacement, or unregistration of a collation callback).
+    /// <see cref="IsCustomCollationIndexPlanReady"/> captures this alongside the file store's
+    /// committed generation before revalidating an index, and only trusts/publishes the result
+    /// if both are still unchanged afterward — guarding against a reentrant or concurrent
+    /// callback replacement racing the very validation it is supposed to gate.
+    /// </summary>
+    private long _collationRegistryVersion;
+    /// <summary>
+    /// Every built-in collation name (BINARY/NOCASE/RTRIM) that has ever been registered as a
+    /// custom override on this connection, even if it has since been unregistered. Never
+    /// cleared. Without this, <see cref="IsCustomCollationIndexPlanReady"/> could not tell "this
+    /// name was never overridden, so any durable index using it was always built under pure
+    /// built-in semantics" (safe to skip revalidation) apart from "this name's override was just
+    /// unregistered, so a durable index using it may still be physically ordered/uniqued the way
+    /// the removed callback saw the world, not the way the just-restored built-in comparer does"
+    /// (unsafe to skip — must revalidate against the restored built-in semantics before being
+    /// trusted again).
+    /// </summary>
+    private readonly HashSet<string> _everOverriddenBuiltInCollations = new(StringComparer.OrdinalIgnoreCase);
     private bool _hasScalarFunctions;
     private bool _hasCustomCollations;
+    /// <summary>
+    /// Fallback collation lookup consulted only when this instance's own <see cref="_collations"/>
+    /// registry has no entry for a requested name. Unset on every ordinary connection; wired up
+    /// exclusively by <see cref="EmbeddedFileStore"/> on its private
+    /// <c>_indexExpressionEvaluator</c> — a throwaway <see cref="EmbeddedDatabase"/> constructed
+    /// solely to evaluate partial-index predicates and index expressions, which therefore never
+    /// receives an application's <see cref="RegisterCollation"/> calls directly. Routing it through
+    /// <see cref="EmbeddedFileStore.SetCollationResolver"/> gives that evaluator visibility into
+    /// whichever custom collations are actually active on the owning connection, through the same
+    /// safe callback wrapper (<see cref="InvokeManagedCallback{T}"/>) real value comparisons use,
+    /// so a partial predicate or expression-index key containing a custom COLLATE evaluates
+    /// correctly instead of always failing "no such collation sequence". A missing callback still
+    /// fails closed, but only lazily — the first time <see cref="Compare"/> or
+    /// <see cref="ValidateCollation"/> actually needs that specific name, never eagerly.
+    /// </summary>
+    private Func<string, Func<string, string, int>?>? _externalCollationResolver;
     private EmbeddedFileStore? _fileStore;
     private readonly string _databasePath = string.Empty;
     private readonly IFileSystem? _fileSystem;
@@ -710,7 +761,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ChangeDataCaptureSession? ChangeDataCapture = null,
         VdbeExecutionOptions? VdbeExecutionOptions = null,
         CteMutationState? CteMutationState = null,
-        EmbeddedDatabase? Database = null)
+        EmbeddedDatabase? Database = null,
+        TransactionMutationOverlay? TransactionOverlay = null,
+        EmbeddedFileReadSnapshot? TransactionPinnedSnapshot = null)
     {
         /// <summary>
         /// Per-statement cache of opened managed index-method scan state. Derived contexts created
@@ -848,6 +901,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             if (recordChangeDataCapture)
                 ChangeDataCapture?.RecordRow(this, operation, tableName, table, rowId, before, after);
+
+            // Feed the classic (non-MVCC) transaction's mutation overlay so a durable index seek
+            // can suppress stale base rows and splice in this transaction's own current values
+            // without materializing the whole index. Same funnel as the method-index maintenance
+            // call below: plain INSERT/UPDATE/DELETE, REPLACE/UPSERT conflict resolution, trigger
+            // bodies, and foreign-key cascade actions all arrive here.
+            if (TransactionOverlay is not null && Database is not null)
+                TransactionOverlay.RecordRowChange(Database, table, tableName, operation, rowId, before, after);
 
             // Feed incremental method-index maintenance. This is the one place every DML path
             // funnels through — plain INSERT/UPDATE/DELETE, REPLACE and UPSERT conflict resolution,
@@ -1187,11 +1248,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return;
 
             _ownsVirtualTableInstances = false;
+            // Ownership is already relinquished above regardless of outcome below, so every
+            // instance must get a disconnect attempt even if an earlier one throws — otherwise a
+            // single misbehaving virtual table instance would leak every later one in the same
+            // catalog (never disconnected, but also never retried since _ownsVirtualTableInstances
+            // is now false). Capture only the first failure and keep going, then rethrow once all
+            // instances have been attempted.
+            ExceptionDispatchInfo? failure = null;
             foreach (var definition in VirtualTables.Values)
             {
-                if (transaction?.IsParticipating(definition.Table) != true)
+                if (transaction?.IsParticipating(definition.Table) == true)
+                    continue;
+
+                try
+                {
                     definition.Table.DisconnectInstance();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
             }
+
+            failure?.Throw();
         }
     }
 
@@ -1639,10 +1718,27 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(compare);
 
+        var normalizedName = name.ToUpperInvariant();
         lock (_gate)
         {
-            _collations[name.ToUpperInvariant()] = compare;
+            _collations[normalizedName] = compare;
             _hasCustomCollations = true;
+            // Remembered permanently (never removed on unregister): once a built-in name has
+            // been overridden, any durable index using it can no longer be assumed to have been
+            // built under pure built-in semantics just because no override is currently active.
+            // See IsCustomCollationIndexPlanReady and _everOverriddenBuiltInCollations.
+            if (IsBuiltInCollation(normalizedName))
+                _everOverriddenBuiltInCollations.Add(normalizedName);
+
+            // A first registration, or replacing an already-registered callback, both leave every
+            // existing durable index using this name unproven against the (possibly new)
+            // callback. RefreshCollationResolverBindingLocked bumps the registry version, drops
+            // the in-memory clean/dirty cache, and rebinds the file store's resolver in the SAME
+            // lock scope as the dictionary mutation above: no statement running on another thread
+            // can ever observe the new comparator in _collations while _collationRegistryVersion
+            // / _customCollationIndexClean still describe the previous registration (which would
+            // let a stale "clean" proof be trusted against a new comparator).
+            RefreshCollationResolverBindingLocked();
         }
     }
 
@@ -1651,12 +1747,287 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ThrowIfRecursiveTriggerCallbackReentry();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
+        bool removed;
         lock (_gate)
         {
-            var removed = _collations.Remove(name.ToUpperInvariant());
+            removed = _collations.Remove(name.ToUpperInvariant());
             _hasCustomCollations = _collations.Count != 0;
-            return removed;
+
+            // Every index that depends on the now-unregistered name must stop being offered to
+            // the planner (IsCustomCollationIndexPlanReady fails closed the moment its collation
+            // has no registered callback), so the stale "clean" cache entries for it must go too
+            // — under the same lock scope as the dictionary mutation above, for the same reason
+            // RegisterCollation does.
+            if (removed)
+                RefreshCollationResolverBindingLocked();
         }
+
+        return removed;
+    }
+
+    /// <summary>
+    /// Attaches (or clears, when <paramref name="resolver"/> is <see langword="null"/>) the
+    /// fallback collation resolver this instance consults when a requested name has no entry in
+    /// its own <see cref="_collations"/> registry. See <see cref="_externalCollationResolver"/>
+    /// for why this exists: it is how <see cref="EmbeddedFileStore"/> gives its private index-
+    /// expression/predicate evaluator visibility into the owning connection's actual custom
+    /// collations, without that throwaway instance ever calling <see cref="RegisterCollation"/>
+    /// itself.
+    /// </summary>
+    internal void SetExternalCollationResolver(Func<string, Func<string, string, int>?>? resolver)
+        => _externalCollationResolver = resolver;
+
+    /// <summary>
+    /// Rebinds the attached file store's runtime collation resolver to the current registry and
+    /// drops the in-memory clean/dirty cache for every custom/overridden-collation index. Called
+    /// after every point that swaps in a different <see cref="EmbeddedFileStore"/> instance (a
+    /// reopen following an externally observed commit), so a reopened store immediately sees
+    /// whichever callbacks are already registered on this connection instead of only picking them
+    /// up on the next explicit Register call. Never touches durable storage: this is exactly the
+    /// "in memory only" tracking architecture item 4 requires.
+    /// </summary>
+    private void RefreshCollationResolverBinding()
+    {
+        lock (_gate)
+        {
+            RefreshCollationResolverBindingLocked();
+        }
+    }
+
+    /// <summary>
+    /// Same work as <see cref="RefreshCollationResolverBinding"/>, but assumes <see cref="_gate"/>
+    /// is already held by the caller. <see cref="RegisterCollation"/> and
+    /// <see cref="UnregisterCollation"/> call this from inside their own callback-dictionary-
+    /// mutating lock scope so the dictionary write, the registry-version bump, the clean-cache
+    /// invalidation, and the file store's resolver rebind all happen as one atomic step under a
+    /// single acquisition of <see cref="_gate"/> — required so no statement can ever observe a
+    /// new comparator in <see cref="_collations"/> together with a stale (pre-update)
+    /// <see cref="_collationRegistryVersion"/> or <see cref="_customCollationIndexClean"/> entry.
+    /// This never invokes an application-defined callback itself: building the resolver only
+    /// constructs a lookup lambda (see <see cref="BuildCollationResolver"/>), and rebinding the
+    /// file store's resolver field is a trivial assignment (see
+    /// <see cref="EmbeddedFileStore.SetCollationResolver"/>) — so running this under <see cref="_gate"/>
+    /// cannot deadlock or execute arbitrary callback code while the lock is held.
+    /// </summary>
+    private void RefreshCollationResolverBindingLocked()
+    {
+        _collationRegistryVersion++;
+        _customCollationIndexClean.Clear();
+        _fileStore?.SetCollationResolver(_hasCustomCollations ? BuildCollationResolver() : null);
+    }
+
+    /// <summary>
+    /// Builds the runtime collation resolver <see cref="EmbeddedFileStore"/> uses to compare
+    /// durable index/table records for a non-built-in (or overridden built-in) collation name.
+    /// Every invocation of the resolved comparison delegate is routed through
+    /// <see cref="InvokeManagedCallback{T}"/>, matching how every other application-defined
+    /// callback on this connection is dispatched (see <see cref="Compare"/>), so recursive-trigger
+    /// re-entrancy guarding and callback exception propagation behave identically for durable
+    /// index-order comparisons as for ordinary value comparisons.
+    /// </summary>
+    private Func<string, Func<string, string, int>?> BuildCollationResolver()
+        => name =>
+        {
+            Func<string, string, int>? compare;
+            lock (_gate)
+            {
+                _collations.TryGetValue(name, out compare);
+            }
+
+            if (compare is null)
+                return null;
+
+            return (left, right) => InvokeManagedCallback(() => compare(left, right));
+        };
+
+    /// <summary>
+    /// True when <paramref name="index"/> is safe to offer the planner for direct index seeks
+    /// and to accept writes against, given its declared column collations, every collation
+    /// embedded inside a partial-index predicate or expression-index body (see
+    /// <see cref="IndexExpressionSemantics.CollectEmbeddedCollationNames"/>), and the collation
+    /// callbacks currently registered on this connection.
+    /// </summary>
+    /// <remarks>
+    /// An index whose columns are all built-in and not overridden is always eligible — this is
+    /// the ordinary SQLite-compatible path and needs no tracking. An index that uses a custom
+    /// collation, or a built-in name an application has overridden with
+    /// <see cref="RegisterCollation"/>, is eligible only once every such name has a registered
+    /// callback <em>and</em> the index's durable order/content has been proven consistent with
+    /// that callback (see <see cref="EmbeddedFileStore.RevalidateIndexOrderAndContent"/>). That
+    /// proof is cached per index, keyed by both the file store's committed generation and the
+    /// collation registry version in effect when the proof was captured, and is held in memory
+    /// only — never persisted (architecture item 4). Any commit, REINDEX, callback
+    /// registration/replacement, or unregistration invalidates the relevant cache entry (a commit
+    /// changes the generation; Register/Unregister call <see cref="RefreshCollationResolverBinding"/>,
+    /// which bumps the registry version and clears the whole cache), so the next planning attempt
+    /// or write re-derives the answer instead of trusting a stale one. Never falls back to
+    /// treating an unresolved custom collation's index as if it were ordered by BINARY.
+    /// This applies identically to a collation named only inside a partial index's WHERE
+    /// predicate or an expression index's column body — an embedded name never surfaced by
+    /// <see cref="IndexExpressionSemantics.GetCollationName"/> — because replacing or
+    /// unregistering the callback such a name depends on can change which rows the predicate
+    /// admits, or what key an expression column projects, exactly as a change to an indexed-term
+    /// collation could: this method must dirty/disable the cached "ready" answer for that
+    /// membership/key relationship until the same revalidation (or a REINDEX) proves it again.
+    /// Because a collation callback can (directly, or indirectly through another callback it
+    /// invokes) itself register, replace, or unregister a collation while this method's
+    /// revalidation call is still running, both the generation and the registry version are
+    /// captured before validating and re-checked immediately after: the result is only ever
+    /// published to the cache when neither moved during validation. If either moved, the
+    /// just-computed answer reflects a state that no longer holds, so it is discarded and
+    /// validation retries against whatever is current, bounded so sustained churn fails closed
+    /// (declines) rather than loops forever or trusts a racy result.
+    /// </remarks>
+    internal bool IsCustomCollationIndexPlanReady(EmbeddedTable table, EmbeddedIndex index)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(index);
+
+        var embeddedCollationNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        IndexExpressionSemantics.CollectEmbeddedCollationNames(index, embeddedCollationNames);
+
+        const int maxAttempts = 8;
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            var needsValidation = false;
+            long registryVersion;
+            lock (_gate)
+            {
+                registryVersion = _collationRegistryVersion;
+                foreach (var column in index.Columns)
+                {
+                    var collationName = IndexExpressionSemantics.GetCollationName(table, column);
+                    switch (EvaluateCollationNameReadinessLocked(collationName))
+                    {
+                        case CollationNameReadiness.Unavailable:
+                            return false;
+                        case CollationNameReadiness.NeedsValidation:
+                            needsValidation = true;
+                            break;
+                    }
+                }
+
+                // A partial index's WHERE predicate or an expression index's column body can
+                // embed its own COLLATE reference distinct from every trailing COLLATE already
+                // checked above (see IndexExpressionSemantics.CollectEmbeddedCollationNames):
+                // apply the exact same readiness rule to those, so a callback replacement or
+                // unregistration that only an embedded name depends on still dirties this
+                // index's cached membership/key proof until it is revalidated.
+                foreach (var collationName in embeddedCollationNames)
+                {
+                    switch (EvaluateCollationNameReadinessLocked(collationName))
+                    {
+                        case CollationNameReadiness.Unavailable:
+                            return false;
+                        case CollationNameReadiness.NeedsValidation:
+                            needsValidation = true;
+                            break;
+                    }
+                }
+            }
+
+            if (!needsValidation)
+                return true;
+            // An in-memory (temp/attached-memory) catalog has no durable index image that could ever
+            // drift from the current comparer: every scan/seek already rebuilds its ordering live
+            // from the active callback, so there is nothing to prove stale.
+            if (_fileStore is null)
+                return true;
+
+            var generation = _fileStore.CommittedViewGeneration;
+            lock (_gate)
+            {
+                if (_customCollationIndexClean.TryGetValue(index.Name, out var cached)
+                    && cached.Generation == generation
+                    && cached.RegistryVersion == registryVersion)
+                {
+                    return cached.Clean;
+                }
+            }
+
+            // A durable-order/content proof is only meaningful against what is actually
+            // committed to disk. `table` here may be a per-transaction catalog clone with
+            // uncommitted DML already applied in place (the classic transaction overlay), in
+            // which case its in-memory row count races ahead of the durable b-tree this
+            // check reads via EmbeddedFileStore. `_tables` is this database's
+            // last-published (committed) catalog — untouched by any open transaction's
+            // clone until that transaction commits and republishes it — so it is the
+            // correct source for the row content this proof must match against.
+            var committedTable = _tables.TryGetValue(table.Name, out var published) ? published : table;
+            var clean = _fileStore.RevalidateIndexOrderAndContent(committedTable.Name, committedTable, index, out _);
+
+            long registryVersionAfter;
+            lock (_gate)
+            {
+                registryVersionAfter = _collationRegistryVersion;
+            }
+            var generationAfter = _fileStore?.CommittedViewGeneration ?? generation;
+
+            if (registryVersionAfter != registryVersion || generationAfter != generation)
+            {
+                // A reentrant or concurrent callback registration/replacement/unregistration
+                // (or an intervening commit) happened while validating: the answer just
+                // computed no longer reflects the current state, so it must not be published.
+                // Retry against whatever is current instead of trusting or caching it.
+                continue;
+            }
+
+            lock (_gate)
+            {
+                _customCollationIndexClean[index.Name] = (generation, registryVersion, clean);
+            }
+
+            return clean;
+        }
+
+        // Sustained concurrent/reentrant registry churn never let validation settle long enough
+        // to publish a trustworthy result: fail closed rather than offer a possibly-stale answer.
+        return false;
+    }
+
+    private enum CollationNameReadiness
+    {
+        /// <summary>Built-in, never overridden on this connection: no proof needed.</summary>
+        Skip,
+
+        /// <summary>
+        /// Either a custom/overridden collation with an active callback, or a built-in name that
+        /// has been overridden at some point (even if not right now): the index must be proven
+        /// consistent with the currently active semantics before it is trusted.
+        /// </summary>
+        NeedsValidation,
+
+        /// <summary>No callback is registered for a non-built-in (or overridden built-in) name.</summary>
+        Unavailable,
+    }
+
+    /// <summary>
+    /// Classifies one collation name a durable index depends on — whether it qualifies an
+    /// indexed term (<see cref="IndexExpressionSemantics.GetCollationName"/>) or is embedded
+    /// inside a partial-index predicate or expression-index body
+    /// (<see cref="IndexExpressionSemantics.CollectEmbeddedCollationNames"/>) — against the
+    /// collation callbacks currently registered on this connection. Must be called with
+    /// <see cref="_gate"/> already held: it reads <see cref="_collations"/> and
+    /// <see cref="_everOverriddenBuiltInCollations"/>.
+    /// </summary>
+    private CollationNameReadiness EvaluateCollationNameReadinessLocked(string collationName)
+    {
+        var isBuiltIn = IsBuiltInCollation(collationName);
+        var hasCallback = _collations.ContainsKey(collationName);
+        if (isBuiltIn && !hasCallback)
+        {
+            // Built-in name with no override currently active. Only safe to skip outright if
+            // this name has never been overridden on this connection: otherwise the durable
+            // index may still be physically ordered/uniqued (or, for an embedded predicate
+            // name, may still admit/reject rows) per the just-removed callback's semantics
+            // rather than the restored built-in ones, so it must go through the same
+            // revalidation as an active override (see _everOverriddenBuiltInCollations).
+            return _everOverriddenBuiltInCollations.Contains(collationName)
+                ? CollationNameReadiness.NeedsValidation
+                : CollationNameReadiness.Skip;
+        }
+
+        return hasCallback ? CollationNameReadiness.NeedsValidation : CollationNameReadiness.Unavailable;
     }
 
     internal ExecutionResult Execute(
@@ -1884,7 +2255,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 PersistFileCatalog(
                                     cancellableWorking,
                                     forceFullRewrite: cancellableResult.ForceFullCatalogRewrite,
-                                    busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
+                                    busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline),
+                                    targetedIndexRebuild: cancellableResult.TargetedIndexRebuild);
                             }
 
                             if (ownsVirtualTableTransaction)
@@ -2008,7 +2380,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             PersistFileCatalog(
                                 working,
                                 forceFullRewrite: result.ForceFullCatalogRewrite,
-                                busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
+                                busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline),
+                                targetedIndexRebuild: result.TargetedIndexRebuild);
                         }
                         else if (!inTransaction)
                         {
@@ -2491,7 +2864,96 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    internal (MvccTxId TransactionId, TransactionSnapshot Snapshot)
+    /// <summary>
+    /// Clones the catalog exactly like <see cref="CreateTransactionSnapshot"/> and, for a
+    /// file-backed database, additionally pins a durable pager read snapshot at the same locked
+    /// version — the snapshot a classic (non-MVCC) transaction reads through for its whole
+    /// lifetime, immune to any later peer commit. Returns a <see langword="null"/> pinned snapshot
+    /// for an in-memory/temp database, which has nothing to pin.
+    /// </summary>
+    internal (TransactionSnapshot Snapshot, EmbeddedFileReadSnapshot? PinnedSnapshot) CreateTransactionSnapshotWithPin(
+        TimeSpan busyTimeout = default)
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null)
+            {
+                RefreshTransactionSnapshotCatalogLocked(busyTimeout);
+                return (CloneTransactionSnapshotLocked(), null);
+            }
+
+            if (_fileCatalogWriteLock is null)
+                throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+
+            // Hold the per-file catalog lock across the refresh, the catalog clone, and the
+            // pager read-snapshot pin below. Releasing it in between (as an earlier version of
+            // this method did) let a peer connection commit and durably persist new WAL frames
+            // after this transaction's catalog was already cloned but before its pager read
+            // snapshot was opened, pinning a snapshot generation that no longer matched the
+            // cloned catalog. PersistFileCatalog holds this exact same lock for its whole
+            // commit, so holding it here fully serializes this snapshot against any peer
+            // commit — the catalog clone and the pinned pager snapshot are guaranteed to
+            // observe the same generation. Lock order stays _gate outer, _fileCatalogWriteLock
+            // inner, matching every other caller (e.g. BeginConcurrentTransactionSnapshot), so
+            // this does not introduce a new deadlock risk.
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
+            {
+                RefreshTransactionSnapshotCatalogUnderWriteLockLocked(busyTimeout);
+                var snapshot = CloneTransactionSnapshotLocked();
+                try
+                {
+                    BeforePinningTransactionSnapshotForTesting?.Invoke();
+                    EmbeddedFileReadSnapshot? pinnedSnapshot = null;
+                    if (_fileStore.TryOpenReadSnapshot(out var opened))
+                        pinnedSnapshot = opened;
+                    return (snapshot, pinnedSnapshot);
+                }
+                catch (Exception primaryFailure)
+                {
+                    // The pager snapshot failed to open after the catalog was already cloned
+                    // and this transaction's active count already bumped by
+                    // CloneTransactionSnapshotLocked; undo both so a failed pin leaves no trace
+                    // of a transaction that never actually began. Both cleanup steps must be
+                    // attempted even if the first one throws: EndTransaction has to run
+                    // unconditionally so a failing virtual-table disconnect can never leak the
+                    // active-transaction count registration this method already bumped. Cleanup
+                    // failures are collected and combined with the original failure instead of
+                    // letting an earlier throw skip the remaining cleanup.
+                    List<Exception>? cleanupFailures = null;
+                    try
+                    {
+                        snapshot.Catalog.DisconnectOwnedVirtualTables();
+                    }
+                    catch (Exception exception)
+                    {
+                        (cleanupFailures ??= []).Add(exception);
+                    }
+
+                    try
+                    {
+                        EndTransaction();
+                    }
+                    catch (Exception exception)
+                    {
+                        (cleanupFailures ??= []).Add(exception);
+                    }
+
+                    if (cleanupFailures is null)
+                        throw;
+
+                    throw new AggregateException([primaryFailure, .. cleanupFailures]);
+                }
+            }
+        }
+    }
+
+    /// <summary>Builds a primary-key record comparer for a WITHOUT ROWID table's mutation overlay.</summary>
+    internal SqliteIndexRecordComparer CreatePrimaryKeyRecordComparer(SqlitePrimaryKeySchema schema)
+        => _fileStore?.CreatePrimaryKeyComparer(schema)
+            ?? throw new InvalidOperationException(
+                "A primary-key record comparer requires a file-backed managed store.");
+
+    internal (MvccTxId TransactionId, TransactionSnapshot Snapshot, EmbeddedFileReadSnapshot? PinnedSnapshot)
         BeginConcurrentTransactionSnapshot(
             TimeSpan busyTimeout,
             Action? afterBegin)
@@ -2522,21 +2984,95 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     internal bool IsTransactionSnapshotGateHeldForTesting => Monitor.IsEntered(_gate);
 
-    private (MvccTxId TransactionId, TransactionSnapshot Snapshot)
+    /// <summary>
+    /// Fires inside <see cref="CreateTransactionSnapshotWithPin"/> and
+    /// <see cref="BeginConcurrentTransactionSnapshotLocked"/> after the catalog clone but
+    /// before the pager read-snapshot pin, while <see cref="_fileCatalogWriteLock"/> is still
+    /// held. Tests use this to prove the lock genuinely serializes a peer's commit out of the
+    /// window between clone and pin (the peer's commit attempt must block until this callback
+    /// returns and the lock is released), or to inject a pin failure and assert the resulting
+    /// cleanup (active-transaction count, cloned virtual tables, and -- for the BEGIN CONCURRENT
+    /// path -- the MvStore transaction being rolled back).
+    /// </summary>
+    [field: ThreadStatic]
+    internal static Action? BeforePinningTransactionSnapshotForTesting { get; set; }
+
+    private (MvccTxId TransactionId, TransactionSnapshot Snapshot, EmbeddedFileReadSnapshot? PinnedSnapshot)
         BeginConcurrentTransactionSnapshotLocked(
             MvStore store,
             Action? afterBegin)
     {
         var transaction = store.BeginTransaction(store.SchemaGeneration);
+        TransactionSnapshot? snapshot = null;
+        EmbeddedFileReadSnapshot? pinnedSnapshot = null;
         try
         {
             afterBegin?.Invoke();
-            return (transaction.Id, CloneTransactionSnapshotLocked());
+            snapshot = CloneTransactionSnapshotLocked();
+            // Pin the same durable pager read snapshot a classic (non-MVCC) transaction pins,
+            // at the same locked point in time as the cloned catalog and this MvStore
+            // transaction's begin timestamp. CommitTransaction's MergeConcurrentCatalogFromStoreLocked
+            // folds every peer's committed MvStore rows into the durable file image at commit
+            // time, so this snapshot already reflects every commit that happened before this
+            // transaction began; only this transaction's own writes and any peer commits during
+            // its lifetime need MvStore version-chain visibility, which BeginTimestamp/commit
+            // timestamp rules gate separately (see MvStore.IsVisibleTo). Null for an in-memory
+            // database, which has no durable pager to pin.
+            BeforePinningTransactionSnapshotForTesting?.Invoke();
+            if (_fileStore is not null && _fileStore.TryOpenReadSnapshot(out var opened))
+                pinnedSnapshot = opened;
+            return (transaction.Id, snapshot.Value, pinnedSnapshot);
         }
-        catch
+        catch (Exception primaryFailure)
         {
-            store.Rollback(transaction.Id);
-            throw;
+            pinnedSnapshot?.Dispose();
+
+            // If CloneTransactionSnapshotLocked already succeeded -- this transaction's active
+            // count already bumped and, for a database with virtual tables, its catalog clone
+            // already owning cloned virtual-table instances -- before the durable pager snapshot
+            // pin above failed, both must be unwound so a failed pin leaves no trace of a
+            // transaction that never actually began, exactly like the equivalent failure window
+            // in CreateTransactionSnapshotWithPin. Every cleanup step below must be attempted
+            // even if an earlier one throws, and the MvStore transaction must always be rolled
+            // back regardless of whether the catalog clone ever ran, so a failing virtual-table
+            // disconnect or EndTransaction call can never leak the MvStore transaction or its
+            // active read mark. Cleanup failures are collected and combined with the original
+            // failure instead of letting an earlier throw skip the remaining cleanup.
+            List<Exception>? cleanupFailures = null;
+            if (snapshot is { } clonedSnapshot)
+            {
+                try
+                {
+                    clonedSnapshot.Catalog.DisconnectOwnedVirtualTables();
+                }
+                catch (Exception exception)
+                {
+                    (cleanupFailures ??= []).Add(exception);
+                }
+
+                try
+                {
+                    EndTransaction();
+                }
+                catch (Exception exception)
+                {
+                    (cleanupFailures ??= []).Add(exception);
+                }
+            }
+
+            try
+            {
+                store.Rollback(transaction.Id);
+            }
+            catch (Exception exception)
+            {
+                (cleanupFailures ??= []).Add(exception);
+            }
+
+            if (cleanupFailures is null)
+                throw;
+
+            throw new AggregateException([primaryFailure, .. cleanupFailures]);
         }
     }
 
@@ -2834,7 +3370,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         TimeSpan busyTimeout = default,
         bool concurrent = false,
         bool containsSchemaChanges = false,
-        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
+        IReadOnlySet<string>? targetedIndexRebuildNames = null)
     {
         synchronousMode.Validate(nameof(synchronousMode));
 
@@ -2879,13 +3416,53 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 }
 
                 _fileStore.SetSynchronousMode(synchronousMode);
-                PersistFileCatalog(publishCatalog, pragmaHeader, forceFullRewrite, busyTimeout);
+                // Resolve targeted REINDEX names against publishCatalog -- the exact object
+                // about to be persisted, after any concurrent MVCC merge above -- rather than
+                // against the caller's original catalog. This is the one place a transaction's
+                // per-statement TargetedIndexRebuildNames (see TransactionDatabaseState) can be
+                // turned into (TableName, Table, Index) tuples without risking a stale capture:
+                // a name that no longer resolves (dropped/renamed) is silently skipped here, and
+                // is independently caught by EmbeddedFileStore.HasCurrentSchemaShape's own
+                // schema-signature check, which safely widens to the full-catalog rewrite that
+                // forceFullRewrite already forces for any REINDEX.
+                var targetedIndexRebuild = ResolveTargetedIndexRebuild(targetedIndexRebuildNames, publishCatalog);
+                PersistFileCatalog(publishCatalog, pragmaHeader, forceFullRewrite, busyTimeout, targetedIndexRebuild: targetedIndexRebuild);
             }
             finally
             {
                 ownedPublishCatalog?.DisconnectOwnedVirtualTables();
             }
         }
+    }
+
+    /// <summary>
+    /// Turns the index names a transaction's REINDEX statements tracked
+    /// (<c>TransactionDatabaseState.TargetedIndexRebuildNames</c>) into fresh
+    /// (TableName, Table, Index) tuples resolved against <paramref name="catalog"/> -- the exact
+    /// catalog object about to be persisted. Index names are unique across an entire schema, so a
+    /// single dictionary walk is enough to find each target regardless of which table it lives on.
+    /// A name that no longer resolves is simply omitted from the result.
+    /// </summary>
+    private static IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? ResolveTargetedIndexRebuild(
+        IReadOnlySet<string>? targetedIndexRebuildNames,
+        SchemaCatalog catalog)
+    {
+        if (targetedIndexRebuildNames is not { Count: > 0 })
+            return null;
+
+        List<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? resolved = null;
+        foreach (var (tableName, table) in catalog.Tables)
+        {
+            foreach (var index in table.Indexes)
+            {
+                if (!targetedIndexRebuildNames.Contains(index.Name))
+                    continue;
+                resolved ??= [];
+                resolved.Add((tableName, table, index));
+            }
+        }
+
+        return resolved;
     }
 
     /// <summary>
@@ -3766,7 +4343,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         PragmaHeaderMetadata? pragmaHeader = null,
         bool forceFullRewrite = false,
         TimeSpan busyTimeout = default,
-        bool checkpointAfterCommit = true)
+        bool checkpointAfterCommit = true,
+        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null)
     {
         if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
             throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
@@ -3786,7 +4364,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         catalog.VirtualTables,
                         pragmaHeader,
                         forceFullRewrite,
-                        previousTables: _tables)
+                        previousTables: _tables,
+                        targetedIndexRebuild: targetedIndexRebuild)
                     : _fileStore.PersistForMvccCheckpoint(
                         catalog.Tables,
                         catalog.Views,
@@ -3903,6 +4482,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var previous = _fileStore!;
             _fileStore = replacement;
             replacement = null;
+            RefreshCollationResolverBinding();
             PublishCatalog(replacementCatalog, loadedVersion);
             previous.Dispose();
             return true;
@@ -4043,6 +4623,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var previous = _fileStore;
             _fileStore = replacement;
             replacement = null;
+            RefreshCollationResolverBinding();
             _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath, foreignReadOnly: true);
             PublishCatalog(replacementCatalog);
             _foreignViewToken = _fileStore.CaptureCommittedViewToken();
@@ -4124,6 +4705,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     var previous = _fileStore;
                     _fileStore = replacement;
                     replacement = null;
+                    RefreshCollationResolverBinding();
                     _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
                     PublishCatalog(replacementCatalog);
                     previous.Dispose();
@@ -4201,6 +4783,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     var previous = _fileStore;
                     _fileStore = replacement;
                     replacement = null;
+                    RefreshCollationResolverBinding();
                     PublishCatalog(replacementCatalog, loadedVersion);
                     previous.Dispose();
                 }
@@ -4560,7 +5143,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         MvccTxId? concurrentMvccTxId = null,
         ChangeDataCaptureSession? changeDataCapture = null,
         VdbeExecutionOptions? vdbeExecutionOptions = null,
-        ManagedVirtualTableTransaction? virtualTableTransaction = null)
+        ManagedVirtualTableTransaction? virtualTableTransaction = null,
+        TransactionMutationOverlay? transactionOverlay = null,
+        EmbeddedFileReadSnapshot? transactionPinnedSnapshot = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -4589,7 +5174,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 concurrentMvccTxId,
                 changeDataCapture,
                 vdbeExecutionOptions,
-                virtualTableTransaction));
+                virtualTableTransaction,
+                transactionOverlay,
+                transactionPinnedSnapshot));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -4636,7 +5223,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             CteMutationState: statement is QueryStatement && statementMayMutate
                 ? new CteMutationState()
                 : null,
-            Database: this);
+            Database: this,
+            TransactionOverlay: transactionOverlay,
+            TransactionPinnedSnapshot: transactionPinnedSnapshot);
         try
         {
             EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
@@ -5987,6 +6576,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException(
                 "application-defined functions are prohibited in index expressions and partial index WHERE clauses");
         }
+        foreach (var column in definition.Columns)
+        {
+            // Building an index requires ordering its rows by every declared column's collation.
+            // A name that resolves to neither a SQLite built-in nor an already-registered
+            // application-defined callback can never be honored, so CREATE INDEX must fail closed
+            // here with the SQLite-style message instead of publishing an index that would silently
+            // fall back to BINARY ordering (or simply sit unusable) the first time it is planned or
+            // written to. This applies uniformly whether the catalog is file-backed or in-memory
+            // only, matching a bare custom-collation table/column CREATE TABLE rejection.
+            var collationName = IndexExpressionSemantics.GetCollationName(table, column);
+            if (!HasCollation(collationName))
+                throw new EmbeddedSqlException($"no such collation sequence: {collationName}");
+        }
         IndexExpressionSemantics.ValidateRoundTrip(statement.TableName, table, definition);
         if (definition.Unique)
             ValidateUniqueIndex(statement.TableName, table, definition, table.Rows);
@@ -6093,18 +6695,42 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         var rebuiltMethodIndex = selected.Any(static entry => entry.Index.IsMethodIndex);
 
+        if (_fileStore is null)
+        {
+            return rebuiltMethodIndex
+                ? new ExecutionResult([], [], 0, Changed: true)
+                : ExecutionResult.Empty;
+        }
+
+        // A targeted REINDEX of index/table/collation only ever needs to rebuild the
+        // selected ordinary index trees: rebuilding them in place, reusing each root
+        // page, leaves every other table and index — including one whose custom
+        // collation is not currently registered — completely untouched, so it never
+        // requires that collation's callback and never binary-compares its keys.
+        // Persistence itself has to happen where every other mutation is committed —
+        // inside EmbeddedFileStore.Persist, at the same point ForceFullCatalogRewrite
+        // is consumed — not here: a statement's Execute() runs before the catalog is
+        // durably written, so this only records the targets to attempt. Bare REINDEX
+        // (no target) still forces the unconditional full-catalog rewrite, since it may
+        // need every collation or touch every index anyway; a selection that includes a
+        // method index does too, since those are rebuilt above via their cursor, not
+        // through this file-store b-tree path. If the targeted attempt is not eligible
+        // or fails (for example because a targeted tree's on-disk image is itself
+        // corrupted and cannot be traversed to find its stale pages), ForceFullCatalogRewrite
+        // still guarantees the exact pre-existing repair behavior.
+        var targetedIndexRebuild = statement.Target is not null && selected.Count > 0 && !rebuiltMethodIndex
+            ? selected
+            : null;
+
         // The file writer's unchanged-schema full rewrite rebuilds every index tree in one
         // pager transaction. In-memory catalogs have no physical index image to rebuild.
-        return _fileStore is null
-            ? rebuiltMethodIndex
-                ? new ExecutionResult([], [], 0, Changed: true)
-                : ExecutionResult.Empty
-            : new ExecutionResult(
-                [],
-                [],
-                0,
-                Changed: true,
-                ForceFullCatalogRewrite: true);
+        return new ExecutionResult(
+            [],
+            [],
+            0,
+            Changed: true,
+            ForceFullCatalogRewrite: true,
+            TargetedIndexRebuild: targetedIndexRebuild);
     }
 
     private ExecutionResult ExecuteOptimizeIndex(OptimizeIndexStatement statement, SchemaCatalog catalog)
@@ -6232,12 +6858,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (targets.Count == 0)
             return new ExecutionResult([], [], 0, Changed: true);
 
-        foreach (var target in targets)
-        {
-            if (!target.Table.HasRowid)
-                throw new EmbeddedSqlException("ANALYZE on tables without rowid is not supported");
-        }
-
         var statistics = GetOrCreateSqliteStat1Table(catalog);
         var histogramStatistics = GetOrCreateSqliteStat4Table(catalog);
         var stat4RowIds = new Stat4RowIdAllocator(
@@ -6344,7 +6964,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private void AddTableStatistics(EmbeddedTable statistics, EmbeddedTable table)
     {
         var indexes = table.Indexes.ToArray();
-        if (!indexes.Any(static index => !index.IsPartial))
+        var hasImplicitPrimaryKeyIndex = table.WithoutRowid
+            && table.PrimaryKeySchema is { Terms.Count: > 0 }
+            && table.WithoutRowidPrimaryKeyIndexName is not null;
+        if (!hasImplicitPrimaryKeyIndex && !indexes.Any(static index => !index.IsPartial))
         {
             if (table.Rows.Count > 0)
             {
@@ -6356,8 +6979,90 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
+        if (hasImplicitPrimaryKeyIndex)
+        {
+            AddPrimaryKeyStatistic(
+                statistics,
+                table,
+                table.PrimaryKeySchema!);
+        }
+
         foreach (var index in indexes)
             AddIndexStatistic(statistics, table, index);
+    }
+
+    /// <summary>
+    /// Emits a <c>sqlite_stat1</c> row for a WITHOUT ROWID table's implicit primary-key
+    /// b-tree, mirroring <see cref="AddIndexStatistic"/> but projecting keys through the
+    /// table's <see cref="SqlitePrimaryKeySchema"/> instead of an <see cref="EmbeddedIndex"/>,
+    /// since the primary key is never represented as a member of <c>table.Indexes</c>.
+    /// </summary>
+    private void AddPrimaryKeyStatistic(
+        EmbeddedTable statistics,
+        EmbeddedTable table,
+        SqlitePrimaryKeySchema primaryKeySchema)
+    {
+        if (table.Rows.Count == 0 || primaryKeySchema.Terms.Count == 0)
+            return;
+
+        var keys = new List<SqlValue[]>(table.Rows.Count);
+        foreach (var row in table.Rows)
+            keys.Add(primaryKeySchema.ProjectKey(row));
+
+        keys.Sort((left, right) => ComparePrimaryKeyStatisticKeys(primaryKeySchema, left, right));
+        var statParts = new List<string>(primaryKeySchema.Terms.Count + 1)
+        {
+            keys.Count.ToString(CultureInfo.InvariantCulture)
+        };
+
+        for (var prefixLength = 1; prefixLength <= primaryKeySchema.Terms.Count; prefixLength++)
+        {
+            var distinctPrefixCount = 1;
+            for (var keyIndex = 1; keyIndex < keys.Count; keyIndex++)
+            {
+                if (!PrimaryKeyPrefixesEqual(primaryKeySchema, keys[keyIndex - 1], keys[keyIndex], prefixLength))
+                    distinctPrefixCount++;
+            }
+
+            var averageRowsPerDistinctPrefix = (keys.Count + distinctPrefixCount - 1) / distinctPrefixCount;
+            statParts.Add(averageRowsPerDistinctPrefix.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // SQLite stores the table name, not sqlite_autoindex_<table>_1, in sqlite_stat1.idx
+        // for a WITHOUT ROWID table's primary b-tree.
+        AddStatisticRow(statistics, table.Name, SqlValue.Text(table.Name), string.Join(" ", statParts));
+    }
+
+    private int ComparePrimaryKeyStatisticKeys(
+        SqlitePrimaryKeySchema primaryKeySchema,
+        SqlValue[] left,
+        SqlValue[] right)
+    {
+        for (var position = 0; position < primaryKeySchema.Terms.Count; position++)
+        {
+            var term = primaryKeySchema.Terms[position];
+            var comparison = Compare(left[position], right[position], term.Collation.Name);
+            if (comparison != 0)
+                return term.SortOrder == SqliteKeySortOrder.Descending ? -comparison : comparison;
+        }
+
+        return 0;
+    }
+
+    private bool PrimaryKeyPrefixesEqual(
+        SqlitePrimaryKeySchema primaryKeySchema,
+        SqlValue[] left,
+        SqlValue[] right,
+        int prefixLength)
+    {
+        for (var position = 0; position < prefixLength; position++)
+        {
+            var term = primaryKeySchema.Terms[position];
+            if (Compare(left[position], right[position], term.Collation.Name) != 0)
+                return false;
+        }
+
+        return true;
     }
 
     private void AddIndexStatistic(EmbeddedTable statistics, EmbeddedTable table, EmbeddedIndex index)
@@ -18947,14 +19652,31 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
             }
 
-            return table.Indexes.Any(index =>
+            // Partial and expression indexes are analyzed candidates too now (the shared costed
+            // planner proves partial-index implication and matches expression-index equalities
+            // itself); only a method (virtual-table) index is still categorically unsupported.
+            if (table.Indexes.Any(index =>
                 (named.IndexDirective is not IndexedByDirective indexedBy
                     || string.Equals(index.Name, indexedBy.IndexName, StringComparison.OrdinalIgnoreCase))
-                && !index.IsPartial
                 && !index.IsMethodIndex
                 && index.Columns.Count > 0
-                && index.Columns.All(static column => !column.IsExpression)
-                && TryGetSqliteStat1PrefixAverage(queryContext, table.Name, index.Name, 1, out _));
+                && TryGetSqliteStat1PrefixAverage(queryContext, table.Name, index.Name, 1, out _)))
+            {
+                return true;
+            }
+
+            return table.WithoutRowidPrimaryKeyIndexName is { } primaryKeyIndexName
+                && (named.IndexDirective is not IndexedByDirective indexedByPrimaryKey
+                    || string.Equals(
+                        indexedByPrimaryKey.IndexName,
+                        primaryKeyIndexName,
+                        StringComparison.OrdinalIgnoreCase))
+                && TryGetSqliteStat1PrefixAverage(
+                    queryContext,
+                    table.Name,
+                    table.Name,
+                    1,
+                    out _);
         }
 
         // Build the combined (left ++ right) row shape exactly as GetJoinRows does, so a
@@ -19365,8 +20087,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     term.Expression,
                     IsRegisteredScalarFunction)
                 || !IsSafeCompiledJoinOrderTerm(term, source))
+            {
                 return false;
+            }
         }
+
 
         VdbeJoinedRowPredicate? filter = null;
         if (select.Where is not null)
@@ -19629,7 +20354,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             && source.ResolveColumnIndex(column.Name) is not null;
     }
 
-    private static bool IsSafeCompiledJoinPredicate(
+    private bool IsSafeCompiledJoinPredicate(
         Expression expression,
         CompiledJoinSource source)
         => IsSafeCompiledJoinPredicate(
@@ -19637,7 +20362,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             source.ResolveColumnIndex,
             source.ResolveColumnDefinition);
 
-    private static bool IsSafeCompiledJoinPredicate(
+    private bool IsSafeCompiledJoinPredicate(
         Expression expression,
         string[] columns,
         IReadOnlyDictionary<string, int> qualifiedColumns,
@@ -19693,7 +20418,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return IsSafeCompiledJoinPredicate(expression, ResolveIndex, ResolveDefinition);
     }
 
-    private static bool IsSafeCompiledJoinPredicate(
+    private bool IsSafeCompiledJoinPredicate(
         Expression expression,
         Func<string, int?> resolveColumnIndex,
         Func<Expression, EmbeddedColumn?> resolveColumnDefinition)
@@ -19733,7 +20458,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 resolveColumnDefinition);
     }
 
-    private static bool IsSafeCompiledJoinOperand(
+    private bool IsSafeCompiledJoinOperand(
         Expression expression,
         Func<string, int?> resolveColumnIndex,
         Func<Expression, EmbeddedColumn?> resolveColumnDefinition)
@@ -19747,6 +20472,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (expression is LiteralExpression or ParameterExpression)
             return true;
+        if (expression is FunctionExpression function)
+        {
+            return !IsRegisteredScalarFunction(function.Name, function.Arguments.Count)
+                && IndexExpressionSemantics.IsDeterministicBuiltin(function)
+                && function.Filter is null
+                && function.Window is null
+                && function.Arguments.All(argument =>
+                    IsSafeCompiledJoinOperand(argument, resolveColumnIndex, resolveColumnDefinition));
+        }
+
         if (expression is not ColumnExpression column || resolveColumnIndex(column.Name) is null)
             return false;
 
@@ -19852,6 +20587,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
             }
 
+
             var leafRowIdIndices = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             if (target.HasRowId)
                 leafRowIdIndices.Add(target.Qualifier, 0);
@@ -19926,7 +20662,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var outputColumns = GetOutputColumns(join, context);
         var rawOutputColumns = GetRawOutputColumns(join, context);
         var joinPairs = BuildJoinPairs(join, context);
+        // A join node the cost-based rewrite selected for a durable index seek never falls back
+        // to the hash-equijoin probe below (equiProbe stays null once indexSeekDescription is
+        // set), so the streaming-safe-collation gate — which exists solely to protect that hash
+        // path from an arbitrary custom comparator — does not apply here. The per-row residual
+        // check still runs through Evaluate/JoinPairMatches, which already resolve the callback.
+        var hasSelectedIndexSeek = indexSeekSelections is not null && indexSeekSelections.ContainsKey(join);
         if (join.Condition is not null
+            && !hasSelectedIndexSeek
             && !IsSafeCompiledJoinPredicate(
                 join.Condition,
                 columns,
@@ -20086,34 +20829,102 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         EmbeddedIndex? index = null;
-        if (!selection.Candidate.Automatic)
+        if (selection.Candidate.IsPrimaryKey)
+        {
+            if (!table.WithoutRowid
+                || table.PrimaryKeySchema is not { Terms.Count: > 0 }
+                || table.WithoutRowidPrimaryKeyIndexName is null)
+            {
+                return false;
+            }
+        }
+        else if (!selection.Candidate.Automatic)
         {
             index = table.Indexes.FirstOrDefault(candidate =>
                 string.Equals(candidate.Name, selection.Candidate.Name, StringComparison.OrdinalIgnoreCase));
-            if (index is null
-                || index.IsPartial
-                || index.IsMethodIndex
-                || index.Columns.Any(static column => column.IsExpression))
+            if (index is null || index.IsMethodIndex)
             {
                 return false;
             }
         }
 
-        var keys = new EquiJoinKey[selection.EqualityTerms.Count];
+        var indexName = index?.Name ?? selection.Candidate.Name;
+        var keys = new EquiJoinKey?[selection.EqualityTerms.Count];
+        // Set only for a position whose candidate column is an expression column: the resolved
+        // ordinal (within left.OutputColumns) of the plain-column "outer" operand that was
+        // matched against the persisted index expression back in TryCreateJoinOrderTerm. Exactly
+        // one of keys[position]/expressionOuterOrdinal[position] is populated per position.
+        var expressionOuterOrdinal = new int?[selection.EqualityTerms.Count];
         for (var position = 0; position < keys.Length; position++)
         {
+            var candidateColumn = selection.Candidate.Columns[position];
+            if (candidateColumn.IndexExpression is { } indexExpression)
+            {
+                // The enumerator only binds this candidate column to a term shaped as an equality
+                // whose one operand structurally matches the persisted index expression (see
+                // TryMatchExpressionIndexOperand); re-derive which operand that is here rather
+                // than trust position alone, so a mismatched rewrite fails closed instead of
+                // silently seeking on the wrong value.
+                if (selection.EqualityTerms[position] is not BinaryExpression { Operator: BinaryOperator.Equal } binary)
+                {
+                    return false;
+                }
+
+                // Like TryMatchExpressionIndexOperand's own match, the persisted index's stored
+                // expression is always bare (its COLLATE is peeled off into metadata at parse
+                // time — see EmbeddedIndexFactory.Create), while this ON/WHERE operand may still
+                // carry an explicit "(...) COLLATE name" wrapper straight from the parser. Unwrap
+                // before comparing so this re-derivation agrees with the match that selected this
+                // candidate in the first place, instead of failing structurally here.
+                Expression outerOperand;
+                if (IndexExpressionSemantics.ExpressionsEqual(UnwrapCollation(binary.Left), indexExpression))
+                    outerOperand = binary.Right;
+                else if (IndexExpressionSemantics.ExpressionsEqual(UnwrapCollation(binary.Right), indexExpression))
+                    outerOperand = binary.Left;
+                else
+                {
+                    return false;
+                }
+
+                if (UnwrapCollation(outerOperand) is not ColumnExpression { BooleanKeyword: null } outerColumnExpression
+                    || ResolveJoinSideColumn(outerColumnExpression, left.OutputColumns) is not { } outerColumn)
+                {
+                    return false;
+                }
+
+                var outerDefinition = GetOutputColumnDefinition(join.Left, outerColumn, context);
+                var explicitCollation = GetExplicitCollation(binary.Left) ?? GetExplicitCollation(binary.Right);
+                var resolvedCollation = (explicitCollation
+                    ?? (outerDefinition is not null ? NormalizeDeclaredCollation(outerDefinition.Collation) : null)
+                    ?? "BINARY").ToUpperInvariant();
+                if (!string.Equals(resolvedCollation, candidateColumn.Collation, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                expressionOuterOrdinal[position] = outerColumn.Index;
+                continue;
+            }
+
             if (TryCreateEquiJoinKey(
                     selection.EqualityTerms[position],
                     join,
                     left.OutputColumns,
                     right.OutputColumns,
-                    context) is not { } key
-                || key.RightColumn.Index != selection.Candidate.Columns[position].ColumnOrdinal
+                    context,
+                    // A real persisted index/PK seeks with Compare(...) against the durable
+                    // order, never a hash bucket, so an application-defined collation is fine
+                    // here as long as it matches the candidate column's declared collation
+                    // (checked below). The synthetic "automatic covering index" path still
+                    // canonicalizes keys into a hash bucket (CanonicalizeAutomaticKey), so it
+                    // keeps requiring a built-in hashable collation.
+                    allowUnhashableCollation: !selection.Candidate.Automatic) is not { } key
+                || key.RightColumn.Index != candidateColumn.ColumnOrdinal
                 || key.RightConvertsTextToNumeric
                 || key.RightConvertsNumericToText
                 || !string.Equals(
                     key.Collation,
-                    selection.Candidate.Columns[position].Collation,
+                    candidateColumn.Collation,
                     StringComparison.OrdinalIgnoreCase))
             {
                 return false;
@@ -20129,7 +20940,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 context,
                 maximumRows: null,
                 outerRow).Rows;
-            var entries = GetManagedIndexEntries(table, index!, visibleRows, context);
+            var entries = index is not null
+                ? GetManagedIndexEntries(table, index, visibleRows, context)
+                : GetManagedPrimaryKeyEntries(table, visibleRows, context);
             var rows = entries.Select(static entry => entry.Row.Values).ToArray();
             var rowIds = table.HasRowid
                 ? entries.Select(static entry => entry.Row.RowId ?? 0L).ToArray()
@@ -20170,7 +20983,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var result = new SqlValue[keys.Length];
             for (var position = 0; position < keys.Length; position++)
             {
-                var key = keys[position];
+                if (expressionOuterOrdinal[position] is { } ordinal)
+                {
+                    if (ordinal < 0 || ordinal >= outer.Values.Length)
+                        return null;
+
+                    var exprValue = outer.Values[ordinal];
+                    if (exprValue.Kind == SqlValueKind.Null)
+                        return null;
+
+                    // TryCreateJoinOrderTerm never enables numeric/text conversion for an
+                    // expression-index term (the persisted expression's result type is not
+                    // statically known), so the outer value is used verbatim.
+                    result[position] = exprValue;
+                    continue;
+                }
+
+                var key = keys[position]!;
                 if (key.LeftColumn.Index < 0 || key.LeftColumn.Index >= outer.Values.Length)
                     return null;
 
@@ -20225,12 +21054,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ", ",
             selection.Candidate.Columns
                 .Take(keys.Length)
-                .Select(column => $"{table.Columns[column.ColumnOrdinal]}=?"));
+                .Select((column, position) => column.IndexExpression is not null
+                    ? $"{(index!.Columns[position].ExpressionSql ?? "expr")}=?"
+                    : $"{table.Columns[column.ColumnOrdinal]}=?"));
         var usingClause = selection.Candidate.Automatic
             ? "USING AUTOMATIC COVERING INDEX"
             : selection.Candidate.Covering
-                ? $"USING COVERING INDEX {index!.Name}"
-                : $"USING INDEX {index!.Name}";
+                ? $"USING COVERING INDEX {indexName}"
+                : $"USING INDEX {indexName}";
         var searchDescription = $"SEARCH {table.Name} {usingClause} ({prefix})";
         if (selection.Candidate.Automatic)
         {
@@ -20246,12 +21077,84 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return true;
         }
 
+        if (context.ConcurrentMvStore is not null
+            && context.ConcurrentMvccTxId is not null
+            && TryOpenConcurrentMvccIndexAccessor(
+                table,
+                index,
+                keys.Length,
+                selection.Candidate.Covering,
+                context,
+                out var concurrentMvccAccessor))
+        {
+            IEnumerable<VdbeJoinRow> SeekConcurrentMvcc(SqlValue[] seekKey)
+            {
+                foreach (var row in concurrentMvccAccessor.Seek(
+                             seekKey,
+                             _joinIndexSeekMetrics.IndexPageRead,
+                             _joinIndexSeekMetrics.KeyCompared,
+                             _joinIndexSeekMetrics.TableRowFetched))
+                {
+                    yield return new VdbeJoinRow(row.Values, [row.RowId]);
+                }
+            }
+
+            plan = new VdbeJoinPagerIndexSeekPlan(
+                table.Name,
+                indexName,
+                searchDescription,
+                table.Columns.Length,
+                BuildSeekKey,
+                SeekConcurrentMvcc,
+                concurrentMvccAccessor.Open,
+                concurrentMvccAccessor.Dispose,
+                _joinIndexSeekMetrics);
+            description = $"pager-index-seek {table.Name} {usingClause} ({prefix})";
+            return true;
+        }
+
+        if (context.ConcurrentMvStore is null
+            && context.ConcurrentMvccTxId is null
+            && TryOpenTransactionIndexAccessor(
+                table,
+                index,
+                keys.Length,
+                selection.Candidate.Covering,
+                context,
+                out var transactionAccessor))
+        {
+            IEnumerable<VdbeJoinRow> SeekTransactionPager(SqlValue[] seekKey)
+            {
+                foreach (var row in transactionAccessor.Seek(
+                             seekKey,
+                             _joinIndexSeekMetrics.IndexPageRead,
+                             _joinIndexSeekMetrics.KeyCompared,
+                             _joinIndexSeekMetrics.TableRowFetched))
+                {
+                    yield return new VdbeJoinRow(row.Values, [row.RowId]);
+                }
+            }
+
+            plan = new VdbeJoinPagerIndexSeekPlan(
+                table.Name,
+                indexName,
+                searchDescription,
+                table.Columns.Length,
+                BuildSeekKey,
+                SeekTransactionPager,
+                transactionAccessor.Open,
+                transactionAccessor.Dispose,
+                _joinIndexSeekMetrics);
+            description = $"pager-index-seek {table.Name} {usingClause} ({prefix})";
+            return true;
+        }
+
         if (context.ConcurrentMvStore is null
             && context.ConcurrentMvccTxId is null
             && !context.InTransaction
             && _fileStore?.TryOpenIndexAccessor(
                 table,
-                index!,
+                index,
                 keys.Length,
                 selection.Candidate.Covering,
                 sharedSnapshot: null,
@@ -20271,7 +21174,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             plan = new VdbeJoinPagerIndexSeekPlan(
                 table.Name,
-                index!.Name,
+                indexName,
                 searchDescription,
                 table.Columns.Length,
                 BuildSeekKey,
@@ -20285,7 +21188,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         plan = new VdbeJoinIndexScanPlan(
             table.Name,
-            index!.Name,
+            indexName,
             searchDescription,
             table.Columns.Length,
             MaterializeDurable,
@@ -20294,6 +21197,304 @@ public sealed partial class EmbeddedDatabase : IDisposable
             _joinIndexSeekMetrics);
         description = $"materialized-index-seek {table.Name} {usingClause} ({prefix})";
         return true;
+    }
+
+    /// <summary>
+    /// Opens a durable index accessor over a classic (non-MVCC) file-backed transaction's own
+    /// pinned pager snapshot, merged with that transaction's <see cref="TransactionMutationOverlay"/>
+    /// so a compiled-join index seek sees read-your-writes without materializing or re-sorting the
+    /// whole index. Requires <see cref="QueryContext.TransactionOverlay"/> and
+    /// <see cref="QueryContext.TransactionPinnedSnapshot"/> — both are populated only for a durable
+    /// classic transaction that has made no schema changes since BEGIN (see
+    /// <c>EmbeddedConnection</c>'s in-transaction <c>Execute</c> dispatch, which nulls the pinned
+    /// snapshot once <c>HasSchemaChanges</c> is set, automatically falling back to
+    /// <see cref="VdbeJoinIndexScanPlan"/>'s full materialization for the remainder of the
+    /// transaction).
+    /// </summary>
+    private bool TryOpenTransactionIndexAccessor(
+        EmbeddedTable table,
+        EmbeddedIndex? index,
+        int prefixLength,
+        bool covering,
+        QueryContext context,
+        out EmbeddedFileIndexAccessor accessor)
+    {
+        accessor = null!;
+        if (_fileStore is null
+            || context.TransactionOverlay is not { } overlay
+            || context.TransactionPinnedSnapshot is not { } pinnedSnapshot)
+        {
+            return false;
+        }
+
+        if (!_fileStore.TryOpenIndexAccessor(
+                table,
+                index,
+                prefixLength,
+                covering,
+                sharedSnapshot: pinnedSnapshot,
+                out var baseAccessor,
+                requireCommittedTableIdentity: false))
+        {
+            return false;
+        }
+
+        if (!overlay.TryGet(table.Name, out var tableOverlay) || tableOverlay.IsEmpty)
+        {
+            // Nothing this transaction touched for this table: the pinned base snapshot alone is
+            // already correct and read-your-writes is trivially satisfied.
+            accessor = baseAccessor;
+            return true;
+        }
+
+        if (table.WithoutRowid && table.PrimaryKeySchema is null)
+        {
+            // Unreachable in practice (CanOpenIndexAccessor already requires primary-key metadata
+            // for a WITHOUT ROWID table), but fail closed rather than risk an incorrect merge.
+            return false;
+        }
+
+        var mergeComparer = index is not null
+            ? _fileStore.CreateIndexComparer(table, index)
+            : _fileStore.CreatePrimaryKeyComparer(table.PrimaryKeySchema!);
+
+        IEnumerable<EmbeddedFileIndexSeekRow> MergeSeek(
+            SqlValue[] prefix,
+            Action? pageRead,
+            Action? keyCompared,
+            Action? tableRowFetched)
+        {
+            // Bounded by this transaction's own mutation count, never by the whole table or index.
+            var candidates = new List<(SqlValue[] Key, EmbeddedFileIndexSeekRow Row)>();
+            foreach (var candidateRow in tableOverlay.EnumerateCurrentRows())
+            {
+                if (index is not null
+                    && !IndexExpressionSemantics.Qualifies(
+                        index, table, candidateRow.Values, candidateRow.RowId, EvaluateIndexExpression))
+                {
+                    continue;
+                }
+
+                var key = _fileStore.BuildIndexMergeKey(
+                    table, index, candidateRow.Values, candidateRow.RowId, EvaluateIndexExpression);
+                if (!IndexKeyPrefixMatches(mergeComparer, key, prefix))
+                    continue;
+
+                candidates.Add((key, candidateRow));
+            }
+
+            candidates.Sort((left, right) => mergeComparer.Compare(left.Key, right.Key));
+
+            return MergeTransactionIndexRows(
+                baseAccessor.Seek(prefix, pageRead, keyCompared, tableRowFetched),
+                candidates,
+                mergeComparer,
+                table,
+                index,
+                tableOverlay);
+        }
+
+        accessor = new EmbeddedFileIndexAccessor(MergeSeek, baseAccessor.Open, baseAccessor.Dispose);
+        return true;
+    }
+
+    /// <summary>
+    /// Lazily merge-joins the pinned base pager's sorted seek stream with this transaction's own
+    /// sorted overlay candidates for the same seek prefix, suppressing any base row identity this
+    /// transaction has touched — whether it now reads live under a new key or was deleted — so the
+    /// caller never observes a stale entry alongside its replacement, while preserving the durable
+    /// pager's exact SQLite key order and duplicate handling.
+    /// </summary>
+    private IEnumerable<EmbeddedFileIndexSeekRow> MergeTransactionIndexRows(
+        IEnumerable<EmbeddedFileIndexSeekRow> baseRows,
+        List<(SqlValue[] Key, EmbeddedFileIndexSeekRow Row)> candidates,
+        SqliteIndexRecordComparer comparer,
+        EmbeddedTable table,
+        EmbeddedIndex? index,
+        TransactionTableOverlay tableOverlay)
+    {
+        using var baseEnumerator = baseRows.GetEnumerator();
+        var candidateIndex = 0;
+        var hasBase = baseEnumerator.MoveNext();
+        while (true)
+        {
+            while (hasBase && IsSuppressedByTransactionOverlay(tableOverlay, table, baseEnumerator.Current))
+                hasBase = baseEnumerator.MoveNext();
+
+            if (!hasBase && candidateIndex >= candidates.Count)
+                yield break;
+
+            if (!hasBase)
+            {
+                yield return candidates[candidateIndex++].Row;
+                continue;
+            }
+
+            if (candidateIndex >= candidates.Count)
+            {
+                yield return baseEnumerator.Current;
+                hasBase = baseEnumerator.MoveNext();
+                continue;
+            }
+
+            var baseKey = _fileStore!.BuildIndexMergeKey(
+                table, index, baseEnumerator.Current.Values, baseEnumerator.Current.RowId, EvaluateIndexExpression);
+            if (comparer.Compare(baseKey, candidates[candidateIndex].Key) <= 0)
+            {
+                yield return baseEnumerator.Current;
+                hasBase = baseEnumerator.MoveNext();
+            }
+            else
+            {
+                yield return candidates[candidateIndex++].Row;
+            }
+        }
+    }
+
+    private static bool IsSuppressedByTransactionOverlay(
+        TransactionTableOverlay tableOverlay,
+        EmbeddedTable table,
+        EmbeddedFileIndexSeekRow row)
+    {
+        if (table.HasRowid)
+            return row.RowId is { } rowId && tableOverlay.TryGetByRowId(rowId, out _);
+
+        var primaryKey = table.PrimaryKeySchema!.ProjectKey(row.Values);
+        return tableOverlay.TryGetByPrimaryKey(primaryKey, out _);
+    }
+
+    /// <summary>
+    /// Opens a durable index accessor over a BEGIN CONCURRENT transaction's own pinned durable
+    /// b-tree snapshot (<see cref="QueryContext.TransactionPinnedSnapshot"/>, captured at BEGIN
+    /// CONCURRENT — see <c>BeginConcurrentTransactionSnapshotLocked</c>), merged lazily with this
+    /// transaction's visible <see cref="MvStore"/> effects via <see
+    /// cref="MvccDualCursor.EnumerateVisibleIndexRows"/> — the same two-peek merge primitive the
+    /// single-table <see cref="GetConcurrentMvccIndexRows"/> path uses — so a compiled-join index
+    /// seek sees read-your-writes (and any peer transaction committed before this reader's begin
+    /// timestamp) without materializing or re-sorting the whole durable index. Mirrors <see
+    /// cref="TryOpenTransactionIndexAccessor"/>, substituting the concurrent version store for the
+    /// classic <see cref="TransactionMutationOverlay"/>.
+    /// </summary>
+    private bool TryOpenConcurrentMvccIndexAccessor(
+        EmbeddedTable table,
+        EmbeddedIndex? index,
+        int prefixLength,
+        bool covering,
+        QueryContext context,
+        out EmbeddedFileIndexAccessor accessor)
+    {
+        accessor = null!;
+        if (_fileStore is not { } fileStore
+            || context.ConcurrentMvStore is not { } store
+            || context.ConcurrentMvccTxId is not { } txId
+            || context.TransactionPinnedSnapshot is not { } pinnedSnapshot)
+        {
+            return false;
+        }
+
+        if (!fileStore.TryOpenIndexAccessor(
+                table,
+                index,
+                prefixLength,
+                covering,
+                sharedSnapshot: pinnedSnapshot,
+                out var baseAccessor,
+                requireCommittedTableIdentity: false))
+        {
+            return false;
+        }
+
+        if (table.WithoutRowid && table.PrimaryKeySchema is null)
+        {
+            // Unreachable in practice (CanOpenIndexAccessor already requires primary-key metadata
+            // for a WITHOUT ROWID table), but fail closed rather than risk an incorrect merge.
+            return false;
+        }
+
+        IComparer<MvccKey> tableKeyComparer = MvccKeyComparer.Integer;
+        if (!table.HasRowid)
+        {
+            var primaryKey = table.PrimaryKeySchema!;
+            tableKeyComparer = MvccKeyComparer.ForRecord(
+                new SqliteIndexRecordComparer(
+                    context.MvccTextEncoding,
+                    primaryKey.Terms.Select(term =>
+                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray()));
+        }
+
+        var mergeComparer = index is not null
+            ? fileStore.CreateIndexComparer(table, index)
+            : fileStore.CreatePrimaryKeyComparer(table.PrimaryKeySchema!);
+        var indexComparer = Comparer<MvccDualCursor.IndexRow>.Create(
+            (left, right) => mergeComparer.Compare(left.IndexKey, right.IndexKey));
+        var tableId = store.GetOrCreateTableId(txId, table.Name);
+
+        IEnumerable<EmbeddedFileIndexSeekRow> MergeSeek(
+            SqlValue[] prefix,
+            Action? pageRead,
+            Action? keyCompared,
+            Action? tableRowFetched)
+        {
+            IEnumerable<MvccDualCursor.IndexRow> EnumerateBaseRows()
+            {
+                foreach (var row in baseAccessor.Seek(prefix, pageRead, keyCompared, tableRowFetched))
+                {
+                    var rowId = row.RowId ?? 0L;
+                    yield return new MvccDualCursor.IndexRow(
+                        GetMvccTableKey(table, row.Values, rowId),
+                        fileStore.BuildIndexMergeKey(table, index, row.Values, row.RowId, EvaluateIndexExpression),
+                        row.Values);
+                }
+            }
+
+            MvccDualCursor.IndexRow? ProjectOverlay(MvccVisibleRow visible)
+            {
+                var cells = visible.Cells
+                    ?? throw new InvalidOperationException("A visible MVCC index row has no payload.");
+                var rowId = table.HasRowid ? visible.Key.Integer : (long?)null;
+                if (index is not null
+                    && !IndexExpressionSemantics.Qualifies(index, table, cells, rowId, EvaluateIndexExpression))
+                {
+                    return null;
+                }
+
+                var key = fileStore.BuildIndexMergeKey(table, index, cells, rowId, EvaluateIndexExpression);
+                if (!IndexKeyPrefixMatches(mergeComparer, key, prefix))
+                    return null;
+
+                return new MvccDualCursor.IndexRow(visible.Key, key, cells);
+            }
+
+            foreach (var merged in MvccDualCursor.EnumerateVisibleIndexRows(
+                         store,
+                         txId,
+                         tableId,
+                         EnumerateBaseRows(),
+                         ProjectOverlay,
+                         indexComparer,
+                         tableKeyComparer,
+                         _joinIndexSeekMetrics.BaseRowSuppressed,
+                         _joinIndexSeekMetrics.OverlayRowExamined))
+            {
+                yield return new EmbeddedFileIndexSeekRow(
+                    merged.Cells,
+                    table.HasRowid ? merged.TableKey.Integer : null);
+            }
+        }
+
+        accessor = new EmbeddedFileIndexAccessor(MergeSeek, baseAccessor.Open, baseAccessor.Dispose);
+        return true;
+    }
+
+    private static bool IndexKeyPrefixMatches(SqliteIndexRecordComparer comparer, SqlValue[] key, SqlValue[] prefix)
+    {
+        if (prefix.Length == 0)
+            return true;
+        if (key.Length < prefix.Length)
+            return false;
+
+        var slice = key.Length == prefix.Length ? key : key[..prefix.Length];
+        return comparer.Compare(slice, prefix) == 0;
     }
 
     /// <summary>
@@ -21058,6 +22259,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
         && !collation.Equals("BINARY", StringComparison.OrdinalIgnoreCase)
         && !collation.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
         && !collation.Equals("RTRIM", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// True when <paramref name="collation"/> can be handed to <see cref="Compare"/> without it
+    /// throwing "no such collation sequence": every built-in name always resolves (falling back
+    /// to its built-in behavior if not overridden), and a custom name resolves once it has a
+    /// registered <see cref="RegisterCollation"/> callback.
+    /// </summary>
+    private bool IsCollationResolvable(string? collation)
+        => IsBuiltInCollation(collation) || _collations.ContainsKey(collation!);
 
     private static bool CollationsEquivalent(string? left, string? right) =>
         string.Equals(
@@ -24868,6 +26078,12 @@ out bool hasReturning)
 
         var index = table.Indexes.FirstOrDefault(candidate =>
             string.Equals(candidate.Name, indexedBy.IndexName, StringComparison.OrdinalIgnoreCase));
+        if (index is null
+            && table.WithoutRowidPrimaryKeyIndexName is { } primaryKeyIndexName
+            && string.Equals(primaryKeyIndexName, indexedBy.IndexName, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
         if (index is null)
             throw new EmbeddedSqlException($"no such index: {indexedBy.IndexName}");
         if (index.Where is null)
@@ -25153,12 +26369,14 @@ out bool hasReturning)
         // Score favors equality SEARCH depth, ORDER BY elision, and covering projection.
         foreach (var index in table.Indexes)
         {
-            // Skip indexes the managed planner cannot evaluate (registered functions /
-            // overridden collations), and skip partial indexes whose WHERE is not
-            // implied by the query predicate. Plain (non-partial, non-expression)
-            // indexes are eligible for SEARCH and ORDER BY elision.
+            // Skip indexes the managed planner cannot evaluate (registered functions), and
+            // indexes whose custom/overridden collation has no registered callback yet or is
+            // marked dirty pending REINDEX (see IsCustomCollationIndexPlanReady) — a clean
+            // custom-collation index is fully eligible here, same as a built-in one. Also skip
+            // partial indexes whose WHERE is not implied by the query predicate. Plain
+            // (non-partial, non-expression) indexes are eligible for SEARCH and ORDER BY elision.
             if (IndexUsesRegisteredFunctions(index)
-                || IndexUsesOverriddenBuiltInCollation(index, table)
+                || !IsCustomCollationIndexPlanReady(table, index)
                 || !IndexExpressionSemantics.PredicateImplies(
                     statement.Where,
                     index.Where,
@@ -25749,10 +26967,6 @@ out bool hasReturning)
             || index.Where is not null
                 && IndexExpressionSemantics.ContainsFunction(index.Where, IsRegisteredScalarFunction);
 
-    private bool IndexUsesOverriddenBuiltInCollation(EmbeddedIndex index, EmbeddedTable table)
-        => index.Columns.Any(term =>
-            IsOverriddenBuiltInCollation(IndexExpressionSemantics.GetCollationName(table, term)));
-
     private static bool WhereUsesIndexTerm(
         Expression? expression,
         EmbeddedTable table,
@@ -25879,16 +27093,63 @@ out bool hasReturning)
                 left,
                 right));
         var tableId = store.GetOrCreateTableId(txId, plan.Source.Name);
-        var baseOrder = table.GetOrCreateIndexScanOrder(
-            plan.Index.Name,
-            () => BuildBaseIndexScanOrder(
-                table,
-                plan.Index,
-                context,
-                indexComparer));
 
+        // Prefer the transaction's own pinned durable b-tree snapshot: an unconditional ascending
+        // scan of the committed index (see EmbeddedFileStore.ScanCommittedRowidIndexAscending et
+        // al.) whose physical key order is provably identical to indexComparer (both derive from
+        // the same declared collation/sort-direction terms — see CreateIndexComparer), so no
+        // in-memory sort/materialization of the base index is needed. Only when the file store is
+        // unavailable, the pinned snapshot was invalidated by a schema change, or the table/index
+        // is otherwise ineligible (e.g. an in-memory table) does this fall back to the classic
+        // table.GetOrCreateIndexScanOrder full-heap materialization.
         IEnumerable<MvccDualCursor.IndexRow> EnumerateBaseRows()
         {
+            if (_fileStore is { } fileStore
+                && context.TransactionPinnedSnapshot is { } pinnedSnapshot
+                && fileStore.TryOpenIndexFullScanAccessor(
+                    table,
+                    plan.Index,
+                    covering: false,
+                    pinnedSnapshot,
+                    out var scanAccessor,
+                    requireCommittedTableIdentity: false))
+            {
+                _joinIndexSeekMetrics.DurableCursorPlanCreated();
+                scanAccessor.Open();
+                try
+                {
+                    foreach (var row in scanAccessor.Scan(
+                                 _joinIndexSeekMetrics.IndexPageRead,
+                                 _joinIndexSeekMetrics.TableRowFetched))
+                    {
+                        context.CheckInterrupt();
+                        var rowId = row.RowId ?? 0L;
+                        yield return new MvccDualCursor.IndexRow(
+                            GetMvccTableKey(table, row.Values, rowId),
+                            IndexExpressionSemantics.ProjectKey(
+                                plan.Index,
+                                table,
+                                row.Values,
+                                table.HasRowid ? rowId : null,
+                                EvaluateIndexExpression),
+                            row.Values);
+                    }
+                }
+                finally
+                {
+                    scanAccessor.Dispose();
+                }
+
+                yield break;
+            }
+
+            var baseOrder = table.GetOrCreateIndexScanOrder(
+                plan.Index.Name,
+                () => BuildBaseIndexScanOrder(
+                    table,
+                    plan.Index,
+                    context,
+                    indexComparer));
             foreach (var position in baseOrder)
             {
                 context.CheckInterrupt();
@@ -25946,7 +27207,9 @@ out bool hasReturning)
             EnumerateBaseRows(),
             ProjectOverlay,
             indexComparer,
-            tableKeyComparer);
+            tableKeyComparer,
+            _joinIndexSeekMetrics.BaseRowSuppressed,
+            _joinIndexSeekMetrics.OverlayRowExamined);
 
         IEnumerable<SourceRow> EnumerateSourceRows()
         {
@@ -26065,7 +27328,12 @@ out bool hasReturning)
                     EvaluateIndexExpression)));
         }
 
-        entries.Sort((left, right) => CompareManagedIndexEntries(table, index, left, right));
+        // See EmbeddedFileStore.SortPropagatingComparerExceptions: List<T>.Sort wraps any
+        // exception the comparison delegate throws (for example an application-defined
+        // collation callback) in an opaque InvalidOperationException, so callers must go
+        // through the unwrapping helper to observe the callback's real exception.
+        EmbeddedFileStore.SortPropagatingComparerExceptions(
+            entries, (left, right) => CompareManagedIndexEntries(table, index, left, right));
         return entries;
     }
 
@@ -26155,7 +27423,7 @@ out bool hasReturning)
         foreach (var candidate in table.Indexes)
         {
             if (IndexUsesRegisteredFunctions(candidate)
-                || IndexUsesOverriddenBuiltInCollation(candidate, table)
+                || !IsCustomCollationIndexPlanReady(table, candidate)
                 || candidate.IsPartial
                 || !IndexExpressionSemantics.PredicateImplies(
                     branch,
@@ -26260,10 +27528,24 @@ out bool hasReturning)
         for (var position = 0; position < index.Columns.Count; position++)
         {
             var term = index.Columns[position];
-            var comparison = Compare(
-                left.Key[position],
-                right.Key[position],
-                IndexExpressionSemantics.GetCollationName(table, term));
+            var collationName = IndexExpressionSemantics.GetCollationName(table, term);
+
+            // This managed in-memory index emulation (used for e.g. INDEXED BY forced scans)
+            // recomputes its key order live from the currently visible rows on every call -- it
+            // never reads a possibly-stale durable image, so it has nothing to defer via REINDEX.
+            // But a term whose collation has no registered callback yet must still not throw the
+            // whole scan closed the way a genuine seek/build against durable storage would
+            // (architecture item 3 is about writes/builds/seeks, not a plain unordered scan): skip
+            // it, exactly like SqliteIndexRecordComparer.HasDeferredTerms treats an unresolvable
+            // durable term as "no discrimination", falling through to the next term or the
+            // rowid/primary-key tiebreaker. The rows produced are unaffected -- only their
+            // relative order might not reflect that term -- and any caller that actually needs
+            // this index's collation-defined order gates on IsCustomCollationIndexPlanReady
+            // before ever choosing this in-memory path over a durable direct seek.
+            if (!IsCollationResolvable(collationName))
+                continue;
+
+            var comparison = Compare(left.Key[position], right.Key[position], collationName);
             if (comparison != 0)
                 return term.Descending ? -comparison : comparison;
         }
@@ -26295,6 +27577,46 @@ out bool hasReturning)
                     ? -comparison
                     : comparison;
             }
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// The <see cref="GetManagedIndexEntries"/> analog for the implicit primary-key join
+    /// candidate: keys are projected through the table's <see cref="SqlitePrimaryKeySchema"/>
+    /// rather than an <see cref="EmbeddedIndex"/>, since the primary key is never one of
+    /// <c>table.Indexes</c>. Every visible row qualifies (a primary key has no partial predicate).
+    /// </summary>
+    private List<(SourceRow Row, SqlValue[] Key)> GetManagedPrimaryKeyEntries(
+        EmbeddedTable table,
+        IReadOnlyList<SourceRow> visibleRows,
+        QueryContext context)
+    {
+        var primaryKeySchema = table.PrimaryKeySchema
+            ?? throw new InvalidOperationException("WITHOUT ROWID table has no primary-key metadata.");
+        var entries = new List<(SourceRow Row, SqlValue[] Key)>(visibleRows.Count);
+        foreach (var row in visibleRows)
+        {
+            context.CheckInterrupt();
+            entries.Add((row, primaryKeySchema.ProjectKey(row.Values)));
+        }
+
+        entries.Sort((left, right) => ComparePrimaryKeyEntries(primaryKeySchema, left, right));
+        return entries;
+    }
+
+    private int ComparePrimaryKeyEntries(
+        SqlitePrimaryKeySchema primaryKeySchema,
+        (SourceRow Row, SqlValue[] Key) left,
+        (SourceRow Row, SqlValue[] Key) right)
+    {
+        for (var position = 0; position < primaryKeySchema.Terms.Count; position++)
+        {
+            var term = primaryKeySchema.Terms[position];
+            var comparison = Compare(left.Key[position], right.Key[position], term.Collation.Name);
+            if (comparison != 0)
+                return term.SortOrder == SqliteKeySortOrder.Descending ? -comparison : comparison;
         }
 
         return 0;
@@ -30898,7 +32220,8 @@ out bool hasReturning)
         JoinTableSource source,
         IReadOnlyList<OutputColumn> leftColumns,
         IReadOnlyList<OutputColumn> rightColumns,
-        QueryContext context)
+        QueryContext context,
+        bool allowUnhashableCollation = false)
     {
         if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } binary)
             return null;
@@ -30939,7 +32262,8 @@ out bool hasReturning)
             leftColumn,
             rightColumn,
             context,
-            explicitCollation);
+            explicitCollation,
+            allowUnhashableCollation);
     }
 
     private EquiJoinKey? TryCreateEquiJoinKey(
@@ -30947,17 +32271,25 @@ out bool hasReturning)
         OutputColumn leftColumn,
         OutputColumn rightColumn,
         QueryContext context,
-        string? explicitCollation = null)
+        string? explicitCollation = null,
+        bool allowUnhashableCollation = false)
     {
         var leftDefinition = GetOutputColumnDefinition(source.Left, leftColumn, context);
         var rightDefinition = GetOutputColumnDefinition(source.Right, rightColumn, context);
         var leftAffinity = GetJoinKeyAffinity(leftDefinition);
         var rightAffinity = GetJoinKeyAffinity(rightDefinition);
+        // Read the raw declared collation directly rather than routing each operand through
+        // NormalizeDeclaredCollation first: that helper substitutes "BINARY" for a null/absent
+        // collation, so chaining NormalizeDeclaredCollation(left) ?? NormalizeDeclaredCollation(right)
+        // would short-circuit on "BINARY" whenever the left side has no explicit COLLATE and never
+        // consult the right side's declared collation, contradicting SQLite's actual resolution
+        // order (explicit COLLATE > left declared > right declared > BINARY default).
         var collation = explicitCollation
-            ?? (leftDefinition is not null ? NormalizeDeclaredCollation(leftDefinition.Collation) : null)
-            ?? (rightDefinition is not null ? NormalizeDeclaredCollation(rightDefinition.Collation) : null)
+            ?? leftDefinition?.Collation
+            ?? rightDefinition?.Collation
             ?? "BINARY";
-        if (!IsHashableJoinKeyCollation(collation) || IsUnsafeCompiledCollation(collation))
+        if (!allowUnhashableCollation
+            && (!IsHashableJoinKeyCollation(collation) || IsUnsafeCompiledCollation(collation)))
         {
             return null;
         }
@@ -30971,6 +32303,7 @@ out bool hasReturning)
             RightConvertsNumericToText: leftAffinity == ColumnAffinity.Text && rightAffinity is null,
             Collation: collation.ToUpperInvariant());
     }
+
 
     private static OutputColumn? ResolveJoinSideColumn(
         ColumnExpression operand,
@@ -39778,8 +41111,18 @@ out bool hasReturning)
             return;
         }
 
-        if (!_collations.ContainsKey(collation))
-            throw new EmbeddedSqlException($"no such collation sequence: {collation}");
+        if (_collations.ContainsKey(collation))
+            return;
+
+        // See _externalCollationResolver: an instance with no registrations of its own (the
+        // index-expression/predicate evaluator EmbeddedFileStore owns) still needs to recognize a
+        // name the owning connection has actually registered, or every partial-index predicate and
+        // expression-index key using a custom COLLATE would fail closed even while the callback is
+        // live.
+        if (_externalCollationResolver?.Invoke(collation) is not null)
+            return;
+
+        throw new EmbeddedSqlException($"no such collation sequence: {collation}");
     }
 
     private bool TryGetAggregateFunction(string name, int arity, out ManagedAggregateFunction function)
@@ -39806,6 +41149,26 @@ out bool hasReturning)
                 return InvokeManagedCallback(
                     () => compare(left.AsText(), right.AsText()));
             }
+
+            // Consult the external resolver BEFORE the built-in BINARY/NOCASE/RTRIM fallback.
+            // The own-registry check above only sees registrations made directly on this
+            // instance; the private index-expression/partial-predicate evaluator (see
+            // _externalCollationResolver) never registers anything of its own and relies
+            // entirely on this resolver to see the owning connection's actual collations —
+            // including an application override of a built-in name. Checking the hard-coded
+            // fallback first would let such a BINARY/NOCASE/RTRIM override silently miss inside
+            // a partial-index predicate or expression-index key while it is honored everywhere
+            // else. On the owning connection itself _externalCollationResolver is always null
+            // (it is only ever set via SetExternalCollationResolver on a throwaway evaluator
+            // instance) and any override is already caught by the own-registry check above, so
+            // this preserves ordinary EmbeddedDatabase.Compare precedence there. The resolver's
+            // own delegate already routes the invocation through the owning connection's
+            // InvokeManagedCallback (see BuildCollationResolver), so it is called directly
+            // rather than re-wrapped here.
+            var external = _externalCollationResolver?.Invoke(collation ?? "BINARY");
+            if (external is not null)
+                return external(left.AsText(), right.AsText());
+
             if (collation is null || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase))
                 return string.CompareOrdinal(left.AsText(), right.AsText());
             if (string.Equals(collation, "NOCASE", StringComparison.OrdinalIgnoreCase))
@@ -46356,6 +47719,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                     transaction.Catalog = pair.Value.Catalog;
                     previous.DisconnectOwnedVirtualTables(transaction.VirtualTableTransaction);
                     transaction.HasChanges = true;
+                    // Publishing a replaced trigger-body catalog is not a targeted index
+                    // rebuild: an earlier REINDEX in this same transaction must not cause
+                    // commit to skip persisting this catalog swap.
+                    transaction.HasNonTargetedIndexRebuildChange = true;
                     transaction.ForceFullCatalogRewrite |= pair.Value.ForceFullCatalogRewrite;
                     if (!ReferenceEquals(pair.Key, connection._tempDatabase))
                         connection._transactionWriteDatabase = pair.Key;
@@ -46492,7 +47859,14 @@ public sealed partial class EmbeddedConnection : IDisposable
         if (GetTransactionState(_tempDatabase) is { } state)
         {
             if (EmbeddedDatabase.RemoveForeignTargetTriggers(state.Catalog, schema, droppedName))
+            {
+                // Pruning a dangling temp trigger is a catalog mutation, not a targeted index
+                // rebuild: an earlier REINDEX in this same transaction must not cause commit
+                // to skip persisting this removal.
                 state.HasChanges = true;
+                state.HasNonTargetedIndexRebuildChange = true;
+            }
+
             return;
         }
 
@@ -47006,6 +48380,10 @@ public sealed partial class EmbeddedConnection : IDisposable
             state.Catalog = pending.Catalog;
             previous.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
             state.HasChanges = true;
+            // Rewriting the temp trigger catalog for a rename is not a targeted index
+            // rebuild: an earlier REINDEX in this same transaction must not cause commit
+            // to skip persisting this rewrite.
+            state.HasNonTargetedIndexRebuildChange = true;
             state.PragmaHeader = state.PragmaHeader with
             {
                 SchemaVersion = unchecked(state.PragmaHeader.SchemaVersion + 1),
@@ -47089,9 +48467,62 @@ public sealed partial class EmbeddedConnection : IDisposable
         public bool HasSnapshotPragmaHeader { get; set; }
         public bool HasSchemaChanges { get; set; }
         public bool ForceFullCatalogRewrite { get; set; }
+
+        /// <summary>
+        /// Index names a REINDEX statement anywhere in this transaction (or an enclosing
+        /// savepoint) targeted for an in-place rebuild, unioned across every such statement.
+        /// Deliberately just names, never the <see cref="EmbeddedTable"/>/<see
+        /// cref="EmbeddedIndex"/> objects a statement's <c>ExecutionResult</c> captured at the
+        /// time it ran: a later statement in the same transaction can still mutate that same
+        /// table, which would leave a captured object stale. Resolving these names against the
+        /// transaction's actual final catalog at commit (see the <c>CommitTransaction</c>
+        /// overload below) means intervening DML can never be rebuilt from stale data, and an
+        /// intervening schema/index change that drops or redefines the target is caught by
+        /// <c>EmbeddedFileStore.HasCurrentSchemaShape</c>'s existing schema-signature check,
+        /// which safely widens to the unconditional full-catalog rewrite
+        /// <see cref="ForceFullCatalogRewrite"/> already guarantees for any REINDEX.
+        /// </summary>
+        public HashSet<string> TargetedIndexRebuildNames { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Set whenever this transaction changed anything other than the ordinary index trees
+        /// named by <see cref="TargetedIndexRebuildNames"/> -- any INSERT/UPDATE/DELETE, pragma
+        /// header write, schema change, CDC record, virtual-table mutation, bare/collation
+        /// REINDEX, or a REINDEX that rebuilt a method index. A targeted, in-place index rebuild
+        /// (<c>EmbeddedFileStore.TryPersistTargetedIndexRebuild</c>) only ever rewrites the named
+        /// index trees themselves; it never re-derives or rewrites any table's row storage. If
+        /// commit only checked <see cref="TargetedIndexRebuildNames"/> for emptiness it would
+        /// silently drop every other durable change the moment a targeted REINDEX shares a
+        /// transaction with them -- the in-memory catalog would look correct until the store is
+        /// reopened, at which point the un-persisted DML/schema/CDC/virtual-table changes are
+        /// simply gone. Commit must therefore widen to the full-catalog rewrite (which
+        /// <see cref="ForceFullCatalogRewrite"/> already guarantees runs for any REINDEX) whenever
+        /// this is true, by treating <see cref="TargetedIndexRebuildNames"/> as empty.
+        /// </summary>
+        public bool HasNonTargetedIndexRebuildChange { get; set; }
         public HashSet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations { get; } = [];
         public EmbeddedDatabase.ManagedVirtualTableTransaction VirtualTableTransaction { get; } = new();
+
+        /// <summary>
+        /// The durable pager read snapshot pinned at BEGIN for a file-backed transaction, coupled
+        /// to <see cref="Catalog"/>/<see cref="Version"/> at the same locked point in time. Also
+        /// populated for a concurrent (MVCC) transaction — a durable index accessor opened
+        /// against this snapshot merges lazily with visible <c>MvStore</c> effects instead of
+        /// materializing the base index (see <c>TryOpenConcurrentMvccIndexAccessor</c>). Null for
+        /// an in-memory/temp database. Disposed centrally in ResetTransactionState.
+        /// </summary>
+        public EmbeddedFileReadSnapshot? PinnedSnapshot { get; set; }
+
+        /// <summary>
+        /// Per-table mutation bookkeeping fed by every DML path a classic (non-MVCC) transaction
+        /// executes, so a durable index seek against <see cref="PinnedSnapshot"/> can merge in
+        /// read-your-writes without materializing the whole index. Always null for a concurrent
+        /// (MVCC) transaction — that transaction's own writes live in the attached <c>MvStore</c>
+        /// instead and are merged in via <c>ConcurrentMvStore</c>/<c>ConcurrentMvccTxId</c>.
+        /// </summary>
+        public TransactionMutationOverlay? Overlay { get; set; }
     }
+
 
     private readonly record struct RoutedStatement(
         EmbeddedDatabase Database,
@@ -47781,6 +49212,13 @@ public sealed partial class EmbeddedConnection : IDisposable
                 routed.Database.TransactionLock.ThrowIfReadBlocked(this, BusyTimeout);
                 TransactionDatabaseState? transactionState = null;
                 EmbeddedDatabase.SchemaCatalog? statementCatalog = null;
+                // Mirrors statementCatalog: captured before a mutating statement runs so every
+                // failure path that discards the cloned catalog also discards this statement's
+                // overlay writes (QueryContext.ReportRowChange mutates the overlay in place, with
+                // no clone-on-write of its own), and left alone on every path that keeps the
+                // catalog (success, and SQLite's ON CONFLICT FAIL / trigger-depth PreserveChanges
+                // semantics, which likewise keep the statement's partial catalog changes).
+                TransactionMutationOverlayCheckpoint? statementOverlayCheckpoint = null;
                 int? virtualTableTransactionCheckpoint = null;
                 var retainVirtualTableParticipation = false;
                 HashSet<EmbeddedDatabase.ForeignKeyViolation>? deferredBefore = null;
@@ -47888,6 +49326,9 @@ public sealed partial class EmbeddedConnection : IDisposable
                             statementCatalog = routedMayMutate
                                 ? transactionState.Catalog.Clone()
                                 : transactionState.Catalog;
+                            statementOverlayCheckpoint = routedMayMutate
+                                ? transactionState.Overlay?.CreateCheckpoint()
+                                : null;
                             result = routed.Database.Execute(
                                 routed.Statement,
                                 parameters,
@@ -47909,7 +49350,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 concurrentMvccTxId: concurrentTxId,
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
-                                virtualTableTransaction: transactionState.VirtualTableTransaction);
+                                virtualTableTransaction: transactionState.VirtualTableTransaction,
+                                transactionOverlay: transactionState.Overlay,
+                                transactionPinnedSnapshot: transactionState.HasSchemaChanges
+                                    ? null
+                                    : transactionState.PinnedSnapshot);
                             if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not
@@ -47948,6 +49393,20 @@ public sealed partial class EmbeddedConnection : IDisposable
                             retainVirtualTableParticipation = true;
                             transactionState.HasChanges = true;
                             transactionState.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
+                            if (result.TargetedIndexRebuild is { Count: > 0 } targetedThisStatement)
+                            {
+                                foreach (var target in targetedThisStatement)
+                                    transactionState.TargetedIndexRebuildNames.Add(target.Index.Name);
+                            }
+                            else
+                            {
+                                // Anything that changed but was not itself a pure, in-place
+                                // targeted index rebuild -- DML, schema/pragma changes, a
+                                // bare/collation REINDEX, or a REINDEX that rebuilt a method
+                                // index -- must widen commit off the targeted-rebuild-only
+                                // persistence path (see HasNonTargetedIndexRebuildChange).
+                                transactionState.HasNonTargetedIndexRebuildChange = true;
+                            }
                             if (!ReferenceEquals(routed.Database, _tempDatabase))
                                 _transactionWriteDatabase = routed.Database;
                             if (EmbeddedDatabase.MayChangeSchema(routed.Statement))
@@ -48011,6 +49470,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                         concurrentStore,
                         concurrentTxId,
                         mvccStatementSavepoint);
+                    // The statement's cloned catalog is discarded (never written back), so its
+                    // overlay writes must be discarded too.
+                    if (statementOverlayCheckpoint is not null)
+                        transactionState?.Overlay?.RestoreCheckpoint(statementOverlayCheckpoint);
                     ReleaseConcurrentSchemaGateIfUnused();
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
@@ -48023,6 +49486,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                         concurrentStore,
                         concurrentTxId,
                         mvccStatementSavepoint);
+                    // The statement's cloned catalog is discarded (never written back), so its
+                    // overlay writes must be discarded too.
+                    if (statementOverlayCheckpoint is not null)
+                        transactionState?.Overlay?.RestoreCheckpoint(statementOverlayCheckpoint);
                     ReleaseConcurrentSchemaGateIfUnused();
                     ExceptionDispatchInfo.Capture(exception.Failure).Throw();
                     throw new InvalidOperationException("ExceptionDispatchInfo.Throw unexpectedly returned.");
@@ -48046,6 +49513,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                             transactionState.VirtualTableTransaction);
                         retainVirtualTableParticipation = true;
                         transactionState.HasChanges = true;
+                        // A conflict-fail rollback still preserves earlier statements' partial
+                        // row changes in this transaction: that is table DML, never a targeted
+                        // index rebuild, so an earlier REINDEX in this transaction must not
+                        // cause commit to silently omit it (see HasNonTargetedIndexRebuildChange).
+                        transactionState.HasNonTargetedIndexRebuildChange = true;
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
                     }
@@ -48080,6 +49552,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                             transactionState.VirtualTableTransaction);
                         retainVirtualTableParticipation = true;
                         transactionState.HasChanges = true;
+                        // Preserving the partial recursive-trigger mutation is table DML, never
+                        // a targeted index rebuild: an earlier REINDEX in this same transaction
+                        // must not cause commit to silently omit it.
+                        transactionState.HasNonTargetedIndexRebuildChange = true;
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
                         tempTriggerSession?.Commit();
@@ -48095,6 +49571,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                             concurrentStore,
                             concurrentTxId,
                             mvccStatementSavepoint);
+                        // The catalog is discarded (never written back) when a recursive-trigger
+                        // abort does not preserve changes, so the overlay must discard this
+                        // statement's writes too.
+                        if (statementOverlayCheckpoint is not null)
+                            transactionState?.Overlay?.RestoreCheckpoint(statementOverlayCheckpoint);
                     }
                     else
                     {
@@ -48130,6 +49611,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                         concurrentStore,
                         concurrentTxId,
                         mvccStatementSavepoint);
+                    // Any other statement failure discards the cloned catalog (never written
+                    // back), so the overlay must discard this statement's writes too.
+                    if (statementOverlayCheckpoint is not null)
+                        transactionState?.Overlay?.RestoreCheckpoint(statementOverlayCheckpoint);
                     ReleaseConcurrentSchemaGateIfUnused();
                     throw;
                 }
@@ -48358,6 +49843,9 @@ public sealed partial class EmbeddedConnection : IDisposable
         _transactionWriteDatabase = _database;
         state.PragmaHeader = new PragmaHeaderMetadata(schemaVersion, userVersion, applicationId);
         state.HasChanges = true;
+        // A pragma header write is never a targeted index rebuild: an earlier REINDEX in this
+        // same transaction must not cause commit to skip persisting this header change.
+        state.HasNonTargetedIndexRebuildChange = true;
         state.HasSnapshotPragmaHeader = true;
     }
 
@@ -48907,6 +50395,18 @@ public sealed partial class EmbeddedConnection : IDisposable
                             catalog = null;
                             state.HasChanges = true;
                             state.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
+                            if (result.TargetedIndexRebuild is { Count: > 0 } targetedThisDatabase)
+                            {
+                                foreach (var target in targetedThisDatabase)
+                                    state.TargetedIndexRebuildNames.Add(target.Index.Name);
+                            }
+                            else
+                            {
+                                // A bare/collation REINDEX that fanned out to this database, or one
+                                // that rebuilt a method index, is not a pure targeted rebuild -- see
+                                // HasNonTargetedIndexRebuildChange.
+                                state.HasNonTargetedIndexRebuildChange = true;
+                            }
                             if (!ReferenceEquals(database, _tempDatabase))
                                 _transactionWriteDatabase = database;
                         }
@@ -48984,6 +50484,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                             previous.DisconnectOwnedVirtualTables(state.VirtualTableTransaction);
                             catalog = null;
                             state.HasChanges = true;
+                            // PRAGMA optimize never reports a TargetedIndexRebuild (only the
+                            // REINDEX statement path populates that): any change here is a full
+                            // schema/index rebuild, so an earlier REINDEX in this same
+                            // transaction must not cause commit to skip persisting it.
+                            state.HasNonTargetedIndexRebuildChange = true;
                             if (!ReferenceEquals(database, _tempDatabase))
                                 _transactionWriteDatabase = database;
                         }
@@ -51030,14 +52535,53 @@ Func<string, ParsedStatement> rewrite)
                         states.Add(database, new TransactionDatabaseState(
                             concurrentSnapshot.Snapshot.Catalog,
                             concurrentSnapshot.Snapshot.Version,
-                            concurrentSnapshot.Snapshot.PragmaHeader));
+                            concurrentSnapshot.Snapshot.PragmaHeader)
+                        {
+                            // MVCC-eligible index joins/scans read through this pinned durable
+                            // snapshot merged lazily with visible MvStore effects instead of
+                            // materializing the base index; Overlay stays null for a concurrent
+                            // transaction (that gate is exclusively for the classic path).
+                            PinnedSnapshot = concurrentSnapshot.PinnedSnapshot,
+                        });
                     }
-                    catch
+                    catch (Exception primaryFailure)
                     {
                         mvccTxs.Remove(database);
-                        database.MvStore?.Rollback(concurrentSnapshot.TransactionId);
-                        database.EndTransaction();
-                        throw;
+                        // Both cleanup steps must be attempted even if the first throws: a
+                        // failing MVCC rollback must never skip EndTransaction and leak this
+                        // database's active-transaction count registration.
+                        List<Exception>? cleanupFailures = null;
+                        try
+                        {
+                            concurrentSnapshot.PinnedSnapshot?.Dispose();
+                        }
+                        catch (Exception exception)
+                        {
+                            (cleanupFailures ??= []).Add(exception);
+                        }
+
+                        try
+                        {
+                            database.MvStore?.Rollback(concurrentSnapshot.TransactionId);
+                        }
+                        catch (Exception exception)
+                        {
+                            (cleanupFailures ??= []).Add(exception);
+                        }
+
+                        try
+                        {
+                            database.EndTransaction();
+                        }
+                        catch (Exception exception)
+                        {
+                            (cleanupFailures ??= []).Add(exception);
+                        }
+
+                        if (cleanupFailures is null)
+                            throw;
+
+                        throw new AggregateException([primaryFailure, .. cleanupFailures]);
                     }
                     continue;
                 }
@@ -51049,23 +52593,130 @@ Func<string, ParsedStatement> rewrite)
                     mvccTxs.Add(database, tx.Id);
                 }
 
-                var snapshot = database.CreateTransactionSnapshot(busyTimeout: BusyTimeout);
-                states.Add(database, new TransactionDatabaseState(
-                    snapshot.Catalog,
-                    snapshot.Version,
-                    snapshot.PragmaHeader));
+                var (snapshot, pinnedSnapshot) = database.CreateTransactionSnapshotWithPin(busyTimeout: BusyTimeout);
+                try
+                {
+                    states.Add(database, new TransactionDatabaseState(
+                        snapshot.Catalog,
+                        snapshot.Version,
+                        snapshot.PragmaHeader)
+                    {
+                        PinnedSnapshot = pinnedSnapshot,
+                        Overlay = pinnedSnapshot is not null ? new TransactionMutationOverlay() : null,
+                    });
+                }
+                catch (Exception primaryFailure)
+                {
+                    // CreateTransactionSnapshotWithPin already registered this database as an
+                    // active transaction and cloned its catalog before returning; if adding the
+                    // resulting state fails, this database is never recorded in states, so the
+                    // outer catch below (which only walks states.Values/Keys) would otherwise
+                    // never see it and would leak the pinned snapshot and the active-transaction
+                    // count for it. Every cleanup step below must be attempted even if an earlier
+                    // one throws — in particular EndTransaction must always run, so a failing
+                    // virtual-table disconnect can never leak the active-transaction count this
+                    // method already bumped — so failures are collected and combined with the
+                    // original failure rather than one throw short-circuiting the rest.
+                    List<Exception>? cleanupFailures = null;
+                    try
+                    {
+                        pinnedSnapshot?.Dispose();
+                    }
+                    catch (Exception exception)
+                    {
+                        (cleanupFailures ??= []).Add(exception);
+                    }
+
+                    try
+                    {
+                        snapshot.Catalog.DisconnectOwnedVirtualTables();
+                    }
+                    catch (Exception exception)
+                    {
+                        (cleanupFailures ??= []).Add(exception);
+                    }
+
+                    try
+                    {
+                        database.EndTransaction();
+                    }
+                    catch (Exception exception)
+                    {
+                        (cleanupFailures ??= []).Add(exception);
+                    }
+
+                    if (cleanupFailures is null)
+                        throw;
+
+                    throw new AggregateException([primaryFailure, .. cleanupFailures]);
+                }
             }
         }
-        catch
+        catch (Exception primaryFailure)
         {
+            // Every step below must be attempted for every database/state even if an earlier
+            // one throws: a failing disconnect/dispose for one database must never skip
+            // EndTransaction (leaking its active-transaction count) or
+            // ReleaseTransactionWriteReservations (leaking a write reservation) for the rest.
+            List<Exception>? cleanupFailures = null;
             foreach (var (database, txId) in mvccTxs)
-                database.MvStore?.Rollback(txId);
+            {
+                try
+                {
+                    database.MvStore?.Rollback(txId);
+                }
+                catch (Exception exception)
+                {
+                    (cleanupFailures ??= []).Add(exception);
+                }
+            }
+
             foreach (var state in states.Values)
-                state.Catalog.DisconnectOwnedVirtualTables();
+            {
+                try
+                {
+                    state.Catalog.DisconnectOwnedVirtualTables();
+                }
+                catch (Exception exception)
+                {
+                    (cleanupFailures ??= []).Add(exception);
+                }
+
+                try
+                {
+                    state.PinnedSnapshot?.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    (cleanupFailures ??= []).Add(exception);
+                }
+            }
+
             foreach (var database in states.Keys)
-                database.EndTransaction();
-            ReleaseTransactionWriteReservations();
-            throw;
+            {
+                try
+                {
+                    database.EndTransaction();
+                }
+                catch (Exception exception)
+                {
+                    (cleanupFailures ??= []).Add(exception);
+                }
+            }
+
+            try
+            {
+                ReleaseTransactionWriteReservations();
+            }
+            catch (Exception exception)
+            {
+                (cleanupFailures ??= []).Add(exception);
+            }
+
+            if (cleanupFailures is null)
+                throw;
+
+            throw new AggregateException([primaryFailure, .. cleanupFailures]);
         }
 
         _transactionDatabases = states;
@@ -51372,6 +53023,26 @@ Func<string, ParsedStatement> rewrite)
         store.BeginSchemaChange(txId, BusyTimeout);
         try
         {
+            // The durable pager read snapshot pinned at BEGIN CONCURRENT (see
+            // BeginConcurrentTransactionSnapshotLocked) holds an open pager read
+            // transaction on this very connection. A schema-changing transaction's
+            // frozen snapshot predates the schema generation it is about to publish,
+            // so a page-native index join/scan has nothing useful left to read from
+            // it anyway once DDL starts. Release it before the TRUNCATE checkpoint
+            // below so this transaction's own reader can never be mistaken for a
+            // foreign one blocking its own schema-change checkpoint — TRUNCATE
+            // requires zero active pager readers, and before this snapshot existed
+            // an MVCC transaction never held one, so this call always used to see
+            // zero readers from itself. Falling back to the non-page-native merge
+            // path for the remainder of this (already schema-changing) transaction
+            // is the correct, conservative behavior here.
+            if (_transactionDatabases is not null
+                && _transactionDatabases.TryGetValue(_database, out var schemaOwnerState))
+            {
+                schemaOwnerState.PinnedSnapshot?.Dispose();
+                schemaOwnerState.PinnedSnapshot = null;
+            }
+
             // Retire every older logical frame before the private catalog can
             // diverge. The owner transaction is admitted only as a frozen
             // snapshot; its uncommitted versions are excluded from collection.
@@ -51428,6 +53099,10 @@ Func<string, ParsedStatement> rewrite)
             if (changeDataCapture.CompleteExplicitTransaction(cdcState.Catalog.Tables, cdcStore, cdcTxId))
             {
                 cdcState.HasChanges = true;
+                // Appending a CDC record is never a targeted index rebuild: an earlier
+                // REINDEX in this same transaction must not cause commit to skip
+                // persisting it.
+                cdcState.HasNonTargetedIndexRebuildChange = true;
                 _transactionWriteDatabase = _database;
             }
         }
@@ -51494,6 +53169,17 @@ Func<string, ParsedStatement> rewrite)
             .Where(pair => ReferenceEquals(pair.Key, _tempDatabase))
             .Select(pair => pair.Value)
             .SingleOrDefault();
+
+        // Release every pinned snapshot before the durable WAL commit below: post-commit
+        // checkpoint maintenance requires that this connection hold no outstanding pager reader
+        // of its own, and by this point deferred FK validation and the commit hook have already
+        // run any query that might have needed the transaction's own read-your-writes overlay.
+        foreach (var pinnedState in _transactionDatabases.Values)
+        {
+            pinnedState.PinnedSnapshot?.Dispose();
+            pinnedState.PinnedSnapshot = null;
+        }
+
         ExceptionDispatchInfo? deferredMaintenanceFailure = null;
         var schemaCatalogWasPublished = false;
         try
@@ -51513,7 +53199,18 @@ Func<string, ParsedStatement> rewrite)
                         busyTimeout: BusyTimeout,
                         concurrent: _transactionIsConcurrent,
                         containsSchemaChanges: state.HasSchemaChanges,
-                        synchronousMode: GetSynchronousMode(database));
+                        synchronousMode: GetSynchronousMode(database),
+                        // A targeted, in-place index rebuild never rewrites table row storage, so
+                        // it must never be attempted as the sole persistence path when anything
+                        // else in this transaction also changed durable state -- see
+                        // HasNonTargetedIndexRebuildChange. Passing null here (rather than an
+                        // empty set) makes EmbeddedFileStore.PersistCore skip the targeted attempt
+                        // entirely and fall through to the full-catalog rewrite that
+                        // ForceFullCatalogRewrite already forces for any REINDEX, so every
+                        // coexisting change is persisted atomically alongside the rebuilt index.
+                        targetedIndexRebuildNames: state.HasNonTargetedIndexRebuildChange
+                            ? null
+                            : state.TargetedIndexRebuildNames);
                 }
                 catch (EmbeddedPostCommitMaintenanceException failure)
                 {
@@ -51725,6 +53422,9 @@ Func<string, ParsedStatement> rewrite)
             EnsureTransactionMayMutate(database, statement);
             transactionState.PragmaHeader = updated;
             transactionState.HasChanges = true;
+            // A pragma header write is never a targeted index rebuild: an earlier REINDEX in
+            // this same transaction must not cause commit to skip persisting this header change.
+            transactionState.HasNonTargetedIndexRebuildChange = true;
             transactionState.HasSnapshotPragmaHeader = true;
             if (!ReferenceEquals(database, _tempDatabase))
                 _transactionWriteDatabase = database;
@@ -52449,7 +54149,12 @@ Func<string, ParsedStatement> rewrite)
                         pair.Value.ForceFullCatalogRewrite,
                         pair.Value.VirtualTableTransaction.CreateCheckpoint(),
                         new HashSet<EmbeddedDatabase.ForeignKeyViolation>(
-                            pair.Value.PendingDeferredViolations)));
+                            pair.Value.PendingDeferredViolations),
+                        pair.Value.Overlay?.CreateCheckpoint(),
+                        new HashSet<string>(
+                            pair.Value.TargetedIndexRebuildNames,
+                            StringComparer.OrdinalIgnoreCase),
+                        pair.Value.HasNonTargetedIndexRebuildChange));
             }
 
             _savepoints.Add(new SavepointEntry(
@@ -52513,6 +54218,21 @@ Func<string, ParsedStatement> rewrite)
             state.ForceFullCatalogRewrite = savedState.ForceFullCatalogRewrite;
             state.PendingDeferredViolations.Clear();
             state.PendingDeferredViolations.UnionWith(savedState.PendingDeferredViolations);
+            state.TargetedIndexRebuildNames.Clear();
+            state.TargetedIndexRebuildNames.UnionWith(savedState.TargetedIndexRebuildNames);
+            state.HasNonTargetedIndexRebuildChange = savedState.HasNonTargetedIndexRebuildChange;
+            if (state.Overlay is not null && savedState.OverlayCheckpoint is not null)
+            {
+                state.Overlay.RestoreCheckpoint(
+                    savedState.OverlayCheckpoint,
+                    tableName => database.CreatePrimaryKeyRecordComparer(
+                        state.Catalog.Tables.TryGetValue(tableName, out var restoredTable)
+                            ? restoredTable.PrimaryKeySchema
+                                ?? throw new InvalidOperationException(
+                                    $"WITHOUT ROWID table '{tableName}' is missing its primary-key metadata.")
+                            : throw new InvalidOperationException(
+                                $"Restoring the mutation overlay for table '{tableName}' requires it to exist in the restored catalog.")));
+            }
         }
         _transactionWriteDatabase = savepoint.WriteDatabase;
         if (_changeDataCapture is { } changeDataCapture
@@ -52577,23 +54297,69 @@ Func<string, ParsedStatement> rewrite)
             _mvccTransactions.Clear();
         }
 
+        // Every step below must run even if an earlier one throws — most notably a
+        // virtual-table module's own Rollback callback, which is arbitrary user/extension code.
+        // Losing the rest of this cleanup to one throwing callback would leak pinned snapshots
+        // (an open pager read mark) and write reservations, and would skip EndTransaction,
+        // leaking the active-transaction count forever. Only the first exception is preserved
+        // (matching the ManagedVirtualTableTransaction.Complete idiom used elsewhere in this
+        // file) and rethrown only after every deterministic cleanup step below has run.
+        ExceptionDispatchInfo? failure = null;
+
         if (transactionDatabases is not null)
         {
             if (rollbackVirtualTables)
             {
                 foreach (var state in transactionDatabases.Values)
-                    state.VirtualTableTransaction.Rollback(state.Catalog);
+                {
+                    try
+                    {
+                        state.VirtualTableTransaction.Rollback(state.Catalog);
+                    }
+                    catch (Exception exception)
+                    {
+                        failure ??= ExceptionDispatchInfo.Capture(exception);
+                    }
+                }
             }
 
             foreach (var state in transactionDatabases.Values)
-                state.Catalog.DisconnectOwnedVirtualTables();
+            {
+                try
+                {
+                    state.Catalog.DisconnectOwnedVirtualTables();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+
+                try
+                {
+                    state.PinnedSnapshot?.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
         }
 
         foreach (var savepoint in _savepoints)
         {
             foreach (var state in savepoint.Databases.Values)
-                state.Catalog.DisconnectOwnedVirtualTables();
+            {
+                try
+                {
+                    state.Catalog.DisconnectOwnedVirtualTables();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
         }
+
         _savepoints.Clear();
         _changeDataCapture?.ResetTransaction();
         _deferForeignKeys = false;
@@ -52601,8 +54367,19 @@ Func<string, ParsedStatement> rewrite)
         if (transactionDatabases is not null)
         {
             foreach (var database in transactionDatabases.Keys)
-                database.EndTransaction();
+            {
+                try
+                {
+                    database.EndTransaction();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
         }
+
+        failure?.Throw();
     }
 
     private sealed record SavepointEntry(
@@ -52619,7 +54396,10 @@ Func<string, ParsedStatement> rewrite)
         bool HasSchemaChanges,
         bool ForceFullCatalogRewrite,
         int VirtualTableTransactionCheckpoint,
-        IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations);
+        IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations,
+        TransactionMutationOverlayCheckpoint? OverlayCheckpoint,
+        IReadOnlySet<string> TargetedIndexRebuildNames,
+        bool HasNonTargetedIndexRebuildChange);
 
     private void ThrowIfRecursiveTriggerCallbackReentry()
     {
@@ -53108,9 +54888,35 @@ public sealed class EmbeddedStatement : IDisposable
 // without hunting down each individual mutation site.
 internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
 {
+    private static long _lineageSequence;
+
     private readonly List<SqlValue[]> _rows = [];
 
     public long Revision { get; private set; }
+
+    /// <summary>
+    /// Identifies this specific RowStore instance's physical storage lineage, distinct from
+    /// <see cref="Revision"/>. Assigned fresh, process-uniquely, whenever a RowStore is
+    /// constructed, and copied forward only by <see cref="ReplaceContentsPreservingRevision"/> —
+    /// i.e. only <see cref="EmbeddedTable.Clone"/>'s same-statement working copy carries the
+    /// same LineageId as its source; every other path that builds a replacement
+    /// <see cref="EmbeddedTable"/> (ALTER COLUMN, ADD/DROP COLUMN, or any other full rebuild that
+    /// re-adds every row into a brand-new RowStore) gets a distinct one.
+    /// </summary>
+    /// <remarks>
+    /// Revision alone cannot distinguish "the same physical row store, unchanged since the
+    /// previous commit" from "a brand-new row store that coincidentally replayed the same number
+    /// of mutations." For example, <c>EmbeddedTable.CreateWithAlteredColumn</c> rebuilds every row
+    /// via <see cref="Add"/> into a fresh RowStore: a table with N rows and no prior
+    /// updates/deletes has Revision == N both before and after an ALTER COLUMN, even though every
+    /// row's bytes may have changed under the new column's affinity/type — and the table's
+    /// <c>Indexes</c> list is carried forward by reference, so an index-reference check alone
+    /// would not catch it either. Comparing LineageId closes that gap: it can only ever match
+    /// when the very same in-memory RowStore was carried forward, never across a rebuild that
+    /// constructs a new one — see
+    /// <see cref="EmbeddedFileStore.IsTableRowStorageUnchangedFromPrevious"/>.
+    /// </remarks>
+    public long LineageId { get; private set; } = Interlocked.Increment(ref _lineageSequence);
 
     public int Count => _rows.Count;
 
@@ -53172,6 +54978,27 @@ internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
     {
         _rows.RemoveAt(index);
         Revision++;
+    }
+
+    // EmbeddedTable.Clone() deep-copies every table in the working catalog on every
+    // statement (so a rolled-back statement never mutates the live, published catalog),
+    // even tables the statement never touches. Populating the clone through the ordinary
+    // Add() path would bump Revision once per copied row, making a fully-untouched clone's
+    // Revision diverge from its source (row count vs. the source's full mutation history)
+    // and defeating any same-instance staleness check built on it. Copying the rows
+    // directly and assigning Revision verbatim instead means an untouched clone keeps
+    // exactly its source's Revision, so a later mutation (via the ordinary Add/Insert/
+    // Remove/indexer members, all of which still bump Revision as usual) is the only thing
+    // that can make it diverge again. LineageId is carried forward the same way, so a
+    // same-statement clone also keeps proving "this is still the very same physical row
+    // store" even when Revision alone would be ambiguous (see LineageId's doc comment).
+    internal void ReplaceContentsPreservingRevision(RowStore source)
+    {
+        _rows.Clear();
+        foreach (var row in source._rows)
+            _rows.Add(row.ToArray());
+        Revision = source.Revision;
+        LineageId = source.LineageId;
     }
 
     System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
@@ -55400,8 +57227,7 @@ internal sealed class EmbeddedTable
             Strict);
         clone.SchemaSqlCompact = SchemaSqlCompact;
         clone.Sql = Sql;
-        foreach (var row in Rows)
-            clone.Rows.Add(row.ToArray());
+        clone.Rows.ReplaceContentsPreservingRevision(Rows);
 
         clone.RowIds.AddRange(RowIds);
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
@@ -55781,7 +57607,8 @@ internal sealed record ExecutionResult(
     IReadOnlyList<SqlValue[]> Rows,
     int RowsAffected,
     bool Changed = false,
-    bool ForceFullCatalogRewrite = false)
+    bool ForceFullCatalogRewrite = false,
+    IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? TargetedIndexRebuild = null)
 {
     public static ExecutionResult Empty { get; } = new([], [], 0);
 

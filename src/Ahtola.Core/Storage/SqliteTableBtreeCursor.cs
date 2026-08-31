@@ -52,11 +52,11 @@ public sealed class SqliteTableBtreeCursor
                     }
 
                 case SqliteBtreePageType.TableInterior:
-                    pageNumber = SqliteTableInteriorPageView
-                        .Parse(image, _io.UsableSpace, isFirstPage)
-                        .SearchChild(rowId)
-                        .ChildPage;
-                    break;
+                    {
+                        var interior = SqliteTableInteriorPageView.Parse(image, _io.UsableSpace, isFirstPage);
+                        pageNumber = interior.SearchChild(rowId).ChildPage;
+                        break;
+                    }
 
                 default:
                     throw new InvalidDataException(

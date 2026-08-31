@@ -979,6 +979,8 @@ public sealed class VdbeJoinIndexSeekMetrics
     private long _durableCursorPlans;
     private long _indexPagesRead;
     private long _tableRowsFetched;
+    private long _overlayRowsExamined;
+    private long _baseRowsSuppressed;
 
     public long PlansCreated => Interlocked.Read(ref _plansCreated);
 
@@ -997,6 +999,12 @@ public sealed class VdbeJoinIndexSeekMetrics
     public long IndexPagesRead => Interlocked.Read(ref _indexPagesRead);
 
     public long TableRowsFetched => Interlocked.Read(ref _tableRowsFetched);
+
+    /// <summary>Visible MVCC/overlay candidate rows examined while merging a durable base stream.</summary>
+    public long OverlayRowsExamined => Interlocked.Read(ref _overlayRowsExamined);
+
+    /// <summary>Durable base rows skipped because a visible overlay effect shadows their identity.</summary>
+    public long BaseRowsSuppressed => Interlocked.Read(ref _baseRowsSuppressed);
 
     internal void PlanCreated(int rowCount, bool automatic = false)
     {
@@ -1018,6 +1026,10 @@ public sealed class VdbeJoinIndexSeekMetrics
 
     internal void TableRowFetched() => Interlocked.Increment(ref _tableRowsFetched);
 
+    internal void OverlayRowExamined() => Interlocked.Increment(ref _overlayRowsExamined);
+
+    internal void BaseRowSuppressed() => Interlocked.Increment(ref _baseRowsSuppressed);
+
     internal void Reset()
     {
         Interlocked.Exchange(ref _plansCreated, 0);
@@ -1029,6 +1041,8 @@ public sealed class VdbeJoinIndexSeekMetrics
         Interlocked.Exchange(ref _durableCursorPlans, 0);
         Interlocked.Exchange(ref _indexPagesRead, 0);
         Interlocked.Exchange(ref _tableRowsFetched, 0);
+        Interlocked.Exchange(ref _overlayRowsExamined, 0);
+        Interlocked.Exchange(ref _baseRowsSuppressed, 0);
     }
 }
 

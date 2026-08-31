@@ -390,7 +390,7 @@ public sealed class PlannerAccessPathDepthTests
     }
 
     [Test]
-    public void TransactionLocalRowsUseMaterializedIndexFallback()
+    public void TransactionLocalRowsUseDurablePagerAccessorWithOverlay()
     {
         var fileSystem = new InMemoryFileSystem();
         using var database = EmbeddedDatabase.OpenFile("planner-depth-transaction.db", fileSystem);
@@ -415,8 +415,10 @@ public sealed class PlannerAccessPathDepthTests
                 """)
             .Select(row => row[0].AsText())
             .Should().Equal("two", "two-local");
-        database.JoinIndexSeekMetrics.DurableCursorPlans.Should().Be(0);
-        database.JoinIndexSeekMetrics.IndexRowsMaterialized.Should().Be(3);
+        // The pinned durable pager snapshot plus this transaction's mutation overlay serves the
+        // seek directly: no full-index materialization is needed to see the transaction-local row.
+        database.JoinIndexSeekMetrics.DurableCursorPlans.Should().Be(1);
+        database.JoinIndexSeekMetrics.IndexRowsMaterialized.Should().Be(0);
         Execute(connection, "ROLLBACK;");
     }
 

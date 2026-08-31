@@ -668,6 +668,42 @@ public sealed partial class EmbeddedDatabase
                      && value.Kind is SqlValueKind.Integer or SqlValueKind.Real)
                 value = SqlValue.Text(ToSqlText(value));
 
+            if (branch.Index.Columns.Count > 0
+                && branch.Index.Columns[0].ColumnIndex == lookup.ColumnOrdinal
+                && context.ConcurrentMvStore is null
+                && context.ConcurrentMvccTxId is null
+                && TryOpenTransactionIndexAccessor(
+                    plan.Table,
+                    branch.Index,
+                    prefixLength: 1,
+                    covering: false,
+                    context,
+                    out var transactionAccessor))
+            {
+                var qualifier = plan.Source.Alias ?? plan.Source.Name;
+                var qualifiedColumns = BuildQualifiedColumns(qualifier, plan.Table.Columns);
+                var qualifiedDefinitions = BuildQualifiedColumnDefinitions(
+                    qualifier,
+                    plan.Table.ColumnDefinitions);
+                using (transactionAccessor)
+                {
+                    return transactionAccessor.Seek(
+                            [value],
+                            _plannerAccessPathMetrics.IntersectionIndexPageRead,
+                            _plannerAccessPathMetrics.IntersectionKeyCompared)
+                        .Select(row => new SourceRow(
+                            plan.Table.Columns,
+                            row.Values,
+                            qualifiedColumns,
+                            outerRow,
+                            RowId: row.RowId,
+                            RowIdQualifier: qualifier,
+                            ColumnDefinitions: plan.Table.ColumnDefinitions,
+                            QualifiedColumnDefinitions: qualifiedDefinitions))
+                        .ToArray();
+                }
+            }
+
             if (readSnapshot is not null
                 && branch.Index.Columns.Count > 0
                 && branch.Index.Columns[0].ColumnIndex == lookup.ColumnOrdinal

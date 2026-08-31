@@ -1875,8 +1875,16 @@ public class EmbeddedEngineTests
             Assert.Throws<EmbeddedSqlException>(() => parameterIndex.Step())!
                 .Message.Should().Contain("parameters are prohibited");
         }
-        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX collated_idx ON t(a + b COLLATE custom);"))!
-            .Message.Should().Contain("not a supported SQLite built-in collation");
+        // "custom" is a valid application-defined collation name syntactically, but nothing has
+        // registered a callback for it on this connection, so CREATE INDEX must fail closed with
+        // the SQLite-style "no such collation sequence" message rather than silently falling back
+        // to BINARY ordering or leaving an unusable index behind (see CustomCollationIndexTests).
+        // COLLATE binds tighter than binary operators (SQLite grammar), so it must wrap the whole
+        // "(a + b)" expression here to become the index term's own collating sequence; without the
+        // parens "a + b COLLATE custom" would parse as "a + (b COLLATE custom)", whose sum discards
+        // the nested collation and never actually needs "custom" registered.
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX collated_idx ON t((a + b) COLLATE custom);"))!
+            .Message.Should().Contain("no such collation sequence: custom");
 
         using var list = connection.Prepare("PRAGMA index_list(t);");
         list.Step().Should().Be(StatementStepResult.Done);

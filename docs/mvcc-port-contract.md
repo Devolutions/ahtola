@@ -35,10 +35,11 @@ original baseline with `git -C turso-src show v0.7.2:<path>`.
    (single write reservation, WAL snapshots).
 6. **Upstream anomaly TODOs.** Do not claim protection against phantoms, cursor
    lost updates, read skew, or write skew beyond Turso v0.7.2.
-7. **Concurrent DDL fails closed.** Turso versions `sqlite_schema` rows through
-   MVCC. Ahtola does not yet version schema rows, so schema-changing statements
-   inside `BEGIN CONCURRENT` are rejected rather than appearing to succeed and
-   then being discarded by the committed-row merge.
+7. **Concurrent DDL is generation gated.** Schema rows and table identities are
+   versioned by schema generation. A schema-changing `BEGIN CONCURRENT`
+   transaction publishes through the pager-first schema path and fails busy
+   while an incompatible peer snapshot is active, rather than exposing or
+   discarding a stale catalog.
 
 ## Phase map
 
@@ -48,9 +49,10 @@ original baseline with `git -C turso-src show v0.7.2:<path>`.
 | **1.5** | Row-version chains (`Insert`/`Update`/`Delete`/`TryRead`/`ScanVisible`), visibility + WW on chains, commit stamp rewrite, rollback drop |
 | **2** | Durable logical log (`*.db-log`) with Turso LML2/MVTX framing constants, CRC32C, upsert/delete ops, replay into `MvStore` on enable; encrypted databases AES-GCM-encrypt row payload chunks while authenticating salt/length/op-count/commit-ts/chunk/version metadata and require exact payload consumption; checkpoint TRUNCATE clears log |
 | **3** | Header version **255** via pager `SwitchJournalMode(Mvcc)`; cold open restores `MvStore`; typed `MvccKey` rows/index objects and V4 logical-log frames cover rowid and composite keys; **shared `MvStore`/log per path** (`EmbeddedMvStoreRegistry`) lets pooled multi-connection concurrent writers share one version store; concurrent commit reloads durable catalog then merges store snapshots |
-| **3.5** | **SQL dual-cursor routing:** under `BEGIN CONCURRENT`, typed base/store overlays cover rowid and `WITHOUT ROWID` primary keys, with materialized index-plan overlays. DML records typed table/index versions through `ReportRowChange`, including trigger and foreign-key actions; peer uncommitted writes remain invisible, snapshot isolation holds after peer commit, and same-key writes conflict. |
-| **3.6 (current)** | **Synchronous page-WAL checkpoint state machine:** `PRAGMA wal_checkpoint` in MVCC mode runs `RunMvccCheckpoint` — AcquireLock → Collect/Materialize (reuse `MergeConcurrentCatalogFromStoreLocked`) → persist pages to WAL **without automatic reset** → backfill and flush the main store → retire/upgrade the logical log → reset the WAL last for TRUNCATE/RESTART/FULL → `GarbageCollectAfterCheckpoint`. Active concurrent txs return busy before mutation. PASSIVE retains both WAL and logical-log recovery evidence. This adapts Turso's cooperative b-tree I/O state machine to managed synchronous `IFileSystem` operations. |
-| **Open** | Concurrent DDL is deliberately exclusive while active MVCC snapshots exist; full lazy per-page B-tree cursor/checkpoint parity with Turso remains deferred if product requires it. |
+| **3.5** | **SQL dual-cursor routing:** under `BEGIN CONCURRENT`, typed base/store overlays cover rowid and `WITHOUT ROWID` primary keys, originally via materialized index-plan overlays (superseded for eligible index paths by the page-native accessor in 3.7). DML records typed table/index versions through `ReportRowChange`, including trigger and foreign-key actions; peer uncommitted writes remain invisible, snapshot isolation holds after peer commit, and same-key writes conflict. |
+| **3.6** | **Synchronous page-WAL checkpoint state machine:** `PRAGMA wal_checkpoint` in MVCC mode runs `RunMvccCheckpoint` — AcquireLock → Collect/Materialize (reuse `MergeConcurrentCatalogFromStoreLocked`) → persist pages to WAL **without automatic reset** → backfill and flush the main store → retire/upgrade the logical log → reset the WAL last for TRUNCATE/RESTART/FULL → `GarbageCollectAfterCheckpoint`. Active concurrent txs return busy before mutation. PASSIVE retains both WAL and logical-log recovery evidence. This adapts Turso's cooperative b-tree I/O state machine to managed synchronous `IFileSystem` operations. Fixed alongside 3.7: the schema owner's own pinned reader snapshot is released *before* the internal TRUNCATE checkpoint that `BeginConcurrentSchemaChange` issues, so a schema-changing connection no longer deadlocks/busy-fails against its own pin (`EmbeddedDatabase.cs`). |
+| **3.7 (current)** | **Page-native direct-index access:** eligible `BEGIN CONCURRENT` index joins/scans (ordinary, partial, expression, `WITHOUT ROWID`, and validated custom-collation secondary indexes) seek and stream the transaction-pinned durable b-tree snapshot (`EmbeddedFileReadSnapshot` captured at `BEGIN CONCURRENT`, generation/root-map bound) directly via the existing page-native cursors (`SqliteIndexBtreeCursor`/`SqliteTableBtreeCursor`), merging lazily with the visible `MvStore` overlay through `MvccDualCursor`'s two-pointer merge (per Turso's `core/mvcc/cursor.rs` two-peek semantics: peek base, peek overlay, emit the lesser typed key, suppress base rows shadowed by an overlay tombstone/replacement). No `table.GetOrCreateIndexScanOrder`/`BuildBaseIndexScanOrder` full-table materialization occurs on these paths. Classic transactions use the same pinned-cursor contract with a savepoint-aware mutation overlay. Custom-collation callbacks remain connection-bound and are generation/version validated; stale physical order stays ineligible until `REINDEX`. `EmbeddedDatabase.JoinIndexSeekMetrics` differentiates durable cursor plans, prohibited full-index materialization, overlay rows examined/emitted, and base rows suppressed. |
+| **Open** | Concurrent DDL remains deliberately exclusive while incompatible MVCC snapshots exist; full cooperative per-page checkpoint-state-machine parity with Turso remains deferred. Custom-collated `WITHOUT ROWID` primary keys remain fail-closed because their comparator is required before the catalog can be reconstructed. |
 
 ## Dual-cursor SQL routing notes
 
@@ -61,9 +63,12 @@ original baseline with `git -C turso-src show v0.7.2:<path>`.
   key or indexed-value changes remove old typed/index keys and insert their replacements.
 - **WW:** `ThrowIfConcurrentWriterOnRow` applies to the typed identity, so pure base tombstones
   cannot bypass first-committer-wins conflict detection.
-- **SELECT:** typed dual-cursor routing covers rowid and `WITHOUT ROWID` primary-key scans, with
-  materialized index-plan overlays. `sqlite_schema` publication is schema-generation gated; DDL
-  remains exclusive against active MVCC snapshots rather than exposing a stale catalog.
+- **SELECT:** typed dual-cursor routing covers rowid and `WITHOUT ROWID` primary-key scans.
+  Eligible index joins/scans (ordinary, partial, expression, `WITHOUT ROWID`) route through the
+  page-native direct-index accessor (phase 3.7): the durable b-tree snapshot is streamed and
+  merged lazily with the visible `MvStore` overlay, with zero full base-index materialization.
+  `sqlite_schema` publication is schema-generation gated; DDL remains exclusive against active
+  MVCC snapshots rather than exposing a stale catalog.
 - **Process-local:** store is not cross-process (same as Turso process MVCC scope here).
 
 ## Checkpoint notes

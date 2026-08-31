@@ -1,4 +1,5 @@
-﻿using System.Text;
+﻿using System.Runtime.ExceptionServices;
+using System.Text;
 using Ahtola.Core.Parsing;
 using Ahtola.Core.Storage;
 
@@ -13,7 +14,7 @@ internal sealed record EmbeddedFileCatalog(
     Dictionary<string, TriggerDefinition> Triggers,
     Dictionary<string, EmbeddedDatabase.VirtualTableDefinition> VirtualTables);
 
-internal sealed record EmbeddedFileIndexSeekRow(SqlValue[] Values, long RowId);
+internal sealed record EmbeddedFileIndexSeekRow(SqlValue[] Values, long? RowId);
 
 internal sealed class EmbeddedFileIndexAccessor(
     Func<
@@ -37,14 +38,51 @@ internal sealed class EmbeddedFileIndexAccessor(
     public void Dispose() => close();
 }
 
+/// <summary>
+/// Durable full-ascending-order scan handle over an index's (or a WITHOUT ROWID table's own
+/// primary-key b-tree's) entire committed b-tree — the "no known equality prefix" sibling of
+/// <see cref="EmbeddedFileIndexAccessor"/>, used for ORDER BY elision / unconstrained MVCC merge
+/// scans that would otherwise have to materialize and sort every row in memory.
+/// </summary>
+internal sealed class EmbeddedFileIndexFullScanAccessor(
+    Func<Action?, Action?, IEnumerable<EmbeddedFileIndexSeekRow>> scan,
+    Action open,
+    Action close) : IDisposable
+{
+    public void Open() => open();
+
+    public IEnumerable<EmbeddedFileIndexSeekRow> Scan(
+        Action? pageRead = null,
+        Action? tableRowFetched = null)
+        => scan(pageRead, tableRowFetched);
+
+    public void Dispose() => close();
+}
+
 internal sealed class EmbeddedFileReadSnapshot(
     EmbeddedFileStore owner,
     SqlitePagerReadTransaction transaction,
-    ISqliteBtreePageIo pageIo) : IDisposable
+    ISqliteBtreePageIo pageIo,
+    IReadOnlyDictionary<string, uint> tableRootPages,
+    IReadOnlyDictionary<string, uint> indexRootPages) : IDisposable
 {
     internal EmbeddedFileStore Owner { get; } = owner;
 
     internal ISqliteBtreePageIo PageIo { get; } = pageIo;
+
+    /// <summary>
+    /// The table root-page mapping captured atomically with <see cref="PageIo"/>'s pager
+    /// transaction (same locked section as the catalog clone — see
+    /// <see cref="EmbeddedDatabase.CreateTransactionSnapshotWithPin"/>). A pinned classic
+    /// transaction must resolve root pages from here, never from the store's live
+    /// <c>_tableRootPages</c>, so a peer's later DDL — including a drop/recreate that reuses the
+    /// same table name with a new root page — cannot redirect this snapshot's pager reads onto a
+    /// page that has nothing to do with the table this snapshot was pinned against.
+    /// </summary>
+    internal IReadOnlyDictionary<string, uint> TableRootPages { get; } = tableRootPages;
+
+    /// <summary>Same generation-bound guarantee as <see cref="TableRootPages"/>, for named secondary indexes.</summary>
+    internal IReadOnlyDictionary<string, uint> IndexRootPages { get; } = indexRootPages;
 
     public void Dispose() => transaction.Dispose();
 }
@@ -167,6 +205,17 @@ internal sealed class EmbeddedFileStore : IDisposable
     private Dictionary<string, uint> _indexRootPages = new(StringComparer.OrdinalIgnoreCase);
     private string _lastSchemaSignature = string.Empty;
 
+    // Resolves an application-defined (non-built-in) collation name to a
+    // ready-to-call comparison delegate, or null when no callback is
+    // currently registered for that name. Attached by EmbeddedDatabase after
+    // construction, because this store opens and loads the file catalog
+    // before any owning database exists to register collation callbacks
+    // against. A store with no resolver attached (the true cold-start path)
+    // structurally validates custom-collation index pages/records but defers
+    // ordering/content/uniqueness validation for them; see
+    // ValidateIndexRepresentable and ValidateStoredIndex.
+    private Func<string, Func<string, string, int>?>? _collationResolver;
+
     // The exact table dictionary whose contents this store last made durable.
     // Reference identity is the only admissible proof that a caller's "previous"
     // catalog really is the committed one, so an incremental write can compute
@@ -191,6 +240,31 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     /// <summary>
+    /// Attaches (or clears, when <paramref name="resolver"/> is
+    /// <see langword="null"/>) the runtime collation resolver used to bind
+    /// application-defined collation names to comparison delegates for
+    /// index build/write/seek. The owning <c>EmbeddedDatabase</c> calls this
+    /// immediately after construction and again whenever a collation
+    /// callback is registered, replaced, or unregistered.
+    /// </summary>
+    /// <remarks>
+    /// Also forwards the same resolver to <see cref="_indexExpressionEvaluator"/> — a private,
+    /// throwaway <c>EmbeddedDatabase</c> this store owns purely to evaluate partial-index
+    /// predicates and index expressions, which never receives the application's
+    /// <c>RegisterCollation</c> calls directly. Without this, a partial predicate or expression
+    /// index key referencing a custom COLLATE would fail "no such collation sequence" while
+    /// evaluating through that private instance even though the exact same collation is fully
+    /// registered and active on the owning connection. A missing callback still fails closed,
+    /// but only lazily: the first time the affected expression/predicate is actually evaluated,
+    /// never eagerly at store-open time.
+    /// </remarks>
+    internal void SetCollationResolver(Func<string, Func<string, string, int>?>? resolver)
+    {
+        _collationResolver = resolver;
+        _indexExpressionEvaluator.SetExternalCollationResolver(resolver);
+    }
+
+    /// <summary>
     /// Opens (or creates) the managed file database and reconstructs its catalog
     /// from the committed SQLite pages.
     /// </summary>
@@ -204,7 +278,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         SqliteTextEncoding? initialTextEncoding = null,
         bool foreignReadOnly = false,
         IPageCodec? pageCodec = null,
-        bool createRollbackJournalMode = false)
+        bool createRollbackJournalMode = false,
+        Func<string, Func<string, string, int>?>? collationResolver = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         ArgumentNullException.ThrowIfNull(fileSystem);
@@ -286,6 +361,14 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(SchemaRootPage));
             var store = new EmbeddedFileStore(fileSystem, path, walPath, pager, header);
+            // Attaching the resolver before the catalog load lets a reopen on an
+            // existing connection (which already knows its registered
+            // collations) validate custom-collation index order/content/
+            // uniqueness immediately instead of deferring; the true cold-start
+            // path (a brand-new connection with no owning EmbeddedDatabase yet)
+            // passes null here and defers structurally, per
+            // ValidateIndexRepresentable/ValidateStoredIndex.
+            store.SetCollationResolver(collationResolver);
             catalog = store.Load();
             return store;
         }
@@ -315,20 +398,53 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// </summary>
     internal long CommittedViewGeneration => _pager.CommittedViewGeneration;
 
-    internal bool CanOpenIndexAccessor(EmbeddedTable table, EmbeddedIndex index)
+    /// <summary>
+    /// Answers "can the pager physically seek this table's committed durable b-tree", either for
+    /// a named secondary index (<paramref name="index"/> non-null, rowid or WITHOUT ROWID) or, when
+    /// <paramref name="index"/> is <see langword="null"/>, for a WITHOUT ROWID table's own primary-key
+    /// b-tree (the table's root page, which the managed engine already stores as an index b-tree keyed
+    /// by <see cref="EmbeddedTable.PrimaryKeySchema"/>).
+    /// </summary>
+    internal bool CanOpenIndexAccessor(
+        EmbeddedTable table,
+        EmbeddedIndex? index,
+        bool requireCommittedTableIdentity = true)
     {
         ArgumentNullException.ThrowIfNull(table);
-        ArgumentNullException.ThrowIfNull(index);
-        return !_disposed
-            && table.HasRowid
+        // A classic transaction's QueryContext.Tables is built from a cloned SchemaCatalog, so its
+        // EmbeddedTable is never the same object as the one this store committed even when nothing
+        // schema-relevant changed. The transaction-overlay caller passes false here and instead
+        // relies on the transaction's own "no schema changes this transaction" gate for safety, so
+        // relaxing this check to a name-based existence test is sound: everything downstream already
+        // matches indexes/tables by name (see the persistedIndex lookup below), not by reference.
+        var committed = !_disposed
+            && _committedTables is not null
+            && (requireCommittedTableIdentity
+                ? _committedTables.TryGetValue(table.Name, out var committedTable) && ReferenceEquals(committedTable, table)
+                : _committedTables.ContainsKey(table.Name))
+            && _tableRootPages.ContainsKey(table.Name);
+        if (index is null)
+        {
+            return committed
+                && table.WithoutRowid
+                && table.PrimaryKeySchema is { Terms.Count: > 0 };
+        }
+
+        // Partial and expression index columns are both safe to seek here: the persisted b-tree
+        // holds whatever rows/values were computed when the row was written (see
+        // TryBuildIndexRecord), so a seek never has to re-evaluate a predicate or an expression at
+        // read time. Query-level safety (partial-predicate implication, expression-operand
+        // matching, keeping expression indexes non-covering) is enforced by the caller before it
+        // ever asks to open an accessor; this method only answers "can the pager physically seek
+        // this index's committed b-tree". WITHOUT ROWID secondary indexes are just as physically
+        // seekable as rowid ones: their records always carry the table's primary-key columns
+        // (see GetWithoutRowidIndexStorageColumns), so the PK-driven table-root lookup they need
+        // for a non-covering fetch is always possible.
+        return committed
             && !index.IsMethodIndex
             && index.Columns.Count > 0
-            && index.Columns.All(static column => !column.IsExpression)
-            && _committedTables is not null
-            && _committedTables.TryGetValue(table.Name, out var committed)
-            && ReferenceEquals(committed, table)
-            && _tableRootPages.ContainsKey(table.Name)
-            && _indexRootPages.ContainsKey(index.Name);
+            && _indexRootPages.ContainsKey(index.Name)
+            && (!table.WithoutRowid || table.PrimaryKeySchema is { Terms.Count: > 0 });
     }
 
     internal bool TryOpenReadSnapshot(
@@ -346,6 +462,21 @@ internal sealed class EmbeddedFileStore : IDisposable
             return false;
         }
 
+        return TryOpenReadSnapshot(out snapshot);
+    }
+
+    /// <summary>
+    /// Opens a pager read snapshot independent of any single table, for pinning at the start of a
+    /// classic (non-MVCC) transaction. The snapshot is coupled to whatever catalog/version was
+    /// cloned in the same locked section (see <see cref="EmbeddedDatabase.CreateTransactionSnapshotWithPin"/>)
+    /// and, once opened, is unaffected by any later peer commit until it is disposed.
+    /// </summary>
+    internal bool TryOpenReadSnapshot(out EmbeddedFileReadSnapshot snapshot)
+    {
+        snapshot = null!;
+        if (_disposed || _committedTables is null)
+            return false;
+
         var transaction = _pager.BeginReadTransaction();
         try
         {
@@ -354,7 +485,12 @@ internal sealed class EmbeddedFileStore : IDisposable
                 transaction.PageCount,
                 _pageSize,
                 _usableSpace);
-            snapshot = new EmbeddedFileReadSnapshot(this, transaction, pageIo);
+            // Capturing the field references (not a defensive copy) is sound: every writer
+            // replaces _tableRootPages/_indexRootPages wholesale with a brand-new dictionary
+            // rather than mutating one in place (see RefreshCommittedCatalog and the VACUUM
+            // rewrite path), so the dictionary this snapshot now holds a reference to can never
+            // change out from under it once captured.
+            snapshot = new EmbeddedFileReadSnapshot(this, transaction, pageIo, _tableRootPages, _indexRootPages);
             return true;
         }
         catch
@@ -366,20 +502,31 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     internal bool TryOpenIndexAccessor(
         EmbeddedTable table,
-        EmbeddedIndex index,
+        EmbeddedIndex? index,
         int prefixLength,
         bool covering,
         EmbeddedFileReadSnapshot? sharedSnapshot,
-        out EmbeddedFileIndexAccessor accessor)
+        out EmbeddedFileIndexAccessor accessor,
+        bool requireCommittedTableIdentity = true)
     {
         ArgumentNullException.ThrowIfNull(table);
-        ArgumentNullException.ThrowIfNull(index);
         accessor = null!;
-        if (!CanOpenIndexAccessor(table, index)
-            || prefixLength < 1
-            || prefixLength > index.Columns.Count
-            || !_tableRootPages.TryGetValue(table.Name, out var tableRootPage)
-            || !_indexRootPages.TryGetValue(index.Name, out var indexRootPage))
+        if (!CanOpenIndexAccessor(table, index, requireCommittedTableIdentity) || prefixLength < 1)
+            return false;
+
+        if (index is null)
+            return TryOpenPrimaryKeyIndexAccessor(table, prefixLength, sharedSnapshot, out accessor);
+
+        // A shared (pinned) snapshot resolves roots from the mapping it captured atomically with
+        // its pager transaction, never from the store's live _tableRootPages/_indexRootPages: a
+        // peer's DDL committed after this snapshot was pinned — including a drop/recreate that
+        // reuses the same name with a new root page — must not redirect this snapshot's reads
+        // onto a page number that has nothing to do with what it was pinned against.
+        var tableRootPages = sharedSnapshot?.TableRootPages ?? _tableRootPages;
+        var indexRootPages = sharedSnapshot?.IndexRootPages ?? _indexRootPages;
+        if (prefixLength > index.Columns.Count
+            || !tableRootPages.TryGetValue(table.Name, out var tableRootPage)
+            || !indexRootPages.TryGetValue(index.Name, out var indexRootPage))
         {
             return false;
         }
@@ -391,6 +538,215 @@ internal sealed class EmbeddedFileStore : IDisposable
             return false;
 
         var comparer = CreateIndexComparer(table, persistedIndex);
+        var (getPageIo, openSnapshot, closeSnapshot) = CreateIndexAccessorSnapshotAdapter(sharedSnapshot);
+
+        if (table.WithoutRowid)
+        {
+            var primaryKeySchema = table.PrimaryKeySchema
+                ?? throw new InvalidDataException(
+                    $"WITHOUT ROWID table '{table.Name}' is missing its primary-key metadata.");
+            var storageColumns = GetWithoutRowidIndexStorageColumns(table, persistedIndex);
+            var primaryKeyComparer = CreatePrimaryKeyComparer(primaryKeySchema);
+            accessor = new EmbeddedFileIndexAccessor(
+                (prefix, pageRead, keyCompared, tableRowFetched) => SeekCommittedWithoutRowidIndex(
+                    table,
+                    persistedIndex,
+                    storageColumns,
+                    primaryKeySchema,
+                    tableRootPage,
+                    indexRootPage,
+                    prefixLength,
+                    covering,
+                    getPageIo(),
+                    comparer,
+                    primaryKeyComparer,
+                    prefix,
+                    pageRead,
+                    keyCompared,
+                    tableRowFetched),
+                openSnapshot,
+                closeSnapshot);
+            return true;
+        }
+
+        accessor = new EmbeddedFileIndexAccessor(
+            (prefix, pageRead, keyCompared, tableRowFetched) => SeekCommittedRowidIndex(
+                table,
+                persistedIndex,
+                tableRootPage,
+                indexRootPage,
+                prefixLength,
+                covering,
+                getPageIo(),
+                comparer,
+                prefix,
+                pageRead,
+                keyCompared,
+                tableRowFetched),
+            openSnapshot,
+            closeSnapshot);
+        return true;
+    }
+
+    private bool TryOpenPrimaryKeyIndexAccessor(
+        EmbeddedTable table,
+        int prefixLength,
+        EmbeddedFileReadSnapshot? sharedSnapshot,
+        out EmbeddedFileIndexAccessor accessor)
+    {
+        accessor = null!;
+        var primaryKeySchema = table.PrimaryKeySchema;
+        // See the identical comment in TryOpenIndexAccessor: a shared snapshot's own captured
+        // root-page mapping must win over the store's live one.
+        var tableRootPages = sharedSnapshot?.TableRootPages ?? _tableRootPages;
+        if (primaryKeySchema is null
+            || prefixLength > primaryKeySchema.Terms.Count
+            || !tableRootPages.TryGetValue(table.Name, out var tableRootPage))
+        {
+            return false;
+        }
+
+        var comparer = CreatePrimaryKeyComparer(primaryKeySchema);
+        var (getPageIo, openSnapshot, closeSnapshot) = CreateIndexAccessorSnapshotAdapter(sharedSnapshot);
+        accessor = new EmbeddedFileIndexAccessor(
+            (prefix, pageRead, keyCompared, _) => SeekCommittedPrimaryKeyIndex(
+                table,
+                primaryKeySchema,
+                tableRootPage,
+                prefixLength,
+                getPageIo(),
+                comparer,
+                prefix,
+                pageRead,
+                keyCompared),
+            openSnapshot,
+            closeSnapshot);
+        return true;
+    }
+
+    /// <summary>
+    /// Opens a durable full-ascending-order scan accessor over an index's (or a WITHOUT ROWID
+    /// table's own primary-key b-tree's) entire committed b-tree — the "no known equality prefix"
+    /// counterpart of <see cref="TryOpenIndexAccessor"/>. A caller with no seek prefix (e.g. an
+    /// ORDER BY-elision full scan, or an MVCC merge that must visit every base row) uses this to
+    /// stream the base table's natural key order lazily instead of materializing and sorting every
+    /// row in memory first.
+    /// </summary>
+    internal bool TryOpenIndexFullScanAccessor(
+        EmbeddedTable table,
+        EmbeddedIndex? index,
+        bool covering,
+        EmbeddedFileReadSnapshot? sharedSnapshot,
+        out EmbeddedFileIndexFullScanAccessor accessor,
+        bool requireCommittedTableIdentity = true)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        accessor = null!;
+        if (!CanOpenIndexAccessor(table, index, requireCommittedTableIdentity))
+            return false;
+
+        if (index is null)
+            return TryOpenPrimaryKeyIndexFullScanAccessor(table, sharedSnapshot, out accessor);
+
+        // See the identical comment in TryOpenIndexAccessor: a shared snapshot's own captured
+        // root-page mapping must win over the store's live one.
+        var tableRootPages = sharedSnapshot?.TableRootPages ?? _tableRootPages;
+        var indexRootPages = sharedSnapshot?.IndexRootPages ?? _indexRootPages;
+        if (!tableRootPages.TryGetValue(table.Name, out var tableRootPage)
+            || !indexRootPages.TryGetValue(index.Name, out var indexRootPage))
+        {
+            return false;
+        }
+
+        var persistedIndex = table.Indexes.FirstOrDefault(candidate =>
+            ReferenceEquals(candidate, index)
+            || string.Equals(candidate.Name, index.Name, StringComparison.OrdinalIgnoreCase));
+        if (persistedIndex is null)
+            return false;
+
+        var comparer = CreateIndexComparer(table, persistedIndex);
+        var (getPageIo, openSnapshot, closeSnapshot) = CreateIndexAccessorSnapshotAdapter(sharedSnapshot);
+
+        if (table.WithoutRowid)
+        {
+            var primaryKeySchema = table.PrimaryKeySchema
+                ?? throw new InvalidDataException(
+                    $"WITHOUT ROWID table '{table.Name}' is missing its primary-key metadata.");
+            var storageColumns = GetWithoutRowidIndexStorageColumns(table, persistedIndex);
+            var primaryKeyComparer = CreatePrimaryKeyComparer(primaryKeySchema);
+            accessor = new EmbeddedFileIndexFullScanAccessor(
+                (pageRead, tableRowFetched) => ScanCommittedWithoutRowidIndexAscending(
+                    table,
+                    persistedIndex,
+                    storageColumns,
+                    primaryKeySchema,
+                    tableRootPage,
+                    indexRootPage,
+                    covering,
+                    getPageIo(),
+                    comparer,
+                    primaryKeyComparer,
+                    pageRead,
+                    tableRowFetched),
+                openSnapshot,
+                closeSnapshot);
+            return true;
+        }
+
+        accessor = new EmbeddedFileIndexFullScanAccessor(
+            (pageRead, tableRowFetched) => ScanCommittedRowidIndexAscending(
+                table,
+                persistedIndex,
+                tableRootPage,
+                indexRootPage,
+                covering,
+                getPageIo(),
+                comparer,
+                pageRead,
+                tableRowFetched),
+            openSnapshot,
+            closeSnapshot);
+        return true;
+    }
+
+    private bool TryOpenPrimaryKeyIndexFullScanAccessor(
+        EmbeddedTable table,
+        EmbeddedFileReadSnapshot? sharedSnapshot,
+        out EmbeddedFileIndexFullScanAccessor accessor)
+    {
+        accessor = null!;
+        var primaryKeySchema = table.PrimaryKeySchema;
+        // See the identical comment in TryOpenIndexAccessor: a shared snapshot's own captured
+        // root-page mapping must win over the store's live one.
+        var tableRootPages = sharedSnapshot?.TableRootPages ?? _tableRootPages;
+        if (primaryKeySchema is null || !tableRootPages.TryGetValue(table.Name, out var tableRootPage))
+            return false;
+
+        var comparer = CreatePrimaryKeyComparer(primaryKeySchema);
+        var (getPageIo, openSnapshot, closeSnapshot) = CreateIndexAccessorSnapshotAdapter(sharedSnapshot);
+        accessor = new EmbeddedFileIndexFullScanAccessor(
+            (pageRead, _) => ScanCommittedPrimaryKeyIndexAscending(
+                table,
+                primaryKeySchema,
+                tableRootPage,
+                getPageIo(),
+                comparer,
+                pageRead),
+            openSnapshot,
+            closeSnapshot);
+        return true;
+    }
+
+    /// <summary>
+    /// Builds the shared lazy-open/close committed-page-snapshot plumbing used by every durable
+    /// index accessor (secondary index, or WITHOUT ROWID primary-key b-tree). When
+    /// <paramref name="sharedSnapshot"/> is supplied the accessor reuses its page I/O and never
+    /// opens or closes a transaction of its own; otherwise a fresh read transaction is opened
+    /// lazily on first use and disposed when the accessor is disposed.
+    /// </summary>
+    private (Func<ISqliteBtreePageIo> GetPageIo, Action Open, Action Close) CreateIndexAccessorSnapshotAdapter(
+        EmbeddedFileReadSnapshot? sharedSnapshot)
+    {
         var snapshotGate = new object();
         SqlitePagerReadTransaction? snapshot = null;
         ISqliteBtreePageIo? pageIo = null;
@@ -429,26 +785,13 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
         }
 
-        accessor = new EmbeddedFileIndexAccessor(
-            (prefix, pageRead, keyCompared, tableRowFetched) => SeekCommittedIndex(
-                table,
-                persistedIndex,
-                tableRootPage,
-                indexRootPage,
-                prefixLength,
-                covering,
-                GetPageIo(),
-                comparer,
-                prefix,
-                pageRead,
-                keyCompared,
-                tableRowFetched),
+        return (
+            GetPageIo,
             sharedSnapshot is null ? () => _ = GetPageIo() : static () => { },
             CloseSnapshot);
-        return true;
     }
 
-    private IEnumerable<EmbeddedFileIndexSeekRow> SeekCommittedIndex(
+    private IEnumerable<EmbeddedFileIndexSeekRow> SeekCommittedRowidIndex(
         EmbeddedTable table,
         EmbeddedIndex index,
         uint tableRootPage,
@@ -502,6 +845,273 @@ internal sealed class EmbeddedFileStore : IDisposable
                 row[table.RowidAliasColumnIndex] = SqlValue.Integer(rowId);
             EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, row);
             yield return new EmbeddedFileIndexSeekRow(row, rowId);
+        }
+    }
+
+    /// <summary>
+    /// Seeks a WITHOUT ROWID table's secondary index. Every persisted record for such an index
+    /// always carries the table's full primary-key columns as a locator suffix (see
+    /// <see cref="GetWithoutRowidIndexStorageColumns"/>), never a rowid: a non-covering match
+    /// re-seeks the table's own root page — which the managed engine stores as an index b-tree
+    /// keyed by the declared primary key — using that locator instead of <see cref="SqliteTableBtreeCursor"/>.
+    /// </summary>
+    private IEnumerable<EmbeddedFileIndexSeekRow> SeekCommittedWithoutRowidIndex(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyList<EmbeddedIndexColumn> storageColumns,
+        SqlitePrimaryKeySchema primaryKeySchema,
+        uint tableRootPage,
+        uint indexRootPage,
+        int prefixLength,
+        bool covering,
+        ISqliteBtreePageIo pageIo,
+        SqliteIndexRecordComparer comparer,
+        SqliteIndexRecordComparer primaryKeyComparer,
+        SqlValue[] prefix,
+        Action? pageRead,
+        Action? keyCompared,
+        Action? tableRowFetched)
+    {
+        if (prefix.Length != prefixLength)
+            throw new ArgumentException("The index seek key does not match the planned prefix length.", nameof(prefix));
+
+        var indexCursor = new SqliteIndexBtreeCursor(pageIo, comparer, _textEncoding);
+        var tableCursor = covering ? null : new SqliteIndexBtreeCursor(pageIo, primaryKeyComparer, _textEncoding);
+        foreach (var record in indexCursor.SeekPrefix(indexRootPage, prefix, pageRead, keyCompared))
+        {
+            var indexValues = SqliteRecordCodec.Decode(record, _textEncoding);
+            if (indexValues.Length != storageColumns.Count)
+            {
+                throw new InvalidDataException(
+                    $"SQLite index '{index.Name}' record does not carry its declared storage columns.");
+            }
+
+            // Scatter every non-expression storage column (the declared index columns plus the
+            // always-present primary-key suffix) into a partial row. Expression-index columns
+            // (ColumnIndex < 0) key the index but are never real table columns, and a covering
+            // plan never includes one (see CanOpenIndexAccessor); they contribute to neither the
+            // covering projection nor primary-key reconstruction.
+            var partialRow = new SqlValue[table.Columns.Length];
+            Array.Fill(partialRow, SqlValue.Null);
+            for (var position = 0; position < storageColumns.Count; position++)
+            {
+                var columnIndex = storageColumns[position].ColumnIndex;
+                if (columnIndex >= 0)
+                    partialRow[columnIndex] = indexValues[position];
+            }
+
+            SqlValue[] row;
+            if (covering)
+            {
+                row = partialRow;
+            }
+            else
+            {
+                var primaryKey = primaryKeySchema.ProjectKey(partialRow);
+                byte[]? tableRecord = null;
+                foreach (var candidate in tableCursor!.SeekPrefix(tableRootPage, primaryKey, pageRead, keyCompared))
+                {
+                    tableRecord = candidate;
+                    break;
+                }
+
+                if (tableRecord is null)
+                {
+                    throw new InvalidDataException(
+                        $"SQLite index '{index.Name}' references a missing primary key in table '{table.Name}'.");
+                }
+
+                tableRowFetched?.Invoke();
+                row = RestoreWithoutRowidRecord(
+                    table.Name,
+                    table,
+                    primaryKeySchema,
+                    SqliteRecordCodec.Decode(tableRecord, _textEncoding));
+            }
+
+            EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, row);
+            yield return new EmbeddedFileIndexSeekRow(row, RowId: null);
+        }
+    }
+
+    /// <summary>
+    /// Seeks a WITHOUT ROWID table's own primary-key b-tree (its root page) directly, driving an
+    /// equality join lookup on the table's leading primary-key term(s) without materializing an
+    /// index view. The primary key already carries the full row, so this is always covering.
+    /// </summary>
+    private IEnumerable<EmbeddedFileIndexSeekRow> SeekCommittedPrimaryKeyIndex(
+        EmbeddedTable table,
+        SqlitePrimaryKeySchema primaryKeySchema,
+        uint tableRootPage,
+        int prefixLength,
+        ISqliteBtreePageIo pageIo,
+        SqliteIndexRecordComparer comparer,
+        SqlValue[] prefix,
+        Action? pageRead,
+        Action? keyCompared)
+    {
+        if (prefix.Length != prefixLength)
+            throw new ArgumentException("The index seek key does not match the planned prefix length.", nameof(prefix));
+
+        var cursor = new SqliteIndexBtreeCursor(pageIo, comparer, _textEncoding);
+        foreach (var record in cursor.SeekPrefix(tableRootPage, prefix, pageRead, keyCompared))
+        {
+            var storedValues = SqliteRecordCodec.Decode(record, _textEncoding);
+            var row = RestoreWithoutRowidRecord(table.Name, table, primaryKeySchema, storedValues);
+            EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, row);
+            yield return new EmbeddedFileIndexSeekRow(row, RowId: null);
+        }
+    }
+
+    /// <summary>
+    /// Ascending-order sibling of <see cref="SeekCommittedRowidIndex"/>: materializes every row in
+    /// the index's committed b-tree, in the index's own key order, instead of only the rows
+    /// matching an equality prefix. Used by ORDER BY-elision and MVCC merge scans that have no
+    /// known seek prefix.
+    /// </summary>
+    private IEnumerable<EmbeddedFileIndexSeekRow> ScanCommittedRowidIndexAscending(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        uint tableRootPage,
+        uint indexRootPage,
+        bool covering,
+        ISqliteBtreePageIo pageIo,
+        SqliteIndexRecordComparer comparer,
+        Action? pageRead,
+        Action? tableRowFetched)
+    {
+        var indexCursor = new SqliteIndexBtreeCursor(pageIo, comparer, _textEncoding);
+        var tableCursor = covering ? null : new SqliteTableBtreeCursor(pageIo);
+        foreach (var record in indexCursor.ScanAscending(indexRootPage, pageRead))
+        {
+            var indexValues = SqliteRecordCodec.Decode(record, _textEncoding);
+            if (indexValues.Length <= index.Columns.Count
+                || indexValues[^1].Kind != SqlValueKind.Integer)
+            {
+                throw new InvalidDataException(
+                    $"SQLite index '{index.Name}' record is missing its rowid suffix.");
+            }
+
+            var rowId = indexValues[^1].AsInteger();
+            SqlValue[] row;
+            if (covering)
+            {
+                row = new SqlValue[table.Columns.Length];
+                Array.Fill(row, SqlValue.Null);
+                for (var position = 0; position < index.Columns.Count; position++)
+                    row[index.Columns[position].ColumnIndex] = indexValues[position];
+            }
+            else
+            {
+                if (!tableCursor!.TrySeek(tableRootPage, rowId, out var tableRecord))
+                {
+                    throw new InvalidDataException(
+                        $"SQLite index '{index.Name}' references missing rowid {rowId} in table '{table.Name}'.");
+                }
+
+                tableRowFetched?.Invoke();
+                row = RestoreRowidTableRecord(table, SqliteRecordCodec.Decode(tableRecord, _textEncoding));
+            }
+
+            if (table.RowidAliasColumnIndex >= 0)
+                row[table.RowidAliasColumnIndex] = SqlValue.Integer(rowId);
+            EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, row);
+            yield return new EmbeddedFileIndexSeekRow(row, rowId);
+        }
+    }
+
+    /// <summary>
+    /// Ascending-order sibling of <see cref="SeekCommittedWithoutRowidIndex"/>. See that method's
+    /// doc comment for the record shape; this variant walks the whole index instead of an equality
+    /// prefix range.
+    /// </summary>
+    private IEnumerable<EmbeddedFileIndexSeekRow> ScanCommittedWithoutRowidIndexAscending(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyList<EmbeddedIndexColumn> storageColumns,
+        SqlitePrimaryKeySchema primaryKeySchema,
+        uint tableRootPage,
+        uint indexRootPage,
+        bool covering,
+        ISqliteBtreePageIo pageIo,
+        SqliteIndexRecordComparer comparer,
+        SqliteIndexRecordComparer primaryKeyComparer,
+        Action? pageRead,
+        Action? tableRowFetched)
+    {
+        var indexCursor = new SqliteIndexBtreeCursor(pageIo, comparer, _textEncoding);
+        var tableCursor = covering ? null : new SqliteIndexBtreeCursor(pageIo, primaryKeyComparer, _textEncoding);
+        foreach (var record in indexCursor.ScanAscending(indexRootPage, pageRead))
+        {
+            var indexValues = SqliteRecordCodec.Decode(record, _textEncoding);
+            if (indexValues.Length != storageColumns.Count)
+            {
+                throw new InvalidDataException(
+                    $"SQLite index '{index.Name}' record does not carry its declared storage columns.");
+            }
+
+            var partialRow = new SqlValue[table.Columns.Length];
+            Array.Fill(partialRow, SqlValue.Null);
+            for (var position = 0; position < storageColumns.Count; position++)
+            {
+                var columnIndex = storageColumns[position].ColumnIndex;
+                if (columnIndex >= 0)
+                    partialRow[columnIndex] = indexValues[position];
+            }
+
+            SqlValue[] row;
+            if (covering)
+            {
+                row = partialRow;
+            }
+            else
+            {
+                var primaryKey = primaryKeySchema.ProjectKey(partialRow);
+                byte[]? tableRecord = null;
+                foreach (var candidate in tableCursor!.SeekPrefix(tableRootPage, primaryKey, pageRead, keyCompared: null))
+                {
+                    tableRecord = candidate;
+                    break;
+                }
+
+                if (tableRecord is null)
+                {
+                    throw new InvalidDataException(
+                        $"SQLite index '{index.Name}' references a missing primary key in table '{table.Name}'.");
+                }
+
+                tableRowFetched?.Invoke();
+                row = RestoreWithoutRowidRecord(
+                    table.Name,
+                    table,
+                    primaryKeySchema,
+                    SqliteRecordCodec.Decode(tableRecord, _textEncoding));
+            }
+
+            EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, row);
+            yield return new EmbeddedFileIndexSeekRow(row, RowId: null);
+        }
+    }
+
+    /// <summary>
+    /// Ascending-order sibling of <see cref="SeekCommittedPrimaryKeyIndex"/>: walks a WITHOUT
+    /// ROWID table's own primary-key b-tree in full instead of seeking an equality prefix.
+    /// </summary>
+    private IEnumerable<EmbeddedFileIndexSeekRow> ScanCommittedPrimaryKeyIndexAscending(
+        EmbeddedTable table,
+        SqlitePrimaryKeySchema primaryKeySchema,
+        uint tableRootPage,
+        ISqliteBtreePageIo pageIo,
+        SqliteIndexRecordComparer comparer,
+        Action? pageRead)
+    {
+        var cursor = new SqliteIndexBtreeCursor(pageIo, comparer, _textEncoding);
+        foreach (var record in cursor.ScanAscending(tableRootPage, pageRead))
+        {
+            var storedValues = SqliteRecordCodec.Decode(record, _textEncoding);
+            var row = RestoreWithoutRowidRecord(table.Name, table, primaryKeySchema, storedValues);
+            EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, row);
+            yield return new EmbeddedFileIndexSeekRow(row, RowId: null);
         }
     }
 
@@ -618,8 +1228,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                     var candidatePages = new HashSet<uint>(occupiedBtreePages);
                     try
                     {
-                        ValidateIndexRepresentable(entry.TableName, table, candidate);
-                        ValidateStoredIndex(entry, table, candidate, candidatePages);
+                        ValidateIndexRepresentable(entry.TableName, table, candidate, structuralOnly: _collationResolver is null);
+                        ValidateStoredIndex(entry, table, candidate, candidatePages, structuralOnly: _collationResolver is null);
                         occupiedBtreePages.UnionWith(candidatePages);
                         validatedIndex = candidate;
                         break;
@@ -663,8 +1273,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
 
             var index = CreateIndexDefinition(entry.TableName, table, create);
-            ValidateIndexRepresentable(entry.TableName, table, index);
-            ValidateStoredIndex(entry, table, index, occupiedBtreePages);
+            ValidateIndexRepresentable(entry.TableName, table, index, structuralOnly: _collationResolver is null);
+            ValidateStoredIndex(entry, table, index, occupiedBtreePages, structuralOnly: _collationResolver is null);
             if (index.IsMethodIndex)
             {
                 ManagedIndexMethodSemantics
@@ -783,7 +1393,11 @@ internal sealed class EmbeddedFileStore : IDisposable
                             activePages,
                             pageCount,
                             overflowReader,
-                            CreateIndexComparer(indexedTable, index));
+                            // ValidateAllocationMap only runs from Load(), before EmbeddedDatabase
+                            // wires up a runtime collation resolver, so a not-yet-resolvable custom
+                            // collation must defer here exactly like the other Load() validation
+                            // calls above (structural page-reachability only, never ordering).
+                            CreateIndexComparer(indexedTable, index, allowDeferredCustomCollation: _collationResolver is null));
                         break;
                 }
             }
@@ -1025,6 +1639,363 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new InvalidDataException(
                     $"Stored {treeDescription} {owner} page {pageNumber} has unsupported type {header.PageType}.");
         }
+    }
+
+    /// <summary>
+    /// Collects every page one index's b-tree currently occupies EXCEPT its
+    /// root — interior, leaf, and overflow pages — reading through
+    /// <paramref name="pageIo"/> rather than the committed pager directly, so
+    /// this is safe to call against a <see cref="SqliteStagedBtreePageIo"/>
+    /// mid-transaction as well as against committed state.
+    /// </summary>
+    /// <remarks>
+    /// A targeted REINDEX frees the pages this collects and then writes the
+    /// index's replacement tree, reusing the same root page number so the
+    /// schema catalog's root-page pointer never has to change. <paramref
+    /// name="comparer"/> should be built with
+    /// <c>allowDeferredCustomCollation: true</c> AND
+    /// <c>forceDeferCustomCollation: true</c>: this traversal only needs to
+    /// prove page/record shape, never real ordering, so an index whose
+    /// custom collation callback is not currently registered — or whose
+    /// currently-registered callback is a replacement that no longer agrees
+    /// with the tree's existing physical order, which is precisely why a
+    /// REINDEX is often requested in the first place — can still have its
+    /// stale tree freed without ever binary-comparing its keys under either
+    /// the old or the new semantics.
+    /// </remarks>
+    private void CollectIndexTreeNonRootPagesForFree(
+        uint rootPage,
+        ISqliteBtreePageIo pageIo,
+        SqliteOverflowChainReader overflowReader,
+        SqliteIndexRecordComparer comparer,
+        ISet<uint> pages)
+    {
+        CollectIndexTreeNodePagesForFree(rootPage, pageIo.ReadPage(rootPage), pageIo, overflowReader, comparer, pages);
+    }
+
+    private void CollectIndexTreeNodePagesForFree(
+        uint pageNumber,
+        ReadOnlySpan<byte> pageImage,
+        ISqliteBtreePageIo pageIo,
+        SqliteOverflowChainReader overflowReader,
+        SqliteIndexRecordComparer comparer,
+        ISet<uint> pages)
+    {
+        var header = SqliteBtreePageHeader.Parse(pageImage);
+        switch (header.PageType)
+        {
+            case SqliteBtreePageType.IndexLeaf:
+                CollectIndexLeafOverflowPages(
+                    SqliteIndexLeafPageView.Parse(
+                        pageImage,
+                        _usableSpace,
+                        _textEncoding,
+                        overflowReader: overflowReader,
+                        recordComparer: comparer),
+                    pages,
+                    pageIo.PageCount,
+                    overflowReader,
+                    $"stale index page {pageNumber}");
+                return;
+            case SqliteBtreePageType.IndexInterior:
+                {
+                    var interior = SqliteIndexInteriorPageView.Parse(
+                        pageImage,
+                        _usableSpace,
+                        _textEncoding,
+                        overflowReader: overflowReader,
+                        recordComparer: comparer);
+                    foreach (var cell in interior.Cells)
+                    {
+                        CollectIndexOverflowPages(
+                            cell.Cell.Key,
+                            pages,
+                            pageIo.PageCount,
+                            overflowReader,
+                            $"stale index page {pageNumber} separator");
+                    }
+
+                    foreach (var childPage in interior.Cells
+                                 .Select(cell => cell.Cell.LeftChildPage)
+                                 .Append(interior.Header.RightMostChildPage))
+                    {
+                        AddOwnedPage(pages, childPage, pageIo.PageCount, $"stale index page {pageNumber} child");
+                        CollectIndexTreeNodePagesForFree(
+                            childPage,
+                            pageIo.ReadPage(childPage),
+                            pageIo,
+                            overflowReader,
+                            comparer,
+                            pages);
+                    }
+
+                    return;
+                }
+            default:
+                throw new InvalidDataException(
+                    $"Stale index page {pageNumber} has unsupported type {header.PageType}.");
+        }
+    }
+
+    /// <summary>
+    /// Finds indexes whose collation is currently unavailable — nothing has registered a
+    /// callback for a custom name, or an application override is bound but this store cannot
+    /// prove it still agrees with the tree's existing physical order — but whose owning table
+    /// has not changed since the previous commit, and clones their existing committed b-tree
+    /// byte-for-byte so a full rewrite never has to call <see cref="BuildIndexTree"/> — which
+    /// unconditionally requires a working comparator — for them. This is what lets an unrelated
+    /// <c>CREATE TABLE</c> or a sibling <c>CREATE INDEX</c> succeed even while another index
+    /// depends on a collation nothing has registered right now.
+    /// </summary>
+    /// <remarks>
+    /// Only ever engaged for a plain full rewrite (see the <c>!reclaimTrailingPages</c> caller
+    /// in <see cref="PersistCore"/>): VACUUM / page-size migration compute their target page
+    /// count from <see cref="RebuildPageAllocator.HighestAllocatedPage"/>, which never accounts
+    /// for a page this method asks the allocator to leave untouched, so a preserved index's
+    /// existing (possibly high-numbered) page could then land outside the shrunk target range
+    /// and fail <see cref="ValidateRewritePlan"/>.
+    /// </remarks>
+    private Dictionary<string, PreservedIndexTree> TryPreserveUnavailableIndexTrees(
+        IReadOnlyList<IndexDefinition> indexes,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables,
+        SqliteDatabaseHeader currentHeader)
+    {
+        var preserved = new Dictionary<string, PreservedIndexTree>(StringComparer.OrdinalIgnoreCase);
+        foreach (var definition in indexes)
+        {
+            if (definition.Index.IsMethodIndex)
+                continue;
+            if (!IsIndexUnchangedFromPrevious(definition.TableName, definition.Table, definition.Index, previousTables))
+                continue;
+            if (!_indexRootPages.TryGetValue(definition.Index.Name, out var rootPage)
+                || rootPage < 2
+                || rootPage > _pager.CommittedPageCount)
+            {
+                continue;
+            }
+
+            // A comparer built with no deferred flags is exactly this store's
+            // "is this index's collation fully usable right now" probe (see
+            // CreateIndexComparer / CreateIndexComparerOrThrowNoSuchCollation).
+            // When it succeeds there is nothing to preserve: the ordinary
+            // BuildIndexTree path below already handles this index correctly —
+            // and, unlike this preserving path, also re-proves its order —
+            // so only genuinely unavailable collations reach the clone below.
+            // That probe only ever looks at indexed-term (column-level)
+            // collations, though: a partial index's WHERE predicate or an
+            // expression index's column body can embed its own COLLATE
+            // reference that CreateIndexComparer never sees at all (it is
+            // never handed to the SqliteIndexRecordComparer constructor).
+            // TryFindUnresolvedEmbeddedIndexCollation is the same check
+            // ValidateStoredIndex uses to defer judgement on those, so an
+            // index unavailable for that reason must be preserved here too —
+            // otherwise BuildIndexRecords below would call into the
+            // predicate/expression evaluator and fail hard with "no such
+            // collation sequence", turning an unrelated CREATE TABLE / CREATE
+            // INDEX into a hard failure instead of leaving this index alone.
+            if (!TryFindUnresolvedEmbeddedIndexCollation(definition.Index, out _))
+            {
+                try
+                {
+                    CreateIndexComparer(definition.Table, definition.Index);
+                    continue;
+                }
+                catch (EmbeddedSqlException)
+                {
+                    // Falls through to attempt preservation.
+                }
+            }
+
+            try
+            {
+                var structuralComparer = CreateIndexComparer(
+                    definition.Table,
+                    definition.Index,
+                    allowDeferredCustomCollation: true,
+                    forceDeferCustomCollation: true);
+                var tree = ClonePreservedIndexTree(rootPage, structuralComparer, currentHeader);
+                preserved[definition.Index.Name] = new PreservedIndexTree(rootPage, tree);
+            }
+            catch (InvalidDataException)
+            {
+                // The committed tree itself is not safely traversable
+                // (physically corrupted, or truncated). Fall back to the
+                // ordinary rebuild path, which will then correctly throw the
+                // same no-such-collation-sequence failure BuildIndexTree
+                // already produces for an index whose collation truly is
+                // unavailable: preservation is only ever a byte-for-byte
+                // optimization, never a way to paper over real corruption.
+            }
+        }
+
+        return preserved;
+    }
+
+    /// <summary>
+    /// Reads one index's complete committed b-tree — root, every interior/leaf/overflow page —
+    /// into a <see cref="PreparedIndexTree"/> without ever trusting <paramref
+    /// name="structuralComparer"/> to compare key ordering (it must be built with
+    /// <c>forceDeferCustomCollation: true</c>). Applies the same duplicate/out-of-range page
+    /// checks <see cref="CollectIndexTreeNodePagesForFree"/> applies when freeing a stale tree,
+    /// so a physically corrupted committed image is rejected here exactly as it would be there,
+    /// rather than silently copied forward.
+    /// </summary>
+    private PreparedIndexTree ClonePreservedIndexTree(
+        uint rootPage,
+        SqliteIndexRecordComparer structuralComparer,
+        SqliteDatabaseHeader currentHeader)
+    {
+        var overflowReader = new SqliteOverflowChainReader(_pager, currentHeader);
+        var visited = new HashSet<uint> { rootPage };
+        var interiorPages = new List<PageImage>();
+        var leafPages = new List<PageImage>();
+        var overflowPages = new List<PageImage>();
+        var rootImage = _pager.ReadCommittedPage(rootPage);
+        ClonePreservedIndexNode(
+            rootPage,
+            rootImage,
+            isRoot: true,
+            overflowReader,
+            structuralComparer,
+            visited,
+            interiorPages,
+            leafPages,
+            overflowPages);
+        return new PreparedIndexTree(rootImage, interiorPages, leafPages, overflowPages);
+    }
+
+    private void ClonePreservedIndexNode(
+        uint pageNumber,
+        byte[] pageImage,
+        bool isRoot,
+        SqliteOverflowChainReader overflowReader,
+        SqliteIndexRecordComparer comparer,
+        HashSet<uint> visited,
+        List<PageImage> interiorPages,
+        List<PageImage> leafPages,
+        List<PageImage> overflowPages)
+    {
+        var header = SqliteBtreePageHeader.Parse(pageImage);
+        switch (header.PageType)
+        {
+            case SqliteBtreePageType.IndexLeaf:
+                {
+                    if (!isRoot)
+                        leafPages.Add(new PageImage(pageNumber, pageImage));
+
+                    var leaf = SqliteIndexLeafPageView.Parse(
+                        pageImage,
+                        _usableSpace,
+                        _textEncoding,
+                        overflowReader: overflowReader,
+                        recordComparer: comparer);
+                    foreach (var cell in leaf.Cells)
+                    {
+                        CloneIndexOverflowPages(
+                            cell.Cell,
+                            overflowReader,
+                            visited,
+                            overflowPages,
+                            $"preserved index page {pageNumber}");
+                    }
+
+                    return;
+                }
+            case SqliteBtreePageType.IndexInterior:
+                {
+                    if (!isRoot)
+                        interiorPages.Add(new PageImage(pageNumber, pageImage));
+
+                    var interior = SqliteIndexInteriorPageView.Parse(
+                        pageImage,
+                        _usableSpace,
+                        _textEncoding,
+                        overflowReader: overflowReader,
+                        recordComparer: comparer);
+                    foreach (var cell in interior.Cells)
+                    {
+                        CloneIndexOverflowPages(
+                            cell.Cell.Key,
+                            overflowReader,
+                            visited,
+                            overflowPages,
+                            $"preserved index page {pageNumber} separator");
+                    }
+
+                    foreach (var childPage in interior.Cells
+                                 .Select(cell => cell.Cell.LeftChildPage)
+                                 .Append(interior.Header.RightMostChildPage))
+                    {
+                        AddOwnedPage(visited, childPage, _pager.CommittedPageCount, $"preserved index page {pageNumber} child");
+                        ClonePreservedIndexNode(
+                            childPage,
+                            _pager.ReadCommittedPage(childPage),
+                            isRoot: false,
+                            overflowReader,
+                            comparer,
+                            visited,
+                            interiorPages,
+                            leafPages,
+                            overflowPages);
+                    }
+
+                    return;
+                }
+            default:
+                throw new InvalidDataException(
+                    $"Stored preserved index page {pageNumber} has unsupported type {header.PageType}.");
+        }
+    }
+
+    private void CloneIndexOverflowPages(
+        SqliteIndexLeafCell cell,
+        SqliteOverflowChainReader overflowReader,
+        HashSet<uint> visited,
+        List<PageImage> overflowPages,
+        string owner)
+    {
+        var overflowLength = GetOverflowLength(cell.PayloadLength, cell.LocalPayload.Length, owner);
+        if (overflowLength == 0)
+        {
+            if (cell.FirstOverflowPage is not null)
+                throw new InvalidDataException($"SQLite {owner} cell has an unnecessary overflow page.");
+            return;
+        }
+
+        if (cell.FirstOverflowPage is not { } firstOverflowPage)
+            throw new InvalidDataException($"SQLite {owner} cell is missing its overflow page.");
+
+        foreach (var overflowPage in overflowReader.Traverse(firstOverflowPage, overflowLength))
+        {
+            AddOwnedPage(visited, overflowPage, _pager.CommittedPageCount, $"{owner} overflow");
+            overflowPages.Add(new PageImage(overflowPage, _pager.ReadCommittedPage(overflowPage)));
+        }
+    }
+
+    /// <summary>
+    /// Unions every root/interior/leaf/overflow page number a set of preserved index trees
+    /// occupies, so <see cref="RebuildPageAllocator"/> can be told to leave all of them alone.
+    /// Also re-validates there is no collision ACROSS different preserved indexes: each tree's
+    /// own clone already guarantees no duplicate WITHIN itself (see the <c>visited</c> set in
+    /// <see cref="ClonePreservedIndexTree"/>), but two indexes should never legitimately share a
+    /// page, so a collision here would mean the committed catalog itself is corrupted.
+    /// </summary>
+    private static HashSet<uint> CollectPreservedIndexTreePages(
+        IReadOnlyDictionary<string, PreservedIndexTree> preservedIndexTrees)
+    {
+        var pages = new HashSet<uint>();
+        foreach (var preserved in preservedIndexTrees.Values)
+        {
+            AddOwnedPage(pages, preserved.RootPage, uint.MaxValue, "preserved index root");
+            foreach (var page in preserved.Tree.InteriorPages)
+                AddOwnedPage(pages, page.PageNumber, uint.MaxValue, "preserved index page");
+            foreach (var page in preserved.Tree.LeafPages)
+                AddOwnedPage(pages, page.PageNumber, uint.MaxValue, "preserved index page");
+            foreach (var page in preserved.Tree.OverflowPages)
+                AddOwnedPage(pages, page.PageNumber, uint.MaxValue, "preserved index overflow page");
+        }
+
+        return pages;
     }
 
     private static void CollectTableLeafOverflowPages(
@@ -1643,7 +2614,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
         PragmaHeaderMetadata? pragmaHeader = null,
         bool forceFullRewrite = false,
-        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null,
+        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null)
         => PersistCore(
             tables,
             views,
@@ -1653,7 +2625,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             incrementSchemaCookie: false,
             pragmaHeader,
             forceFullRewrite,
-            previousTables);
+            previousTables,
+            targetedIndexRebuild: targetedIndexRebuild);
 
     /// <summary>
     /// Materializes an MVCC checkpoint into pager WAL pages without reclaiming
@@ -2030,14 +3003,15 @@ internal sealed class EmbeddedFileStore : IDisposable
         bool forceFullRewrite,
         IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null,
         bool checkpointAfterCommit = true,
-        SqliteDatabaseHeader? vacuumSourceHeader = null)
+        SqliteDatabaseHeader? vacuumSourceHeader = null,
+        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
 
         // Validate first: a reject must leave the existing database untouched.
         foreach (var (name, table) in tables)
-            EmbeddedFileStore.ValidateTableRepresentable(name, table);
+            ValidateTableRepresentable(name, table, previousTables);
         EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
         ValidateSchemaDefinitions(tables, views, triggers, virtualTables);
 
@@ -2072,25 +3046,84 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
         }
 
+        // A targeted REINDEX only ever needs to rebuild the selected ordinary index
+        // trees in place: everything else — including a table whose index uses a
+        // custom collation with no callback registered right now — must remain
+        // byte-for-byte untouched. This has to be attempted here, at the same point
+        // every other mutation is actually committed to the pager/WAL, rather than
+        // eagerly inside statement execution: the statement only records which
+        // targets to rebuild, and ForceFullCatalogRewrite is still requested as the
+        // guaranteed fallback in case the rebuild is not eligible (schema changed
+        // concurrently, a pragma header write is also pending) or fails structurally
+        // (for example the old tree's on-disk image cannot be traversed because it
+        // is itself corrupted, which the full rewrite already knows how to repair).
+        if (forceFullRewrite
+            && !reclaimTrailingPages
+            && pragmaHeader is null
+            && targetedIndexRebuild is { Count: > 0 }
+            && TryPersistTargetedIndexRebuild(
+                tables,
+                views,
+                triggers,
+                virtualTables,
+                targetedIndexRebuild,
+                checkpointAfterCommit,
+                previousTables))
+        {
+            _committedTables = tables;
+            return CommittedCatalogVersion;
+        }
+
         var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
         var currentFreelist = SqliteFreelist.Read(
             currentHeader,
             _pager.CommittedPageCount,
             _pager.ReadCommittedPage);
+        var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
+        // previousTables lets GetIndexDefinitions defer validation for an index
+        // whose own row/tree has not changed since the previous commit even while
+        // this rewrite's connection has some OTHER custom collation resolver
+        // attached (see IsIndexUnchangedFromPrevious / structuralOnly below);
+        // omitting it here used to silently force full validation of every
+        // index on every full rewrite, defeating that deferral exactly when an
+        // unrelated CREATE TABLE / CREATE INDEX needed it most.
+        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables, previousTables);
+
+        // An index whose custom collation nothing has registered right now
+        // must never block an unrelated schema change as long as its own
+        // table has not changed since the previous commit: its existing
+        // committed b-tree is cloned byte-for-byte below instead of being
+        // rebuilt through BuildIndexTree, which unconditionally requires a
+        // working comparator. Gated to a plain full rewrite (never VACUUM /
+        // page-size migration): those compute their target page count from
+        // the allocator's own high-water mark, which would not account for a
+        // page this preserves without ever handing out.
+        var preservedIndexTrees = reclaimTrailingPages
+            ? new Dictionary<string, PreservedIndexTree>(StringComparer.OrdinalIgnoreCase)
+            : TryPreserveUnavailableIndexTrees(indexes, previousTables, currentHeader);
+        var reservedPages = preservedIndexTrees.Count == 0
+            ? null
+            : CollectPreservedIndexTreePages(preservedIndexTrees);
+
         // Only a fully rebuilt page map can safely repurpose existing freelist
         // pages: all new data, trunks, leaves, and page 1 are one WAL commit.
         var allocator = new RebuildPageAllocator(
             _pager.CommittedPageCount,
             currentFreelist.LeafPageNumbers,
-            reclaimTrailingPages);
-        var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
-        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables);
+            reclaimTrailingPages,
+            reservedPages);
         var rootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         var indexRootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         foreach (var name in tableNames)
             rootPages[name] = allocator.ReservePage();
         foreach (var definition in indexes)
-            indexRootPages[definition.Index.Name] = allocator.ReservePage();
+        {
+            indexRootPages[definition.Index.Name] = preservedIndexTrees.TryGetValue(
+                definition.Index.Name,
+                out var preservedRoot)
+                ? preservedRoot.RootPage
+                : allocator.ReservePage();
+        }
 
         // Build every page image up front so a build failure also rejects cleanly.
         var tablePages = new Dictionary<uint, PreparedTableTree>();
@@ -2104,11 +3137,15 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
         foreach (var definition in indexes)
         {
-            indexPages[indexRootPages[definition.Index.Name]] = BuildIndexTree(
-                definition.TableName,
-                definition.Table,
-                definition.Index,
-                allocator);
+            indexPages[indexRootPages[definition.Index.Name]] = preservedIndexTrees.TryGetValue(
+                definition.Index.Name,
+                out var preservedTree)
+                ? preservedTree.Tree
+                : BuildIndexTree(
+                    definition.TableName,
+                    definition.Table,
+                    definition.Index,
+                    allocator);
         }
 
         var schemaEntries = BuildSchemaEntries(
@@ -2396,7 +3433,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable> previousTables,
         bool checkpointAfterCommit)
     {
-        if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables))
+        if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables, previousTables))
             return false;
 
         var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
@@ -2417,7 +3454,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             return false;
 
         var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
-        var indexesByTable = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables)
+        var indexesByTable = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables, previousTables)
             .GroupBy(definition => definition.TableName, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(
                 group => group.Key,
@@ -2480,6 +3517,179 @@ internal sealed class EmbeddedFileStore : IDisposable
 
             // Page one publishes the new database size, so it must be the frame
             // that makes every page this mutation allocated reachable.
+            transaction.WritePage(SchemaRootPage, pageOne);
+            transaction.Commit(_synchronousMode);
+        }
+
+        _header = newHeader;
+        if (checkpointAfterCommit)
+            CheckpointCommittedMutation(reclaimTrailingPages: false);
+        return true;
+    }
+
+    /// <summary>
+    /// Rebuilds only the b-tree of each targeted, ordinary index in place —
+    /// reusing its existing root page number and freeing its old
+    /// interior/leaf/overflow pages — in one pager/WAL transaction, without
+    /// touching any other table or index tree and without requiring any
+    /// collation other than each targeted index's own.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the persistence path for a targeted <c>REINDEX
+    /// index|table|collation</c>. Every targeted index's replacement tree is
+    /// written to the SAME root page number it already occupies — real SQLite
+    /// roots change shape between leaf and interior in place as a tree grows
+    /// or shrinks, so this mirrors ordinary b-tree behavior rather than
+    /// inventing a new one — which means the schema catalog's root-page
+    /// pointer, and therefore the schema tree itself, never needs to change.
+    /// </para>
+    /// <para>
+    /// Every OTHER index's pages — including one whose custom collation is
+    /// not currently registered — are never read, freed, or rewritten by this
+    /// method, so they are never binary-compared and never require their
+    /// callback. A caller must not include a method index in
+    /// <paramref name="targets"/>: method indexes are rebuilt through their
+    /// cursor, not through this file-store b-tree path.
+    /// </para>
+    /// </remarks>
+    internal bool TryPersistTargetedIndexRebuild(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
+        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)> targets,
+        bool checkpointAfterCommit = true,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
+    {
+        if (targets.Count == 0)
+            return true;
+        if (targets.Any(target => target.Index.IsMethodIndex))
+            return false;
+        if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables, previousTables))
+            return false;
+
+        var distinctTargets = targets
+            .GroupBy(target => target.Index.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+
+        var rootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (_, _, index) in distinctTargets)
+        {
+            if (!_indexRootPages.TryGetValue(index.Name, out var rootPage)
+                || rootPage < 2
+                || rootPage > _pager.CommittedPageCount)
+            {
+                return false;
+            }
+
+            rootPages[index.Name] = rootPage;
+        }
+
+        var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
+        if (currentHeader.PageSize != _pageSize
+            || currentHeader.UsableSpace != _usableSpace
+            || currentHeader.VersionValidFor != currentHeader.ChangeCounter
+            || currentHeader.DatabaseSizeInPages != _pager.CommittedPageCount
+            || currentHeader.LargestRootBtreePage != 0
+            || currentHeader.IncrementalVacuumEnabled != 0)
+        {
+            return false;
+        }
+
+        var pageIo = new SqliteStagedBtreePageIo(
+            pageNumber => _pager.ReadCommittedPage(pageNumber),
+            _pager.CommittedPageCount,
+            _pageSize,
+            _usableSpace,
+            currentHeader.FirstFreelistTrunkPage,
+            currentHeader.FreelistPageCount);
+        var overflowReader = new SqliteOverflowChainReader(pageIo);
+
+        try
+        {
+            // Free every non-root page each targeted index's OLD tree
+            // occupies before rebuilding, so the replacement tree below can
+            // reuse them. forceDeferCustomCollation keeps this a pure
+            // structural traversal: it proves page/record shape only, never
+            // ordering, regardless of whether the target's own callback
+            // happens to be registered right now. A REINDEX is frequently
+            // triggered precisely because a replacement callback no longer
+            // agrees with the OLD tree's physical order (that mismatch is
+            // exactly what makes the index stale) — trusting the currently
+            // bound delegate to validate the old tree's order would either
+            // throw on a false "corruption" or, worse, silently misjudge
+            // which pages are stale, so this pass must never binary-compare
+            // keys under any delegate, old or new.
+            var freedPages = new HashSet<uint>();
+            foreach (var (_, table, index) in distinctTargets)
+            {
+                var freeComparer = CreateIndexComparer(
+                    table,
+                    index,
+                    allowDeferredCustomCollation: true,
+                    forceDeferCustomCollation: true);
+                CollectIndexTreeNonRootPagesForFree(rootPages[index.Name], pageIo, overflowReader, freeComparer, freedPages);
+            }
+
+            foreach (var pageNumber in freedPages.Order())
+                pageIo.FreePage(pageNumber);
+
+            var allocator = new StagedIndexRebuildPageAllocator(pageIo);
+            foreach (var (tableName, table, index) in distinctTargets)
+            {
+                // Resolving this comparer requires only the targeted index's
+                // own collation — never any other index's — so an unrelated
+                // index whose custom collation is not registered is untouched
+                // by this call.
+                var tree = BuildIndexTree(tableName, table, index, allocator);
+                var rootPage = rootPages[index.Name];
+                pageIo.WritePage(rootPage, tree.RootPage);
+                foreach (var page in tree.InteriorPages)
+                    pageIo.WritePage(page.PageNumber, page.Page);
+                foreach (var page in tree.LeafPages)
+                    pageIo.WritePage(page.PageNumber, page.Page);
+                foreach (var page in tree.OverflowPages)
+                    pageIo.WritePage(page.PageNumber, page.Page);
+            }
+        }
+        catch (SqliteBtreeMaintenanceRequiredException)
+        {
+            return false;
+        }
+        catch (InvalidDataException)
+        {
+            // Free-page collection walks the OLD tree to discover its stale
+            // pages, which requires that tree's stored bytes to still parse as
+            // a well-formed b-tree. REINDEX must also repair a physically
+            // corrupted index, so a target whose on-disk image is not safely
+            // traversable falls back to the full-catalog rewrite, which never
+            // reads the old tree and always succeeds by reallocating fresh.
+            return false;
+        }
+
+        if (pageIo.StagedPages.Count == 0 || pageIo.StagedPages.ContainsKey(SchemaRootPage))
+            return false;
+
+        var target = pageIo.PageCount;
+        var newChangeCounter = currentHeader.ChangeCounter + 1;
+        var newHeader = currentHeader with
+        {
+            ChangeCounter = newChangeCounter,
+            VersionValidFor = newChangeCounter,
+            DatabaseSizeInPages = target,
+            FirstFreelistTrunkPage = pageIo.FirstFreelistTrunkPage,
+            FreelistPageCount = pageIo.FreelistPageCount,
+        };
+        var pageOne = _pager.ReadCommittedPage(SchemaRootPage);
+        newHeader.WriteTo(pageOne);
+
+        using (var transaction = _pager.BeginTransaction(target))
+        {
+            foreach (var (pageNumber, image) in pageIo.StagedPages)
+                transaction.WritePage(pageNumber, image);
+
             transaction.WritePage(SchemaRootPage, pageOne);
             transaction.Commit(_synchronousMode);
         }
@@ -2757,7 +3967,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             return false;
 
         var persisted = Load();
-        if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables)
+        if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables, persisted.Tables)
             || !TryGetSingleChangedTable(tables, persisted.Tables, out var tableName, out var table))
         {
             return false;
@@ -2773,7 +3983,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
-        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables)
+        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables, persisted.Tables)
             .Where(index => string.Equals(index.TableName, tableName, StringComparison.OrdinalIgnoreCase))
             .ToArray();
         if (indexes.Length != table.Indexes.Count
@@ -7867,7 +9077,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
-        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
     {
         if (tables.Count != _tableRootPages.Count
             || tables.Keys.Any(name => !_tableRootPages.ContainsKey(name)))
@@ -7876,7 +9087,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
-        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables);
+        var indexes = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables, previousTables);
         if (indexes.Count != _indexRootPages.Count
             || indexes.Any(index => !_indexRootPages.ContainsKey(index.Index.Name)))
         {
@@ -8298,6 +9509,17 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             _pager.CheckpointToMainStoreAndResetWal(synchronousMode: _synchronousMode);
         }
+        catch (SqlitePagerBusyException)
+        {
+            // A peer connection's pinned durable transaction snapshot (or another
+            // in-flight checkpoint) is legitimately holding a WAL read mark right now.
+            // This is ordinary SQLite PASSIVE-checkpoint contention, not a maintenance
+            // failure: the mutation above is already durable, and the WAL simply keeps
+            // the frames around for the next opportunistic checkpoint to reclaim. Do
+            // not escalate this to EmbeddedPostCommitMaintenanceException regardless of
+            // reclaimTrailingPages, since surfacing it would make an unrelated reader's
+            // still-open transaction fail an otherwise-successful peer commit.
+        }
         catch (IOException exception) when (!reclaimTrailingPages)
         {
             throw RecordPostCommitMaintenanceFailure(exception);
@@ -8472,11 +9694,102 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
-    private static void ValidateTableRepresentable(string name, EmbeddedTable table)
+    /// <summary>
+    /// Reports whether <paramref name="table"/>'s row storage — <see cref="RowStore.LineageId"/>
+    /// and <see cref="RowStore.Revision"/> — is unchanged relative to the entry recorded for
+    /// <paramref name="name"/> in <paramref name="previousTables"/>, and returns that previous
+    /// entry via <paramref name="previous"/> for a caller to then check individual indexes
+    /// against (see <see cref="IsIndexUnchangedFromPrevious(EmbeddedIndex,EmbeddedTable?)"/>).
+    /// Deliberately says nothing about the table's current index *list*: a sibling
+    /// <c>CREATE INDEX</c>/<c>DROP INDEX</c> only ever appends to or removes an entry from
+    /// <see cref="EmbeddedTable.Indexes"/> without touching the table's row storage, so gating
+    /// this proof on the index list being identical (as an earlier version of this method did)
+    /// would defeat every pre-existing index's preservation/deferred-validation exemption the
+    /// moment any one index on the same table was added or dropped — forcing an unrelated
+    /// <c>CREATE INDEX new_binary ON t(...)</c> to rebuild (and therefore require a working
+    /// comparator for) every other index on <c>t</c>, including one whose collation is not
+    /// currently available.
+    /// </summary>
+    /// <remarks>
+    /// The working catalog for an ordinary statement is built via
+    /// <c>SchemaCatalog.Clone()</c>, which unconditionally deep-clones every table (so a
+    /// failed/rolled-back statement never mutates the published catalog) — even tables
+    /// the statement never touches. That means <paramref name="table"/> is essentially
+    /// never reference-identical to the previously-recorded entry even when nothing about
+    /// it changed, so a plain reference check alone would defeat this exemption for every
+    /// commit. <see cref="EmbeddedTable.Clone"/> preserves the source's exact
+    /// <see cref="RowStore.Revision"/> *and* <see cref="RowStore.LineageId"/> (rather than
+    /// rebuilding the row store row by row), so comparing those cheap, already-tracked signals
+    /// detects "row storage genuinely untouched since the previous commit" without an
+    /// O(row count) content diff.
+    /// <para>
+    /// Revision equality alone is not collision-resistant: a full table rebuild (e.g.
+    /// <c>EmbeddedTable.CreateWithAlteredColumn</c> for <c>ALTER TABLE ... ALTER COLUMN</c>,
+    /// or DROP/ADD COLUMN) constructs a brand-new <see cref="RowStore"/> and re-adds every
+    /// existing row into it via <see cref="RowStore.Add"/> — so a table with N rows and no
+    /// prior updates/deletes ends up with the identical Revision (== N) both before and after
+    /// the rebuild, even though every row's bytes may have changed under a column's new
+    /// affinity/type. Requiring <see cref="RowStore.LineageId"/> equality as well closes that
+    /// gap: it can only ever match when the exact same in-memory RowStore was carried forward
+    /// (Clone), never across a rebuild that constructs a new one.
+    /// </para>
+    /// </remarks>
+    private static bool IsTableRowStorageUnchangedFromPrevious(
+        string name,
+        EmbeddedTable table,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables,
+        out EmbeddedTable? previous)
+    {
+        if (previousTables is null || !previousTables.TryGetValue(name, out previous))
+        {
+            previous = null;
+            return false;
+        }
+
+        return ReferenceEquals(previous, table)
+            || (table.Rows.LineageId == previous.Rows.LineageId
+                && table.Rows.Revision == previous.Rows.Revision);
+    }
+
+    /// <summary>
+    /// Reports whether <paramref name="index"/> — one specific index, not its owning table's
+    /// entire index list — is the exact same <see cref="EmbeddedIndex"/> instance carried
+    /// forward on <paramref name="previous"/> (the table entry recorded at the previous
+    /// commit; see <see cref="IsTableRowStorageUnchangedFromPrevious"/>). A brand-new index
+    /// added by this statement's own <c>CREATE INDEX</c> (<c>table.Indexes.Add(definition)</c>
+    /// in EmbeddedDatabase.cs) is never present by reference in <paramref name="previous"/>'s
+    /// list and so correctly reports "changed" here even while every pre-existing index on the
+    /// same table — carried forward unmodified — still reports "unchanged". Combined with
+    /// row-storage-unchanged, this is what proves a specific index's already-committed b-tree
+    /// is still exactly what was durably written for it, independent of whether some other
+    /// index on the same table was just added or dropped.
+    /// </summary>
+    private static bool IsIndexUnchangedFromPrevious(EmbeddedIndex index, EmbeddedTable? previous)
+        => previous is not null
+            && previous.Indexes.Contains(index, ReferenceEqualityComparer.Instance);
+
+    /// <summary>
+    /// Combines <see cref="IsTableRowStorageUnchangedFromPrevious"/> and
+    /// <see cref="IsIndexUnchangedFromPrevious(EmbeddedIndex,EmbeddedTable?)"/> into the single
+    /// per-index "is this index's committed b-tree still trustworthy/preservable" proof callers
+    /// need. See both for why this is scoped to one index rather than the table as a whole.
+    /// </summary>
+    private static bool IsIndexUnchangedFromPrevious(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables)
+        => IsTableRowStorageUnchangedFromPrevious(tableName, table, previousTables, out var previous)
+            && IsIndexUnchangedFromPrevious(index, previous);
+
+    private void ValidateTableRepresentable(
+        string name,
+        EmbeddedTable table,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
     {
         if (table.WithoutRowid)
         {
-            _ = ValidateWithoutRowidTableRepresentable(name, table);
+            _ = ValidateWithoutRowidTableRepresentable(name, table, previousTables);
             return;
         }
 
@@ -8534,7 +9847,11 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         foreach (var index in table.Indexes)
-            ValidateIndexRepresentable(name, table, index);
+        {
+            var structuralOnly = _collationResolver is null
+                || IsIndexUnchangedFromPrevious(name, table, index, previousTables);
+            ValidateIndexRepresentable(name, table, index, structuralOnly: structuralOnly);
+        }
     }
 
     private static void ValidatePrimaryKeyIndexPrerequisites(
@@ -8578,9 +9895,10 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
-    private static SqlitePrimaryKeySchema ValidateWithoutRowidTableRepresentable(
+    private SqlitePrimaryKeySchema ValidateWithoutRowidTableRepresentable(
         string tableName,
-        EmbeddedTable table)
+        EmbeddedTable table,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
     {
         ValidatePrimaryKeyIndexPrerequisites(
             tableName,
@@ -8615,7 +9933,11 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         foreach (var index in table.Indexes)
-            ValidateIndexRepresentable(tableName, table, index);
+        {
+            var structuralOnly = _collationResolver is null
+                || IsIndexUnchangedFromPrevious(tableName, table, index, previousTables);
+            ValidateIndexRepresentable(tableName, table, index, structuralOnly: structuralOnly);
+        }
 
         return primaryKeySchema;
     }
@@ -9601,7 +10923,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         string tableName,
         EmbeddedTable table,
         EmbeddedIndex index,
-        RebuildPageAllocator allocator)
+        IIndexRebuildPageAllocator allocator)
     {
         var comparer = CreateIndexComparer(table, index);
         var leafGroups = PartitionIndexLeafRecords(
@@ -9619,7 +10941,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         string treeDescription,
         IReadOnlyList<List<byte[]>> leafGroups,
         SqliteIndexRecordComparer comparer,
-        RebuildPageAllocator allocator)
+        IIndexRebuildPageAllocator allocator)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(treeDescription);
         ArgumentNullException.ThrowIfNull(leafGroups);
@@ -10144,7 +11466,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private byte[] BuildIndexInteriorPage(
         IndexInteriorPlan plan,
         SqliteIndexRecordComparer comparer,
-        RebuildPageAllocator allocator,
+        IIndexRebuildPageAllocator allocator,
         ICollection<PageImage> overflowPages)
     {
         if (plan.Separators.Count != plan.Children.Count - 1)
@@ -10170,7 +11492,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private void MaterializeIndexTreeChildren(
         IReadOnlyList<IndexTreeNode> children,
         SqliteIndexRecordComparer comparer,
-        RebuildPageAllocator allocator,
+        IIndexRebuildPageAllocator allocator,
         ICollection<PageImage> overflowPages,
         ICollection<PageImage> interiorPages,
         ICollection<PageImage> leafPages)
@@ -10320,7 +11642,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private byte[] BuildIndexLeafPage(
         IReadOnlyList<byte[]> records,
         SqliteIndexRecordComparer comparer,
-        RebuildPageAllocator allocator,
+        IIndexRebuildPageAllocator allocator,
         ICollection<PageImage> overflowPages)
     {
         var builder = new SqliteIndexLeafPageBuilder(_pageSize, _usableSpace, comparer);
@@ -10381,7 +11703,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private SqliteIndexLeafCell CreateIndexLeafCell(
         byte[] record,
-        RebuildPageAllocator allocator,
+        IIndexRebuildPageAllocator allocator,
         ICollection<PageImage> overflowPages)
     {
         var layout = SqlitePayloadLayout.Calculate(
@@ -10702,7 +12024,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             decorated.Add((values, record));
         }
 
-        decorated.Sort((left, right) => comparer.Compare(left.SortKey, right.SortKey));
+        SortPropagatingComparerExceptions(decorated, (left, right) => comparer.Compare(left.SortKey, right.SortKey));
         var records = new List<byte[]>(decorated.Count);
         for (var indexPosition = 0; indexPosition < decorated.Count; indexPosition++)
         {
@@ -10719,14 +12041,46 @@ internal sealed class EmbeddedFileStore : IDisposable
         return records;
     }
 
-    private SqliteIndexRecordComparer CreateIndexComparer(EmbeddedTable table, EmbeddedIndex index)
+    /// <summary>
+    /// Sorts <paramref name="list"/> with <paramref name="comparison"/>, unwrapping the
+    /// <see cref="InvalidOperationException"/> ("Failed to compare two elements in the
+    /// array.") that <see cref="List{T}.Sort(Comparison{T})"/> wraps around any exception a
+    /// comparison delegate throws. An application-defined collation callback registered via
+    /// <c>RegisterCollation</c> can throw arbitrary exceptions (including
+    /// non-Ahtola ones), and callers must see that original exception, not an opaque
+    /// sort-failure wrapper that discards it as an inner exception.
+    /// </summary>
+    internal static void SortPropagatingComparerExceptions<T>(List<T> list, Comparison<T> comparison)
+    {
+        try
+        {
+            list.Sort(comparison);
+        }
+        catch (InvalidOperationException exception) when (exception.InnerException is not null)
+        {
+            ExceptionDispatchInfo.Capture(exception.InnerException).Throw();
+            throw;
+        }
+    }
+
+    internal SqliteIndexRecordComparer CreateIndexComparer(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        bool allowDeferredCustomCollation = false,
+        bool forceDeferCustomCollation = false)
     {
         if (!table.WithoutRowid)
         {
-            return new SqliteIndexRecordComparer(
-                _textEncoding,
-                index.Columns.Select(column => column.Descending).ToArray(),
-                index.Columns.Select(column => column.Collation).ToArray());
+            var rowidTerms = index.Columns
+                .Select(column => new SqliteIndexComparisonTerm(
+                    column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
+                    GetIndexCollation(table, column)))
+                .ToArray();
+            return CreateIndexComparerOrThrowNoSuchCollation(
+                index,
+                rowidTerms,
+                allowDeferredCustomCollation,
+                forceDeferCustomCollation);
         }
 
         var terms = GetWithoutRowidIndexStorageColumns(table, index)
@@ -10734,15 +12088,104 @@ internal sealed class EmbeddedFileStore : IDisposable
                 column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
                 GetIndexCollation(table, column)))
             .ToArray();
-        return new SqliteIndexRecordComparer(_textEncoding, terms);
+        return CreateIndexComparerOrThrowNoSuchCollation(
+            index,
+            terms,
+            allowDeferredCustomCollation,
+            forceDeferCustomCollation);
     }
 
-    private SqliteIndexRecordComparer CreatePrimaryKeyComparer(SqlitePrimaryKeySchema schema)
+    /// <summary>
+    /// Builds the comparer for <paramref name="index"/>'s complete key terms, converting the
+    /// <see cref="SqliteIndexRecordComparer"/> constructor's <see cref="NotSupportedException"/>
+    /// (thrown only when <paramref name="allowDeferredCustomCollation"/> is <see langword="false"/>
+    /// and a term names a collation with neither a built-in implementation nor a bound
+    /// application-defined callback) into the SQLite-style
+    /// <see cref="EmbeddedSqlException"/> a write against this index must fail closed with —
+    /// never a raw <see cref="NotSupportedException"/> that leaks a managed-engine implementation
+    /// detail to callers expecting SQLite's "no such collation sequence" wording.
+    /// </summary>
+    private SqliteIndexRecordComparer CreateIndexComparerOrThrowNoSuchCollation(
+        EmbeddedIndex index,
+        SqliteIndexComparisonTerm[] terms,
+        bool allowDeferredCustomCollation,
+        bool forceDeferCustomCollation = false)
+    {
+        try
+        {
+            return new SqliteIndexRecordComparer(
+                _textEncoding,
+                terms,
+                allowDeferredCustomCollation,
+                forceDeferCustomCollation);
+        }
+        catch (NotSupportedException exception)
+        {
+            var unavailable = terms.FirstOrDefault(
+                term => !term.Collation.IsAvailable || !term.Collation.IsSupportedByManagedIndexWriter);
+            var name = unavailable?.Collation.Name ?? "?";
+            throw new EmbeddedSqlException(
+                $"The managed file engine cannot use index '{index.Name}' because no such collation sequence: {name}",
+                exception);
+        }
+    }
+
+    internal SqliteIndexRecordComparer CreatePrimaryKeyComparer(SqlitePrimaryKeySchema schema)
         => new(
             _textEncoding,
             schema.Terms.Select(term => new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
 
-    private static IReadOnlyList<EmbeddedIndexColumn> GetWithoutRowidIndexStorageColumns(
+    /// <summary>
+    /// Projects a row into the exact comparison-key shape the durable pager uses when persisting
+    /// <paramref name="index"/> (or, when <paramref name="index"/> is <see langword="null"/>, the
+    /// table's own WITHOUT ROWID primary-key b-tree), so a transaction's mutation-overlay rows sort
+    /// identically to — and merge deterministically with — rows read from the committed b-tree via
+    /// <see cref="CreateIndexComparer"/> / <see cref="CreatePrimaryKeyComparer"/>.
+    /// </summary>
+    internal SqlValue[] BuildIndexMergeKey(
+        EmbeddedTable table,
+        EmbeddedIndex? index,
+        SqlValue[] values,
+        long? rowId,
+        Func<Expression, EmbeddedTable, SqlValue[], long?, SqlValue> evaluateExpression)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(values);
+        ArgumentNullException.ThrowIfNull(evaluateExpression);
+
+        if (index is null)
+        {
+            var primaryKeySchema = table.PrimaryKeySchema
+                ?? throw new InvalidOperationException(
+                    $"WITHOUT ROWID table '{table.Name}' is missing its primary-key metadata.");
+            return primaryKeySchema.ProjectKey(values);
+        }
+
+        if (!table.WithoutRowid)
+        {
+            var key = IndexExpressionSemantics.ProjectKey(index, table, values, rowId, evaluateExpression);
+            var withRowId = new SqlValue[key.Length + 1];
+            Array.Copy(key, withRowId, key.Length);
+            withRowId[^1] = SqlValue.Integer(
+                rowId ?? throw new InvalidOperationException(
+                    $"Rowid table '{table.Name}' index seek requires a rowid."));
+            return withRowId;
+        }
+
+        var storageColumns = GetWithoutRowidIndexStorageColumns(table, index);
+        var storageKey = new SqlValue[storageColumns.Count];
+        for (var position = 0; position < storageColumns.Count; position++)
+        {
+            var column = storageColumns[position];
+            storageKey[position] = column.ColumnIndex >= 0
+                ? values[column.ColumnIndex]
+                : evaluateExpression(column.Expression!, table, values, rowId);
+        }
+
+        return storageKey;
+    }
+
+    private IReadOnlyList<EmbeddedIndexColumn> GetWithoutRowidIndexStorageColumns(
         EmbeddedTable table,
         EmbeddedIndex index)
     {
@@ -10774,8 +12217,65 @@ internal sealed class EmbeddedFileStore : IDisposable
         return columns;
     }
 
-    private static SqliteKeyCollation GetIndexCollation(EmbeddedTable table, EmbeddedIndexColumn column)
-        => SqliteKeyCollation.FromName(IndexExpressionSemantics.GetCollationName(table, column));
+    /// <summary>
+    /// Resolves the collation to use for one index storage column, binding
+    /// an application-defined comparison delegate when a runtime resolver is
+    /// attached and a callback is registered under the collation's name.
+    /// This also lets an application override BINARY/NOCASE/RTRIM by
+    /// registering a callback under that exact name; ordinary built-in
+    /// columns are unaffected because no callback is registered for them,
+    /// so the resolver returns <see langword="null"/> and default built-in
+    /// behavior is preserved. With no resolver attached (the true
+    /// cold-start catalog-load path) or no callback registered under the
+    /// name, this returns a collation descriptor with no bound delegate;
+    /// callers decide whether that is fatal (write/plan/seek) or
+    /// deferrable (initial structural catalog load).
+    /// </summary>
+    private SqliteKeyCollation GetIndexCollation(EmbeddedTable table, EmbeddedIndexColumn column)
+    {
+        var collation = SqliteKeyCollation.FromName(IndexExpressionSemantics.GetCollationName(table, column));
+        if (_collationResolver is null || collation.Name is null)
+            return collation;
+
+        var comparison = _collationResolver(collation.Name);
+        return comparison is null ? collation : collation.WithComparison(comparison);
+    }
+
+    /// <summary>
+    /// Checks whether <paramref name="index"/>'s partial-index predicate or index-expression
+    /// bodies embed a <c>COLLATE</c> reference that this store cannot currently resolve — neither
+    /// a built-in collation nor one bound via <see cref="SetCollationResolver"/> — so that
+    /// <see cref="ValidateStoredIndex"/> can decline to (re)evaluate the predicate/expression
+    /// through <see cref="BuildIndexRecords"/> before the caller has a chance to register it.
+    /// This mirrors <see cref="SqliteIndexRecordComparer.HasDeferredTerms"/>, which covers only
+    /// collations trailing an indexed term (column-level), never ones nested inside a predicate
+    /// or expression body.
+    /// </summary>
+    private bool TryFindUnresolvedEmbeddedIndexCollation(EmbeddedIndex index, out string? unresolvedName)
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        IndexExpressionSemantics.CollectEmbeddedCollationNames(index, names);
+        foreach (var name in names)
+        {
+            if (IsCollationNameResolvable(name))
+                continue;
+
+            unresolvedName = name;
+            return true;
+        }
+
+        unresolvedName = null;
+        return false;
+    }
+
+    private bool IsCollationNameResolvable(string name)
+    {
+        var collation = SqliteKeyCollation.FromName(name);
+        if (collation.IsSupportedByManagedIndexWriter)
+            return true;
+
+        return _collationResolver is not null && _collationResolver(name) is not null;
+    }
 
     private PreparedSchemaTree BuildSchemaTree(
         IReadOnlyList<SchemaEntry> entries,
@@ -10984,12 +12484,13 @@ internal sealed class EmbeddedFileStore : IDisposable
         return entries;
     }
 
-    private static IReadOnlyList<IndexDefinition> GetIndexDefinitions(
+    private IReadOnlyList<IndexDefinition> GetIndexDefinitions(
         IReadOnlyList<string> tableNames,
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
-        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
     {
         var names = new HashSet<string>(tables.Keys, StringComparer.OrdinalIgnoreCase);
         foreach (var name in views.Keys)
@@ -11014,7 +12515,9 @@ internal sealed class EmbeddedFileStore : IDisposable
             var table = tables[tableName];
             foreach (var index in table.Indexes)
             {
-                ValidateIndexRepresentable(tableName, table, index);
+                var structuralOnly = _collationResolver is null
+                    || IsIndexUnchangedFromPrevious(tableName, table, index, previousTables);
+                ValidateIndexRepresentable(tableName, table, index, structuralOnly: structuralOnly);
                 if (!names.Add(index.Name))
                 {
                     throw new EmbeddedSqlException(
@@ -11028,10 +12531,11 @@ internal sealed class EmbeddedFileStore : IDisposable
         return definitions;
     }
 
-    private static void ValidateIndexRepresentable(
+    private void ValidateIndexRepresentable(
         string tableName,
         EmbeddedTable table,
-        EmbeddedIndex index)
+        EmbeddedIndex index,
+        bool structuralOnly = false)
     {
         ArgumentNullException.ThrowIfNull(index);
         IndexExpressionSemantics.ValidateDefinition(tableName, table, index);
@@ -11046,13 +12550,24 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"The managed file engine cannot persist index '{index.Name}' because its column metadata is inconsistent.");
             }
             var collation = GetIndexCollation(table, column);
-            if (!collation.IsSupportedByManagedIndexWriter)
-            {
-                throw new EmbeddedSqlException(
-                    table.WithoutRowid
-                        ? $"The managed file engine cannot persist index '{index.Name}' because application-defined collation '{collation.Name}' cannot be restored before the file catalog is loaded."
-                        : $"The managed file engine cannot persist index '{index.Name}' because collation '{collation.Name}' is not a supported SQLite built-in collation.");
-            }
+            if (collation.IsSupportedByManagedIndexWriter)
+                continue;
+
+            // A structural-only pass (initial catalog load, before this store
+            // has a runtime collation resolver) can neither prove nor
+            // disprove that the durable order/content for this
+            // application-defined collation is still valid, so it defers
+            // that judgement instead of failing the whole catalog open.
+            // Everything else about the index — page layout, cell/record
+            // decodability, schema round-trip — is still fully validated.
+            // Ordering, content, and uniqueness are (re)validated once a
+            // matching collation callback is registered; see
+            // EmbeddedDatabase.RegisterCollation.
+            if (structuralOnly)
+                continue;
+
+            throw new EmbeddedSqlException(
+                $"The managed file engine cannot persist index '{index.Name}' because no such collation sequence: {collation.Name}");
         }
 
         if (table.WithoutRowid)
@@ -11083,7 +12598,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         SchemaEntry entry,
         EmbeddedTable table,
         EmbeddedIndex index,
-        ISet<uint> occupiedBtreePages)
+        ISet<uint> occupiedBtreePages,
+        bool structuralOnly = false)
     {
         if (entry.RootPage < 2 || entry.RootPage > _pager.CommittedPageCount)
         {
@@ -11092,7 +12608,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         var overflowReader = new SqliteOverflowChainReader(_pager, _header);
-        var comparer = CreateIndexComparer(table, index);
+        var comparer = CreateIndexComparer(table, index, allowDeferredCustomCollation: structuralOnly);
         IReadOnlyList<byte[]> actualRecords;
         try
         {
@@ -11116,6 +12632,36 @@ internal sealed class EmbeddedFileStore : IDisposable
             throw new EmbeddedSqlException(
                 $"Stored index '{entry.Name}' is not a valid supported SQLite index b-tree.",
                 exception);
+        }
+
+        if (comparer.HasDeferredTerms)
+        {
+            // Page shape and record decodability are proven above, but this
+            // index depends on an application-defined collation with no
+            // registered callback yet, so its order, content, and uniqueness
+            // cannot be checked here. It stays unusable for planning/writes
+            // until EmbeddedDatabase.RegisterCollation revalidates it with a
+            // real callback (see RevalidateIndexOrderAndContent).
+            return;
+        }
+
+        if (TryFindUnresolvedEmbeddedIndexCollation(index, out var unresolvedName))
+        {
+            // The partial-index predicate or index-expression body itself embeds a
+            // COLLATE reference (as opposed to a trailing COLLATE on an indexed term,
+            // already covered by comparer.HasDeferredTerms above) that has no bound
+            // callback yet. Evaluating BuildIndexRecords below would call into
+            // EmbeddedDatabase's private expression evaluator and fail hard with "no
+            // such collation sequence" — before the caller ever gets a chance to
+            // register it. Structural passes defer judgement the same way deferred
+            // column terms do; a live re-check (structuralOnly: false, from
+            // RegisterCollation/RevalidateIndexOrderAndContent) still fails closed so
+            // a genuinely-missing collation is never silently treated as valid.
+            if (structuralOnly)
+                return;
+
+            throw new EmbeddedSqlException(
+                $"The managed file engine cannot persist index '{entry.Name}' because no such collation sequence: {unresolvedName}");
         }
 
         ValidateUniqueIndexRecords(entry.TableName, table, index, actualRecords);
@@ -11170,6 +12716,50 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
 
             previousKey = key;
+        }
+    }
+
+    /// <summary>
+    /// Re-validates one durable index's on-disk order, content, and
+    /// uniqueness using the collation resolver currently attached to this
+    /// store, without re-running the full catalog-load pass. Called by
+    /// <c>EmbeddedDatabase</c> when a collation callback is registered,
+    /// replaced, or unregistered, to decide whether an existing
+    /// custom-collation index becomes eligible for planning/writes (clean)
+    /// or must be treated as unusable until REINDEX rebuilds it (dirty).
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> when the index's durable order/content/
+    /// uniqueness is proven consistent with the active collation callback;
+    /// <see langword="false"/> otherwise, with <paramref name="failureReason"/>
+    /// set to a human-readable explanation.
+    /// </returns>
+    internal bool RevalidateIndexOrderAndContent(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        out string? failureReason)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(index);
+        if (!_indexRootPages.TryGetValue(index.Name, out var rootPage))
+        {
+            failureReason = $"Index '{index.Name}' has no durable root page to revalidate.";
+            return false;
+        }
+
+        try
+        {
+            ValidateIndexRepresentable(tableName, table, index, structuralOnly: false);
+            var entry = new SchemaEntry("index", index.Name, tableName, rootPage, index.Sql);
+            ValidateStoredIndex(entry, table, index, new HashSet<uint>(), structuralOnly: false);
+            failureReason = null;
+            return true;
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            failureReason = exception.Message;
+            return false;
         }
     }
 
@@ -11331,7 +12921,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             if (childIndex < interior.Cells.Count)
             {
                 var separator = interior.GetRecord(childIndex);
-                if (comparer.Compare(childResult.Records[^1], separator) >= 0)
+                if (!comparer.HasDeferredTerms && comparer.Compare(childResult.Records[^1], separator) >= 0)
                 {
                     throw new InvalidDataException(
                         $"Stored index '{entry.Name}' interior page {pageNumber} separator {childIndex} does not follow child page {childPage}.");
@@ -11373,7 +12963,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         ref byte[]? previousRecord,
         string level)
     {
-        if (previousRecord is not null && comparer.Compare(previousRecord, value) >= 0)
+        if (!comparer.HasDeferredTerms && previousRecord is not null && comparer.Compare(previousRecord, value) >= 0)
         {
             throw new InvalidDataException(
                 $"Stored index '{indexName}' {level} are not globally ordered by their declared complete keys.");
@@ -11535,19 +13125,51 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// proves its entire active/freelist partition before its WAL commit marker.
     /// It is not an in-place page allocator.
     /// </remarks>
-    private sealed class RebuildPageAllocator
+    /// <summary>
+    /// The minimal surface an index-tree builder needs from whatever page
+    /// allocator is driving it: a way to reserve one fresh page number.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RebuildPageAllocator"/> implements this for the whole-catalog
+    /// rewrite, and <see cref="StagedIndexRebuildPageAllocator"/> implements it
+    /// for a single targeted index rebuild through
+    /// <see cref="SqliteStagedBtreePageIo"/>, so the index-tree builders
+    /// (<see cref="BuildIndexTree"/> and everything it calls) stay unaware of
+    /// which persistence path is driving them.
+    /// </remarks>
+    private interface IIndexRebuildPageAllocator
+    {
+        uint ReservePage();
+    }
+
+    /// <summary>
+    /// Adapts <see cref="SqliteStagedBtreePageIo.AllocatePage"/> — which
+    /// prefers freelist reuse over growing the file, exactly like real SQLite
+    /// allocation — to <see cref="IIndexRebuildPageAllocator"/>, so a targeted
+    /// REINDEX can drive the same index-tree builders the whole-catalog
+    /// rewrite uses without allocating from that rewrite's naive full-range
+    /// scan, which assumes it owns every page in the database.
+    /// </summary>
+    private sealed class StagedIndexRebuildPageAllocator(ISqliteBtreePageIo pageIo) : IIndexRebuildPageAllocator
+    {
+        public uint ReservePage() => pageIo.AllocatePage();
+    }
+
+    private sealed class RebuildPageAllocator : IIndexRebuildPageAllocator
     {
         private readonly uint _sourcePageCount;
         private readonly bool _compact;
         private readonly Queue<uint> _reusableLeaves;
         private readonly HashSet<uint> _reusableLeafSet;
+        private readonly HashSet<uint> _reservedPages;
         private uint _nextExistingPage;
         private uint _nextAppendedPage;
 
         public RebuildPageAllocator(
             uint sourcePageCount,
             IReadOnlyList<uint> reusableLeaves,
-            bool compact)
+            bool compact,
+            IReadOnlyCollection<uint>? reservedPages = null)
         {
             ArgumentOutOfRangeException.ThrowIfZero(sourcePageCount);
             ArgumentNullException.ThrowIfNull(reusableLeaves);
@@ -11556,6 +13178,17 @@ internal sealed class EmbeddedFileStore : IDisposable
             _compact = compact;
             _reusableLeafSet = new HashSet<uint>();
             _reusableLeaves = new Queue<uint>();
+            // Pages a caller has already committed to a preserved-in-place index
+            // tree (see EmbeddedFileStore.TryPreserveUnavailableIndexTrees) must
+            // never also be handed out here as free/reusable: that would mean
+            // this rebuild's own recomputed freelist and a preserved index tree
+            // disagree about who owns the page, which is exactly the kind of
+            // silent page-ownership corruption ValidateRewritePlan/AddActivePage
+            // exist to catch elsewhere. compact (VACUUM/page-size migration)
+            // never receives reserved pages — see the PersistCore call site.
+            _reservedPages = reservedPages is { Count: > 0 }
+                ? new HashSet<uint>(reservedPages)
+                : new HashSet<uint>();
             if (!compact)
             {
                 foreach (var pageNumber in reusableLeaves.Order())
@@ -11564,6 +13197,12 @@ internal sealed class EmbeddedFileStore : IDisposable
                     {
                         throw new InvalidDataException(
                             "Managed file rebuild received an invalid or duplicate validated freelist leaf.");
+                    }
+
+                    if (_reservedPages.Contains(pageNumber))
+                    {
+                        throw new InvalidDataException(
+                            $"Managed file rebuild freelist page {pageNumber} collides with a preserved index page.");
                     }
 
                     _reusableLeaves.Enqueue(pageNumber);
@@ -11586,7 +13225,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 var existingPage = _nextExistingPage;
                 _nextExistingPage = existingPage == _sourcePageCount ? 0 : existingPage + 1;
-                if (!_reusableLeafSet.Contains(existingPage))
+                if (!_reusableLeafSet.Contains(existingPage) && !_reservedPages.Contains(existingPage))
                     return RecordAllocation(existingPage);
             }
 
@@ -11648,6 +13287,14 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyList<PageImage> InteriorPages,
         IReadOnlyList<PageImage> LeafPages,
         IReadOnlyList<PageImage> OverflowPages);
+
+    /// <summary>
+    /// Bundles a preserved-in-place index's existing root page number together with a
+    /// byte-for-byte clone of its tree read from committed storage, so a full rewrite never has
+    /// to re-derive one from the other — or risk them getting out of sync — once
+    /// <see cref="TryPreserveUnavailableIndexTrees"/> has decided to preserve it.
+    /// </summary>
+    private sealed record PreservedIndexTree(uint RootPage, PreparedIndexTree Tree);
 
     private sealed record IndexTreeReadResult(IReadOnlyList<byte[]> Records, int Height);
 

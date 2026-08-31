@@ -1,5 +1,4 @@
 using Ahtola.Core.Parsing;
-using Ahtola.Core.Storage;
 
 namespace Ahtola.Core;
 
@@ -223,7 +222,6 @@ internal static class IndexExpressionSemantics
                 }
             }
 
-            ValidateCollation(index.Name, GetCollationName(table, term));
         }
 
         if ((index.Where is null) != (index.WhereSql is null))
@@ -266,6 +264,90 @@ internal static class IndexExpressionSemantics
         => term.Collation
             ?? (term.IsExpression ? null : table.ColumnDefinitions[term.ColumnIndex].Collation)
             ?? "BINARY";
+
+    /// <summary>
+    /// Collects the names of every application-defined collation embedded *inside* a partial
+    /// index's WHERE predicate or an expression-index column's expression tree — i.e. a
+    /// <c>COLLATE</c> clause nested within the expression body, as opposed to a trailing
+    /// <c>COLLATE</c> that qualifies an entire indexed term (already captured separately by
+    /// <see cref="GetCollationName"/> via <see cref="EmbeddedIndexColumn.Collation"/> and excluded
+    /// from the stored expression tree by <c>EmbeddedIndexFactory.Create</c>).
+    /// <para>
+    /// Callers use this to detect a durable index whose stored predicate/expression cannot be
+    /// safely (re)evaluated — for structural revalidation on reopen, or for live writes — until a
+    /// matching collation callback is registered, mirroring the deferred-term handling
+    /// <see cref="EmbeddedFileStore.CreateIndexComparer"/> already applies to column-level
+    /// collations.
+    /// </para>
+    /// </summary>
+    public static void CollectEmbeddedCollationNames(EmbeddedIndex index, ISet<string> names)
+    {
+        ArgumentNullException.ThrowIfNull(index);
+        ArgumentNullException.ThrowIfNull(names);
+        if (index.Where is not null)
+            CollectCollationNames(index.Where, names);
+        foreach (var column in index.Columns)
+        {
+            if (column.Expression is { } expression)
+                CollectCollationNames(expression, names);
+        }
+    }
+
+    private static void CollectCollationNames(Expression expression, ISet<string> names)
+    {
+        switch (expression)
+        {
+            case CollationExpression collation:
+                names.Add(collation.Name);
+                CollectCollationNames(collation.Expression, names);
+                return;
+            case FunctionExpression function:
+                foreach (var argument in function.Arguments)
+                    CollectCollationNames(argument, names);
+                return;
+            case CastExpression cast:
+                CollectCollationNames(cast.Expression, names);
+                return;
+            case CaseExpression @case:
+                if (@case.Operand is not null)
+                    CollectCollationNames(@case.Operand, names);
+                foreach (var clause in @case.Clauses)
+                {
+                    CollectCollationNames(clause.When, names);
+                    CollectCollationNames(clause.Then, names);
+                }
+                if (@case.Else is not null)
+                    CollectCollationNames(@case.Else, names);
+                return;
+            case LikeExpression like:
+                CollectCollationNames(like.Value, names);
+                CollectCollationNames(like.Pattern, names);
+                if (like.Escape is not null)
+                    CollectCollationNames(like.Escape, names);
+                return;
+            case GlobExpression glob:
+                CollectCollationNames(glob.Value, names);
+                CollectCollationNames(glob.Pattern, names);
+                return;
+            case InExpression @in:
+                CollectCollationNames(@in.Value, names);
+                foreach (var value in @in.Values)
+                    CollectCollationNames(value, names);
+                return;
+            case BetweenExpression between:
+                CollectCollationNames(between.Value, names);
+                CollectCollationNames(between.Lower, names);
+                CollectCollationNames(between.Upper, names);
+                return;
+            case UnaryExpression unary:
+                CollectCollationNames(unary.Operand, names);
+                return;
+            case BinaryExpression binary:
+                CollectCollationNames(binary.Left, names);
+                CollectCollationNames(binary.Right, names);
+                return;
+        }
+    }
 
     internal static bool MethodParametersEqual(
         IReadOnlyList<Indexing.ManagedIndexMethodParameter>? left,
@@ -363,10 +445,29 @@ internal static class IndexExpressionSemantics
         if (queryPredicate is null)
             return false;
 
-        var queryTerms = SplitConjuncts(queryPredicate);
+        return PredicateImplies(SplitConjuncts(queryPredicate), indexPredicate, tableName, alias);
+    }
+
+    /// <summary>
+    /// Same proof as the single-predicate overload, but for callers that already hold their
+    /// candidate conjuncts as a flat list — e.g. a join segment's combined safe plain-INNER
+    /// ON/WHERE conjuncts, which were never reconstructed into one AND-tree. Every required
+    /// partial-index conjunct must be matched by some query conjunct that mentions only
+    /// <paramref name="tableName"/>/<paramref name="alias"/>'s columns; an unmatched conjunct (or
+    /// one that reaches outside this table) leaves the predicate unproven.
+    /// </summary>
+    public static bool PredicateImplies(
+        IReadOnlyList<Expression> queryConjuncts,
+        Expression? indexPredicate,
+        string tableName,
+        string? alias)
+    {
+        if (indexPredicate is null)
+            return true;
+
         foreach (var required in SplitConjuncts(indexPredicate))
         {
-            if (!queryTerms.Any(candidate =>
+            if (!queryConjuncts.Any(candidate =>
                     UsesOnlySourceColumns(candidate, tableName, alias)
                     && PredicateTermsEqual(candidate, required)))
                 return false;
@@ -509,8 +610,6 @@ internal static class IndexExpressionSemantics
 
                     throw new EmbeddedSqlException($"no such column: {name}");
                 }
-                if (table.ColumnDefinitions[columnIndex].Collation is { } columnCollation)
-                    ValidateCollation("expression", columnCollation);
                 return;
             case ParameterExpression:
                 throw new EmbeddedSqlException($"parameters are prohibited in {context}");
@@ -531,7 +630,6 @@ internal static class IndexExpressionSemantics
                     ValidateExpression(tableName, table, argument, context);
                 return;
             case CollationExpression collation:
-                ValidateCollation("expression", collation.Name);
                 ValidateExpression(tableName, table, collation.Expression, context);
                 return;
             case CastExpression cast:
@@ -600,7 +698,7 @@ internal static class IndexExpressionSemantics
     // window implementations never qualify (MIN/MAX resolve to scalars only with
     // two or more arguments), and the non-deterministic built-in set is excluded
     // by the registry lookup.
-    private static bool IsDeterministicBuiltin(FunctionExpression function)
+    internal static bool IsDeterministicBuiltin(FunctionExpression function)
     {
         if (!SqliteBuiltinFunctions.AcceptsCall(
                 function.Name,
@@ -616,17 +714,6 @@ internal static class IndexExpressionSemantics
         // Date/time functions are deterministic only when they cannot read the
         // wall clock or the local timezone (mirrors generated-column validation).
         return EmbeddedTable.IsDeterministicSchemaFunction(function);
-    }
-
-    private static void ValidateCollation(string indexName, string name)
-    {
-        var collation = SqliteKeyCollation.FromName(name);
-        if (!collation.IsSupportedByManagedIndexWriter)
-        {
-            throw new EmbeddedSqlException(
-                $"Index '{indexName}' uses application-defined collation '{name}', "
-                + "which is not a supported SQLite built-in collation.");
-        }
     }
 
     public static IReadOnlyList<Expression> SplitConjuncts(Expression expression)

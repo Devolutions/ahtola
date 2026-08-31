@@ -50,6 +50,12 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
+- 2026-08-30: completed planner depth beyond the original workstream: the
+  System-R subset DP now matches Turso's 12-member threshold and deterministic
+  greedy planning covers SQLite's 64-table limit. Direct pager seeks now cover
+  transaction-local and MVCC overlays, `WITHOUT ROWID` primary/secondary
+  indexes, partial/expression indexes, and validated connection-bound custom
+  collations without changing SQLite record bytes.
 - 2026-08-29: closed `mvcc-page-native-depth` with generation-scoped schema
   identities, lazy typed cursors, crash-ordered checkpointing, recovery
   watermarks, and reader-generation-aware GC.
@@ -181,6 +187,14 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 - [x] Build transient automatic indexes for profitable inner join inputs.
 - [x] Replace materialized durable-index probes with lazy pager/index cursors
   where a covering or rowid lookup is proven.
+- [x] Match Turso's 12-member subset-DP threshold and retain deterministic
+  greedy planning through SQLite's 64-table join limit.
+- [x] Extend direct access to transaction-local and MVCC mutation overlays,
+  `WITHOUT ROWID` primary/secondary b-trees, and safe partial/expression-index
+  predicates.
+- [x] Support connection-bound custom collations in secondary indexes with
+  generation/version validation and targeted `REINDEX`, without changing
+  SQLite index record bytes.
 - [x] Preserve deterministic plans without statistics and all existing outer
   join barriers.
 - [x] Extend EXPLAIN QUERY PLAN, selectivity tests, and bounded benchmarks for
@@ -188,12 +202,16 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 
 The managed planner mirrors Turso's `multi_index.rs` row-set costing and
 automatic-index eligibility, while keeping LEFT/RIGHT/FULL, NATURAL, and USING
-subtrees opaque. Committed rowid-table joins now seek the SQLite index b-tree
-directly and defer the table fetch unless the index covers the row; transaction,
-MVCC, unsupported-shape, and unsupported-collation cases retain the materialized
-fallback. The pinned Turso release has no STAT4 reader, so Ahtola's histogram
-extension validates the standard `sqlite_stat4` schema, current `sqlite_stat1`
-row count, built-in collation metadata, and sample record before using it.
+subtrees opaque. Eligible committed, classic-transaction, and MVCC paths seek
+the pinned SQLite index b-tree directly and merge ordered local/version effects
+without rebuilding the complete index. The same access contract covers rowid
+and `WITHOUT ROWID` tables plus safe partial/expression indexes. Custom
+collations remain runtime callbacks: only their names are stored in SQLite
+schema SQL, physical order is generation/version validated, and targeted
+`REINDEX` repairs a stale tree while preserving unrelated unavailable custom
+indexes byte-for-byte. The pinned Turso release has no STAT4 reader, so Ahtola's
+histogram extension validates the standard `sqlite_stat4` schema, current
+`sqlite_stat1` row count, collation metadata, and sample record before using it.
 
 ### 9. Page-native MVCC depth
 
