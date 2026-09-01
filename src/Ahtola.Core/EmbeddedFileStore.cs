@@ -684,6 +684,81 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// Overwrites bytes inside one committed BLOB/TEXT column without materializing
+    /// the value or rewriting sibling rows. Same-size only; the overflow chain is
+    /// reused in place.
+    /// </summary>
+    internal bool TryWriteBlobColumn(
+        EmbeddedTable table,
+        long rowId,
+        int physicalColumnIndex,
+        ulong offset,
+        ReadOnlySpan<byte> source)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        if (_disposed || table.WithoutRowid || source.IsEmpty)
+            return false;
+        if (_committedTables is null
+            || !_committedTables.ContainsKey(table.Name)
+            || !_tableRootPages.TryGetValue(table.Name, out var rootPage)
+            || rootPage < 2
+            || rootPage > _pager.CommittedPageCount)
+        {
+            return false;
+        }
+
+        var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
+        if (currentHeader.PageSize != _pageSize
+            || currentHeader.UsableSpace != _usableSpace
+            || currentHeader.VersionValidFor != currentHeader.ChangeCounter
+            || currentHeader.DatabaseSizeInPages != _pager.CommittedPageCount
+            || currentHeader.LargestRootBtreePage != 0
+            || currentHeader.IncrementalVacuumEnabled != 0)
+        {
+            return false;
+        }
+
+        var pageIo = new SqliteStagedBtreePageIo(
+            pageNumber => _pager.ReadCommittedPage(pageNumber),
+            _pager.CommittedPageCount,
+            _pageSize,
+            _usableSpace,
+            currentHeader.FirstFreelistTrunkPage,
+            currentHeader.FreelistPageCount);
+        var cursor = new SqliteTableBtreeCursor(pageIo);
+        if (!cursor.TryWriteColumn(rootPage, rowId, physicalColumnIndex, offset, source))
+            return false;
+        if (pageIo.StagedPages.Count == 0 || pageIo.StagedPages.ContainsKey(SchemaRootPage))
+            return false;
+
+        var target = pageIo.PageCount;
+        var newChangeCounter = currentHeader.ChangeCounter + 1;
+        var newHeader = currentHeader with
+        {
+            ChangeCounter = newChangeCounter,
+            VersionValidFor = newChangeCounter,
+            DatabaseSizeInPages = target,
+            FirstFreelistTrunkPage = pageIo.FirstFreelistTrunkPage,
+            FreelistPageCount = pageIo.FreelistPageCount,
+        };
+        var pageOne = _pager.ReadCommittedPage(SchemaRootPage);
+        newHeader.WriteTo(pageOne);
+
+        using (var transaction = _pager.BeginTransaction(target))
+        {
+            foreach (var (pageNumber, image) in pageIo.StagedPages)
+                transaction.WritePage(pageNumber, image);
+
+            transaction.WritePage(SchemaRootPage, pageOne);
+            transaction.Commit(_synchronousMode);
+        }
+
+        _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
+        return true;
+    }
+
     internal bool TryOpenIndexAccessor(
         EmbeddedTable table,
         EmbeddedIndex? index,

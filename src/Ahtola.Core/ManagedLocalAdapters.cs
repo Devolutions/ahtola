@@ -616,6 +616,21 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
             out mutationLease,
             out mutationGeneration);
 
+    internal bool TryWritePageNativeBlob(
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowId,
+        long offset,
+        ReadOnlySpan<byte> source)
+        => GetConnection().TryWritePageNativeBlob(
+            databaseName,
+            tableName,
+            columnName,
+            rowId,
+            offset,
+            source);
+
     public void RegisterScalarFunction(string name, int arity, Func<IReadOnlyList<SqlValue>, SqlValue> function)
     {
         GetConnection().RegisterScalarFunction(name, arity, function);

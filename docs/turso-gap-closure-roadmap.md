@@ -59,9 +59,17 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   DISTINCT/compound keyed sets, page-native bounded record-column reads,
   read-only file-backed incremental-BLOB handles over pinned pager/transaction
   views, and `AggInverse` streaming for current-row and one-preceding
-  COUNT/SUM/AVG windows. Trigger-body lowering, the remaining heap-bound
-  intermediates, broader inverse frames, page-native incremental-BLOB writes,
-  and dedicated Blob VDBE opcodes remain explicit follow-up depth.
+  COUNT/SUM/AVG windows.
+- 2026-09-01: extended `AggInverse` streaming to `ROWS n PRECEDING … CURRENT ROW`
+  for n ≤ 1024 (COUNT/SUM/AVG). The builder keeps a departing-argument ring and
+  skip counter; 1 PRECEDING bytecode is unchanged. RANGE/GROUPS, FOLLOWING,
+  EXCLUDE, and non-invertible aggregates stay on the buffered evaluator.
+  Remaining VDBE follow-up: trigger-body lowering, heap-bound intermediates,
+  and dedicated `BlobRead`/`BlobWrite`/`BlobLen` opcodes. Page-native
+  incremental-BLOB writes now overwrite leaf/overflow payload in place for
+  autocommit file-backed rowid tables. Newer Turso instructions (`ColumnRange`,
+  `ChangeCount`, `ResetOnce`, `OpenPseudo`, `TypeCheck`) are still assessed by
+  family.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

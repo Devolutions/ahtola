@@ -7,8 +7,8 @@ using Ahtola.Core.Storage;
 namespace Ahtola.Tests;
 
 // Compiler-output and execution coverage for the direct window-function lowering
-// (WindowProgramBuilder). The builder lowers running-prefix, exact-current-row, and one-preceding
-// ROWS frames into the sorter + aggregate opcode families. These tests assert the emitted
+// (WindowProgramBuilder). The builder lowers running-prefix, exact-current-row, and bounded
+// n-preceding ROWS frames into the sorter + aggregate opcode families. These tests assert the emitted
 // bytecode shape/jump layout and run the programs
 // through the resumable state machine to confirm real observable rows: per-partition
 // running values, row_number ordering, tie/NULL handling, empty/single-row/replay
@@ -263,6 +263,60 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void TwoPrecedingFrameRetainsATwoRowRingAndInversesTheOldest()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.Preceding(2));
+
+        var opcodes = program.Instructions.Select(static instruction => instruction.Opcode).ToList();
+        var result = opcodes.IndexOf(VdbeOpcode.ResultRow);
+        opcodes[result + 1].Should().Be(VdbeOpcode.JumpIf);
+        opcodes[result + 2].Should().Be(VdbeOpcode.AggInverse);
+        opcodes.Should().Contain(VdbeOpcode.Arithmetic);
+
+        var rows = Run(program, Rows([10], [20], [30], [40]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 10),
+            (20, 30),
+            (30, 60),
+            (40, 90));
+    }
+
+    [Test]
+    public void TwoPrecedingFrameRestartsTheRingOnPartitionBoundaries()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [0],
+            windows: [InvertibleSum(1)],
+            outputs:
+            [
+                WindowOutput.ForColumn(0),
+                WindowOutput.ForColumn(1),
+                WindowOutput.ForWindow(0),
+            ],
+            orderComparer: AggregateTestSupport.OrderByColumns(0, 1),
+            partitionComparer: AggregateTestSupport.GroupKeysEqual(),
+            frame: WindowFrameSpec.Preceding(2));
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [1, 30], [1, 40], [2, 5], [2, 7]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger(), row[2].AsInteger())).Should().Equal(
+            (1, 10, 10),
+            (1, 20, 30),
+            (1, 30, 60),
+            (1, 40, 90),
+            (2, 5, 5),
+            (2, 7, 12));
+    }
+
+    [Test]
     public void OnePrecedingFrameSpillsWithinBudgetAndCleansUpOnCancellation()
     {
         const long budget = 16384;
@@ -514,7 +568,7 @@ public class WindowProgramBuilderDirectTests
     [Test]
     public void MovingFramesRejectAnAggregateWithoutInverse()
     {
-        foreach (var frame in new[] { WindowFrameSpec.CurrentRow, WindowFrameSpec.OnePreceding })
+        foreach (var frame in new[] { WindowFrameSpec.CurrentRow, WindowFrameSpec.OnePreceding, WindowFrameSpec.Preceding(2) })
         {
             Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
                 "t", 1, [], [new AggregateFunctionSpec(AggregateTestSupport.Min(), [0])], [WindowOutput.ForWindow(0)],

@@ -530,6 +530,30 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    internal bool TryWriteBlobColumn(
+        EmbeddedTable table,
+        long rowId,
+        int physicalColumnIndex,
+        ulong offset,
+        ReadOnlySpan<byte> source)
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null || _readOnly || _fileCatalogWriteLock is null)
+                return false;
+
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
+            {
+                if (!_fileStore.TryWriteBlobColumn(table, rowId, physicalColumnIndex, offset, source))
+                    return false;
+
+                _ownedCommittedGeneration = _fileStore.CommittedViewGeneration;
+                _ownedViewToken = _fileStore.CaptureCommittedViewToken();
+                return true;
+            }
+        }
+    }
+
     internal bool SetConnectionExclusiveLockingMode(bool exclusive, TimeSpan busyTimeout)
     {
         lock (_lockingModeGate)
@@ -24037,12 +24061,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 Kind: FrameBoundKind.Preceding,
                 Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } offset,
             }
-            && offset.Value.AsInteger() == 1
             && frame.End.Kind == FrameBoundKind.CurrentRow
             && frame.End.Offset is null)
         {
-            spec = WindowFrameSpec.OnePreceding;
-            return true;
+            var preceding = offset.Value.AsInteger();
+            if (preceding == 0)
+            {
+                spec = WindowFrameSpec.CurrentRow;
+                return true;
+            }
+
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.Preceding(preceding);
+                return true;
+            }
         }
 
         return false;
@@ -50440,6 +50473,76 @@ public sealed partial class EmbeddedConnection : IDisposable
 
             return new SqlValueIncrementalBlobReadSource(row[columnIndex]);
         }
+    }
+
+    internal bool TryWritePageNativeBlob(
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowId,
+        long offset,
+        ReadOnlySpan<byte> source)
+    {
+        ThrowIfRecursiveTriggerCallbackReentry();
+        ThrowIfDisposed();
+        if (source.IsEmpty)
+            return true;
+        if (offset < 0)
+            return false;
+
+        var database = ResolveBlobDatabase(databaseName);
+        if (!database.IsFileBacked)
+            return false;
+
+        var transactionState = GetTransactionState(database);
+        if (transactionState is not null)
+            return false;
+        if (TryGetConcurrentMvccScope(database, out _, out _))
+            return false;
+
+        database.RefreshForeignCatalogForStatementIfNeeded();
+        database.RefreshOwnedCatalogForStatementIfNeeded();
+        var catalog = database.LiveCatalog;
+        if (!catalog.Tables.TryGetValue(tableName, out var table)
+            || table.WithoutRowid
+            || !table.TryGetColumnIndex(columnName, out var logicalColumnIndex)
+            || logicalColumnIndex == table.RowidAliasColumnIndex)
+        {
+            return false;
+        }
+
+        var column = table.ColumnDefinitions[logicalColumnIndex];
+        if (column.IsGenerated && !column.GeneratedStored)
+            return false;
+
+        var physicalColumnIndex = 0;
+        for (var index = 0; index < logicalColumnIndex; index++)
+        {
+            var preceding = table.ColumnDefinitions[index];
+            if (!preceding.IsGenerated || preceding.GeneratedStored)
+                physicalColumnIndex++;
+        }
+
+        if (!database.TryWriteBlobColumn(table, rowId, physicalColumnIndex, (ulong)offset, source))
+            return false;
+
+        var position = table.RowIds.IndexOf(rowId);
+        if (position >= 0)
+        {
+            var row = table.Rows[position];
+            if ((uint)logicalColumnIndex < (uint)row.Length && row[logicalColumnIndex].Kind == SqlValueKind.Blob)
+            {
+                var blob = row[logicalColumnIndex].AsBlobSpan().ToArray();
+                if (offset < blob.Length && source.Length <= blob.Length - offset)
+                {
+                    source.CopyTo(blob.AsSpan((int)offset));
+                    row[logicalColumnIndex] = SqlValue.BlobOwned(blob);
+                }
+            }
+        }
+
+        database.RecordBlobMutation(tableName, rowId);
+        return true;
     }
 
     internal IDisposable OpenBlobMutationLease(string databaseName, string tableName, long rowId)

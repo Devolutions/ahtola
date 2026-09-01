@@ -102,7 +102,8 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
     private readonly string _columnName;
     private readonly long _rowId;
     private readonly bool _readOnly;
-    private readonly IManagedIncrementalBlobReadSource? _readSource;
+    private IManagedIncrementalBlobReadSource? _readSource;
+    private readonly List<(int Offset, byte[] Bytes)> _writeOverlays = [];
     private byte[] _value;
     private SqlValue[] _rowSnapshot;
     private readonly IDisposable _mutationLease;
@@ -147,8 +148,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
         ArgumentNullException.ThrowIfNull(tableName);
         ArgumentNullException.ThrowIfNull(columnName);
 
-        if (readOnly
-            && connection.TryOpenPageNativeBlobReadSource(
+        if (connection.TryOpenPageNativeBlobReadSource(
                 databaseName,
                 tableName,
                 columnName,
@@ -165,7 +165,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
                     tableName,
                     columnName,
                     rowId,
-                    readOnly: true,
+                    readOnly,
                     new BlobSnapshot([], []),
                     pageMutationLease,
                     mutationGeneration,
@@ -233,10 +233,15 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             if (offset >= length)
                 return 0;
 
+            int count;
             if (_readSource is not null)
-                return _readSource.Read((int)offset, destination);
+            {
+                count = _readSource.Read((int)offset, destination);
+                ApplyWriteOverlays((int)offset, destination[..count]);
+                return count;
+            }
 
-            var count = Math.Min(destination.Length, _value.Length - (int)offset);
+            count = Math.Min(destination.Length, _value.Length - (int)offset);
             _value.AsSpan((int)offset, count).CopyTo(destination);
             return count;
         }
@@ -249,18 +254,48 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             ThrowIfDisposed();
             if (_readOnly)
                 throw new NotSupportedException("Writing is not supported for a read-only blob.");
-            if (offset < 0 || offset > _value.Length || source.Length > _value.Length - offset)
+
+            EnsureCurrent();
+            var length = _readSource?.Length ?? _value.Length;
+            if (offset < 0 || offset > length || source.Length > length - offset)
                 throw new NotSupportedException("Resizing is not supported.");
 
             if (source.IsEmpty)
                 return;
 
-            EnsureCurrent();
             if (_connection.HasUpdateTrigger(_databaseName, _tableName))
             {
                 throw new ManagedBlobException(
                     SqliteError,
                     "cannot write to an incremental blob on a table with UPDATE triggers");
+            }
+
+            if (_connection.TryWritePageNativeBlob(
+                    _databaseName,
+                    _tableName,
+                    _columnName,
+                    _rowId,
+                    offset,
+                    source))
+            {
+                _mutationGeneration = _connection.GetBlobMutationGeneration(_databaseName, _tableName, _rowId);
+                if (_readSource is null)
+                    source.CopyTo(_value.AsSpan((int)offset, source.Length));
+                else
+                    _writeOverlays.Add(((int)offset, source.ToArray()));
+
+                return;
+            }
+
+            if (_readSource is not null)
+            {
+                var materialized = new byte[length];
+                _readSource.Read(0, materialized);
+                ApplyWriteOverlays(0, materialized);
+                _value = materialized;
+                _readSource.Dispose();
+                _readSource = null;
+                _writeOverlays.Clear();
             }
 
             var updated = _value.ToArray();
@@ -315,6 +350,25 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
     {
         Dispose();
         return ValueTask.CompletedTask;
+    }
+
+    private void ApplyWriteOverlays(int destinationOffset, Span<byte> destination)
+    {
+        if (_writeOverlays.Count == 0 || destination.IsEmpty)
+            return;
+
+        var destinationEnd = destinationOffset + destination.Length;
+        foreach (var (overlayOffset, bytes) in _writeOverlays)
+        {
+            var overlayEnd = overlayOffset + bytes.Length;
+            var start = Math.Max(destinationOffset, overlayOffset);
+            var end = Math.Min(destinationEnd, overlayEnd);
+            if (start >= end)
+                continue;
+
+            bytes.AsSpan(start - overlayOffset, end - start)
+                .CopyTo(destination[(start - destinationOffset)..]);
+        }
     }
 
     private void EnsureCurrent()

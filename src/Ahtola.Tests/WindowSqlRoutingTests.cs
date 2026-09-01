@@ -1,13 +1,14 @@
 using System.Globalization;
 using AwesomeAssertions;
 using Ahtola.Core;
+using Ahtola.Core.Compilation;
 using MsData = Microsoft.Data.Sqlite;
 
 namespace Ahtola.Tests;
 
 // Proves that EmbeddedDatabase routes windowed SELECTs through real bytecode: the streaming
 // streaming program (sorter + aggregate opcodes emitted by WindowProgramBuilder) for the
-// supported running-prefix, exact-current-row, and one-preceding shapes, and the buffered-window program
+// supported running-prefix, exact-current-row, and bounded n-preceding shapes, and the buffered-window program
 // (OpenWindowBuffer/WindowBufferCompute/WindowBufferData emitted by BufferedWindowProgramBuilder) for
 // every other frame, function family, partition and ordering shape. Routed rows stay byte-identical to
 // the tree-walking evaluator (cross-checked against a real SQLite build for the partitioned case).
@@ -392,11 +393,16 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void OtherPrecedingOffsetsKeepBufferedFallback()
+    public void TwoPrecedingRowsFrameRoutesThroughInverseAndMatchesSqlite()
     {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);",
+        ];
         using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+        foreach (var statement in setup)
+            Execute(connection, statement);
 
         const string query =
             "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS w " +
@@ -404,6 +410,50 @@ public class WindowSqlRoutingTests
 
         ReadRows(connection, query).Select(static row => row[1]).Should().Equal(
             SqlValue.Integer(10), SqlValue.Integer(30), SqlValue.Integer(60), SqlValue.Integer(90));
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggInverse").And.Contain("JumpIf").And.NotContain("WindowBufferCompute");
+    }
+
+    [Test]
+    public void ThreePrecedingCountSumAndAvgRouteThroughInverseAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(grp TEXT, id INTEGER, v);",
+            "INSERT INTO t VALUES ('a', 1, NULL), ('a', 2, 5), ('a', 3, 2.5), " +
+            "('a', 4, '7'), ('a', 5, 1), ('b', 1, 10), ('b', 2, 20);",
+        ];
+        var query =
+            "SELECT grp, id, count(*) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW), " +
+            "sum(v) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW), " +
+            "avg(v) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) " +
+            "FROM t ORDER BY grp, id;";
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
+        opcodes.Count(static opcode => opcode == "AggInverse").Should().Be(3);
+        opcodes.Should().Contain("JumpIf").And.NotContain("OpenWindowBuffer");
+
+        var rows = ReadRows(connection, query);
+        AssertMatchesSqlite(rows, setup, query);
+    }
+
+    [Test]
+    public void OversizedPrecedingOffsetKeepsBufferedFallback()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+        var query =
+            $"SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN {WindowFrameSpec.MaxStreamingPreceding + 1} PRECEDING AND CURRENT ROW) AS w " +
+            "FROM t ORDER BY id;";
+
+        ReadRows(connection, query).Select(static row => row[1]).Should().Equal(
+            SqlValue.Integer(10), SqlValue.Integer(30));
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
             .Contain("WindowBufferCompute").And.NotContain("AggInverse");
     }

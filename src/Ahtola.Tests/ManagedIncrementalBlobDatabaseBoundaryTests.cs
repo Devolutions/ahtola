@@ -218,6 +218,59 @@ public sealed class ManagedIncrementalBlobDatabaseBoundaryTests
             "opening a page-native handle must not snapshot or copy the complete BLOB");
     }
 
+    [Test]
+    public void CoreWritableBlobPatchesOverflowRangesWithoutValueSizedAllocation()
+    {
+        const int payloadLength = 1024 * 1024;
+        const int writeOffset = 500_000;
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("blob-page-native-write.db", fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        var payload = Enumerable.Range(0, payloadLength)
+            .Select(static index => unchecked((byte)(index * 31)))
+            .ToArray();
+        Execute(connection, "CREATE TABLE data(value BLOB);");
+        ExecuteBound(
+            connection,
+            "INSERT INTO data(rowid, value) VALUES (1, $value);",
+            SqlValue.Blob(payload));
+        Execute(connection, "INSERT INTO data(rowid, value) VALUES (2, X'01');");
+
+        using (var warmup = connection.OpenBlob("main", "data", "value", 2))
+        {
+            warmup.Write(0, [9]);
+        }
+
+        var patch = new byte[] { 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6 };
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        using (var blob = connection.OpenBlob("main", "data", "value", 1))
+        {
+            var allocatedOpen = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+            allocatedOpen.Should().BeLessThan(
+                payloadLength / 4,
+                "opening a writable page-native handle must not snapshot the complete BLOB");
+
+            blob.Write(writeOffset, patch);
+
+            Span<byte> actual = stackalloc byte[6];
+            blob.Read(writeOffset, actual).Should().Be(actual.Length);
+            actual.ToArray().Should().Equal(patch);
+        }
+
+        ReadBlob(connection, "SELECT value FROM data WHERE rowid = 1;")
+            .AsSpan(writeOffset, patch.Length)
+            .ToArray()
+            .Should()
+            .Equal(patch);
+
+        using var reread = connection.OpenBlob("main", "data", "value", 1, readOnly: true);
+        Span<byte> committed = stackalloc byte[6];
+        reread.Read(writeOffset, committed).Should().Be(committed.Length);
+        committed.ToArray().Should().Equal(patch);
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void CoreReadOnlyBlobUsesTransactionVisibleRowsWithoutCopyingTheBlob(bool concurrent)

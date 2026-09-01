@@ -145,8 +145,9 @@ real mapping, built variant-by-variant:
 > keyed sets. Newer Turso additions such as `ColumnRange`, `BlobRead`,
 > `BlobWrite`, `BlobLen`, `ChangeCount`, and `ResetOnce` must be assessed by
 > semantic family rather than by exact-name diff. `AggInverse` is now appended
-> as opcode 136 and drives exact current-row and one-preceding COUNT/SUM/AVG
-> window frames while unsupported frames retain the buffered evaluator.
+> as opcode 136 and drives exact current-row and bounded `ROWS n PRECEDING`
+> COUNT/SUM/AVG window frames (n ≤ 1024) while unsupported frames retain the
+> buffered evaluator.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).

@@ -145,6 +145,64 @@ public sealed class SqliteTableBtreeCursor
         return true;
     }
 
+    /// <summary>
+    /// Overwrites a bounded range of one TEXT or BLOB column in place. The write
+    /// cannot change the value's size; bytes past the stored length are rejected.
+    /// </summary>
+    public bool TryWriteColumn(
+        uint rootPage,
+        long rowId,
+        int columnIndex,
+        ulong offset,
+        ReadOnlySpan<byte> source)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(columnIndex);
+        if (!TrySeekLeaf(rootPage, rowId, out var leafPage, out var pageCell))
+            return false;
+
+        var cell = pageCell.Cell;
+        var location = LocateColumn(cell, columnIndex);
+        EnsureByteAddressable(location);
+        if (source.IsEmpty)
+            return true;
+        if (offset > location.Length || (ulong)source.Length > location.Length - offset)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(source),
+                "SQLite incremental column writes cannot change the stored value size.");
+        }
+
+        var payloadOffset = checked(location.PayloadOffset + offset);
+        var localLength = checked((ulong)cell.LocalPayload.Length);
+        var remaining = source;
+        if (payloadOffset < localLength)
+        {
+            var localCount = checked((int)Math.Min((ulong)remaining.Length, localLength - payloadOffset));
+            var image = _io.ReadPage(leafPage);
+            remaining[..localCount].CopyTo(
+                image.AsSpan(
+                    pageCell.Offset + cell.LocalPayloadOffset + checked((int)payloadOffset),
+                    localCount));
+            _io.WritePage(leafPage, image);
+            remaining = remaining[localCount..];
+            payloadOffset = localLength;
+        }
+
+        if (remaining.IsEmpty)
+            return true;
+
+        if (cell.FirstOverflowPage is not { } firstOverflowPage)
+            throw new InvalidDataException("SQLite table-leaf cell is missing its first overflow page.");
+
+        SqliteOverflowChainWriter.WriteRange(
+            _io,
+            firstOverflowPage,
+            cell.PayloadLength - localLength,
+            payloadOffset - localLength,
+            remaining);
+        return true;
+    }
+
     private SqliteRecordColumnLocation LocateColumn(SqliteTableLeafCell cell, int columnIndex)
     {
         var localPayload = cell.LocalPayload.Span;
@@ -183,6 +241,22 @@ public sealed class SqliteTableBtreeCursor
 
     private bool TrySeekCell(uint rootPage, long rowId, out SqliteTableLeafCell cell)
     {
+        if (!TrySeekLeaf(rootPage, rowId, out _, out var pageCell))
+        {
+            cell = null!;
+            return false;
+        }
+
+        cell = pageCell.Cell;
+        return true;
+    }
+
+    private bool TrySeekLeaf(
+        uint rootPage,
+        long rowId,
+        out uint leafPage,
+        out SqliteTableLeafPageCell pageCell)
+    {
         var pageNumber = rootPage;
         for (var depth = 0; depth < MaximumDepth; depth++)
         {
@@ -196,11 +270,13 @@ public sealed class SqliteTableBtreeCursor
                         var search = leaf.Search(rowId);
                         if (!search.IsExact)
                         {
-                            cell = null!;
+                            leafPage = 0;
+                            pageCell = null!;
                             return false;
                         }
 
-                        cell = leaf.Cells[search.Index].Cell;
+                        leafPage = pageNumber;
+                        pageCell = leaf.Cells[search.Index];
                         return true;
                     }
 
