@@ -426,7 +426,7 @@ public class CompiledJoinVdbeSqlRoutingTests
             "SELECT fail_on_two(l.id) FROM l JOIN r ON l.id=r.id;"))!;
         var fallbackError = Assert.Throws<EmbeddedSqlException>(() => ReadRows(
             fallback,
-            "SELECT fail_on_two(l.id) FROM l JOIN r ON l.id + 0=r.id;"))!;
+            "SELECT fail_on_two(l.id) FROM l JOIN r ON l.id=r.id COLLATE callback_collation;"))!;
 
         routedError.Message.Should().Be(fallbackError.Message).And.Be("projection boom");
         routedCalls.Should().Equal(1, 2);
@@ -438,7 +438,7 @@ public class CompiledJoinVdbeSqlRoutingTests
             .Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
         ReadRows(
                 fallback,
-                "EXPLAIN QUERY PLAN SELECT fail_on_two(l.id) FROM l JOIN r ON l.id + 0=r.id;")
+                "EXPLAIN QUERY PLAN SELECT fail_on_two(l.id) FROM l JOIN r ON l.id=r.id COLLATE callback_collation;")
             .Should().ContainSingle().Which[3]
             .Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
     }
@@ -678,6 +678,7 @@ public class CompiledJoinVdbeSqlRoutingTests
                 throw new EmbeddedSqlException("projection boom");
             return values[0];
         });
+        database.RegisterCollation("callback_collation", string.CompareOrdinal);
         var connection = database.Connect();
         Execute(connection, "CREATE TABLE l(id INTEGER);");
         Execute(connection, "CREATE TABLE r(id INTEGER);");
