@@ -479,6 +479,57 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     internal bool IsFileBacked => _fileStore is not null;
 
+    internal bool TryOpenBlobReadSource(
+        EmbeddedTable table,
+        long rowId,
+        int physicalColumnIndex,
+        EmbeddedFileReadSnapshot? sharedSnapshot,
+        bool requireCommittedTableIdentity,
+        out IManagedIncrementalBlobReadSource source,
+        out SqliteRecordColumnLocation location,
+        out IDisposable mutationLease,
+        out long mutationGeneration)
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null)
+            {
+                source = null!;
+                location = default;
+                mutationLease = null!;
+                mutationGeneration = 0;
+                return false;
+            }
+
+            if (!_fileStore.TryOpenBlobReadSource(
+                table,
+                rowId,
+                physicalColumnIndex,
+                sharedSnapshot,
+                requireCommittedTableIdentity,
+                out source,
+                out location))
+            {
+                mutationLease = null!;
+                mutationGeneration = 0;
+                return false;
+            }
+
+            try
+            {
+                mutationLease = OpenBlobMutationLease(table.Name, rowId, out mutationGeneration);
+            }
+            catch
+            {
+                source.Dispose();
+                source = null!;
+                throw;
+            }
+
+            return true;
+        }
+    }
+
     internal bool SetConnectionExclusiveLockingMode(bool exclusive, TimeSpan busyTimeout)
     {
         lock (_lockingModeGate)
@@ -764,6 +815,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         EmbeddedDatabase? Database = null,
         TransactionMutationOverlay? TransactionOverlay = null,
         EmbeddedFileReadSnapshot? TransactionPinnedSnapshot = null,
+        Action<string, long>? TransactionBlobMutation = null,
         ManagedSchemaRowSet? StagedSchemaRows = null)
     {
         /// <summary>
@@ -910,6 +962,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             // bodies, and foreign-key cascade actions all arrive here.
             if (TransactionOverlay is not null && Database is not null)
                 TransactionOverlay.RecordRowChange(Database, table, tableName, operation, rowId, before, after);
+            if (TransactionBlobMutation is not null
+                && table.HasRowid
+                && !tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+            {
+                TransactionBlobMutation(tableName, rowId);
+            }
 
             // Feed incremental method-index maintenance. This is the one place every DML path
             // funnels through — plain INSERT/UPDATE/DELETE, REPLACE and UPSERT conflict resolution,
@@ -3656,12 +3714,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     internal IDisposable OpenBlobMutationLease(string tableName, long rowId)
+        => OpenBlobMutationLease(tableName, rowId, out _);
+
+    internal IDisposable OpenBlobMutationLease(string tableName, long rowId, out long mutationGeneration)
     {
         lock (_gate)
         {
             var identity = new BlobMutationIdentity(tableName, rowId);
             _activeBlobMutations.TryGetValue(identity, out var handles);
             _activeBlobMutations[identity] = checked(handles + 1);
+            mutationGeneration = _blobMutationGenerations.GetValueOrDefault(identity);
             return new BlobMutationLease(this, identity);
         }
     }
@@ -3709,6 +3771,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var identity = new BlobMutationIdentity(tableName, rowId);
             if (_activeBlobMutations.ContainsKey(identity))
                 _blobMutationGenerations[identity] = checked(++_nextBlobMutationGeneration);
+        }
+    }
+
+    internal void InvalidateBlobHandles()
+    {
+        lock (_gate)
+        {
+            if (_activeBlobMutations.Count == 0)
+                return;
+
+            var generation = checked(++_nextBlobMutationGeneration);
+            foreach (var identity in _activeBlobMutations.Keys)
+                _blobMutationGenerations[identity] = generation;
         }
     }
 
@@ -5176,7 +5251,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
         TransactionMutationOverlay? transactionOverlay = null,
-        EmbeddedFileReadSnapshot? transactionPinnedSnapshot = null)
+        EmbeddedFileReadSnapshot? transactionPinnedSnapshot = null,
+        Action<string, long>? transactionBlobMutation = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -5207,7 +5283,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 vdbeExecutionOptions,
                 virtualTableTransaction,
                 transactionOverlay,
-                transactionPinnedSnapshot));
+                transactionPinnedSnapshot,
+                transactionBlobMutation));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -5256,7 +5333,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 : null,
             Database: this,
             TransactionOverlay: transactionOverlay,
-            TransactionPinnedSnapshot: transactionPinnedSnapshot);
+            TransactionPinnedSnapshot: transactionPinnedSnapshot,
+            TransactionBlobMutation: transactionBlobMutation);
         try
         {
             EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
@@ -49741,6 +49819,15 @@ public sealed partial class EmbeddedConnection : IDisposable
         /// instead and are merged in via <c>ConcurrentMvStore</c>/<c>ConcurrentMvccTxId</c>.
         /// </summary>
         public TransactionMutationOverlay? Overlay { get; set; }
+
+        public Dictionary<BlobMutationIdentity, long> BlobMutationCounts { get; } = [];
+
+        public void RecordBlobMutation(string tableName, long rowId)
+        {
+            var identity = new BlobMutationIdentity(tableName, rowId);
+            BlobMutationCounts.TryGetValue(identity, out var count);
+            BlobMutationCounts[identity] = checked(count + 1);
+        }
     }
 
 
@@ -50182,6 +50269,179 @@ public sealed partial class EmbeddedConnection : IDisposable
         return removed;
     }
 
+    internal bool TryOpenPageNativeBlobReadSource(
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowId,
+        out IManagedIncrementalBlobReadSource source,
+        out IDisposable mutationLease,
+        out long mutationGeneration)
+    {
+        ThrowIfRecursiveTriggerCallbackReentry();
+        ThrowIfDisposed();
+        var database = ResolveBlobDatabase(databaseName);
+        source = null!;
+        mutationLease = null!;
+        mutationGeneration = 0;
+        if (!database.IsFileBacked)
+            return false;
+
+        var transactionState = GetTransactionState(database);
+        if (transactionState is null)
+        {
+            database.RefreshForeignCatalogForStatementIfNeeded();
+            database.RefreshOwnedCatalogForStatementIfNeeded();
+        }
+
+        var catalog = transactionState?.Catalog ?? database.LiveCatalog;
+        if (!catalog.Tables.TryGetValue(tableName, out var table))
+        {
+            if (catalog.Views.ContainsKey(tableName))
+            {
+                throw new ManagedBlobException(
+                    1,
+                    $"cannot open an incremental blob on view {tableName}");
+            }
+            if (catalog.VirtualTables.ContainsKey(tableName))
+            {
+                throw new ManagedBlobException(
+                    1,
+                    $"cannot open an incremental blob on virtual table {tableName}");
+            }
+
+            throw new ManagedBlobException(1, $"no such table: {tableName}");
+        }
+        if (table.WithoutRowid)
+            throw new ManagedBlobException(1, $"cannot open table without rowid: {tableName}");
+        if (!table.TryGetColumnIndex(columnName, out var logicalColumnIndex))
+            throw new ManagedBlobException(1, $"no such column: {columnName}");
+        if (logicalColumnIndex == table.RowidAliasColumnIndex)
+            throw new ManagedBlobException(1, "cannot open value of type integer");
+
+        var column = table.ColumnDefinitions[logicalColumnIndex];
+        if (column.IsGenerated && !column.GeneratedStored)
+            throw new ManagedBlobException(1, $"cannot open generated column: {columnName}");
+        if (transactionState?.HasSchemaChanges == true)
+        {
+            throw new ManagedBlobException(
+                1,
+                $"page-native incremental blob reads are unavailable after schema changes to table {tableName}");
+        }
+
+        SqlValue[]? visibleRow = null;
+        var rowResolvedFromOverlay = false;
+        if (transactionState?.Overlay is { } overlay
+            && overlay.TryGet(tableName, out var tableOverlay)
+            && tableOverlay.TryGetByRowId(rowId, out visibleRow))
+        {
+            rowResolvedFromOverlay = true;
+        }
+        else if (TryGetConcurrentMvccScope(database, out var mvStore, out var mvccTxId)
+                 && mvStore!.TryReadVisibleEffect(
+                     mvccTxId!.Value,
+                     new MvccRowId(mvStore.GetOrCreateTableId(mvccTxId.Value, tableName), rowId),
+                     out visibleRow,
+                     out var isDelete))
+        {
+            rowResolvedFromOverlay = true;
+            if (isDelete)
+                visibleRow = null;
+        }
+
+        if (rowResolvedFromOverlay)
+        {
+            if (visibleRow is null)
+                throw new ManagedBlobException(1, $"no such rowid: {rowId}");
+
+            source = CreateBlobValueReadSource(visibleRow, logicalColumnIndex);
+            try
+            {
+                mutationLease = database.OpenBlobMutationLease(
+                    tableName,
+                    rowId,
+                    out mutationGeneration);
+            }
+            catch
+            {
+                source.Dispose();
+                source = null!;
+                mutationLease?.Dispose();
+                mutationLease = null!;
+                throw;
+            }
+
+            return true;
+        }
+
+        if (table.RowIds.IndexOf(rowId) < 0)
+            throw new ManagedBlobException(1, $"no such rowid: {rowId}");
+        if (transactionState is not null && transactionState.PinnedSnapshot is null)
+        {
+            throw new ManagedBlobException(
+                1,
+                $"page-native incremental blob reads are unavailable after schema changes to table {tableName}");
+        }
+
+        var physicalColumnIndex = 0;
+        for (var index = 0; index < logicalColumnIndex; index++)
+        {
+            var preceding = table.ColumnDefinitions[index];
+            if (!preceding.IsGenerated || preceding.GeneratedStored)
+                physicalColumnIndex++;
+        }
+
+        SqliteRecordColumnLocation location;
+        try
+        {
+            if (!database.TryOpenBlobReadSource(
+                    table,
+                    rowId,
+                    physicalColumnIndex,
+                    transactionState?.PinnedSnapshot,
+                    requireCommittedTableIdentity: transactionState is null,
+                    out source,
+                    out location,
+                    out mutationLease,
+                    out mutationGeneration))
+            {
+                throw new ManagedBlobException(
+                    1,
+                    $"page-native incremental blob read source is unavailable for table {tableName}");
+            }
+        }
+        catch (InvalidDataException exception)
+            when (exception.Message.StartsWith(
+                "SQLite record does not contain column ",
+                StringComparison.Ordinal))
+        {
+            throw new ManagedBlobException(
+                1,
+                $"page-native incremental blob reads require a stored payload for column {columnName}");
+        }
+
+        if (location.StorageClass != SqliteRecordStorageClass.Blob)
+        {
+            source.Dispose();
+            mutationLease.Dispose();
+            source = null!;
+            mutationLease = null!;
+            throw new ManagedBlobException(1, "cannot open a non-BLOB value as an incremental blob");
+        }
+
+        return true;
+
+        static IManagedIncrementalBlobReadSource CreateBlobValueReadSource(
+            SqlValue[] row,
+            int columnIndex)
+        {
+            if ((uint)columnIndex >= (uint)row.Length || row[columnIndex].Kind != SqlValueKind.Blob)
+                throw new ManagedBlobException(1, "cannot open a non-BLOB value as an incremental blob");
+
+            return new SqlValueIncrementalBlobReadSource(row[columnIndex]);
+        }
+    }
+
     internal IDisposable OpenBlobMutationLease(string databaseName, string tableName, long rowId)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
@@ -50574,7 +50834,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 transactionOverlay: transactionState.Overlay,
                                 transactionPinnedSnapshot: transactionState.HasSchemaChanges
                                     ? null
-                                    : transactionState.PinnedSnapshot);
+                                    : transactionState.PinnedSnapshot,
+                                transactionBlobMutation: transactionState.RecordBlobMutation);
                             if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not
@@ -50591,6 +50852,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                         if (mutationReserved)
                             ReleaseTransactionMutation(routed.Database);
                     }
+                    if (result.Changed && EmbeddedDatabase.MayChangeSchema(routed.Statement))
+                        routed.Database.InvalidateBlobHandles();
                     if (result.Changed)
                         RemoveTempTriggersForDroppedObject(routed);
                     if (transactionState is not null)
@@ -55374,7 +55637,8 @@ Func<string, ParsedStatement> rewrite)
                         new HashSet<string>(
                             pair.Value.TargetedIndexRebuildNames,
                             StringComparer.OrdinalIgnoreCase),
-                        pair.Value.HasNonTargetedIndexRebuildChange));
+                        pair.Value.HasNonTargetedIndexRebuildChange,
+                        new Dictionary<BlobMutationIdentity, long>(pair.Value.BlobMutationCounts)));
             }
 
             _savepoints.Add(new SavepointEntry(
@@ -55441,6 +55705,17 @@ Func<string, ParsedStatement> rewrite)
             state.TargetedIndexRebuildNames.Clear();
             state.TargetedIndexRebuildNames.UnionWith(savedState.TargetedIndexRebuildNames);
             state.HasNonTargetedIndexRebuildChange = savedState.HasNonTargetedIndexRebuildChange;
+            foreach (var pair in state.BlobMutationCounts)
+            {
+                if (!savedState.BlobMutationCounts.TryGetValue(pair.Key, out var savedCount)
+                    || savedCount != pair.Value)
+                {
+                    database.RecordBlobMutation(pair.Key.TableName, pair.Key.RowId);
+                }
+            }
+            state.BlobMutationCounts.Clear();
+            foreach (var pair in savedState.BlobMutationCounts)
+                state.BlobMutationCounts.Add(pair.Key, pair.Value);
             if (state.Overlay is not null && savedState.OverlayCheckpoint is not null)
             {
                 state.Overlay.RestoreCheckpoint(
@@ -55528,6 +55803,15 @@ Func<string, ParsedStatement> rewrite)
 
         if (transactionDatabases is not null)
         {
+            if (rollbackVirtualTables)
+            {
+                foreach (var (database, state) in transactionDatabases)
+                {
+                    foreach (var identity in state.BlobMutationCounts.Keys)
+                        database.RecordBlobMutation(identity.TableName, identity.RowId);
+                }
+            }
+
             if (rollbackVirtualTables)
             {
                 foreach (var state in transactionDatabases.Values)
@@ -55619,7 +55903,8 @@ Func<string, ParsedStatement> rewrite)
         IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations,
         TransactionMutationOverlayCheckpoint? OverlayCheckpoint,
         IReadOnlySet<string> TargetedIndexRebuildNames,
-        bool HasNonTargetedIndexRebuildChange);
+        bool HasNonTargetedIndexRebuildChange,
+        IReadOnlyDictionary<BlobMutationIdentity, long> BlobMutationCounts);
 
     private void ThrowIfRecursiveTriggerCallbackReentry()
     {

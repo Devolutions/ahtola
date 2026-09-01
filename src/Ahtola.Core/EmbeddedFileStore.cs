@@ -59,6 +59,34 @@ internal sealed class EmbeddedFileIndexFullScanAccessor(
     public void Dispose() => close();
 }
 
+internal sealed class EmbeddedFileBlobReadSource(
+    SqliteTableBtreeCursor cursor,
+    uint rootPage,
+    long rowId,
+    int columnIndex,
+    int length,
+    IDisposable snapshotLease) : IManagedIncrementalBlobReadSource
+{
+    private IDisposable? _snapshotLease = snapshotLease;
+
+    public int Length { get; } = length;
+
+    public int Read(int offset, Span<byte> destination)
+    {
+        ObjectDisposedException.ThrowIf(_snapshotLease is null, this);
+        if (!cursor.TryReadColumn(rootPage, rowId, columnIndex, (ulong)offset, destination, out var bytesRead))
+            throw new InvalidDataException($"SQLite rowid {rowId} disappeared from its pinned pager snapshot.");
+
+        return bytesRead;
+    }
+
+    public void Dispose()
+    {
+        var lease = Interlocked.Exchange(ref _snapshotLease, null);
+        lease?.Dispose();
+    }
+}
+
 internal sealed class EmbeddedFileReadSnapshot(
     EmbeddedFileStore owner,
     SqlitePagerReadTransaction transaction,
@@ -66,6 +94,9 @@ internal sealed class EmbeddedFileReadSnapshot(
     IReadOnlyDictionary<string, uint> tableRootPages,
     IReadOnlyDictionary<string, uint> indexRootPages) : IDisposable
 {
+    private int _referenceCount = 1;
+    private int _ownerReleased;
+
     internal EmbeddedFileStore Owner { get; } = owner;
 
     internal ISqliteBtreePageIo PageIo { get; } = pageIo;
@@ -84,7 +115,51 @@ internal sealed class EmbeddedFileReadSnapshot(
     /// <summary>Same generation-bound guarantee as <see cref="TableRootPages"/>, for named secondary indexes.</summary>
     internal IReadOnlyDictionary<string, uint> IndexRootPages { get; } = indexRootPages;
 
-    public void Dispose() => transaction.Dispose();
+    internal IDisposable Retain()
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _referenceCount);
+            ObjectDisposedException.ThrowIf(current == 0, this);
+            if (current == int.MaxValue)
+                throw new InvalidOperationException("The pager read snapshot has too many active leases.");
+            if (Interlocked.CompareExchange(ref _referenceCount, current + 1, current) == current)
+                return new EmbeddedFileReadSnapshotLease(this);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _ownerReleased, 1) == 0)
+            Release();
+    }
+
+    private void Release()
+    {
+        var remaining = Interlocked.Decrement(ref _referenceCount);
+        if (remaining == 0)
+        {
+            try
+            {
+                transaction.Dispose();
+            }
+            finally
+            {
+                Owner.ReleaseSnapshotReference();
+            }
+        }
+    }
+
+    private sealed class EmbeddedFileReadSnapshotLease(EmbeddedFileReadSnapshot snapshot) : IDisposable
+    {
+        private EmbeddedFileReadSnapshot? _snapshot = snapshot;
+
+        public void Dispose()
+        {
+            var owner = Interlocked.Exchange(ref _snapshot, null);
+            owner?.Release();
+        }
+    }
 }
 
 internal static class ManagedVirtualTableSchemaSql
@@ -234,6 +309,8 @@ internal sealed class EmbeddedFileStore : IDisposable
     private IReadOnlyDictionary<string, EmbeddedTable>? _committedTables;
     private Exception? _postCommitMaintenanceFailure;
     private SqliteSynchronousMode _synchronousMode = SqliteSynchronousMode.Full;
+    private int _referenceCount = 1;
+    private int _disposeRequested;
     private bool _disposed;
 
     private EmbeddedFileStore(IFileSystem fileSystem, string databasePath, string walPath, SqlitePager pager, SqliteDatabaseHeader header)
@@ -488,9 +565,11 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (_disposed || _committedTables is null)
             return false;
 
-        var transaction = _pager.BeginReadTransaction();
+        RetainForSnapshot();
+        SqlitePagerReadTransaction? transaction = null;
         try
         {
+            transaction = _pager.BeginReadTransaction();
             var pageIo = new SqliteStagedBtreePageIo(
                 transaction.ReadPage,
                 transaction.PageCount,
@@ -506,8 +585,102 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
         catch
         {
-            transaction.Dispose();
+            transaction?.Dispose();
+            Release();
             throw;
+        }
+    }
+
+    private void RetainForSnapshot()
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _referenceCount);
+            ObjectDisposedException.ThrowIf(current == 0, this);
+            if (current == int.MaxValue)
+                throw new InvalidOperationException("The file store has too many active snapshots.");
+            if (Interlocked.CompareExchange(ref _referenceCount, current + 1, current) != current)
+                continue;
+
+            if (Volatile.Read(ref _disposeRequested) == 0)
+                return;
+
+            Release();
+            throw new ObjectDisposedException(nameof(EmbeddedFileStore));
+        }
+    }
+
+    internal void ReleaseSnapshotReference() => Release();
+
+    private void Release()
+    {
+        if (Interlocked.Decrement(ref _referenceCount) == 0)
+            _pager.Dispose();
+    }
+
+    internal bool TryOpenBlobReadSource(
+        EmbeddedTable table,
+        long rowId,
+        int physicalColumnIndex,
+        EmbeddedFileReadSnapshot? sharedSnapshot,
+        bool requireCommittedTableIdentity,
+        out IManagedIncrementalBlobReadSource source,
+        out SqliteRecordColumnLocation location)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        source = null!;
+        location = default;
+        if (_disposed || table.WithoutRowid)
+            return false;
+        if (sharedSnapshot is not null && !ReferenceEquals(sharedSnapshot.Owner, this))
+            throw new ArgumentException("The shared read snapshot belongs to another file store.", nameof(sharedSnapshot));
+
+        var tableRootPages = sharedSnapshot?.TableRootPages ?? _tableRootPages;
+        if (_committedTables is null
+            || (requireCommittedTableIdentity
+                ? !_committedTables.TryGetValue(table.Name, out var committed) || !ReferenceEquals(committed, table)
+                : !_committedTables.ContainsKey(table.Name))
+            || !tableRootPages.TryGetValue(table.Name, out var rootPage))
+        {
+            return false;
+        }
+
+        EmbeddedFileReadSnapshot snapshot;
+        IDisposable snapshotLease;
+        if (sharedSnapshot is null)
+        {
+            if (!TryOpenReadSnapshot(table, out snapshot))
+                return false;
+
+            snapshotLease = snapshot;
+        }
+        else
+        {
+            snapshot = sharedSnapshot;
+            snapshotLease = snapshot.Retain();
+        }
+
+        try
+        {
+            var cursor = new SqliteTableBtreeCursor(snapshot.PageIo);
+            if (!cursor.TryGetColumnLocation(rootPage, rowId, physicalColumnIndex, out location))
+                return false;
+            if (location.Length > int.MaxValue)
+                throw new InvalidDataException("SQLite incremental BLOB length exceeds the managed address space.");
+
+            source = new EmbeddedFileBlobReadSource(
+                cursor,
+                rootPage,
+                rowId,
+                physicalColumnIndex,
+                checked((int)location.Length),
+                snapshotLease);
+            snapshotLease = null!;
+            return true;
+        }
+        finally
+        {
+            snapshotLease?.Dispose();
         }
     }
 
@@ -9608,11 +9781,11 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// <summary>Flushes the committed view into the main file and releases resources.</summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeRequested, 1) != 0)
             return;
 
         _disposed = true;
-        _pager.Dispose();
+        Release();
     }
 
     private EmbeddedPostCommitMaintenanceException RecordPostCommitMaintenanceFailure(Exception exception)
