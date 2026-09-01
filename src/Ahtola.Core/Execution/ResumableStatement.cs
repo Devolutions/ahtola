@@ -34,7 +34,8 @@ public sealed class StatementYieldedException : InvalidOperationException
 
 public sealed class ResumableStatement : IDisposable
 {
-    private readonly SqlValue[] _registers;
+    private readonly VdbeRegisterFile _registers;
+    private readonly VdbeRecordValue?[] _recordRegisters;
     private readonly bool[] _openCursors;
     private readonly int[] _cursorPositions;
     private readonly bool[] _skipLastInsertRowId;
@@ -61,6 +62,8 @@ public sealed class ResumableStatement : IDisposable
     private readonly VdbeExecutionMemory _memory;
     private readonly VdbeTransactionContext _transaction;
     private readonly bool _ownsTransaction;
+    private readonly VdbeSchemaExecutionContext? _schemaContext;
+    private readonly bool _ownsSchemaContext;
     private VdbeParameterBinding? _binding;
     private ProgramCounter _instructionPointer;
     private ReadOnlyCollection<SqlValue>? _currentRow;
@@ -116,7 +119,9 @@ public sealed class ResumableStatement : IDisposable
         VdbeTransactionContext? sharedTransaction,
         IReadOnlyList<VdbeVirtualTableBinding?>? virtualTableBindings,
         VdbeExecutionOptions executionOptions,
-        VdbeExecutionMemory? executionMemory = null)
+        VdbeExecutionMemory? executionMemory = null,
+        VdbeSchemaExecutionContext? schemaContext = null,
+        bool ownsSchemaContext = true)
     {
         ArgumentNullException.ThrowIfNull(program);
         ArgumentNullException.ThrowIfNull(executionOptions);
@@ -144,7 +149,8 @@ public sealed class ResumableStatement : IDisposable
             ValidateBindingWidth(program, parameterBinding);
 
         Program = program;
-        _registers = new SqlValue[program.RegisterCount];
+        _registers = new VdbeRegisterFile(program.RegisterCount);
+        _recordRegisters = _registers.Records;
         _openCursors = new bool[program.CursorCount];
         _cursorPositions = new int[program.CursorCount];
         _skipLastInsertRowId = new bool[program.CursorCount];
@@ -171,8 +177,45 @@ public sealed class ResumableStatement : IDisposable
         _binding = parameterBinding;
         _ownsTransaction = sharedTransaction is null;
         _transaction = sharedTransaction ?? new VdbeTransactionContext();
+        _schemaContext = schemaContext;
+        _ownsSchemaContext = ownsSchemaContext;
         State = ResumableStatementState.Ready;
     }
+
+    /// <summary>
+    /// Creates a statement bound to a schema execution context, so its DDL opcodes have somewhere to
+    /// perform their effects. The public constructors deliberately do not expose this: a schema context is
+    /// an engine-internal binding, and a statement built without one fails any schema opcode explicitly
+    /// rather than succeeding as a no-op.
+    /// </summary>
+    internal static ResumableStatement CreateWithSchemaContext(
+        VdbeProgram program,
+        VdbeSchemaExecutionContext schemaContext,
+        IReadOnlyList<VdbeCursorSource?>? cursorSources = null,
+        IReadOnlyList<VdbeWriteTarget?>? writeTargets = null,
+        VdbeParameterBinding? parameterBinding = null,
+        VdbeTransactionContext? sharedTransaction = null,
+        IReadOnlyList<VdbeVirtualTableBinding?>? virtualTableBindings = null,
+        VdbeExecutionOptions? executionOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(schemaContext);
+        return new ResumableStatement(
+            program,
+            cursorSources,
+            writeTargets,
+            parameterBinding,
+            sharedTransaction,
+            virtualTableBindings,
+            executionOptions ?? VdbeExecutionOptions.Default,
+            executionMemory: null,
+            schemaContext: schemaContext);
+    }
+
+    /// <summary>
+    /// The schema execution context this statement's DDL opcodes run against, or <see langword="null"/>
+    /// when none is bound. A nested subprogram observes the same instance as its parent.
+    /// </summary>
+    internal VdbeSchemaExecutionContext? SchemaContext => _schemaContext;
 
     /// <summary>
     /// The transaction/savepoint + deferred-FK counter this statement uses. When constructed with a
@@ -269,7 +312,9 @@ public sealed class ResumableStatement : IDisposable
                     AdvanceInstructionPointer();
                     break;
                 case CopyInstruction copy:
-                    _registers[copy.Destination.Index] = _registers[copy.Source.Index];
+                    // Copy moves whatever the source register holds, scalar or record, so a MakeRecord
+                    // result survives being staged through a scratch register.
+                    _registers.CopySlot(copy.Source.Index, copy.Destination.Index);
                     AdvanceInstructionPointer();
                     break;
                 case FunctionInstruction function:
@@ -853,7 +898,7 @@ public sealed class ResumableStatement : IDisposable
                         _registers[groupKey.Destination.Index] = SqlValue.Integer(groupIndex);
                         if (groupKey.KeyOutput is { } keyOutput)
                         {
-                            Array.Copy(key, 0, _registers, keyOutput.Start.Index, key.Length);
+                            _registers.CopyFrom(key, 0, keyOutput.Start.Index, key.Length);
                         }
 
                         AdvanceInstructionPointer();
@@ -870,7 +915,7 @@ public sealed class ResumableStatement : IDisposable
                                 $"A register projection declared {project.Output.Count} outputs but returned {output.Length}.");
                         }
 
-                        Array.Copy(output, 0, _registers, project.Output.Start.Index, output.Length);
+                        _registers.CopyFrom(output, 0, project.Output.Start.Index, output.Length);
                         AdvanceInstructionPointer();
                         break;
                     }
@@ -971,6 +1016,104 @@ public sealed class ResumableStatement : IDisposable
                         AdvanceInstructionPointer();
                         break;
                     }
+                case MakeRecordInstruction makeRecord:
+                    try
+                    {
+                        var values = new SqlValue[makeRecord.Values.Count];
+                        for (var offset = 0; offset < values.Length; offset++)
+                        {
+                            var sourceIndex = makeRecord.Values.Start.Index + offset;
+                            if (_registers.GetRecord(sourceIndex) is not null)
+                            {
+                                throw new InvalidOperationException(
+                                    $"MakeRecord cannot pack register {sourceIndex}, which holds a record rather than a scalar.");
+                            }
+
+                            values[offset] = _registers[sourceIndex];
+                        }
+
+                        _registers.SetRecord(makeRecord.Destination.Index, new VdbeRecordValue(values));
+                        AdvanceInstructionPointer();
+                    }
+                    catch (Exception exception)
+                    {
+                        FailExecution(exception);
+                    }
+
+                    break;
+                case NewRowidInstruction newRowid:
+                    try
+                    {
+                        var source = RequireCursorSource(newRowid.Cursor);
+                        var rowIds = source.RowIds
+                            ?? throw new InvalidOperationException(
+                                $"NewRowid requires cursor {newRowid.Cursor.Index} to expose rowids, but its source is value-only.");
+
+                        long? largest;
+                        if (source.LargestRowId is { } readLargest)
+                        {
+                            largest = readLargest();
+                        }
+                        else
+                        {
+                            largest = null;
+                            for (var index = 0; index < rowIds.Count; index++)
+                            {
+                                var rowId = rowIds[index];
+                                if (largest is null || rowId > largest.Value)
+                                    largest = rowId;
+                            }
+                        }
+
+                        long allocated;
+                        if (largest == long.MaxValue)
+                        {
+                            var usedRowIds = new HashSet<long>(rowIds);
+                            allocated = 0;
+                            for (var attempt = 0; attempt < 100; attempt++)
+                            {
+                                var candidate = Random.Shared.NextInt64(1, (long.MaxValue >> 1) + 1);
+                                if (usedRowIds.Contains(candidate))
+                                    continue;
+
+                                allocated = candidate;
+                                break;
+                            }
+
+                            if (allocated == 0)
+                            {
+                                throw new InvalidOperationException(
+                                    $"NewRowid could not find an unused rowid for cursor {newRowid.Cursor.Index} after 100 attempts.");
+                            }
+                        }
+                        else
+                            allocated = largest is { } current ? current + 1 : 1;
+
+                        _registers[newRowid.Destination.Index] = SqlValue.Integer(allocated);
+                        if (newRowid.PreviousLargest is { } previousLargest)
+                            _registers[previousLargest.Index] = SqlValue.Integer(largest ?? 0);
+                        AdvanceInstructionPointer();
+                    }
+                    catch (Exception exception)
+                    {
+                        FailExecution(exception);
+                    }
+
+                    break;
+                // Every schema opcode is dispatched as one group so a failed schema effect always faults
+                // the statement instead of leaving it resumable over a half-applied schema.
+                case VdbeInstruction when instruction is IVdbeSchemaInstruction schemaInstruction:
+                    try
+                    {
+                        ExecuteSchemaInstruction(schemaInstruction);
+                        AdvanceInstructionPointer();
+                    }
+                    catch (Exception exception)
+                    {
+                        FailExecution(exception);
+                    }
+
+                    break;
                 case PrevInstruction prev:
                     {
                         _materializedRows[prev.Cursor.Index] = null;
@@ -1011,6 +1154,21 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case InsertInstruction insert:
                     {
+                        if (insert.Record is { } insertRecord)
+                        {
+                            try
+                            {
+                                InsertRecordRow(insert, insertRecord);
+                                AdvanceInstructionPointer();
+                            }
+                            catch (Exception exception)
+                            {
+                                FailExecution(exception);
+                            }
+
+                            break;
+                        }
+
                         MutateCursorRow(insert.Cursor, insert.Flags);
                         AdvanceInstructionPointer();
                         break;
@@ -1111,7 +1269,7 @@ public sealed class ResumableStatement : IDisposable
                     {
                         var runtime = RequireOpenSorter(sorterData.Sorter);
                         var record = runtime.Current();
-                        Array.Copy(record, 0, _registers, sorterData.Destination.Start.Index, record.Length);
+                        _registers.CopyFrom(record, 0, sorterData.Destination.Start.Index, record.Length);
                         AdvanceInstructionPointer();
                         break;
                     }
@@ -1471,7 +1629,7 @@ public sealed class ResumableStatement : IDisposable
                         break;
                     }
                 case BeginTransactionInstruction:
-                    _transaction.Begin(_registers);
+                    _transaction.Begin(_registers.Scalars, _registers.Records);
                     AdvanceInstructionPointer();
                     break;
                 case CommitTransactionInstruction:
@@ -1479,11 +1637,11 @@ public sealed class ResumableStatement : IDisposable
                     AdvanceInstructionPointer();
                     break;
                 case RollbackTransactionInstruction:
-                    _transaction.Rollback(_registers);
+                    _transaction.Rollback(_registers.Scalars, _registers.Records);
                     AdvanceInstructionPointer();
                     break;
                 case SavepointInstruction savepoint:
-                    _transaction.Savepoint(savepoint.Name, _registers);
+                    _transaction.Savepoint(savepoint.Name, _registers.Scalars, _registers.Records);
                     AdvanceInstructionPointer();
                     break;
                 case ReleaseSavepointInstruction release:
@@ -1491,7 +1649,7 @@ public sealed class ResumableStatement : IDisposable
                     AdvanceInstructionPointer();
                     break;
                 case RollbackToSavepointInstruction rollbackTo:
-                    _transaction.RollbackTo(rollbackTo.Name, _registers);
+                    _transaction.RollbackTo(rollbackTo.Name, _registers.Scalars, _registers.Records);
                     AdvanceInstructionPointer();
                     break;
                 case OpenWorkTableInstruction openWorkTable:
@@ -1513,7 +1671,7 @@ public sealed class ResumableStatement : IDisposable
                         var runtime = RequireOpenWorkTable(step.WorkTable);
                         if (runtime.TryStep(out var row))
                         {
-                            Array.Copy(row, 0, _registers, step.Destination.Start.Index, row.Length);
+                            _registers.CopyFrom(row, 0, step.Destination.Start.Index, row.Length);
                             AdvanceInstructionPointer();
                         }
                         else
@@ -1574,7 +1732,7 @@ public sealed class ResumableStatement : IDisposable
                     {
                         var runtime = RequireOpenWindowBuffer(windowData.Buffer);
                         var record = runtime.Current();
-                        Array.Copy(record, 0, _registers, windowData.Destination.Start.Index, record.Length);
+                        _registers.CopyFrom(record, 0, windowData.Destination.Start.Index, record.Length);
                         AdvanceInstructionPointer();
                         break;
                     }
@@ -1657,7 +1815,7 @@ public sealed class ResumableStatement : IDisposable
     {
         ThrowIfDisposed();
 
-        Array.Clear(_registers);
+        _registers.Clear();
         Array.Clear(_openCursors);
         Array.Clear(_cursorPositions);
         Array.Clear(_skipLastInsertRowId);
@@ -1679,6 +1837,11 @@ public sealed class ResumableStatement : IDisposable
         // keeps its frames and deferred FK counter so multi-statement VDBE programs can share them.
         if (_ownsTransaction)
             _transaction.Reset();
+        // The same ownership rule applies to the schema context: the statement that introduced it
+        // discards its staged root reservations, while a nested subprogram leaves the caller's
+        // transaction-local schema staging intact.
+        if (_ownsSchemaContext)
+            _schemaContext?.Reset();
         _currentRow = null;
         _instructionPointer = default;
         _hasExecutedInstruction = false;
@@ -1732,6 +1895,154 @@ public sealed class ResumableStatement : IDisposable
         return _registers[register.Index];
     }
 
+    /// <summary>
+    /// The record a register holds, or <see langword="null"/> when it holds a scalar. Records are an
+    /// interpreter-internal representation, so the public <see cref="GetRegister(Register)"/> reports a
+    /// record register as <see cref="SqlValue.Null"/> instead of inventing a blob for it.
+    /// </summary>
+    internal VdbeRecordValue? GetRecordRegister(Register register)
+    {
+        ThrowIfDisposed();
+        ValidateRegister(register);
+        return _registers.GetRecord(register.Index);
+    }
+
+    /// <summary>
+    /// The schema execution context a schema opcode must run against. A statement built without one fails
+    /// here rather than treating a missing binding as a successful no-op.
+    /// </summary>
+    private VdbeSchemaExecutionContext RequireSchemaContext(string opcodeName)
+        => _schemaContext
+            ?? throw new VdbeSchemaExecutionException(
+                $"{opcodeName} requires a schema execution context, but the statement was created without one.");
+
+    /// <summary>
+    /// Reads a b-tree root page out of a register, rejecting anything that is not a page number. A root
+    /// read from a <c>sqlite_schema</c> row is data, so it is validated rather than trusted.
+    /// </summary>
+    private long RequireRootPageRegister(Register register)
+    {
+        var value = _registers[register.Index];
+        if (value.Kind != SqlValueKind.Integer)
+        {
+            throw new VdbeSchemaExecutionException(
+                $"Destroy reads its root page from r[{register.Index}], which holds {value.Kind} instead of an integer.");
+        }
+
+        return value.AsInteger();
+    }
+
+    /// <summary>
+    /// Performs one context-owned schema effect. Every branch resolves the schema context first, so an
+    /// unbound statement fails before any effect is attempted.
+    /// </summary>
+    private void ExecuteSchemaInstruction(IVdbeSchemaInstruction instruction)
+    {
+        switch (instruction)
+        {
+            case CreateBtreeInstruction createBtree:
+                {
+                    var rootPage = RequireSchemaContext("CreateBtree")
+                        .CreateBtree(createBtree.Database, createBtree.Flags);
+                    _registers[createBtree.RootDestination.Index] = SqlValue.Integer(rootPage);
+                    break;
+                }
+            case ClearBtreeInstruction clearBtree:
+                RequireSchemaContext("ClearBtree").ClearBtree(clearBtree.Database, clearBtree.RootPage);
+                break;
+            case DestroyInstruction destroy:
+                {
+                    // A program that discovered the root in a register passes it here; upstream always
+                    // knows it as a literal because SQLite assigns roots when the b-tree is created.
+                    var rootPage = destroy.RootRegister is { } rootRegister
+                        ? RequireRootPageRegister(rootRegister)
+                        : destroy.RootPage;
+                    var formerRoot = RequireSchemaContext("Destroy")
+                        .Destroy(destroy.Database, rootPage, destroy.IsTemporary);
+                    _registers[destroy.FormerRootDestination.Index] = SqlValue.Integer(formerRoot);
+                    break;
+                }
+            case IndexBuildInstruction indexBuild:
+                RequireSchemaContext("IndexBuild").BuildIndex(
+                    indexBuild.Database,
+                    indexBuild.TableName,
+                    indexBuild.IndexName,
+                    indexBuild.Unique);
+                break;
+            case ReadCookieInstruction readCookie:
+                {
+                    var cookie = RequireSchemaContext("ReadCookie")
+                        .ReadCookie(readCookie.Database, readCookie.Cookie);
+                    _registers[readCookie.Destination.Index] = SqlValue.Integer(cookie);
+                    break;
+                }
+            case SetCookieInstruction setCookie:
+                RequireSchemaContext("SetCookie")
+                    .SetCookie(setCookie.Database, setCookie.Cookie, setCookie.Value);
+                break;
+            case ParseSchemaInstruction parseSchema:
+                RequireSchemaContext("ParseSchema").ParseSchema(
+                    parseSchema.Database,
+                    parseSchema.WhereClause,
+                    parseSchema.TriggerTargetDatabase);
+                break;
+            case DropTableInstruction dropTable:
+                RequireSchemaContext("DropTable").DropObject(
+                    dropTable.Database,
+                    VdbeSchemaObjectKind.Table,
+                    dropTable.TableName);
+                break;
+            case DropViewInstruction dropView:
+                RequireSchemaContext("DropView").DropObject(
+                    dropView.Database,
+                    VdbeSchemaObjectKind.View,
+                    dropView.ViewName);
+                break;
+            case DropIndexInstruction dropIndex:
+                RequireSchemaContext("DropIndex").DropObject(
+                    dropIndex.Database,
+                    VdbeSchemaObjectKind.Index,
+                    dropIndex.IndexName);
+                break;
+            case DropTriggerInstruction dropTrigger:
+                RequireSchemaContext("DropTrigger").DropObject(
+                    dropTrigger.Database,
+                    VdbeSchemaObjectKind.Trigger,
+                    dropTrigger.TriggerName);
+                break;
+            case RenameTableInstruction renameTable:
+                RequireSchemaContext("RenameTable")
+                    .RenameTable(renameTable.Database, renameTable.From, renameTable.To);
+                break;
+            case AddColumnInstruction addColumn:
+                RequireSchemaContext("AddColumn").AddColumn(
+                    addColumn.Database,
+                    addColumn.TableName,
+                    addColumn.ColumnName,
+                    addColumn.ColumnDefinition,
+                    addColumn.ColumnSql);
+                break;
+            case DropColumnInstruction dropColumn:
+                RequireSchemaContext("DropColumn").DropColumn(
+                    dropColumn.Database,
+                    dropColumn.TableName,
+                    dropColumn.ColumnIndex);
+                break;
+            case AlterColumnInstruction alterColumn:
+                RequireSchemaContext("AlterColumn").AlterColumn(
+                    alterColumn.Database,
+                    alterColumn.TableName,
+                    alterColumn.ColumnIndex,
+                    alterColumn.ColumnDefinition,
+                    alterColumn.Rename,
+                    alterColumn.QuoteNewName);
+                break;
+            default:
+                throw new InvalidOperationException(
+                    $"Validated VDBE program contains unsupported schema opcode {((VdbeInstruction)instruction).Opcode}.");
+        }
+    }
+
     public bool IsCursorOpen(Cursor cursor)
     {
         ThrowIfDisposed();
@@ -1744,7 +2055,7 @@ public sealed class ResumableStatement : IDisposable
         if (_disposed)
             return;
 
-        Array.Clear(_registers);
+        _registers.Clear();
         Array.Clear(_openCursors);
         Array.Clear(_materializedRows);
         DisposeExecutionResources();
@@ -1761,6 +2072,8 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_windowBuffers);
         if (_ownsTransaction)
             _transaction.Reset();
+        if (_ownsSchemaContext)
+            _schemaContext?.Discard();
         _binding = null;
         _currentRow = null;
         State = ResumableStatementState.Disposed;
@@ -1799,7 +2112,8 @@ public sealed class ResumableStatement : IDisposable
             subprogram = instruction.Subprogram.CreateRuntime(
                 CreateSubprogramBinding(instruction),
                 _executionOptions,
-                _memory);
+                _memory,
+                _schemaContext);
             _subprogramStatements[instructionOffset] = subprogram;
         }
         else if (subprogram!.State == ResumableStatementState.Yielded)
@@ -2111,9 +2425,10 @@ public sealed class ResumableStatement : IDisposable
         }
 
         var writeTarget = WriteTargetOrNull(cursor);
-        return writeTarget is not null
-            ? writeTarget.RowCount
-            : RequireCursorSource(cursor).Rows.Count;
+        if (writeTarget is not null)
+            return writeTarget.LiveRowCount is { } liveRowCount ? liveRowCount() : writeTarget.RowCount;
+
+        return RequireCursorSource(cursor).Rows.Count;
     }
 
     // Runs a mutation delegate for the current position and materializes the written
@@ -2149,6 +2464,47 @@ public sealed class ResumableStatement : IDisposable
 
         // SkipLastRowid is honored at Commit; mutation still records the rowid for Column/RowId.
         if ((flags & (VdbeInsertFlags.SkipStatementChangeCount | VdbeInsertFlags.SkipAllChangeCounts)) == 0)
+            RowsAffected = checked(RowsAffected + 1);
+    }
+
+    /// <summary>
+    /// Executes the register-backed <see cref="InsertInstruction"/> form: it stores the record built by
+    /// <see cref="MakeRecordInstruction"/> under the rowid the program computed, through the cursor's
+    /// <see cref="VdbeWriteTarget.InsertRecord"/> binding.
+    /// </summary>
+    /// <remarks>
+    /// The written row is materialized on the cursor so a following <c>Column</c>/<c>RowId</c> observes
+    /// what was stored, exactly as the cursor-only form does through <see cref="MutateCursorRow"/>.
+    /// </remarks>
+    private void InsertRecordRow(InsertInstruction insert, Register recordRegister)
+    {
+        var target = RequireWriteTarget(insert.Cursor);
+        var insertRecord = target.InsertRecord
+            ?? throw new InvalidOperationException(
+                $"Cursor {insert.Cursor.Index} has no record insert action bound.");
+        var record = _registers.GetRecord(recordRegister.Index)
+            ?? throw new InvalidOperationException(
+                $"Insert reads register {recordRegister.Index}, which holds a scalar rather than a record.");
+        var rowIdRegister = insert.RowId
+            ?? throw new InvalidOperationException("Validated Insert carries a record without a rowid register.");
+        var rowIdValue = _registers[rowIdRegister.Index];
+        if (rowIdValue.Kind != SqlValueKind.Integer)
+        {
+            throw new InvalidOperationException(
+                $"Insert reads its rowid from register {rowIdRegister.Index}, which holds {rowIdValue.Kind} rather than an integer.");
+        }
+
+        var row = record.ToArray();
+        var storedRowId = insertRecord(rowIdValue.AsInteger(), row);
+        _materializedRows[insert.Cursor.Index] = row;
+        _materializedRowIds[insert.Cursor.Index] = storedRowId;
+
+        if ((insert.Flags & VdbeInsertFlags.SkipLastRowid) != 0)
+            _skipLastInsertRowId[insert.Cursor.Index] = true;
+        else
+            LastInsertRowId = storedRowId;
+
+        if ((insert.Flags & (VdbeInsertFlags.SkipStatementChangeCount | VdbeInsertFlags.SkipAllChangeCounts)) == 0)
             RowsAffected = checked(RowsAffected + 1);
     }
 
@@ -2233,7 +2589,7 @@ public sealed class ResumableStatement : IDisposable
     private SqlValue[] ReadRegisters(RegisterRange range)
     {
         var values = new SqlValue[range.Count];
-        Array.Copy(_registers, range.Start.Index, values, 0, range.Count);
+        _registers.CopyTo(range.Start.Index, values, 0, range.Count);
         return values;
     }
 
@@ -2324,7 +2680,7 @@ public sealed class ResumableStatement : IDisposable
                 $"Row-set row has {row.Length} columns but destination has {destination.Count} registers.");
         }
 
-        Array.Copy(row, 0, _registers, destination.Start.Index, row.Length);
+        _registers.CopyFrom(row, 0, destination.Start.Index, row.Length);
     }
 
     /// <summary>

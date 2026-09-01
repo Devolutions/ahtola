@@ -1561,7 +1561,17 @@ internal sealed class SqlParser
             ExpectKeyword("COLUMN");
             var columnName = ExpectIdentifier();
             ExpectKeyword("TO");
-            return new AlterTableAlterColumnStatement(tableName, columnName, ParseColumnDefinition());
+            // The replacement's source text is kept verbatim, exactly as ADD COLUMN keeps the added
+            // column's: the compiled ALTER COLUMN opcode carries the declaration as written, so the
+            // definition the schema is rebuilt from is the one the statement supplied.
+            var definitionStart = _lexer.Current.Offset;
+            var replacement = ParseColumnDefinition();
+            var definitionSql = _sql[definitionStart.._lexer.Current.Offset].Trim();
+            return new AlterTableAlterColumnStatement(
+                tableName,
+                columnName,
+                replacement,
+                definitionSql.Length > 0 ? definitionSql : null);
         }
         if (ConsumeKeyword("DROP"))
         {
@@ -3982,7 +3992,7 @@ internal sealed class SqlParser
 
     private string? ParseDeclaredType()
     {
-        if (_lexer.Current.Kind is TokenKind.Comma or TokenKind.RightParen)
+        if (_lexer.Current.Kind is TokenKind.Comma or TokenKind.RightParen or TokenKind.Semicolon)
             return null;
         if (_lexer.Current.Kind == TokenKind.Identifier && IsColumnConstraintKeyword(_lexer.Current.Text))
             return null;
@@ -3993,7 +4003,11 @@ internal sealed class SqlParser
         {
             if (depth == 0)
             {
-                if (_lexer.Current.Kind is TokenKind.Comma or TokenKind.RightParen)
+                // A declared type ends where the column definition does. Inside CREATE TABLE that is a
+                // comma or the closing parenthesis; at the tail of ALTER TABLE ADD/ALTER COLUMN the
+                // definition is the last thing in the statement, so the statement terminator ends it too —
+                // without this a trailing semicolon would be absorbed into the type name and persisted.
+                if (_lexer.Current.Kind is TokenKind.Comma or TokenKind.RightParen or TokenKind.Semicolon)
                     break;
                 if (_lexer.Current.Kind == TokenKind.Identifier && IsColumnConstraintKeyword(_lexer.Current.Text))
                     break;
@@ -4068,7 +4082,12 @@ internal sealed class SqlParser
 
     private bool IsTableConstraintStart()
     {
+        // A quoted identifier is never a keyword, so `CREATE TABLE t("NULL", "CHECK")` declares two
+        // ordinary columns. This matters beyond exotic hand-written SQL: CREATE TABLE AS SELECT derives
+        // column names from result expressions and quotes them, so a `SELECT NULL` produces a stored
+        // schema whose own reparse would otherwise be read as a table constraint.
         return _lexer.Current.Kind == TokenKind.Identifier
+            && !_lexer.Current.IsQuoted
             && IsColumnConstraintKeyword(_lexer.Current.Text);
     }
 

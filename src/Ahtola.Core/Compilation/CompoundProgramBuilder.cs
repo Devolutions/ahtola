@@ -660,7 +660,12 @@ public static class CompoundProgramBuilder
             ColumnInstruction x => new ColumnInstruction(Cur(x.Cursor), x.ColumnIndex, Reg(x.Destination)),
             RowIdInstruction x => new RowIdInstruction(Cur(x.Cursor), Reg(x.Destination)),
             DeleteInstruction x => new DeleteInstruction(Cur(x.Cursor)),
-            InsertInstruction x => new InsertInstruction(Cur(x.Cursor)),
+            InsertInstruction x => new InsertInstruction(
+                Cur(x.Cursor),
+                x.Flags,
+                x.Record is { } record ? Reg(record) : null,
+                x.RowId is { } rowId ? Reg(rowId) : null,
+                x.TableName),
             UpdateInstruction x => new UpdateInstruction(Cur(x.Cursor)),
             CommitInstruction x => new CommitInstruction(Cur(x.Cursor)),
             FilterInstruction x => new FilterInstruction(Cur(x.Cursor), x.Predicate, Pc(x.FalseTarget), x.Description),
