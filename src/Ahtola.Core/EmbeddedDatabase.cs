@@ -24705,6 +24705,35 @@ out bool hasReturning)
             return false;
         }
 
+        var updatedColumns = statement.Assignments
+            .Select(assignment => assignment.Column)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var beforeUpdateTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.Before,
+            TriggerEvent.Update,
+            updatedColumns);
+        var afterUpdateTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.After,
+            TriggerEvent.Update,
+            updatedColumns);
+        if (beforeUpdateTriggers.Count != 0 || afterUpdateTriggers.Count != 0)
+        {
+            var triggerPlan = PrepareUpdate(statement, table, context);
+            return TryCompileAfterUpdateTriggerPrograms(
+                statement,
+                parameters,
+                context,
+                table,
+                triggerPlan,
+                beforeUpdateTriggers,
+                afterUpdateTriggers,
+                out compiled);
+        }
+
         DmlRowFilter? filter = null;
         if (statement.Where is not null)
         {
@@ -24819,6 +24848,28 @@ out bool hasReturning)
             || !context.Tables.TryGetValue(statement.TableName, out var table))
         {
             return false;
+        }
+
+        var beforeDeleteTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.Before,
+            TriggerEvent.Delete);
+        var afterDeleteTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.After,
+            TriggerEvent.Delete);
+        if (beforeDeleteTriggers.Count != 0 || afterDeleteTriggers.Count != 0)
+        {
+            return TryCompileAfterDeleteTriggerPrograms(
+                statement,
+                parameters,
+                context,
+                table,
+                beforeDeleteTriggers,
+                afterDeleteTriggers,
+                out compiled);
         }
 
         DmlRowFilter? filter = null;
