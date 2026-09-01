@@ -20935,6 +20935,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 && function.Arguments.All(argument =>
                     IsSafeCompiledJoinOperand(argument, resolveColumnIndex, resolveColumnDefinition));
         }
+        if (expression is BinaryExpression binary
+            && TryMapArithmeticOperator(binary.Operator, out _))
+        {
+            return IsSafeCompiledJoinOperand(
+                    binary.Left,
+                    resolveColumnIndex,
+                    resolveColumnDefinition)
+                && IsSafeCompiledJoinOperand(
+                    binary.Right,
+                    resolveColumnIndex,
+                    resolveColumnDefinition);
+        }
+        if (expression is UnaryExpression unary
+            && TryMapArithmeticOperator(unary.Operator, out _))
+        {
+            return IsSafeCompiledJoinOperand(
+                unary.Operand,
+                resolveColumnIndex,
+                resolveColumnDefinition);
+        }
 
         if (expression is not ColumnExpression column || resolveColumnIndex(column.Name) is null)
             return false;
@@ -21200,7 +21220,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var equiProbe = indexSeekDescription is null
-            ? TryCreateCompiledJoinEquiProbe(join, context)
+            ? TryCreateCompiledJoinEquiProbe(join, left, right, parameters, context, outerRow)
             : null;
         // INNER equijoin: hash-build the smaller estimated side (default still right).
         // OUTER joins keep hash-build-right so unmatched-side semantics stay correct.
@@ -21952,19 +21972,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     /// <summary>
-    /// Builds a hash probe for compiled multi-way joins when ON is a conjunction of
-    /// simple column equalities (same shape as the evaluator EquiJoinHashIndex).
+    /// Builds a hash probe for compiled multi-way joins when ON contains an equality whose
+    /// operands each belong to one join side. Simple column equalities retain their affinity
+    /// and collation-aware canonicalization; numeric arithmetic expressions are evaluated on
+    /// their owning side and hashed by their resulting numeric value.
     /// </summary>
     private VdbeJoinEquiProbe? TryCreateCompiledJoinEquiProbe(
         JoinTableSource join,
-        QueryContext context)
+        CompiledJoinSource left,
+        CompiledJoinSource right,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
     {
         if (join.Condition is null)
             return null;
 
         var leftColumns = GetOutputColumns(join.Left, context);
         var rightColumns = GetOutputColumns(join.Right, context);
-        var keys = new List<EquiJoinKey>();
+        var keys = new List<CompiledJoinHashKey>();
         var pending = new Stack<Expression>();
         pending.Push(join.Condition);
         while (pending.Count > 0)
@@ -21978,7 +22004,54 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
 
             if (TryCreateEquiJoinKey(conjunct, join, leftColumns, rightColumns, context) is { } key)
-                keys.Add(key);
+            {
+                keys.Add(new CompiledJoinHashKey(
+                    row => row.Values[key.LeftColumn.Index],
+                    row => row.Values[key.RightColumn.Index],
+                    key.LeftConvertsTextToNumeric,
+                    key.LeftConvertsNumericToText,
+                    key.RightConvertsTextToNumeric,
+                    key.RightConvertsNumericToText,
+                    key.Collation));
+                continue;
+            }
+
+            if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } equality)
+                continue;
+
+            Expression leftExpression;
+            Expression rightExpression;
+            if (ExpressionBelongsToSource(equality.Left, left, right)
+                && ExpressionBelongsToSource(equality.Right, right, left))
+            {
+                leftExpression = equality.Left;
+                rightExpression = equality.Right;
+            }
+            else if (ExpressionBelongsToSource(equality.Right, left, right)
+                && ExpressionBelongsToSource(equality.Left, right, left))
+            {
+                leftExpression = equality.Right;
+                rightExpression = equality.Left;
+            }
+            else
+            {
+                continue;
+            }
+
+            if (!IsNumericHashExpression(leftExpression, left)
+                || !IsNumericHashExpression(rightExpression, right))
+            {
+                continue;
+            }
+
+            keys.Add(new CompiledJoinHashKey(
+                row => Evaluate(leftExpression, parameters, left.CreateSourceRow(row, outerRow), context),
+                row => Evaluate(rightExpression, parameters, right.CreateSourceRow(row, outerRow), context),
+                LeftConvertsTextToNumeric: false,
+                LeftConvertsNumericToText: false,
+                RightConvertsTextToNumeric: false,
+                RightConvertsNumericToText: false,
+                Collation: "BINARY"));
         }
 
         if (keys.Count == 0)
@@ -21989,10 +22062,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             string? key = null;
             foreach (var equiKey in keys)
             {
-                var column = leftSide ? equiKey.LeftColumn : equiKey.RightColumn;
-                if (column.Index < 0 || column.Index >= row.Values.Length)
-                    return null;
-                var value = row.Values[column.Index];
+                var value = leftSide ? equiKey.LeftValue(row) : equiKey.RightValue(row);
                 var segment = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
                     value,
                     leftSide ? equiKey.LeftConvertsTextToNumeric : equiKey.RightConvertsTextToNumeric,
@@ -22011,7 +22081,79 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return new VdbeJoinEquiProbe(
             left => BuildKey(left, leftSide: true),
             right => BuildKey(right, leftSide: false));
+
+        static bool ExpressionBelongsToSource(
+            Expression expression,
+            CompiledJoinSource owner,
+            CompiledJoinSource other)
+        {
+            var sawColumn = false;
+            return Visit(expression) && sawColumn;
+
+            bool Visit(Expression candidate)
+            {
+                switch (candidate)
+                {
+                    case LiteralExpression or ParameterExpression:
+                        return true;
+                    case ColumnExpression column:
+                        sawColumn = true;
+                        return owner.ResolveColumnIndex(column.Name) is not null
+                            && other.ResolveColumnIndex(column.Name) is null;
+                    case CollationExpression collation:
+                        return Visit(collation.Expression);
+                    case CastExpression cast:
+                        return Visit(cast.Expression);
+                    case UnaryExpression unary:
+                        return Visit(unary.Operand);
+                    case BinaryExpression binary:
+                        return Visit(binary.Left) && Visit(binary.Right);
+                    case FunctionExpression function when function.Filter is null && function.Window is null:
+                        return function.Arguments.All(Visit);
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        static bool IsNumericHashExpression(Expression expression, CompiledJoinSource source)
+        {
+            while (expression is CollationExpression collation)
+            {
+                if (!string.Equals(collation.Name, "BINARY", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                expression = collation.Expression;
+            }
+
+            if (expression is BinaryExpression binary
+                && TryMapArithmeticOperator(binary.Operator, out _))
+            {
+                return true;
+            }
+            if (expression is UnaryExpression unary
+                && TryMapArithmeticOperator(unary.Operator, out _))
+            {
+                return true;
+            }
+            if (expression is not ColumnExpression column
+                || source.ResolveColumnIndex(column.Name) is not { } index)
+            {
+                return false;
+            }
+
+            return index >= source.Columns.Length
+                || IsNumericAffinity(GetJoinKeyAffinity(source.ResolveColumnDefinition(column)));
+        }
     }
+
+    private sealed record CompiledJoinHashKey(
+        Func<VdbeJoinRow, SqlValue> LeftValue,
+        Func<VdbeJoinRow, SqlValue> RightValue,
+        bool LeftConvertsTextToNumeric,
+        bool LeftConvertsNumericToText,
+        bool RightConvertsTextToNumeric,
+        bool RightConvertsNumericToText,
+        string Collation);
 
     private static SourceRow CreateCompiledJoinSourceRow(
         string[] columns,
@@ -32362,6 +32504,7 @@ out bool hasReturning)
         Expression? rightPredicate = null,
         IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
+        context.CheckInterrupt();
         if (source.Kind.ProducesLeftShapeOnly())
         {
             return GetSemiOrAntiJoinRows(
@@ -32446,7 +32589,9 @@ out bool hasReturning)
         var ambiguousQualifiedColumns = GetAmbiguousQualifiedColumns(source, context);
         var leftWidth = left.Columns.Length;
         var joinPairs = BuildJoinPairs(source, context);
-        var joinHashIndex = rightIsCorrelatedSource ? null : TryBuildJoinHashIndex(source, right, context);
+        var joinHashIndex = rightIsCorrelatedSource
+            ? null
+            : TryBuildJoinHashIndex(source, right, parameters, context);
         IEnumerable<int>? allRightIndices = null;
 
         var rows = new List<SourceRow>();
@@ -32502,6 +32647,7 @@ out bool hasReturning)
         {
             foreach (var rightRow in right.Rows)
             {
+                context.CheckInterrupt();
                 var rowsForRight = GetSideSourceRows(
                     source.Left,
                     leftConstraintPredicate,
@@ -32512,6 +32658,7 @@ out bool hasReturning)
                 AddOmittedPredicates(rowsForRight.OmittedVirtualTablePredicates);
                 foreach (var leftRow in rowsForRight.Rows)
                 {
+                    context.CheckInterrupt();
                     if (source.Condition is null
                         && !JoinConditionMatches(source, joinPairs, combinedRow: null, leftRow, rightRow, parameters, context))
                     {
@@ -32537,6 +32684,7 @@ out bool hasReturning)
         var rightMatched = new bool[right.Rows.Count];
         foreach (var leftRow in left.Rows)
         {
+            context.CheckInterrupt();
             var rowsForLeft = rightIsCorrelatedSource
                 ? GetSideSourceRows(
                     source.Right,
@@ -32555,6 +32703,7 @@ out bool hasReturning)
                     : allRightIndices ??= Enumerable.Range(0, rowsForLeft.Rows.Count);
             foreach (var rightIndex in candidateIndices)
             {
+                context.CheckInterrupt();
                 var rightRow = rowsForLeft.Rows[rightIndex];
                 if (source.Condition is null
                     && !JoinConditionMatches(source, joinPairs, combinedRow: null, leftRow, rightRow, parameters, context))
@@ -32614,6 +32763,7 @@ out bool hasReturning)
         {
             for (var rightIndex = 0; rightIndex < right.Rows.Count; rightIndex++)
             {
+                context.CheckInterrupt();
                 if (rightMatched[rightIndex])
                     continue;
 
@@ -32890,20 +33040,21 @@ out bool hasReturning)
     private EquiJoinHashIndex? TryBuildJoinHashIndex(
         JoinTableSource source,
         SourceData right,
+        SqlValue[] parameters,
         QueryContext context)
     {
         var leftColumns = GetOutputColumns(source.Left, context);
         var rightColumns = GetOutputColumns(source.Right, context);
-        var keys = new List<EquiJoinKey>();
+        var keys = new List<EvaluatorJoinHashKey>();
         if (source.Condition is null)
         {
             foreach (var (left, rightColumn) in BuildJoinPairs(source, context))
             {
                 if (TryCreateEquiJoinKey(source, left, rightColumn, context) is { } key)
-                    keys.Add(key);
+                    keys.Add(FromSimpleKey(key));
             }
 
-            return keys.Count == 0 ? null : new EquiJoinHashIndex(keys, right);
+            return keys.Count == 0 ? null : new EquiJoinHashIndex(keys, right, context);
         }
 
         var pending = new Stack<Expression>();
@@ -32919,10 +33070,129 @@ out bool hasReturning)
             }
 
             if (TryCreateEquiJoinKey(conjunct, source, leftColumns, rightColumns, context) is { } key)
-                keys.Add(key);
+            {
+                keys.Add(FromSimpleKey(key));
+                continue;
+            }
+
+            if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } equality)
+                continue;
+
+            Expression leftExpression;
+            Expression rightExpression;
+            if (ExpressionBelongsToJoinSide(equality.Left, leftColumns, rightColumns)
+                && ExpressionBelongsToJoinSide(equality.Right, rightColumns, leftColumns))
+            {
+                leftExpression = equality.Left;
+                rightExpression = equality.Right;
+            }
+            else if (ExpressionBelongsToJoinSide(equality.Right, leftColumns, rightColumns)
+                && ExpressionBelongsToJoinSide(equality.Left, rightColumns, leftColumns))
+            {
+                leftExpression = equality.Right;
+                rightExpression = equality.Left;
+            }
+            else
+            {
+                continue;
+            }
+
+            if (!IsNumericJoinHashExpression(leftExpression, source.Left, leftColumns)
+                || !IsNumericJoinHashExpression(rightExpression, source.Right, rightColumns))
+            {
+                continue;
+            }
+
+            keys.Add(new EvaluatorJoinHashKey(
+                row => Evaluate(leftExpression, parameters, row, context),
+                row => Evaluate(rightExpression, parameters, row, context),
+                LeftConvertsTextToNumeric: false,
+                LeftConvertsNumericToText: false,
+                RightConvertsTextToNumeric: false,
+                RightConvertsNumericToText: false,
+                Collation: "BINARY"));
         }
 
-        return keys.Count == 0 ? null : new EquiJoinHashIndex(keys, right);
+        return keys.Count == 0 ? null : new EquiJoinHashIndex(keys, right, context);
+
+        static EvaluatorJoinHashKey FromSimpleKey(EquiJoinKey key) => new(
+            row => GetOutputValue(row, key.LeftColumn),
+            row => GetOutputValue(row, key.RightColumn),
+            key.LeftConvertsTextToNumeric,
+            key.LeftConvertsNumericToText,
+            key.RightConvertsTextToNumeric,
+            key.RightConvertsNumericToText,
+            key.Collation);
+
+        bool ExpressionBelongsToJoinSide(
+            Expression expression,
+            IReadOnlyList<OutputColumn> owner,
+            IReadOnlyList<OutputColumn> other)
+        {
+            var sawColumn = false;
+            return Visit(expression) && sawColumn;
+
+            bool Visit(Expression candidate)
+            {
+                switch (candidate)
+                {
+                    case LiteralExpression or ParameterExpression:
+                        return true;
+                    case ColumnExpression column:
+                        sawColumn = true;
+                        return ResolveJoinSideColumn(column, owner) is not null
+                            && ResolveJoinSideColumn(column, other) is null;
+                    case CollationExpression collation:
+                        return Visit(collation.Expression);
+                    case CastExpression cast:
+                        return Visit(cast.Expression);
+                    case UnaryExpression unary:
+                        return Visit(unary.Operand);
+                    case BinaryExpression binary:
+                        return Visit(binary.Left) && Visit(binary.Right);
+                    case FunctionExpression function
+                        when function.Filter is null
+                            && function.Window is null
+                            && !IsRegisteredScalarFunction(function.Name, function.Arguments.Count)
+                            && IndexExpressionSemantics.IsDeterministicBuiltin(function):
+                        return function.Arguments.All(Visit);
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        bool IsNumericJoinHashExpression(
+            Expression expression,
+            TableSource side,
+            IReadOnlyList<OutputColumn> columns)
+        {
+            while (expression is CollationExpression collation)
+            {
+                if (!string.Equals(collation.Name, "BINARY", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                expression = collation.Expression;
+            }
+
+            if (expression is BinaryExpression binary
+                && TryMapArithmeticOperator(binary.Operator, out _))
+            {
+                return true;
+            }
+            if (expression is UnaryExpression unary
+                && TryMapArithmeticOperator(unary.Operator, out _))
+            {
+                return true;
+            }
+            if (expression is not ColumnExpression column
+                || ResolveJoinSideColumn(column, columns) is not { } output)
+            {
+                return false;
+            }
+
+            return EmbeddedTable.IsRowidAliasName(output.Name)
+                || IsNumericAffinity(GetJoinKeyAffinity(GetOutputColumnDefinition(side, output, context)));
+        }
     }
 
     private EquiJoinKey? TryCreateEquiJoinKey(
@@ -33106,20 +33376,33 @@ out bool hasReturning)
         bool RightConvertsNumericToText,
         string Collation);
 
+    private sealed record EvaluatorJoinHashKey(
+        Func<SourceRow, SqlValue> LeftValue,
+        Func<SourceRow, SqlValue> RightValue,
+        bool LeftConvertsTextToNumeric,
+        bool LeftConvertsNumericToText,
+        bool RightConvertsTextToNumeric,
+        bool RightConvertsNumericToText,
+        string Collation);
+
     // Pre-filters equi-join candidates by hashing the right side on normalized key values.
     // Keys are canonicalized so that any pair comparing equal (after comparison affinities and
     // collation) lands in the same bucket; candidates still run the full join condition.
     private sealed class EquiJoinHashIndex
     {
         private static readonly IReadOnlyList<int> NoCandidates = [];
-        private readonly IReadOnlyList<EquiJoinKey> _keys;
+        private readonly IReadOnlyList<EvaluatorJoinHashKey> _keys;
         private readonly Dictionary<string, List<int>> _buckets = new(StringComparer.Ordinal);
 
-        public EquiJoinHashIndex(IReadOnlyList<EquiJoinKey> keys, SourceData right)
+        public EquiJoinHashIndex(
+            IReadOnlyList<EvaluatorJoinHashKey> keys,
+            SourceData right,
+            QueryContext context)
         {
             _keys = keys;
             for (var index = 0; index < right.Rows.Count; index++)
             {
+                context.CheckInterrupt();
                 var key = BuildKey(right.Rows[index], leftSide: false);
                 if (key is null)
                     continue;
@@ -33146,7 +33429,7 @@ out bool hasReturning)
             string? key = null;
             foreach (var equiKey in _keys)
             {
-                var value = GetOutputValue(row, leftSide ? equiKey.LeftColumn : equiKey.RightColumn);
+                var value = leftSide ? equiKey.LeftValue(row) : equiKey.RightValue(row);
                 var segment = CanonicalizeJoinKeyValue(
                     value,
                     leftSide ? equiKey.LeftConvertsTextToNumeric : equiKey.RightConvertsTextToNumeric,

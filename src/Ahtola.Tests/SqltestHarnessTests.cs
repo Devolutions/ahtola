@@ -215,7 +215,7 @@ public class SqltestHarnessTests
     }
 
     [Test]
-    public void UnboundedPlannerGapIsReportedAsAnExplicitHarnessLimitation()
+    public void FourWayJoinIsRunnableAfterCancellationBecameBounded()
     {
         var file = Parse(
             """
@@ -227,8 +227,8 @@ public class SqltestHarnessTests
 
         var classification = SqltestCorpus.Classify(file, file.Tests.Single());
 
-        classification.Status.Should().Be(SqltestCaseStatus.UnsupportedHarness);
-        classification.Reason.Should().Contain("cannot be bounded in-process");
+        classification.Status.Should().Be(SqltestCaseStatus.Runnable);
+        classification.Reason.Should().BeNull();
     }
 
     private static SqltestFile Parse(string source, string relativePath = "focused.sqltest")

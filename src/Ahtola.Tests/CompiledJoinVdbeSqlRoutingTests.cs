@@ -259,6 +259,30 @@ public class CompiledJoinVdbeSqlRoutingTests
     }
 
     [Test]
+    public void ArithmeticEqualityJoinUsesACompiledHashProbe()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE l(id INTEGER);");
+        Execute(connection, "CREATE TABLE r(id INTEGER);");
+        Execute(connection, "INSERT INTO l VALUES (2), (3), (9);");
+        Execute(connection, "INSERT INTO r VALUES (1), (2), (7);");
+
+        var rows = ReadRows(
+            connection,
+            "SELECT l.id, r.id FROM l JOIN r ON l.id = r.id + 1 ORDER BY l.id;");
+        rows.Should().HaveCount(2);
+        rows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(1));
+        rows[1].Should().Equal(SqlValue.Integer(3), SqlValue.Integer(2));
+
+        var explain = ReadRows(
+            connection,
+            "EXPLAIN SELECT l.id, r.id FROM l JOIN r ON l.id = r.id + 1;");
+        explain.Select(row => row[1].AsText()).Should().Contain("OpenJoinCursor");
+        explain.Select(row => row[6].AsText())
+            .Should().Contain(comment => comment.Contains("equijoin hash-build", StringComparison.Ordinal));
+    }
+
+    [Test]
     public void ParametersRebindAcrossResetOnCompiledJoin()
     {
         using var connection = new EmbeddedDatabase().Connect();
@@ -420,7 +444,7 @@ public class CompiledJoinVdbeSqlRoutingTests
     }
 
     [Test]
-    public void UnsafeOrderCallbackAndCancelableExecutionStayOnEvaluator()
+    public void UnsafeCallbacksAndCancelableExecutionStayOnEvaluator()
     {
         var database = new EmbeddedDatabase();
         database.RegisterScalarFunction("order_mark", 1, values => values[0]);
@@ -467,6 +491,57 @@ public class CompiledJoinVdbeSqlRoutingTests
         query.Reset();
         query.Step().Should().Be(StatementStepResult.Row);
         query.GetValue(0).Should().Be(SqlValue.Integer(2));
+    }
+
+    [Test]
+    public void CancelableEvaluatorJoinStopsAfterCallbackCancels()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction("cancel_probe", 2, _ =>
+        {
+            cancellation.Cancel();
+            return SqlValue.Integer(0);
+        });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE l(id INTEGER);");
+        Execute(connection, "CREATE TABLE r(id INTEGER);");
+        Execute(connection, "INSERT INTO l VALUES (1), (2);");
+        Execute(connection, "INSERT INTO r VALUES (1), (2);");
+
+        ReadRows(
+                connection,
+                "EXPLAIN QUERY PLAN SELECT l.id FROM l JOIN r ON cancel_probe(l.id, r.id);")
+            .Should().ContainSingle().Which[3]
+            .Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+
+        using var query = connection.Prepare(
+            "SELECT l.id FROM l JOIN r ON cancel_probe(l.id, r.id);");
+        Assert.Throws<OperationCanceledException>(() => query.Step(cancellation.Token));
+    }
+
+    [Test]
+    public void RegisteredArithmeticJoinCallbackIsEvaluatedForEveryCandidatePair()
+    {
+        var calls = 0;
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction("identity_mark", 1, values =>
+        {
+            calls++;
+            return values[0];
+        });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE l(id INTEGER);");
+        Execute(connection, "CREATE TABLE r(id INTEGER);");
+        Execute(connection, "INSERT INTO l VALUES (1), (2), (3);");
+        Execute(connection, "INSERT INTO r VALUES (1), (2), (3);");
+
+        var rows = ReadRows(
+            connection,
+            "SELECT l.id, r.id FROM l JOIN r ON l.id = identity_mark(r.id) + 0;");
+
+        rows.Should().HaveCount(3);
+        calls.Should().Be(9, "registered callbacks must not be cached into an evaluator hash key");
     }
 
     [Test]
