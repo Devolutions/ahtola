@@ -724,7 +724,7 @@ public class JoinSqlRoutingTests
     }
 
     [Test]
-    public void BoundedComputedPredicatesRemainOnEvaluator()
+    public void BoundedComputedPredicatesRouteThroughVdbe()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
@@ -742,8 +742,9 @@ public class JoinSqlRoutingTests
                 connection,
                 "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;")
             .Should().ContainSingle();
-        // Computed ON/WHERE expressions can fail or invoke user code while SQLite is still
-        // traversing the join, so the materializing cursor does not claim their callback order.
+        // Deterministic arithmetic operands are evaluated inside the compiled join. The source
+        // may consume the bound directly, so a separate LimitGate is not required.
+        // Registered callbacks remain on the evaluator path.
         foreach (var sql in new[]
         {
             "EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id + 0 = o.user_id LIMIT 1;",
@@ -751,7 +752,7 @@ public class JoinSqlRoutingTests
             "EXPLAIN SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;",
         })
         {
-            Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, sql));
+            Opcodes(ReadRows(connection, sql)).Should().Contain("OpenJoinCursor");
         }
     }
 
