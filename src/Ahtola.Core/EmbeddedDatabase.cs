@@ -24533,6 +24533,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (table.IsAutoIncrement && statement.Rows.Count > 1)
             return false;
 
+        var beforeInsertTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.Before,
+            TriggerEvent.Insert);
+        var afterInsertTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.After,
+            TriggerEvent.Insert);
+        if (beforeInsertTriggers.Count != 0 || afterInsertTriggers.Count != 0)
+        {
+            return TryCompileAfterInsertTriggerPrograms(
+                statement,
+                parameters,
+                context,
+                table,
+                beforeInsertTriggers,
+                afterInsertTriggers,
+                out compiled);
+        }
+
         if (!TryCompileReturningClause(
                 statement.Returning,
                 table,

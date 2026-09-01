@@ -281,7 +281,7 @@ public class VdbeProgramTests
 
         p1.Should().Be(2);
         p2.Should().Be(0);
-        p3.Should().Be(0);
+        p3.Should().Be(2);
         p4.Should().Be("subprogram");
         comment.Should().Be("invoke subprogram with r[2, 4]");
     }

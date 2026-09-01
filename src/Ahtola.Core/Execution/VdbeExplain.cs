@@ -605,9 +605,9 @@ public static class VdbeExplain
                     ? $"update current row of cursor {update.Cursor.Index}"
                     : $"update current row of cursor {update.Cursor.Index} flags={update.Flags}"),
             ProgramInstruction program => (
-                program.ParameterRegisters.Count,
+                program.ParameterRegisters.Count == 0 ? 0 : program.ParameterRegisters[0].Index,
                 program.IgnoreJumpTarget?.Offset ?? 0,
-                0,
+                program.ParameterRegisters.Count,
                 "subprogram",
                 $"invoke subprogram with {FormatRegisters(program.ParameterRegisters)}"
                     + (program.IgnoreJumpTarget is { } ignoreJumpTarget

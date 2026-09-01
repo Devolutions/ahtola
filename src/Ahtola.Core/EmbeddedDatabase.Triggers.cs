@@ -1,3 +1,5 @@
+using Ahtola.Core.Compilation;
+using Ahtola.Core.Execution;
 using Ahtola.Core.Parsing;
 
 namespace Ahtola.Core;
@@ -136,96 +138,107 @@ public sealed partial class EmbeddedDatabase
     {
         foreach (var trigger in triggers)
         {
-            var identity = GetTriggerIdentity(trigger);
-            if (!context.RecursiveTriggersEnabled
-                && context.ActiveTriggers?.Contains(identity) == true)
-            {
-                continue;
-            }
-            if (context.TriggerDepth >= MaximumTriggerDepth)
-            {
-                throw new EmbeddedTriggerDepthException(
-                    context.TriggerState?.LiveLastInsertRowId ?? context.LastInsertRowId);
-            }
-
-            var activeTriggers = context.ActiveTriggers is null
-                ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                : new HashSet<string>(context.ActiveTriggers, StringComparer.OrdinalIgnoreCase);
-            activeTriggers.Add(identity);
-            var state = context.TriggerState
-                ?? throw new InvalidOperationException("Row trigger execution lost its statement state.");
-            var savedLastInsertRowId = state.LiveLastInsertRowId;
-            // The connection-level changes() value is saved when a trigger fires and restored
-            // when the trigger returns. Trigger-body statements temporarily replace it (see the
-            // flush below), mirroring Turso's saved_changes_value around a trigger subprogram.
-            var savedChanges = _changes;
-            var triggerContext = context with
-            {
-                CommonTableExpressions = new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
-                InsideTrigger = true,
-                ActiveTriggers = activeTriggers,
-                TriggerDepth = context.TriggerDepth + 1,
-                TriggerRow = frame,
-            };
-
             try
             {
-                if (trigger.When is not null
-                    && !IsTrue(Evaluate(trigger.When, EmptyParameters, row: null, triggerContext)))
-                {
-                    continue;
-                }
-
-                foreach (var bodyStatement in trigger.Body)
-                {
-                    var localStatement = LocalizeTriggerBodyStatement(context, trigger, bodyStatement);
-                    if (localStatement is not null)
-                        EnsureConcurrentMvccDmlTargetIsSupported(localStatement, triggerContext.Tables, triggerContext);
-                    var result = localStatement is null
-                        ? context.TempTriggers!.ExecuteForeign(bodyStatement, triggerContext)
-                        : localStatement switch
-                        {
-                            InsertStatement insert => ExecuteInsert(insert, EmptyParameters, triggerContext),
-                            UpdateStatement update => ExecuteUpdate(update, EmptyParameters, triggerContext),
-                            DeleteStatement delete => ExecuteDelete(delete, EmptyParameters, triggerContext),
-                            QueryStatement query => ExecuteQuery(query, EmptyParameters, triggerContext, outerRow: null),
-                            _ => throw new EmbeddedSqlException(
-                                $"unsupported trigger body statement {bodyStatement.GetType().Name}"),
-                        };
-                    state.Changed |= result.Changed;
-                    if (result.LastInsertRowId is { } insertedRowId)
-                        state.LiveLastInsertRowId = insertedRowId;
-                    // A trigger-body INSERT/UPDATE/DELETE replaces the changes() value visible to
-                    // subsequent body statements and counts toward total_changes(), per SQLite.
-                    if (bodyStatement is InsertStatement or UpdateStatement or DeleteStatement)
-                    {
-                        _changes = result.RowsAffected;
-                        _totalChanges += result.RowsAffected;
-                    }
-                }
-            }
-            catch (EmbeddedConflictFailException exception)
-            {
-                throw new EmbeddedConflictFailException(exception, savedLastInsertRowId);
-            }
-            catch (EmbeddedTriggerDepthException exception)
-            {
-                throw new EmbeddedTriggerDepthException(exception, savedLastInsertRowId);
+                FireRowTrigger(trigger, frame, context);
             }
             catch (TriggerIgnoreException)
             {
                 return true;
             }
-            finally
-            {
-                state.LiveLastInsertRowId = savedLastInsertRowId;
-                // Restore the caller's changes() value; total_changes() is intentionally not
-                // restored so trigger-body rows remain counted.
-                _changes = savedChanges;
-            }
         }
 
         return false;
+    }
+
+    private void FireRowTrigger(
+        TriggerDefinition trigger,
+        TriggerRowFrame frame,
+        QueryContext context)
+    {
+        var identity = GetTriggerIdentity(trigger);
+        if (!context.RecursiveTriggersEnabled
+            && context.ActiveTriggers?.Contains(identity) == true)
+        {
+            return;
+        }
+        if (context.TriggerDepth >= MaximumTriggerDepth)
+        {
+            throw new EmbeddedTriggerDepthException(
+                context.TriggerState?.LiveLastInsertRowId ?? context.LastInsertRowId);
+        }
+
+        var activeTriggers = context.ActiveTriggers is null
+            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(context.ActiveTriggers, StringComparer.OrdinalIgnoreCase);
+        activeTriggers.Add(identity);
+        var state = context.TriggerState
+            ?? throw new InvalidOperationException("Row trigger execution lost its statement state.");
+        var savedLastInsertRowId = state.LiveLastInsertRowId;
+        // The connection-level changes() value is saved when a trigger fires and restored
+        // when the trigger returns. Trigger-body statements temporarily replace it (see the
+        // flush below), mirroring Turso's saved_changes_value around a trigger subprogram.
+        var savedChanges = _changes;
+        var triggerContext = context with
+        {
+            CommonTableExpressions = new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
+            InsideTrigger = true,
+            ActiveTriggers = activeTriggers,
+            TriggerDepth = context.TriggerDepth + 1,
+            TriggerRow = frame,
+        };
+
+        try
+        {
+            if (trigger.When is not null
+                && !IsTrue(Evaluate(trigger.When, EmptyParameters, row: null, triggerContext)))
+            {
+                return;
+            }
+
+            foreach (var bodyStatement in trigger.Body)
+            {
+                var localStatement = LocalizeTriggerBodyStatement(context, trigger, bodyStatement);
+                if (localStatement is not null)
+                    EnsureConcurrentMvccDmlTargetIsSupported(localStatement, triggerContext.Tables, triggerContext);
+                var result = localStatement is null
+                    ? context.TempTriggers!.ExecuteForeign(bodyStatement, triggerContext)
+                    : localStatement switch
+                    {
+                        InsertStatement insert => ExecuteInsert(insert, EmptyParameters, triggerContext),
+                        UpdateStatement update => ExecuteUpdate(update, EmptyParameters, triggerContext),
+                        DeleteStatement delete => ExecuteDelete(delete, EmptyParameters, triggerContext),
+                        QueryStatement query => ExecuteQuery(query, EmptyParameters, triggerContext, outerRow: null),
+                        _ => throw new EmbeddedSqlException(
+                            $"unsupported trigger body statement {bodyStatement.GetType().Name}"),
+                    };
+                state.Changed |= result.Changed;
+                if (result.LastInsertRowId is { } insertedRowId)
+                    state.LiveLastInsertRowId = insertedRowId;
+                // A trigger-body INSERT/UPDATE/DELETE replaces the changes() value visible to
+                // subsequent body statements and counts toward total_changes(), per SQLite.
+                if (bodyStatement is InsertStatement or UpdateStatement or DeleteStatement)
+                {
+                    _changes = result.RowsAffected;
+                    _totalChanges += result.RowsAffected;
+                }
+            }
+        }
+        catch (EmbeddedConflictFailException exception)
+        {
+            throw new EmbeddedConflictFailException(exception, savedLastInsertRowId);
+        }
+        catch (EmbeddedTriggerDepthException exception)
+        {
+            throw new EmbeddedTriggerDepthException(exception, savedLastInsertRowId);
+        }
+        finally
+        {
+            state.LiveLastInsertRowId = savedLastInsertRowId;
+            // Restore the caller's changes() value; total_changes() is intentionally not
+            // restored so trigger-body rows remain counted.
+            _changes = savedChanges;
+        }
     }
 
     // Only a temp trigger can have a body statement that leaves the executing database, and only
@@ -475,6 +488,23 @@ public sealed partial class EmbeddedDatabase
                 TriggerEvent.Delete,
                 beforeDelete.Concat(afterDelete));
         }
+        if (TryCompileAfterInsertTriggerPrograms(
+                statement,
+                parameters,
+                context,
+                table,
+                beforeTriggers,
+                afterTriggers,
+                out var compiled))
+        {
+            return RunCompiledDml(
+                compiled,
+                columns: [],
+                hasReturning: false,
+                parameters,
+                context.VdbeExecutionOptions);
+        }
+
         var plan = PrepareInsert(statement, table, context);
         var sourceRows = statement.Source is null
             ? null
@@ -610,6 +640,133 @@ public sealed partial class EmbeddedDatabase
         {
             LastInsertRowId = lastInsertRowId,
         };
+    }
+
+    // Turso lowers each SQL trigger to an Insn::Program with sparse NEW/OLD parameter registers.
+    // This first managed route deliberately admits only ordinary AFTER INSERT rows: each trigger
+    // gets its own reentrant Program frame, while its established evaluator remains the subprogram
+    // leaf until individual trigger statements are lowerable without changing their error ordering.
+    private bool TryCompileAfterInsertTriggerPrograms(
+        InsertStatement statement,
+        SqlValue[] parameters,
+        QueryContext context,
+        EmbeddedTable table,
+        IReadOnlyList<TriggerDefinition> beforeTriggers,
+        IReadOnlyList<TriggerDefinition> afterTriggers,
+        out CompiledDml compiled)
+    {
+        compiled = null!;
+        if (!CanRouteInsertThroughCompiler(statement, context)
+            || context.InsideTrigger
+            || statement.Source is not null
+            || statement.Returning is not null
+            || context.CommonTableExpressions.Count != 0
+            || beforeTriggers.Count != 0
+            || afterTriggers.Count == 0
+            || afterTriggers.Any(static trigger => trigger.Temporary)
+            || table.IsAutoIncrement && statement.Rows.Count > 1)
+        {
+            return false;
+        }
+
+        var parameterCount = table.Columns.Length + 1;
+        var parameterRegisters = Enumerable.Range(0, parameterCount)
+            .Select(static index => new Register(index))
+            .ToArray();
+        var captureInstructions = new List<VdbeInstruction>(parameterCount + afterTriggers.Count);
+        for (var columnIndex = 0; columnIndex < table.Columns.Length; columnIndex++)
+        {
+            captureInstructions.Add(new ColumnInstruction(
+                new Cursor(0),
+                columnIndex,
+                parameterRegisters[columnIndex]));
+        }
+        captureInstructions.Add(new RowIdInstruction(new Cursor(0), parameterRegisters[^1]));
+
+        var ignoreTarget = new ProgramCounter(3 + parameterCount + afterTriggers.Count);
+        foreach (var trigger in afterTriggers)
+        {
+            var childInstructions = new List<VdbeInstruction>(parameterCount + 2);
+            for (var parameterIndex = 0; parameterIndex < parameterCount; parameterIndex++)
+            {
+                childInstructions.Add(new LoadParameterInstruction(
+                    parameterRegisters[parameterIndex],
+                    new ParameterSlot(parameterIndex)));
+            }
+
+            childInstructions.Add(new FunctionInstruction(
+                parameterRegisters[0],
+                new VdbeScalarFunction
+                {
+                    Name = $"trigger:{trigger.Name}",
+                    Arity = parameterCount,
+                    Invoke = values =>
+                    {
+                        var row = values[..table.Columns.Length];
+                        var rowId = values[^1].AsInteger();
+                        FireRowTrigger(
+                            trigger,
+                            new TriggerRowFrame(
+                                Old: null,
+                                New: CreateTriggerRowImage(table, row, rowId)),
+                            context);
+                        return SqlValue.Null;
+                    },
+                },
+                new RegisterRange(parameterRegisters[0], parameterCount)));
+            childInstructions.Add(new HaltInstruction());
+            var childProgram = new VdbeProgram(
+                parameterCount,
+                cursorCount: 0,
+                childInstructions,
+                parameterSlotCount: parameterCount);
+            captureInstructions.Add(new ProgramInstruction(
+                parameterRegisters,
+                new VdbeSubprogram(childProgram),
+                ignoreTarget));
+        }
+
+        var plan = PrepareInsert(statement, table, context);
+        IReadOnlyList<SqlValue>[]? inputRows = null;
+        long? lastInsertRowId = null;
+        var writeTarget = new VdbeWriteTarget
+        {
+            TableName = statement.TableName,
+            RowCount = statement.Rows.Count,
+            MutateRow = index =>
+            {
+                inputRows ??= statement.Rows.Select(row =>
+                    (IReadOnlyList<SqlValue>)row.Select(expression =>
+                        Evaluate(expression, parameters, row: null, context)).ToArray()).ToArray();
+                ResetInsertPlan(table, plan);
+                var (row, rowId) = BuildInsertRow(
+                    statement,
+                    table,
+                    plan,
+                    inputRows[index],
+                    parameters,
+                    context);
+                CommitInserts(context, statement.TableName, table, [row], [rowId]);
+                context.TriggerState!.Changed = true;
+                if (table.HasRowid)
+                {
+                    lastInsertRowId = rowId;
+                    context.TriggerState.LiveLastInsertRowId = rowId;
+                }
+                return new VdbeRowMutation(row, rowId);
+            },
+            Commit = () => lastInsertRowId,
+        };
+        var program = DmlStatementCompiler.BuildProgramWithMutationPrograms(
+            DmlKind.Insert,
+            statement.TableName,
+            table.Columns.Length,
+            filter: null,
+            beforeMutation: Array.Empty<VdbeInstruction>(),
+            afterMutation: captureInstructions,
+            registerCount: parameterCount);
+        compiled = new CompiledDml(program, [writeTarget]);
+        return true;
     }
 
     private ExecutionResult PerformRowTriggeredUpdate(
