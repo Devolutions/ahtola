@@ -56,11 +56,12 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 - 2026-09-01: began the next VDBE-depth wave with parent
   `ProgramInstruction` IGNORE control flow/shared transaction state, a narrow
   AFTER INSERT/UPDATE/DELETE trigger program route, bounded spillable
-  DISTINCT/compound keyed sets, page-native bounded record-column reads, and
-  `AggInverse` streaming for current-row and one-preceding COUNT/SUM/AVG
-  windows. Trigger-body lowering, the remaining heap-bound intermediates,
-  broader inverse frames, and page-native incremental-BLOB adapter/writes
-  remain explicit follow-up depth.
+  DISTINCT/compound keyed sets, page-native bounded record-column reads,
+  read-only file-backed incremental-BLOB handles over pinned pager/transaction
+  views, and `AggInverse` streaming for current-row and one-preceding
+  COUNT/SUM/AVG windows. Trigger-body lowering, the remaining heap-bound
+  intermediates, broader inverse frames, page-native incremental-BLOB writes,
+  and dedicated Blob VDBE opcodes remain explicit follow-up depth.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
