@@ -70,7 +70,7 @@ public class KeyedRowSetSpillExecutionTests
         var metrics = new VdbeExecutionMetrics();
         using var statement = ResumableStatement.CreateWithExecutionOptions(
             compound.Program,
-            Options(fileSystem, metrics, memoryLimitBytes: 8192),
+            Options(fileSystem, metrics, memoryLimitBytes: (SpillInfrastructureBytes * 4) + 8192),
             compound.CursorSources);
 
         var rows = Drain(statement);
@@ -204,6 +204,48 @@ public class KeyedRowSetSpillExecutionTests
         fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
     }
 
+    [Test]
+    public void SpilledLookupAndIterationReadEachRequestedSlotDirectly()
+    {
+        const int rowCount = 80;
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = Options(fileSystem, metrics, SpillInfrastructureBytes + 512);
+        var memory = new VdbeExecutionMemory(options.MemoryLimitBytes, metrics);
+
+        using (var store = new VdbeKeyedRowStore(options, memory))
+        {
+            for (var value = 0; value < rowCount; value++)
+            {
+                store.TryInsert(
+                    [SqlValue.Integer(value)],
+                    ByteExactRows,
+                    replaceExisting: false,
+                    default).Should().BeTrue();
+            }
+
+            store.IsSpilled.Should().BeTrue();
+            store.Rewind(default).Should().BeTrue();
+            var actual = new List<long>(rowCount);
+            do
+            {
+                actual.Add(store.Current()[0].AsInteger());
+            }
+            while (store.MoveNext(default));
+
+            actual.Should().Equal(Enumerable.Range(0, rowCount).Select(static value => (long)value));
+        }
+
+        // Each requested slot needs seven fixed-position reads: two file headers, the offset,
+        // record length, slot, value tag, and integer payload. The upper bound assumes spilling
+        // before the first insert; buffering some prefix only reduces the number of requests.
+        var maximumSlotRequests = checked((long)rowCount * (rowCount + 1) / 2);
+        fileSystem.ReadCalls.Should().BeLessThanOrEqualTo(checked(maximumSlotRequests * 7));
+        metrics.ActiveSpillFiles.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
     private static long SpillInfrastructureBytes =>
         VdbeManagedFootprint.EstimateKeyedRowSetSpillInfrastructure(TemporaryDirectory);
 
@@ -309,6 +351,8 @@ public class KeyedRowSetSpillExecutionTests
 
         public List<string> Deleted { get; } = [];
 
+        public long ReadCalls { get; private set; }
+
         public bool FileExists(string path) => _inner.FileExists(path);
 
         public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
@@ -316,13 +360,35 @@ public class KeyedRowSetSpillExecutionTests
             var file = _inner.OpenFile(path, mode, readOnly);
             if (mode == FileOpenMode.CreateNew)
                 Created.Add(path);
-            return file;
+            return new TrackingFile(this, file);
         }
 
         public void DeleteFile(string path)
         {
             Deleted.Add(path);
             _inner.DeleteFile(path);
+        }
+
+        private sealed class TrackingFile(TrackingFileSystem owner, IFile inner) : IFile
+        {
+            public long Length => inner.Length;
+
+            public bool IsReadOnly => inner.IsReadOnly;
+
+            public int Read(long position, Span<byte> destination)
+            {
+                owner.ReadCalls++;
+                return inner.Read(position, destination);
+            }
+
+            public void Write(long position, ReadOnlySpan<byte> source) =>
+                inner.Write(position, source);
+
+            public void SetLength(long length) => inner.SetLength(length);
+
+            public void FlushToDisk() => inner.FlushToDisk();
+
+            public void Dispose() => inner.Dispose();
         }
     }
 }

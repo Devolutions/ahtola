@@ -11,6 +11,7 @@ internal enum VdbeSpillFileKind : byte
     HashBuildOrder = 3,
     HashMatchMap = 4,
     KeyedRowSet = 5,
+    KeyedRowSetIndex = 6,
 }
 
 internal sealed class VdbeTemporaryFile : IDisposable

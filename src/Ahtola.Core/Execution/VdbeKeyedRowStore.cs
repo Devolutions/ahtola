@@ -5,7 +5,8 @@ namespace Ahtola.Core.Execution;
 /// <summary>
 /// Statement-local insertion-ordered row set that spills through the shared execution-memory budget.
 /// Equality remains caller-defined so SQLite affinity, collation, and NULL semantics stay with the
-/// compiler-supplied <see cref="VdbeRowEquality"/>.
+/// compiler-supplied <see cref="VdbeRowEquality"/>. A fixed-width spill sidecar maps each logical slot
+/// to its latest append-log record so replacements and iteration use bounded direct reads.
 /// </summary>
 internal sealed class VdbeKeyedRowStore : IDisposable
 {
@@ -13,6 +14,7 @@ internal sealed class VdbeKeyedRowStore : IDisposable
     private readonly VdbeExecutionMemory _memory;
     private readonly List<SqlValue[]> _rows = [];
     private VdbeTemporaryFile? _temporaryFile;
+    private VdbeTemporaryFile? _indexFile;
     private VdbeMemoryReservation? _spillInfrastructure;
     private ReadLease? _current;
     private long _writePosition;
@@ -190,6 +192,16 @@ internal sealed class VdbeKeyedRowStore : IDisposable
 
             try
             {
+                _indexFile?.Dispose();
+                _indexFile = null;
+            }
+            catch (Exception exception)
+            {
+                (failures ??= []).Add(exception);
+            }
+
+            try
+            {
                 _temporaryFile?.Dispose();
                 _temporaryFile = null;
             }
@@ -329,15 +341,23 @@ internal sealed class VdbeKeyedRowStore : IDisposable
         VdbeMemoryReservation? infrastructure =
             VdbeMemoryReservation.Create(_memory, SpillInfrastructureBytes());
         VdbeTemporaryFile? temporaryFile = null;
+        VdbeTemporaryFile? indexFile = null;
         try
         {
             temporaryFile = VdbeTemporaryFile.Create(_options, "keyed-row-set");
+            indexFile = VdbeTemporaryFile.Create(_options, "keyed-row-index");
             _writePosition = VdbeSpillRecordCodec.InitializeFile(
                 temporaryFile.File,
                 VdbeSpillFileKind.KeyedRowSet,
                 _options.Metrics);
+            VdbeSpillRecordCodec.InitializeFile(
+                indexFile.File,
+                VdbeSpillFileKind.KeyedRowSetIndex,
+                _options.Metrics);
             _temporaryFile = temporaryFile;
             temporaryFile = null;
+            _indexFile = indexFile;
+            indexFile = null;
             _spillInfrastructure = infrastructure;
             infrastructure = null;
 
@@ -356,6 +376,7 @@ internal sealed class VdbeKeyedRowStore : IDisposable
         }
         finally
         {
+            indexFile?.Dispose();
             temporaryFile?.Dispose();
             infrastructure?.Dispose();
         }
@@ -381,6 +402,8 @@ internal sealed class VdbeKeyedRowStore : IDisposable
     {
         var file = _temporaryFile?.File
             ?? throw new InvalidOperationException("Keyed row set has no spill file.");
+        var index = _indexFile?.File
+            ?? throw new InvalidOperationException("Keyed row set has no spill index.");
         var recordStart = VdbeSpillRecordCodec.BeginRecord(ref _writePosition);
         VdbeSpillRecordCodec.WriteInt32(file, ref _writePosition, slot, _options.Metrics);
         VdbeSpillRecordCodec.WriteValues(file, ref _writePosition, row, _options.Metrics);
@@ -389,63 +412,75 @@ internal sealed class VdbeKeyedRowStore : IDisposable
             recordStart,
             _writePosition,
             _options.Metrics);
+        var indexPosition = checked(
+            (long)VdbeSpillRecordCodec.FileHeaderSize
+            + ((long)slot * sizeof(long)));
+        VdbeSpillRecordCodec.WriteInt64(
+            index,
+            ref indexPosition,
+            recordStart,
+            _options.Metrics);
     }
 
     private ReadLease ReadSpilledSlot(int targetSlot, CancellationToken cancellationToken)
     {
         var file = _temporaryFile?.File
             ?? throw new InvalidOperationException("Keyed row set has no spill file.");
+        var index = _indexFile?.File
+            ?? throw new InvalidOperationException("Keyed row set has no spill index.");
+        cancellationToken.ThrowIfCancellationRequested();
+        VdbeSpillRecordCodec.ValidateFile(
+            index,
+            VdbeSpillFileKind.KeyedRowSetIndex,
+            _options.Metrics);
+        var indexPosition = checked(
+            (long)VdbeSpillRecordCodec.FileHeaderSize
+            + ((long)targetSlot * sizeof(long)));
+        var recordStart = VdbeSpillRecordCodec.ReadInt64(
+            index,
+            ref indexPosition,
+            _options.Metrics);
         VdbeSpillRecordCodec.ValidateFile(
             file,
             VdbeSpillFileKind.KeyedRowSet,
             _options.Metrics);
-        var position = (long)VdbeSpillRecordCodec.FileHeaderSize;
-        ReadLease? found = null;
+        if (recordStart < VdbeSpillRecordCodec.FileHeaderSize || recordStart >= file.Length)
+        {
+            throw new InvalidDataException(
+                $"Keyed row set spill index points slot {targetSlot} outside the data file.");
+        }
+
+        var position = recordStart;
+        var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(
+            file,
+            ref position,
+            _options.Metrics);
+        var slot = VdbeSpillRecordCodec.ReadInt32(
+            file,
+            ref position,
+            _options.Metrics);
+        if (slot != targetSlot)
+        {
+            throw new InvalidDataException(
+                $"Keyed row set spill index maps slot {targetSlot} to record {slot}.");
+        }
+
+        var found = ReadLease.Read(
+            file,
+            ref position,
+            _columnCount,
+            recordEnd,
+            _options.Metrics,
+            _memory,
+            cancellationToken);
         try
         {
-            while (position < file.Length)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(
-                    file,
-                    ref position,
-                    _options.Metrics);
-                var slot = VdbeSpillRecordCodec.ReadInt32(
-                    file,
-                    ref position,
-                    _options.Metrics);
-                if (slot == targetSlot)
-                {
-                    found?.Dispose();
-                    found = null;
-                    found = ReadLease.Read(
-                        file,
-                        ref position,
-                        _columnCount,
-                        recordEnd,
-                        _options.Metrics,
-                        _memory,
-                        cancellationToken);
-                }
-                else
-                {
-                    VdbeSpillRecordCodec.SkipValues(
-                        file,
-                        ref position,
-                        _columnCount,
-                        recordEnd,
-                        _options.Metrics,
-                        cancellationToken);
-                }
-                VdbeSpillRecordCodec.RequireRecordEnd(position, recordEnd);
-            }
-
-            return found
-                ?? throw new InvalidDataException($"Keyed row set spill is missing slot {targetSlot}.");
+            VdbeSpillRecordCodec.RequireRecordEnd(position, recordEnd);
+            return found;
         }
         catch
         {
-            found?.Dispose();
+            found.Dispose();
             throw;
         }
     }

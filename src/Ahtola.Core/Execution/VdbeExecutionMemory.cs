@@ -245,7 +245,7 @@ internal static class VdbeManagedFootprint
     private const long RunDescriptorSlotBytes = 32;
     private const long SorterSpillObjectBytes = 96;
     private const long HashSpillObjectBytes = 96;
-    private const long KeyedRowSetSpillObjectBytes = 96;
+    private const long KeyedRowSetSpillObjectBytes = 104;
     private const long HashPartitionObjectBytes = 32;
     private const long TemporaryFileObjectBytes = 64;
     private const long TemporaryFileWrapperBytes = 128;
@@ -398,7 +398,10 @@ internal static class VdbeManagedFootprint
             KeyedRowSetSpillObjectBytes
             + EstimateTemporaryFileInfrastructure(
                 temporaryDirectory.Length,
-                "keyed-row-set".Length));
+                "keyed-row-set".Length)
+            + EstimateTemporaryFileInfrastructure(
+                temporaryDirectory.Length,
+                "keyed-row-index".Length));
     }
 
     public static int GetListCapacityForCount(int currentCapacity, int requiredCount)
