@@ -181,6 +181,303 @@ public sealed class ManagedIncrementalBlobDatabaseBoundaryTests
     }
 
     [Test]
+    public void CoreReadOnlyBlobStreamsOverflowRangesWithoutValueSizedOpenAllocation()
+    {
+        const int payloadLength = 1024 * 1024;
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("blob-page-native-read.db", fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        var payload = Enumerable.Range(0, payloadLength)
+            .Select(static index => unchecked((byte)(index * 31)))
+            .ToArray();
+        Execute(connection, "CREATE TABLE data(value BLOB);");
+        ExecuteBound(
+            connection,
+            "INSERT INTO data(rowid, value) VALUES (1, $value);",
+            SqlValue.Blob(payload));
+        Execute(connection, "INSERT INTO data(rowid, value) VALUES (2, X'01');");
+
+        using (var warmup = connection.OpenBlob("main", "data", "value", 2, readOnly: true))
+        {
+            Span<byte> one = stackalloc byte[1];
+            warmup.Read(0, one).Should().Be(1);
+        }
+
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        using var blob = connection.OpenBlob("main", "data", "value", 1, readOnly: true);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        Span<byte> actual = stackalloc byte[96];
+
+        blob.Length.Should().Be(payloadLength);
+        blob.Read(4070, actual).Should().Be(actual.Length);
+        actual.ToArray().Should().Equal(payload.AsSpan(4070, actual.Length).ToArray());
+        allocated.Should().BeLessThan(
+            payloadLength / 4,
+            "opening a page-native handle must not snapshot or copy the complete BLOB");
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void CoreReadOnlyBlobUsesTransactionVisibleRowsWithoutCopyingTheBlob(bool concurrent)
+    {
+        const int payloadLength = 64 * 1024;
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile(
+            concurrent ? "blob-page-native-mvcc.db" : "blob-page-native-classic.db",
+            fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        var baseline = Enumerable.Repeat((byte)0x11, payloadLength).ToArray();
+        var updated = Enumerable.Range(0, payloadLength)
+            .Select(static index => unchecked((byte)(index * 13)))
+            .ToArray();
+        Execute(connection, "CREATE TABLE data(value BLOB);");
+        ExecuteBound(
+            connection,
+            "INSERT INTO data(rowid, value) VALUES (1, $value);",
+            SqlValue.Blob(baseline));
+        if (concurrent)
+            Execute(connection, "PRAGMA journal_mode = mvcc;");
+        Execute(connection, concurrent ? "BEGIN CONCURRENT;" : "BEGIN;");
+
+        try
+        {
+            using (var baseBlob = connection.OpenBlob("main", "data", "value", 1, readOnly: true))
+            {
+                Span<byte> actual = stackalloc byte[32];
+                baseBlob.Read(4090, actual).Should().Be(actual.Length);
+                actual.ToArray().Should().Equal(baseline.AsSpan(4090, actual.Length).ToArray());
+            }
+
+            ExecuteBound(
+                connection,
+                "UPDATE data SET value = $value WHERE rowid = 1;",
+                SqlValue.Blob(updated));
+            var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+            using var overlayBlob = connection.OpenBlob("main", "data", "value", 1, readOnly: true);
+            var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+            Span<byte> overlayActual = stackalloc byte[48];
+
+            overlayBlob.Read(8180, overlayActual).Should().Be(overlayActual.Length);
+            overlayActual.ToArray().Should().Equal(updated.AsSpan(8180, overlayActual.Length).ToArray());
+            allocated.Should().BeLessThan(
+                payloadLength / 2,
+                "transaction overlays already own an immutable SqlValue and need no full-value snapshot");
+        }
+        finally
+        {
+            Execute(connection, "ROLLBACK;");
+        }
+    }
+
+    [Test]
+    public void CoreReadOnlyBlobMapsLogicalColumnsPastVirtualGeneratedColumns()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("blob-page-native-generated.db", fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        Execute(
+            connection,
+            "CREATE TABLE data(prefix BLOB, computed BLOB GENERATED ALWAYS AS (X'AA') VIRTUAL, value BLOB);"
+            + "INSERT INTO data(rowid, prefix, value) VALUES (1, X'0102', X'030405');");
+
+        using var blob = connection.OpenBlob("main", "data", "value", 1, readOnly: true);
+        Span<byte> actual = stackalloc byte[3];
+
+        blob.Read(0, actual).Should().Be(3);
+        actual.ToArray().Should().Equal(3, 4, 5);
+        Assert.Throws<ManagedBlobException>(() =>
+            connection.OpenBlob("main", "data", "computed", 1, readOnly: true))!.Message
+            .Should().Be("cannot open generated column: computed");
+    }
+
+    [Test]
+    public void CorePageNativeReadOnlyBlobExpiresOnlyWhenItsOwnRowChanges()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("blob-page-native-expiry.db", fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        Execute(
+            connection,
+            "CREATE TABLE data(value BLOB, revision INTEGER);"
+            + "INSERT INTO data(rowid, value, revision) VALUES (1, X'0102', 0);"
+            + "INSERT INTO data(rowid, value, revision) VALUES (2, X'0304', 0);");
+        using var blob = connection.OpenBlob("main", "data", "value", 1, readOnly: true);
+
+        Execute(connection, "UPDATE data SET revision = 1 WHERE rowid = 2;");
+        Span<byte> actual = stackalloc byte[2];
+        blob.Read(0, actual).Should().Be(2);
+        actual.ToArray().Should().Equal(1, 2);
+
+        Execute(connection, "UPDATE data SET revision = 1 WHERE rowid = 1;");
+        var expired = Assert.Throws<ManagedBlobException>(() => blob.Read(0, new byte[1]));
+        expired!.ErrorCode.Should().Be(4);
+    }
+
+    [Test]
+    public void CorePageNativeReadOnlyBlobSurvivesPeerCatalogRefresh()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("blob-page-native-refresh.db", fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        Execute(
+            connection,
+            "CREATE TABLE data(value BLOB);"
+            + "INSERT INTO data(rowid, value) VALUES (1, X'0102');"
+            + "INSERT INTO data(rowid, value) VALUES (2, X'0304');");
+        using var blob = connection.OpenBlob("main", "data", "value", 1, readOnly: true);
+
+        using (var peerDatabase = EmbeddedDatabase.OpenFile("blob-page-native-refresh.db", fileSystem))
+        using (var peer = peerDatabase.Connect())
+        using (var peerAdapter = ManagedDatabaseAdapter.FromConnection(peer))
+            Execute(peerAdapter.Connection, "UPDATE data SET value = X'0506' WHERE rowid = 2;");
+
+        ReadBlob(connection, "SELECT value FROM data WHERE rowid = 2;").Should().Equal(5, 6);
+        Span<byte> actual = stackalloc byte[2];
+        blob.Read(0, actual).Should().Be(2);
+        actual.ToArray().Should().Equal(1, 2);
+    }
+
+    [Test]
+    public void CorePageNativeReadOnlyBlobOpenAdoptsPeerCatalogChanges()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("blob-page-native-open-refresh.db", fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        Execute(
+            connection,
+            "CREATE TABLE data(value BLOB);"
+            + "INSERT INTO data(rowid, value) VALUES (1, X'0102');");
+
+        using (var peerDatabase = EmbeddedDatabase.OpenFile("blob-page-native-open-refresh.db", fileSystem))
+        using (var peer = peerDatabase.Connect())
+        using (var peerAdapter = ManagedDatabaseAdapter.FromConnection(peer))
+            Execute(peerAdapter.Connection, "INSERT INTO data(rowid, value) VALUES (2, X'030405');");
+
+        using (var blob = connection.OpenBlob("main", "data", "value", 2, readOnly: true))
+        {
+            Span<byte> actual = stackalloc byte[3];
+            blob.Read(0, actual).Should().Be(3);
+            actual.ToArray().Should().Equal(3, 4, 5);
+        }
+
+        using (var peerDatabase = EmbeddedDatabase.OpenFile("blob-page-native-open-refresh.db", fileSystem))
+        using (var peer = peerDatabase.Connect())
+        using (var peerAdapter = ManagedDatabaseAdapter.FromConnection(peer))
+            Execute(peerAdapter.Connection, "DROP TABLE data;");
+
+        Assert.Throws<ManagedBlobException>(() =>
+            connection.OpenBlob("main", "data", "value", 1, readOnly: true))!.Message
+            .Should().Be("no such table: data");
+    }
+
+    [Test]
+    public void CorePageNativeReadOnlyBlobRejectsTransactionLocalSchemaChanges()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("blob-page-native-schema-change.db", fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        Execute(
+            connection,
+            "CREATE TABLE data(prefix BLOB, value BLOB);"
+            + "INSERT INTO data(rowid, prefix, value) VALUES (1, X'01', X'020304');");
+        using var existingBlob = connection.OpenBlob("main", "data", "value", 1, readOnly: true);
+        Execute(connection, "BEGIN; ALTER TABLE data DROP COLUMN prefix;");
+
+        try
+        {
+            Assert.Throws<ManagedBlobException>(() => existingBlob.Read(0, new byte[1]))!.ErrorCode
+                .Should().Be(4);
+            Assert.Throws<ManagedBlobException>(() =>
+                connection.OpenBlob("main", "data", "value", 1, readOnly: true))!.Message
+                .Should().Contain("unavailable after schema changes");
+        }
+        finally
+        {
+            Execute(connection, "ROLLBACK;");
+        }
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void CorePageNativeReadOnlyBlobExpiresWhenSavepointRollbackRewindsItsValue(bool concurrent)
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile(
+            concurrent ? "blob-page-native-rollback-mvcc.db" : "blob-page-native-rollback-classic.db",
+            fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        Execute(
+            connection,
+            "CREATE TABLE data(value BLOB);"
+            + "INSERT INTO data(rowid, value) VALUES (1, X'0102');");
+        if (concurrent)
+            Execute(connection, "PRAGMA journal_mode = mvcc;");
+        Execute(connection, concurrent ? "BEGIN CONCURRENT; SAVEPOINT before_update;" : "BEGIN; SAVEPOINT before_update;");
+
+        try
+        {
+            Execute(connection, "UPDATE data SET value = X'03040506' WHERE rowid = 1;");
+            using var blob = connection.OpenBlob("main", "data", "value", 1, readOnly: true);
+            blob.Length.Should().Be(4);
+
+            Execute(connection, "ROLLBACK TO before_update;");
+
+            var expired = Assert.Throws<ManagedBlobException>(() => _ = blob.Length);
+            expired!.ErrorCode.Should().Be(4);
+        }
+        finally
+        {
+            Execute(connection, "ROLLBACK;");
+        }
+    }
+
+    [Test]
+    public void CorePageNativeReadOnlyBlobSurvivesUnaffectedRollbackAndCommit()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("blob-page-native-transaction-lifetime.db", fileSystem);
+        using var embedded = database.Connect();
+        using var adapter = ManagedDatabaseAdapter.FromConnection(embedded);
+        var connection = adapter.Connection;
+        Execute(
+            connection,
+            "CREATE TABLE data(value BLOB);"
+            + "INSERT INTO data(rowid, value) VALUES (1, X'0102');"
+            + "INSERT INTO data(rowid, value) VALUES (2, X'0304');"
+            + "BEGIN;");
+        using var blob = connection.OpenBlob("main", "data", "value", 1, readOnly: true);
+
+        Execute(
+            connection,
+            "SAVEPOINT other_row;"
+            + "UPDATE data SET value = X'0506' WHERE rowid = 2;"
+            + "ROLLBACK TO other_row;");
+        Span<byte> actual = stackalloc byte[2];
+        blob.Read(0, actual).Should().Be(2);
+        actual.ToArray().Should().Equal(1, 2);
+
+        Execute(connection, "COMMIT;");
+        blob.Read(0, actual).Should().Be(2);
+        actual.ToArray().Should().Equal(1, 2);
+    }
+
+    [Test]
     public void ManagedAttachedBlobPersistsAcrossPlaintextAndEncryptedReopen()
     {
         VerifyAttachedReopen(encrypted: false);
@@ -240,8 +537,20 @@ public sealed class ManagedIncrementalBlobDatabaseBoundaryTests
         foreach (var statementSql in sql.Split(';', StringSplitOptions.RemoveEmptyEntries))
         {
             using var statement = connection.Prepare(statementSql + ";");
-            statement.Step().Should().Be(StatementStepResult.Done);
+            while (statement.Step() == StatementStepResult.Row)
+            {
+            }
         }
+    }
+
+    private static void ExecuteBound(
+        IManagedConnectionAdapter connection,
+        string sql,
+        SqlValue value)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Bind(statement.GetParameterIndex("$value"), value);
+        statement.Step().Should().Be(StatementStepResult.Done);
     }
 
     private static byte[] ReadBlob(IManagedConnectionAdapter connection, string sql)

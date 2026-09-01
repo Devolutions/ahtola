@@ -10,6 +10,8 @@ internal enum VdbeSpillFileKind : byte
     HashPartition = 2,
     HashBuildOrder = 3,
     HashMatchMap = 4,
+    KeyedRowSet = 5,
+    KeyedRowSetIndex = 6,
 }
 
 internal sealed class VdbeTemporaryFile : IDisposable
@@ -247,6 +249,41 @@ internal static class VdbeSpillRecordCodec
             values[index] = ReadValue(file, ref position, recordEnd, metrics);
         }
         return values;
+    }
+
+    public static void SkipValues(
+        IFile file,
+        ref long position,
+        int count,
+        long recordEnd,
+        VdbeExecutionMetrics metrics,
+        CancellationToken cancellationToken)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        for (var index = 0; index < count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            RequireRecordBytes(position, recordEnd, 1, "value tag");
+            var kindByte = ReadByte(file, ref position, metrics);
+            switch (kindByte)
+            {
+                case 0x00:
+                    break;
+                case 0x01:
+                case 0x02:
+                    RequireRecordBytes(position, recordEnd, sizeof(long), "numeric payload");
+                    position += sizeof(long);
+                    break;
+                case 0x03:
+                case 0x04:
+                case 0x83:
+                    var length = ReadLength(file, ref position, recordEnd, metrics, "value");
+                    position += length;
+                    break;
+                default:
+                    throw new InvalidDataException($"Unknown spilled value tag 0x{kindByte:X2}.");
+            }
+        }
     }
 
     public static void WriteString(

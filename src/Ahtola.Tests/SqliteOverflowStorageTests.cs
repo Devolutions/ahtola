@@ -110,6 +110,37 @@ public class SqliteOverflowStorageTests
     }
 
     [Test]
+    public void OverflowRangeReadValidatesTheRequiredNextPointerBeforeReturning()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var store = CreateReservedStore(fileSystem, "range-corrupt.db");
+        var reader = new SqliteOverflowChainReader(store);
+        var logicalLength = checked((ulong)reader.PayloadCapacity + 1);
+
+        WriteOverflowPage(store, pageNumber: 2, nextPageNumber: 2, new byte[reader.PayloadCapacity]);
+        Assert.Throws<InvalidDataException>(() =>
+            reader.ReadRange(2, logicalLength, offset: 0, new byte[1]));
+
+        WriteOverflowPage(store, pageNumber: 2, nextPageNumber: 3, new byte[reader.PayloadCapacity]);
+        Assert.Throws<InvalidDataException>(() =>
+            reader.ReadRange(2, logicalLength, offset: 0, new byte[1]));
+
+        var cellPayloadLength = checked((ulong)reader.PayloadCapacity + 100);
+        var localLength = SqlitePayloadLayout.Calculate(
+            SqliteBtreePageType.TableLeaf,
+            cellPayloadLength,
+            store.Header.UsableSpace).LocalPayloadLength;
+        var invalidCell = SqliteTableLeafCell.Create(
+            rowId: 1,
+            cellPayloadLength,
+            new byte[localLength],
+            firstOverflowPage: 3,
+            store.Header.UsableSpace);
+        Assert.Throws<InvalidDataException>(() =>
+            reader.ReadPayloadRange(invalidCell, offset: 0, new byte[1]));
+    }
+
+    [Test]
     public void OverflowChainReaderSurfacesDeterministicReadFaultsWithoutMutation()
     {
         var faults = new DeterministicFaultInjector();

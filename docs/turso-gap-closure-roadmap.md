@@ -47,6 +47,21 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   exposed case was not in the 135-entry baseline).
 - Current expected-failure count: 2, both intentional STORED-generated-column
   differences. There are no actionable sqltest failures in the baseline.
+- 2026-09-01: removed the final in-process harness exclusion. Cancellable
+  evaluator joins now poll every nested candidate loop, and deterministic
+  numeric arithmetic equalities can use sound expression hash probes without
+  caching registered functions or bypassing custom collations. The
+  10,000-row `join/default.sqltest::four-way-inner-join` case and the complete
+  join corpus now run inside the managed timeout.
+- 2026-09-01: began the next VDBE-depth wave with parent
+  `ProgramInstruction` IGNORE control flow/shared transaction state, a narrow
+  AFTER INSERT/UPDATE/DELETE trigger program route, bounded spillable
+  DISTINCT/compound keyed sets, page-native bounded record-column reads,
+  read-only file-backed incremental-BLOB handles over pinned pager/transaction
+  views, and `AggInverse` streaming for current-row and one-preceding
+  COUNT/SUM/AVG windows. Trigger-body lowering, the remaining heap-bound
+  intermediates, broader inverse frames, page-native incremental-BLOB writes,
+  and dedicated Blob VDBE opcodes remain explicit follow-up depth.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

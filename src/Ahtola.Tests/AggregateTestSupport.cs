@@ -6,7 +6,8 @@ namespace Ahtola.Tests;
 // Shared aggregate semantics and comparers for the aggregate opcode, program-builder,
 // and EXPLAIN tests. The delegates model the exact null/type contracts the executor
 // relies on the caller to supply (COUNT ignoring NULLs, SUM of no rows being NULL,
-// MIN/MAX ignoring NULLs), so the tests exercise real aggregation rather than stubs.
+// MIN/MAX ignoring NULLs), including inverse operations where the aggregate can remove
+// a prior step without retaining the whole input.
 internal static class AggregateTestSupport
 {
     // COUNT(*): counts every row regardless of argument values; empty input yields 0.
@@ -15,6 +16,7 @@ internal static class AggregateTestSupport
         Name = "count",
         CreateContext = () => 0L,
         Accumulate = (context, _) => (long)context! + 1L,
+        Inverse = (context, _) => (long)context! - 1L,
         Finalize = context => SqlValue.Integer((long)context!),
     };
 
@@ -25,6 +27,8 @@ internal static class AggregateTestSupport
         CreateContext = () => 0L,
         Accumulate = (context, arguments) =>
             arguments[0].Kind == SqlValueKind.Null ? context : (long)context! + 1L,
+        Inverse = (context, arguments) =>
+            arguments[0].Kind == SqlValueKind.Null ? context : (long)context! - 1L,
         Finalize = context => SqlValue.Integer((long)context!),
     };
 
@@ -38,8 +42,19 @@ internal static class AggregateTestSupport
             var state = (SumState)context!;
             if (arguments[0].Kind == SqlValueKind.Integer)
             {
-                state.HasValue = true;
+                state.Count++;
                 state.Sum += arguments[0].AsInteger();
+            }
+
+            return state;
+        },
+        Inverse = (context, arguments) =>
+        {
+            var state = (SumState)context!;
+            if (arguments[0].Kind == SqlValueKind.Integer)
+            {
+                state.Count--;
+                state.Sum -= arguments[0].AsInteger();
             }
 
             return state;
@@ -47,7 +62,7 @@ internal static class AggregateTestSupport
         Finalize = context =>
         {
             var state = (SumState)context!;
-            return state.HasValue ? SqlValue.Integer(state.Sum) : SqlValue.Null;
+            return state.Count > 0 ? SqlValue.Integer(state.Sum) : SqlValue.Null;
         },
     };
 
@@ -63,6 +78,17 @@ internal static class AggregateTestSupport
             {
                 state.Count++;
                 state.Sum += arguments[0].AsInteger();
+            }
+
+            return state;
+        },
+        Inverse = (context, arguments) =>
+        {
+            var state = (AvgState)context!;
+            if (arguments[0].Kind == SqlValueKind.Integer)
+            {
+                state.Count--;
+                state.Sum -= arguments[0].AsInteger();
             }
 
             return state;
@@ -182,7 +208,7 @@ internal static class AggregateTestSupport
 
     private sealed class SumState
     {
-        public bool HasValue;
+        public long Count;
         public long Sum;
     }
 

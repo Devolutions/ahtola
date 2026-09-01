@@ -634,6 +634,7 @@ public static class CompoundProgramBuilder
             JumpIfNotTrueInstruction x => new JumpIfNotTrueInstruction(Reg(x.Value), Pc(x.FalseTarget)),
             AggResetInstruction x => new AggResetInstruction(Acc(x.Accumulator)),
             AggStepInstruction x => new AggStepInstruction(Acc(x.Accumulator), x.Aggregate, Range(x.Arguments)),
+            AggInverseInstruction x => new AggInverseInstruction(Acc(x.Accumulator), x.Aggregate, Range(x.Arguments)),
             AggFinalizeInstruction x => new AggFinalizeInstruction(Acc(x.Accumulator), x.Aggregate, Reg(x.Destination)),
             SameGroupInstruction x => new SameGroupInstruction(Range(x.CurrentKey), Range(x.SavedKey), x.Comparer, Pc(x.SameGroupTarget)),
             RowSetInsertInstruction x => new RowSetInsertInstruction(

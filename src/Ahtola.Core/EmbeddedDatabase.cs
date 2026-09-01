@@ -479,6 +479,57 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     internal bool IsFileBacked => _fileStore is not null;
 
+    internal bool TryOpenBlobReadSource(
+        EmbeddedTable table,
+        long rowId,
+        int physicalColumnIndex,
+        EmbeddedFileReadSnapshot? sharedSnapshot,
+        bool requireCommittedTableIdentity,
+        out IManagedIncrementalBlobReadSource source,
+        out SqliteRecordColumnLocation location,
+        out IDisposable mutationLease,
+        out long mutationGeneration)
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null)
+            {
+                source = null!;
+                location = default;
+                mutationLease = null!;
+                mutationGeneration = 0;
+                return false;
+            }
+
+            if (!_fileStore.TryOpenBlobReadSource(
+                table,
+                rowId,
+                physicalColumnIndex,
+                sharedSnapshot,
+                requireCommittedTableIdentity,
+                out source,
+                out location))
+            {
+                mutationLease = null!;
+                mutationGeneration = 0;
+                return false;
+            }
+
+            try
+            {
+                mutationLease = OpenBlobMutationLease(table.Name, rowId, out mutationGeneration);
+            }
+            catch
+            {
+                source.Dispose();
+                source = null!;
+                throw;
+            }
+
+            return true;
+        }
+    }
+
     internal bool SetConnectionExclusiveLockingMode(bool exclusive, TimeSpan busyTimeout)
     {
         lock (_lockingModeGate)
@@ -764,6 +815,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         EmbeddedDatabase? Database = null,
         TransactionMutationOverlay? TransactionOverlay = null,
         EmbeddedFileReadSnapshot? TransactionPinnedSnapshot = null,
+        Action<string, long>? TransactionBlobMutation = null,
         ManagedSchemaRowSet? StagedSchemaRows = null)
     {
         /// <summary>
@@ -910,6 +962,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             // bodies, and foreign-key cascade actions all arrive here.
             if (TransactionOverlay is not null && Database is not null)
                 TransactionOverlay.RecordRowChange(Database, table, tableName, operation, rowId, before, after);
+            if (TransactionBlobMutation is not null
+                && table.HasRowid
+                && !tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+            {
+                TransactionBlobMutation(tableName, rowId);
+            }
 
             // Feed incremental method-index maintenance. This is the one place every DML path
             // funnels through — plain INSERT/UPDATE/DELETE, REPLACE and UPSERT conflict resolution,
@@ -3656,12 +3714,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     internal IDisposable OpenBlobMutationLease(string tableName, long rowId)
+        => OpenBlobMutationLease(tableName, rowId, out _);
+
+    internal IDisposable OpenBlobMutationLease(string tableName, long rowId, out long mutationGeneration)
     {
         lock (_gate)
         {
             var identity = new BlobMutationIdentity(tableName, rowId);
             _activeBlobMutations.TryGetValue(identity, out var handles);
             _activeBlobMutations[identity] = checked(handles + 1);
+            mutationGeneration = _blobMutationGenerations.GetValueOrDefault(identity);
             return new BlobMutationLease(this, identity);
         }
     }
@@ -3709,6 +3771,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var identity = new BlobMutationIdentity(tableName, rowId);
             if (_activeBlobMutations.ContainsKey(identity))
                 _blobMutationGenerations[identity] = checked(++_nextBlobMutationGeneration);
+        }
+    }
+
+    internal void InvalidateBlobHandles()
+    {
+        lock (_gate)
+        {
+            if (_activeBlobMutations.Count == 0)
+                return;
+
+            var generation = checked(++_nextBlobMutationGeneration);
+            foreach (var identity in _activeBlobMutations.Keys)
+                _blobMutationGenerations[identity] = generation;
         }
     }
 
@@ -5176,7 +5251,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
         TransactionMutationOverlay? transactionOverlay = null,
-        EmbeddedFileReadSnapshot? transactionPinnedSnapshot = null)
+        EmbeddedFileReadSnapshot? transactionPinnedSnapshot = null,
+        Action<string, long>? transactionBlobMutation = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -5207,7 +5283,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 vdbeExecutionOptions,
                 virtualTableTransaction,
                 transactionOverlay,
-                transactionPinnedSnapshot));
+                transactionPinnedSnapshot,
+                transactionBlobMutation));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -5256,7 +5333,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 : null,
             Database: this,
             TransactionOverlay: transactionOverlay,
-            TransactionPinnedSnapshot: transactionPinnedSnapshot);
+            TransactionPinnedSnapshot: transactionPinnedSnapshot,
+            TransactionBlobMutation: transactionBlobMutation);
         try
         {
             EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
@@ -18022,10 +18100,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return true;
 
         // The aggregate route declines window calls (ContainsAggregate is false for them). Try the
-        // running-frame window route so a single-table SELECT whose window functions all share one
-        // ROWS UNBOUNDED PRECEDING -> CURRENT ROW frame lowers to the real sorter + AggReset/AggStep/
-        // AggFinalize opcode family, reusing the evaluator's accumulation, partition equality, and
-        // ordering so routed rows stay byte-identical; every other window shape stays on the evaluator.
+        // streaming window route for supported ROWS frames, reusing the evaluator's accumulation,
+        // partition equality, and ordering so routed rows stay byte-identical; every other window
+        // shape stays on the evaluator.
         if (TryCompileWindowSelect(select, parameters, context, outerRow, out compiled))
             return true;
 
@@ -19555,6 +19632,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             FunctionInstruction
             or AggResetInstruction
             or AggStepInstruction
+            or AggInverseInstruction
             or AggFinalizeInstruction
             or OpenSorterInstruction
             or OpenWindowBufferInstruction
@@ -20935,6 +21013,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 && function.Arguments.All(argument =>
                     IsSafeCompiledJoinOperand(argument, resolveColumnIndex, resolveColumnDefinition));
         }
+        if (expression is BinaryExpression binary
+            && TryMapArithmeticOperator(binary.Operator, out _))
+        {
+            return IsSafeCompiledJoinOperand(
+                    binary.Left,
+                    resolveColumnIndex,
+                    resolveColumnDefinition)
+                && IsSafeCompiledJoinOperand(
+                    binary.Right,
+                    resolveColumnIndex,
+                    resolveColumnDefinition);
+        }
+        if (expression is UnaryExpression { Operator: not UnaryOperator.Plus } unary
+            && TryMapArithmeticOperator(unary.Operator, out _))
+        {
+            return IsSafeCompiledJoinOperand(
+                unary.Operand,
+                resolveColumnIndex,
+                resolveColumnDefinition);
+        }
 
         if (expression is not ColumnExpression column || resolveColumnIndex(column.Name) is null)
             return false;
@@ -21200,7 +21298,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var equiProbe = indexSeekDescription is null
-            ? TryCreateCompiledJoinEquiProbe(join, context)
+            ? TryCreateCompiledJoinEquiProbe(join, left, right, parameters, context, outerRow)
             : null;
         // INNER equijoin: hash-build the smaller estimated side (default still right).
         // OUTER joins keep hash-build-right so unmatched-side semantics stay correct.
@@ -21952,19 +22050,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     /// <summary>
-    /// Builds a hash probe for compiled multi-way joins when ON is a conjunction of
-    /// simple column equalities (same shape as the evaluator EquiJoinHashIndex).
+    /// Builds a hash probe for compiled multi-way joins when ON contains an equality whose
+    /// operands each belong to one join side. Simple column equalities retain their affinity
+    /// and collation-aware canonicalization; numeric arithmetic expressions are evaluated on
+    /// their owning side and hashed by their resulting numeric value.
     /// </summary>
     private VdbeJoinEquiProbe? TryCreateCompiledJoinEquiProbe(
         JoinTableSource join,
-        QueryContext context)
+        CompiledJoinSource left,
+        CompiledJoinSource right,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
     {
         if (join.Condition is null)
             return null;
 
         var leftColumns = GetOutputColumns(join.Left, context);
         var rightColumns = GetOutputColumns(join.Right, context);
-        var keys = new List<EquiJoinKey>();
+        var keys = new List<CompiledJoinHashKey>();
         var pending = new Stack<Expression>();
         pending.Push(join.Condition);
         while (pending.Count > 0)
@@ -21978,7 +22082,54 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
 
             if (TryCreateEquiJoinKey(conjunct, join, leftColumns, rightColumns, context) is { } key)
-                keys.Add(key);
+            {
+                keys.Add(new CompiledJoinHashKey(
+                    row => row.Values[key.LeftColumn.Index],
+                    row => row.Values[key.RightColumn.Index],
+                    key.LeftConvertsTextToNumeric,
+                    key.LeftConvertsNumericToText,
+                    key.RightConvertsTextToNumeric,
+                    key.RightConvertsNumericToText,
+                    key.Collation));
+                continue;
+            }
+
+            if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } equality)
+                continue;
+
+            Expression leftExpression;
+            Expression rightExpression;
+            if (ExpressionBelongsToSource(equality.Left, left, right)
+                && ExpressionBelongsToSource(equality.Right, right, left))
+            {
+                leftExpression = equality.Left;
+                rightExpression = equality.Right;
+            }
+            else if (ExpressionBelongsToSource(equality.Right, left, right)
+                && ExpressionBelongsToSource(equality.Left, right, left))
+            {
+                leftExpression = equality.Right;
+                rightExpression = equality.Left;
+            }
+            else
+            {
+                continue;
+            }
+
+            if (!IsNumericHashExpression(leftExpression, left)
+                || !IsNumericHashExpression(rightExpression, right))
+            {
+                continue;
+            }
+
+            keys.Add(new CompiledJoinHashKey(
+                row => Evaluate(leftExpression, parameters, left.CreateSourceRow(row, outerRow), context),
+                row => Evaluate(rightExpression, parameters, right.CreateSourceRow(row, outerRow), context),
+                LeftConvertsTextToNumeric: false,
+                LeftConvertsNumericToText: false,
+                RightConvertsTextToNumeric: false,
+                RightConvertsNumericToText: false,
+                Collation: "BINARY"));
         }
 
         if (keys.Count == 0)
@@ -21989,10 +22140,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             string? key = null;
             foreach (var equiKey in keys)
             {
-                var column = leftSide ? equiKey.LeftColumn : equiKey.RightColumn;
-                if (column.Index < 0 || column.Index >= row.Values.Length)
-                    return null;
-                var value = row.Values[column.Index];
+                var value = leftSide ? equiKey.LeftValue(row) : equiKey.RightValue(row);
                 var segment = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
                     value,
                     leftSide ? equiKey.LeftConvertsTextToNumeric : equiKey.RightConvertsTextToNumeric,
@@ -22011,7 +22159,85 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return new VdbeJoinEquiProbe(
             left => BuildKey(left, leftSide: true),
             right => BuildKey(right, leftSide: false));
+
+        static bool ExpressionBelongsToSource(
+            Expression expression,
+            CompiledJoinSource owner,
+            CompiledJoinSource other)
+        {
+            var sawColumn = false;
+            return Visit(expression) && sawColumn;
+
+            bool Visit(Expression candidate)
+            {
+                switch (candidate)
+                {
+                    case LiteralExpression or ParameterExpression:
+                        return true;
+                    case ColumnExpression column:
+                        sawColumn = true;
+                        return owner.ResolveColumnIndex(column.Name) is not null
+                            && other.ResolveColumnIndex(column.Name) is null;
+                    case CollationExpression collation:
+                        return Visit(collation.Expression);
+                    case CastExpression cast:
+                        return Visit(cast.Expression);
+                    case UnaryExpression unary:
+                        return Visit(unary.Operand);
+                    case BinaryExpression binary:
+                        return Visit(binary.Left) && Visit(binary.Right);
+                    case FunctionExpression function when function.Filter is null && function.Window is null:
+                        return function.Arguments.All(Visit);
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        bool IsNumericHashExpression(Expression expression, CompiledJoinSource source)
+        {
+            while (expression is CollationExpression collation)
+            {
+                if (!string.Equals(collation.Name, "BINARY", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                expression = collation.Expression;
+            }
+
+            if (expression is BinaryExpression binary
+                && TryMapArithmeticOperator(binary.Operator, out _))
+            {
+                return true;
+            }
+            if (expression is UnaryExpression { Operator: not UnaryOperator.Plus } unary
+                && TryMapArithmeticOperator(unary.Operator, out _))
+            {
+                return true;
+            }
+            if (expression is not ColumnExpression column
+                || source.ResolveColumnIndex(column.Name) is not { } index)
+            {
+                return false;
+            }
+
+            if (index >= source.Columns.Length)
+                return true;
+
+            var definition = source.ResolveColumnDefinition(column);
+            var declaredCollation = (definition?.Collation ?? "BINARY").ToUpperInvariant();
+            return IsNumericAffinity(GetJoinKeyAffinity(definition))
+                && IsHashableJoinKeyCollation(declaredCollation)
+                && !IsUnsafeCompiledCollation(declaredCollation);
+        }
     }
+
+    private sealed record CompiledJoinHashKey(
+        Func<VdbeJoinRow, SqlValue> LeftValue,
+        Func<VdbeJoinRow, SqlValue> RightValue,
+        bool LeftConvertsTextToNumeric,
+        bool LeftConvertsNumericToText,
+        bool RightConvertsTextToNumeric,
+        bool RightConvertsNumericToText,
+        string Collation);
 
     private static SourceRow CreateCompiledJoinSourceRow(
         string[] columns,
@@ -22963,10 +23189,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // evaluator keeps ownership and raises its own value or error. Two lowerings sit behind this router,
     // tried in order:
     //
-    //  1. The streaming running-frame program (WindowProgramBuilder): the narrow shape whose window calls
-    //     all share one ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW spec over aggregate functions of
-    //     bare columns, which folds into the AggReset/AggStep/AggFinalize opcode family without buffering
-    //     a partition. See TryBuildRunningWindowProgram for its exact grammar.
+    //  1. The streaming program (WindowProgramBuilder): the narrow shapes whose window calls all share
+    //     a running-prefix, exact-current-row, or literal 1 PRECEDING ROWS frame over aggregate
+    //     functions of bare columns. Moving shapes use AggInverse; none buffers a partition.
+    //     See TryBuildStreamingWindowProgram for its exact grammar.
     //  2. The buffered-window program (BufferedWindowProgramBuilder): every other window shape whose
     //     inputs are computable from one scanned row. It buffers the scanned rows through the
     //     OpenWindowBuffer/WindowBufferInsert/WindowBufferCompute/WindowBufferData opcode family and
@@ -23142,7 +23368,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ? select
             : select with { Limit = null, Offset = null };
 
-        if (!TryBuildRunningWindowProgram(baseSelect, target, parameters, context, outerRow, out var program)
+        if (!TryBuildStreamingWindowProgram(baseSelect, target, parameters, context, outerRow, out var program)
             && !TryBuildBufferedWindowProgram(
                 baseSelect,
                 target,
@@ -23193,7 +23419,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return false;
     }
 
-    // The streaming running-frame lowering. It reuses the evaluator's own accumulation
+    // The streaming running/current-row/1-preceding lowering. It reuses the evaluator's own accumulation
     // (BuildAccumulatorAggregate), partition equality (BuildGroupComparers), and ordering (CompareRows)
     // so a routed row is byte-identical to the fallback.
     //
@@ -23202,15 +23428,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
     //   [ORDER BY <partition cols as prefix> , <window ORDER BY terms>]
     // where each <proj> is one of: '*', a bare backed column, a folded constant, or
     //   agg(<bare column>|*) OVER ([PARTITION BY <bare cols>] [ORDER BY <scan terms>]
-    //                              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-    // with agg in {count, sum, total, avg, min, max, group_concat/1, registered aggregates}, and
-    // every window call sharing one identical OVER spec.
+    //                              <supported ROWS frame>)
+    // where the running frame supports the existing aggregate set, while moving frames admit
+    // only inverse-capable count/sum/avg calls. Every call shares one OVER spec.
     //
     // Exactness of the emitted (partition, order) sort order requires the top-level ORDER BY to be
     // the partition columns (in any direction, as a bijective prefix) followed by the window ORDER BY
     // terms verbatim; absent an ORDER BY the window must be unpartitioned and unordered so the sorter
     // preserves scan order. Everything else declines to the buffered lowering.
-    private bool TryBuildRunningWindowProgram(
+    private bool TryBuildStreamingWindowProgram(
         SelectStatement select,
         ScanTarget target,
         SqlValue[] parameters,
@@ -23220,7 +23446,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         program = null!;
 
-        // Classify every projection into a pass-through column, a running window call sharing
+        // Classify every projection into a pass-through column, a streaming window call sharing
         // one spec, or a folded constant. Any other shape (computed expressions over window
         // results, qualified stars, scalar functions) declines to the buffered lowering.
         WindowSpecification? spec = null;
@@ -23239,7 +23465,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     outputs.Add(WindowOutput.ForColumn(ordinal));
                     continue;
                 case FunctionExpression function when function.Window is not null:
-                    if (!TryClassifyRunningWindowCall(
+                    if (!TryClassifyStreamingWindowCall(
                             function, target, parameters, context, outerRow, ref spec, windows, out var windowOutput))
                     {
                         return false;
@@ -23260,6 +23486,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         if (!sawWindow || spec is null)
+            return false;
+        if (!TryGetStreamingWindowFrame(spec.Frame, out var frame))
             return false;
 
         ValidateOrderByCollations(spec.OrderBy);
@@ -23288,7 +23516,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             partitionNames.Add(column.Name);
         }
 
-        // Window ORDER BY terms drive the running accumulation order, so they must be evaluable
+        // Window ORDER BY terms drive the accumulation order, so they must be evaluable
         // against a single scanned row and must not read an unbacked rowid the materialized row
         // cannot supply. (IsScanPredicate already rejects nested window/aggregate terms.)
         foreach (var term in spec.OrderBy)
@@ -23318,7 +23546,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // The builder emits rows in its own (partition, order) sort order. That order is exact
         // only when the evaluator would emit the same order:
         //   * no ORDER BY  -> the evaluator emits scan order, which matches only the single
-        //     unordered, unpartitioned running frame; the sorter preserves scan order.
+        //     unordered, unpartitioned streaming frame; the sorter preserves scan order.
         //   * ORDER BY      -> it must be [all partition columns as a bijective prefix] ++ [the
         //     window ORDER BY terms verbatim], so the sort is partition-contiguous with window
         //     order within each partition and equals the evaluator's output order term-for-term.
@@ -23407,7 +23635,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             outputs,
             orderComparer,
             partitionComparer,
-            predicate);
+            predicate,
+            frame);
         return true;
     }
 
@@ -23705,13 +23934,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return substitution;
     }
 
-    // Recognizes a top-level running-frame window call over bare, backed columns, appends its
+    // Recognizes a top-level streaming window call over bare, backed columns, appends its
     // VdbeAggregate to <paramref name="windows"/>, and yields the output that projects the
     // finalized per-row value. Declines (returns false) for DISTINCT/FILTER modifiers, any frame
-    // other than the running frame, non-aggregate window functions (row_number/rank/percentile),
+    // other than the supported running/current/one-preceding frames, non-aggregate window functions,
     // arguments that are not bare columns, or a spec that differs from an earlier window call, so
     // those shapes fall back to the evaluator, which produces the value or its exact error.
-    private bool TryClassifyRunningWindowCall(
+    private bool TryClassifyStreamingWindowCall(
         FunctionExpression function,
         ScanTarget target,
         SqlValue[] parameters,
@@ -23723,14 +23952,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         output = default;
 
-        // Frame/window modifiers the running-frame accumulator cannot honor. FILTER would need to
+        // Frame/window modifiers the streaming accumulator cannot honor. FILTER would need to
         // evaluate a predicate over columns the accumulator does not buffer; DISTINCT dedup is not
-        // modeled by the running AggStep.
+        // modeled by the emitted AggStep.
         if (function.Distinct || function.Filter is not null)
             return false;
 
         var window = function.Window!;
-        if (!IsRunningWindowFrame(window.Frame))
+        if (!TryGetStreamingWindowFrame(window.Frame, out var frame))
+            return false;
+        if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG"))
             return false;
 
         // The bytecode shape only models aggregate accumulation. Dedicated ranking,
@@ -23765,23 +23996,57 @@ public sealed partial class EmbeddedDatabase : IDisposable
             argumentNames[index] = column.Name;
         }
 
+        var aggregate = BuildAccumulatorAggregate(function, argumentNames, parameters, context, outerRow);
+        if (frame.RequiresInverse && aggregate.Inverse is null)
+            return false;
+
         var windowIndex = windows.Count;
-        windows.Add(new AggregateFunctionSpec(
-            BuildAccumulatorAggregate(function, argumentNames, parameters, context, outerRow),
-            argumentColumns));
+        windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns));
         output = WindowOutput.ForWindow(windowIndex);
         return true;
     }
 
-    // The one frame WindowProgramBuilder models: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW.
-    // The parser also produces this shape for bare "ROWS UNBOUNDED PRECEDING". A null frame (the
-    // default RANGE frame) and every bounded/forward-looking ROWS frame decline.
-    private static bool IsRunningWindowFrame(WindowFrame? frame)
-        => frame is not null
-            && frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Rows
-            && frame.Start.Kind == FrameBoundKind.UnboundedPreceding
+    // The streaming builder handles the running prefix, exact current row, and literal 1 PRECEDING.
+    // Moving frames follow Turso's order: step, emit, then inverse the departing row.
+    private static bool TryGetStreamingWindowFrame(WindowFrame? frame, out WindowFrameSpec spec)
+    {
+        spec = default;
+        if (frame is null
+            || frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows
+            || frame.Exclusion != FrameExclusion.NoOthers)
+        {
+            return false;
+        }
+
+        if (frame.Start.Kind == FrameBoundKind.UnboundedPreceding
+            && frame.End.Kind == FrameBoundKind.CurrentRow)
+        {
+            spec = WindowFrameSpec.Running;
+            return true;
+        }
+
+        if (frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Kind == FrameBoundKind.CurrentRow)
+        {
+            spec = WindowFrameSpec.CurrentRow;
+            return true;
+        }
+
+        if (frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } offset,
+            }
+            && offset.Value.AsInteger() == 1
             && frame.End.Kind == FrameBoundKind.CurrentRow
-            && frame.Exclusion == FrameExclusion.NoOthers;
+            && frame.End.Offset is null)
+        {
+            spec = WindowFrameSpec.OnePreceding;
+            return true;
+        }
+
+        return false;
+    }
 
     // Structural equality of two window specs: PARTITION BY expressions and ORDER BY terms compared
     // element-wise (record equality on the IReadOnlyList fields is reference equality, so the lists
@@ -23806,12 +24071,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return Equals(left.Frame, right.Frame);
     }
 
-    // Builds a VdbeAggregate whose accumulation replays the evaluator's own aggregate
-    // semantics: it buffers each scanned argument tuple as a synthetic single-row source
-    // keyed by the argument column names, then finalizes by handing those rows to
-    // EvaluateAggregateFunction. This reuses the evaluator exactly (COUNT ignoring NULLs,
-    // SUM's integer/real promotion, MIN/MAX typing, GROUP_CONCAT ordering, and every
-    // empty-input identity), so a routed aggregate is byte-identical to the fallback.
+    // COUNT and numeric aggregates use constant-size accumulator state; the remaining routed
+    // aggregates replay the evaluator from buffered argument tuples.
     private VdbeAggregate BuildAccumulatorAggregate(
         FunctionExpression function,
         string[] argumentNames,
@@ -23819,8 +24080,44 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        if (function.Name == "COUNT" && (function.CountStar || function.Arguments.Count is 0 or 1))
+        {
+            var countAll = function.CountStar || function.Arguments.Count == 0;
+            return new VdbeAggregate
+            {
+                Name = "count",
+                CreateContext = static () => new CountAggregateAccumulator(),
+                Accumulate = (contextObject, arguments) =>
+                {
+                    var accumulator = (CountAggregateAccumulator)contextObject!;
+                    if (countAll || arguments[0].Kind != SqlValueKind.Null)
+                        accumulator.Add();
+                    return accumulator;
+                },
+                Inverse = (contextObject, arguments) =>
+                {
+                    var accumulator = (CountAggregateAccumulator)contextObject!;
+                    if (countAll || arguments[0].Kind != SqlValueKind.Null)
+                        accumulator.Remove();
+                    return accumulator;
+                },
+                Finalize = static contextObject =>
+                    SqlValue.Integer(((CountAggregateAccumulator)contextObject!).Count),
+            };
+        }
+
         if (function.Name is "SUM" or "TOTAL" or "AVG" && function.Arguments.Count == 1)
         {
+            Func<object?, SqlValue[], object?>? inverse = null;
+            if (function.Name is "SUM" or "AVG")
+            {
+                inverse = static (contextObject, arguments) =>
+                {
+                    ((NumericAggregateAccumulator)contextObject!).Remove(arguments[0]);
+                    return contextObject;
+                };
+            }
+
             return new VdbeAggregate
             {
                 Name = function.Name.ToLowerInvariant(),
@@ -23832,6 +24129,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     ((NumericAggregateAccumulator)contextObject!).Accumulate(arguments[0]);
                     return contextObject;
                 },
+                Inverse = inverse,
                 Finalize = static contextObject => ((NumericAggregateAccumulator)contextObject!).Finalize(),
             };
         }
@@ -24385,6 +24683,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (table.IsAutoIncrement && statement.Rows.Count > 1)
             return false;
 
+        var beforeInsertTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.Before,
+            TriggerEvent.Insert);
+        var afterInsertTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.After,
+            TriggerEvent.Insert);
+        if (beforeInsertTriggers.Count != 0 || afterInsertTriggers.Count != 0)
+        {
+            return TryCompileAfterInsertTriggerPrograms(
+                statement,
+                parameters,
+                context,
+                table,
+                beforeInsertTriggers,
+                afterInsertTriggers,
+                out compiled);
+        }
+
         if (!TryCompileReturningClause(
                 statement.Returning,
                 table,
@@ -24474,6 +24794,35 @@ out bool hasReturning)
             || !context.Tables.TryGetValue(statement.TableName, out var table))
         {
             return false;
+        }
+
+        var updatedColumns = statement.Assignments
+            .Select(assignment => assignment.Column)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var beforeUpdateTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.Before,
+            TriggerEvent.Update,
+            updatedColumns);
+        var afterUpdateTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.After,
+            TriggerEvent.Update,
+            updatedColumns);
+        if (beforeUpdateTriggers.Count != 0 || afterUpdateTriggers.Count != 0)
+        {
+            var triggerPlan = PrepareUpdate(statement, table, context);
+            return TryCompileAfterUpdateTriggerPrograms(
+                statement,
+                parameters,
+                context,
+                table,
+                triggerPlan,
+                beforeUpdateTriggers,
+                afterUpdateTriggers,
+                out compiled);
         }
 
         DmlRowFilter? filter = null;
@@ -24590,6 +24939,28 @@ out bool hasReturning)
             || !context.Tables.TryGetValue(statement.TableName, out var table))
         {
             return false;
+        }
+
+        var beforeDeleteTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.Before,
+            TriggerEvent.Delete);
+        var afterDeleteTriggers = GetRowTriggers(
+            context,
+            statement.TableName,
+            TriggerTiming.After,
+            TriggerEvent.Delete);
+        if (beforeDeleteTriggers.Count != 0 || afterDeleteTriggers.Count != 0)
+        {
+            return TryCompileAfterDeleteTriggerPrograms(
+                statement,
+                parameters,
+                context,
+                table,
+                beforeDeleteTriggers,
+                afterDeleteTriggers,
+                out compiled);
         }
 
         DmlRowFilter? filter = null;
@@ -26352,6 +26723,12 @@ out bool hasReturning)
                 aggStep.Arguments.Count,
                 aggStep.Aggregate.Name,
                 $"accumulator {aggStep.Accumulator.Index}={aggStep.Aggregate.Name} step {FormatRegisterRange(aggStep.Arguments)}"),
+            AggInverseInstruction aggInverse => (
+                aggInverse.Accumulator.Index,
+                aggInverse.Arguments.Start.Index,
+                aggInverse.Arguments.Count,
+                aggInverse.Aggregate.Name,
+                $"accumulator {aggInverse.Accumulator.Index}={aggInverse.Aggregate.Name} inverse {FormatRegisterRange(aggInverse.Arguments)}"),
             AggFinalizeInstruction aggFinalize => (
                 aggFinalize.Accumulator.Index,
                 aggFinalize.Destination.Index,
@@ -32362,6 +32739,7 @@ out bool hasReturning)
         Expression? rightPredicate = null,
         IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
+        context.CheckInterrupt();
         if (source.Kind.ProducesLeftShapeOnly())
         {
             return GetSemiOrAntiJoinRows(
@@ -32446,7 +32824,9 @@ out bool hasReturning)
         var ambiguousQualifiedColumns = GetAmbiguousQualifiedColumns(source, context);
         var leftWidth = left.Columns.Length;
         var joinPairs = BuildJoinPairs(source, context);
-        var joinHashIndex = rightIsCorrelatedSource ? null : TryBuildJoinHashIndex(source, right, context);
+        var joinHashIndex = rightIsCorrelatedSource
+            ? null
+            : TryBuildJoinHashIndex(source, right, parameters, context);
         IEnumerable<int>? allRightIndices = null;
 
         var rows = new List<SourceRow>();
@@ -32502,6 +32882,7 @@ out bool hasReturning)
         {
             foreach (var rightRow in right.Rows)
             {
+                context.CheckInterrupt();
                 var rowsForRight = GetSideSourceRows(
                     source.Left,
                     leftConstraintPredicate,
@@ -32512,6 +32893,7 @@ out bool hasReturning)
                 AddOmittedPredicates(rowsForRight.OmittedVirtualTablePredicates);
                 foreach (var leftRow in rowsForRight.Rows)
                 {
+                    context.CheckInterrupt();
                     if (source.Condition is null
                         && !JoinConditionMatches(source, joinPairs, combinedRow: null, leftRow, rightRow, parameters, context))
                     {
@@ -32537,6 +32919,7 @@ out bool hasReturning)
         var rightMatched = new bool[right.Rows.Count];
         foreach (var leftRow in left.Rows)
         {
+            context.CheckInterrupt();
             var rowsForLeft = rightIsCorrelatedSource
                 ? GetSideSourceRows(
                     source.Right,
@@ -32555,6 +32938,7 @@ out bool hasReturning)
                     : allRightIndices ??= Enumerable.Range(0, rowsForLeft.Rows.Count);
             foreach (var rightIndex in candidateIndices)
             {
+                context.CheckInterrupt();
                 var rightRow = rowsForLeft.Rows[rightIndex];
                 if (source.Condition is null
                     && !JoinConditionMatches(source, joinPairs, combinedRow: null, leftRow, rightRow, parameters, context))
@@ -32614,6 +32998,7 @@ out bool hasReturning)
         {
             for (var rightIndex = 0; rightIndex < right.Rows.Count; rightIndex++)
             {
+                context.CheckInterrupt();
                 if (rightMatched[rightIndex])
                     continue;
 
@@ -32890,20 +33275,21 @@ out bool hasReturning)
     private EquiJoinHashIndex? TryBuildJoinHashIndex(
         JoinTableSource source,
         SourceData right,
+        SqlValue[] parameters,
         QueryContext context)
     {
         var leftColumns = GetOutputColumns(source.Left, context);
         var rightColumns = GetOutputColumns(source.Right, context);
-        var keys = new List<EquiJoinKey>();
+        var keys = new List<EvaluatorJoinHashKey>();
         if (source.Condition is null)
         {
             foreach (var (left, rightColumn) in BuildJoinPairs(source, context))
             {
                 if (TryCreateEquiJoinKey(source, left, rightColumn, context) is { } key)
-                    keys.Add(key);
+                    keys.Add(FromSimpleKey(key));
             }
 
-            return keys.Count == 0 ? null : new EquiJoinHashIndex(keys, right);
+            return keys.Count == 0 ? null : new EquiJoinHashIndex(keys, right, context);
         }
 
         var pending = new Stack<Expression>();
@@ -32919,10 +33305,135 @@ out bool hasReturning)
             }
 
             if (TryCreateEquiJoinKey(conjunct, source, leftColumns, rightColumns, context) is { } key)
-                keys.Add(key);
+            {
+                keys.Add(FromSimpleKey(key));
+                continue;
+            }
+
+            if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } equality)
+                continue;
+
+            Expression leftExpression;
+            Expression rightExpression;
+            if (ExpressionBelongsToJoinSide(equality.Left, leftColumns, rightColumns)
+                && ExpressionBelongsToJoinSide(equality.Right, rightColumns, leftColumns))
+            {
+                leftExpression = equality.Left;
+                rightExpression = equality.Right;
+            }
+            else if (ExpressionBelongsToJoinSide(equality.Right, leftColumns, rightColumns)
+                && ExpressionBelongsToJoinSide(equality.Left, rightColumns, leftColumns))
+            {
+                leftExpression = equality.Right;
+                rightExpression = equality.Left;
+            }
+            else
+            {
+                continue;
+            }
+
+            if (!IsNumericJoinHashExpression(leftExpression, source.Left, leftColumns)
+                || !IsNumericJoinHashExpression(rightExpression, source.Right, rightColumns))
+            {
+                continue;
+            }
+
+            keys.Add(new EvaluatorJoinHashKey(
+                row => Evaluate(leftExpression, parameters, row, context),
+                row => Evaluate(rightExpression, parameters, row, context),
+                LeftConvertsTextToNumeric: false,
+                LeftConvertsNumericToText: false,
+                RightConvertsTextToNumeric: false,
+                RightConvertsNumericToText: false,
+                Collation: "BINARY"));
         }
 
-        return keys.Count == 0 ? null : new EquiJoinHashIndex(keys, right);
+        return keys.Count == 0 ? null : new EquiJoinHashIndex(keys, right, context);
+
+        static EvaluatorJoinHashKey FromSimpleKey(EquiJoinKey key) => new(
+            row => GetOutputValue(row, key.LeftColumn),
+            row => GetOutputValue(row, key.RightColumn),
+            key.LeftConvertsTextToNumeric,
+            key.LeftConvertsNumericToText,
+            key.RightConvertsTextToNumeric,
+            key.RightConvertsNumericToText,
+            key.Collation);
+
+        bool ExpressionBelongsToJoinSide(
+            Expression expression,
+            IReadOnlyList<OutputColumn> owner,
+            IReadOnlyList<OutputColumn> other)
+        {
+            var sawColumn = false;
+            return Visit(expression) && sawColumn;
+
+            bool Visit(Expression candidate)
+            {
+                switch (candidate)
+                {
+                    case LiteralExpression or ParameterExpression:
+                        return true;
+                    case ColumnExpression column:
+                        sawColumn = true;
+                        return ResolveJoinSideColumn(column, owner) is not null
+                            && ResolveJoinSideColumn(column, other) is null;
+                    case CollationExpression collation:
+                        return Visit(collation.Expression);
+                    case CastExpression cast:
+                        return Visit(cast.Expression);
+                    case UnaryExpression unary:
+                        return Visit(unary.Operand);
+                    case BinaryExpression binary:
+                        return Visit(binary.Left) && Visit(binary.Right);
+                    case FunctionExpression function
+                        when function.Filter is null
+                            && function.Window is null
+                            && !IsRegisteredScalarFunction(function.Name, function.Arguments.Count)
+                            && IndexExpressionSemantics.IsDeterministicBuiltin(function):
+                        return function.Arguments.All(Visit);
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        bool IsNumericJoinHashExpression(
+            Expression expression,
+            TableSource side,
+            IReadOnlyList<OutputColumn> columns)
+        {
+            while (expression is CollationExpression collation)
+            {
+                if (!string.Equals(collation.Name, "BINARY", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                expression = collation.Expression;
+            }
+
+            if (expression is BinaryExpression binary
+                && TryMapArithmeticOperator(binary.Operator, out _))
+            {
+                return true;
+            }
+            if (expression is UnaryExpression { Operator: not UnaryOperator.Plus } unary
+                && TryMapArithmeticOperator(unary.Operator, out _))
+            {
+                return true;
+            }
+            if (expression is not ColumnExpression column
+                || ResolveJoinSideColumn(column, columns) is not { } output)
+            {
+                return false;
+            }
+
+            if (EmbeddedTable.IsRowidAliasName(output.Name))
+                return true;
+
+            var definition = GetOutputColumnDefinition(side, output, context);
+            var declaredCollation = (definition?.Collation ?? "BINARY").ToUpperInvariant();
+            return IsNumericAffinity(GetJoinKeyAffinity(definition))
+                && IsHashableJoinKeyCollation(declaredCollation)
+                && !IsUnsafeCompiledCollation(declaredCollation);
+        }
     }
 
     private EquiJoinKey? TryCreateEquiJoinKey(
@@ -33106,20 +33617,33 @@ out bool hasReturning)
         bool RightConvertsNumericToText,
         string Collation);
 
+    private sealed record EvaluatorJoinHashKey(
+        Func<SourceRow, SqlValue> LeftValue,
+        Func<SourceRow, SqlValue> RightValue,
+        bool LeftConvertsTextToNumeric,
+        bool LeftConvertsNumericToText,
+        bool RightConvertsTextToNumeric,
+        bool RightConvertsNumericToText,
+        string Collation);
+
     // Pre-filters equi-join candidates by hashing the right side on normalized key values.
     // Keys are canonicalized so that any pair comparing equal (after comparison affinities and
     // collation) lands in the same bucket; candidates still run the full join condition.
     private sealed class EquiJoinHashIndex
     {
         private static readonly IReadOnlyList<int> NoCandidates = [];
-        private readonly IReadOnlyList<EquiJoinKey> _keys;
+        private readonly IReadOnlyList<EvaluatorJoinHashKey> _keys;
         private readonly Dictionary<string, List<int>> _buckets = new(StringComparer.Ordinal);
 
-        public EquiJoinHashIndex(IReadOnlyList<EquiJoinKey> keys, SourceData right)
+        public EquiJoinHashIndex(
+            IReadOnlyList<EvaluatorJoinHashKey> keys,
+            SourceData right,
+            QueryContext context)
         {
             _keys = keys;
             for (var index = 0; index < right.Rows.Count; index++)
             {
+                context.CheckInterrupt();
                 var key = BuildKey(right.Rows[index], leftSide: false);
                 if (key is null)
                     continue;
@@ -33146,7 +33670,7 @@ out bool hasReturning)
             string? key = null;
             foreach (var equiKey in _keys)
             {
-                var value = GetOutputValue(row, leftSide ? equiKey.LeftColumn : equiKey.RightColumn);
+                var value = leftSide ? equiKey.LeftValue(row) : equiKey.RightValue(row);
                 var segment = CanonicalizeJoinKeyValue(
                     value,
                     leftSide ? equiKey.LeftConvertsTextToNumeric : equiKey.RightConvertsTextToNumeric,
@@ -38915,6 +39439,21 @@ out bool hasReturning)
         return accumulator.Finalize();
     }
 
+    private sealed class CountAggregateAccumulator
+    {
+        internal long Count { get; private set; }
+
+        internal void Add() => Count = checked(Count + 1);
+
+        internal void Remove()
+        {
+            if (Count == 0)
+                throw new InvalidOperationException("Aggregate inverse removed a row from an empty count.");
+
+            Count--;
+        }
+    }
+
     private sealed class NumericAggregateAccumulator
     {
         private readonly bool _forceReal;
@@ -38970,6 +39509,55 @@ out bool hasReturning)
             KahanBabuskaNeumaierStepInt64(addend, ref _realTotal, ref _realError);
         }
 
+        internal void Remove(SqlValue value)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+            if (_count == 0)
+                throw new InvalidOperationException("Aggregate inverse removed a row from an empty numeric aggregate.");
+
+            // If the departing value is the aggregate's only non-NULL input, reset exactly. This also
+            // avoids manufacturing NaN when an infinite value leaves a one-row SUM/AVG frame.
+            if (_count == 1)
+            {
+                Reset();
+                return;
+            }
+
+            var exact = ApplyComparisonNumericAffinity(value);
+            _count--;
+            if (exact.Kind != SqlValueKind.Integer)
+            {
+                var real = exact.Kind == SqlValueKind.Real
+                    ? AsReal(exact)
+                    : AsReal(ApplyNumericAffinity(value));
+                PromoteToReal();
+                KahanBabuskaNeumaierStep(-real, ref _realTotal, ref _realError);
+                return;
+            }
+
+            var subtrahend = exact.AsInteger();
+            if (!_approximate)
+            {
+                var candidate = unchecked(_integerTotal - subtrahend);
+                if (((_integerTotal ^ subtrahend) & (_integerTotal ^ candidate)) >= 0)
+                {
+                    _integerTotal = candidate;
+                    return;
+                }
+
+                if (value.Kind == SqlValueKind.Integer && !_forceReal && !_average)
+                    throw new EmbeddedSqlException("integer overflow");
+
+                PromoteToReal();
+            }
+
+            if (subtrahend == long.MinValue)
+                KahanBabuskaNeumaierStep(9223372036854775808d, ref _realTotal, ref _realError);
+            else
+                KahanBabuskaNeumaierStepInt64(-subtrahend, ref _realTotal, ref _realError);
+        }
+
         internal SqlValue Finalize()
         {
             var accumulated = _approximate
@@ -38984,6 +39572,15 @@ out bool hasReturning)
                 return SqlValue.Null;
 
             return _approximate ? SqlValue.Real(accumulated) : SqlValue.Integer(_integerTotal);
+        }
+
+        private void Reset()
+        {
+            _integerTotal = 0;
+            _realTotal = 0;
+            _realError = 0;
+            _approximate = false;
+            _count = 0;
         }
 
         private void PromoteToReal()
@@ -49222,6 +49819,15 @@ public sealed partial class EmbeddedConnection : IDisposable
         /// instead and are merged in via <c>ConcurrentMvStore</c>/<c>ConcurrentMvccTxId</c>.
         /// </summary>
         public TransactionMutationOverlay? Overlay { get; set; }
+
+        public Dictionary<BlobMutationIdentity, long> BlobMutationCounts { get; } = [];
+
+        public void RecordBlobMutation(string tableName, long rowId)
+        {
+            var identity = new BlobMutationIdentity(tableName, rowId);
+            BlobMutationCounts.TryGetValue(identity, out var count);
+            BlobMutationCounts[identity] = checked(count + 1);
+        }
     }
 
 
@@ -49663,6 +50269,179 @@ public sealed partial class EmbeddedConnection : IDisposable
         return removed;
     }
 
+    internal bool TryOpenPageNativeBlobReadSource(
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowId,
+        out IManagedIncrementalBlobReadSource source,
+        out IDisposable mutationLease,
+        out long mutationGeneration)
+    {
+        ThrowIfRecursiveTriggerCallbackReentry();
+        ThrowIfDisposed();
+        var database = ResolveBlobDatabase(databaseName);
+        source = null!;
+        mutationLease = null!;
+        mutationGeneration = 0;
+        if (!database.IsFileBacked)
+            return false;
+
+        var transactionState = GetTransactionState(database);
+        if (transactionState is null)
+        {
+            database.RefreshForeignCatalogForStatementIfNeeded();
+            database.RefreshOwnedCatalogForStatementIfNeeded();
+        }
+
+        var catalog = transactionState?.Catalog ?? database.LiveCatalog;
+        if (!catalog.Tables.TryGetValue(tableName, out var table))
+        {
+            if (catalog.Views.ContainsKey(tableName))
+            {
+                throw new ManagedBlobException(
+                    1,
+                    $"cannot open an incremental blob on view {tableName}");
+            }
+            if (catalog.VirtualTables.ContainsKey(tableName))
+            {
+                throw new ManagedBlobException(
+                    1,
+                    $"cannot open an incremental blob on virtual table {tableName}");
+            }
+
+            throw new ManagedBlobException(1, $"no such table: {tableName}");
+        }
+        if (table.WithoutRowid)
+            throw new ManagedBlobException(1, $"cannot open table without rowid: {tableName}");
+        if (!table.TryGetColumnIndex(columnName, out var logicalColumnIndex))
+            throw new ManagedBlobException(1, $"no such column: {columnName}");
+        if (logicalColumnIndex == table.RowidAliasColumnIndex)
+            throw new ManagedBlobException(1, "cannot open value of type integer");
+
+        var column = table.ColumnDefinitions[logicalColumnIndex];
+        if (column.IsGenerated && !column.GeneratedStored)
+            throw new ManagedBlobException(1, $"cannot open generated column: {columnName}");
+        if (transactionState?.HasSchemaChanges == true)
+        {
+            throw new ManagedBlobException(
+                1,
+                $"page-native incremental blob reads are unavailable after schema changes to table {tableName}");
+        }
+
+        SqlValue[]? visibleRow = null;
+        var rowResolvedFromOverlay = false;
+        if (transactionState?.Overlay is { } overlay
+            && overlay.TryGet(tableName, out var tableOverlay)
+            && tableOverlay.TryGetByRowId(rowId, out visibleRow))
+        {
+            rowResolvedFromOverlay = true;
+        }
+        else if (TryGetConcurrentMvccScope(database, out var mvStore, out var mvccTxId)
+                 && mvStore!.TryReadVisibleEffect(
+                     mvccTxId!.Value,
+                     new MvccRowId(mvStore.GetOrCreateTableId(mvccTxId.Value, tableName), rowId),
+                     out visibleRow,
+                     out var isDelete))
+        {
+            rowResolvedFromOverlay = true;
+            if (isDelete)
+                visibleRow = null;
+        }
+
+        if (rowResolvedFromOverlay)
+        {
+            if (visibleRow is null)
+                throw new ManagedBlobException(1, $"no such rowid: {rowId}");
+
+            source = CreateBlobValueReadSource(visibleRow, logicalColumnIndex);
+            try
+            {
+                mutationLease = database.OpenBlobMutationLease(
+                    tableName,
+                    rowId,
+                    out mutationGeneration);
+            }
+            catch
+            {
+                source.Dispose();
+                source = null!;
+                mutationLease?.Dispose();
+                mutationLease = null!;
+                throw;
+            }
+
+            return true;
+        }
+
+        if (table.RowIds.IndexOf(rowId) < 0)
+            throw new ManagedBlobException(1, $"no such rowid: {rowId}");
+        if (transactionState is not null && transactionState.PinnedSnapshot is null)
+        {
+            throw new ManagedBlobException(
+                1,
+                $"page-native incremental blob reads are unavailable after schema changes to table {tableName}");
+        }
+
+        var physicalColumnIndex = 0;
+        for (var index = 0; index < logicalColumnIndex; index++)
+        {
+            var preceding = table.ColumnDefinitions[index];
+            if (!preceding.IsGenerated || preceding.GeneratedStored)
+                physicalColumnIndex++;
+        }
+
+        SqliteRecordColumnLocation location;
+        try
+        {
+            if (!database.TryOpenBlobReadSource(
+                    table,
+                    rowId,
+                    physicalColumnIndex,
+                    transactionState?.PinnedSnapshot,
+                    requireCommittedTableIdentity: transactionState is null,
+                    out source,
+                    out location,
+                    out mutationLease,
+                    out mutationGeneration))
+            {
+                throw new ManagedBlobException(
+                    1,
+                    $"page-native incremental blob read source is unavailable for table {tableName}");
+            }
+        }
+        catch (InvalidDataException exception)
+            when (exception.Message.StartsWith(
+                "SQLite record does not contain column ",
+                StringComparison.Ordinal))
+        {
+            throw new ManagedBlobException(
+                1,
+                $"page-native incremental blob reads require a stored payload for column {columnName}");
+        }
+
+        if (location.StorageClass != SqliteRecordStorageClass.Blob)
+        {
+            source.Dispose();
+            mutationLease.Dispose();
+            source = null!;
+            mutationLease = null!;
+            throw new ManagedBlobException(1, "cannot open a non-BLOB value as an incremental blob");
+        }
+
+        return true;
+
+        static IManagedIncrementalBlobReadSource CreateBlobValueReadSource(
+            SqlValue[] row,
+            int columnIndex)
+        {
+            if ((uint)columnIndex >= (uint)row.Length || row[columnIndex].Kind != SqlValueKind.Blob)
+                throw new ManagedBlobException(1, "cannot open a non-BLOB value as an incremental blob");
+
+            return new SqlValueIncrementalBlobReadSource(row[columnIndex]);
+        }
+    }
+
     internal IDisposable OpenBlobMutationLease(string databaseName, string tableName, long rowId)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
@@ -50055,7 +50834,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 transactionOverlay: transactionState.Overlay,
                                 transactionPinnedSnapshot: transactionState.HasSchemaChanges
                                     ? null
-                                    : transactionState.PinnedSnapshot);
+                                    : transactionState.PinnedSnapshot,
+                                transactionBlobMutation: transactionState.RecordBlobMutation);
                             if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not
@@ -50072,6 +50852,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                         if (mutationReserved)
                             ReleaseTransactionMutation(routed.Database);
                     }
+                    if (result.Changed && EmbeddedDatabase.MayChangeSchema(routed.Statement))
+                        routed.Database.InvalidateBlobHandles();
                     if (result.Changed)
                         RemoveTempTriggersForDroppedObject(routed);
                     if (transactionState is not null)
@@ -54855,7 +55637,8 @@ Func<string, ParsedStatement> rewrite)
                         new HashSet<string>(
                             pair.Value.TargetedIndexRebuildNames,
                             StringComparer.OrdinalIgnoreCase),
-                        pair.Value.HasNonTargetedIndexRebuildChange));
+                        pair.Value.HasNonTargetedIndexRebuildChange,
+                        new Dictionary<BlobMutationIdentity, long>(pair.Value.BlobMutationCounts)));
             }
 
             _savepoints.Add(new SavepointEntry(
@@ -54922,6 +55705,17 @@ Func<string, ParsedStatement> rewrite)
             state.TargetedIndexRebuildNames.Clear();
             state.TargetedIndexRebuildNames.UnionWith(savedState.TargetedIndexRebuildNames);
             state.HasNonTargetedIndexRebuildChange = savedState.HasNonTargetedIndexRebuildChange;
+            foreach (var pair in state.BlobMutationCounts)
+            {
+                if (!savedState.BlobMutationCounts.TryGetValue(pair.Key, out var savedCount)
+                    || savedCount != pair.Value)
+                {
+                    database.RecordBlobMutation(pair.Key.TableName, pair.Key.RowId);
+                }
+            }
+            state.BlobMutationCounts.Clear();
+            foreach (var pair in savedState.BlobMutationCounts)
+                state.BlobMutationCounts.Add(pair.Key, pair.Value);
             if (state.Overlay is not null && savedState.OverlayCheckpoint is not null)
             {
                 state.Overlay.RestoreCheckpoint(
@@ -55009,6 +55803,15 @@ Func<string, ParsedStatement> rewrite)
 
         if (transactionDatabases is not null)
         {
+            if (rollbackVirtualTables)
+            {
+                foreach (var (database, state) in transactionDatabases)
+                {
+                    foreach (var identity in state.BlobMutationCounts.Keys)
+                        database.RecordBlobMutation(identity.TableName, identity.RowId);
+                }
+            }
+
             if (rollbackVirtualTables)
             {
                 foreach (var state in transactionDatabases.Values)
@@ -55100,7 +55903,8 @@ Func<string, ParsedStatement> rewrite)
         IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations,
         TransactionMutationOverlayCheckpoint? OverlayCheckpoint,
         IReadOnlySet<string> TargetedIndexRebuildNames,
-        bool HasNonTargetedIndexRebuildChange);
+        bool HasNonTargetedIndexRebuildChange,
+        IReadOnlyDictionary<BlobMutationIdentity, long> BlobMutationCounts);
 
     private void ThrowIfRecursiveTriggerCallbackReentry()
     {

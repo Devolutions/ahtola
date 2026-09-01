@@ -2,13 +2,14 @@ using AwesomeAssertions;
 using Ahtola.Core;
 using Ahtola.Core.Compilation;
 using Ahtola.Core.Execution;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
 
 // Compiler-output and execution coverage for the direct window-function lowering
-// (WindowProgramBuilder). The builder lowers a partitioned running-aggregate window —
-// the ROWS UNBOUNDED PRECEDING TO CURRENT ROW frame — into the sorter + aggregate opcode
-// families. These tests assert the emitted bytecode shape/jump layout and run the programs
+// (WindowProgramBuilder). The builder lowers running-prefix, exact-current-row, and one-preceding
+// ROWS frames into the sorter + aggregate opcode families. These tests assert the emitted
+// bytecode shape/jump layout and run the programs
 // through the resumable state machine to confirm real observable rows: per-partition
 // running values, row_number ordering, tie/NULL handling, empty/single-row/replay
 // behavior, and the frame/argument rejections. row_number() is modeled as a running
@@ -18,6 +19,19 @@ public class WindowProgramBuilderDirectTests
     private static AggregateFunctionSpec Sum(int column) => new(AggregateTestSupport.Sum(), [column]);
 
     private static AggregateFunctionSpec RowNumber() => new(AggregateTestSupport.CountStar(), []);
+
+    private static AggregateFunctionSpec InvertibleSum(int column) => new(
+        new VdbeAggregate
+        {
+            Name = "sum",
+            CreateContext = static () => 0L,
+            Accumulate = static (context, arguments) =>
+                checked((long)context! + arguments[0].AsInteger()),
+            Inverse = static (context, arguments) =>
+                checked((long)context! - arguments[0].AsInteger()),
+            Finalize = static context => SqlValue.Integer((long)context!),
+        },
+        [column]);
 
     [Test]
     public void BuildEmitsTheIngestSortDrainPipelineForAPartitionedRunningSum()
@@ -189,6 +203,114 @@ public class WindowProgramBuilderDirectTests
         var rows = Run(program, Rows([1, 10], [1, 20], [2, 30]));
 
         rows.Select(row => row[2].AsInteger()).Should().Equal(10, 30, 60);
+    }
+
+    [Test]
+    public void CurrentRowFrameStepsEmitsAndThenInversesEachRow()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.CurrentRow);
+
+        var opcodes = program.Instructions.Select(static instruction => instruction.Opcode).ToList();
+        var result = opcodes.IndexOf(VdbeOpcode.ResultRow);
+        opcodes[result - 1].Should().Be(VdbeOpcode.Copy);
+        opcodes[result + 1].Should().Be(VdbeOpcode.AggInverse);
+        opcodes[result + 2].Should().Be(VdbeOpcode.SorterNext);
+
+        var rows = Run(program, Rows([3], [1], [2]));
+        rows.Select(static row => row[0].AsInteger()).Should().Equal(1, 2, 3);
+        rows.Select(static row => row[1].AsInteger()).Should().Equal(1, 2, 3);
+    }
+
+    [Test]
+    public void OnePrecedingFrameRetainsAndInversesThePreviousRowPerPartition()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [0],
+            windows: [InvertibleSum(1)],
+            outputs:
+            [
+                WindowOutput.ForColumn(0),
+                WindowOutput.ForColumn(1),
+                WindowOutput.ForWindow(0),
+            ],
+            orderComparer: AggregateTestSupport.OrderByColumns(0, 1),
+            partitionComparer: AggregateTestSupport.GroupKeysEqual(),
+            frame: WindowFrameSpec.OnePreceding);
+
+        var opcodes = program.Instructions.Select(static instruction => instruction.Opcode).ToList();
+        var result = opcodes.IndexOf(VdbeOpcode.ResultRow);
+        opcodes[result + 1].Should().Be(VdbeOpcode.JumpIf);
+        opcodes[result + 2].Should().Be(VdbeOpcode.AggInverse);
+        opcodes[result + 3].Should().Be(VdbeOpcode.Copy);
+        opcodes[result + 4].Should().Be(VdbeOpcode.SorterNext);
+
+        var rows = Run(program, Rows([1, 30], [2, 7], [1, 10], [2, 3], [1, 20]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger(), row[2].AsInteger())).Should().Equal(
+            (1, 10, 10),
+            (1, 20, 30),
+            (1, 30, 50),
+            (2, 3, 3),
+            (2, 7, 10));
+    }
+
+    [Test]
+    public void OnePrecedingFrameSpillsWithinBudgetAndCleansUpOnCancellation()
+    {
+        const long budget = 16384;
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: budget,
+            temporaryDirectory: "window-one-preceding-cancellation",
+            metrics: metrics);
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.OnePreceding);
+        var rows = Enumerable.Range(1, 32)
+            .Reverse()
+            .Select(static value => new[]
+            {
+                SqlValue.Integer(value),
+                SqlValue.Text(new string('x', 512)),
+            })
+            .ToArray();
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            program,
+            options,
+            [new VdbeCursorSource(rows)]);
+
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
+        statement.CurrentRow.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1));
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
+        statement.CurrentRow.Should().Equal(SqlValue.Integer(2), SqlValue.Integer(3));
+        metrics.SorterRunsWritten.Should().BeGreaterThan(0);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        Assert.Throws<OperationCanceledException>(
+            () => statement.StepResumable(cancellation.Token));
+        statement.Dispose();
+
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Created.Should().NotBeEmpty();
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
     }
 
     [Test]
@@ -390,6 +512,18 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void MovingFramesRejectAnAggregateWithoutInverse()
+    {
+        foreach (var frame in new[] { WindowFrameSpec.CurrentRow, WindowFrameSpec.OnePreceding })
+        {
+            Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
+                "t", 1, [], [new AggregateFunctionSpec(AggregateTestSupport.Min(), [0])], [WindowOutput.ForWindow(0)],
+                AggregateTestSupport.OrderByColumns(0),
+                frame: frame));
+        }
+    }
+
+    [Test]
     public void BuildValidatesItsArguments()
     {
         var order = AggregateTestSupport.OrderByColumns(0);
@@ -509,5 +643,30 @@ public class WindowProgramBuilderDirectTests
         }
 
         return rows;
+    }
+
+    private sealed class TrackingFileSystem : IFileSystem
+    {
+        private readonly IFileSystem _inner = new InMemoryFileSystem();
+
+        public List<string> Created { get; } = [];
+
+        public List<string> Deleted { get; } = [];
+
+        public bool FileExists(string path) => _inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+        {
+            var file = _inner.OpenFile(path, mode, readOnly);
+            if (mode == FileOpenMode.CreateNew)
+                Created.Add(path);
+            return file;
+        }
+
+        public void DeleteFile(string path)
+        {
+            Deleted.Add(path);
+            _inner.DeleteFile(path);
+        }
     }
 }

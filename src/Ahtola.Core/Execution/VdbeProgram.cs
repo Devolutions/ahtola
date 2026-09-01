@@ -384,6 +384,9 @@ public enum VdbeOpcode
     /// Refill an index from its base table (Turso's <c>emit_refill_index</c> block, index.rs:326).
     /// </summary>
     IndexBuild = 135,
+
+    /// <summary>Remove one prior aggregate step as a row leaves a window frame (Turso <c>AggInverse</c>).</summary>
+    AggInverse = 136,
 }
 
 /// <summary>
@@ -651,12 +654,13 @@ public delegate IReadOnlyList<SqlValue[]> VdbeRecursiveGenerationTransform(
 public delegate IReadOnlyList<SqlValue[]> VdbeWindowEvaluator(IReadOnlyList<SqlValue[]> bufferedRows);
 
 /// <summary>
-/// A single aggregate function expressed as the three lifecycle operations the
+/// A single aggregate function expressed as the lifecycle operations the
 /// aggregate opcodes drive: create a fresh accumulator context, fold one argument
-/// tuple into it, and finalize it into a result value. The caller supplies the
-/// delegates so the emitted program reuses the evaluator's exact accumulation and
-/// null/type semantics (e.g. <c>COUNT</c> ignoring NULLs, <c>SUM</c> of no rows being
-/// NULL) rather than re-deriving them in the executor.
+/// tuple into it, optionally remove a previously folded tuple, and finalize it into
+/// a result value. The caller supplies the delegates so the emitted program reuses
+/// the evaluator's exact accumulation and null/type semantics (e.g. <c>COUNT</c>
+/// ignoring NULLs, <c>SUM</c> of no rows being NULL) rather than re-deriving them in
+/// the executor.
 /// </summary>
 /// <remarks>
 /// The context is an opaque <see cref="object"/> owned entirely by the delegates; the
@@ -675,6 +679,12 @@ public sealed class VdbeAggregate
 
     /// <summary>Folds one argument tuple into the accumulator, returning the next context.</summary>
     public required Func<object?, SqlValue[], object?> Accumulate { get; init; }
+
+    /// <summary>
+    /// Removes one previously folded argument tuple, returning the next context. Aggregate
+    /// descriptors that do not support inverse window steps leave this unset.
+    /// </summary>
+    public Func<object?, SqlValue[], object?>? Inverse { get; init; }
 
     /// <summary>Produces the group's result value from its accumulator context.</summary>
     public required Func<object?, SqlValue> Finalize { get; init; }
@@ -2092,10 +2102,12 @@ public sealed class VdbeSubprogram
         VdbeParameterBinding? parameterBinding,
         VdbeExecutionOptions executionOptions,
         VdbeExecutionMemory executionMemory,
+        VdbeTransactionContext transaction,
         VdbeSchemaExecutionContext? schemaContext = null)
     {
         ArgumentNullException.ThrowIfNull(executionOptions);
         ArgumentNullException.ThrowIfNull(executionMemory);
+        ArgumentNullException.ThrowIfNull(transaction);
         lock (_syncRoot)
         {
             var program = _program ?? throw new InvalidOperationException(
@@ -2106,7 +2118,7 @@ public sealed class VdbeSubprogram
                 _cursorSources,
                 writeTargets,
                 parameterBinding,
-                sharedTransaction: null,
+                sharedTransaction: transaction,
                 virtualTableBindings: null,
                 executionOptions: executionOptions,
                 executionMemory: executionMemory,
@@ -2881,6 +2893,20 @@ public sealed record AggStepInstruction(
     public override VdbeOpcode Opcode => VdbeOpcode.AggStep;
 }
 
+/// <summary>
+/// Removes the argument tuple in <paramref name="Arguments"/> from an already initialized
+/// <paramref name="Accumulator"/> using <see cref="VdbeAggregate.Inverse"/>. This mirrors
+/// SQLite/Turso window execution, where an inverse step is paired with a prior <c>AggStep</c>
+/// as a row leaves the frame's left edge.
+/// </summary>
+public sealed record AggInverseInstruction(
+    Accumulator Accumulator,
+    VdbeAggregate Aggregate,
+    RegisterRange Arguments) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.AggInverse;
+}
+
 /// <summary>Finalizes <paramref name="Accumulator"/> with <paramref name="Aggregate"/>
 /// and writes the result into <paramref name="Destination"/>. It does not reset the
 /// accumulator; grouped programs emit an explicit <c>AggReset</c> before the next group.</summary>
@@ -3038,7 +3064,9 @@ public sealed record UpdateInstruction(Cursor Cursor, VdbeInsertFlags Flags = Vd
 /// <summary>
 /// Invokes a nested VDBE program. Each register in <see cref="ParameterRegisters"/> becomes the value
 /// of the equally positioned parameter slot in <see cref="Subprogram"/>; rows produced by the child are
-/// consumed internally, as required for trigger and foreign-key action programs.
+/// consumed internally, as required for trigger and foreign-key action programs. A child
+/// <c>RAISE(IGNORE)</c> transfers control to <see cref="IgnoreJumpTarget"/>, or falls through when no
+/// explicit target is supplied.
 /// </summary>
 public sealed record ProgramInstruction : VdbeInstruction
 {
@@ -3047,17 +3075,32 @@ public sealed record ProgramInstruction : VdbeInstruction
     public ProgramInstruction(
         IEnumerable<Register> parameterRegisters,
         VdbeSubprogram subprogram)
+        : this(parameterRegisters, subprogram, ignoreJumpTarget: null)
+    {
+    }
+
+    public ProgramInstruction(
+        IEnumerable<Register> parameterRegisters,
+        VdbeSubprogram subprogram,
+        ProgramCounter? ignoreJumpTarget)
     {
         ArgumentNullException.ThrowIfNull(parameterRegisters);
         ArgumentNullException.ThrowIfNull(subprogram);
 
         _parameterRegisters = Array.AsReadOnly(parameterRegisters.ToArray());
         Subprogram = subprogram;
+        IgnoreJumpTarget = ignoreJumpTarget;
     }
 
     public IReadOnlyList<Register> ParameterRegisters => _parameterRegisters;
 
     public VdbeSubprogram Subprogram { get; }
+
+    /// <summary>
+    /// Parent-program destination used when the child halts with <see cref="VdbeHaltOnError.Ignore"/>.
+    /// A null target means the instruction immediately following this Program opcode.
+    /// </summary>
+    public ProgramCounter? IgnoreJumpTarget { get; }
 
     public override VdbeOpcode Opcode => VdbeOpcode.Program;
 }
@@ -4604,6 +4647,8 @@ public sealed class VdbeProgram
 
                     foreach (var parameterRegister in program.ParameterRegisters)
                         ValidateRegister(parameterRegister, instructionIndex);
+                    if (program.IgnoreJumpTarget is { } ignoreJumpTarget)
+                        ValidateJumpTarget(ignoreJumpTarget, instructionIndex);
                     break;
                 case CommitInstruction commit:
                     ValidateOpenCursor(commit.Cursor, openCursors, instructionIndex);
@@ -4887,6 +4932,22 @@ public sealed class VdbeProgram
                     }
 
                     ValidateRegisterRange(aggStep.Arguments, instructionIndex);
+                    break;
+                case AggInverseInstruction aggInverse:
+                    ValidateAccumulator(aggInverse.Accumulator, instructionIndex);
+                    if (aggInverse.Aggregate is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} inverses accumulator {aggInverse.Accumulator.Index} with a null aggregate.");
+                    }
+
+                    if (aggInverse.Aggregate.Inverse is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} inverses accumulator {aggInverse.Accumulator.Index} with aggregate '{aggInverse.Aggregate.Name}' that has no inverse operation.");
+                    }
+
+                    ValidateRegisterRange(aggInverse.Arguments, instructionIndex);
                     break;
                 case AggFinalizeInstruction aggFinalize:
                     ValidateAccumulator(aggFinalize.Accumulator, instructionIndex);

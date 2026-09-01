@@ -46,7 +46,7 @@ public class VdbeProgramTests
                 "CreateBtree=121", "ClearBtree=122", "Destroy=123", "ReadCookie=124",
                 "SetCookie=125", "ParseSchema=126", "DropTable=127", "DropView=128",
                 "DropIndex=129", "DropTrigger=130", "RenameTable=131", "AddColumn=132",
-                "DropColumn=133", "AlterColumn=134", "IndexBuild=135");
+                "DropColumn=133", "AlterColumn=134", "IndexBuild=135", "AggInverse=136");
 
         var constructors = typeof(VdbeProgram).GetConstructors();
         Type[] legacyParameterTypes =
@@ -281,7 +281,7 @@ public class VdbeProgramTests
 
         p1.Should().Be(2);
         p2.Should().Be(0);
-        p3.Should().Be(0);
+        p3.Should().Be(2);
         p4.Should().Be("subprogram");
         comment.Should().Be("invoke subprogram with r[2, 4]");
     }

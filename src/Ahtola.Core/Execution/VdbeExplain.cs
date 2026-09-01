@@ -572,6 +572,12 @@ public static class VdbeExplain
                 aggStep.Arguments.Count,
                 aggStep.Aggregate.Name,
                 $"accumulator {aggStep.Accumulator.Index}={aggStep.Aggregate.Name} step {FormatRange(aggStep.Arguments)}"),
+            AggInverseInstruction aggInverse => (
+                aggInverse.Accumulator.Index,
+                aggInverse.Arguments.Start.Index,
+                aggInverse.Arguments.Count,
+                aggInverse.Aggregate.Name,
+                $"accumulator {aggInverse.Accumulator.Index}={aggInverse.Aggregate.Name} inverse {FormatRange(aggInverse.Arguments)}"),
             AggFinalizeInstruction aggFinalize => (
                 aggFinalize.Accumulator.Index,
                 aggFinalize.Destination.Index,
@@ -605,11 +611,14 @@ public static class VdbeExplain
                     ? $"update current row of cursor {update.Cursor.Index}"
                     : $"update current row of cursor {update.Cursor.Index} flags={update.Flags}"),
             ProgramInstruction program => (
+                program.ParameterRegisters.Count == 0 ? 0 : program.ParameterRegisters[0].Index,
+                program.IgnoreJumpTarget?.Offset ?? 0,
                 program.ParameterRegisters.Count,
-                0,
-                0,
                 "subprogram",
-                $"invoke subprogram with {FormatRegisters(program.ParameterRegisters)}"),
+                $"invoke subprogram with {FormatRegisters(program.ParameterRegisters)}"
+                    + (program.IgnoreJumpTarget is { } ignoreJumpTarget
+                        ? $"; RAISE(IGNORE) goto {ignoreJumpTarget.Offset}"
+                        : string.Empty)),
             CommitInstruction commit => (
                 commit.Cursor.Index,
                 0,

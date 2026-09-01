@@ -49,6 +49,8 @@ public sealed class VdbeExecutionMetrics
 
     public long HashPartitionFallbackScans { get; private set; }
 
+    public long KeyedRowSetsSpilled { get; private set; }
+
     internal void Retain(long bytes, long rows)
     {
         CurrentRetainedBytes = checked(CurrentRetainedBytes + bytes);
@@ -94,6 +96,9 @@ public sealed class VdbeExecutionMetrics
 
     internal void HashPartitionFallbackScan() =>
         HashPartitionFallbackScans = checked(HashPartitionFallbackScans + 1);
+
+    internal void KeyedRowSetSpilled() =>
+        KeyedRowSetsSpilled = checked(KeyedRowSetsSpilled + 1);
 }
 
 internal sealed class VdbeExecutionMemory(long limitBytes, VdbeExecutionMetrics metrics)
@@ -240,6 +245,7 @@ internal static class VdbeManagedFootprint
     private const long RunDescriptorSlotBytes = 32;
     private const long SorterSpillObjectBytes = 96;
     private const long HashSpillObjectBytes = 96;
+    private const long KeyedRowSetSpillObjectBytes = 104;
     private const long HashPartitionObjectBytes = 32;
     private const long TemporaryFileObjectBytes = 64;
     private const long TemporaryFileWrapperBytes = 128;
@@ -383,6 +389,19 @@ internal static class VdbeManagedFootprint
             + EstimateTemporaryFileInfrastructure(
                 temporaryDirectory.Length,
                 "sorter".Length));
+    }
+
+    public static long EstimateKeyedRowSetSpillInfrastructure(string temporaryDirectory)
+    {
+        ArgumentNullException.ThrowIfNull(temporaryDirectory);
+        return checked(
+            KeyedRowSetSpillObjectBytes
+            + EstimateTemporaryFileInfrastructure(
+                temporaryDirectory.Length,
+                "keyed-row-set".Length)
+            + EstimateTemporaryFileInfrastructure(
+                temporaryDirectory.Length,
+                "keyed-row-index".Length));
     }
 
     public static int GetListCapacityForCount(int currentCapacity, int requiredCount)

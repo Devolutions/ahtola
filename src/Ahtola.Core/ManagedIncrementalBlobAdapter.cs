@@ -48,6 +48,48 @@ public sealed class ManagedBlobException : Exception
     public int ErrorCode { get; }
 }
 
+internal interface IManagedIncrementalBlobReadSource : IDisposable
+{
+    int Length { get; }
+
+    int Read(int offset, Span<byte> destination);
+}
+
+internal sealed class SqlValueIncrementalBlobReadSource : IManagedIncrementalBlobReadSource
+{
+    private SqlValue _value;
+    private bool _disposed;
+
+    public SqlValueIncrementalBlobReadSource(SqlValue value)
+    {
+        if (value.Kind != SqlValueKind.Blob)
+            throw new ArgumentException("Incremental blob sources require a BLOB value.", nameof(value));
+
+        _value = value;
+        Length = value.AsBlobSpan().Length;
+    }
+
+    public int Length { get; }
+
+    public int Read(int offset, Span<byte> destination)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var source = _value.AsBlobSpan();
+        if (offset >= source.Length || destination.IsEmpty)
+            return 0;
+
+        var bytesRead = Math.Min(destination.Length, source.Length - offset);
+        source.Slice(offset, bytesRead).CopyTo(destination);
+        return bytesRead;
+    }
+
+    public void Dispose()
+    {
+        _disposed = true;
+        _value = default;
+    }
+}
+
 internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAdapter
 {
     private const int SqliteError = 1;
@@ -60,6 +102,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
     private readonly string _columnName;
     private readonly long _rowId;
     private readonly bool _readOnly;
+    private readonly IManagedIncrementalBlobReadSource? _readSource;
     private byte[] _value;
     private SqlValue[] _rowSnapshot;
     private readonly IDisposable _mutationLease;
@@ -75,7 +118,8 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
         bool readOnly,
         BlobSnapshot snapshot,
         IDisposable mutationLease,
-        long mutationGeneration)
+        long mutationGeneration,
+        IManagedIncrementalBlobReadSource? readSource = null)
     {
         _connection = connection;
         _databaseName = databaseName;
@@ -83,6 +127,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
         _columnName = columnName;
         _rowId = rowId;
         _readOnly = readOnly;
+        _readSource = readSource;
         _value = snapshot.Value;
         _rowSnapshot = snapshot.Row;
         _mutationLease = mutationLease;
@@ -101,6 +146,38 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
         ArgumentNullException.ThrowIfNull(databaseName);
         ArgumentNullException.ThrowIfNull(tableName);
         ArgumentNullException.ThrowIfNull(columnName);
+
+        if (readOnly
+            && connection.TryOpenPageNativeBlobReadSource(
+                databaseName,
+                tableName,
+                columnName,
+                rowId,
+                out var readSource,
+                out var pageMutationLease,
+                out var mutationGeneration))
+        {
+            try
+            {
+                return new ManagedIncrementalBlobAdapter(
+                    connection,
+                    databaseName,
+                    tableName,
+                    columnName,
+                    rowId,
+                    readOnly: true,
+                    new BlobSnapshot([], []),
+                    pageMutationLease,
+                    mutationGeneration,
+                    readSource);
+            }
+            catch
+            {
+                pageMutationLease.Dispose();
+                readSource.Dispose();
+                throw;
+            }
+        }
 
         EnsureTable(connection, databaseName, tableName);
         var mutationLease = connection.OpenBlobMutationLease(databaseName, tableName, rowId);
@@ -138,7 +215,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             {
                 ThrowIfDisposed();
                 EnsureCurrent();
-                return _value.Length;
+                return _readSource?.Length ?? _value.Length;
             }
         }
     }
@@ -152,8 +229,12 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
                 throw new ArgumentOutOfRangeException(nameof(offset));
 
             EnsureCurrent();
-            if (offset >= _value.Length)
+            var length = _readSource?.Length ?? _value.Length;
+            if (offset >= length)
                 return 0;
+
+            if (_readSource is not null)
+                return _readSource.Read((int)offset, destination);
 
             var count = Math.Min(destination.Length, _value.Length - (int)offset);
             _value.AsSpan((int)offset, count).CopyTo(destination);
@@ -219,7 +300,14 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
 
             _disposed = true;
             _value = [];
-            _mutationLease.Dispose();
+            try
+            {
+                _readSource?.Dispose();
+            }
+            finally
+            {
+                _mutationLease.Dispose();
+            }
         }
     }
 
@@ -232,6 +320,14 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
     private void EnsureCurrent()
     {
         var generationBeforeRead = _connection.GetBlobMutationGeneration(_databaseName, _tableName, _rowId);
+        if (_readSource is not null)
+        {
+            if (generationBeforeRead != _mutationGeneration)
+                throw Aborted();
+
+            return;
+        }
+
         var snapshot = ReadSnapshot(
             _connection,
             _databaseName,

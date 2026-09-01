@@ -295,6 +295,7 @@ public static class LimitOffsetProgramBuilder
                 or CloseWindowBufferInstruction
                 or AggResetInstruction
                 or AggStepInstruction
+                or AggInverseInstruction
                 or AggFinalizeInstruction
                 or FunctionInstruction
                 or ArithmeticInstruction

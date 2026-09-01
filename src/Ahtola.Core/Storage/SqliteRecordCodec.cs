@@ -3,8 +3,35 @@ using System.Text;
 
 namespace Ahtola.Core.Storage;
 
+/// <summary>The SQLite storage class encoded by a record serial type.</summary>
+public enum SqliteRecordStorageClass
+{
+    Null,
+    Integer,
+    Real,
+    Blob,
+    Text,
+}
+
+/// <summary>Physical location and type metadata for one value in a SQLite record payload.</summary>
+public readonly record struct SqliteRecordColumnLocation(
+    ulong PayloadOffset,
+    ulong Length,
+    ulong SerialType,
+    SqliteRecordStorageClass StorageClass)
+{
+    /// <summary>Whether the value can be addressed as bytes by incremental BLOB I/O.</summary>
+    public bool IsByteAddressable
+        => StorageClass is SqliteRecordStorageClass.Blob or SqliteRecordStorageClass.Text;
+}
+
 public static class SqliteRecordCodec
 {
+    /// <summary>
+    /// Maximum well-formed record-header size at SQLite's hard limit of 32,767 columns.
+    /// </summary>
+    public const int MaximumHeaderSize = SqliteVarint.MaximumLength + (32767 * SqliteVarint.MaximumLength);
+
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly UnicodeEncoding StrictUtf16LittleEndian = new(false, false, true);
     private static readonly UnicodeEncoding StrictUtf16BigEndian = new(true, false, true);
@@ -94,6 +121,66 @@ public static class SqliteRecordCodec
         return values;
     }
 
+    /// <summary>
+    /// Locates one column body from exactly the record-header bytes without decoding any value body.
+    /// </summary>
+    public static SqliteRecordColumnLocation LocateColumn(
+        ReadOnlySpan<byte> header,
+        ulong payloadLength,
+        int columnIndex)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(columnIndex);
+        if (!SqliteVarint.TryRead(header, out var headerSizeValue, out var headerSizeLength))
+            throw new InvalidDataException("SQLite record header size is invalid.");
+        if (headerSizeValue != (ulong)header.Length
+            || header.Length < headerSizeLength
+            || header.Length > MaximumHeaderSize
+            || (ulong)header.Length > payloadLength)
+        {
+            throw new InvalidDataException(
+                $"SQLite record header size {headerSizeValue} is inconsistent with its payload.");
+        }
+
+        var headerPosition = headerSizeLength;
+        var bodyPosition = (ulong)header.Length;
+        for (var currentColumn = 0; ; currentColumn++)
+        {
+            if (headerPosition >= header.Length)
+            {
+                throw new InvalidDataException(
+                    $"SQLite record does not contain column {columnIndex}.");
+            }
+
+            if (!SqliteVarint.TryRead(
+                    header[headerPosition..],
+                    out var serialType,
+                    out var serialTypeLength))
+            {
+                throw new InvalidDataException("SQLite record serial type is invalid.");
+            }
+
+            headerPosition = checked(headerPosition + serialTypeLength);
+            var bodyLength = GetBodyLength64(serialType);
+            if (bodyPosition > payloadLength || bodyLength > payloadLength - bodyPosition)
+            {
+                throw new InvalidDataException(
+                    $"SQLite record column {currentColumn} extends outside its payload.");
+            }
+
+            var bodyEnd = bodyPosition + bodyLength;
+            if (currentColumn == columnIndex)
+            {
+                return new SqliteRecordColumnLocation(
+                    bodyPosition,
+                    bodyLength,
+                    serialType,
+                    GetStorageClass(serialType));
+            }
+
+            bodyPosition = bodyEnd;
+        }
+    }
+
     /// <summary>The SQLite serial type that will represent <paramref name="value"/>.</summary>
     private static ulong GetSerialType(SqlValue value, Encoding textEncoding)
         => value.Kind switch
@@ -119,6 +206,31 @@ public static class SqliteRecordCodec
             6 or 7 => 8,
             10 or 11 => throw new InvalidOperationException($"SQLite record uses reserved serial type {serialType}."),
             _ => checked((int)((serialType - (serialType % 2 == 0 ? 12UL : 13UL)) / 2)),
+        };
+
+    private static ulong GetBodyLength64(ulong serialType)
+        => serialType switch
+        {
+            0 or 8 or 9 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 or 7 => 8,
+            10 or 11 => throw new InvalidDataException($"SQLite record uses reserved serial type {serialType}."),
+            _ => (serialType - (serialType % 2 == 0 ? 12UL : 13UL)) / 2,
+        };
+
+    private static SqliteRecordStorageClass GetStorageClass(ulong serialType)
+        => serialType switch
+        {
+            0 => SqliteRecordStorageClass.Null,
+            1 or 2 or 3 or 4 or 5 or 6 or 8 or 9 => SqliteRecordStorageClass.Integer,
+            7 => SqliteRecordStorageClass.Real,
+            10 or 11 => throw new InvalidDataException($"SQLite record uses reserved serial type {serialType}."),
+            _ when serialType % 2 == 0 => SqliteRecordStorageClass.Blob,
+            _ => SqliteRecordStorageClass.Text,
         };
 
     private static ulong GetIntegerSerialType(long value)

@@ -146,13 +146,28 @@ public class ManagedSqltestConformanceTests
             .Where(static discovered => discovered.Status == SqltestCaseStatus.UnsupportedHarness)
             .ToDictionary(static discovered => discovered.Id, StringComparer.Ordinal);
 
-        SqltestCorpus.HarnessExclusions.Should().ContainSingle(
-            "in-process exclusions must stay exceptional and individually reviewed");
+        SqltestCorpus.HarnessExclusions.Should().BeEmpty(
+            "every discovered managed sqltest case must be bounded in-process");
         foreach (var (id, reason) in SqltestCorpus.HarnessExclusions)
         {
             unsupported.Should().ContainKey(id, "stale exclusions silently shrink conformance coverage");
             reason.Should().NotBeNullOrWhiteSpace();
         }
+    }
+
+    [Test]
+    public void FourWayInnerJoinMatchesWithinTheManagedHarness()
+    {
+        var discovered = SqltestCorpus.Cases.Single(candidate =>
+            candidate.RelativePath == "join/default.sqltest"
+            && candidate.TestName == "four-way-inner-join");
+        discovered.Status.Should().Be(SqltestCaseStatus.Runnable);
+
+        var file = SqltestCorpus.LoadFile(discovered.RelativePath, discovered.FullPath);
+        var test = file.Tests.Single(candidate => candidate.Name == discovered.TestName);
+        var outcome = SqltestManagedRunner.Run(file, test);
+
+        outcome.Matched.Should().BeTrue(outcome.Detail);
     }
 
     [Test]

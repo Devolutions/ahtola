@@ -599,6 +599,23 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         return ManagedIncrementalBlobAdapter.Open(this, databaseName, tableName, columnName, rowId, readOnly);
     }
 
+    internal bool TryOpenPageNativeBlobReadSource(
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowId,
+        out IManagedIncrementalBlobReadSource source,
+        out IDisposable mutationLease,
+        out long mutationGeneration)
+        => GetConnection().TryOpenPageNativeBlobReadSource(
+            databaseName,
+            tableName,
+            columnName,
+            rowId,
+            out source,
+            out mutationLease,
+            out mutationGeneration);
+
     public void RegisterScalarFunction(string name, int arity, Func<IReadOnlyList<SqlValue>, SqlValue> function)
     {
         GetConnection().RegisterScalarFunction(name, arity, function);
