@@ -20947,7 +20947,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     resolveColumnIndex,
                     resolveColumnDefinition);
         }
-        if (expression is UnaryExpression unary
+        if (expression is UnaryExpression { Operator: not UnaryOperator.Plus } unary
             && TryMapArithmeticOperator(unary.Operator, out _))
         {
             return IsSafeCompiledJoinOperand(
@@ -22130,7 +22130,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 return true;
             }
-            if (expression is UnaryExpression unary
+            if (expression is UnaryExpression { Operator: not UnaryOperator.Plus } unary
                 && TryMapArithmeticOperator(unary.Operator, out _))
             {
                 return true;
