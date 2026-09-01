@@ -115,6 +115,77 @@ public sealed class ManagedIncrementalPagerTests
     }
 
     [Test]
+    public void PointLookupReadsBoundedPayloadRangesAcrossOverflowBoundaries()
+    {
+        const int payloadLength = 1024 * 1024;
+        var pageIo = new CountingPageIo(pageSize: 4096, usableSpace: 4096, initialPageCount: 2);
+        pageIo.WritePage(2u, SqliteTableLeafPageBuilderImage(pageIo));
+        var payload = Enumerable.Range(0, payloadLength)
+            .Select(static value => unchecked((byte)(value * 31)))
+            .ToArray();
+        new SqliteIncrementalTableBtree(pageIo).Insert(2, 7, payload);
+
+        var layout = SqlitePayloadLayout.Calculate(
+            SqliteBtreePageType.TableLeaf,
+            (ulong)payload.Length,
+            pageIo.UsableSpace);
+        var overflowCapacity = pageIo.UsableSpace - SqliteOverflowPageView.HeaderLength;
+        var cursor = new SqliteTableBtreeCursor(pageIo);
+        pageIo.ResetReadCount();
+        cursor.TryGetPayloadLength(2, 7, out var storedLength).Should().BeTrue();
+        storedLength.Should().Be((ulong)payload.Length);
+        pageIo.ReadCount.Should().Be(1, "payload length comes from the table-leaf cell header");
+
+        AssertPayloadRange(
+            cursor,
+            pageIo,
+            payload,
+            checked((ulong)(layout.LocalPayloadLength - 17)),
+            length: 64,
+            maximumPageReads: 2);
+        AssertPayloadRange(
+            cursor,
+            pageIo,
+            payload,
+            checked((ulong)(layout.LocalPayloadLength + overflowCapacity - 17)),
+            length: 64,
+            maximumPageReads: 3);
+    }
+
+    [Test]
+    public void BoundedPayloadReadDoesNotAllocateTheCompleteRecord()
+    {
+        const int payloadLength = 1024 * 1024;
+        var pageIo = new CountingPageIo(pageSize: 4096, usableSpace: 4096, initialPageCount: 2);
+        pageIo.WritePage(2u, SqliteTableLeafPageBuilderImage(pageIo));
+        var payload = new byte[payloadLength];
+        payload.AsSpan().Fill(0x5A);
+        new SqliteIncrementalTableBtree(pageIo).Insert(2, 11, payload);
+
+        var localLength = SqlitePayloadLayout.Calculate(
+            SqliteBtreePageType.TableLeaf,
+            (ulong)payload.Length,
+            pageIo.UsableSpace).LocalPayloadLength;
+        var offset = checked((ulong)(localLength - 8));
+        var destination = new byte[32];
+        var cursor = new SqliteTableBtreeCursor(pageIo);
+
+        cursor.TryReadPayload(2, 11, offset, destination).Should().BeTrue();
+        pageIo.ResetReadCount();
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+        var found = cursor.TryReadPayload(2, 11, offset, destination);
+
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        found.Should().BeTrue();
+        destination.Should().OnlyContain(static value => value == 0x5A);
+        pageIo.ReadCount.Should().BeLessThanOrEqualTo(2);
+        allocated.Should().BeLessThan(
+            payloadLength / 8,
+            "a bounded range read must allocate for touched pages, not the complete record");
+    }
+
+    [Test]
     public void IncrementalMutationsMatchSqliteAcrossIndexesOverflowAndDeletes()
     {
         var path = CreateDatabasePath("differential");
@@ -292,6 +363,23 @@ public sealed class ManagedIncrementalPagerTests
             record[index] = unchecked((byte)(rowId + index));
 
         return record;
+    }
+
+    private static void AssertPayloadRange(
+        SqliteTableBtreeCursor cursor,
+        CountingPageIo pageIo,
+        byte[] payload,
+        ulong offset,
+        int length,
+        int maximumPageReads)
+    {
+        var destination = new byte[length];
+        pageIo.ResetReadCount();
+
+        cursor.TryReadPayload(2, 7, offset, destination).Should().BeTrue();
+
+        destination.Should().Equal(payload.AsSpan(checked((int)offset), length).ToArray());
+        pageIo.ReadCount.Should().BeLessThanOrEqualTo(maximumPageReads);
     }
 
     private static void AssertSqliteIntegrityCheck(string path)

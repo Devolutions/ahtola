@@ -4,9 +4,9 @@ namespace Ahtola.Core.Storage;
 /// A read cursor over a SQLite rowid-table b-tree.
 /// </summary>
 /// <remarks>
-/// Seeking descends from the root to one leaf, so the pages it reads are bounded
-/// by the height of the tree plus the overflow pages of the row it returns. It
-/// shares the <see cref="ISqliteBtreePageIo"/> boundary with
+/// Seeking descends from the root to one leaf. A complete record read then visits
+/// its overflow chain, while a bounded payload read visits only the pages needed
+/// to reach and fill that range. It shares the <see cref="ISqliteBtreePageIo"/> boundary with
 /// <see cref="SqliteIncrementalTableBtree"/>, so a cursor opened over a staging
 /// layer observes uncommitted mutations exactly as the writer left them.
 /// </remarks>
@@ -29,6 +29,51 @@ public sealed class SqliteTableBtreeCursor
     /// </summary>
     public bool TrySeek(uint rootPage, long rowId, out byte[] record)
     {
+        if (!TrySeekCell(rootPage, rowId, out var cell))
+        {
+            record = [];
+            return false;
+        }
+
+        record = new SqliteOverflowChainReader(_io).ReadPayload(cell);
+        return true;
+    }
+
+    /// <summary>
+    /// Reads one exact range from the record payload stored at
+    /// <paramref name="rowId"/> without materializing the complete record.
+    /// </summary>
+    public bool TryReadPayload(
+        uint rootPage,
+        long rowId,
+        ulong offset,
+        Span<byte> destination)
+    {
+        if (!TrySeekCell(rootPage, rowId, out var cell))
+            return false;
+
+        new SqliteOverflowChainReader(_io).ReadPayloadRange(cell, offset, destination);
+        return true;
+    }
+
+    /// <summary>
+    /// Gets the logical record-payload length for <paramref name="rowId"/>
+    /// without reading its overflow payload.
+    /// </summary>
+    public bool TryGetPayloadLength(uint rootPage, long rowId, out ulong payloadLength)
+    {
+        if (!TrySeekCell(rootPage, rowId, out var cell))
+        {
+            payloadLength = 0;
+            return false;
+        }
+
+        payloadLength = cell.PayloadLength;
+        return true;
+    }
+
+    private bool TrySeekCell(uint rootPage, long rowId, out SqliteTableLeafCell cell)
+    {
         var pageNumber = rootPage;
         for (var depth = 0; depth < MaximumDepth; depth++)
         {
@@ -42,12 +87,11 @@ public sealed class SqliteTableBtreeCursor
                         var search = leaf.Search(rowId);
                         if (!search.IsExact)
                         {
-                            record = [];
+                            cell = null!;
                             return false;
                         }
 
-                        record = new SqliteOverflowChainReader(_io)
-                            .ReadPayload(leaf.Cells[search.Index].Cell);
+                        cell = leaf.Cells[search.Index].Cell;
                         return true;
                     }
 
