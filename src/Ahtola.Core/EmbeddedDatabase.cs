@@ -23112,8 +23112,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // tried in order:
     //
     //  1. The streaming program (WindowProgramBuilder): the narrow shapes whose window calls all share
-    //     either a running-prefix or exact-current-row ROWS frame over aggregate functions of bare
-    //     columns. The current-row shape uses AggInverse after emission; neither buffers a partition.
+    //     a running-prefix, exact-current-row, or literal 1 PRECEDING ROWS frame over aggregate
+    //     functions of bare columns. Moving shapes use AggInverse; none buffers a partition.
     //     See TryBuildStreamingWindowProgram for its exact grammar.
     //  2. The buffered-window program (BufferedWindowProgramBuilder): every other window shape whose
     //     inputs are computable from one scanned row. It buffers the scanned rows through the
@@ -23341,7 +23341,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return false;
     }
 
-    // The streaming running/current-row lowering. It reuses the evaluator's own accumulation
+    // The streaming running/current-row/1-preceding lowering. It reuses the evaluator's own accumulation
     // (BuildAccumulatorAggregate), partition equality (BuildGroupComparers), and ordering (CompareRows)
     // so a routed row is byte-identical to the fallback.
     //
@@ -23351,8 +23351,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // where each <proj> is one of: '*', a bare backed column, a folded constant, or
     //   agg(<bare column>|*) OVER ([PARTITION BY <bare cols>] [ORDER BY <scan terms>]
     //                              <supported ROWS frame>)
-    // where the running frame supports the existing aggregate set, while the exact-current-row
-    // frame admits only inverse-capable count/sum/avg calls. Every call shares one OVER spec.
+    // where the running frame supports the existing aggregate set, while moving frames admit
+    // only inverse-capable count/sum/avg calls. Every call shares one OVER spec.
     //
     // Exactness of the emitted (partition, order) sort order requires the top-level ORDER BY to be
     // the partition columns (in any direction, as a bijective prefix) followed by the window ORDER BY
@@ -23859,7 +23859,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // Recognizes a top-level streaming window call over bare, backed columns, appends its
     // VdbeAggregate to <paramref name="windows"/>, and yields the output that projects the
     // finalized per-row value. Declines (returns false) for DISTINCT/FILTER modifiers, any frame
-    // other than the running or exact-current-row frame, non-aggregate window functions,
+    // other than the supported running/current/one-preceding frames, non-aggregate window functions,
     // arguments that are not bare columns, or a spec that differs from an earlier window call, so
     // those shapes fall back to the evaluator, which produces the value or its exact error.
     private bool TryClassifyStreamingWindowCall(
@@ -23883,7 +23883,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var window = function.Window!;
         if (!TryGetStreamingWindowFrame(window.Frame, out var frame))
             return false;
-        if (frame.IsCurrentRow && function.Name is not ("COUNT" or "SUM" or "AVG"))
+        if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG"))
             return false;
 
         // The bytecode shape only models aggregate accumulation. Dedicated ranking,
@@ -23919,7 +23919,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var aggregate = BuildAccumulatorAggregate(function, argumentNames, parameters, context, outerRow);
-        if (frame.IsCurrentRow && aggregate.Inverse is null)
+        if (frame.RequiresInverse && aggregate.Inverse is null)
             return false;
 
         var windowIndex = windows.Count;
@@ -23928,8 +23928,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return true;
     }
 
-    // The streaming builder handles the running prefix and the exact current row. The latter
-    // follows Turso's moving-frame order: step, emit, then inverse the departing row.
+    // The streaming builder handles the running prefix, exact current row, and literal 1 PRECEDING.
+    // Moving frames follow Turso's order: step, emit, then inverse the departing row.
     private static bool TryGetStreamingWindowFrame(WindowFrame? frame, out WindowFrameSpec spec)
     {
         spec = default;
@@ -23951,6 +23951,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
             && frame.End.Kind == FrameBoundKind.CurrentRow)
         {
             spec = WindowFrameSpec.CurrentRow;
+            return true;
+        }
+
+        if (frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } offset,
+            }
+            && offset.Value.AsInteger() == 1
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Offset is null)
+        {
+            spec = WindowFrameSpec.OnePreceding;
             return true;
         }
 
@@ -39425,8 +39438,8 @@ out bool hasReturning)
             if (_count == 0)
                 throw new InvalidOperationException("Aggregate inverse removed a row from an empty numeric aggregate.");
 
-            // The exact-current-row route always reaches this fast path. Resetting instead of adding
-            // the negated value also avoids manufacturing NaN for an infinite one-row SUM/AVG frame.
+            // If the departing value is the aggregate's only non-NULL input, reset exactly. This also
+            // avoids manufacturing NaN when an infinite value leaves a one-row SUM/AVG frame.
             if (_count == 1)
             {
                 Reset();
