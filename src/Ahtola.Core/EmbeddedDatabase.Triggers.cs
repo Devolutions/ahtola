@@ -3179,13 +3179,20 @@ public sealed partial class EmbeddedDatabase
     private static QueryContext TriggerStatementContext(
         QueryContext context,
         ParsedStatement statement)
-        => statement is InsertStatement insert
-            ? context with
+        => statement switch
+        {
+            InsertStatement insert => context with
             {
                 ConflictAlgorithmOverride =
                     context.ConflictAlgorithmOverride ?? insert.ConflictAlgorithm,
-            }
-            : context;
+            },
+            UpdateStatement update => context with
+            {
+                ConflictAlgorithmOverride =
+                    context.ConflictAlgorithmOverride ?? update.ConflictAlgorithm,
+            },
+            _ => context,
+        };
 
     private bool TriggerStatementRequiresStatementRollback(
         QueryContext context,
@@ -3610,7 +3617,7 @@ public sealed partial class EmbeddedDatabase
         var columns = update.Assignments
             .Select(assignment => assignment.Column)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        return GetRowTriggers(
+        IEnumerable<TriggerDefinition> triggers = GetRowTriggers(
             context,
             update.TableName,
             TriggerTiming.Before,
@@ -3628,6 +3635,25 @@ public sealed partial class EmbeddedDatabase
                 TriggerTiming.InsteadOf,
                 TriggerEvent.Update,
                 columns));
+        var mayReplace = context.ConflictAlgorithmOverride == InsertConflictAlgorithm.Replace
+            || context.Tables.TryGetValue(update.TableName, out var table)
+                && table.HasNonDefaultConflictAlgorithms;
+        if (context.RecursiveTriggersEnabled && mayReplace)
+        {
+            triggers = triggers
+                .Concat(GetRowTriggers(
+                    context,
+                    update.TableName,
+                    TriggerTiming.Before,
+                    TriggerEvent.Delete))
+                .Concat(GetRowTriggers(
+                    context,
+                    update.TableName,
+                    TriggerTiming.After,
+                    TriggerEvent.Delete));
+        }
+
+        return triggers;
     }
 
     private void ValidateTriggerStatement(

@@ -414,6 +414,40 @@ public sealed class VdbeAfterTriggerSqlRoutingTests
                 + "UNION ALL SELECT 'victim', id, NULL FROM victim ORDER BY 1, 2");
     }
 
+    [Test]
+    public void InheritedReplaceUpdateThatCanMutateTheSourceTableStaysEvaluatorOwned()
+    {
+        string[] setup =
+        [
+            "PRAGMA recursive_triggers = ON",
+            "CREATE TABLE data(id INTEGER PRIMARY KEY, value INTEGER)",
+            "CREATE TABLE middle(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE victim(id INTEGER PRIMARY KEY, key INTEGER UNIQUE)",
+            "INSERT INTO data VALUES (1, 10), (2, 20)",
+            "INSERT INTO victim VALUES (1, 1), (2, 2)",
+            "CREATE TRIGGER data_after AFTER UPDATE ON data BEGIN "
+                + "INSERT OR REPLACE INTO middle VALUES (NEW.id); END",
+            "CREATE TRIGGER middle_after AFTER INSERT ON middle BEGIN "
+                + "UPDATE victim SET key = 1 WHERE id = 2; END",
+            "CREATE TRIGGER victim_after AFTER DELETE ON victim BEGIN "
+                + "DELETE FROM data WHERE id = 2; END",
+        ];
+        using var database = new EmbeddedDatabase();
+        using var managed = database.Connect();
+        using var sqlite = OpenSqlite();
+        ExecuteBoth(managed, sqlite, setup);
+
+        AssertExplainFallsBack(managed, "EXPLAIN UPDATE data SET value = value + 1");
+        Execute(managed, "UPDATE data SET value = value + 1");
+        Execute(sqlite, "UPDATE data SET value = value + 1");
+        AssertQueriesMatch(
+            managed,
+            sqlite,
+            "SELECT 'data', id, value FROM data "
+                + "UNION ALL SELECT 'middle', id, NULL FROM middle "
+                + "UNION ALL SELECT 'victim', id, key FROM victim ORDER BY 1, 2");
+    }
+
     private static void AssertProgramTargets(
         IReadOnlyList<SqlValue[]> explain,
         int expectedCount,
