@@ -2092,10 +2092,12 @@ public sealed class VdbeSubprogram
         VdbeParameterBinding? parameterBinding,
         VdbeExecutionOptions executionOptions,
         VdbeExecutionMemory executionMemory,
+        VdbeTransactionContext transaction,
         VdbeSchemaExecutionContext? schemaContext = null)
     {
         ArgumentNullException.ThrowIfNull(executionOptions);
         ArgumentNullException.ThrowIfNull(executionMemory);
+        ArgumentNullException.ThrowIfNull(transaction);
         lock (_syncRoot)
         {
             var program = _program ?? throw new InvalidOperationException(
@@ -2106,7 +2108,7 @@ public sealed class VdbeSubprogram
                 _cursorSources,
                 writeTargets,
                 parameterBinding,
-                sharedTransaction: null,
+                sharedTransaction: transaction,
                 virtualTableBindings: null,
                 executionOptions: executionOptions,
                 executionMemory: executionMemory,
@@ -3038,7 +3040,9 @@ public sealed record UpdateInstruction(Cursor Cursor, VdbeInsertFlags Flags = Vd
 /// <summary>
 /// Invokes a nested VDBE program. Each register in <see cref="ParameterRegisters"/> becomes the value
 /// of the equally positioned parameter slot in <see cref="Subprogram"/>; rows produced by the child are
-/// consumed internally, as required for trigger and foreign-key action programs.
+/// consumed internally, as required for trigger and foreign-key action programs. A child
+/// <c>RAISE(IGNORE)</c> transfers control to <see cref="IgnoreJumpTarget"/>, or falls through when no
+/// explicit target is supplied.
 /// </summary>
 public sealed record ProgramInstruction : VdbeInstruction
 {
@@ -3047,17 +3051,32 @@ public sealed record ProgramInstruction : VdbeInstruction
     public ProgramInstruction(
         IEnumerable<Register> parameterRegisters,
         VdbeSubprogram subprogram)
+        : this(parameterRegisters, subprogram, ignoreJumpTarget: null)
+    {
+    }
+
+    public ProgramInstruction(
+        IEnumerable<Register> parameterRegisters,
+        VdbeSubprogram subprogram,
+        ProgramCounter? ignoreJumpTarget)
     {
         ArgumentNullException.ThrowIfNull(parameterRegisters);
         ArgumentNullException.ThrowIfNull(subprogram);
 
         _parameterRegisters = Array.AsReadOnly(parameterRegisters.ToArray());
         Subprogram = subprogram;
+        IgnoreJumpTarget = ignoreJumpTarget;
     }
 
     public IReadOnlyList<Register> ParameterRegisters => _parameterRegisters;
 
     public VdbeSubprogram Subprogram { get; }
+
+    /// <summary>
+    /// Parent-program destination used when the child halts with <see cref="VdbeHaltOnError.Ignore"/>.
+    /// A null target means the instruction immediately following this Program opcode.
+    /// </summary>
+    public ProgramCounter? IgnoreJumpTarget { get; }
 
     public override VdbeOpcode Opcode => VdbeOpcode.Program;
 }
@@ -4604,6 +4623,8 @@ public sealed class VdbeProgram
 
                     foreach (var parameterRegister in program.ParameterRegisters)
                         ValidateRegister(parameterRegister, instructionIndex);
+                    if (program.IgnoreJumpTarget is { } ignoreJumpTarget)
+                        ValidateJumpTarget(ignoreJumpTarget, instructionIndex);
                     break;
                 case CommitInstruction commit:
                     ValidateOpenCursor(commit.Cursor, openCursors, instructionIndex);

@@ -2113,6 +2113,7 @@ public sealed class ResumableStatement : IDisposable
                 CreateSubprogramBinding(instruction),
                 _executionOptions,
                 _memory,
+                _transaction,
                 _schemaContext);
             _subprogramStatements[instructionOffset] = subprogram;
         }
@@ -2127,21 +2128,36 @@ public sealed class ResumableStatement : IDisposable
                 subprogram.Rebind(CreateSubprogramBinding(instruction)!);
         }
 
-        while (true)
+        try
         {
-            switch (subprogram.StepResumable(cancellationToken))
+            while (true)
             {
-                case ResumableStatementStepResult.Row:
-                    continue;
-                case ResumableStatementStepResult.Yielded:
-                    State = ResumableStatementState.Yielded;
-                    return true;
-                case ResumableStatementStepResult.Done:
-                    AdvanceInstructionPointer();
-                    return false;
-                default:
-                    throw new InvalidOperationException("Nested VDBE program returned an unknown step result.");
+                switch (subprogram.StepResumable(cancellationToken))
+                {
+                    case ResumableStatementStepResult.Row:
+                        continue;
+                    case ResumableStatementStepResult.Yielded:
+                        State = ResumableStatementState.Yielded;
+                        return true;
+                    case ResumableStatementStepResult.Done:
+                        AdvanceInstructionPointer();
+                        return false;
+                    default:
+                        throw new InvalidOperationException("Nested VDBE program returned an unknown step result.");
+                }
             }
+        }
+        catch (TriggerIgnoreException)
+        {
+            // An ignored trigger frame is aborted, not cached for reuse. Turso's Program opcode
+            // converts this child-only signal into parent control flow.
+            _subprogramStatements.Remove(instructionOffset);
+            subprogram.Dispose();
+            if (instruction.IgnoreJumpTarget is { } ignoreJumpTarget)
+                _instructionPointer = ignoreJumpTarget;
+            else
+                AdvanceInstructionPointer();
+            return false;
         }
     }
 

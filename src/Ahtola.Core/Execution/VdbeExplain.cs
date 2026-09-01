@@ -606,10 +606,13 @@ public static class VdbeExplain
                     : $"update current row of cursor {update.Cursor.Index} flags={update.Flags}"),
             ProgramInstruction program => (
                 program.ParameterRegisters.Count,
-                0,
+                program.IgnoreJumpTarget?.Offset ?? 0,
                 0,
                 "subprogram",
-                $"invoke subprogram with {FormatRegisters(program.ParameterRegisters)}"),
+                $"invoke subprogram with {FormatRegisters(program.ParameterRegisters)}"
+                    + (program.IgnoreJumpTarget is { } ignoreJumpTarget
+                        ? $"; RAISE(IGNORE) goto {ignoreJumpTarget.Offset}"
+                        : string.Empty)),
             CommitInstruction commit => (
                 commit.Cursor.Index,
                 0,
