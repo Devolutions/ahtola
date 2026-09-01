@@ -19555,6 +19555,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             FunctionInstruction
             or AggResetInstruction
             or AggStepInstruction
+            or AggInverseInstruction
             or AggFinalizeInstruction
             or OpenSorterInstruction
             or OpenWindowBufferInstruction
@@ -26522,6 +26523,12 @@ out bool hasReturning)
                 aggStep.Arguments.Count,
                 aggStep.Aggregate.Name,
                 $"accumulator {aggStep.Accumulator.Index}={aggStep.Aggregate.Name} step {FormatRegisterRange(aggStep.Arguments)}"),
+            AggInverseInstruction aggInverse => (
+                aggInverse.Accumulator.Index,
+                aggInverse.Arguments.Start.Index,
+                aggInverse.Arguments.Count,
+                aggInverse.Aggregate.Name,
+                $"accumulator {aggInverse.Accumulator.Index}={aggInverse.Aggregate.Name} inverse {FormatRegisterRange(aggInverse.Arguments)}"),
             AggFinalizeInstruction aggFinalize => (
                 aggFinalize.Accumulator.Index,
                 aggFinalize.Destination.Index,

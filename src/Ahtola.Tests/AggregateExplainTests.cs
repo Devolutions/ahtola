@@ -6,7 +6,7 @@ using Ahtola.Core.Execution;
 namespace Ahtola.Tests;
 
 // EXPLAIN description coverage for the aggregate opcode family (AggReset/AggStep/
-// AggFinalize) and its grouped control flow (Goto/SameGroup). Confirms the
+// AggInverse/AggFinalize) and its grouped control flow (Goto/SameGroup). Confirms the
 // addr/opcode/p1/p2/p3/p4/comment shape matches the sorter-family conventions and
 // describes whole built aggregate programs end to end.
 public class AggregateExplainTests
@@ -55,6 +55,31 @@ public class AggregateExplainTests
         p3.Should().Be(0);
         p4.Should().Be("sum");
         comment.Should().Be("r[5]=sum finalize accumulator 0");
+    }
+
+    [Test]
+    public void DescribesAggInverseForSingleAndNullaryArgumentRanges()
+    {
+        var single = VdbeExplain.Describe(
+            new AggInverseInstruction(
+                new Accumulator(0),
+                AggregateTestSupport.Sum(),
+                new RegisterRange(new Register(4), 1)));
+        single.P1.Should().Be(0);
+        single.P2.Should().Be(4);
+        single.P3.Should().Be(1);
+        single.P4.Should().Be("sum");
+        single.Comment.Should().Be("accumulator 0=sum inverse r[4]");
+
+        var nullary = VdbeExplain.Describe(
+            new AggInverseInstruction(
+                new Accumulator(2),
+                AggregateTestSupport.CountStar(),
+                new RegisterRange(new Register(0), 0)));
+        nullary.P1.Should().Be(2);
+        nullary.P3.Should().Be(0);
+        nullary.P4.Should().Be("count");
+        nullary.Comment.Should().Be("accumulator 2=count inverse r[]");
     }
 
     [Test]

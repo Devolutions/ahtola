@@ -1338,6 +1338,30 @@ public sealed class ResumableStatement : IDisposable
 
                         break;
                     }
+                case AggInverseInstruction aggInverse:
+                    {
+                        try
+                        {
+                            var index = aggInverse.Accumulator.Index;
+                            if (!_accumulatorInitialized[index])
+                            {
+                                throw new InvalidOperationException(
+                                    $"AggInverse accumulator {index} is not initialized; AggStep must run first.");
+                            }
+
+                            _accumulatorContexts[index] = aggInverse.Aggregate.Inverse!(
+                                _accumulatorContexts[index],
+                                ReadRegisters(aggInverse.Arguments));
+                            AdvanceInstructionPointer();
+                        }
+                        catch
+                        {
+                            State = ResumableStatementState.Faulted;
+                            throw;
+                        }
+
+                        break;
+                    }
                 case AggFinalizeInstruction aggFinalize:
                     {
                         try

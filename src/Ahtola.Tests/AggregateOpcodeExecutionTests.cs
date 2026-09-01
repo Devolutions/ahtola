@@ -1,11 +1,12 @@
 using AwesomeAssertions;
 using Ahtola.Core;
+using Ahtola.Core.Compilation;
 using Ahtola.Core.Execution;
 
 namespace Ahtola.Tests;
 
-// Opcode-level coverage for the aggregate family (AggReset/AggStep/AggFinalize) and its
-// grouped control flow (Goto/SameGroup). Programs are built by hand from the public
+// Opcode-level coverage for the aggregate family (AggReset/AggStep/AggInverse/AggFinalize)
+// and its grouped control flow (Goto/SameGroup). Programs are built by hand from the public
 // Execution contract and run through the resumable state machine, so the tests exercise
 // the interpreter and validator directly rather than any database wiring.
 public class AggregateOpcodeExecutionTests
@@ -123,6 +124,142 @@ public class AggregateOpcodeExecutionTests
         var rows = RunToCompletion(program);
 
         rows[0].Should().Equal(SqlValue.Integer(3));
+    }
+
+    [Test]
+    public void AggInverseRemovesSteppedRowsBeforeFinalize()
+    {
+        var sum = AggregateTestSupport.Sum();
+        VdbeInstruction[] instructions =
+        [
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(10)),
+            new AggStepInstruction(new Accumulator(0), sum, new RegisterRange(new Register(0), 1)),
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(20)),
+            new AggStepInstruction(new Accumulator(0), sum, new RegisterRange(new Register(0), 1)),
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(10)),
+            new AggInverseInstruction(new Accumulator(0), sum, new RegisterRange(new Register(0), 1)),
+            new AggFinalizeInstruction(new Accumulator(0), sum, new Register(1)),
+            new ResultRowInstruction(new RegisterRange(new Register(1), 1)),
+            new HaltInstruction(),
+        ];
+
+        var program = new VdbeProgram(registerCount: 2, cursorCount: 0, instructions, accumulatorCount: 1);
+
+        RunToCompletion(program)[0].Should().Equal(SqlValue.Integer(20));
+    }
+
+    [Test]
+    public void NullaryAggInverseRemovesOneCountStarStep()
+    {
+        var count = AggregateTestSupport.CountStar();
+        var noArguments = new RegisterRange(new Register(0), 0);
+        VdbeInstruction[] instructions =
+        [
+            new AggStepInstruction(new Accumulator(0), count, noArguments),
+            new AggStepInstruction(new Accumulator(0), count, noArguments),
+            new AggStepInstruction(new Accumulator(0), count, noArguments),
+            new AggInverseInstruction(new Accumulator(0), count, noArguments),
+            new AggFinalizeInstruction(new Accumulator(0), count, new Register(0)),
+            new ResultRowInstruction(new RegisterRange(new Register(0), 1)),
+            new HaltInstruction(),
+        ];
+
+        var program = new VdbeProgram(registerCount: 1, cursorCount: 0, instructions, accumulatorCount: 1);
+
+        RunToCompletion(program)[0].Should().Equal(SqlValue.Integer(2));
+    }
+
+    [Test]
+    public void AggInverseStoresTheReplacementContextAndCannotMutateRegisters()
+    {
+        var aggregate = new VdbeAggregate
+        {
+            Name = "replace",
+            CreateContext = static () => 0L,
+            Accumulate = static (context, arguments) => (long)context! + arguments[0].AsInteger(),
+            Inverse = static (context, arguments) =>
+            {
+                var next = (long)context! - arguments[0].AsInteger();
+                arguments[0] = SqlValue.Integer(999);
+                return next;
+            },
+            Finalize = static context => SqlValue.Integer((long)context!),
+        };
+        VdbeInstruction[] instructions =
+        [
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(7)),
+            new AggStepInstruction(new Accumulator(0), aggregate, new RegisterRange(new Register(0), 1)),
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(2)),
+            new AggInverseInstruction(new Accumulator(0), aggregate, new RegisterRange(new Register(0), 1)),
+            new AggFinalizeInstruction(new Accumulator(0), aggregate, new Register(1)),
+            new ResultRowInstruction(new RegisterRange(new Register(0), 2)),
+            new HaltInstruction(),
+        ];
+
+        var program = new VdbeProgram(registerCount: 2, cursorCount: 0, instructions, accumulatorCount: 1);
+
+        RunToCompletion(program)[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(5));
+    }
+
+    [Test]
+    public void AggInverseRequiresAPriorStep()
+    {
+        var sum = AggregateTestSupport.Sum();
+        var program = new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 0,
+            [
+                new AggInverseInstruction(
+                    new Accumulator(0),
+                    sum,
+                    new RegisterRange(new Register(0), 1)),
+                new HaltInstruction(),
+            ],
+            accumulatorCount: 1);
+        using var statement = new ResumableStatement(program);
+
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable())!
+            .Message.Should().Be("AggInverse accumulator 0 is not initialized; AggStep must run first.");
+        statement.State.Should().Be(ResumableStatementState.Faulted);
+    }
+
+    [Test]
+    public void AggInverseComposesWithCompoundAndLimitRelocation()
+    {
+        static CompoundTerm Term(long stepped, long removed)
+        {
+            var sum = AggregateTestSupport.Sum();
+            var program = new VdbeProgram(
+                registerCount: 2,
+                cursorCount: 0,
+                [
+                    new LoadConstantInstruction(new Register(0), SqlValue.Integer(stepped)),
+                    new AggStepInstruction(
+                        new Accumulator(0),
+                        sum,
+                        new RegisterRange(new Register(0), 1)),
+                    new LoadConstantInstruction(new Register(0), SqlValue.Integer(removed)),
+                    new AggStepInstruction(
+                        new Accumulator(0),
+                        sum,
+                        new RegisterRange(new Register(0), 1)),
+                    new AggInverseInstruction(
+                        new Accumulator(0),
+                        sum,
+                        new RegisterRange(new Register(0), 1)),
+                    new AggFinalizeInstruction(new Accumulator(0), sum, new Register(1)),
+                    new ResultRowInstruction(new RegisterRange(new Register(1), 1)),
+                    new HaltInstruction(),
+                ],
+                accumulatorCount: 1);
+            return new CompoundTerm(program, Array.Empty<VdbeCursorSource>());
+        }
+        var compound = CompoundProgramBuilder.BuildUnionAll([Term(10, 3), Term(20, 5)]);
+        var gated = LimitOffsetProgramBuilder.Apply(compound.Program, offset: 0, limit: 2);
+
+        RunToCompletion(gated).Select(row => row[0]).Should().Equal(
+            SqlValue.Integer(10),
+            SqlValue.Integer(20));
     }
 
     [Test]
@@ -263,6 +400,58 @@ public class AggregateOpcodeExecutionTests
             cursorCount: 0,
             [
                 new AggStepInstruction(new Accumulator(0), sum, new RegisterRange(new Register(0), 3)),
+                new HaltInstruction(),
+            ],
+            accumulatorCount: 1));
+
+        // Inversing with a null aggregate.
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 0,
+            [
+                new AggInverseInstruction(
+                    new Accumulator(0),
+                    null!,
+                    new RegisterRange(new Register(0), 1)),
+                new HaltInstruction(),
+            ],
+            accumulatorCount: 1));
+
+        // Inversing with an aggregate that does not implement inverse.
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 0,
+            [
+                new AggInverseInstruction(
+                    new Accumulator(0),
+                    AggregateTestSupport.Min(),
+                    new RegisterRange(new Register(0), 1)),
+                new HaltInstruction(),
+            ],
+            accumulatorCount: 1));
+
+        // Inversing arguments that reach outside the register file.
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 0,
+            [
+                new AggInverseInstruction(
+                    new Accumulator(0),
+                    sum,
+                    new RegisterRange(new Register(0), 3)),
+                new HaltInstruction(),
+            ],
+            accumulatorCount: 1));
+
+        // Inversing with an accumulator beyond the declared count.
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 0,
+            [
+                new AggInverseInstruction(
+                    new Accumulator(1),
+                    sum,
+                    new RegisterRange(new Register(0), 1)),
                 new HaltInstruction(),
             ],
             accumulatorCount: 1));
@@ -431,6 +620,59 @@ public class AggregateOpcodeExecutionTests
     }
 
     [Test]
+    public void FailedAggregateInverseRequiresResetBeforeRetry()
+    {
+        var failOnce = true;
+        var aggregate = new VdbeAggregate
+        {
+            Name = "fail-inverse-once",
+            CreateContext = static () => 0L,
+            Accumulate = static (context, arguments) => (long)context! + arguments[0].AsInteger(),
+            Inverse = (context, arguments) =>
+            {
+                if (failOnce)
+                {
+                    failOnce = false;
+                    throw new InvalidOperationException("aggregate inverse failed");
+                }
+
+                return (long)context! - arguments[0].AsInteger();
+            },
+            Finalize = static context => SqlValue.Integer((long)context!),
+        };
+        var program = new VdbeProgram(
+            registerCount: 2,
+            cursorCount: 0,
+            [
+                new LoadConstantInstruction(new Register(0), SqlValue.Integer(5)),
+                new AggStepInstruction(
+                    new Accumulator(0),
+                    aggregate,
+                    new RegisterRange(new Register(0), 1)),
+                new LoadConstantInstruction(new Register(0), SqlValue.Integer(2)),
+                new AggInverseInstruction(
+                    new Accumulator(0),
+                    aggregate,
+                    new RegisterRange(new Register(0), 1)),
+                new AggFinalizeInstruction(new Accumulator(0), aggregate, new Register(1)),
+                new ResultRowInstruction(new RegisterRange(new Register(1), 1)),
+                new HaltInstruction(),
+            ],
+            accumulatorCount: 1);
+        using var statement = new ResumableStatement(program);
+
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable())!
+            .Message.Should().Be("aggregate inverse failed");
+        statement.State.Should().Be(ResumableStatementState.Faulted);
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable())!
+            .Message.Should().Contain("Call Reset");
+
+        statement.Reset();
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
+        statement.CurrentRow.Should().Equal(SqlValue.Integer(3));
+    }
+
+    [Test]
     public void NewAggregateOpcodesPreserveExistingNumericValues()
     {
         ((int)VdbeOpcode.Next).Should().Be(17);
@@ -438,6 +680,7 @@ public class AggregateOpcodeExecutionTests
         ((int)VdbeOpcode.Halt).Should().Be(57);
         ((int)VdbeOpcode.GroupKey).Should().Be(58);
         ((int)VdbeOpcode.DistinctGate).Should().Be(59);
+        ((int)VdbeOpcode.AggInverse).Should().Be(136);
     }
 
     // Loads saved/current keys, compares them with SameGroup, and returns the value the

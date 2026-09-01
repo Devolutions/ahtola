@@ -572,6 +572,12 @@ public static class VdbeExplain
                 aggStep.Arguments.Count,
                 aggStep.Aggregate.Name,
                 $"accumulator {aggStep.Accumulator.Index}={aggStep.Aggregate.Name} step {FormatRange(aggStep.Arguments)}"),
+            AggInverseInstruction aggInverse => (
+                aggInverse.Accumulator.Index,
+                aggInverse.Arguments.Start.Index,
+                aggInverse.Arguments.Count,
+                aggInverse.Aggregate.Name,
+                $"accumulator {aggInverse.Accumulator.Index}={aggInverse.Aggregate.Name} inverse {FormatRange(aggInverse.Arguments)}"),
             AggFinalizeInstruction aggFinalize => (
                 aggFinalize.Accumulator.Index,
                 aggFinalize.Destination.Index,
