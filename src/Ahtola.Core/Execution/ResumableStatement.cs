@@ -45,9 +45,10 @@ public sealed class ResumableStatement : IDisposable
     private readonly SorterRuntime?[] _sorters;
     private readonly object?[] _accumulatorContexts;
     private readonly bool[] _accumulatorInitialized;
-    private readonly List<SqlValue[]>?[] _distinctSets;
+    private readonly VdbeKeyedRowStore?[] _distinctSets;
+    private readonly SorterRuntime?[] _rowSetSorters;
+    private readonly List<SqlValue[]>?[] _groupKeys;
     private readonly Dictionary<SqlValue[], int>?[] _groupIndexes;
-    private readonly int[] _rowSetPositions;
     private readonly Dictionary<int, IntegerRowSet> _integerRowSets = [];
     private readonly Dictionary<int, ResumableStatement> _subprogramStatements = [];
     private readonly WorkTableRuntime?[] _workTables;
@@ -160,9 +161,10 @@ public sealed class ResumableStatement : IDisposable
         _sorters = new SorterRuntime?[program.SorterCount];
         _accumulatorContexts = new object?[program.AccumulatorCount];
         _accumulatorInitialized = new bool[program.AccumulatorCount];
-        _distinctSets = new List<SqlValue[]>?[program.DistinctSetCount];
+        _distinctSets = new VdbeKeyedRowStore?[program.DistinctSetCount];
+        _rowSetSorters = new SorterRuntime?[program.DistinctSetCount];
+        _groupKeys = new List<SqlValue[]>?[program.DistinctSetCount];
         _groupIndexes = new Dictionary<SqlValue[], int>?[program.DistinctSetCount];
-        _rowSetPositions = new int[program.DistinctSetCount];
         _workTables = new WorkTableRuntime?[program.WorkTableCount];
         _windowBuffers = new WindowBufferRuntime?[program.WindowBufferCount];
         _ephemeralTables = new EphemeralTableRuntime?[program.CursorCount];
@@ -863,7 +865,7 @@ public sealed class ResumableStatement : IDisposable
                                 $"GROUP BY projector returned {key.Length} value(s), expected {groupKey.KeyCount}.");
                         }
 
-                        var groups = _distinctSets[groupKey.GroupSetIndex] ??= [];
+                        var groups = _groupKeys[groupKey.GroupSetIndex] ??= [];
                         var groupIndex = -1;
                         if (groupKey.Hasher is not null)
                         {
@@ -921,18 +923,25 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case DistinctFilterInstruction distinctFilter:
                     {
-                        var candidate = ReadRegisters(distinctFilter.Values);
-                        if (RowSetContains(
-                                distinctFilter.DistinctSetIndex,
+                        try
+                        {
+                            var candidate = ReadRegisters(distinctFilter.Values);
+                            if (RequireRowSet(distinctFilter.DistinctSetIndex).TryInsert(
                                 candidate,
-                                distinctFilter.Equality))
-                        {
-                            _instructionPointer = distinctFilter.DuplicateTarget;
+                                distinctFilter.Equality,
+                                replaceExisting: false,
+                                cancellationToken))
+                            {
+                                AdvanceInstructionPointer();
+                            }
+                            else
+                            {
+                                _instructionPointer = distinctFilter.DuplicateTarget;
+                            }
                         }
-                        else
+                        catch (Exception exception)
                         {
-                            (_distinctSets[distinctFilter.DistinctSetIndex] ??= []).Add(candidate);
-                            AdvanceInstructionPointer();
+                            FailExecution(exception);
                         }
 
                         break;
@@ -1373,111 +1382,144 @@ public sealed class ResumableStatement : IDisposable
                     return ResumableStatementStepResult.Row;
                 case DistinctResultRowInstruction distinctRow:
                     {
-                        // Compare the candidate against every row already emitted through this
-                        // distinct set. Duplicates advance without producing a row (continuing the
-                        // dispatch loop); the first occurrence of a row is recorded and yielded.
-                        var candidate = ReadRegisters(distinctRow.Values);
-                        var seen = _distinctSets[distinctRow.DistinctSetIndex] ??= [];
-                        var duplicate = false;
-                        foreach (var emitted in seen)
+                        try
                         {
-                            if (distinctRow.Equality(emitted, candidate))
-                            {
-                                duplicate = true;
+                            var candidate = ReadRegisters(distinctRow.Values);
+                            var inserted = RequireRowSet(distinctRow.DistinctSetIndex).TryInsert(
+                                candidate,
+                                distinctRow.Equality,
+                                replaceExisting: false,
+                                cancellationToken);
+
+                            AdvanceInstructionPointer();
+                            if (!inserted)
                                 break;
-                            }
+
+                            _currentRow = Array.AsReadOnly(candidate);
+                            State = ResumableStatementState.Row;
+                            return ResumableStatementStepResult.Row;
                         }
-
-                        AdvanceInstructionPointer();
-                        if (duplicate)
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
                             break;
-
-                        seen.Add(candidate);
-                        _currentRow = Array.AsReadOnly(candidate);
-                        State = ResumableStatementState.Row;
-                        return ResumableStatementStepResult.Row;
+                        }
                     }
                 case DistinctGateInstruction distinctGate:
                     {
-                        var candidate = ReadRegisters(distinctGate.Values);
-                        var seen = _distinctSets[distinctGate.DistinctSetIndex] ??= [];
-                        var duplicate = false;
-                        foreach (var emitted in seen)
+                        try
                         {
-                            if (distinctGate.Equality(emitted, candidate))
+                            var candidate = ReadRegisters(distinctGate.Values);
+                            if (RequireRowSet(distinctGate.DistinctSetIndex).TryInsert(
+                                candidate,
+                                distinctGate.Equality,
+                                replaceExisting: false,
+                                cancellationToken))
                             {
-                                duplicate = true;
-                                break;
+                                AdvanceInstructionPointer();
+                            }
+                            else
+                            {
+                                _instructionPointer = distinctGate.DuplicateTarget;
                             }
                         }
-
-                        if (duplicate)
+                        catch (Exception exception)
                         {
-                            _instructionPointer = distinctGate.DuplicateTarget;
-                        }
-                        else
-                        {
-                            seen.Add(candidate);
-                            AdvanceInstructionPointer();
+                            FailExecution(exception);
                         }
 
                         break;
                     }
                 case RowSetInsertInstruction rowSetInsert:
                     {
-                        // A temporary B-tree overwrites an equal key with the later record, so retain the
-                        // latest representative while preserving one row per distinct tuple.
-                        var candidate = ReadRegisters(rowSetInsert.Values);
-                        var set = _distinctSets[rowSetInsert.RowSetIndex] ??= [];
-                        var existingIndex = -1;
-                        for (var index = 0; index < set.Count; index++)
+                        try
                         {
-                            if (rowSetInsert.Equality(set[index], candidate))
-                            {
-                                existingIndex = index;
-                                break;
-                            }
+                            RequireRowSet(rowSetInsert.RowSetIndex).TryInsert(
+                                ReadRegisters(rowSetInsert.Values),
+                                rowSetInsert.Equality,
+                                replaceExisting: true,
+                                cancellationToken);
+                            AdvanceInstructionPointer();
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
                         }
 
-                        if (existingIndex < 0)
-                            set.Add(candidate);
-                        else
-                            set[existingIndex] = candidate;
-
-                        AdvanceInstructionPointer();
                         break;
                     }
                 case RowSetRewindInstruction rowSetRewind:
                     {
-                        var set = _distinctSets[rowSetRewind.RowSetIndex];
-                        _rowSetPositions[rowSetRewind.RowSetIndex] = 0;
-                        if (set is null || set.Count == 0)
+                        try
                         {
-                            _instructionPointer = rowSetRewind.EmptyTarget;
-                            break;
+                            var set = _distinctSets[rowSetRewind.RowSetIndex];
+                            DisposeRowSetSorter(rowSetRewind.RowSetIndex);
+                            if (set is null || set.Count == 0)
+                            {
+                                _instructionPointer = rowSetRewind.EmptyTarget;
+                                break;
+                            }
+
+                            if (rowSetRewind.Comparer is not null && set.Count > 1)
+                            {
+                                if (set.IsSpilled)
+                                {
+                                    var sorter = BuildRowSetSorter(
+                                        rowSetRewind.RowSetIndex,
+                                        set,
+                                        rowSetRewind.Comparer,
+                                        rowSetRewind.Destination.Count,
+                                        cancellationToken);
+                                    CopyRowSetRow(sorter.Current(), rowSetRewind.Destination);
+                                }
+                                else
+                                {
+                                    set.SortBuffered(rowSetRewind.Comparer, cancellationToken);
+                                    set.Rewind(cancellationToken);
+                                    CopyRowSetRow(set.Current(), rowSetRewind.Destination);
+                                }
+                            }
+                            else
+                            {
+                                set.Rewind(cancellationToken);
+                                CopyRowSetRow(set.Current(), rowSetRewind.Destination);
+                            }
+
+                            AdvanceInstructionPointer();
                         }
-
-                        if (rowSetRewind.Comparer is not null && set.Count > 1)
-                            set.Sort((left, right) => rowSetRewind.Comparer(left, right));
-
-                        CopyRowSetRow(set[0], rowSetRewind.Destination);
-                        AdvanceInstructionPointer();
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
                         break;
                     }
                 case RowSetNextInstruction rowSetNext:
                     {
-                        var set = _distinctSets[rowSetNext.RowSetIndex]
-                            ?? throw new InvalidOperationException(
-                                $"Cannot advance unopened row set {rowSetNext.RowSetIndex}.");
-                        var position = checked(++_rowSetPositions[rowSetNext.RowSetIndex]);
-                        if (position < set.Count)
+                        try
                         {
-                            CopyRowSetRow(set[position], rowSetNext.Destination);
-                            _instructionPointer = rowSetNext.LoopTarget;
+                            var sorter = _rowSetSorters[rowSetNext.RowSetIndex];
+                            var hasNext = sorter is not null
+                                ? sorter.MoveNext(cancellationToken)
+                                : (_distinctSets[rowSetNext.RowSetIndex]
+                                    ?? throw new InvalidOperationException(
+                                        $"Cannot advance unopened row set {rowSetNext.RowSetIndex}."))
+                                    .MoveNext(cancellationToken);
+                            if (hasNext)
+                            {
+                                CopyRowSetRow(
+                                    sorter?.Current()
+                                        ?? _distinctSets[rowSetNext.RowSetIndex]!.Current(),
+                                    rowSetNext.Destination);
+                                _instructionPointer = rowSetNext.LoopTarget;
+                            }
+                            else
+                            {
+                                AdvanceInstructionPointer();
+                            }
                         }
-                        else
+                        catch (Exception exception)
                         {
-                            AdvanceInstructionPointer();
+                            FailExecution(exception);
                         }
 
                         break;
@@ -1515,80 +1557,101 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case CompoundResultRowInstruction compoundRow:
                     {
-                        // Emit the candidate only when it satisfies the membership condition against every
-                        // probe set and is novel to the output set. A failing or duplicate candidate advances
-                        // without producing a row, so the primary term keeps streaming in its own order.
-                        var candidate = ReadRegisters(compoundRow.Values);
-                        var passesMembership = true;
-                        foreach (var membershipSetIndex in compoundRow.MembershipSetIndices)
+                        try
                         {
-                            var contained = RowSetContains(membershipSetIndex, candidate, compoundRow.Equality);
-                            var required = compoundRow.Mode == CompoundMembershipMode.PresentInAll;
-                            if (contained != required)
+                            var candidate = ReadRegisters(compoundRow.Values);
+                            var passesMembership = true;
+                            foreach (var membershipSetIndex in compoundRow.MembershipSetIndices)
                             {
-                                passesMembership = false;
+                                var contained = RowSetContains(
+                                    membershipSetIndex,
+                                    candidate,
+                                    compoundRow.Equality,
+                                    cancellationToken);
+                                var required = compoundRow.Mode == CompoundMembershipMode.PresentInAll;
+                                if (contained != required)
+                                {
+                                    passesMembership = false;
+                                    break;
+                                }
+                            }
+
+                            AdvanceInstructionPointer();
+                            if (!passesMembership)
+                                break;
+
+                            if (!RequireRowSet(compoundRow.OutputSetIndex).TryInsert(
+                                candidate,
+                                compoundRow.Equality,
+                                replaceExisting: false,
+                                cancellationToken))
+                            {
                                 break;
                             }
+
+                            _currentRow = Array.AsReadOnly(candidate);
+                            State = ResumableStatementState.Row;
+                            return ResumableStatementStepResult.Row;
                         }
-
-                        AdvanceInstructionPointer();
-                        if (!passesMembership)
-                            break;
-
-                        var output = _distinctSets[compoundRow.OutputSetIndex] ??= [];
-                        var duplicate = false;
-                        foreach (var emitted in output)
+                        catch (Exception exception)
                         {
-                            if (compoundRow.Equality(emitted, candidate))
-                            {
-                                duplicate = true;
-                                break;
-                            }
-                        }
-
-                        if (duplicate)
+                            FailExecution(exception);
                             break;
-
-                        output.Add(candidate);
-                        _currentRow = Array.AsReadOnly(candidate);
-                        State = ResumableStatementState.Row;
-                        return ResumableStatementStepResult.Row;
+                        }
                     }
                 case GuardedRowInstruction guardedRow:
                     {
-                        var candidate = ReadRegisters(guardedRow.Values);
-                        var accepted = EvaluateRowGuards(guardedRow.Guards, candidate);
-
-                        AdvanceInstructionPointer();
-                        if (!accepted)
-                            break;
-
-                        switch (guardedRow.Destination)
+                        try
                         {
-                            case ResultRowDestination:
-                                _currentRow = Array.AsReadOnly(candidate);
-                                State = ResumableStatementState.Row;
-                                return ResumableStatementStepResult.Row;
-                            case RowSetDestination destination:
-                                TryInsertRowSet(destination.RowSetIndex, candidate, destination.Equality);
+                            var candidate = ReadRegisters(guardedRow.Values);
+                            var accepted = EvaluateRowGuards(
+                                guardedRow.Guards,
+                                candidate,
+                                cancellationToken);
+
+                            AdvanceInstructionPointer();
+                            if (!accepted)
                                 break;
-                            default:
-                                throw new InvalidOperationException(
-                                    $"Validated guarded row contains unsupported destination {guardedRow.Destination.GetType().Name}.");
+
+                            switch (guardedRow.Destination)
+                            {
+                                case ResultRowDestination:
+                                    _currentRow = Array.AsReadOnly(candidate);
+                                    State = ResumableStatementState.Row;
+                                    return ResumableStatementStepResult.Row;
+                                case RowSetDestination destination:
+                                    TryInsertRowSet(
+                                        destination.RowSetIndex,
+                                        candidate,
+                                        destination.Equality,
+                                        cancellationToken);
+                                    break;
+                                default:
+                                    throw new InvalidOperationException(
+                                        $"Validated guarded row contains unsupported destination {guardedRow.Destination.GetType().Name}.");
+                            }
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
                         }
 
                         break;
                     }
                 case RowGateInstruction rowGate:
                     {
-                        // Same guard pipeline as GuardedRow, but emission is left to the plain ResultRow that
-                        // follows. A rejected candidate jumps past the whole emit block, so it never reaches
-                        // the offset/limit counters and is not charged against them.
-                        var candidate = ReadRegisters(rowGate.Values);
-                        if (EvaluateRowGuards(rowGate.Guards, candidate))
-                            AdvanceInstructionPointer();
-                        else
-                            _instructionPointer = rowGate.RejectTarget;
+                        try
+                        {
+                            var candidate = ReadRegisters(rowGate.Values);
+                            if (EvaluateRowGuards(rowGate.Guards, candidate, cancellationToken))
+                                AdvanceInstructionPointer();
+                            else
+                                _instructionPointer = rowGate.RejectTarget;
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
 
                         break;
                     }
@@ -1825,8 +1888,9 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
+        Array.Clear(_rowSetSorters);
+        Array.Clear(_groupKeys);
         Array.Clear(_groupIndexes);
-        Array.Clear(_rowSetPositions);
         _integerRowSets.Clear();
         foreach (var subprogram in _subprogramStatements.Values)
             subprogram.Reset();
@@ -2062,8 +2126,9 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
+        Array.Clear(_rowSetSorters);
+        Array.Clear(_groupKeys);
         Array.Clear(_groupIndexes);
-        Array.Clear(_rowSetPositions);
         _integerRowSets.Clear();
         foreach (var subprogram in _subprogramStatements.Values)
             subprogram.Dispose();
@@ -2276,7 +2341,36 @@ public sealed class ResumableStatement : IDisposable
         List<Exception>? cleanupFailures = null;
         TryDispose(DisposeAllJoinCursors, ref cleanupFailures);
         TryDispose(DisposeAllSorters, ref cleanupFailures);
+        TryDispose(DisposeAllRowSets, ref cleanupFailures);
         TryDispose(DisposeAllVirtualCursors, ref cleanupFailures);
+        ThrowCleanupFailures(cleanupFailures);
+    }
+
+    private void DisposeAllRowSets()
+    {
+        List<Exception>? cleanupFailures = null;
+        for (var index = 0; index < _distinctSets.Length; index++)
+        {
+            try
+            {
+                DisposeRowSetSorter(index);
+            }
+            catch (Exception exception)
+            {
+                (cleanupFailures ??= []).Add(exception);
+            }
+
+            try
+            {
+                _distinctSets[index]?.Dispose();
+                _distinctSets[index] = null;
+            }
+            catch (Exception exception)
+            {
+                (cleanupFailures ??= []).Add(exception);
+            }
+        }
+
         ThrowCleanupFailures(cleanupFailures);
     }
 
@@ -2634,21 +2728,35 @@ public sealed class ResumableStatement : IDisposable
     // GuardedRow (which emits or row-set-inserts inline) and RowGate (which defers emission to a following
     // ResultRow). A DistinctRowGuard inserts on accept, so a tuple later discarded by OFFSET still counts as
     // seen — matching the evaluator, which de-duplicates before applying OFFSET.
-    private bool EvaluateRowGuards(IReadOnlyList<VdbeRowGuard> guards, SqlValue[] candidate)
+    private bool EvaluateRowGuards(
+        IReadOnlyList<VdbeRowGuard> guards,
+        SqlValue[] candidate,
+        CancellationToken cancellationToken)
     {
         foreach (var guard in guards)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             switch (guard)
             {
                 case DistinctRowGuard distinctGuard:
-                    if (!TryInsertRowSet(distinctGuard.RowSetIndex, candidate, distinctGuard.Equality))
+                    if (!TryInsertRowSet(
+                        distinctGuard.RowSetIndex,
+                        candidate,
+                        distinctGuard.Equality,
+                        cancellationToken))
+                    {
                         return false;
+                    }
 
                     break;
                 case MembershipRowGuard membershipGuard:
                     foreach (var rowSetIndex in membershipGuard.RowSetIndices)
                     {
-                        var contained = RowSetContains(rowSetIndex, candidate, membershipGuard.Equality);
+                        var contained = RowSetContains(
+                            rowSetIndex,
+                            candidate,
+                            membershipGuard.Equality,
+                            cancellationToken);
                         var required = membershipGuard.Mode == CompoundMembershipMode.PresentInAll;
                         if (contained != required)
                             return false;
@@ -2664,28 +2772,65 @@ public sealed class ResumableStatement : IDisposable
         return true;
     }
 
-    private bool RowSetContains(int rowSetIndex, SqlValue[] candidate, VdbeRowEquality equality)
+    private bool RowSetContains(
+        int rowSetIndex,
+        SqlValue[] candidate,
+        VdbeRowEquality equality,
+        CancellationToken cancellationToken)
     {
         var set = _distinctSets[rowSetIndex];
-        if (set is null)
-            return false;
-
-        foreach (var stored in set)
-        {
-            if (equality(stored, candidate))
-                return true;
-        }
-
-        return false;
+        return set is not null && set.Contains(candidate, equality, cancellationToken);
     }
 
-    private bool TryInsertRowSet(int rowSetIndex, SqlValue[] candidate, VdbeRowEquality equality)
+    private bool TryInsertRowSet(
+        int rowSetIndex,
+        SqlValue[] candidate,
+        VdbeRowEquality equality,
+        CancellationToken cancellationToken)
     {
-        if (RowSetContains(rowSetIndex, candidate, equality))
-            return false;
+        return RequireRowSet(rowSetIndex).TryInsert(
+            candidate,
+            equality,
+            replaceExisting: false,
+            cancellationToken);
+    }
 
-        (_distinctSets[rowSetIndex] ??= []).Add(candidate);
-        return true;
+    private VdbeKeyedRowStore RequireRowSet(int rowSetIndex) =>
+        _distinctSets[rowSetIndex] ??= new VdbeKeyedRowStore(_executionOptions, _memory);
+
+    private SorterRuntime BuildRowSetSorter(
+        int rowSetIndex,
+        VdbeKeyedRowStore set,
+        VdbeRowComparer comparer,
+        int columnCount,
+        CancellationToken cancellationToken)
+    {
+        var sorter = new SorterRuntime(
+            comparer,
+            columnCount,
+            bufferRowCapacity: 0,
+            _executionOptions,
+            _memory);
+        _rowSetSorters[rowSetIndex] = sorter;
+        if (set.Rewind(cancellationToken))
+        {
+            do
+            {
+                var row = set.TakeCurrent(out var retainedBytes);
+                sorter.InsertRetained(row, retainedBytes, cancellationToken);
+            }
+            while (set.MoveNext(cancellationToken));
+        }
+
+        if (!sorter.Sort(cancellationToken))
+            throw new InvalidOperationException("A non-empty row set produced an empty sorter.");
+        return sorter;
+    }
+
+    private void DisposeRowSetSorter(int rowSetIndex)
+    {
+        _rowSetSorters[rowSetIndex]?.Dispose();
+        _rowSetSorters[rowSetIndex] = null;
     }
 
     private void CopyRowSetRow(SqlValue[] row, RegisterRange destination)
@@ -3248,6 +3393,48 @@ public sealed class ResumableStatement : IDisposable
             }
         }
 
+        public void InsertRetained(
+            SqlValue[] record,
+            long retainedBytes,
+            CancellationToken cancellationToken)
+        {
+            if (_sorted)
+                throw new InvalidOperationException("Cannot insert into a sorter after it has been sorted.");
+            if (record.Length != _columnCount)
+            {
+                _memory.Release(retainedBytes);
+                throw new InvalidOperationException(
+                    $"Sorter stores {_columnCount}-column records but received {record.Length} values.");
+            }
+
+            var recordBytes = EstimateRecordBytes(record);
+            try
+            {
+                if (retainedBytes < recordBytes)
+                    _memory.RetainOrThrow(recordBytes - retainedBytes, rows: 0);
+                else if (retainedBytes > recordBytes)
+                    _memory.Release(retainedBytes - recordBytes, rows: 0);
+                retainedBytes = recordBytes;
+
+                if (!_executionOptions.AllowTemporaryFileSpill)
+                    throw new VdbeMemoryLimitExceededException(_bufferMemoryLimitBytes, recordBytes);
+
+                _spill ??= CreateSpill();
+                _spill.WriteSingleRow(record, recordBytes, cancellationToken);
+                _spill.CompactRunTiers(
+                    _comparer,
+                    _memory,
+                    cancellationToken);
+            }
+            catch
+            {
+                _memory.Release(retainedBytes);
+                throw;
+            }
+
+            _memory.Release(recordBytes);
+        }
+
         // Sorts the buffered records and positions on the first one. Returns false (and
         // leaves the sorter unpositioned) when there is nothing to drain.
         public bool Sort(CancellationToken cancellationToken)
@@ -3552,6 +3739,7 @@ public sealed class ResumableStatement : IDisposable
             {
                 return false;
             }
+
             if (!_memory.TryRetain(retainedBytes))
                 return false;
 
