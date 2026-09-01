@@ -133,8 +133,9 @@ public sealed class VdbeSchemaRuntimeTests
         ((int)VdbeOpcode.DropColumn).Should().Be(133);
         ((int)VdbeOpcode.AlterColumn).Should().Be(134);
         ((int)VdbeOpcode.IndexBuild).Should().Be(135);
+        ((int)VdbeOpcode.AggInverse).Should().Be(136);
 
-        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(135);
+        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(136);
     }
 
     [Test]
