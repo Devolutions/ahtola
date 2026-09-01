@@ -6,8 +6,8 @@ using MsData = Microsoft.Data.Sqlite;
 namespace Ahtola.Tests;
 
 // Proves that EmbeddedDatabase routes windowed SELECTs through real bytecode: the streaming
-// running-frame program (sorter + AggReset/AggStep/AggFinalize emitted by WindowProgramBuilder) for the
-// narrow ROWS UNBOUNDED PRECEDING -> CURRENT ROW shape, and the buffered-window program
+// streaming program (sorter + aggregate opcodes emitted by WindowProgramBuilder) for the
+// supported running-prefix and exact-current-row shapes, and the buffered-window program
 // (OpenWindowBuffer/WindowBufferCompute/WindowBufferData emitted by BufferedWindowProgramBuilder) for
 // every other frame, function family, partition and ordering shape. Routed rows stay byte-identical to
 // the tree-walking evaluator (cross-checked against a real SQLite build for the partitioned case).
@@ -18,8 +18,9 @@ namespace Ahtola.Tests;
 public class WindowSqlRoutingTests
 {
     private const string RunningFrame = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+    private const string CurrentRowFrame = "ROWS BETWEEN CURRENT ROW AND CURRENT ROW";
 
-    // ---- Routed running-frame values -------------------------------------------------------
+    // ---- Routed streaming-frame values -----------------------------------------------------
 
     [Test]
     public void UnpartitionedRunningSumRoutesAndAccumulatesInOrder()
@@ -192,6 +193,50 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
+    public void CurrentRowCountSumAndAvgRouteThroughInverseAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v);",
+            "INSERT INTO t VALUES (1, NULL), (2, 5), (3, 2.5), (4, '7'), (5, 'not-a-number');",
+        ];
+        var query =
+            $"SELECT id, count(*) OVER (ORDER BY id {CurrentRowFrame}), " +
+            $"count(v) OVER (ORDER BY id {CurrentRowFrame}), " +
+            $"sum(v) OVER (ORDER BY id {CurrentRowFrame}), " +
+            $"avg(v) OVER (ORDER BY id {CurrentRowFrame}) FROM t ORDER BY id;";
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
+        opcodes.Should().Contain("AggStep").And.Contain("AggFinalize").And.Contain("AggInverse");
+        opcodes.Count(static opcode => opcode == "AggInverse").Should().Be(4);
+        opcodes.Should().NotContain("OpenWindowBuffer").And.NotContain("WindowBufferCompute");
+
+        var rows = ReadRows(connection, query);
+        AssertMatchesSqlite(rows, setup, query);
+        rows.Select(static row => row[1].AsInteger()).Should().OnlyContain(static count => count == 1);
+        rows.Select(static row => row[2].AsInteger()).Should().Equal(0, 1, 1, 1, 1);
+    }
+
+    [Test]
+    public void CurrentRowAggregateWithoutInverseKeepsBufferedFallback()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20);");
+
+        var query =
+            $"SELECT id, min(v) OVER (ORDER BY id {CurrentRowFrame}) FROM t ORDER BY id;";
+        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
+
+        opcodes.Should().Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
+        opcodes.Should().NotContain("AggInverse");
+        ReadRows(connection, query).Select(static row => row[1].AsInteger()).Should().Equal(30, 10, 20);
+    }
+
+    [Test]
     public void PartitionWithoutWindowOrderRoutesInScanOrderWithinPartition()
     {
         using var connection = new EmbeddedDatabase().Connect();
@@ -276,7 +321,7 @@ public class WindowSqlRoutingTests
             .Should().Equal("id", $"sum(v) OVER (ORDER BY id {RunningFrame})");
     }
 
-    // ---- Buffered-window routing (shapes the running-frame builder cannot model) --------------
+    // ---- Buffered-window routing (shapes the streaming builder cannot model) -----------------
 
     [Test]
     public void DefaultRangeFrameRoutesThroughTheBufferedWindowProgram()

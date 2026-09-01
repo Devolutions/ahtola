@@ -18022,10 +18022,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return true;
 
         // The aggregate route declines window calls (ContainsAggregate is false for them). Try the
-        // running-frame window route so a single-table SELECT whose window functions all share one
-        // ROWS UNBOUNDED PRECEDING -> CURRENT ROW frame lowers to the real sorter + AggReset/AggStep/
-        // AggFinalize opcode family, reusing the evaluator's accumulation, partition equality, and
-        // ordering so routed rows stay byte-identical; every other window shape stays on the evaluator.
+        // streaming window route for supported ROWS frames, reusing the evaluator's accumulation,
+        // partition equality, and ordering so routed rows stay byte-identical; every other window
+        // shape stays on the evaluator.
         if (TryCompileWindowSelect(select, parameters, context, outerRow, out compiled))
             return true;
 
@@ -23112,10 +23111,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // evaluator keeps ownership and raises its own value or error. Two lowerings sit behind this router,
     // tried in order:
     //
-    //  1. The streaming running-frame program (WindowProgramBuilder): the narrow shape whose window calls
-    //     all share one ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW spec over aggregate functions of
-    //     bare columns, which folds into the AggReset/AggStep/AggFinalize opcode family without buffering
-    //     a partition. See TryBuildRunningWindowProgram for its exact grammar.
+    //  1. The streaming program (WindowProgramBuilder): the narrow shapes whose window calls all share
+    //     either a running-prefix or exact-current-row ROWS frame over aggregate functions of bare
+    //     columns. The current-row shape uses AggInverse after emission; neither buffers a partition.
+    //     See TryBuildStreamingWindowProgram for its exact grammar.
     //  2. The buffered-window program (BufferedWindowProgramBuilder): every other window shape whose
     //     inputs are computable from one scanned row. It buffers the scanned rows through the
     //     OpenWindowBuffer/WindowBufferInsert/WindowBufferCompute/WindowBufferData opcode family and
@@ -23291,7 +23290,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ? select
             : select with { Limit = null, Offset = null };
 
-        if (!TryBuildRunningWindowProgram(baseSelect, target, parameters, context, outerRow, out var program)
+        if (!TryBuildStreamingWindowProgram(baseSelect, target, parameters, context, outerRow, out var program)
             && !TryBuildBufferedWindowProgram(
                 baseSelect,
                 target,
@@ -23342,7 +23341,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return false;
     }
 
-    // The streaming running-frame lowering. It reuses the evaluator's own accumulation
+    // The streaming running/current-row lowering. It reuses the evaluator's own accumulation
     // (BuildAccumulatorAggregate), partition equality (BuildGroupComparers), and ordering (CompareRows)
     // so a routed row is byte-identical to the fallback.
     //
@@ -23351,15 +23350,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
     //   [ORDER BY <partition cols as prefix> , <window ORDER BY terms>]
     // where each <proj> is one of: '*', a bare backed column, a folded constant, or
     //   agg(<bare column>|*) OVER ([PARTITION BY <bare cols>] [ORDER BY <scan terms>]
-    //                              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-    // with agg in {count, sum, total, avg, min, max, group_concat/1, registered aggregates}, and
-    // every window call sharing one identical OVER spec.
+    //                              <supported ROWS frame>)
+    // where the running frame supports the existing aggregate set, while the exact-current-row
+    // frame admits only inverse-capable count/sum/avg calls. Every call shares one OVER spec.
     //
     // Exactness of the emitted (partition, order) sort order requires the top-level ORDER BY to be
     // the partition columns (in any direction, as a bijective prefix) followed by the window ORDER BY
     // terms verbatim; absent an ORDER BY the window must be unpartitioned and unordered so the sorter
     // preserves scan order. Everything else declines to the buffered lowering.
-    private bool TryBuildRunningWindowProgram(
+    private bool TryBuildStreamingWindowProgram(
         SelectStatement select,
         ScanTarget target,
         SqlValue[] parameters,
@@ -23369,7 +23368,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         program = null!;
 
-        // Classify every projection into a pass-through column, a running window call sharing
+        // Classify every projection into a pass-through column, a streaming window call sharing
         // one spec, or a folded constant. Any other shape (computed expressions over window
         // results, qualified stars, scalar functions) declines to the buffered lowering.
         WindowSpecification? spec = null;
@@ -23388,7 +23387,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     outputs.Add(WindowOutput.ForColumn(ordinal));
                     continue;
                 case FunctionExpression function when function.Window is not null:
-                    if (!TryClassifyRunningWindowCall(
+                    if (!TryClassifyStreamingWindowCall(
                             function, target, parameters, context, outerRow, ref spec, windows, out var windowOutput))
                     {
                         return false;
@@ -23409,6 +23408,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         if (!sawWindow || spec is null)
+            return false;
+        if (!TryGetStreamingWindowFrame(spec.Frame, out var frame))
             return false;
 
         ValidateOrderByCollations(spec.OrderBy);
@@ -23437,7 +23438,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             partitionNames.Add(column.Name);
         }
 
-        // Window ORDER BY terms drive the running accumulation order, so they must be evaluable
+        // Window ORDER BY terms drive the accumulation order, so they must be evaluable
         // against a single scanned row and must not read an unbacked rowid the materialized row
         // cannot supply. (IsScanPredicate already rejects nested window/aggregate terms.)
         foreach (var term in spec.OrderBy)
@@ -23467,7 +23468,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // The builder emits rows in its own (partition, order) sort order. That order is exact
         // only when the evaluator would emit the same order:
         //   * no ORDER BY  -> the evaluator emits scan order, which matches only the single
-        //     unordered, unpartitioned running frame; the sorter preserves scan order.
+        //     unordered, unpartitioned streaming frame; the sorter preserves scan order.
         //   * ORDER BY      -> it must be [all partition columns as a bijective prefix] ++ [the
         //     window ORDER BY terms verbatim], so the sort is partition-contiguous with window
         //     order within each partition and equals the evaluator's output order term-for-term.
@@ -23556,7 +23557,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             outputs,
             orderComparer,
             partitionComparer,
-            predicate);
+            predicate,
+            frame);
         return true;
     }
 
@@ -23854,13 +23856,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return substitution;
     }
 
-    // Recognizes a top-level running-frame window call over bare, backed columns, appends its
+    // Recognizes a top-level streaming window call over bare, backed columns, appends its
     // VdbeAggregate to <paramref name="windows"/>, and yields the output that projects the
     // finalized per-row value. Declines (returns false) for DISTINCT/FILTER modifiers, any frame
-    // other than the running frame, non-aggregate window functions (row_number/rank/percentile),
+    // other than the running or exact-current-row frame, non-aggregate window functions,
     // arguments that are not bare columns, or a spec that differs from an earlier window call, so
     // those shapes fall back to the evaluator, which produces the value or its exact error.
-    private bool TryClassifyRunningWindowCall(
+    private bool TryClassifyStreamingWindowCall(
         FunctionExpression function,
         ScanTarget target,
         SqlValue[] parameters,
@@ -23872,14 +23874,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         output = default;
 
-        // Frame/window modifiers the running-frame accumulator cannot honor. FILTER would need to
+        // Frame/window modifiers the streaming accumulator cannot honor. FILTER would need to
         // evaluate a predicate over columns the accumulator does not buffer; DISTINCT dedup is not
-        // modeled by the running AggStep.
+        // modeled by the emitted AggStep.
         if (function.Distinct || function.Filter is not null)
             return false;
 
         var window = function.Window!;
-        if (!IsRunningWindowFrame(window.Frame))
+        if (!TryGetStreamingWindowFrame(window.Frame, out var frame))
+            return false;
+        if (frame.IsCurrentRow && function.Name is not ("COUNT" or "SUM" or "AVG"))
             return false;
 
         // The bytecode shape only models aggregate accumulation. Dedicated ranking,
@@ -23914,23 +23918,44 @@ public sealed partial class EmbeddedDatabase : IDisposable
             argumentNames[index] = column.Name;
         }
 
+        var aggregate = BuildAccumulatorAggregate(function, argumentNames, parameters, context, outerRow);
+        if (frame.IsCurrentRow && aggregate.Inverse is null)
+            return false;
+
         var windowIndex = windows.Count;
-        windows.Add(new AggregateFunctionSpec(
-            BuildAccumulatorAggregate(function, argumentNames, parameters, context, outerRow),
-            argumentColumns));
+        windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns));
         output = WindowOutput.ForWindow(windowIndex);
         return true;
     }
 
-    // The one frame WindowProgramBuilder models: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW.
-    // The parser also produces this shape for bare "ROWS UNBOUNDED PRECEDING". A null frame (the
-    // default RANGE frame) and every bounded/forward-looking ROWS frame decline.
-    private static bool IsRunningWindowFrame(WindowFrame? frame)
-        => frame is not null
-            && frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Rows
-            && frame.Start.Kind == FrameBoundKind.UnboundedPreceding
-            && frame.End.Kind == FrameBoundKind.CurrentRow
-            && frame.Exclusion == FrameExclusion.NoOthers;
+    // The streaming builder handles the running prefix and the exact current row. The latter
+    // follows Turso's moving-frame order: step, emit, then inverse the departing row.
+    private static bool TryGetStreamingWindowFrame(WindowFrame? frame, out WindowFrameSpec spec)
+    {
+        spec = default;
+        if (frame is null
+            || frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows
+            || frame.Exclusion != FrameExclusion.NoOthers)
+        {
+            return false;
+        }
+
+        if (frame.Start.Kind == FrameBoundKind.UnboundedPreceding
+            && frame.End.Kind == FrameBoundKind.CurrentRow)
+        {
+            spec = WindowFrameSpec.Running;
+            return true;
+        }
+
+        if (frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Kind == FrameBoundKind.CurrentRow)
+        {
+            spec = WindowFrameSpec.CurrentRow;
+            return true;
+        }
+
+        return false;
+    }
 
     // Structural equality of two window specs: PARTITION BY expressions and ORDER BY terms compared
     // element-wise (record equality on the IReadOnlyList fields is reference equality, so the lists
@@ -23955,12 +23980,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return Equals(left.Frame, right.Frame);
     }
 
-    // Builds a VdbeAggregate whose accumulation replays the evaluator's own aggregate
-    // semantics: it buffers each scanned argument tuple as a synthetic single-row source
-    // keyed by the argument column names, then finalizes by handing those rows to
-    // EvaluateAggregateFunction. This reuses the evaluator exactly (COUNT ignoring NULLs,
-    // SUM's integer/real promotion, MIN/MAX typing, GROUP_CONCAT ordering, and every
-    // empty-input identity), so a routed aggregate is byte-identical to the fallback.
+    // COUNT and numeric aggregates use constant-size accumulator state; the remaining routed
+    // aggregates replay the evaluator from buffered argument tuples.
     private VdbeAggregate BuildAccumulatorAggregate(
         FunctionExpression function,
         string[] argumentNames,
@@ -23968,8 +23989,44 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        if (function.Name == "COUNT" && (function.CountStar || function.Arguments.Count is 0 or 1))
+        {
+            var countAll = function.CountStar || function.Arguments.Count == 0;
+            return new VdbeAggregate
+            {
+                Name = "count",
+                CreateContext = static () => new CountAggregateAccumulator(),
+                Accumulate = (contextObject, arguments) =>
+                {
+                    var accumulator = (CountAggregateAccumulator)contextObject!;
+                    if (countAll || arguments[0].Kind != SqlValueKind.Null)
+                        accumulator.Add();
+                    return accumulator;
+                },
+                Inverse = (contextObject, arguments) =>
+                {
+                    var accumulator = (CountAggregateAccumulator)contextObject!;
+                    if (countAll || arguments[0].Kind != SqlValueKind.Null)
+                        accumulator.Remove();
+                    return accumulator;
+                },
+                Finalize = static contextObject =>
+                    SqlValue.Integer(((CountAggregateAccumulator)contextObject!).Count),
+            };
+        }
+
         if (function.Name is "SUM" or "TOTAL" or "AVG" && function.Arguments.Count == 1)
         {
+            Func<object?, SqlValue[], object?>? inverse = null;
+            if (function.Name is "SUM" or "AVG")
+            {
+                inverse = static (contextObject, arguments) =>
+                {
+                    ((NumericAggregateAccumulator)contextObject!).Remove(arguments[0]);
+                    return contextObject;
+                };
+            }
+
             return new VdbeAggregate
             {
                 Name = function.Name.ToLowerInvariant(),
@@ -23981,6 +24038,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     ((NumericAggregateAccumulator)contextObject!).Accumulate(arguments[0]);
                     return contextObject;
                 },
+                Inverse = inverse,
                 Finalize = static contextObject => ((NumericAggregateAccumulator)contextObject!).Finalize(),
             };
         }
@@ -39239,6 +39297,21 @@ out bool hasReturning)
         return accumulator.Finalize();
     }
 
+    private sealed class CountAggregateAccumulator
+    {
+        internal long Count { get; private set; }
+
+        internal void Add() => Count = checked(Count + 1);
+
+        internal void Remove()
+        {
+            if (Count == 0)
+                throw new InvalidOperationException("Aggregate inverse removed a row from an empty count.");
+
+            Count--;
+        }
+    }
+
     private sealed class NumericAggregateAccumulator
     {
         private readonly bool _forceReal;
@@ -39294,6 +39367,55 @@ out bool hasReturning)
             KahanBabuskaNeumaierStepInt64(addend, ref _realTotal, ref _realError);
         }
 
+        internal void Remove(SqlValue value)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+            if (_count == 0)
+                throw new InvalidOperationException("Aggregate inverse removed a row from an empty numeric aggregate.");
+
+            // The exact-current-row route always reaches this fast path. Resetting instead of adding
+            // the negated value also avoids manufacturing NaN for an infinite one-row SUM/AVG frame.
+            if (_count == 1)
+            {
+                Reset();
+                return;
+            }
+
+            var exact = ApplyComparisonNumericAffinity(value);
+            _count--;
+            if (exact.Kind != SqlValueKind.Integer)
+            {
+                var real = exact.Kind == SqlValueKind.Real
+                    ? AsReal(exact)
+                    : AsReal(ApplyNumericAffinity(value));
+                PromoteToReal();
+                KahanBabuskaNeumaierStep(-real, ref _realTotal, ref _realError);
+                return;
+            }
+
+            var subtrahend = exact.AsInteger();
+            if (!_approximate)
+            {
+                var candidate = unchecked(_integerTotal - subtrahend);
+                if (((_integerTotal ^ subtrahend) & (_integerTotal ^ candidate)) >= 0)
+                {
+                    _integerTotal = candidate;
+                    return;
+                }
+
+                if (value.Kind == SqlValueKind.Integer && !_forceReal && !_average)
+                    throw new EmbeddedSqlException("integer overflow");
+
+                PromoteToReal();
+            }
+
+            if (subtrahend == long.MinValue)
+                KahanBabuskaNeumaierStep(9223372036854775808d, ref _realTotal, ref _realError);
+            else
+                KahanBabuskaNeumaierStepInt64(-subtrahend, ref _realTotal, ref _realError);
+        }
+
         internal SqlValue Finalize()
         {
             var accumulated = _approximate
@@ -39308,6 +39430,15 @@ out bool hasReturning)
                 return SqlValue.Null;
 
             return _approximate ? SqlValue.Real(accumulated) : SqlValue.Integer(_integerTotal);
+        }
+
+        private void Reset()
+        {
+            _integerTotal = 0;
+            _realTotal = 0;
+            _realError = 0;
+            _approximate = false;
+            _count = 0;
         }
 
         private void PromoteToReal()

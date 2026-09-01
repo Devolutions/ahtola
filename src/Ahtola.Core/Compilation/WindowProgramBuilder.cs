@@ -31,11 +31,10 @@ public enum WindowBound
 }
 
 /// <summary>
-/// The frame a window function is evaluated over. <see cref="WindowProgramBuilder"/> models exactly one
-/// shape — <see cref="Running"/>, i.e. <c>ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</c> — which is
-/// the running-aggregate frame whose value at each row folds every partition row from the partition start
-/// up to and including that row. Any other frame is rejected by the builder because it cannot be expressed
-/// with the accumulate-then-finalize-per-row bytecode the builder emits.
+/// The frame a window function is evaluated over. <see cref="WindowProgramBuilder"/> models the running
+/// prefix (<see cref="Running"/>) and the exact current row (<see cref="CurrentRow"/>). Other frames are
+/// rejected because they need retained departing rows or forward-looking input that this streaming builder
+/// does not model.
 /// </summary>
 /// <remarks>
 /// This is a VDBE-lowering primitive, distinct from the evaluator's SQL-level frame AST: it exists so the
@@ -45,13 +44,24 @@ public enum WindowBound
 /// </remarks>
 public readonly record struct WindowFrameSpec(WindowFrameMode Mode, WindowBound Start, WindowBound End)
 {
-    /// <summary>The only frame the builder models: <c>ROWS UNBOUNDED PRECEDING TO CURRENT ROW</c>.</summary>
+    /// <summary>A running frame: <c>ROWS UNBOUNDED PRECEDING TO CURRENT ROW</c>.</summary>
     public static WindowFrameSpec Running => new(WindowFrameMode.Rows, WindowBound.UnboundedPreceding, WindowBound.CurrentRow);
 
-    /// <summary>Whether this frame is the running-rows frame the builder can lower.</summary>
+    /// <summary>A one-row moving frame: <c>ROWS CURRENT ROW TO CURRENT ROW</c>.</summary>
+    public static WindowFrameSpec CurrentRow => new(WindowFrameMode.Rows, WindowBound.CurrentRow, WindowBound.CurrentRow);
+
+    /// <summary>Whether this frame is the running-rows frame.</summary>
     public bool IsRunning => Mode == WindowFrameMode.Rows
         && Start == WindowBound.UnboundedPreceding
         && End == WindowBound.CurrentRow;
+
+    /// <summary>Whether this frame contains exactly the current physical row.</summary>
+    public bool IsCurrentRow => Mode == WindowFrameMode.Rows
+        && Start == WindowBound.CurrentRow
+        && End == WindowBound.CurrentRow;
+
+    /// <summary>Whether this frame can be lowered by the streaming builder.</summary>
+    public bool IsSupported => IsRunning || IsCurrentRow;
 }
 
 /// <summary>The kind of value a window result column projects.</summary>
@@ -113,11 +123,11 @@ public readonly record struct WindowOutput
 }
 
 /// <summary>
-/// Lowers a partitioned running-aggregate window into a runnable <see cref="VdbeProgram"/> built from the
+/// Lowers a partitioned streaming aggregate window into a runnable <see cref="VdbeProgram"/> built from the
 /// sorter and aggregate opcode families. The program materializes every scanned row into a sorter ordered
 /// by <c>(PARTITION BY keys, ORDER BY keys)</c> so each partition is a contiguous, in-order run, then walks
 /// the sorted rows once: it resets the accumulators at each partition boundary, folds the current row into
-/// them, finalizes them, and emits one result row per input row. So a running window
+/// them, finalizes them, and emits one result row per input row. So a supported window
 /// (<c>func(...) OVER (PARTITION BY ... ORDER BY ...)</c>) runs entirely through the resumable state machine
 /// rather than the tree-walking evaluator, with no precomputed output.
 /// </summary>
@@ -132,15 +142,14 @@ public readonly record struct WindowOutput
 /// rows are bound at execution time through a <see cref="VdbeCursorSource"/>.
 /// </para>
 /// <para>
-/// The one frame this builder models is <c>ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</c>
-/// (<see cref="WindowFrameSpec.Running"/>): the value at each row folds every partition row up to and
-/// including that row, restarting per partition. <c>row_number()</c> is expressed as a running
+/// The running frame (<see cref="WindowFrameSpec.Running"/>) folds every partition row up to and including
+/// the current row, restarting per partition. <c>row_number()</c> is expressed as a running
 /// <c>count(*)</c> (a nullary window function), and running <c>sum</c>/<c>count</c>/<c>avg</c>/<c>min</c>/<c>max</c>
 /// follow from the corresponding accumulators. Because the finalize step runs once per row against the
 /// still-open accumulator, each window function's <see cref="VdbeAggregate.Finalize"/> must be side-effect
-/// free (as the standard aggregates are). Any other frame — RANGE/GROUPS framing, a bounded or
-/// forward-looking ROWS bound, EXCLUDE — is rejected because it cannot be represented by this accumulate-then-
-/// finalize-per-row shape.
+/// free (as the standard aggregates are). The exact-current-row frame steps, finalizes, emits, and then
+/// applies <c>AggInverse</c> for that same row, so its aggregates must supply
+/// <see cref="VdbeAggregate.Inverse"/>. Any other frame is rejected.
 /// </para>
 /// <code>
 ///   0            OpenReadCursor
@@ -164,6 +173,7 @@ public readonly record struct WindowOutput
 ///   emit         [Copy args] AggStep; AggFinalize -> aggOut  (per window)
 ///                Copy/LoadConstant per output register
 ///                ResultRow
+///                [AggInverse]                               (exact-current-row frame only)
 ///                SorterNext    -> drainLoop
 ///   doneAddr     CloseSorter
 ///                Halt
@@ -189,10 +199,10 @@ public static class WindowProgramBuilder
         ArgumentNullException.ThrowIfNull(orderComparer);
 
         var effectiveFrame = frame ?? WindowFrameSpec.Running;
-        if (!effectiveFrame.IsRunning)
+        if (!effectiveFrame.IsSupported)
         {
             throw new ArgumentException(
-                $"WindowProgramBuilder only models the running frame ROWS UNBOUNDED PRECEDING TO CURRENT ROW; " +
+                $"WindowProgramBuilder only models ROWS UNBOUNDED PRECEDING TO CURRENT ROW and ROWS CURRENT ROW TO CURRENT ROW; " +
                 $"frame ({effectiveFrame.Mode}, {effectiveFrame.Start}, {effectiveFrame.End}) is not representable.",
                 nameof(frame));
         }
@@ -211,6 +221,12 @@ public static class WindowProgramBuilder
             if (spec.Aggregate is null)
                 throw new ArgumentException("Window function specifications must supply an aggregate.", nameof(windows));
             ArgumentNullException.ThrowIfNull(spec.ArgumentColumns);
+            if (effectiveFrame.IsCurrentRow && spec.Aggregate.Inverse is null)
+            {
+                throw new ArgumentException(
+                    "ROWS CURRENT ROW TO CURRENT ROW requires every window aggregate to supply an inverse delegate.",
+                    nameof(windows));
+            }
 
             foreach (var column in spec.ArgumentColumns)
             {
@@ -251,7 +267,8 @@ public static class WindowProgramBuilder
             outputs,
             orderComparer,
             partitionComparer,
-            predicate);
+            predicate,
+            effectiveFrame);
     }
 
     private static VdbeProgram BuildProgram(
@@ -262,7 +279,8 @@ public static class WindowProgramBuilder
         IReadOnlyList<WindowOutput> outputs,
         VdbeRowComparer orderComparer,
         VdbeGroupComparer? partitionComparer,
-        VdbeRowPredicate? predicate)
+        VdbeRowPredicate? predicate,
+        WindowFrameSpec frame)
     {
         var width = tableColumnCount;
         var partition = partitionColumns.Count;
@@ -379,6 +397,17 @@ public static class WindowProgramBuilder
         }
 
         ins.Add(new ResultRowInstruction(new RegisterRange(new Register(outBase), outputs.Count)));
+        if (frame.IsCurrentRow)
+        {
+            for (var i = 0; i < windows.Count; i++)
+            {
+                ins.Add(new AggInverseInstruction(
+                    new Accumulator(i),
+                    windows[i].Aggregate,
+                    new RegisterRange(new Register(argBase + argOffsets[i]), windows[i].Arity)));
+            }
+        }
+
         ins.Add(new SorterNextInstruction(sorter, new ProgramCounter(drainLoop)));
 
         var doneAddr = ins.Count;
