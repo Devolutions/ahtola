@@ -1,4 +1,4 @@
-﻿using System.Runtime.ExceptionServices;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using Ahtola.Core.Parsing;
 using Ahtola.Core.Storage;
@@ -93,21 +93,32 @@ internal static class ManagedVirtualTableSchemaSql
     private const string PayloadTerminator = "*/";
 
     public static string Build(EmbeddedDatabase.VirtualTableDefinition definition)
-    {
-        var arguments = definition.Arguments.Count == 0
-            ? string.Empty
-            : "(" + string.Join(", ", definition.Arguments) + ")";
-        return "CREATE VIRTUAL TABLE "
-            + QuoteIdentifier(definition.Name)
-            + " USING "
-            + QuoteIdentifier(definition.ModuleName)
-            + arguments
+        => BuildDeclaration(definition.Name, definition.ModuleName, definition.Arguments)
             + " "
             + PayloadMarker
             + definition.PersistencePayload.Version.ToString(System.Globalization.CultureInfo.InvariantCulture)
             + ":"
             + Convert.ToBase64String(definition.PersistencePayload.Bytes.Span)
             + PayloadTerminator;
+
+    /// <summary>
+    /// The <c>CREATE VIRTUAL TABLE</c> text without the managed persistence envelope: the declaration a
+    /// user wrote, and the form a transaction-local schema stage carries because it holds the live
+    /// instance whose state the envelope would otherwise have to transport.
+    /// </summary>
+    public static string BuildDeclaration(string name, string moduleName, IReadOnlyList<string> arguments)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentException.ThrowIfNullOrWhiteSpace(moduleName);
+        ArgumentNullException.ThrowIfNull(arguments);
+        var argumentList = arguments.Count == 0
+            ? string.Empty
+            : "(" + string.Join(", ", arguments) + ")";
+        return "CREATE VIRTUAL TABLE "
+            + QuoteIdentifier(name)
+            + " USING "
+            + QuoteIdentifier(moduleName)
+            + argumentList;
     }
 
     public static (
@@ -1143,50 +1154,11 @@ internal sealed class EmbeddedFileStore : IDisposable
 
             if (entry.RootPage == 0)
             {
-                var (declaration, payload) = ManagedVirtualTableSchemaSql.Parse(entry.Sql!);
-                if (!string.Equals(declaration.Name, entry.Name, StringComparison.OrdinalIgnoreCase)
-                    || !string.Equals(entry.Name, entry.TableName, StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new EmbeddedSqlException(
-                        $"Stored virtual table '{entry.Name}' does not match its sqlite_schema metadata.");
-                }
-
-                var virtualTable = ManagedVirtualTableModuleRegistry.Resolve(declaration.ModuleName).Create(
-                    new ManagedVirtualTableCreateContext(declaration.Name, declaration.Arguments),
-                    payload);
-                ArgumentNullException.ThrowIfNull(virtualTable);
-                virtualTables.Add(
-                    entry.Name,
-                    new EmbeddedDatabase.VirtualTableDefinition(
-                        declaration.Name,
-                        declaration.ModuleName,
-                        declaration.Arguments.ToArray(),
-                        payload,
-                        virtualTable));
+                virtualTables.Add(entry.Name, ManagedSchemaRowParser.ParseVirtualTable(entry));
                 continue;
             }
 
-            var statement = SqlParser.Parse(entry.Sql!, SqlParameterMap.Parse(entry.Sql!));
-            if (statement is not CreateTableStatement create)
-                throw new EmbeddedSqlException($"Stored schema for table '{entry.Name}' is not a CREATE TABLE statement.");
-            if (!string.Equals(create.Name, entry.Name, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new EmbeddedSqlException(
-                    $"Stored schema entry for table '{entry.Name}' does not match its CREATE TABLE name.");
-            }
-            var table = new EmbeddedTable(
-                entry.Name,
-                create.Columns,
-                create.WithoutRowid,
-                create.PrimaryKeyColumns,
-                create.UniqueConstraints,
-                create.CheckConstraints,
-                create.PrimaryKeyConflictAlgorithm,
-                create.PrimaryKeyConstraintName,
-                create.PrimaryKeyDeclarationOrder,
-                create.TableForeignKeys,
-                create.Strict);
-            table.Sql = create.Sql;
+            var table = ManagedSchemaRowParser.ParseTable(entry);
             LoadTableRows(entry.Name, table, entry.RootPage, occupiedBtreePages);
             tables[entry.Name] = table;
             rootPages[entry.Name] = entry.RootPage;
@@ -1251,36 +1223,11 @@ internal sealed class EmbeddedFileStore : IDisposable
                 continue;
             }
 
-            // A method index carries its versioned state envelope in a trailing SQL comment. The
-            // envelope is only stripped once the candidate declaration has been parsed and proven to
-            // be a USING-method index, so an ordinary index whose own SQL text happens to end in a
-            // similar comment round-trips untouched. A newer or malformed envelope fails closed
-            // instead of silently loading as an empty index.
-            Indexing.ManagedIndexMethodStateSql.TrySplit(
-                entry.Sql,
-                ManagedIndexMethodSemantics.IsMethodIndexDeclaration,
-                out var declarationSql,
-                out var stateVersion,
-                out var state);
-            var statement = SqlParser.Parse(declarationSql, SqlParameterMap.Parse(declarationSql));
-            if (statement is not CreateIndexStatement create)
-                throw new EmbeddedSqlException($"Stored schema for index '{entry.Name}' is not a CREATE INDEX statement.");
-            if (!string.Equals(create.Name, entry.Name, StringComparison.OrdinalIgnoreCase)
-                || !string.Equals(create.TableName, entry.TableName, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new EmbeddedSqlException(
-                    $"Stored schema entry for index '{entry.Name}' does not match its sqlite_schema name or table.");
-            }
-
-            var index = CreateIndexDefinition(entry.TableName, table, create);
+            var parsed = ManagedSchemaRowParser.ParseIndex(entry, table);
+            var index = parsed.Index;
             ValidateIndexRepresentable(entry.TableName, table, index, structuralOnly: _collationResolver is null);
             ValidateStoredIndex(entry, table, index, occupiedBtreePages, structuralOnly: _collationResolver is null);
-            if (index.IsMethodIndex)
-            {
-                ManagedIndexMethodSemantics
-                    .GetAttachment(entry.TableName, table, index)
-                    .LoadState(stateVersion, state);
-            }
+            parsed.RestoreMethodState(entry.TableName, table);
 
             table.Indexes.Add(index);
             indexRootPages.Add(entry.Name, entry.RootPage);
@@ -1295,26 +1242,16 @@ internal sealed class EmbeddedFileStore : IDisposable
             if (entry.Type is "table" or "index")
                 continue;
 
-            if (entry.Sql is null)
-                throw new EmbeddedSqlException($"Stored schema entry '{entry.Name}' is missing SQL text.");
-            var statement = SqlParser.Parse(entry.Sql, SqlParameterMap.Parse(entry.Sql));
             switch (entry.Type)
             {
-                case "view" when statement is CreateViewStatement view:
-                    ValidateStoredView(entry, view);
-                    views[entry.Name] = new ViewDefinition(view.Name, view.Columns, view.Query, view.Sql);
+                case "view":
+                    views[entry.Name] = ManagedSchemaRowParser.ParseView(entry);
                     break;
-                case "trigger" when statement is CreateTriggerStatement trigger:
-                    ValidateStoredTrigger(entry, trigger, tables, views);
-                    triggers[entry.Name] = new TriggerDefinition(
-                        trigger.Name,
-                        trigger.Timing,
-                        trigger.Event,
-                        trigger.UpdateOfColumns,
-                        LocalTableName(trigger.TableName),
-                        trigger.When,
-                        trigger.Body,
-                        trigger.Sql,
+                case "trigger":
+                    triggers[entry.Name] = ManagedSchemaRowParser.ParseTrigger(
+                        entry,
+                        tables,
+                        views,
                         triggerDeclarationOrder++);
                     break;
                 default:
@@ -1330,7 +1267,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private void ValidateAllocationMap(
-        IReadOnlyList<SchemaEntry> schemaEntries,
+        IReadOnlyList<ManagedSchemaRow> schemaEntries,
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, EmbeddedIndex> loadedIndexes,
         IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables)
@@ -1427,7 +1364,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private void CollectTableTreePages(
-        SchemaEntry entry,
+        ManagedSchemaRow entry,
         EmbeddedTable table,
         ISet<uint> activePages,
         uint pageCount,
@@ -1511,7 +1448,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private void CollectWithoutRowidTableTreePages(
-        SchemaEntry entry,
+        ManagedSchemaRow entry,
         EmbeddedTable table,
         ISet<uint> activePages,
         uint pageCount,
@@ -1541,7 +1478,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private void CollectIndexTreePages(
-        SchemaEntry entry,
+        ManagedSchemaRow entry,
         ISet<uint> activePages,
         uint pageCount,
         SqliteOverflowChainReader overflowReader,
@@ -2094,11 +2031,11 @@ internal sealed class EmbeddedFileStore : IDisposable
             throw new InvalidDataException($"SQLite {owner} reuses page {pageNumber}.");
     }
 
-    private List<SchemaEntry> ReadSchemaEntries()
+    private List<ManagedSchemaRow> ReadSchemaEntries()
     {
         try
         {
-            var entries = new List<SchemaEntry>();
+            var entries = new List<ManagedSchemaRow>();
             var occupiedPages = new HashSet<uint> { SchemaRootPage };
             long? previousRowId = null;
             _ = ReadSchemaTreeNodeEntries(
@@ -2128,7 +2065,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         bool isRoot,
         ISet<uint> occupiedPages,
         ref long? previousRowId,
-        ICollection<SchemaEntry> entries)
+        ICollection<ManagedSchemaRow> entries)
     {
         var header = SqliteBtreePageHeader.Parse(pageImage, isFirstPage: isRoot);
         switch (header.PageType)
@@ -2158,7 +2095,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                         if (values.Length != SchemaColumnCount)
                             throw new EmbeddedSqlException("Managed file database has a malformed sqlite_schema row.");
 
-                        entries.Add(new SchemaEntry(
+                        entries.Add(new ManagedSchemaRow(
+                            cell.Cell.RowId,
                             RequireText(values[0], "type"),
                             RequireText(values[1], "name"),
                             RequireText(values[2], "tbl_name"),
@@ -2509,7 +2447,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 SqliteBtreePageType.IndexLeaf => ReadIndexLeafRecords(rootPageImage, overflowReader, comparer),
                 SqliteBtreePageType.IndexInterior => ReadIndexInteriorRecords(
-                    new SchemaEntry("table", tableName, tableName, rootPage, string.Empty),
+                    new ManagedSchemaRow("table", tableName, tableName, rootPage, string.Empty),
                     rootPageImage,
                     overflowReader,
                     occupiedBtreePages,
@@ -10030,56 +9968,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         ValidateTriggerCollationDependencies(catalogName, trigger, tables, views);
     }
 
-    private static void ValidateStoredView(SchemaEntry entry, CreateViewStatement view)
-    {
-        if (!string.Equals(view.Name, entry.Name, StringComparison.OrdinalIgnoreCase))
-        {
-            throw new EmbeddedSqlException(
-                $"Stored schema entry for view '{entry.Name}' does not match its CREATE VIEW name.");
-        }
 
-        ValidateRuntimeIndependentQuery("view", entry.Name, view.Query);
-    }
-
-    private static void ValidateStoredTrigger(
-        SchemaEntry entry,
-        CreateTriggerStatement trigger,
-        IReadOnlyDictionary<string, EmbeddedTable> tables,
-        IReadOnlyDictionary<string, ViewDefinition> views)
-    {
-        // SQLite keeps ON-clause schema qualifiers verbatim in the stored trigger SQL
-        // (CREATE TRIGGER ... ON main.t ...), so the reparsed target may be qualified while
-        // the catalog keys are local.
-        var targetName = LocalTableName(trigger.TableName);
-        if (!string.Equals(trigger.Name, entry.Name, StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(targetName, entry.TableName, StringComparison.OrdinalIgnoreCase))
-        {
-            throw new EmbeddedSqlException(
-                $"Stored schema entry for trigger '{entry.Name}' does not match its CREATE TRIGGER definition.");
-        }
-        var targetExists = trigger.Timing == TriggerTiming.InsteadOf
-            ? views.ContainsKey(targetName)
-            : tables.ContainsKey(targetName);
-        if (!targetExists)
-        {
-            throw new EmbeddedSqlException(
-                $"Stored trigger '{entry.Name}' references missing target '{trigger.TableName}'.");
-        }
-
-        ValidateRuntimeIndependentTriggerBody(entry.Name, trigger.When, trigger.Body);
-        ValidateTriggerCollationDependencies(entry.Name, new TriggerDefinition(
-            trigger.Name,
-            trigger.Timing,
-            trigger.Event,
-            trigger.UpdateOfColumns,
-            targetName,
-            trigger.When,
-            trigger.Body,
-            trigger.Sql,
-            DeclarationOrder: 0), tables, views);
-    }
-
-    private static void ValidateTriggerCollationDependencies(
+    internal static void ValidateTriggerCollationDependencies(
         string name,
         TriggerDefinition trigger,
         IReadOnlyDictionary<string, EmbeddedTable> tables,
@@ -10342,7 +10232,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         return true;
     }
 
-    private static void ValidateRuntimeIndependentQuery(string objectType, string name, QueryStatement query)
+    internal static void ValidateRuntimeIndependentQuery(string objectType, string name, QueryStatement query)
     {
         var dependency = FindRuntimeDependency(query);
         if (dependency is not null)
@@ -10353,7 +10243,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
-    private static void ValidateRuntimeIndependentTriggerBody(
+    internal static void ValidateRuntimeIndependentTriggerBody(
         string name,
         Expression? when,
         IReadOnlyList<ParsedStatement> statements)
@@ -12278,7 +12168,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private PreparedSchemaTree BuildSchemaTree(
-        IReadOnlyList<SchemaEntry> entries,
+        IReadOnlyList<ManagedSchemaRow> entries,
         RebuildPageAllocator allocator)
     {
         var cells = new List<SqliteTableLeafCell>(entries.Count);
@@ -12414,7 +12304,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
-    private static List<SchemaEntry> BuildSchemaEntries(
+    private static List<ManagedSchemaRow> BuildSchemaEntries(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
@@ -12422,27 +12312,15 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, uint> rootPages,
         IReadOnlyDictionary<string, uint> indexRootPages)
     {
-        var entries = new List<SchemaEntry>();
+        var entries = new List<ManagedSchemaRow>();
         foreach (var name in tables.Keys)
-        {
-            entries.Add(new SchemaEntry(
-                "table",
-                name,
-                name,
-                rootPages[name],
-                tables[name].Sql ?? EmbeddedDatabase.BuildCreateTableSql(name, tables[name])));
-        }
+            entries.Add(ManagedSchemaRowFactory.ForTable(name, tables[name], rootPages[name]));
 
         foreach (var definition in virtualTables.Values.OrderBy(
                      static value => value.Name,
                      StringComparer.OrdinalIgnoreCase))
         {
-            entries.Add(new SchemaEntry(
-                "table",
-                definition.Name,
-                definition.Name,
-                0,
-                ManagedVirtualTableSchemaSql.Build(definition)));
+            entries.Add(ManagedSchemaRowFactory.ForVirtualTable(definition));
         }
 
         foreach (var tableName in tables.Keys)
@@ -12455,30 +12333,23 @@ internal sealed class EmbeddedFileStore : IDisposable
                         $"SQLite schema construction is missing root page for index '{index.Name}'.");
                 }
 
-                entries.Add(new SchemaEntry(
-                    "index",
-                    index.Name,
+                entries.Add(ManagedSchemaRowFactory.ForIndex(
                     tableName,
+                    tables[tableName],
+                    index,
                     rootPage,
-                    index.Origin == EmbeddedIndexOrigin.Explicit
-                        ? index.IsMethodIndex
-                            ? ManagedIndexMethodSemantics.BuildPersistedSql(tableName, tables[tableName], index)
-                            : index.Sql ?? BuildCreateIndexSql(tableName, index)
-                        : null));
+                    ManagedSchemaSqlForm.Persisted));
             }
         }
 
         foreach (var name in views.Keys.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
-        {
-            var view = views[name];
-            entries.Add(new SchemaEntry("view", view.Name, view.Name, 0, view.Sql));
-        }
+            entries.Add(ManagedSchemaRowFactory.ForView(views[name]));
 
         foreach (var trigger in triggers.Values
                      .OrderBy(value => value.DeclarationOrder)
                      .ThenBy(value => value.Name, StringComparer.OrdinalIgnoreCase))
         {
-            entries.Add(new SchemaEntry("trigger", trigger.Name, trigger.TableName, 0, trigger.Sql));
+            entries.Add(ManagedSchemaRowFactory.ForTrigger(trigger));
         }
 
         return entries;
@@ -12595,7 +12466,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         => EmbeddedIndexFactory.Create(tableName, table, statement);
 
     private void ValidateStoredIndex(
-        SchemaEntry entry,
+        ManagedSchemaRow entry,
         EmbeddedTable table,
         EmbeddedIndex index,
         ISet<uint> occupiedBtreePages,
@@ -12751,7 +12622,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         try
         {
             ValidateIndexRepresentable(tableName, table, index, structuralOnly: false);
-            var entry = new SchemaEntry("index", index.Name, tableName, rootPage, index.Sql);
+            var entry = new ManagedSchemaRow("index", index.Name, tableName, rootPage, index.Sql);
             ValidateStoredIndex(entry, table, index, new HashSet<uint>(), structuralOnly: false);
             failureReason = null;
             return true;
@@ -12781,7 +12652,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private IReadOnlyList<byte[]> ReadIndexInteriorRecords(
-        SchemaEntry entry,
+        ManagedSchemaRow entry,
         ReadOnlySpan<byte> rootPage,
         SqliteOverflowChainReader overflowReader,
         ISet<uint> occupiedBtreePages,
@@ -12797,7 +12668,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private IndexTreeReadResult ReadIndexInteriorNodeRecords(
-        SchemaEntry entry,
+        ManagedSchemaRow entry,
         uint pageNumber,
         ReadOnlySpan<byte> pageImage,
         SqliteOverflowChainReader overflowReader,
@@ -12973,7 +12844,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         previousRecord = value;
     }
 
-    private void ValidateSchemaEntries(IReadOnlyList<SchemaEntry> entries)
+    private void ValidateSchemaEntries(IReadOnlyList<ManagedSchemaRow> entries)
     {
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var rootPages = new HashSet<uint>();
@@ -13044,7 +12915,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 
-    private static string ComputeSchemaSignature(IReadOnlyList<SchemaEntry> entries)
+    private static string ComputeSchemaSignature(IReadOnlyList<ManagedSchemaRow> entries)
     {
         var builder = new StringBuilder();
         foreach (var entry in EnumerateSignatureEntries(entries))
@@ -13059,8 +12930,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         return builder.ToString();
     }
 
-    private static IEnumerable<SchemaEntry> EnumerateSignatureEntries(
-        IReadOnlyList<SchemaEntry> entries)
+    private static IEnumerable<ManagedSchemaRow> EnumerateSignatureEntries(
+        IReadOnlyList<ManagedSchemaRow> entries)
     {
         foreach (var entry in entries
                      .Where(entry => entry.Type == "table")
@@ -13249,8 +13120,6 @@ internal sealed class EmbeddedFileStore : IDisposable
             return pageNumber;
         }
     }
-
-    private sealed record SchemaEntry(string Type, string Name, string TableName, uint RootPage, string? Sql);
 
     private sealed record PageImage(uint PageNumber, byte[] Page);
 

@@ -9,40 +9,66 @@ public class VdbeProgramTests
     [Test]
     public void PublicOpcodeValuesAndConstructorRemainCompatible()
     {
-        ((int)VdbeOpcode.OpenJoinCursor).Should().Be(7);
-        ((int)VdbeOpcode.Next).Should().Be(17);
-        ((int)VdbeOpcode.AggStep).Should().Be(32);
-        ((int)VdbeOpcode.Halt).Should().Be(57);
-        ((int)VdbeOpcode.Compare).Should().Be(66);
-        ((int)VdbeOpcode.JumpIfNotTrue).Should().Be(67);
-        ((int)VdbeOpcode.Cast).Should().Be(68);
-        ((int)VdbeOpcode.RowSetTest).Should().Be(74);
-        ((int)VdbeOpcode.Program).Should().Be(75);
-        ((int)VdbeOpcode.NotExists).Should().Be(76);
-        ((int)VdbeOpcode.Found).Should().Be(77);
-        ((int)VdbeOpcode.HaltIfNull).Should().Be(78);
-        ((int)VdbeOpcode.OpenEphemeral).Should().Be(79);
-        ((int)VdbeOpcode.EphemeralInsert).Should().Be(80);
-        ((int)VdbeOpcode.NoConflict).Should().Be(81);
-        ((int)VdbeOpcode.FkCounter).Should().Be(82);
-        ((int)VdbeOpcode.FkIfZero).Should().Be(83);
-        ((int)VdbeOpcode.FkCheck).Should().Be(84);
-        ((int)VdbeOpcode.SeekGE).Should().Be(85);
-        ((int)VdbeOpcode.IdxDelete).Should().Be(96);
+        Enum.GetValues<VdbeOpcode>()
+            .Select(static opcode => $"{opcode}={(int)opcode}")
+            .Should()
+            .Equal(
+                "LoadConstant=0", "LoadParameter=1", "Copy=2", "Function=3", "Arithmetic=4",
+                "NumericAffinity=5", "OpenReadCursor=6", "OpenJoinCursor=7", "OpenWriteCursor=8",
+                "Rewind=9", "Column=10", "RowId=11", "Filter=12", "FilterRowId=13",
+                "FilterRegisters=14", "ProjectRegisters=15", "DistinctFilter=16", "Next=17",
+                "Delete=18", "Insert=19", "Update=20", "Commit=21", "CloseCursor=22",
+                "OpenSorter=23", "SorterInsert=24", "SorterSort=25", "SorterData=26",
+                "SorterNext=27", "CloseSorter=28", "Goto=29", "JumpIf=30", "AggReset=31",
+                "AggStep=32", "AggFinalize=33", "SameGroup=34", "Yield=35", "ResultRow=36",
+                "DistinctResultRow=37", "RowSetInsert=38", "RowSetRewind=39", "RowSetNext=40",
+                "CompoundResultRow=41", "GuardedRow=42", "OffsetGate=43", "LimitGate=44",
+                "BeginTransaction=45", "CommitTransaction=46", "RollbackTransaction=47",
+                "Savepoint=48", "ReleaseSavepoint=49", "RollbackToSavepoint=50",
+                "OpenWorkTable=51", "SeedWorkTable=52", "WorkTableStep=53",
+                "WorkTableExpand=54", "WorkTableExpandGeneration=55", "CloseWorkTable=56",
+                "Halt=57", "GroupKey=58", "DistinctGate=59", "OpenWindowBuffer=60",
+                "WindowBufferInsert=61", "WindowBufferCompute=62", "WindowBufferData=63",
+                "WindowBufferNext=64", "CloseWindowBuffer=65", "Compare=66",
+                "JumpIfNotTrue=67", "Cast=68", "SeekRowid=69", "SeekRowidRange=70",
+                "RowCount=71", "Last=72", "Prev=73", "RowSetTest=74", "Program=75",
+                "NotExists=76", "Found=77", "HaltIfNull=78", "OpenEphemeral=79",
+                "EphemeralInsert=80", "NoConflict=81", "FkCounter=82", "FkIfZero=83",
+                "FkCheck=84", "SeekGE=85", "SeekGT=86", "SeekLE=87", "SeekLT=88",
+                "IdxGE=89", "IdxGT=90", "IdxLE=91", "IdxLT=92", "IdxRowId=93",
+                "RowData=94", "IdxInsert=95", "IdxDelete=96", "RowGate=97", "VOpen=98",
+                "VFilter=99", "VColumn=100", "VUpdate=101", "VNext=102", "VBegin=103",
+                "VSync=104", "VCommit=105", "VRollback=106", "IndexMethodCreate=107",
+                "IndexMethodDestroy=108", "IndexMethodOptimize=109", "IndexMethodQuery=110",
+                "IndexMethodNext=111", "IndexMethodColumn=112", "IndexMethodRowId=113",
+                "IndexMethodInsert=114", "IndexMethodDelete=115", "VCreate=116",
+                "VDestroy=117", "VRename=118", "MakeRecord=119", "NewRowid=120",
+                "CreateBtree=121", "ClearBtree=122", "Destroy=123", "ReadCookie=124",
+                "SetCookie=125", "ParseSchema=126", "DropTable=127", "DropView=128",
+                "DropIndex=129", "DropTrigger=130", "RenameTable=131", "AddColumn=132",
+                "DropColumn=133", "AlterColumn=134", "IndexBuild=135");
 
-        typeof(VdbeProgram).GetConstructor(
-            [
-                typeof(int),
-                typeof(int),
-                typeof(IEnumerable<VdbeInstruction>),
-                typeof(int),
-                typeof(int),
-                typeof(int),
-                typeof(int),
-                typeof(int),
-            ]).Should().NotBeNull();
+        var constructors = typeof(VdbeProgram).GetConstructors();
+        Type[] legacyParameterTypes =
+        [
+            typeof(int),
+            typeof(int),
+            typeof(IEnumerable<VdbeInstruction>),
+            typeof(int),
+            typeof(int),
+            typeof(int),
+            typeof(int),
+            typeof(int),
+        ];
+        Type[] currentParameterTypes = [.. legacyParameterTypes, typeof(int)];
+        constructors.Any(constructor => constructor.GetParameters()
+            .Select(static parameter => parameter.ParameterType)
+            .SequenceEqual(legacyParameterTypes)).Should().BeTrue();
+        constructors.Any(constructor => constructor.GetParameters()
+            .Select(static parameter => parameter.ParameterType)
+            .SequenceEqual(currentParameterTypes)).Should().BeTrue();
 
-        var program = new VdbeProgram(
+        var legacyProgram = new VdbeProgram(
             0,
             0,
             [new HaltInstruction()],
@@ -51,7 +77,35 @@ public class VdbeProgramTests
             0,
             0,
             0);
-        program.WindowBufferCount.Should().Be(0);
+        legacyProgram.WindowBufferCount.Should().Be(0);
+
+        var defaultProgram = new VdbeProgram(0, 0, [new HaltInstruction()]);
+        defaultProgram.SorterCount.Should().Be(0);
+        defaultProgram.AccumulatorCount.Should().Be(0);
+        defaultProgram.DistinctSetCount.Should().Be(0);
+        defaultProgram.ParameterSlotCount.Should().Be(0);
+        defaultProgram.WorkTableCount.Should().Be(0);
+        defaultProgram.WindowBufferCount.Should().Be(0);
+
+        var currentProgram = new VdbeProgram(
+            0,
+            0,
+            [new HaltInstruction()],
+            sorterCount: 0,
+            accumulatorCount: 0,
+            distinctSetCount: 0,
+            parameterSlotCount: 0,
+            workTableCount: 0,
+            windowBufferCount: 0);
+        currentProgram.WindowBufferCount.Should().Be(0);
+
+        var legacyInsert = new InsertInstruction(new Cursor(3), VdbeInsertFlags.SkipLastRowid);
+        var (legacyCursor, legacyFlags) = legacyInsert;
+        legacyCursor.Should().Be(new Cursor(3));
+        legacyFlags.Should().Be(VdbeInsertFlags.SkipLastRowid);
+        typeof(InsertInstruction).GetConstructor([typeof(Cursor), typeof(VdbeInsertFlags)])
+            .Should()
+            .NotBeNull();
     }
 
     [Test]

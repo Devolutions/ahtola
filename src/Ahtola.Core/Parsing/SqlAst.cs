@@ -19,6 +19,10 @@ internal sealed record CreateTableStatement(
     int? PrimaryKeyDeclarationOrder = null,
     IReadOnlyList<ForeignKeyDefinition>? TableForeignKeys = null,
     bool Strict = false,
+    // Rows a CREATE TABLE AS SELECT materialized from its query. They are the compiler's row source, not
+    // an execution mechanism: DdlStatementCompiler turns them into a per-row MakeRecord/NewRowid/Insert
+    // loop, and a non-null (possibly empty) list is also what marks the statement as a CTAS, which stores
+    // its schema SQL in compact form.
     IReadOnlyList<SqlValue[]>? InitialRows = null,
     string? Sql = null) : ParsedStatement;
 
@@ -179,7 +183,8 @@ internal sealed record AlterTableRenameColumnStatement(
 internal sealed record AlterTableAlterColumnStatement(
     string TableName,
     string ColumnName,
-    EmbeddedColumn Column) : ParsedStatement;
+    EmbeddedColumn Column,
+    string? ColumnSql = null) : ParsedStatement;
 
 internal sealed record AlterTableDropColumnStatement(string TableName, string ColumnName) : ParsedStatement;
 

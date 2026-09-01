@@ -222,6 +222,116 @@ public static class VdbeExplain
                 0,
                 null,
                 $"rename virtual cursor {vRename.Cursor.Index} using r[{vRename.NewName.Index}]"),
+            MakeRecordInstruction makeRecord => (
+                makeRecord.Values.Start.Index,
+                makeRecord.Values.Count,
+                makeRecord.Destination.Index,
+                makeRecord.IndexName,
+                $"r[{makeRecord.Destination.Index}]=mkrec(r[{makeRecord.Values.Start.Index}..{makeRecord.Values.Start.Index + makeRecord.Values.Count - 1}])"
+                    + (makeRecord.IndexName is null ? string.Empty : $"; for {makeRecord.IndexName}")),
+            NewRowidInstruction newRowid => (
+                newRowid.Cursor.Index,
+                newRowid.Destination.Index,
+                newRowid.PreviousLargest?.Index ?? 0,
+                null,
+                $"r[{newRowid.Destination.Index}]=rowid"),
+            CreateBtreeInstruction createBtree => (
+                createBtree.Database,
+                createBtree.RootDestination.Index,
+                (long)createBtree.Flags,
+                null,
+                $"r[{createBtree.RootDestination.Index}]=root iDb={createBtree.Database} flags={(int)createBtree.Flags}"),
+            ClearBtreeInstruction clearBtree => (
+                clearBtree.RootPage,
+                clearBtree.Database,
+                0,
+                null,
+                $"root={clearBtree.RootPage} iDb={clearBtree.Database}"),
+            DestroyInstruction destroy => (
+                destroy.RootRegister?.Index ?? destroy.RootPage,
+                destroy.FormerRootDestination.Index,
+                destroy.IsTemporary ? 1 : 0,
+                null,
+                (destroy.RootRegister is { } destroyRootRegister
+                    ? $"root=r[{destroyRootRegister.Index}]"
+                    : $"root={destroy.RootPage}")
+                    + $" iDb={destroy.Database} former_root={destroy.FormerRootDestination.Index}"
+                    + $" is_temp={(destroy.IsTemporary ? 1 : 0)}"),
+            IndexBuildInstruction indexBuild => (
+                indexBuild.Database,
+                indexBuild.Unique ? 1 : 0,
+                0,
+                indexBuild.IndexName,
+                $"refill index {indexBuild.IndexName} from {indexBuild.TableName}"
+                    + (indexBuild.Unique ? "; unique" : string.Empty)),
+            ReadCookieInstruction readCookie => (
+                readCookie.Database,
+                readCookie.Destination.Index,
+                (long)readCookie.Cookie,
+                null,
+                $"r[{readCookie.Destination.Index}]=cookie[{(int)readCookie.Cookie}] iDb={readCookie.Database}"),
+            // Turso reports the SetCookie flag word as P5. VdbeExplain exposes no P5 column, so it is
+            // carried in the comment rather than dropped.
+            SetCookieInstruction setCookie => (
+                setCookie.Database,
+                (long)setCookie.Cookie,
+                setCookie.Value,
+                null,
+                $"cookie[{(int)setCookie.Cookie}]={setCookie.Value} iDb={setCookie.Database} p5={setCookie.P5}"),
+            ParseSchemaInstruction parseSchema => (
+                parseSchema.Database,
+                0,
+                0,
+                parseSchema.WhereClause ?? "NULL",
+                parseSchema.WhereClause ?? "NULL"),
+            DropTableInstruction dropTable => (
+                dropTable.Database,
+                0,
+                0,
+                dropTable.TableName,
+                $"DROP TABLE {dropTable.TableName}"),
+            DropViewInstruction dropView => (
+                dropView.Database,
+                0,
+                0,
+                dropView.ViewName,
+                $"DROP VIEW {dropView.ViewName}"),
+            DropIndexInstruction dropIndex => (
+                0,
+                0,
+                0,
+                dropIndex.IndexName,
+                $"DROP INDEX {dropIndex.IndexName}"),
+            DropTriggerInstruction dropTrigger => (
+                dropTrigger.Database,
+                0,
+                0,
+                dropTrigger.TriggerName,
+                $"DROP TRIGGER {dropTrigger.TriggerName}"),
+            RenameTableInstruction renameTable => (
+                0,
+                0,
+                0,
+                null,
+                $"rename_table({renameTable.From}, {renameTable.To})"),
+            AddColumnInstruction addColumn => (
+                0,
+                0,
+                0,
+                null,
+                $"add_column({addColumn.TableName}, {addColumn.ColumnDefinition})"),
+            DropColumnInstruction dropColumn => (
+                0,
+                0,
+                0,
+                null,
+                $"drop_column({dropColumn.TableName}, {dropColumn.ColumnIndex})"),
+            AlterColumnInstruction alterColumn => (
+                0,
+                0,
+                0,
+                null,
+                $"alter_column({alterColumn.TableName}, {alterColumn.ColumnIndex}, {alterColumn.ColumnDefinition}, {(alterColumn.Rename ? "true" : "false")})"),
             VBeginInstruction vBegin => (vBegin.Cursor.Index, 0, 0, null, $"begin virtual cursor {vBegin.Cursor.Index}"),
             VSyncInstruction vSync => (vSync.Cursor.Index, 0, 0, null, $"sync virtual cursor {vSync.Cursor.Index}"),
             VCommitInstruction vCommit => (vCommit.Cursor.Index, 0, 0, null, $"commit virtual cursor {vCommit.Cursor.Index}"),
@@ -483,11 +593,9 @@ public static class VdbeExplain
             InsertInstruction insert => (
                 insert.Cursor.Index,
                 (long)insert.Flags,
-                0,
-                insert.Flags == VdbeInsertFlags.None ? null : insert.Flags.ToString(),
-                insert.Flags == VdbeInsertFlags.None
-                    ? $"insert row into cursor {insert.Cursor.Index}"
-                    : $"insert row into cursor {insert.Cursor.Index} flags={insert.Flags}"),
+                insert.Record?.Index ?? 0,
+                insert.TableName ?? (insert.Flags == VdbeInsertFlags.None ? null : insert.Flags.ToString()),
+                DescribeInsert(insert)),
             UpdateInstruction update => (
                 update.Cursor.Index,
                 (long)update.Flags,
@@ -691,6 +799,22 @@ public static class VdbeExplain
             VdbeComparisonOperator.GreaterThanOrEqual => ">=",
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown comparison operator."),
         };
+
+    /// <summary>
+    /// Describes an <see cref="InsertInstruction"/> in whichever addressing mode it uses: the
+    /// register-backed form names the record and rowid registers Turso carries as <c>record_reg</c> and
+    /// <c>key_reg</c>, while the cursor-only DML form keeps its existing wording.
+    /// </summary>
+    private static string DescribeInsert(InsertInstruction insert)
+    {
+        var target = insert.TableName is null
+            ? $"cursor {insert.Cursor.Index}"
+            : $"cursor {insert.Cursor.Index} ({insert.TableName})";
+        var flags = insert.Flags == VdbeInsertFlags.None ? string.Empty : $" flags={insert.Flags}";
+        return insert.Record is { } record && insert.RowId is { } rowId
+            ? $"insert r[{record.Index}] into {target} key=r[{rowId.Index}]{flags}"
+            : $"insert row into {target}{flags}";
+    }
 
     private static string FormatRange(RegisterRange range)
     {

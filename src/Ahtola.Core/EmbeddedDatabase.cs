@@ -763,7 +763,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CteMutationState? CteMutationState = null,
         EmbeddedDatabase? Database = null,
         TransactionMutationOverlay? TransactionOverlay = null,
-        EmbeddedFileReadSnapshot? TransactionPinnedSnapshot = null)
+        EmbeddedFileReadSnapshot? TransactionPinnedSnapshot = null,
+        ManagedSchemaRowSet? StagedSchemaRows = null)
     {
         /// <summary>
         /// Per-statement cache of opened managed index-method scan state. Derived contexts created
@@ -3253,7 +3254,44 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (affinities.Count != result.Columns.Length)
             throw new InvalidOperationException("CREATE TABLE AS SELECT affinity metadata does not match the result width.");
 
-        var names = MakeCreateTableColumnNamesUnique(result.Columns);
+        var columns = BuildCreateTableAsColumns(result.Columns, affinities);
+
+        var rows = new SqlValue[result.Rows.Count][];
+        for (var rowIndex = 0; rowIndex < rows.Length; rowIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            rows[rowIndex] = MaterializeQueryRow(result.Rows[rowIndex]);
+        }
+
+        return new CreateTableMaterialization(columns, rows);
+    }
+
+    /// <summary>
+    /// Derives the columns a <c>CREATE TABLE AS SELECT</c> would declare without running its query.
+    /// <c>EXPLAIN</c> uses it so describing the statement never executes the SELECT.
+    /// </summary>
+    internal static EmbeddedColumn[] DescribeCreateTableAsColumns(QueryStatement statement, QueryContext context)
+    {
+        var names = DescribeQuery(statement, context);
+        var affinities = DescribeQueryAffinities(
+            statement,
+            context,
+            new Dictionary<string, IReadOnlyList<QueryAffinityColumn>>(StringComparer.OrdinalIgnoreCase));
+        if (affinities.Count != names.Length)
+            throw new InvalidOperationException("CREATE TABLE AS SELECT affinity metadata does not match the result width.");
+
+        return BuildCreateTableAsColumns(names, affinities);
+    }
+
+    /// <summary>
+    /// Turns a query's result column names and affinities into the column definitions the created table
+    /// declares. Shared so the executed and described forms of a CTAS cannot disagree on the schema.
+    /// </summary>
+    private static EmbeddedColumn[] BuildCreateTableAsColumns(
+        string[] resultColumns,
+        IReadOnlyList<QueryAffinityColumn> affinities)
+    {
+        var names = MakeCreateTableColumnNamesUnique(resultColumns);
         var columns = new EmbeddedColumn[names.Length];
         for (var index = 0; index < columns.Length; index++)
         {
@@ -3266,14 +3304,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 DefaultValue: null);
         }
 
-        var rows = new SqlValue[result.Rows.Count][];
-        for (var rowIndex = 0; rowIndex < rows.Length; rowIndex++)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            rows[rowIndex] = MaterializeQueryRow(result.Rows[rowIndex]);
-        }
-
-        return new CreateTableMaterialization(columns, rows);
+        return columns;
     }
 
     internal bool ContainsTableOrView(string name)
@@ -5235,7 +5266,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 CreateVirtualTableStatement createVirtual => ExecuteCreateVirtualTable(
                     createVirtual,
                     catalog,
-                    context.InTransaction),
+                    cancellationToken),
                 CreateTableAsSelectStatement => throw new InvalidOperationException(
                     "CREATE TABLE AS SELECT must be materialized by the owning connection."),
                 DropTableStatement drop => ExecuteDmlWithAutoIncrementState(
@@ -5245,24 +5276,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             scoped,
                             () => ExecuteDropTable(drop, catalog, scoped))
                         : ExecuteDropTable(drop, catalog, scoped)),
-                CreateIndexStatement createIndex => ExecuteCreateIndex(createIndex, catalog),
-                DropIndexStatement dropIndex => ExecuteDropIndex(dropIndex, tables),
-                CreateViewStatement createView => ExecuteCreateView(createView, catalog),
-                DropViewStatement dropView => ExecuteDropView(dropView, catalog),
-                CreateTriggerStatement createTrigger => ExecuteCreateTrigger(createTrigger, catalog, context),
-                DropTriggerStatement dropTrigger => ExecuteDropTrigger(dropTrigger, catalog),
-                AlterTableAddColumnStatement addColumn => ExecuteAlterTableAddColumn(addColumn, parameters, context),
-                AlterTableRenameStatement rename => ExecuteAlterTableRename(rename, catalog, context),
-                AlterTableRenameColumnStatement renameColumn => ExecuteAlterTableRenameColumn(
-                    renameColumn,
+                CreateIndexStatement createIndex => ExecuteCreateIndex(createIndex, catalog, cancellationToken),
+                DropIndexStatement dropIndex => ExecuteDropIndex(dropIndex, catalog, cancellationToken),
+                CreateViewStatement createView => ExecuteCreateView(createView, catalog, cancellationToken),
+                DropViewStatement dropView => ExecuteDropView(dropView, catalog, cancellationToken),
+                CreateTriggerStatement createTrigger => ExecuteCreateTrigger(
+                    createTrigger,
                     catalog,
-                    context),
-                AlterTableAlterColumnStatement alterColumn => ExecuteAlterTableAlterColumn(
-                    alterColumn,
-                    catalog,
-                    parameters,
-                    context),
-                AlterTableDropColumnStatement dropColumn => ExecuteAlterTableDropColumn(dropColumn, catalog, context),
+                    cancellationToken),
+                DropTriggerStatement dropTrigger => ExecuteDropTrigger(dropTrigger, catalog, cancellationToken),
+                AlterTableAddColumnStatement or AlterTableRenameStatement
+                    or AlterTableRenameColumnStatement or AlterTableAlterColumnStatement
+                    or AlterTableDropColumnStatement
+                    => ExecuteAlterTable(statement, catalog, parameters, context),
                 InsertStatement insert => ExecuteDmlWithAutoIncrementState(
                     context,
                     scoped => ExecuteInsert(insert, parameters, scoped)),
@@ -6062,156 +6088,196 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
 
+    /// <summary>
+    /// Runs <c>CREATE TABLE</c> (and the materialized form of <c>CREATE TABLE AS SELECT</c>) as a compiled
+    /// VDBE program rather than a direct catalog mutation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The program stages every effect into a <see cref="ManagedSchemaStage"/> whose working catalog is an
+    /// overlay of <paramref name="catalog"/>: new dictionaries holding the same object instances. A failure
+    /// anywhere in the program — a rejected schema row, a failed reparse, a cancelled population scan —
+    /// leaves <paramref name="catalog"/> exactly as it was, because nothing the program created was ever
+    /// in it. Only a program that reaches <c>Halt</c> has its objects adopted.
+    /// </para>
+    /// <para>
+    /// Durable publication is unchanged: the caller's existing autocommit/transaction boundary persists
+    /// <paramref name="catalog"/> in one pager/WAL commit, and that commit is still what bumps the schema
+    /// cookie exactly once. The program's <c>SetCookie</c> stages the value that commit must produce, and
+    /// <see cref="AdoptSchemaStage"/> fails closed when the two disagree.
+    /// </para>
+    /// </remarks>
     private ExecutionResult ExecuteCreateTable(
         CreateTableStatement statement,
         SchemaCatalog catalog,
         CancellationToken cancellationToken)
     {
-        var tables = catalog.Tables;
-        if (IsReservedObjectName(statement.Name))
-            throw new EmbeddedSqlException($"object name reserved for internal use: {statement.Name}");
-        if (tables.ContainsKey(statement.Name))
-        {
-            if (statement.IfNotExists)
-                return ExecutionResult.Empty;
+        var compiled = DdlStatementCompiler.CompileCreateTable(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
 
-            throw new EmbeddedSqlException($"table {statement.Name} already exists");
-        }
-        if (catalog.Views.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a view named {statement.Name}");
-        if (catalog.Triggers.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a trigger named {statement.Name}");
-        if (TryFindIndex(tables, statement.Name, out _, out _))
-            throw new EmbeddedSqlException($"there is already an index named {statement.Name}");
-
-        // A WITHOUT ROWID table has no hidden rowid to fall back on, so SQLite requires a
-        // PRIMARY KEY; reject the table before it is registered when none is declared.
-        if (statement.WithoutRowid
-            && statement.PrimaryKeyColumns is null
-            && !statement.Columns.Any(column => column.PrimaryKey))
-        {
-            throw new EmbeddedSqlException($"PRIMARY KEY missing on table {statement.Name}");
-        }
-
-        foreach (var check in statement.Columns
-                     .SelectMany(column => column.CheckConstraints)
-                     .Concat(statement.CheckConstraints ?? []))
-        {
-            ValidateCheckConstraintFunctions(check.Expression);
-        }
-
-        var table = new EmbeddedTable(
-            statement.Name,
-            statement.Columns,
-            statement.WithoutRowid,
-            statement.PrimaryKeyColumns,
-            statement.UniqueConstraints,
-            statement.CheckConstraints,
-            statement.PrimaryKeyConflictAlgorithm,
-            statement.PrimaryKeyConstraintName,
-            statement.PrimaryKeyDeclarationOrder,
-            statement.TableForeignKeys,
-            statement.Strict);
-        if (statement.InitialRows is { } initialRows)
-        {
-            // CREATE TABLE AS SELECT stores its schema SQL in compact form (verified
-            // against sqlite3); the catalog dump must reproduce that exact layout.
-            table.SchemaSqlCompact = true;
-            for (var rowIndex = 0; rowIndex < initialRows.Count; rowIndex++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var row = initialRows[rowIndex].ToArray();
-                if (row.Length != table.ColumnDefinitions.Length)
-                {
-                    throw new InvalidOperationException(
-                        "A materialized CREATE TABLE AS SELECT row has the wrong column count.");
-                }
-
-                table.ApplyAffinities(row);
-                table.Rows.Add(row);
-                table.RowIds.Add(checked(rowIndex + 1L));
-            }
-        }
-        var requiredPages = 1;
-        if (table.IsAutoIncrement)
-        {
-            if (!catalog.Tables.ContainsKey(SqliteSequenceTableName))
-                requiredPages++;
-            if (!catalog.Tables.ContainsKey(GetAutoIncrementSequenceBackingTableName(table.Name)))
-                requiredPages++;
-        }
-        EnforceMaxPageCountForCatalogChange(requiredPages);
-        if (table.IsAutoIncrement)
-        {
-            EnsureSqliteSequenceTable(catalog);
-            EnsureAutoIncrementSequenceBackingTable(catalog, table.Name);
-        }
-
-        table.Sql = statement.InitialRows is null
-            ? statement.Sql
-            : BuildCreateTableSql(statement.Name, table);
-
-        tables.Add(statement.Name, table);
+        RunSchemaProgram(compiled, catalog, cancellationToken);
         return new ExecutionResult([], [], 0, true);
     }
 
+    /// <summary>
+    /// The connection-dependent facts and checks a DDL compilation needs.
+    /// </summary>
+    /// <param name="catalog">The schema the statement is resolved against.</param>
+    /// <param name="enforceMaxPageCount">
+    /// Whether the compilation enforces <c>PRAGMA max_page_count</c>. <c>EXPLAIN</c> passes
+    /// <see langword="false"/>: describing a program allocates no page and must not consult a runtime
+    /// storage limit.
+    /// </param>
+    private DdlCompilationContext CreateDdlCompilationContext(
+        SchemaCatalog catalog,
+        bool enforceMaxPageCount = true)
+        => new(
+            catalog,
+            GetPragmaHeaderMetadata().SchemaVersion,
+            ValidateCheckConstraintFunctions,
+            enforceMaxPageCount ? EnforceMaxPageCountForCatalogChange : static _ => { },
+            Database: 0,
+            HasCollation,
+            IsRegisteredScalarFunction,
+            IsMvccEnabled);
+
+    /// <summary>
+    /// Executes a compiled schema program against a stage over <paramref name="catalog"/> and adopts the
+    /// result when it completes.
+    /// </summary>
+    private void RunSchemaProgram(
+        CompiledSchemaProgram compiled,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
+    {
+        var stage = CreateSchemaStage(catalog);
+        var adopted = false;
+        try
+        {
+            var operations = new ManagedSchemaOperations(
+                stage,
+                databaseIndex: 0,
+                new ManagedSchemaIndexServices(ValidateIndexAgainstRows),
+                compiled.PendingObjects);
+            // Deferred index-method and virtual-table bindings resolve through these operations, so a
+            // described program — which is never bound — can never attach a method, reach a module, or
+            // touch their state.
+            compiled.Bind(operations);
+            var (cursorSources, writeTargets) = compiled.CreateBindings(stage, cancellationToken);
+            using var runtime = ResumableStatement.CreateWithSchemaContext(
+                compiled.Program,
+                new Execution.VdbeSchemaExecutionContext(operations),
+                cursorSources,
+                writeTargets,
+                virtualTableBindings: compiled.VirtualTableBindings);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (runtime.StepResumable(cancellationToken) != ResumableStatementStepResult.Done)
+                throw new InvalidOperationException("A schema program yielded instead of completing.");
+
+            cancellationToken.ThrowIfCancellationRequested();
+            // Adoption happens while the statement is still alive so the catalog is published before any
+            // teardown path can run.
+            AdoptSchemaStage(compiled, stage, catalog);
+            adopted = true;
+            // The live catalog now owns whatever VCreate produced, so the statement's disposal must not
+            // disconnect it. A program that failed instead leaves ownership here, and disposal releases it.
+            operations.RelinquishCreatedVirtualTables();
+        }
+        finally
+        {
+            // Discarding a stage releases whatever its working catalog connected. The overlay this phase
+            // builds never owns virtual-table instances, so discarding it is inert either way; the guard
+            // states the rule the later DDL families will depend on — an adopted stage has handed its
+            // objects to the caller and must not release them.
+            if (!adopted)
+                stage.Discard();
+        }
+    }
+
+    /// <summary>
+    /// Builds the transaction-local schema a DDL program stages into: an overlay of
+    /// <paramref name="catalog"/> whose dictionaries are fresh but whose objects are shared.
+    /// </summary>
+    /// <remarks>
+    /// The overlay is what makes a failed program invisible. Adding, replacing or removing an entry in the
+    /// overlay cannot reach <paramref name="catalog"/>, and the objects a <c>CREATE TABLE</c> program
+    /// mutates are the ones it just created, never ones it shares with the caller.
+    /// </remarks>
+    private ManagedSchemaStage CreateSchemaStage(SchemaCatalog catalog)
+        => ManagedSchemaStage.Create(
+            string.IsNullOrEmpty(_databasePath) ? "main" : _databasePath,
+            () => new SchemaCatalog(
+                new Dictionary<string, EmbeddedTable>(catalog.Tables, StringComparer.OrdinalIgnoreCase),
+                new Dictionary<string, ViewDefinition>(catalog.Views, StringComparer.OrdinalIgnoreCase),
+                new Dictionary<string, TriggerDefinition>(catalog.Triggers, StringComparer.OrdinalIgnoreCase),
+                new Dictionary<string, VirtualTableDefinition>(
+                    catalog.VirtualTables,
+                    StringComparer.OrdinalIgnoreCase)),
+            GetPragmaHeaderMetadata(),
+            ManagedSchemaFixedCookies.Default with
+            {
+                DatabaseTextEncoding = (int)GetTextEncoding(),
+            });
+
+    /// <summary>
+    /// Publishes a completed program's staged schema into <paramref name="catalog"/>, after checking that
+    /// the staged rows still describe the staged catalog and that the staged cookie is the single
+    /// increment the outer commit will publish.
+    /// </summary>
+    private void AdoptSchemaStage(
+        CompiledSchemaProgram compiled,
+        ManagedSchemaStage stage,
+        SchemaCatalog catalog)
+    {
+        stage.ValidateRowsDescribeCatalog();
+        if (stage.PragmaHeader.SchemaVersion != compiled.StagedSchemaVersion)
+        {
+            throw new InvalidOperationException(
+                $"A schema program staged schema version {stage.PragmaHeader.SchemaVersion} but its compiled "
+                + $"SetCookie declared {compiled.StagedSchemaVersion}.");
+        }
+
+        AdoptSchemaDictionary(catalog.Tables, stage.Catalog.Tables);
+        AdoptSchemaDictionary(catalog.Views, stage.Catalog.Views);
+        AdoptSchemaDictionary(catalog.Triggers, stage.Catalog.Triggers);
+        AdoptSchemaDictionary(catalog.VirtualTables, stage.Catalog.VirtualTables);
+    }
+
+    private static void AdoptSchemaDictionary<T>(
+        Dictionary<string, T> target,
+        Dictionary<string, T> staged)
+    {
+        foreach (var name in target.Keys.ToArray())
+        {
+            if (!staged.ContainsKey(name))
+                target.Remove(name);
+        }
+
+        foreach (var entry in staged)
+            target[entry.Key] = entry.Value;
+    }
+
+    /// <summary>
+    /// Runs <c>CREATE VIRTUAL TABLE</c> as a compiled VDBE program: <c>VCreate</c> instantiates the
+    /// module's table, one rootpage-0 schema row records it, and <c>ParseSchema</c> adopts that very
+    /// instance.
+    /// </summary>
     private ExecutionResult ExecuteCreateVirtualTable(
         CreateVirtualTableStatement statement,
         SchemaCatalog catalog,
-        bool inTransaction)
+        CancellationToken cancellationToken)
     {
-        if (IsReservedObjectName(statement.Name))
-            throw new EmbeddedSqlException($"object name reserved for internal use: {statement.Name}");
-        if (catalog.VirtualTables.ContainsKey(statement.Name))
-        {
-            if (statement.IfNotExists)
-                return ExecutionResult.Empty;
+        var compiled = DdlStatementCompiler.CompileCreateVirtualTable(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
 
-            throw new EmbeddedSqlException($"table {statement.Name} already exists");
-        }
-        if (catalog.Tables.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a table named {statement.Name}");
-        if (catalog.Views.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a view named {statement.Name}");
-        if (catalog.Triggers.ContainsKey(statement.Name)
-            || TryFindIndex(catalog.Tables, statement.Name, out _, out _))
-        {
-            throw new EmbeddedSqlException($"there is already an object named {statement.Name}");
-        }
-
-        var context = new ManagedVirtualTableCreateContext(statement.Name, statement.Arguments);
-        var program = new VdbeProgram(
-            registerCount: 0,
-            cursorCount: 0,
-            [
-                new VCreateInstruction(
-                    statement.ModuleName,
-                    context,
-                    table =>
-                    {
-                        var payload = table.GetPersistencePayload();
-                        catalog.VirtualTables.Add(
-                            statement.Name,
-                            new VirtualTableDefinition(
-                                statement.Name,
-                                statement.ModuleName,
-                                statement.Arguments.ToArray(),
-                                payload,
-                                table));
-                    }),
-                new HaltInstruction(),
-            ]);
-        RunVirtualTableLifecycleProgram(program);
+        RunSchemaProgram(compiled, catalog, cancellationToken);
         return new ExecutionResult([], [], 0, true);
-    }
-
-    private static void RunVirtualTableLifecycleProgram(
-        VdbeProgram program,
-        IReadOnlyList<VdbeVirtualTableBinding?>? bindings = null)
-    {
-        using var runtime = new ResumableStatement(program, virtualTableBindings: bindings);
-        if (runtime.StepResumable() != ResumableStatementStepResult.Done)
-            throw new InvalidOperationException("A managed virtual-table lifecycle program yielded unexpectedly.");
     }
 
     // SQLite resolves functions in CHECK constraints when the CREATE TABLE statement is
@@ -6301,176 +6367,94 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// Runs <c>DROP TABLE</c> as a compiled VDBE program rather than a direct catalog mutation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every schema effect — the object's <c>sqlite_schema</c> rows, its b-tree roots, a managed index
+    /// method's own state, the <c>sqlite_sequence</c> watermark, the change-capture version entry, the
+    /// implicit AUTOINCREMENT backing table, the cache evictions and the single cookie bump — is staged, so
+    /// a failure anywhere leaves <paramref name="catalog"/> exactly as it was.
+    /// </para>
+    /// <para>
+    /// The foreign-key preflight is the one part that is not a schema effect: emptying the table fires the
+    /// parent actions its children declared, and the managed engine applies those through this connection's
+    /// evaluator against the live child tables, exactly as deleting every row would. It therefore runs
+    /// here rather than in the program, and hands back the undo this method applies when the program that
+    /// follows it fails — so the statement stays all-or-nothing.
+    /// </para>
+    /// </remarks>
     private ExecutionResult ExecuteDropTable(
         DropTableStatement statement,
         SchemaCatalog catalog,
         QueryContext context)
     {
-        var tables = catalog.Tables;
-        if (IsSqliteSequenceTable(statement.Name) && tables.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be dropped");
-        if (catalog.Views.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"use DROP VIEW to delete view {statement.Name}");
-
-        if (catalog.VirtualTables.TryGetValue(statement.Name, out var virtualTable))
-        {
-            var cursor = new Cursor(0);
-            RunVirtualTableLifecycleProgram(
-                new VdbeProgram(
-                    registerCount: 0,
-                    cursorCount: 1,
-                    [
-                        new VDestroyInstruction(cursor, statement.Name),
-                        new HaltInstruction(),
-                    ]),
-                [new VdbeVirtualTableBinding(virtualTable.Table)]);
-            catalog.VirtualTables.Remove(statement.Name);
-            RemoveTriggersForTable(catalog, statement.Name);
-            return new ExecutionResult([], [], 0, true);
-        }
-
-        if (tables.TryGetValue(statement.Name, out var table))
-        {
-            if (context.ForeignKeysEnabled && table.Rows.Count > 0)
-            {
-                var backup = CloneTables(tables);
-                var originalRows = table.Rows.ToArray();
-                try
-                {
-                    table.Rows.Clear();
-                    table.RowIds.Clear();
-                    ValidateForeignKeysAfterDelete(
-                        context,
-                        statement.Name,
-                        table,
-                        originalRows,
-                        table.Rows,
-                        originalRows);
-                }
-                catch
-                {
-                    RestoreTables(tables, backup);
-                    throw;
-                }
-            }
-
-            tables.Remove(statement.Name);
-            RemoveChangeDataCaptureVersion(tables, statement.Name);
-            if (table.IsAutoIncrement)
-            {
-                DeleteSqliteSequenceRows(tables, table.Name);
-                tables.Remove(GetAutoIncrementSequenceBackingTableName(table.Name));
-            }
-            RemoveTriggersForTable(catalog, statement.Name);
-            return new ExecutionResult([], [], 0, true);
-        }
-
-        if (statement.IfExists)
+        var compiled = DdlStatementCompiler.CompileDropTable(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
             return ExecutionResult.Empty;
 
-        throw new EmbeddedSqlException($"no such table: {statement.Name}");
+        var undoForeignKeyActions = catalog.Tables.TryGetValue(statement.Name, out var table)
+            ? RunForeignKeyDropTablePreflight(context, catalog.Tables, statement.Name, table)
+            : null;
+        try
+        {
+            RunSchemaProgram(compiled, catalog, context.CancellationToken);
+        }
+        catch
+        {
+            undoForeignKeyActions?.Invoke();
+            throw;
+        }
+
+        return new ExecutionResult([], [], 0, true);
     }
 
-    private static void RemoveTriggersForTable(SchemaCatalog catalog, string tableName)
+    /// <summary>
+    /// Fires the parent foreign-key actions a <c>DROP TABLE</c> owes its children, by emptying the table
+    /// the way a delete of every row would, and returns the undo that restores the tables it changed — or
+    /// <see langword="null"/> when foreign keys are off or the table is already empty and nothing was
+    /// applied.
+    /// </summary>
+    /// <remarks>
+    /// This is upstream's <c>emit_fk_drop_table_check</c> block (fkeys.rs:2378) in the form the managed
+    /// engine can honor: Ahtola enforces foreign keys in the evaluator, not in bytecode, so the cascade
+    /// runs against the live child tables through the same code path a <c>DELETE</c> uses. A violation
+    /// raises before anything is dropped, and the returned undo lets the caller reverse a cascade whose
+    /// statement failed afterwards.
+    /// </remarks>
+    private Action? RunForeignKeyDropTablePreflight(
+        QueryContext context,
+        Dictionary<string, EmbeddedTable> tables,
+        string tableName,
+        EmbeddedTable table)
     {
-        var orphaned = catalog.Triggers
-            // A temp trigger that watches a table in another schema is stored here but is not
-            // orphaned by a drop in this schema; the owning connection cleans those up instead.
-            .Where(entry => entry.Value.TargetSchema is null
-                && string.Equals(entry.Value.TableName, tableName, StringComparison.OrdinalIgnoreCase))
-            .Select(entry => entry.Key)
-            .ToArray();
-        foreach (var trigger in orphaned)
-            catalog.Triggers.Remove(trigger);
-    }
+        if (!context.ForeignKeysEnabled || table.Rows.Count == 0)
+            return null;
 
-    private static void RemoveChangeDataCaptureVersion(
-        IReadOnlyDictionary<string, EmbeddedTable> tables,
-        string tableName)
-    {
-        if (tableName.Equals(ChangeDataCaptureConfiguration.VersionTableName, StringComparison.OrdinalIgnoreCase)
-            || !tables.TryGetValue(ChangeDataCaptureConfiguration.VersionTableName, out var versions))
+        var backup = CloneTables(tables);
+        var originalRows = table.Rows.ToArray();
+        try
         {
-            return;
+            table.Rows.Clear();
+            table.RowIds.Clear();
+            ValidateForeignKeysAfterDelete(
+                context,
+                tableName,
+                table,
+                originalRows,
+                table.Rows,
+                originalRows);
+        }
+        catch
+        {
+            RestoreTables(tables, backup);
+            throw;
         }
 
-        for (var index = versions.Rows.Count - 1; index >= 0; index--)
-        {
-            var row = versions.Rows[index];
-            if (row.Length != 0
-                && row[0].Kind == SqlValueKind.Text
-                && string.Equals(row[0].AsText(), tableName, StringComparison.Ordinal))
-            {
-                versions.Rows.RemoveAt(index);
-                versions.RowIds.RemoveAt(index);
-            }
-        }
-    }
-
-    private static void EnsureSqliteSequenceTable(SchemaCatalog catalog)
-    {
-        if (catalog.Tables.TryGetValue(SqliteSequenceTableName, out _))
-        {
-            ValidateSqliteSequenceCatalog(catalog.Tables);
-            return;
-        }
-        if (catalog.Views.ContainsKey(SqliteSequenceTableName)
-            || catalog.Triggers.ContainsKey(SqliteSequenceTableName)
-            || TryFindIndex(catalog.Tables, SqliteSequenceTableName, out _, out _))
-        {
-            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
-        }
-
-        catalog.Tables.Add(
-            SqliteSequenceTableName,
-            new EmbeddedTable(
-                SqliteSequenceTableName,
-                [
-                    new EmbeddedColumn("name", null, false, false, false, null),
-                    new EmbeddedColumn("seq", null, false, false, false, null),
-                ]));
-    }
-
-    private static void EnsureAutoIncrementSequenceBackingTable(
-        SchemaCatalog catalog,
-        string tableName)
-    {
-        var backingName = GetAutoIncrementSequenceBackingTableName(tableName);
-        if (catalog.Tables.TryGetValue(backingName, out var existing))
-        {
-            ValidateAutoIncrementSequenceBackingTable(existing);
-            return;
-        }
-        if (catalog.Views.ContainsKey(backingName)
-            || catalog.Triggers.ContainsKey(backingName)
-            || TryFindIndex(catalog.Tables, backingName, out _, out _))
-        {
-            throw new EmbeddedSqlException($"object name reserved for internal use: {backingName}");
-        }
-
-        var backing = new EmbeddedTable(
-            backingName,
-            [
-                new EmbeddedColumn("value", "INTEGER", true, false, false, null),
-                new EmbeddedColumn("is_called", "INTEGER", false, false, false, null),
-                new EmbeddedColumn("start", "INTEGER", false, false, false, null),
-                new EmbeddedColumn("inc", "INTEGER", false, false, false, null),
-                new EmbeddedColumn("min", "INTEGER", false, false, false, null),
-                new EmbeddedColumn("max", "INTEGER", false, false, false, null),
-                new EmbeddedColumn("cycle", "INTEGER", false, false, false, null),
-            ]);
-        backing.Rows.Add(
-        [
-            SqlValue.Integer(1),
-            SqlValue.Integer(0),
-            SqlValue.Integer(1),
-            SqlValue.Integer(1),
-            SqlValue.Integer(1),
-            SqlValue.Integer(long.MaxValue),
-            SqlValue.Integer(0),
-        ]);
-        backing.RowIds.Add(1);
-        catalog.Tables.Add(backingName, backing);
+        return () => RestoreTables(tables, backup);
     }
 
     internal static void ValidateSqliteSequenceCatalog(
@@ -6496,7 +6480,100 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    private static void ValidateAutoIncrementSequenceBackingTable(EmbeddedTable backing)
+    /// <summary>
+    /// Whether a <c>CREATE TABLE ... AUTOINCREMENT</c> has to create <c>sqlite_sequence</c>, validating the
+    /// existing one or the availability of its name.
+    /// </summary>
+    /// <remarks>
+    /// This is the decision half of what <c>ExecuteCreateTable</c> used to do inline; the creation half is
+    /// now bytecode emitted by <see cref="Compilation.DdlStatementCompiler"/>.
+    /// </remarks>
+    internal static bool RequiresSqliteSequenceTable(SchemaCatalog catalog)
+    {
+        ArgumentNullException.ThrowIfNull(catalog);
+        if (catalog.Tables.ContainsKey(SqliteSequenceTableName))
+        {
+            ValidateSqliteSequenceCatalog(catalog.Tables);
+            return false;
+        }
+
+        if (catalog.Views.ContainsKey(SqliteSequenceTableName)
+            || catalog.Triggers.ContainsKey(SqliteSequenceTableName)
+            || TryFindIndex(catalog.Tables, SqliteSequenceTableName, out _, out _))
+        {
+            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
+        }
+
+        return true;
+    }
+
+    /// <summary>The <c>sqlite_sequence</c> definition, used to derive its schema SQL and to adopt it.</summary>
+    internal static EmbeddedTable CreateSqliteSequenceTable()
+        => new(
+            SqliteSequenceTableName,
+            [
+                new EmbeddedColumn("name", null, false, false, false, null),
+                new EmbeddedColumn("seq", null, false, false, false, null),
+            ]);
+
+    /// <summary>
+    /// Whether a <c>CREATE TABLE ... AUTOINCREMENT</c> has to create the Turso sequence backing table,
+    /// validating the existing one or the availability of its name.
+    /// </summary>
+    internal static bool RequiresAutoIncrementSequenceBackingTable(SchemaCatalog catalog, string backingName)
+    {
+        ArgumentNullException.ThrowIfNull(catalog);
+        ArgumentException.ThrowIfNullOrWhiteSpace(backingName);
+        if (catalog.Tables.TryGetValue(backingName, out var existing))
+        {
+            ValidateAutoIncrementSequenceBackingTable(existing);
+            return false;
+        }
+
+        if (catalog.Views.ContainsKey(backingName)
+            || catalog.Triggers.ContainsKey(backingName)
+            || TryFindIndex(catalog.Tables, backingName, out _, out _))
+        {
+            throw new EmbeddedSqlException($"object name reserved for internal use: {backingName}");
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// The Turso sequence backing table, seeded with the initial sequence row. The seed row travels in
+    /// <see cref="EmbeddedTable.Rows"/> so the compiled program can write it through ordinary
+    /// record/rowid/insert bytecode once <c>ParseSchema</c> has adopted the table.
+    /// </summary>
+    internal static EmbeddedTable CreateAutoIncrementSequenceBackingTable(string backingName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(backingName);
+        var backing = new EmbeddedTable(
+            backingName,
+            [
+                new EmbeddedColumn("value", "INTEGER", true, false, false, null),
+                new EmbeddedColumn("is_called", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("start", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("inc", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("min", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("max", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("cycle", "INTEGER", false, false, false, null),
+            ]);
+        backing.Rows.Add(
+        [
+            SqlValue.Integer(1),
+            SqlValue.Integer(0),
+            SqlValue.Integer(1),
+            SqlValue.Integer(1),
+            SqlValue.Integer(1),
+            SqlValue.Integer(long.MaxValue),
+            SqlValue.Integer(0),
+        ]);
+        backing.RowIds.Add(1);
+        return backing;
+    }
+
+    internal static void ValidateAutoIncrementSequenceBackingTable(EmbeddedTable backing)
     {
         string[] columns = ["value", "is_called", "start", "inc", "min", "max", "cycle"];
         if (!backing.HasRowid || backing.ColumnDefinitions.Length != columns.Length)
@@ -6535,89 +6612,64 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    private ExecutionResult ExecuteCreateIndex(CreateIndexStatement statement, SchemaCatalog catalog)
+    /// <summary>
+    /// Runs <c>CREATE INDEX</c> as a compiled VDBE program rather than a direct catalog mutation.
+    /// </summary>
+    /// <remarks>
+    /// Every effect — the b-tree root, the <c>sqlite_schema</c> row, the schema cookie, the adoption into
+    /// the catalog, the refill, and a method index's own <c>Create</c> hook — is staged, so a failure
+    /// anywhere leaves <paramref name="catalog"/> exactly as it was. Durable publication is unchanged: the
+    /// caller's autocommit/transaction boundary persists the catalog in one pager/WAL commit.
+    /// </remarks>
+    private ExecutionResult ExecuteCreateIndex(
+        CreateIndexStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
     {
-        var tables = catalog.Tables;
-        if (IsReservedObjectName(statement.Name))
-            throw new EmbeddedSqlException($"object name reserved for internal use: {statement.Name}");
-        if (tables.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a table named {statement.Name}");
-        if (catalog.Views.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a view named {statement.Name}");
-        if (catalog.Triggers.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a trigger named {statement.Name}");
+        var compiled = DdlStatementCompiler.CompileCreateIndex(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
 
-        if (TryFindIndex(tables, statement.Name, out _, out _))
-        {
-            if (statement.IfNotExists)
-                return ExecutionResult.Empty;
-
-            throw new EmbeddedSqlException($"index {statement.Name} already exists");
-        }
-
-        if (IsSchemaTable(statement.TableName))
-            throw new EmbeddedSqlException($"table {statement.TableName} may not be indexed");
-        if (IsSqliteSequenceTable(statement.TableName))
-            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be indexed");
-        if (catalog.VirtualTables.ContainsKey(statement.TableName))
-            throw new EmbeddedSqlException("virtual tables may not be indexed");
-        if (catalog.Views.ContainsKey(statement.TableName))
-            throw new EmbeddedSqlException($"views may not be indexed");
-        if (!tables.TryGetValue(statement.TableName, out var table))
-            throw new EmbeddedSqlException($"no such table: {statement.TableName}");
-
-        var definition = EmbeddedIndexFactory.Create(statement.TableName, table, statement);
-        if (definition.Columns.Any(column =>
-                column.Expression is not null
-                && IndexExpressionSemantics.ContainsFunction(column.Expression, IsRegisteredScalarFunction))
-            || definition.Where is not null
-                && IndexExpressionSemantics.ContainsFunction(definition.Where, IsRegisteredScalarFunction))
-        {
-            throw new EmbeddedSqlException(
-                "application-defined functions are prohibited in index expressions and partial index WHERE clauses");
-        }
-        foreach (var column in definition.Columns)
-        {
-            // Building an index requires ordering its rows by every declared column's collation.
-            // A name that resolves to neither a SQLite built-in nor an already-registered
-            // application-defined callback can never be honored, so CREATE INDEX must fail closed
-            // here with the SQLite-style message instead of publishing an index that would silently
-            // fall back to BINARY ordering (or simply sit unusable) the first time it is planned or
-            // written to. This applies uniformly whether the catalog is file-backed or in-memory
-            // only, matching a bare custom-collation table/column CREATE TABLE rejection.
-            var collationName = IndexExpressionSemantics.GetCollationName(table, column);
-            if (!HasCollation(collationName))
-                throw new EmbeddedSqlException($"no such collation sequence: {collationName}");
-        }
-        IndexExpressionSemantics.ValidateRoundTrip(statement.TableName, table, definition);
-        if (definition.Unique)
-            ValidateUniqueIndex(statement.TableName, table, definition, table.Rows);
-
-        if (definition.IsMethodIndex)
-        {
-            // Attach eagerly so an unknown method, a bad column shape or an unknown WITH key fails
-            // the CREATE rather than the first query. The index is published into the table only
-            // after the derived state built successfully, and the attachment cache is cleaned up on
-            // every failure path so a thrown CREATE leaves nothing behind for the next statement to
-            // find.
-            ManagedIndexMethodSemantics.Forget(table, definition.Name);
-            try
-            {
-                var attachment = ManagedIndexMethodSemantics.GetAttachment(statement.TableName, table, definition);
-                Indexing.ManagedIndexMethodMvcc.Ensure(attachment.Definition, IsMvccEnabled, forWrite: true);
-                using var cursor = attachment.Open(new EmbeddedTableIndexSource(table));
-                cursor.Create();
-            }
-            catch
-            {
-                ManagedIndexMethodSemantics.Forget(table, definition.Name);
-                throw;
-            }
-        }
-
-        EnforceMaxPageCountForCatalogChange(1);
-        table.Indexes.Add(definition);
+        RunSchemaProgram(compiled, catalog, cancellationToken);
         return new ExecutionResult([], [], 0, true);
+    }
+
+    /// <summary>
+    /// Runs <c>DROP INDEX</c> as a compiled VDBE program rather than a direct catalog mutation.
+    /// </summary>
+    private ExecutionResult ExecuteDropIndex(
+        DropIndexStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
+    {
+        var compiled = DdlStatementCompiler.CompileDropIndex(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
+
+        RunSchemaProgram(compiled, catalog, cancellationToken);
+        return new ExecutionResult([], [], 0, true);
+    }
+
+    /// <summary>
+    /// Projects every qualifying base row through <paramref name="index"/> and enforces the index's
+    /// uniqueness constraint, using this connection's registered collations and expression evaluator.
+    /// </summary>
+    /// <remarks>
+    /// This is the observable half of the sorter-driven refill Turso emits for <c>CREATE INDEX</c>
+    /// (index.rs:326). It is reachable only from the <c>IndexBuild</c> opcode, so the diagnostic and the
+    /// point at which it is raised are the same whether an index is created over existing rows or a
+    /// conflicting row is written afterwards.
+    /// </remarks>
+    internal void ValidateIndexAgainstRows(string tableName, EmbeddedTable table, EmbeddedIndex index)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(index);
+        if (index.Unique)
+            ValidateUniqueIndex(tableName, table, index, table.Rows);
     }
 
     private ExecutionResult ExecuteReindex(ReindexStatement statement, SchemaCatalog catalog)
@@ -7189,34 +7241,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             || _scalarFunctions.ContainsKey((normalized, -1));
     }
 
-    private static ExecutionResult ExecuteDropIndex(DropIndexStatement statement, Dictionary<string, EmbeddedTable> tables)
-    {
-        if (TryFindIndex(tables, statement.Name, out var table, out var index))
-        {
-            if (index.Origin != EmbeddedIndexOrigin.Explicit)
-            {
-                throw new EmbeddedSqlException(
-                    $"index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped: {statement.Name}");
-            }
-
-            table.Indexes.Remove(index);
-            if (index.IsMethodIndex)
-            {
-                // Give the method its Destroy hook before the attachment is forgotten, so anything
-                // it owns is released rather than orphaned.
-                ManagedIndexMethodSemantics.Forget(table, index.Name, destroy: true);
-            }
-
-            return new ExecutionResult([], [], 0, true);
-        }
-
-        if (statement.IfExists)
-            return ExecutionResult.Empty;
-
-        throw new EmbeddedSqlException($"no such index: {statement.Name}");
-    }
-
-    private static bool TryFindIndex(
+    internal static bool TryFindIndex(
         Dictionary<string, EmbeddedTable> tables,
         string indexName,
         out EmbeddedTable table,
@@ -7266,45 +7291,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return false;
     }
 
-    private static ExecutionResult ExecuteCreateView(CreateViewStatement statement, SchemaCatalog catalog)
+    /// <summary>
+    /// Runs <c>CREATE VIEW</c> as a compiled VDBE program: one rootpage-0 schema row, a
+    /// <c>ParseSchema</c> that adopts the declared definition, and one cookie bump.
+    /// </summary>
+    private ExecutionResult ExecuteCreateView(
+        CreateViewStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
     {
-        var tables = catalog.Tables;
-        if (IsReservedObjectName(statement.Name))
-            throw new EmbeddedSqlException($"object name reserved for internal use: {statement.Name}");
-        if (catalog.Views.ContainsKey(statement.Name))
-        {
-            if (statement.IfNotExists)
-                return ExecutionResult.Empty;
+        var compiled = DdlStatementCompiler.CompileCreateView(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
 
-            throw new EmbeddedSqlException($"view {statement.Name} already exists");
-        }
-        if (tables.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a table named {statement.Name}");
-        if (catalog.Triggers.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a trigger named {statement.Name}");
-        if (TryFindIndex(tables, statement.Name, out _, out _))
-            throw new EmbeddedSqlException($"there is already an index named {statement.Name}");
-
-        // Turso validates aggregate-internal ORDER BY while compiling a view, even though
-        // ordinary queries retain the managed engine's supported aggregate ordering.
-        if (QueryContainsAggregateInternalOrderBy(statement.Query))
-        {
-            throw new EmbeddedSqlException(
-                "ORDER BY clause is not supported yet in aggregate functions");
-        }
-
-        // SQLite defers view-body validation to query time: base tables and views may be
-        // defined later (forward references), and column arity / unknown columns, tables, or
-        // functions are reported when the view is queried, not when it is created. Circular
-        // definitions are detected at query time by EnterView. File-backed catalogs still
-        // reject runtime-only dependencies (bind parameters, managed callbacks) at persist time.
-        var view = new ViewDefinition(statement.Name, statement.Columns, statement.Query, statement.Sql);
-        catalog.Views.Add(statement.Name, view);
-
+        RunSchemaProgram(compiled, catalog, cancellationToken);
         return new ExecutionResult([], [], 0, true);
     }
 
-    private static bool QueryContainsAggregateInternalOrderBy(QueryStatement query)
+    internal static bool QueryContainsAggregateInternalOrderBy(QueryStatement query)
     {
         return query switch
         {
@@ -7408,97 +7414,74 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 || ExpressionContainsAggregateInternalOrderBy(window.Frame?.End.Offset));
     }
 
-    private static ExecutionResult ExecuteDropView(DropViewStatement statement, SchemaCatalog catalog)
+    /// <summary>
+    /// Runs <c>DROP VIEW</c> as a compiled VDBE program: the <c>view</c> row and the rows of the triggers
+    /// that watched it are deleted by cursor bytecode, then the cookie is bumped and the objects are
+    /// evicted with <c>DropView</c>/<c>DropTrigger</c>.
+    /// </summary>
+    private ExecutionResult ExecuteDropView(
+        DropViewStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
     {
-        if (catalog.Views.Remove(statement.Name))
-        {
-            RemoveTriggersForTable(catalog, statement.Name);
-            return new ExecutionResult([], [], 0, true);
-        }
-        if (catalog.Tables.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"use DROP TABLE to delete table {statement.Name}");
-        if (statement.IfExists)
+        var compiled = DdlStatementCompiler.CompileDropView(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
             return ExecutionResult.Empty;
 
-        throw new EmbeddedSqlException($"no such view: {statement.Name}");
-    }
-
-    private ExecutionResult ExecuteCreateTrigger(
-        CreateTriggerStatement statement,
-        SchemaCatalog catalog,
-        QueryContext context)
-    {
-        var tables = catalog.Tables;
-        if (IsReservedObjectName(statement.Name))
-            throw new EmbeddedSqlException($"object name reserved for internal use: {statement.Name}");
-        if (catalog.Triggers.ContainsKey(statement.Name))
-        {
-            if (statement.IfNotExists)
-                return ExecutionResult.Empty;
-
-            throw new EmbeddedSqlException($"trigger {statement.Name} already exists");
-        }
-
-        // Triggers live in their own namespace: a trigger may share its name with a
-        // table, view, or index. Only trigger-vs-trigger collides (SQLite/Turso
-        // semantics — turso-src/core/translate/trigger.rs checks get_trigger only).
-        var targetsTable = tables.ContainsKey(statement.TableName);
-        var targetsView = catalog.Views.ContainsKey(statement.TableName);
-        if (catalog.VirtualTables.ContainsKey(statement.TableName))
-            throw new EmbeddedSqlException("cannot create triggers on virtual tables");
-        // A temp trigger may watch a table in another schema. That table lives in a database this
-        // instance cannot see, so the owning connection validates the target before routing here.
-        if (statement.TargetSchema is null)
-        {
-            if (IsSqliteSequenceTable(statement.TableName) && targetsTable)
-                throw new EmbeddedSqlException("cannot create trigger on system table");
-            if (statement.Timing == TriggerTiming.InsteadOf)
-            {
-                if (targetsTable)
-                    throw new EmbeddedSqlException($"cannot create INSTEAD OF trigger on table: {statement.TableName}");
-                if (!targetsView)
-                    throw new EmbeddedSqlException($"no such view: {statement.TableName}");
-            }
-            else
-            {
-                if (targetsView)
-                    throw new EmbeddedSqlException($"cannot create {statement.Timing.ToString().ToUpperInvariant()} trigger on view: {statement.TableName}");
-                if (!targetsTable)
-                    throw new EmbeddedSqlException($"no such table: {statement.TableName}");
-            }
-        }
-
-        var declarationOrder = catalog.Triggers.Count == 0
-            ? 0
-            : checked(catalog.Triggers.Values.Max(trigger => trigger.DeclarationOrder) + 1);
-
-        var definition = new TriggerDefinition(
-            statement.Name,
-            statement.Timing,
-            statement.Event,
-            statement.UpdateOfColumns,
-            statement.TableName,
-            statement.When,
-            statement.Body,
-            statement.Sql,
-            declarationOrder,
-            statement.TargetSchema,
-            statement.Temporary);
-        catalog.Triggers.Add(statement.Name, definition);
+        RunSchemaProgram(compiled, catalog, cancellationToken);
         return new ExecutionResult([], [], 0, true);
     }
 
-    private static ExecutionResult ExecuteDropTrigger(DropTriggerStatement statement, SchemaCatalog catalog)
+    /// <summary>
+    /// Runs <c>CREATE TRIGGER</c> as a compiled VDBE program: one rootpage-0 <c>trigger</c> row, one
+    /// cookie bump, and a <c>ParseSchema</c> that adopts the declared definition together with the
+    /// routing facts — its declaration order, whether it is temporary, and which schema owns the table it
+    /// watches — that the stored SQL cannot express.
+    /// </summary>
+    private ExecutionResult ExecuteCreateTrigger(
+        CreateTriggerStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
     {
-        if (catalog.Triggers.Remove(statement.Name))
-            return new ExecutionResult([], [], 0, true);
-        if (statement.IfExists)
+        var compiled = DdlStatementCompiler.CompileCreateTrigger(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
             return ExecutionResult.Empty;
 
-        throw new EmbeddedSqlException($"no such trigger: {statement.Name}");
+        RunSchemaProgram(compiled, catalog, cancellationToken);
+        return new ExecutionResult([], [], 0, true);
     }
 
-    private ExecutionResult ExecuteAlterTableAddColumn(
+    /// <summary>Runs <c>DROP TRIGGER</c> as a compiled VDBE program.</summary>
+    private ExecutionResult ExecuteDropTrigger(
+        DropTriggerStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
+    {
+        var compiled = DdlStatementCompiler.CompileDropTrigger(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
+
+        RunSchemaProgram(compiled, catalog, cancellationToken);
+        return new ExecutionResult([], [], 0, true);
+    }
+
+    /// <summary>
+    /// Decides whether an <c>ADD COLUMN</c> is legal and computes the row the program rewrites.
+    /// </summary>
+    /// <remarks>
+    /// The candidate is built and validated exactly as the column will be added, so every diagnostic
+    /// SQLite raises before it touches the schema — a duplicate name, a PRIMARY KEY or UNIQUE column, a
+    /// non-constant default or a NOT NULL column without one on a non-empty table, a STRICT type mismatch,
+    /// and a CHECK constraint the existing rows violate — is raised here, at the same point in the
+    /// statement the direct rewrite raised it.
+    /// </remarks>
+    private (string CurrentName, CompiledAlterTablePlan Plan) PlanAlterTableAddColumn(
         AlterTableAddColumnStatement statement,
         SqlValue[] parameters,
         QueryContext context)
@@ -7514,6 +7497,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         ValidateCollation(statement.Column.Collation);
         var candidate = table.Clone();
+        // SQLite edits the stored CREATE TABLE by inserting the added column's own text, and regenerates
+        // the statement when there is no faithful text to edit. The opcode repeats this against the stage;
+        // doing it here as well is what lets the rewritten row be computed before anything runs.
+        candidate.Sql = table.Sql is not null && statement.ColumnSql is not null
+            ? AlterTableSqlRewriter.InsertAddedColumn(table.Sql, statement.ColumnSql)
+            : null;
         candidate.AddColumn(statement.Column);
         for (var position = 0; position < candidate.Rows.Count; position++)
         {
@@ -7526,188 +7515,196 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 parameters,
                 context);
         }
-        table.Sql = table.Sql is not null && statement.ColumnSql is not null
-            ? AlterTableSqlRewriter.InsertAddedColumn(table.Sql, statement.ColumnSql)
-            : null;
-        table.AddColumn(statement.Column);
+
+        var rowRewrites = new List<CompiledSchemaRowRewrite>();
+        var droppedIndexes = new List<string>();
+        var addedIndexes = new List<CompiledSchemaIndexCreation>();
+        AddSchemaRowRewrites(
+            rowRewrites,
+            droppedIndexes,
+            table.Name,
+            table.Name,
+            table,
+            candidate,
+            addedIndexes);
+        return (table.Name, new CompiledAlterTablePlan
+        {
+            RowRewrites = rowRewrites,
+            DroppedIndexes = droppedIndexes,
+            AddedIndexes = addedIndexes,
+            ReplacementTables = SingleReplacementTable(table.Name, candidate),
+        });
+    }
+
+    /// <summary>
+    /// Runs any ordinary <c>ALTER TABLE</c> as a compiled VDBE program, and the virtual-table rename
+    /// through its own program, exactly as <c>translate_alter_table</c> (alter.rs:855) routes both.
+    /// </summary>
+    private ExecutionResult ExecuteAlterTable(
+        ParsedStatement statement,
+        SchemaCatalog catalog,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (statement is AlterTableRenameStatement virtualRename
+            && catalog.VirtualTables.TryGetValue(virtualRename.TableName, out var virtualTable))
+        {
+            // Deciding whether the rename is legal — the new name is free, and every dependent view and
+            // trigger still resolves once its stored SQL has been rewritten — needs this connection's
+            // evaluator, so it happens here. The effects are a schema program.
+            var (rewrittenViews, rewrittenTriggers) = ValidateVirtualTableRename(
+                virtualRename,
+                virtualTable,
+                catalog,
+                context);
+            RunSchemaProgram(
+                DdlStatementCompiler.CompileRenameVirtualTable(
+                    virtualRename,
+                    virtualTable,
+                    rewrittenViews,
+                    rewrittenTriggers,
+                    CreateDdlCompilationContext(catalog)),
+                catalog,
+                context.CancellationToken);
+            return new ExecutionResult([], [], 0, true);
+        }
+
+        RunSchemaProgram(
+            CompileAlterTable(statement, catalog, parameters, context, CreateDdlCompilationContext(catalog)),
+            catalog,
+            context.CancellationToken);
         return new ExecutionResult([], [], 0, true);
     }
 
-    private ExecutionResult ExecuteAlterTableRename(
+    /// <summary>
+    /// Lowers one ordinary <c>ALTER TABLE</c> into its typed program: the plan half decides whether the
+    /// alteration is legal and computes the rows and dependents it produces, and the compiler half turns
+    /// that into bytecode.
+    /// </summary>
+    internal CompiledSchemaProgram CompileAlterTable(
+        ParsedStatement statement,
+        SchemaCatalog catalog,
+        SqlValue[] parameters,
+        QueryContext context,
+        DdlCompilationContext compilationContext)
+    {
+        ArgumentNullException.ThrowIfNull(statement);
+        switch (statement)
+        {
+            case AlterTableRenameStatement rename:
+                {
+                    var (currentName, plan) = PlanAlterTableRename(rename, catalog, context);
+                    return DdlStatementCompiler.CompileRenameTable(rename, currentName, plan, compilationContext);
+                }
+            case AlterTableAddColumnStatement addColumn:
+                {
+                    var (currentName, plan) = PlanAlterTableAddColumn(addColumn, parameters, context);
+                    return DdlStatementCompiler.CompileAddColumn(addColumn, currentName, plan, compilationContext);
+                }
+            case AlterTableDropColumnStatement dropColumn:
+                {
+                    var (currentName, columnIndex, plan) = PlanAlterTableDropColumn(dropColumn, catalog, context);
+                    return DdlStatementCompiler.CompileDropColumn(
+                        dropColumn,
+                        currentName,
+                        columnIndex,
+                        plan,
+                        compilationContext);
+                }
+            case AlterTableRenameColumnStatement renameColumn:
+                {
+                    var (currentName, columnIndex, plan) = PlanAlterTableRenameColumn(renameColumn, catalog, context);
+                    return DdlStatementCompiler.CompileRenameColumn(
+                        renameColumn,
+                        currentName,
+                        columnIndex,
+                        plan,
+                        compilationContext);
+                }
+            case AlterTableAlterColumnStatement alterColumn:
+                {
+                    var (currentName, columnIndex, plan) = PlanAlterTableAlterColumn(
+                        alterColumn,
+                        catalog,
+                        parameters,
+                        context);
+                    return DdlStatementCompiler.CompileAlterColumn(
+                        alterColumn,
+                        currentName,
+                        columnIndex,
+                        plan,
+                        compilationContext);
+                }
+            default:
+                throw new InvalidOperationException(
+                    $"{statement.GetType().Name} is not an ALTER TABLE statement.");
+        }
+    }
+
+    /// <summary>
+    /// Decides whether an ordinary <c>RENAME TO</c> is legal and computes everything the compiled program
+    /// has to write: the <c>sqlite_schema</c> rows whose identity or text the rename changes, and the
+    /// dependent tables, views and triggers whose rewritten definitions <c>ParseSchema</c> adopts.
+    /// </summary>
+    private (string CurrentName, CompiledAlterTablePlan Plan) PlanAlterTableRename(
         AlterTableRenameStatement statement,
         SchemaCatalog catalog,
         QueryContext context)
     {
         var tables = catalog.Tables;
-        if (catalog.VirtualTables.TryGetValue(statement.TableName, out var virtualTable))
-        {
-            if (IsReservedObjectName(statement.NewName))
-                throw new EmbeddedSqlException($"object name reserved for internal use: {statement.NewName}");
-            if (catalog.VirtualTables.ContainsKey(statement.NewName)
-                || tables.ContainsKey(statement.NewName)
-                || catalog.Views.ContainsKey(statement.NewName)
-                || catalog.Triggers.ContainsKey(statement.NewName)
-                || TryFindIndex(tables, statement.NewName, out _, out _))
-            {
-                throw new EmbeddedSqlException($"there is already an object named {statement.NewName}");
-            }
-
-            var candidatePayload = virtualTable.PersistencePayload.Clone();
-            var virtualCandidateTable = ManagedVirtualTableModuleRegistry.Resolve(virtualTable.ModuleName).Create(
-                new ManagedVirtualTableCreateContext(statement.NewName, virtualTable.Arguments),
-                candidatePayload);
-            ArgumentNullException.ThrowIfNull(virtualCandidateTable);
-            var candidateVirtualTables = new Dictionary<string, VirtualTableDefinition>(
-                catalog.VirtualTables,
-                StringComparer.OrdinalIgnoreCase);
-            candidateVirtualTables.Remove(statement.TableName);
-            candidateVirtualTables.Add(
-                statement.NewName,
-                new VirtualTableDefinition(
-                    statement.NewName,
-                    virtualTable.ModuleName,
-                    virtualTable.Arguments.ToArray(),
-                    candidatePayload,
-                    virtualCandidateTable));
-
-            try
-            {
-                Dictionary<string, ViewDefinition>? virtualCandidateViews = null;
-                Dictionary<string, TriggerDefinition>? virtualCandidateTriggers = null;
-                foreach (var view in catalog.Views.Values)
-                {
-                    context.CheckInterrupt();
-                    var rewritten = AlterTableSqlRewriter.RenameTableReferences(
-                        view.Sql, statement.TableName, statement.NewName);
-                    if (rewritten is null || string.Equals(rewritten, view.Sql, StringComparison.Ordinal))
-                        continue;
-
-                    virtualCandidateViews ??= new Dictionary<string, ViewDefinition>(
-                        catalog.Views,
-                        StringComparer.OrdinalIgnoreCase);
-                    var parsed = (CreateViewStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
-                    virtualCandidateViews[view.Name] = view with { Query = parsed.Query, Sql = parsed.Sql };
-                }
-
-                foreach (var trigger in catalog.Triggers.Values)
-                {
-                    context.CheckInterrupt();
-                    var rewritten = AlterTableSqlRewriter.RenameTableReferences(
-                        trigger.Sql, statement.TableName, statement.NewName);
-                    if (rewritten is null || string.Equals(rewritten, trigger.Sql, StringComparison.Ordinal))
-                        continue;
-
-                    virtualCandidateTriggers ??= new Dictionary<string, TriggerDefinition>(
-                        catalog.Triggers,
-                        StringComparer.OrdinalIgnoreCase);
-                    var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
-                    var parsedTableName = ManagedSchemaName.TrySplit(parsed.TableName, out var parsedSchema, out var parsedLocalName)
-                        && parsedSchema.Equals("main", StringComparison.OrdinalIgnoreCase)
-                        ? parsedLocalName
-                        : parsed.TableName;
-                    virtualCandidateTriggers[trigger.Name] = trigger with
-                    {
-                        TableName = parsedTableName,
-                        UpdateOfColumns = parsed.UpdateOfColumns,
-                        When = parsed.When,
-                        Body = parsed.Body,
-                        Sql = parsed.Sql,
-                    };
-                }
-
-                var virtualCandidateCatalog = new SchemaCatalog(
-                    tables,
-                    virtualCandidateViews ?? catalog.Views,
-                    virtualCandidateTriggers ?? catalog.Triggers,
-                    candidateVirtualTables);
-                ValidateDependentSchema(
-                    virtualCandidateCatalog,
-                    context with
-                    {
-                        Tables = tables,
-                        Views = virtualCandidateCatalog.Views,
-                        Triggers = virtualCandidateCatalog.Triggers,
-                        VirtualTables = virtualCandidateCatalog.VirtualTables,
-                        SchemaValidation = true,
-                    },
-                    context.CancellationToken,
-                    "rename table",
-                    catalog,
-                    context with
-                    {
-                        Views = catalog.Views,
-                        Triggers = catalog.Triggers,
-                        SchemaValidation = true,
-                    });
-
-                var cursor = new Cursor(0);
-                RunVirtualTableLifecycleProgram(
-                    new VdbeProgram(
-                        registerCount: 1,
-                        cursorCount: 1,
-                        [
-                            new LoadConstantInstruction(new Register(0), SqlValue.Text(statement.NewName)),
-                            new VRenameInstruction(cursor, new Register(0)),
-                            new HaltInstruction(),
-                        ]),
-                    [new VdbeVirtualTableBinding(virtualTable.Table)]);
-                catalog.VirtualTables.Remove(statement.TableName);
-                catalog.VirtualTables.Add(
-                    statement.NewName,
-                    (virtualTable with { Name = statement.NewName }).WithCurrentPersistencePayload());
-                if (virtualCandidateViews is not null)
-                {
-                    foreach (var entry in virtualCandidateViews)
-                        catalog.Views[entry.Key] = entry.Value;
-                }
-                if (virtualCandidateTriggers is not null)
-                {
-                    foreach (var entry in virtualCandidateTriggers)
-                        catalog.Triggers[entry.Key] = entry.Value;
-                }
-            }
-            finally
-            {
-                virtualCandidateTable.DisconnectInstance();
-            }
-            return new ExecutionResult([], [], 0, true);
-        }
-
-        if (IsSqliteSequenceTable(statement.TableName) && tables.ContainsKey(statement.TableName))
-            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
-        if (IsSqliteSequenceTable(statement.NewName))
-            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
-        if (tables.ContainsKey(statement.NewName))
-            throw new EmbeddedSqlException($"table {statement.NewName} already exists");
-        if (TryFindIndex(tables, statement.NewName, out _, out _))
-            throw new EmbeddedSqlException($"there is already an index named {statement.NewName}");
+        ValidateAlterTableRenameName(
+            statement,
+            tables,
+            catalog.Views,
+            catalog.Triggers,
+            catalog.VirtualTables);
         if (!tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
-        var candidateTables = new Dictionary<string, EmbeddedTable>(
-            tables,
-            StringComparer.OrdinalIgnoreCase);
-        var hasQualifiedCheckReferences = table.HasQualifiedCheckReferences();
-        var candidateTable = hasQualifiedCheckReferences
-            ? table.CloneWithRenamedCheckTableReferences(table.Name, statement.NewName)
-            : table.Clone();
+
+        // Names resolve case-insensitively, but every schema scan compares the name column with BINARY
+        // semantics, so the program has to search for the spelling the rows carry.
+        var previousName = table.Name;
+        var candidateTables = new Dictionary<string, EmbeddedTable>(tables, StringComparer.OrdinalIgnoreCase);
+        var candidateTable = CreateRenamedTable(table, statement.NewName);
+        RewriteRenamedTableSelfSql(candidateTable, previousName, statement.NewName);
         candidateTables.Remove(statement.TableName);
-        if (!hasQualifiedCheckReferences)
-            candidateTable.Rename(statement.NewName);
         candidateTables.Add(statement.NewName, candidateTable);
+
+        // Foreign-key metadata and stored text of every table that references the old name, including the
+        // renamed table's own self-referencing foreign keys. The metadata must follow the rename or
+        // referential enforcement silently loses the parent.
+        var rewrittenTables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
+        foreach (var subject in candidateTables.Values.ToArray())
+        {
+            context.CheckInterrupt();
+            if (!HasForeignKeyTo(subject, previousName))
+                continue;
+
+            if (CreateWithRenamedForeignKeyParentTable(subject, previousName, statement.NewName) is not { } replacement)
+                continue;
+
+            candidateTables[subject.Name] = replacement;
+            rewrittenTables[subject.Name] = replacement;
+        }
+
+        var renamedBackingTable = default(EmbeddedTable);
         if (candidateTable.IsAutoIncrement)
         {
             if (!candidateTables.TryGetValue(SqliteSequenceTableName, out var sequence))
                 throw new InvalidOperationException("An AUTOINCREMENT table is missing sqlite_sequence.");
             candidateTables[SqliteSequenceTableName] = sequence.Clone();
-            RenameSqliteSequenceRows(candidateTables, table.Name, statement.NewName);
-            RenameAutoIncrementSequenceBackingTable(candidateTables, table.Name, statement.NewName);
+            RenameSqliteSequenceRows(candidateTables, previousName, statement.NewName);
+            RenameAutoIncrementSequenceBackingTable(candidateTables, previousName, statement.NewName);
+            candidateTables.TryGetValue(
+                GetAutoIncrementSequenceBackingTableName(statement.NewName),
+                out renamedBackingTable);
         }
 
         // Dependent views and triggers must follow the rename the way SQLite rewrites them
         // (sqlite3_rename_trigger): the stored SQL gets its table references rewritten in place
         // and the definitions are reparsed so the parsed bodies match the new name.
-        Dictionary<string, ViewDefinition>? candidateViews = null;
-        Dictionary<string, TriggerDefinition>? candidateTriggers = null;
+        var rewrittenViews = new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase);
+        var rewrittenTriggers = new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase);
         foreach (var view in catalog.Views.Values)
         {
             context.CheckInterrupt();
@@ -7716,11 +7713,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (rewritten is null || string.Equals(rewritten, view.Sql, StringComparison.Ordinal))
                 continue;
 
-            candidateViews ??= new Dictionary<string, ViewDefinition>(
-                catalog.Views,
-                StringComparer.OrdinalIgnoreCase);
             var parsed = (CreateViewStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
-            candidateViews[view.Name] = view with { Query = parsed.Query, Sql = parsed.Sql };
+            rewrittenViews[view.Name] = view with { Query = parsed.Query, Sql = parsed.Sql };
         }
 
         foreach (var trigger in catalog.Triggers.Values)
@@ -7731,9 +7725,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (rewritten is null || string.Equals(rewritten, trigger.Sql, StringComparison.Ordinal))
                 continue;
 
-            candidateTriggers ??= new Dictionary<string, TriggerDefinition>(
-                catalog.Triggers,
-                StringComparer.OrdinalIgnoreCase);
             var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
             // The catalog stores the watched table as its bare local name even when the stored
             // ON clause keeps a verbatim main.<table> qualifier.
@@ -7741,7 +7732,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 && parsedSchema.Equals("main", StringComparison.OrdinalIgnoreCase)
                 ? parsedLocalName
                 : parsed.TableName;
-            candidateTriggers[trigger.Name] = trigger with
+            rewrittenTriggers[trigger.Name] = trigger with
             {
                 TableName = parsedTableName,
                 UpdateOfColumns = parsed.UpdateOfColumns,
@@ -7751,13 +7742,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
             };
         }
 
-        var candidateCatalog = candidateViews is null && candidateTriggers is null
-            ? catalog
-            : new SchemaCatalog(
-                candidateTables,
-                candidateViews ?? catalog.Views,
-                candidateTriggers ?? catalog.Triggers,
-                catalog.VirtualTables);
+        var candidateCatalog = new SchemaCatalog(
+            candidateTables,
+            Overlay(catalog.Views, rewrittenViews),
+            Overlay(catalog.Triggers, rewrittenTriggers),
+            catalog.VirtualTables);
         ValidateDependentSchema(
             candidateCatalog,
             context with
@@ -7777,43 +7766,306 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 SchemaValidation = true,
             });
 
-        if (!tables.Remove(statement.TableName))
-            throw new InvalidOperationException($"Table '{statement.TableName}' disappeared during rename.");
-        var previousName = table.Name;
-        tables.Add(statement.NewName, candidateTable);
-        RewriteRenamedTableSql(tables, candidateTable, previousName, statement.NewName);
-        if (candidateTable.IsAutoIncrement)
+        var rowRewrites = new List<CompiledSchemaRowRewrite>();
+        var droppedIndexes = new List<string>();
+        var addedIndexes = new List<CompiledSchemaIndexCreation>();
+        AddSchemaRowRewrites(
+            rowRewrites,
+            droppedIndexes,
+            previousName,
+            statement.NewName,
+            table,
+            candidateTable,
+            addedIndexes);
+
+        foreach (var entry in rewrittenTables)
         {
-            RenameSqliteSequenceRows(tables, previousName, statement.NewName);
-            RenameAutoIncrementSequenceBackingTable(tables, previousName, statement.NewName);
-        }
-        if (candidateViews is not null)
-        {
-            foreach (var entry in candidateViews)
-                catalog.Views[entry.Key] = entry.Value;
+            if (string.Equals(entry.Key, statement.NewName, StringComparison.OrdinalIgnoreCase))
+            {
+                // The renamed table's own row is already being rewritten; a self-referencing foreign key
+                // only changes the text that row carries.
+                rowRewrites[0] = SchemaRowRewriteForTable(previousName, statement.NewName, entry.Value);
+                continue;
+            }
+
+            rowRewrites.Add(SchemaRowRewriteForTable(entry.Key, entry.Key, entry.Value));
         }
 
-        if (candidateTriggers is not null)
+        if (renamedBackingTable is not null)
         {
-            foreach (var entry in candidateTriggers)
-                catalog.Triggers[entry.Key] = entry.Value;
+            rowRewrites.Add(SchemaRowRewriteForTable(
+                GetAutoIncrementSequenceBackingTableName(previousName),
+                GetAutoIncrementSequenceBackingTableName(statement.NewName),
+                renamedBackingTable));
         }
 
-        return new ExecutionResult([], [], 0, true);
+        rowRewrites.AddRange(rewrittenViews.Values.Select(SchemaRowRewriteForView));
+        rowRewrites.AddRange(rewrittenTriggers.Values.Select(SchemaRowRewriteForTrigger));
+
+        return (previousName, new CompiledAlterTablePlan
+        {
+            RowRewrites = rowRewrites,
+            DroppedIndexes = droppedIndexes,
+            Tables = rewrittenTables,
+            Views = rewrittenViews,
+            Triggers = rewrittenTriggers,
+        });
     }
 
     /// <summary>
-    /// Mirrors SQLite's RENAME TO text surgery: the renamed table's own CREATE statement, the
-    /// ON-clause of every explicit index on it, and every foreign-key reference to it get their
-    /// table-name token replaced (SQLite always double-quotes the replacement). Objects whose
-    /// stored text cannot be reparsed fall back to regeneration by clearing their Sql.
+    /// The <c>sqlite_schema</c> row a table carries after an alteration. The text comes from the same
+    /// factory the stage projects its baseline rows with, so a rewritten row is indistinguishable from the
+    /// one a freshly loaded schema would hold.
     /// </summary>
-    private static void RewriteRenamedTableSql(
-        Dictionary<string, EmbeddedTable> tables,
+    private static CompiledSchemaRowRewrite SchemaRowRewriteForTable(
+        string currentName,
+        string name,
+        EmbeddedTable table)
+        => new(
+            ManagedSchemaRow.TableType,
+            currentName,
+            name,
+            name,
+            ManagedSchemaRowFactory.ForTable(name, table, rootPage: 2).Sql,
+            OwnsRootPage: true);
+
+    /// <summary>
+    /// The replacement the plan has already built for the one table an <c>ALTER</c> rewrites, handed to
+    /// the program so its typed opcode adopts that table instead of deriving a second one.
+    /// </summary>
+    /// <remarks>
+    /// Deciding whether the alteration is legal means building the table it produces and validating every
+    /// row against it, so by the time the program exists the replacement is a finished object. Recomputing
+    /// it inside the opcode would repeat the whole per-row projection — a second pass over every row, its
+    /// affinity coercion and its generated columns — for a result that is already known, and would repeat
+    /// it without the cancellation the planner honours.
+    /// </remarks>
+    private static IReadOnlyDictionary<string, EmbeddedTable> SingleReplacementTable(
+        string name,
+        EmbeddedTable replacement)
+        => new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase) { [name] = replacement };
+
+    /// <summary>
+    /// Appends the <c>sqlite_schema</c> row rewrites an alteration of one table produces: the table's own
+    /// row, plus one for every index whose row identity or text the alteration changes. Index rows that
+    /// disappear — the implicit index of a UNIQUE constraint the alteration removed — are reported through
+    /// <paramref name="droppedIndexes"/> so the program can retire their storage as well, and index rows
+    /// the alteration brings into existence are reported through <paramref name="addedIndexes"/> so the
+    /// program can allocate their b-tree and write their row.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The text comes from the same factory the stage projects its baseline rows with, so a rewritten row
+    /// is indistinguishable from the one a freshly loaded schema would hold.
+    /// </para>
+    /// <para>
+    /// Which row an index carries across the alteration is decided by identity, never by position. An
+    /// explicit index — including a method index — is identified by its name, which no <c>ALTER</c>
+    /// changes. A constraint-backed index has no name of its own (its name is derived from the table's and
+    /// from the ordinal its constraint happens to occupy, so removing an earlier constraint renumbers it),
+    /// and is identified instead by the constraint it comes from: the key columns, their collations and
+    /// sort order, and the predicate. Pairing the two lists by position instead would mistake the implicit
+    /// index of a removed UNIQUE constraint for the explicit index that followed it, rewriting one row and
+    /// retiring the other's storage.
+    /// </para>
+    /// </remarks>
+    private static void AddSchemaRowRewrites(
+        List<CompiledSchemaRowRewrite> rewrites,
+        List<string> droppedIndexes,
+        string currentName,
+        string name,
+        EmbeddedTable previous,
+        EmbeddedTable replacement,
+        List<CompiledSchemaIndexCreation>? addedIndexes = null)
+    {
+        rewrites.Add(SchemaRowRewriteForTable(currentName, name, replacement));
+
+        var before = previous.Indexes
+            .Select(index => (
+                Index: index,
+                Row: ManagedSchemaRowFactory.ForIndex(
+                    currentName,
+                    previous,
+                    index,
+                    rootPage: 2,
+                    ManagedSchemaSqlForm.Persisted)))
+            .ToArray();
+        var after = replacement.Indexes
+            .Select(index => (
+                Index: index,
+                Row: ManagedSchemaRowFactory.ForIndex(
+                    name,
+                    replacement,
+                    index,
+                    rootPage: 2,
+                    ManagedSchemaSqlForm.Persisted)))
+            .ToArray();
+
+        // Identity keys are computed twice for constraint-backed indexes because neither spelling is
+        // stable on its own: DROP COLUMN shifts every later column's position while leaving names alone,
+        // and RENAME COLUMN does the opposite. No single ALTER does both, so matching on names first and
+        // on positions second places every surviving constraint index exactly once.
+        var previousByName = BuildIndexIdentityMap(previous, before, byColumnName: true);
+        var previousByPosition = BuildIndexIdentityMap(previous, before, byColumnName: false);
+        var claimed = new bool[before.Length];
+
+        foreach (var candidate in after)
+        {
+            var match = -1;
+            if (previousByName.TryGetValue(
+                    IndexIdentity(replacement, candidate.Index, byColumnName: true),
+                    out var byName)
+                && !claimed[byName])
+            {
+                match = byName;
+            }
+            else if (previousByPosition.TryGetValue(
+                         IndexIdentity(replacement, candidate.Index, byColumnName: false),
+                         out var byPosition)
+                     && !claimed[byPosition])
+            {
+                match = byPosition;
+            }
+
+            if (match < 0)
+            {
+                // The alteration brought a constraint index into existence — a table-level PRIMARY KEY
+                // stops being a rowid alias when the column it names loses its INTEGER type, and the
+                // constraint that was implicit in the rowid then needs an index of its own.
+                if (addedIndexes is null)
+                {
+                    throw new InvalidOperationException(
+                        $"Altering '{currentName}' produced index '{candidate.Row.Name}', "
+                        + "which the alteration cannot create.");
+                }
+
+                addedIndexes.Add(new CompiledSchemaIndexCreation(
+                    candidate.Row.Name,
+                    name,
+                    candidate.Row.Sql));
+                continue;
+            }
+
+            claimed[match] = true;
+            if (string.Equals(before[match].Row.Name, candidate.Row.Name, StringComparison.Ordinal)
+                && string.Equals(before[match].Row.TableName, candidate.Row.TableName, StringComparison.Ordinal)
+                && string.Equals(before[match].Row.Sql, candidate.Row.Sql, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            rewrites.Add(new CompiledSchemaRowRewrite(
+                ManagedSchemaRow.IndexType,
+                before[match].Row.Name,
+                candidate.Row.Name,
+                name,
+                candidate.Row.Sql,
+                OwnsRootPage: true));
+        }
+
+        for (var index = 0; index < before.Length; index++)
+        {
+            if (!claimed[index])
+                droppedIndexes.Add(before[index].Row.Name);
+        }
+    }
+
+    private static Dictionary<string, int> BuildIndexIdentityMap(
+        EmbeddedTable table,
+        (EmbeddedIndex Index, ManagedSchemaRow Row)[] indexes,
+        bool byColumnName)
+    {
+        var map = new Dictionary<string, int>(indexes.Length, StringComparer.Ordinal);
+        for (var position = 0; position < indexes.Length; position++)
+            map[IndexIdentity(table, indexes[position].Index, byColumnName)] = position;
+        return map;
+    }
+
+    /// <summary>
+    /// The identity that decides which row an index keeps across an alteration. An explicit index owns its
+    /// name; a constraint-backed one owns only the constraint it was derived from, so its key columns —
+    /// with the collation and direction the constraint compares them under, and the partial predicate —
+    /// are what distinguishes it from every other constraint on the same table.
+    /// </summary>
+    private static string IndexIdentity(EmbeddedTable table, EmbeddedIndex index, bool byColumnName)
+    {
+        if (index.Origin == EmbeddedIndexOrigin.Explicit)
+            return $"explicit:{index.Name.ToUpperInvariant()}";
+
+        var builder = new StringBuilder("constraint:");
+        builder.Append(index.Unique ? '1' : '0');
+        foreach (var column in index.Columns)
+        {
+            builder.Append('/');
+            if (column.ExpressionSql is { } expressionSql)
+                builder.Append("expr=").Append(expressionSql);
+            else if (byColumnName)
+                builder.Append("name=").Append(column.Name.ToUpperInvariant());
+            else
+                builder.Append("pos=").Append(column.ColumnIndex);
+
+            var collation = column.Collation
+                ?? (column.ColumnIndex >= 0 && column.ColumnIndex < table.ColumnDefinitions.Length
+                    ? table.ColumnDefinitions[column.ColumnIndex].Collation
+                    : null)
+                ?? "BINARY";
+            builder.Append(":coll=").Append(collation.ToUpperInvariant());
+            builder.Append(column.Descending ? ":desc" : ":asc");
+        }
+
+        if (index.WhereSql is { } whereSql)
+            builder.Append("/where=").Append(whereSql);
+
+        return builder.ToString();
+    }
+
+    private static CompiledSchemaRowRewrite SchemaRowRewriteForView(ViewDefinition view)
+        => new(
+            ManagedSchemaRow.ViewType,
+            view.Name,
+            view.Name,
+            view.Name,
+            view.Sql,
+            OwnsRootPage: false);
+
+    private static CompiledSchemaRowRewrite SchemaRowRewriteForTrigger(TriggerDefinition trigger)
+        => new(
+            ManagedSchemaRow.TriggerType,
+            trigger.Name,
+            trigger.Name,
+            trigger.TableName,
+            trigger.Sql,
+            OwnsRootPage: false);
+
+    /// <summary>
+    /// Builds the renamed replacement for <paramref name="table"/>. A table whose CHECK constraints
+    /// qualify their column references with its own name has those expressions rebound as part of the
+    /// clone, which is also what supplies the new name; every other table is cloned and renamed, because
+    /// renaming is what carries its constraint-backed index names across.
+    /// </summary>
+    internal static EmbeddedTable CreateRenamedTable(EmbeddedTable table, string newName)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        if (table.HasQualifiedCheckReferences())
+            return table.CloneWithRenamedCheckTableReferences(table.Name, newName);
+
+        var renamed = table.Clone();
+        renamed.Rename(newName);
+        return renamed;
+    }
+
+    /// <summary>
+    /// Mirrors SQLite's RENAME TO text surgery on the renamed table itself: its own CREATE statement
+    /// (including any foreign key it declares against itself) and the ON-clause of every explicit index on
+    /// it get their table-name token replaced. Objects whose stored text cannot be reparsed fall back to
+    /// regeneration by clearing their Sql.
+    /// </summary>
+    internal static void RewriteRenamedTableSelfSql(
         EmbeddedTable table,
         string previousName,
         string newName)
     {
+        ArgumentNullException.ThrowIfNull(table);
         if (table.Sql is not null)
         {
             var rewritten = AlterTableSqlRewriter.RenameTable(table.Sql, newName);
@@ -7835,18 +8087,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 Sql = AlterTableSqlRewriter.RenameIndexTable(entry.Sql, newName),
             };
         }
-
-        // Foreign-key metadata and stored text of every table that references the old name,
-        // including the renamed table's own self-referencing foreign keys. The metadata must
-        // follow the rename or referential enforcement silently loses the parent.
-        foreach (var subject in tables.Values.ToArray())
-        {
-            if (!HasForeignKeyTo(subject, previousName))
-                continue;
-
-            if (CreateWithRenamedForeignKeyParentTable(subject, previousName, newName) is { } replacement)
-                tables[subject.Name] = replacement;
-        }
     }
 
     /// <summary>
@@ -7855,7 +8095,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// in both the live metadata and the stored CREATE text. Returns <see langword="null"/>
     /// when the table carries no such foreign key.
     /// </summary>
-    private static EmbeddedTable? CreateWithRenamedForeignKeyParentTable(
+    internal static EmbeddedTable? CreateWithRenamedForeignKeyParentTable(
         EmbeddedTable table,
         string oldParentName,
         string newParentName)
@@ -7910,7 +8150,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
             replacement.Rows.Add(row.ToArray());
 
         replacement.RowIds.AddRange(table.RowIds);
-        replacement.Indexes.AddRange(table.Indexes);
+        // The constructor rebuilds the constraint-backed indexes from the declaration it was given, so only
+        // the explicit ones are carried across; adding the whole list would leave the replacement holding
+        // two rows for every UNIQUE or PRIMARY KEY index the table declares.
+        replacement.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
+        replacement.Indexes.AddRange(table.Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
         return replacement;
 
         ForeignKeyDefinition? Rewrite(ForeignKeyDefinition foreignKey)
@@ -7919,14 +8163,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 : null;
     }
 
-    private static bool HasForeignKeyTo(EmbeddedTable child, string parentName)
+    internal static bool HasForeignKeyTo(EmbeddedTable child, string parentName)
         => child.ColumnDefinitions.Any(column =>
                column.ForeignKeyConstraints.Any(foreignKey =>
                    string.Equals(foreignKey.ParentTable, parentName, StringComparison.OrdinalIgnoreCase)))
             || (child.TableForeignKeys?.Any(foreignKey =>
                    string.Equals(foreignKey.ParentTable, parentName, StringComparison.OrdinalIgnoreCase)) ?? false);
 
-    private static void RenameSqliteSequenceRows(
+    internal static void RenameSqliteSequenceRows(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         string previousName,
         string newName)
@@ -7944,7 +8188,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    private static void RenameAutoIncrementSequenceBackingTable(
+    internal static void RenameAutoIncrementSequenceBackingTable(
         Dictionary<string, EmbeddedTable> tables,
         string previousName,
         string newName)
@@ -7963,7 +8207,145 @@ public sealed partial class EmbeddedDatabase : IDisposable
         tables.Add(newBackingName, replacement);
     }
 
-    private ExecutionResult ExecuteAlterTableRenameColumn(
+    /// <summary>
+    /// Decides whether a virtual table may be renamed, and returns the dependent views and triggers whose
+    /// stored SQL has to follow the rename.
+    /// </summary>
+    /// <remarks>
+    /// This is the decision half of the rename: the new name must be free in every namespace, and the
+    /// rewritten dependents must still resolve against the schema the rename would produce. Proving that
+    /// needs this connection's evaluator, so it cannot move into the statement compiler; what it produces
+    /// is data the compiled program turns into schema rows. The candidate instance it connects for the
+    /// check is disconnected again before anything is published — the rename itself keeps the module's own
+    /// instance and renames it in place with <c>VRename</c>.
+    /// </remarks>
+    private (
+        IReadOnlyDictionary<string, ViewDefinition> Views,
+        IReadOnlyDictionary<string, TriggerDefinition> Triggers) ValidateVirtualTableRename(
+        AlterTableRenameStatement statement,
+        VirtualTableDefinition virtualTable,
+        SchemaCatalog catalog,
+        QueryContext context)
+    {
+        var tables = catalog.Tables;
+        if (IsReservedObjectName(statement.NewName))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {statement.NewName}");
+        if (catalog.VirtualTables.ContainsKey(statement.NewName)
+            || tables.ContainsKey(statement.NewName)
+            || catalog.Views.ContainsKey(statement.NewName)
+            || catalog.Triggers.ContainsKey(statement.NewName)
+            || TryFindIndex(tables, statement.NewName, out _, out _))
+        {
+            throw new EmbeddedSqlException($"there is already an object named {statement.NewName}");
+        }
+
+        var rewrittenViews = new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase);
+        var rewrittenTriggers = new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase);
+        foreach (var view in catalog.Views.Values)
+        {
+            context.CheckInterrupt();
+            var rewritten = AlterTableSqlRewriter.RenameTableReferences(
+                view.Sql, statement.TableName, statement.NewName);
+            if (rewritten is null || string.Equals(rewritten, view.Sql, StringComparison.Ordinal))
+                continue;
+
+            var parsed = (CreateViewStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+            rewrittenViews[view.Name] = view with { Query = parsed.Query, Sql = parsed.Sql };
+        }
+
+        foreach (var trigger in catalog.Triggers.Values)
+        {
+            context.CheckInterrupt();
+            var rewritten = AlterTableSqlRewriter.RenameTableReferences(
+                trigger.Sql, statement.TableName, statement.NewName);
+            if (rewritten is null || string.Equals(rewritten, trigger.Sql, StringComparison.Ordinal))
+                continue;
+
+            var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+            var parsedTableName = ManagedSchemaName.TrySplit(parsed.TableName, out var parsedSchema, out var parsedLocalName)
+                && parsedSchema.Equals("main", StringComparison.OrdinalIgnoreCase)
+                ? parsedLocalName
+                : parsed.TableName;
+            rewrittenTriggers[trigger.Name] = trigger with
+            {
+                TableName = parsedTableName,
+                UpdateOfColumns = parsed.UpdateOfColumns,
+                When = parsed.When,
+                Body = parsed.Body,
+                Sql = parsed.Sql,
+            };
+        }
+
+        var candidatePayload = virtualTable.PersistencePayload.Clone();
+        var candidateInstance = ManagedVirtualTableModuleRegistry.Resolve(virtualTable.ModuleName).Create(
+            new ManagedVirtualTableCreateContext(statement.NewName, virtualTable.Arguments),
+            candidatePayload);
+        ArgumentNullException.ThrowIfNull(candidateInstance);
+        try
+        {
+            var candidateVirtualTables = new Dictionary<string, VirtualTableDefinition>(
+                catalog.VirtualTables,
+                StringComparer.OrdinalIgnoreCase);
+            candidateVirtualTables.Remove(statement.TableName);
+            candidateVirtualTables.Add(
+                statement.NewName,
+                new VirtualTableDefinition(
+                    statement.NewName,
+                    virtualTable.ModuleName,
+                    virtualTable.Arguments.ToArray(),
+                    candidatePayload,
+                    candidateInstance));
+
+            var candidateViews = Overlay(catalog.Views, rewrittenViews);
+            var candidateTriggers = Overlay(catalog.Triggers, rewrittenTriggers);
+            var candidateCatalog = new SchemaCatalog(
+                tables,
+                candidateViews,
+                candidateTriggers,
+                candidateVirtualTables);
+            ValidateDependentSchema(
+                candidateCatalog,
+                context with
+                {
+                    Tables = tables,
+                    Views = candidateCatalog.Views,
+                    Triggers = candidateCatalog.Triggers,
+                    VirtualTables = candidateCatalog.VirtualTables,
+                    SchemaValidation = true,
+                },
+                context.CancellationToken,
+                "rename table",
+                catalog,
+                context with
+                {
+                    Views = catalog.Views,
+                    Triggers = catalog.Triggers,
+                    SchemaValidation = true,
+                });
+        }
+        finally
+        {
+            candidateInstance.DisconnectInstance();
+        }
+
+        return (rewrittenViews, rewrittenTriggers);
+    }
+
+    private static Dictionary<string, T> Overlay<T>(
+        IReadOnlyDictionary<string, T> baseline,
+        IReadOnlyDictionary<string, T> replacements)
+    {
+        var merged = new Dictionary<string, T>(baseline, StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in replacements)
+            merged[entry.Key] = entry.Value;
+        return merged;
+    }
+
+    /// <summary>
+    /// Decides whether a <c>RENAME COLUMN</c> is legal and computes the rows the program rewrites together
+    /// with the dependent definitions its <c>ParseSchema</c> adopts.
+    /// </summary>
+    private (string CurrentName, int ColumnIndex, CompiledAlterTablePlan Plan) PlanAlterTableRenameColumn(
         AlterTableRenameColumnStatement statement,
         SchemaCatalog catalog,
         QueryContext context)
@@ -7976,7 +8358,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (!tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
-        var oldName = table.Columns[table.GetColumnIndex(statement.ColumnName)];
+        var columnIndex = table.GetColumnIndex(statement.ColumnName);
+        var oldName = table.Columns[columnIndex];
         var newName = statement.NewName;
         var quoteNewName = statement.QuoteNewName;
         var replacement = table.CreateWithRenamedColumn(
@@ -7992,13 +8375,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         // A foreign key in another table names the parent column by its old spelling, so the
         // REFERENCES clause follows the rename the way SQLite rewrites it.
+        var rewrittenTables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in tables)
         {
             if (string.Equals(entry.Key, statement.TableName, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             if (CreateWithRenamedForeignKeyParentColumn(entry.Value, table.Name, oldName, newName, quoteNewName) is { } rewritten)
+            {
                 candidateTables[entry.Key] = rewritten;
+                rewrittenTables[entry.Key] = rewritten;
+            }
         }
 
         var originalViewContext = context with
@@ -8014,6 +8401,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var renamedViews = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         Dictionary<string, ViewDefinition>? candidateViews = null;
         Dictionary<string, TriggerDefinition>? candidateTriggers = null;
+        var rewrittenViews = new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase);
+        var rewrittenTriggers = new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase);
         try
         {
             bool addedRenamedView;
@@ -8046,6 +8435,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     var parsed = (CreateViewStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
                     var rewrittenView = view with { Query = parsed.Query, Sql = parsed.Sql };
                     candidateViews[view.Name] = rewrittenView;
+                    rewrittenViews[view.Name] = rewrittenView;
 
                     if (view.Columns is null
                         && viewColumns[view.Name] is { } before
@@ -8089,13 +8479,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     catalog.Triggers,
                     StringComparer.OrdinalIgnoreCase);
                 var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
-                candidateTriggers[trigger.Name] = trigger with
+                var rewrittenTrigger = trigger with
                 {
                     UpdateOfColumns = parsed.UpdateOfColumns,
                     When = parsed.When,
                     Body = parsed.Body,
                     Sql = parsed.Sql,
                 };
+                candidateTriggers[trigger.Name] = rewrittenTrigger;
+                rewrittenTriggers[trigger.Name] = rewrittenTrigger;
             }
         }
         catch (RenameColumnRewriteException exception)
@@ -8130,25 +8522,39 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 SchemaValidation = true,
             });
 
-        foreach (var entry in candidateTables)
-            tables[entry.Key] = entry.Value;
+        var rowRewrites = new List<CompiledSchemaRowRewrite>();
+        var droppedIndexes = new List<string>();
+        var addedIndexes = new List<CompiledSchemaIndexCreation>();
+        AddSchemaRowRewrites(
+            rowRewrites,
+            droppedIndexes,
+            table.Name,
+            table.Name,
+            table,
+            replacement,
+            addedIndexes);
+        foreach (var entry in rewrittenTables)
+            rowRewrites.Add(SchemaRowRewriteForTable(entry.Key, entry.Key, entry.Value));
+        rowRewrites.AddRange(rewrittenViews.Values.Select(SchemaRowRewriteForView));
+        rowRewrites.AddRange(rewrittenTriggers.Values.Select(SchemaRowRewriteForTrigger));
 
-        if (candidateViews is not null)
+        return (table.Name, columnIndex, new CompiledAlterTablePlan
         {
-            foreach (var entry in candidateViews)
-                catalog.Views[entry.Key] = entry.Value;
-        }
-
-        if (candidateTriggers is not null)
-        {
-            foreach (var entry in candidateTriggers)
-                catalog.Triggers[entry.Key] = entry.Value;
-        }
-
-        return new ExecutionResult([], [], 0, true);
+            RowRewrites = rowRewrites,
+            DroppedIndexes = droppedIndexes,
+            AddedIndexes = addedIndexes,
+            ReplacementTables = SingleReplacementTable(table.Name, replacement),
+            Tables = rewrittenTables,
+            Views = rewrittenViews,
+            Triggers = rewrittenTriggers,
+        });
     }
 
-    private ExecutionResult ExecuteAlterTableAlterColumn(
+    /// <summary>
+    /// Decides whether an <c>ALTER COLUMN</c> is legal and computes the rows the program rewrites, the
+    /// dependent definitions its <c>ParseSchema</c> adopts, and the AUTOINCREMENT state it retires.
+    /// </summary>
+    private (string CurrentName, int ColumnIndex, CompiledAlterTablePlan Plan) PlanAlterTableAlterColumn(
         AlterTableAlterColumnStatement statement,
         SchemaCatalog catalog,
         SqlValue[] parameters,
@@ -8168,7 +8574,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         foreach (var check in statement.Column.CheckConstraints)
             ValidateCheckConstraintFunctions(check.Expression);
 
-        var oldName = table.Columns[table.GetColumnIndex(statement.ColumnName)];
+        var columnIndex = table.GetColumnIndex(statement.ColumnName);
+        var oldName = table.Columns[columnIndex];
         var replacement = table.CreateWithAlteredColumn(
             statement.ColumnName,
             statement.Column,
@@ -8181,6 +8588,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         };
 
         // A replacement name must also become the parent-column spelling in referencing tables.
+        var rewrittenTables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
         if (!string.Equals(oldName, statement.Column.Name, StringComparison.OrdinalIgnoreCase))
         {
             foreach (var entry in catalog.Tables)
@@ -8196,12 +8604,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         quoteNewName: false) is { } rewritten)
                 {
                     candidateTables[entry.Key] = rewritten;
+                    rewrittenTables[entry.Key] = rewritten;
                 }
             }
         }
 
         Dictionary<string, ViewDefinition>? candidateViews = null;
         Dictionary<string, TriggerDefinition>? candidateTriggers = null;
+        var rewrittenViews = new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase);
+        var rewrittenTriggers = new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase);
         if (!string.Equals(oldName, statement.Column.Name, StringComparison.OrdinalIgnoreCase))
         {
             var renameSchema = CreateRenameColumnSchema(
@@ -8227,7 +8638,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         catalog.Views,
                         StringComparer.OrdinalIgnoreCase);
                     var parsed = (CreateViewStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
-                    candidateViews[view.Name] = view with { Query = parsed.Query, Sql = parsed.Sql };
+                    var rewrittenView = view with { Query = parsed.Query, Sql = parsed.Sql };
+                    candidateViews[view.Name] = rewrittenView;
+                    rewrittenViews[view.Name] = rewrittenView;
                 }
 
                 foreach (var trigger in catalog.Triggers.Values)
@@ -8246,13 +8659,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         catalog.Triggers,
                         StringComparer.OrdinalIgnoreCase);
                     var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
-                    candidateTriggers[trigger.Name] = trigger with
+                    var rewrittenTrigger = trigger with
                     {
                         UpdateOfColumns = parsed.UpdateOfColumns,
                         When = parsed.When,
                         Body = parsed.Body,
                         Sql = parsed.Sql,
                     };
+                    candidateTriggers[trigger.Name] = rewrittenTrigger;
+                    rewrittenTriggers[trigger.Name] = rewrittenTrigger;
                 }
             }
             catch (RenameColumnRewriteException exception)
@@ -8263,7 +8678,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         // sqlite_sequence is catalog state, not table data. Clone it before deleting the old
         // allocator entry so validation failures leave every catalog object untouched.
-        if (table.IsAutoIncrement && !replacement.IsAutoIncrement)
+        var clearsAutoIncrement = table.IsAutoIncrement && !replacement.IsAutoIncrement;
+        if (clearsAutoIncrement)
         {
             if (!candidateTables.TryGetValue(SqliteSequenceTableName, out var sequence))
                 throw new InvalidOperationException("An AUTOINCREMENT table is missing sqlite_sequence.");
@@ -8310,22 +8726,38 @@ public sealed partial class EmbeddedDatabase : IDisposable
             catalog,
             context with { SchemaValidation = true });
 
-        foreach (var entry in candidateTables)
-            catalog.Tables[entry.Key] = entry.Value;
-        if (table.IsAutoIncrement && !replacement.IsAutoIncrement)
-            catalog.Tables.Remove(GetAutoIncrementSequenceBackingTableName(table.Name));
-        if (candidateViews is not null)
-        {
-            foreach (var entry in candidateViews)
-                catalog.Views[entry.Key] = entry.Value;
-        }
-        if (candidateTriggers is not null)
-        {
-            foreach (var entry in candidateTriggers)
-                catalog.Triggers[entry.Key] = entry.Value;
-        }
+        var rowRewrites = new List<CompiledSchemaRowRewrite>();
+        var droppedIndexes = new List<string>();
+        var addedIndexes = new List<CompiledSchemaIndexCreation>();
+        AddSchemaRowRewrites(
+            rowRewrites,
+            droppedIndexes,
+            table.Name,
+            table.Name,
+            table,
+            replacement,
+            addedIndexes);
+        foreach (var entry in rewrittenTables)
+            rowRewrites.Add(SchemaRowRewriteForTable(entry.Key, entry.Key, entry.Value));
+        rowRewrites.AddRange(rewrittenViews.Values.Select(SchemaRowRewriteForView));
+        rowRewrites.AddRange(rewrittenTriggers.Values.Select(SchemaRowRewriteForTrigger));
 
-        return new ExecutionResult([], [], 0, true);
+        var backingTableName = GetAutoIncrementSequenceBackingTableName(table.Name);
+        return (table.Name, columnIndex, new CompiledAlterTablePlan
+        {
+            RowRewrites = rowRewrites,
+            DroppedIndexes = droppedIndexes,
+            AddedIndexes = addedIndexes,
+            ReplacementTables = SingleReplacementTable(table.Name, replacement),
+            DroppedTables = clearsAutoIncrement && catalog.Tables.ContainsKey(backingTableName)
+                ? [backingTableName]
+                : [],
+            ClearedSequenceTableName = clearsAutoIncrement ? SqliteSequenceTableName : null,
+            ClearedSequenceOwner = clearsAutoIncrement ? table.Name : null,
+            Tables = rewrittenTables,
+            Views = rewrittenViews,
+            Triggers = rewrittenTriggers,
+        });
     }
 
     internal static RenameColumnSchema CreateRenameColumnSchema(
@@ -8404,7 +8836,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// Rewrites the parent column list of every foreign key in <paramref name="table"/> that
     /// points at the renamed column, returning <see langword="null"/> when nothing referenced it.
     /// </summary>
-    private static EmbeddedTable? CreateWithRenamedForeignKeyParentColumn(
+    internal static EmbeddedTable? CreateWithRenamedForeignKeyParentColumn(
         EmbeddedTable table,
         string parentTable,
         string oldName,
@@ -8500,7 +8932,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    private ExecutionResult ExecuteAlterTableDropColumn(
+    /// <summary>
+    /// Decides whether a <c>DROP COLUMN</c> is legal and computes the row the program rewrites. Every
+    /// prohibition SQLite enforces — a PRIMARY KEY, UNIQUE, indexed or last remaining column, and any view
+    /// or trigger the drop would break — is raised here, before a single row is projected.
+    /// </summary>
+    private (string CurrentName, int ColumnIndex, CompiledAlterTablePlan Plan) PlanAlterTableDropColumn(
         AlterTableDropColumnStatement statement,
         SchemaCatalog catalog,
         QueryContext context)
@@ -8516,6 +8953,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
         var replacement = table.CreateWithoutColumn(statement.ColumnName, context.CancellationToken);
+        var columnIndex = table.GetColumnIndex(statement.ColumnName);
         var candidateTables = new Dictionary<string, EmbeddedTable>(
             catalog.Tables,
             StringComparer.OrdinalIgnoreCase)
@@ -8536,8 +8974,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
             catalog,
             context with { SchemaValidation = true });
 
-        catalog.Tables[statement.TableName] = replacement;
-        return new ExecutionResult([], [], 0, true);
+        var rowRewrites = new List<CompiledSchemaRowRewrite>();
+        var droppedIndexes = new List<string>();
+        var addedIndexes = new List<CompiledSchemaIndexCreation>();
+        AddSchemaRowRewrites(
+            rowRewrites,
+            droppedIndexes,
+            table.Name,
+            table.Name,
+            table,
+            replacement,
+            addedIndexes);
+        return (table.Name, columnIndex, new CompiledAlterTablePlan
+        {
+            RowRewrites = rowRewrites,
+            DroppedIndexes = droppedIndexes,
+            AddedIndexes = addedIndexes,
+            ReplacementTables = SingleReplacementTable(table.Name, replacement),
+        });
     }
 
     private void ValidateDependentSchema(
@@ -24976,6 +25430,141 @@ out bool hasReturning)
         };
     }
 
+    /// <summary>
+    /// The compilation context <c>EXPLAIN</c> uses. It resolves names against the same schema execution
+    /// would see, but never enforces <c>PRAGMA max_page_count</c>: describing a program allocates no page.
+    /// </summary>
+    private DdlCompilationContext CreateExplainDdlCompilationContext(QueryContext context)
+        => CreateDdlCompilationContext(
+            new SchemaCatalog(
+                new Dictionary<string, EmbeddedTable>(context.Tables, StringComparer.OrdinalIgnoreCase),
+                context.Views is null
+                    ? new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, ViewDefinition>(context.Views, StringComparer.OrdinalIgnoreCase),
+                context.Triggers is null
+                    ? new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, TriggerDefinition>(context.Triggers, StringComparer.OrdinalIgnoreCase),
+                context.VirtualTables is null
+                    ? new Dictionary<string, VirtualTableDefinition>(StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, VirtualTableDefinition>(
+                        context.VirtualTables,
+                        StringComparer.OrdinalIgnoreCase)),
+            enforceMaxPageCount: false);
+
+    /// <summary>
+    /// The <c>CREATE TABLE</c> a <c>CREATE TABLE AS SELECT</c> lowers to, with its columns derived from the
+    /// query rather than from running it.
+    /// </summary>
+    /// <remarks>
+    /// The statement carries an empty row set: <c>EXPLAIN</c> never executes, and the population loop's
+    /// bytecode is the same shape whatever the source produces, so describing it must not run the SELECT.
+    /// </remarks>
+    private static CreateTableStatement DescribeCreateTableAsStatement(
+        CreateTableAsSelectStatement statement,
+        QueryContext context)
+        => new(
+            statement.Name,
+            DescribeCreateTableAsColumns(statement.Query, context),
+            statement.IfNotExists,
+            Strict: false,
+            InitialRows: []);
+
+    /// <summary>
+    /// The table an <c>EXPLAIN</c>ed <c>ALTER TABLE</c> addresses. Describing a statement resolves names
+    /// against the same schema execution would, so a missing or virtual table is reported here exactly as
+    /// running it would report it.
+    /// </summary>
+    private static EmbeddedTable RequireAlterTableTarget(string tableName, QueryContext context)
+    {
+        if (context.VirtualTables?.ContainsKey(tableName) == true)
+            throw new EmbeddedSqlException("virtual tables may not be altered");
+
+        return context.Tables.TryGetValue(tableName, out var table)
+            ? table
+            : throw new EmbeddedSqlException($"no such table: {tableName}");
+    }
+
+    private static EmbeddedTable RequireAlterTableRenameTarget(
+        AlterTableRenameStatement statement,
+        QueryContext context)
+    {
+        ValidateAlterTableRenameName(
+            statement,
+            context.Tables,
+            context.Views,
+            context.Triggers,
+            context.VirtualTables);
+        return RequireAlterTableTarget(statement.TableName, context);
+    }
+
+    private static void ValidateAlterTableRenameName(
+        AlterTableRenameStatement statement,
+        Dictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition>? views,
+        IReadOnlyDictionary<string, TriggerDefinition>? triggers,
+        IReadOnlyDictionary<string, VirtualTableDefinition>? virtualTables)
+    {
+        if (IsSqliteSequenceTable(statement.TableName) && tables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
+        if (IsSqliteSequenceTable(statement.NewName))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
+        if (tables.ContainsKey(statement.NewName) || virtualTables?.ContainsKey(statement.NewName) == true)
+            throw new EmbeddedSqlException($"table {statement.NewName} already exists");
+        if (views?.ContainsKey(statement.NewName) == true)
+            throw new EmbeddedSqlException($"there is already a view named {statement.NewName}");
+        if (triggers?.ContainsKey(statement.NewName) == true)
+            throw new EmbeddedSqlException($"there is already a trigger named {statement.NewName}");
+        if (TryFindIndex(tables, statement.NewName, out _, out _))
+            throw new EmbeddedSqlException($"there is already an index named {statement.NewName}");
+    }
+
+    /// <summary>
+    /// The plan <c>EXPLAIN</c> lowers an <c>ALTER TABLE</c> with: the rows the alteration rewrites on its
+    /// own table, and no dependents at all.
+    /// </summary>
+    /// <remarks>
+    /// Describing an alteration must not run the dependent-schema validation the statement would, so it
+    /// reports the alteration's own shape without evaluating a single view or trigger body — the same rule
+    /// the virtual-table rename already describes under.
+    /// </remarks>
+    private static CompiledAlterTablePlan DescribeAlterTablePlan(
+        string currentName,
+        string name,
+        EmbeddedTable previous,
+        EmbeddedTable replacement)
+    {
+        var rowRewrites = new List<CompiledSchemaRowRewrite>();
+        var droppedIndexes = new List<string>();
+        var addedIndexes = new List<CompiledSchemaIndexCreation>();
+        AddSchemaRowRewrites(
+            rowRewrites,
+            droppedIndexes,
+            currentName,
+            name,
+            previous,
+            replacement,
+            addedIndexes);
+        return new CompiledAlterTablePlan
+        {
+            RowRewrites = rowRewrites,
+            DroppedIndexes = droppedIndexes,
+            AddedIndexes = addedIndexes,
+        };
+    }
+
+    /// <summary>The table an <c>ADD COLUMN</c> produces, computed on a clone so describing it mutates nothing.</summary>
+    private static EmbeddedTable DescribeAddedColumnTable(
+        EmbeddedTable table,
+        AlterTableAddColumnStatement statement)
+    {
+        var candidate = table.Clone();
+        candidate.Sql = table.Sql is not null && statement.ColumnSql is not null
+            ? AlterTableSqlRewriter.InsertAddedColumn(table.Sql, statement.ColumnSql)
+            : null;
+        candidate.AddColumn(statement.Column);
+        return candidate;
+    }
+
     private ExecutionResult ExecuteExplain(
         ExplainStatement statement,
         SqlValue[] parameters,
@@ -25025,38 +25614,134 @@ out bool hasReturning)
 
         switch (statement.Inner)
         {
+            case CreateTableStatement createTable:
+                return DescribeProgram(DdlStatementCompiler.CompileCreateTable(
+                    createTable,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case CreateTableAsSelectStatement createTableAsSelect:
+                return DescribeProgram(DdlStatementCompiler.CompileCreateTable(
+                    DescribeCreateTableAsStatement(createTableAsSelect, compilationContext),
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case CreateIndexStatement createIndex:
+                return DescribeProgram(DdlStatementCompiler.CompileCreateIndex(
+                    createIndex,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case DropIndexStatement dropIndex:
+                return DescribeProgram(DdlStatementCompiler.CompileDropIndex(
+                    dropIndex,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case CreateViewStatement createView:
+                return DescribeProgram(DdlStatementCompiler.CompileCreateView(
+                    createView,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case DropViewStatement dropView:
+                return DescribeProgram(DdlStatementCompiler.CompileDropView(
+                    dropView,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case CreateTriggerStatement createTrigger:
+                // Compiling a trigger validates its declaration and lowers its schema row; the body is
+                // stored, never run, so describing the program cannot fire anything.
+                return DescribeProgram(DdlStatementCompiler.CompileCreateTrigger(
+                    createTrigger,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case DropTriggerStatement dropTrigger:
+                return DescribeProgram(DdlStatementCompiler.CompileDropTrigger(
+                    dropTrigger,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
             case CreateVirtualTableStatement createVirtual:
-                return DescribeProgram(new VdbeProgram(
-                    registerCount: 0,
-                    cursorCount: 0,
-                    [
-                        new VCreateInstruction(
-                            createVirtual.ModuleName,
-                            new ManagedVirtualTableCreateContext(
-                                createVirtual.Name,
-                                createVirtual.Arguments),
-                            static _ => { }),
-                        new HaltInstruction(),
-                    ]));
-            case DropTableStatement dropVirtual
-                when compilationContext.VirtualTables?.ContainsKey(dropVirtual.Name) == true:
-                return DescribeProgram(new VdbeProgram(
-                    registerCount: 0,
-                    cursorCount: 1,
-                    [
-                        new VDestroyInstruction(new Cursor(0), dropVirtual.Name),
-                        new HaltInstruction(),
-                    ]));
+                // The module is resolved and invoked by VCreate at run time, and the publish binding
+                // resolves through an operations slot only a bound program fills, so describing this
+                // program never reaches a module.
+                return DescribeProgram(DdlStatementCompiler.CompileCreateVirtualTable(
+                    createVirtual,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case DropTableStatement drop:
+                // One entry point lowers both arms, exactly as translate_drop_table does: an ordinary
+                // table's program, or the VDestroy-shaped one a virtual table gets.
+                return DescribeProgram(DdlStatementCompiler.CompileDropTable(
+                    drop,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
             case AlterTableRenameStatement renameVirtual
-                when compilationContext.VirtualTables?.ContainsKey(renameVirtual.TableName) == true:
-                return DescribeProgram(new VdbeProgram(
-                    registerCount: 1,
-                    cursorCount: 1,
-                    [
-                        new LoadConstantInstruction(new Register(0), SqlValue.Text(renameVirtual.NewName)),
-                        new VRenameInstruction(new Cursor(0), new Register(0)),
-                        new HaltInstruction(),
-                    ]));
+                when TryGetVirtualTableDefinition(
+                    compilationContext,
+                    renameVirtual.TableName,
+                    out var renameDefinition):
+                // Describing a rename must not run the dependent-schema validation the statement would,
+                // so the program is lowered with no rewritten dependents: EXPLAIN reports the rename's own
+                // shape without evaluating a single view or trigger body.
+                return DescribeProgram(DdlStatementCompiler.CompileRenameVirtualTable(
+                    renameVirtual,
+                    renameDefinition,
+                    new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase),
+                    new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase),
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case AlterTableRenameStatement rename
+                when RequireAlterTableRenameTarget(rename, compilationContext) is { } renamedTable:
+                return DescribeProgram(DdlStatementCompiler.CompileRenameTable(
+                    rename,
+                    renamedTable.Name,
+                    DescribeAlterTablePlan(
+                        renamedTable.Name,
+                        rename.NewName,
+                        renamedTable,
+                        CreateRenamedTable(renamedTable.CloneSchemaOnly(), rename.NewName)),
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case AlterTableAddColumnStatement addColumn
+                when RequireAlterTableTarget(addColumn.TableName, compilationContext) is { } addColumnTable:
+                return DescribeProgram(DdlStatementCompiler.CompileAddColumn(
+                    addColumn,
+                    addColumnTable.Name,
+                    DescribeAlterTablePlan(
+                        addColumnTable.Name,
+                        addColumnTable.Name,
+                        addColumnTable,
+                        DescribeAddedColumnTable(addColumnTable.CloneSchemaOnly(), addColumn)),
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case AlterTableDropColumnStatement dropColumn
+                when RequireAlterTableTarget(dropColumn.TableName, compilationContext) is { } dropColumnTable:
+                return DescribeProgram(DdlStatementCompiler.CompileDropColumn(
+                    dropColumn,
+                    dropColumnTable.Name,
+                    dropColumnTable.GetColumnIndex(dropColumn.ColumnName),
+                    DescribeAlterTablePlan(
+                        dropColumnTable.Name,
+                        dropColumnTable.Name,
+                        dropColumnTable,
+                        dropColumnTable
+                            .CloneSchemaOnly()
+                            .CreateWithoutColumn(dropColumn.ColumnName, compilationContext.CancellationToken)),
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case AlterTableRenameColumnStatement renameColumn
+                when RequireAlterTableTarget(renameColumn.TableName, compilationContext) is { } renameColumnTable:
+                return DescribeProgram(DdlStatementCompiler.CompileRenameColumn(
+                    renameColumn,
+                    renameColumnTable.Name,
+                    renameColumnTable.GetColumnIndex(renameColumn.ColumnName),
+                    DescribeAlterTablePlan(
+                        renameColumnTable.Name,
+                        renameColumnTable.Name,
+                        renameColumnTable,
+                        renameColumnTable.CloneSchemaOnly().CreateWithRenamedColumn(
+                            renameColumn.ColumnName,
+                            renameColumn.NewName,
+                            renameColumn.QuoteNewName,
+                            compilationContext.CancellationToken)),
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case AlterTableAlterColumnStatement alterColumn
+                when RequireAlterTableTarget(alterColumn.TableName, compilationContext) is { } alterColumnTable:
+                return DescribeProgram(DdlStatementCompiler.CompileAlterColumn(
+                    alterColumn,
+                    alterColumnTable.Name,
+                    alterColumnTable.GetColumnIndex(alterColumn.ColumnName),
+                    DescribeAlterTablePlan(
+                        alterColumnTable.Name,
+                        alterColumnTable.Name,
+                        alterColumnTable,
+                        alterColumnTable.CloneSchemaOnly().CreateWithAlteredColumn(
+                            alterColumn.ColumnName,
+                            alterColumn.Column,
+                            compilationContext.CancellationToken)),
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
             case InsertStatement insertVirtual
                 when TryGetVirtualTable(
                     compilationContext,
@@ -25161,6 +25846,21 @@ out bool hasReturning)
         // No fake plan: EXPLAIN only reports programs that were genuinely lowered.
         throw new EmbeddedSqlException(
             "EXPLAIN is only supported for statements lowered to the bytecode compiler.");
+    }
+
+    private static bool TryGetVirtualTableDefinition(
+        QueryContext context,
+        string name,
+        out VirtualTableDefinition definition)
+    {
+        if (context.VirtualTables is { } virtualTables && virtualTables.TryGetValue(name, out var found))
+        {
+            definition = found;
+            return true;
+        }
+
+        definition = null!;
+        return false;
     }
 
     private static VdbeProgram BuildVirtualTableMutationExplainProgram(
@@ -25707,6 +26407,16 @@ out bool hasReturning)
             RowSetRewindInstruction => VdbeExplain.Describe(instruction),
             RowSetNextInstruction => VdbeExplain.Describe(instruction),
             GuardedRowInstruction => VdbeExplain.Describe(instruction),
+            // Schema opcodes and the record/rowid primitives DDL programs build rows with are rendered by
+            // the shared describer, so a compiled schema program's EXPLAIN cannot drift from the
+            // instruction definitions.
+            MakeRecordInstruction => VdbeExplain.Describe(instruction),
+            NewRowidInstruction => VdbeExplain.Describe(instruction),
+            IVdbeSchemaInstruction => VdbeExplain.Describe(instruction),
+            // A method index's lifecycle opcodes carry only their method and index names into EXPLAIN, so
+            // describing one resolves nothing and can never attach a method.
+            IndexMethodCreateInstruction => VdbeExplain.Describe(instruction),
+            IndexMethodDestroyInstruction => VdbeExplain.Describe(instruction),
             _ => throw new EmbeddedSqlException($"Cannot describe unsupported opcode {instruction.Opcode}."),
         };
     }
@@ -32809,14 +33519,14 @@ out bool hasReturning)
         return table;
     }
 
-    private static bool IsSchemaTable(string name)
+    internal static bool IsSchemaTable(string name)
         => string.Equals(name, "sqlite_master", StringComparison.OrdinalIgnoreCase)
             || string.Equals(name, "sqlite_schema", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsSqliteSequenceTable(string name)
+    internal static bool IsSqliteSequenceTable(string name)
         => string.Equals(name, SqliteSequenceTableName, StringComparison.OrdinalIgnoreCase);
 
-    private static string GetAutoIncrementSequenceBackingTableName(string tableName)
+    internal static string GetAutoIncrementSequenceBackingTableName(string tableName)
         => TursoSequenceBackingTablePrefix
             + TursoAutoIncrementSequencePrefix
             + tableName;
@@ -32826,7 +33536,7 @@ out bool hasReturning)
 
     // SQLite rejects any user-created object whose name begins with "sqlite_" (case
     // insensitive); those names are reserved for the internal schema.
-    private static bool IsReservedObjectName(string name)
+    internal static bool IsReservedObjectName(string name)
         => name.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase)
             || IsAutoIncrementSequenceBackingTable(name)
             || Indexing.ManagedIndexMethodNames.IsReserved(name);
@@ -32952,63 +33662,66 @@ out bool hasReturning)
         return new SourceData(table.Columns, sourceRows);
     }
 
+    /// <summary>
+    /// Materializes <c>sqlite_schema</c>/<c>sqlite_master</c>.
+    /// </summary>
+    /// <remarks>
+    /// While a DDL program is running, <see cref="QueryContext.StagedSchemaRows"/> carries that program's
+    /// transaction-local row set and is authoritative — the program may already have written, rewritten, or
+    /// deleted rows that the catalog dictionaries do not describe yet. Otherwise the rows are projected
+    /// from the catalog through <see cref="ManagedSchemaRowFactory"/>, which is the same row shaping the
+    /// file store uses, so the two views cannot drift on type/name/tbl_name/sql.
+    /// </remarks>
     private static SourceData GetSchemaTableRows(
         NamedTableSource source,
         QueryContext context,
         SourceRow? outerRow)
     {
-        var tables = context.Tables;
-        var columns = new[] { "type", "name", "tbl_name", "rootpage", "sql" };
+        var columns = ManagedSchemaRow.CreateColumnNames();
         var qualifiedColumns = BuildQualifiedColumns(source.Alias ?? source.Name, columns);
         var rows = new List<SourceRow>();
-        foreach (var entry in tables)
+        foreach (var schemaRow in EnumerateSchemaRows(context))
+            rows.Add(new SourceRow(columns, schemaRow.ToValues(), qualifiedColumns, outerRow));
+
+        return new SourceData(columns, rows);
+    }
+
+    /// <summary>
+    /// The <c>sqlite_schema</c> rows a query observes, in schema order: each table followed by its indexes,
+    /// then views by name, then triggers in declaration order.
+    /// </summary>
+    internal static IEnumerable<ManagedSchemaRow> EnumerateSchemaRows(QueryContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (context.StagedSchemaRows is { } staged)
+            return staged.Rows;
+
+        return EnumerateCatalogSchemaRows(context);
+    }
+
+    private static IEnumerable<ManagedSchemaRow> EnumerateCatalogSchemaRows(QueryContext context)
+    {
+        foreach (var entry in context.Tables)
         {
-            rows.Add(new SourceRow(
-                columns,
-                [
-                    SqlValue.Text("table"),
-                    SqlValue.Text(entry.Key),
-                    SqlValue.Text(entry.Key),
-                    SqlValue.Integer(0),
-                    SqlValue.Text(entry.Value.Sql ?? BuildCreateTableSql(entry.Key, entry.Value)),
-                ],
-                qualifiedColumns,
-                outerRow));
+            // The in-memory read path has no physical roots, so every row reports rootpage 0, exactly as
+            // this projection always has.
+            yield return ManagedSchemaRowFactory.ForTable(entry.Key, entry.Value, rootPage: 0);
 
             foreach (var index in entry.Value.Indexes)
             {
-                rows.Add(new SourceRow(
-                    columns,
-                    [
-                        SqlValue.Text("index"),
-                        SqlValue.Text(index.Name),
-                        SqlValue.Text(entry.Key),
-                        SqlValue.Integer(0),
-                        index.Origin == EmbeddedIndexOrigin.Explicit
-                            ? SqlValue.Text(index.Sql ?? BuildCreateIndexSql(entry.Key, index))
-                            : SqlValue.Null,
-                    ],
-                    qualifiedColumns,
-                    outerRow));
+                yield return ManagedSchemaRowFactory.ForIndex(
+                    entry.Key,
+                    entry.Value,
+                    index,
+                    rootPage: 0,
+                    ManagedSchemaSqlForm.Declared);
             }
         }
 
         if (context.Views is not null)
         {
             foreach (var entry in context.Views.OrderBy(entry => entry.Key, StringComparer.OrdinalIgnoreCase))
-            {
-                rows.Add(new SourceRow(
-                    columns,
-                    [
-                        SqlValue.Text("view"),
-                        SqlValue.Text(entry.Key),
-                        SqlValue.Text(entry.Key),
-                        SqlValue.Integer(0),
-                        SqlValue.Text(entry.Value.Sql),
-                    ],
-                    qualifiedColumns,
-                    outerRow));
-            }
+                yield return ManagedSchemaRowFactory.ForView(entry.Value);
         }
 
         if (context.Triggers is not null)
@@ -33017,21 +33730,9 @@ out bool hasReturning)
                          .OrderBy(entry => entry.Value.DeclarationOrder)
                          .ThenBy(entry => entry.Key, StringComparer.OrdinalIgnoreCase))
             {
-                rows.Add(new SourceRow(
-                    columns,
-                    [
-                        SqlValue.Text("trigger"),
-                        SqlValue.Text(entry.Key),
-                        SqlValue.Text(entry.Value.TableName),
-                        SqlValue.Integer(0),
-                        SqlValue.Text(entry.Value.Sql),
-                    ],
-                    qualifiedColumns,
-                    outerRow));
+                yield return ManagedSchemaRowFactory.ForTrigger(entry.Value);
             }
         }
-
-        return new SourceData(columns, rows);
     }
 
     private static SourceData GetCommonTableExpressionRows(
@@ -56101,6 +56802,23 @@ internal sealed class EmbeddedTable
         }
     }
 
+    /// <summary>
+    /// Adopts <paramref name="source"/>'s rows, explicit indexes and method attachments into this freshly
+    /// parsed definition. <c>ParseSchema</c> uses it when a rewritten <c>CREATE TABLE</c> replaces a table
+    /// that already holds data: the column shape comes from the new SQL, the content comes from the table
+    /// being replaced. It performs the same transfer <see cref="Clone"/> does, in the opposite direction.
+    /// </summary>
+    internal void AdoptContentFrom(EmbeddedTable source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        Rows.ReplaceContentsPreservingRevision(source.Rows);
+        RowIds.Clear();
+        RowIds.AddRange(source.RowIds);
+        Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
+        Indexes.AddRange(source.Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
+        source.CopyMethodAttachmentsTo(this);
+    }
+
     private void CopyMethodAttachmentsTo(EmbeddedTable clone)
     {
         // Forked attachments carry no derived state and no journal: a snapshot that is later
@@ -57233,6 +57951,27 @@ internal sealed class EmbeddedTable
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
         CopyMethodAttachmentsTo(clone);
+        return clone;
+    }
+
+    internal EmbeddedTable CloneSchemaOnly()
+    {
+        var clone = new EmbeddedTable(
+            Name,
+            ColumnDefinitions,
+            WithoutRowid,
+            TableLevelPrimaryKey,
+            TableUniqueConstraints,
+            CheckConstraints,
+            TablePrimaryKeyConflictAlgorithm,
+            TablePrimaryKeyConstraintName,
+            TablePrimaryKeyDeclarationOrder,
+            TableForeignKeys,
+            Strict);
+        clone.SchemaSqlCompact = SchemaSqlCompact;
+        clone.Sql = Sql;
+        clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
+        clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
         return clone;
     }
 

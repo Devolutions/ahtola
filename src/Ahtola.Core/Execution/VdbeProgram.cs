@@ -331,6 +331,121 @@ public enum VdbeOpcode
     VDestroy = 117,
     /// <summary>Rename a managed virtual-table instance (Turso <c>VRename</c>).</summary>
     VRename = 118,
+
+    /// <summary>Pack a register block into one record register (Turso <c>MakeRecord</c>, insn.rs:912).</summary>
+    MakeRecord = 119,
+
+    /// <summary>Allocate the next unused rowid for a cursor (Turso <c>NewRowid</c>, insn.rs:1368).</summary>
+    NewRowid = 120,
+
+    /// <summary>Allocate a new b-tree root page (Turso <c>CreateBtree</c>, insn.rs:1427).</summary>
+    CreateBtree = 121,
+
+    /// <summary>Delete every entry under a b-tree root, keeping the root (Turso <c>ClearBtree</c>, insn.rs:1461).</summary>
+    ClearBtree = 122,
+
+    /// <summary>Destroy a b-tree root and reclaim its pages (Turso <c>Destroy</c>, insn.rs:1467).</summary>
+    Destroy = 123,
+
+    /// <summary>Read a database header cookie into a register (Turso <c>ReadCookie</c>, insn.rs:1766).</summary>
+    ReadCookie = 124,
+
+    /// <summary>Stage a database header cookie value (Turso <c>SetCookie</c>, insn.rs:1773).</summary>
+    SetCookie = 125,
+
+    /// <summary>Reparse selected <c>sqlite_schema</c> rows into the live schema (Turso <c>ParseSchema</c>, insn.rs:1661).</summary>
+    ParseSchema = 126,
+
+    /// <summary>Evict a table from the in-memory schema (Turso <c>DropTable</c>, insn.rs:1491).</summary>
+    DropTable = 127,
+
+    /// <summary>Evict a view from the in-memory schema (Turso <c>DropView</c>, insn.rs:1501).</summary>
+    DropView = 128,
+
+    /// <summary>Evict an index from the in-memory schema (Turso <c>DropIndex</c>, insn.rs:1507).</summary>
+    DropIndex = 129,
+
+    /// <summary>Evict a trigger from the in-memory schema (Turso <c>DropTrigger</c>, insn.rs:1514).</summary>
+    DropTrigger = 130,
+
+    /// <summary>Rename a table in the in-memory schema (Turso <c>RenameTable</c>, insn.rs:1863).</summary>
+    RenameTable = 131,
+
+    /// <summary>Append a column to a table in the in-memory schema (Turso <c>AddColumn</c>, insn.rs:1873).</summary>
+    AddColumn = 132,
+
+    /// <summary>Remove a column from a table in the in-memory schema (Turso <c>DropColumn</c>, insn.rs:1868).</summary>
+    DropColumn = 133,
+
+    /// <summary>Rewrite a column definition in the in-memory schema (Turso <c>AlterColumn</c>, insn.rs:1876).</summary>
+    AlterColumn = 134,
+
+    /// <summary>
+    /// Refill an index from its base table (Turso's <c>emit_refill_index</c> block, index.rs:326).
+    /// </summary>
+    IndexBuild = 135,
+}
+
+/// <summary>
+/// The b-tree kind <see cref="CreateBtreeInstruction"/> allocates, mirroring Turso's
+/// <c>CreateBTreeFlags</c> bit values (pager.rs:5940) so a compiled program's P3 matches upstream.
+/// </summary>
+[Flags]
+public enum VdbeCreateBtreeFlags
+{
+    /// <summary>No kind selected. Never valid in a compiled program.</summary>
+    None = 0,
+
+    /// <summary>A rowid table b-tree (<c>CreateBTreeFlags::TABLE</c>).</summary>
+    Table = 0b0001,
+
+    /// <summary>An index b-tree (<c>CreateBTreeFlags::INDEX</c>).</summary>
+    Index = 0b0010,
+}
+
+/// <summary>
+/// The database header cookie a <see cref="ReadCookieInstruction"/> or <see cref="SetCookieInstruction"/>
+/// addresses. Values match Turso's <c>Cookie</c> enum (insn.rs:2429), which in turn matches the SQLite
+/// file-header cookie numbering.
+/// </summary>
+public enum VdbeSchemaCookie
+{
+    /// <summary>The schema cookie, bumped by every schema change.</summary>
+    SchemaVersion = 1,
+
+    /// <summary>The schema format number (1, 2, 3, or 4).</summary>
+    DatabaseFormat = 2,
+
+    /// <summary>The default page cache size.</summary>
+    DefaultPageCacheSize = 3,
+
+    /// <summary>The largest root b-tree page under auto/incremental vacuum, otherwise zero.</summary>
+    LargestRootPageNumber = 4,
+
+    /// <summary>The database text encoding (1 = UTF-8, 2 = UTF-16le, 3 = UTF-16be).</summary>
+    DatabaseTextEncoding = 5,
+
+    /// <summary>The user version, as read and written by <c>PRAGMA user_version</c>.</summary>
+    UserVersion = 6,
+
+    /// <summary>The auto-vacuum mode setting.</summary>
+    IncrementalVacuum = 7,
+
+    /// <summary>The application id, as read and written by <c>PRAGMA application_id</c>.</summary>
+    ApplicationId = 8,
+}
+
+/// <summary>
+/// The schema object a Drop opcode evicts from the live schema. Turso spells each one as its own
+/// instruction (<c>DropTable</c>, <c>DropView</c>, <c>DropIndex</c>, <c>DropTrigger</c>); this enum lets the
+/// managed schema context dispatch them through one entry point without losing the distinction.
+/// </summary>
+internal enum VdbeSchemaObjectKind
+{
+    Table,
+    View,
+    Index,
+    Trigger,
 }
 
 /// <summary>Key-order seek comparison used by SeekGE/GT/LE/LT and IdxGE/GT/LE/LT.</summary>
@@ -816,6 +931,14 @@ internal static class VdbeValueOperations
 public sealed class VdbeCursorSource
 {
     public VdbeCursorSource(IReadOnlyList<SqlValue[]> rows, IReadOnlyList<long>? rowIds = null)
+        : this(rows, rowIds, largestRowId: null)
+    {
+    }
+
+    internal VdbeCursorSource(
+        IReadOnlyList<SqlValue[]> rows,
+        IReadOnlyList<long>? rowIds,
+        Func<long?>? largestRowId)
     {
         ArgumentNullException.ThrowIfNull(rows);
         if (rowIds is not null && rowIds.Count != rows.Count)
@@ -827,6 +950,7 @@ public sealed class VdbeCursorSource
 
         Rows = rows;
         RowIds = rowIds;
+        LargestRowId = largestRowId;
     }
 
     public IReadOnlyList<SqlValue[]> Rows { get; }
@@ -836,6 +960,8 @@ public sealed class VdbeCursorSource
     /// these is a value-only cursor and cannot satisfy <see cref="RowIdInstruction"/>.
     /// </summary>
     public IReadOnlyList<long>? RowIds { get; }
+
+    internal Func<long?>? LargestRowId { get; }
 }
 
 /// <summary>
@@ -1795,6 +1921,16 @@ public sealed class VdbeWriteTarget
     /// UPDATE/DELETE, or the count of inserted rows for INSERT.</summary>
     public required int RowCount { get; init; }
 
+    /// <summary>
+    /// Reports the cursor's row count at the moment it is asked, superseding <see cref="RowCount"/>.
+    /// </summary>
+    /// <remarks>
+    /// A binding whose rows the program itself writes cannot state a count up front: a schema program
+    /// inserts a <c>sqlite_schema</c> row and then scans the row set it just extended. Supplying the count
+    /// as a delegate keeps such a cursor honest without forcing every write target to become dynamic.
+    /// </remarks>
+    public Func<int>? LiveRowCount { get; init; }
+
     /// <summary>Reads the pre-mutation row at a scan position (UPDATE/DELETE).</summary>
     public Func<int, SqlValue[]>? GetRow { get; init; }
 
@@ -1814,6 +1950,14 @@ public sealed class VdbeWriteTarget
     /// <summary>Builds and records the new row for a position, returning the values
     /// a following <c>Column</c>/<c>RowId</c> should observe (INSERT/UPDATE).</summary>
     public Func<int, VdbeRowMutation>? MutateRow { get; init; }
+
+    /// <summary>
+    /// Stores one register-built record under the supplied rowid and returns the rowid actually written.
+    /// This is the binding for the register-backed <see cref="InsertInstruction"/> form: unlike
+    /// <see cref="MutateRow"/> it takes the row from the program's registers instead of a scan position,
+    /// so a program can write rows it constructed rather than rows it read.
+    /// </summary>
+    public Func<long, SqlValue[], long>? InsertRecord { get; init; }
 
     /// <summary>Applies all buffered mutations to the table under the statement's
     /// constraints, returning the last inserted rowid (INSERT) or
@@ -1947,7 +2091,8 @@ public sealed class VdbeSubprogram
     internal ResumableStatement CreateRuntime(
         VdbeParameterBinding? parameterBinding,
         VdbeExecutionOptions executionOptions,
-        VdbeExecutionMemory executionMemory)
+        VdbeExecutionMemory executionMemory,
+        VdbeSchemaExecutionContext? schemaContext = null)
     {
         ArgumentNullException.ThrowIfNull(executionOptions);
         ArgumentNullException.ThrowIfNull(executionMemory);
@@ -1964,7 +2109,12 @@ public sealed class VdbeSubprogram
                 sharedTransaction: null,
                 virtualTableBindings: null,
                 executionOptions: executionOptions,
-                executionMemory: executionMemory);
+                executionMemory: executionMemory,
+                // A nested program shares the caller's schema context so a DDL program and the
+                // subprograms it drives stage into one transaction-local schema, but it does not own it:
+                // resetting the nested statement must not discard the outer program's staged effects.
+                schemaContext: schemaContext,
+                ownsSchemaContext: false);
         }
     }
 }
@@ -2178,6 +2328,271 @@ public sealed record VRenameInstruction(Cursor Cursor, Register NewName) : VdbeI
     public override VdbeOpcode Opcode => VdbeOpcode.VRename;
 }
 
+/// <summary>
+/// Packs the <paramref name="Values"/> register block into the single record register
+/// <paramref name="Destination"/> (Turso <c>MakeRecord</c>, insn.rs:912). The destination holds an
+/// ordered tuple, not a scalar: <see cref="ResumableStatement.GetRegister"/> reports it as
+/// <see cref="SqlValueKind.Null"/> rather than inventing a blob encoding, and only record-aware opcodes
+/// read it back. <paramref name="IndexName"/> carries the index a key record is being built for, exactly
+/// as upstream's <c>index_name</c> does, and appears in <c>EXPLAIN</c>.
+/// </summary>
+/// <remarks>
+/// Upstream rejects a destination that overlaps its source range at run time; because both operands are
+/// compile-time constants here, the same rule is enforced when the program is validated.
+/// </remarks>
+public sealed record MakeRecordInstruction(
+    RegisterRange Values,
+    Register Destination,
+    string? IndexName = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.MakeRecord;
+}
+
+/// <summary>
+/// Writes the next unused rowid of <paramref name="Cursor"/> into <paramref name="Destination"/>
+/// (Turso <c>NewRowid</c>, insn.rs:1368). The value is one past the largest rowid the cursor's bound
+/// source currently exposes, so an empty table yields 1. When <paramref name="PreviousLargest"/> is
+/// supplied it receives that largest existing rowid (zero for an empty cursor), which is the operand
+/// upstream reserves as <c>prev_largest_reg</c>.
+/// </summary>
+/// <remarks>
+/// A cursor whose source carries no rowids cannot answer this instruction; that is a hard error rather
+/// than a silent zero, so a value-only cursor can never be mistaken for an empty table.
+/// </remarks>
+public sealed record NewRowidInstruction(
+    Cursor Cursor,
+    Register Destination,
+    Register? PreviousLargest = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.NewRowid;
+}
+
+/// <summary>
+/// Marks the instructions whose effect belongs to a <see cref="VdbeSchemaExecutionContext"/> rather than
+/// to the register file or a cursor. The interpreter dispatches them as one group so every one of them
+/// gets the same treatment: a missing context is a hard error, and a failure faults the statement instead
+/// of leaving it resumable with a half-applied schema effect.
+/// </summary>
+internal interface IVdbeSchemaInstruction;
+
+/// <summary>
+/// Allocates a new b-tree root in database <paramref name="Database"/> and writes its page number into
+/// <paramref name="RootDestination"/> (Turso <c>CreateBtree</c>, insn.rs:1427). <paramref name="Flags"/>
+/// selects a table or index b-tree and is reported as P3 exactly as upstream reports
+/// <c>CreateBTreeFlags::get_flags</c>.
+/// </summary>
+public sealed record CreateBtreeInstruction(
+    int Database,
+    Register RootDestination,
+    VdbeCreateBtreeFlags Flags) : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.CreateBtree;
+}
+
+/// <summary>
+/// Deletes every entry beneath root page <paramref name="RootPage"/> of database
+/// <paramref name="Database"/> while keeping the root itself allocated (Turso <c>ClearBtree</c>,
+/// insn.rs:1461). This is the <c>DELETE FROM</c>/<c>ALTER</c> rebuild primitive; use
+/// <see cref="DestroyInstruction"/> to also reclaim the root.
+/// </summary>
+public sealed record ClearBtreeInstruction(int Database, long RootPage)
+    : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ClearBtree;
+}
+
+/// <summary>
+/// Destroys root page <paramref name="RootPage"/> of database <paramref name="Database"/> and reclaims
+/// its pages (Turso <c>Destroy</c>, insn.rs:1467). <paramref name="FormerRootDestination"/> receives the
+/// page number of any root that had to move to fill the hole, or zero when nothing moved — the operand
+/// upstream names <c>former_root_reg</c>. <paramref name="IsTemporary"/> distinguishes a temp-database
+/// root from a main-database one.
+/// </summary>
+/// <remarks>
+/// Upstream always knows the root as a translate-time literal because SQLite assigns a root page when the
+/// b-tree is created. Ahtola assigns roots at commit, so a program that has to retire a tree it did not
+/// create discovers the root by reading it out of the object's <c>sqlite_schema</c> row and passes it in
+/// <paramref name="RootRegister"/>. Exactly one of the two forms is used: with a register the literal
+/// <paramref name="RootPage"/> must be zero.
+/// </remarks>
+public sealed record DestroyInstruction(
+    int Database,
+    long RootPage,
+    Register FormerRootDestination,
+    bool IsTemporary = false,
+    Register? RootRegister = null) : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Destroy;
+}
+
+/// <summary>
+/// Rebuilds index <paramref name="IndexName"/> of table <paramref name="TableName"/> in database
+/// <paramref name="Database"/> from the table's current rows. It is the managed counterpart of the
+/// sorter-driven refill block Turso emits from <c>emit_refill_index</c> (index.rs:326) for an ordinary
+/// b-tree index.
+/// </summary>
+/// <remarks>
+/// <para>
+/// An ordinary index's <em>content</em> is derived state in Ahtola: the planner reads keys straight from
+/// the base rows and <c>EmbeddedFileStore.Persist</c> rebuilds the index b-tree from them on every commit.
+/// There is therefore no separate row store for the refill to fill, and what upstream's sorter loop
+/// observably contributes — projecting each qualifying row's key and rejecting a duplicate in a
+/// <see cref="Unique"/> index — is what this instruction performs, against the staged catalog, using the
+/// engine's own collation-aware key projection.
+/// </para>
+/// <para>
+/// The index must already be adopted into the staged schema when this runs; a program emits it after the
+/// <c>ParseSchema</c> that publishes the index it names.
+/// </para>
+/// </remarks>
+public sealed record IndexBuildInstruction(
+    int Database,
+    string TableName,
+    string IndexName,
+    bool Unique = false) : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IndexBuild;
+}
+
+/// <summary>
+/// Reads header cookie <paramref name="Cookie"/> of database <paramref name="Database"/> into
+/// <paramref name="Destination"/> (Turso <c>ReadCookie</c>, insn.rs:1766).
+/// </summary>
+public sealed record ReadCookieInstruction(
+    int Database,
+    Register Destination,
+    VdbeSchemaCookie Cookie) : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ReadCookie;
+}
+
+/// <summary>
+/// Stages <paramref name="Value"/> into header cookie <paramref name="Cookie"/> of database
+/// <paramref name="Database"/> (Turso <c>SetCookie</c>, insn.rs:1773). <paramref name="P5"/> carries the
+/// upstream P5 flag word; because <see cref="VdbeExplain"/> exposes no P5 column it is rendered in the
+/// instruction comment instead of being dropped.
+/// </summary>
+public sealed record SetCookieInstruction(
+    int Database,
+    VdbeSchemaCookie Cookie,
+    int Value,
+    int P5 = 0) : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SetCookie;
+}
+
+/// <summary>
+/// Reparses the <c>sqlite_schema</c> rows of database <paramref name="Database"/> that match
+/// <paramref name="WhereClause"/> and republishes them into the live schema (Turso <c>ParseSchema</c>,
+/// insn.rs:1661). A null clause reparses the whole schema.
+/// <paramref name="TriggerTargetDatabase"/> mirrors upstream's <c>trigger_target_database_id</c>: it
+/// records which database supplied the table an unqualified TEMP trigger fires on, because the stored
+/// SQL alone cannot say.
+/// </summary>
+public sealed record ParseSchemaInstruction(
+    int Database,
+    string? WhereClause = null,
+    int? TriggerTargetDatabase = null) : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ParseSchema;
+}
+
+/// <summary>Evicts table <paramref name="TableName"/> from the live schema of database
+/// <paramref name="Database"/> (Turso <c>DropTable</c>, insn.rs:1491).</summary>
+public sealed record DropTableInstruction(int Database, string TableName)
+    : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DropTable;
+}
+
+/// <summary>Evicts view <paramref name="ViewName"/> from the live schema of database
+/// <paramref name="Database"/> (Turso <c>DropView</c>, insn.rs:1501).</summary>
+public sealed record DropViewInstruction(int Database, string ViewName)
+    : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DropView;
+}
+
+/// <summary>Evicts index <paramref name="IndexName"/> from the live schema of database
+/// <paramref name="Database"/> (Turso <c>DropIndex</c>, insn.rs:1507).</summary>
+public sealed record DropIndexInstruction(int Database, string IndexName)
+    : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DropIndex;
+}
+
+/// <summary>Evicts trigger <paramref name="TriggerName"/> from the live schema of database
+/// <paramref name="Database"/> (Turso <c>DropTrigger</c>, insn.rs:1514).</summary>
+public sealed record DropTriggerInstruction(int Database, string TriggerName)
+    : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DropTrigger;
+}
+
+/// <summary>Renames table <paramref name="From"/> to <paramref name="To"/> in the live schema of database
+/// <paramref name="Database"/> (Turso <c>RenameTable</c>, insn.rs:1863).</summary>
+public sealed record RenameTableInstruction(int Database, string From, string To)
+    : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RenameTable;
+}
+
+/// <summary>
+/// Appends column <paramref name="ColumnName"/>, declared by <paramref name="ColumnDefinition"/>, to table
+/// <paramref name="TableName"/> in the live schema of database <paramref name="Database"/>
+/// (Turso <c>AddColumn</c>, insn.rs:1873). The definition stays SQL text so the same rewrite rules apply
+/// whether the schema is being altered or reloaded from <c>sqlite_schema</c>.
+/// </summary>
+/// <remarks>
+/// <paramref name="ColumnSql"/> is the added column's source text as the statement wrote it. SQLite edits
+/// a table's stored <c>CREATE TABLE</c> by inserting that text rather than regenerating the statement, so
+/// the opcode needs it to keep the stored SQL byte-identical to what the direct rewrite produced. A null
+/// value means the table has no faithful stored text to extend, which is exactly when SQLite falls back to
+/// regenerating it.
+/// </remarks>
+public sealed record AddColumnInstruction(
+    int Database,
+    string TableName,
+    string ColumnName,
+    string ColumnDefinition,
+    string? ColumnSql = null) : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.AddColumn;
+}
+
+/// <summary>Removes the column at <paramref name="ColumnIndex"/> from table <paramref name="TableName"/>
+/// in the live schema of database <paramref name="Database"/> (Turso <c>DropColumn</c>, insn.rs:1868).</summary>
+public sealed record DropColumnInstruction(
+    int Database,
+    string TableName,
+    int ColumnIndex) : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DropColumn;
+}
+
+/// <summary>
+/// Rewrites the column at <paramref name="ColumnIndex"/> of table <paramref name="TableName"/> to
+/// <paramref name="ColumnDefinition"/> in the live schema of database <paramref name="Database"/>
+/// (Turso <c>AlterColumn</c>, insn.rs:1876). <paramref name="Rename"/> distinguishes
+/// <c>RENAME COLUMN</c>, which only changes the name and must be propagated to dependent objects, from a
+/// full definition replacement.
+/// </summary>
+/// <remarks>
+/// <paramref name="QuoteNewName"/> mirrors SQLite's <c>bQuote</c> and only applies to a rename: when the
+/// replacement name was written quoted, every reference the token-aware rewrite touches is emitted quoted
+/// too. It is a property of the statement rather than of the schema, so it travels with the opcode.
+/// </remarks>
+public sealed record AlterColumnInstruction(
+    int Database,
+    string TableName,
+    int ColumnIndex,
+    string ColumnDefinition,
+    bool Rename = false,
+    bool QuoteNewName = false) : VdbeInstruction, IVdbeSchemaInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.AlterColumn;
+}
+
 public sealed record VBeginInstruction(Cursor Cursor) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.VBegin;
@@ -2199,15 +2614,110 @@ public sealed record VRollbackInstruction(Cursor Cursor) : VdbeInstruction
 }
 
 /// <summary>
-/// The statically bound managed index method a method-index instruction operates on. Binding the
-/// attachment and its base-row source into the instruction keeps the interpreter free of any global
-/// lookup and keeps the opcodes reflection-free.
+/// The managed index method a method-index instruction operates on. Binding the attachment and its
+/// base-row source into the instruction keeps the interpreter free of any global lookup and keeps the
+/// opcodes reflection-free.
 /// </summary>
-internal sealed record VdbeIndexMethodBinding(
-    string MethodName,
-    string IndexName,
-    Indexing.ManagedIndexMethodAttachment Attachment,
-    Indexing.IManagedIndexSource Source);
+/// <remarks>
+/// <para>
+/// A query program knows both operands when it is compiled and uses the eager form. A schema program
+/// does not: the attachment a <c>CREATE INDEX</c>/<c>DROP INDEX</c> program acts on belongs to the
+/// transaction-local catalog the program itself is building, which does not exist until the program is
+/// bound to a stage and run. Those programs use <see cref="Deferred"/>, whose resolver runs on first use
+/// inside the interpreter.
+/// </para>
+/// <para>
+/// Deferral is also what keeps <c>EXPLAIN</c> inert: describing a program reads only
+/// <see cref="MethodName"/> and <see cref="IndexName"/>, so a resolver that would attach or mutate method
+/// state is never invoked.
+/// </para>
+/// </remarks>
+internal sealed record VdbeIndexMethodBinding
+{
+    private readonly Func<(Indexing.ManagedIndexMethodAttachment Attachment, Indexing.IManagedIndexSource Source)>?
+        _resolver;
+    private Indexing.ManagedIndexMethodAttachment? _attachment;
+    private Indexing.IManagedIndexSource? _source;
+
+    public VdbeIndexMethodBinding(
+        string methodName,
+        string indexName,
+        Indexing.ManagedIndexMethodAttachment attachment,
+        Indexing.IManagedIndexSource source)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(methodName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(indexName);
+        ArgumentNullException.ThrowIfNull(attachment);
+        ArgumentNullException.ThrowIfNull(source);
+        MethodName = methodName;
+        IndexName = indexName;
+        _attachment = attachment;
+        _source = source;
+    }
+
+    private VdbeIndexMethodBinding(
+        string methodName,
+        string indexName,
+        Func<(Indexing.ManagedIndexMethodAttachment Attachment, Indexing.IManagedIndexSource Source)> resolver)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(methodName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(indexName);
+        ArgumentNullException.ThrowIfNull(resolver);
+        MethodName = methodName;
+        IndexName = indexName;
+        _resolver = resolver;
+    }
+
+    /// <summary>Binds a method whose attachment only exists once the program runs.</summary>
+    public static VdbeIndexMethodBinding Deferred(
+        string methodName,
+        string indexName,
+        Func<(Indexing.ManagedIndexMethodAttachment Attachment, Indexing.IManagedIndexSource Source)> resolver)
+        => new(methodName, indexName, resolver);
+
+    public string MethodName { get; }
+
+    public string IndexName { get; }
+
+    /// <summary>Whether the binding can produce an attachment, without producing one.</summary>
+    public bool IsResolvable => _resolver is not null || (_attachment is not null && _source is not null);
+
+    public Indexing.ManagedIndexMethodAttachment Attachment
+    {
+        get
+        {
+            Resolve();
+            return _attachment!;
+        }
+    }
+
+    public Indexing.IManagedIndexSource Source
+    {
+        get
+        {
+            Resolve();
+            return _source!;
+        }
+    }
+
+    private void Resolve()
+    {
+        if (_attachment is not null && _source is not null)
+            return;
+
+        if (_resolver is null)
+        {
+            throw new VdbeSchemaExecutionException(
+                $"The index-method binding for '{IndexName}' has neither an attachment nor a resolver.");
+        }
+
+        var (attachment, source) = _resolver();
+        ArgumentNullException.ThrowIfNull(attachment);
+        ArgumentNullException.ThrowIfNull(source);
+        _attachment = attachment;
+        _source = source;
+    }
+}
 
 /// <summary>Allocates method state for a freshly created method index (Turso <c>IndexMethodCreate</c>).</summary>
 internal sealed record IndexMethodCreateInstruction(Cursor Cursor, VdbeIndexMethodBinding Binding) : VdbeInstruction
@@ -2475,8 +2985,48 @@ public enum VdbeInsertFlags : byte
     SkipAllChangeCounts = 0x20,
 }
 
-public sealed record InsertInstruction(Cursor Cursor, VdbeInsertFlags Flags = VdbeInsertFlags.None) : VdbeInstruction
+/// <summary>
+/// Writes a row through <paramref name="Cursor"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Two addressing modes share this opcode, exactly as they do upstream. The cursor-only form (no
+/// <see cref="Record"/>) is Ahtola's existing DML shape: the bound
+/// <see cref="VdbeWriteTarget.MutateRow"/> has already staged the row at the cursor's scan position and
+/// this instruction applies it. The register-backed form supplies Turso's
+/// <c>Insert { cursor, key_reg, record_reg }</c> operands (insn.rs:1315) — a record built by
+/// <see cref="MakeRecordInstruction"/> plus the rowid it is stored under — and is what schema and CTAS
+/// programs use to write rows they constructed in registers rather than scanned.
+/// </para>
+/// <para>
+/// <see cref="RowId"/> is required whenever <see cref="Record"/> is supplied; a record with no
+/// key has nowhere to go. <see cref="TableName"/> mirrors upstream's <c>table_name</c> operand and
+/// appears in <c>EXPLAIN</c>.
+/// </para>
+/// </remarks>
+public sealed record InsertInstruction(
+    Cursor Cursor,
+    VdbeInsertFlags Flags = VdbeInsertFlags.None) : VdbeInstruction
 {
+    public InsertInstruction(
+        Cursor cursor,
+        VdbeInsertFlags flags,
+        Register? record,
+        Register? rowId,
+        string? tableName)
+        : this(cursor, flags)
+    {
+        Record = record;
+        RowId = rowId;
+        TableName = tableName;
+    }
+
+    public Register? Record { get; init; }
+
+    public Register? RowId { get; init; }
+
+    public string? TableName { get; init; }
+
     public override VdbeOpcode Opcode => VdbeOpcode.Insert;
 }
 
@@ -3800,6 +4350,144 @@ public sealed class VdbeProgram
                     ValidateCursor(vRename.Cursor, instructionIndex);
                     ValidateRegister(vRename.NewName, instructionIndex);
                     break;
+                case MakeRecordInstruction makeRecord:
+                    ValidateRegisterRange(makeRecord.Values, instructionIndex);
+                    ValidateRegister(makeRecord.Destination, instructionIndex);
+                    if (makeRecord.Values.Count <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} builds a record from an empty register range.");
+                    }
+
+                    if (makeRecord.Destination.Index >= makeRecord.Values.Start.Index
+                        && makeRecord.Destination.Index < makeRecord.Values.Start.Index + makeRecord.Values.Count)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} writes its record to register {makeRecord.Destination.Index}, which overlaps its source range {FormatRegisterRange(makeRecord.Values)}.");
+                    }
+
+                    if (makeRecord.IndexName is not null && makeRecord.IndexName.Length == 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} has an empty MakeRecord index name.");
+                    }
+
+                    break;
+                case NewRowidInstruction newRowid:
+                    ValidateOpenCursor(newRowid.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(newRowid.Destination, instructionIndex);
+                    if (newRowid.PreviousLargest is { } previousLargest)
+                    {
+                        ValidateRegister(previousLargest, instructionIndex);
+                        if (previousLargest.Index == newRowid.Destination.Index)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} writes the new and previous largest rowid to the same register {previousLargest.Index}.");
+                        }
+                    }
+
+                    break;
+                case CreateBtreeInstruction createBtree:
+                    ValidateSchemaDatabase(createBtree.Database, instructionIndex);
+                    ValidateRegister(createBtree.RootDestination, instructionIndex);
+                    if (createBtree.Flags is not (VdbeCreateBtreeFlags.Table or VdbeCreateBtreeFlags.Index))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} must create exactly one of a table or index b-tree.");
+                    }
+
+                    break;
+                case ClearBtreeInstruction clearBtree:
+                    ValidateSchemaDatabase(clearBtree.Database, instructionIndex);
+                    ValidateSchemaRootPage(clearBtree.RootPage, instructionIndex);
+                    break;
+                case DestroyInstruction destroy:
+                    ValidateSchemaDatabase(destroy.Database, instructionIndex);
+                    ValidateRegister(destroy.FormerRootDestination, instructionIndex);
+                    if (destroy.RootRegister is { } destroyRootRegister)
+                    {
+                        ValidateRegister(destroyRootRegister, instructionIndex);
+                        if (destroy.RootPage != 0)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} supplies both a literal root page and a root register to Destroy.");
+                        }
+                    }
+                    else
+                    {
+                        ValidateSchemaRootPage(destroy.RootPage, instructionIndex);
+                    }
+
+                    break;
+                case IndexBuildInstruction indexBuild:
+                    ValidateSchemaDatabase(indexBuild.Database, instructionIndex);
+                    ValidateSchemaObjectName(indexBuild.TableName, "IndexBuild", instructionIndex);
+                    ValidateSchemaObjectName(indexBuild.IndexName, "IndexBuild", instructionIndex);
+                    break;
+                case ReadCookieInstruction readCookie:
+                    ValidateSchemaDatabase(readCookie.Database, instructionIndex);
+                    ValidateRegister(readCookie.Destination, instructionIndex);
+                    ValidateSchemaCookie(readCookie.Cookie, instructionIndex);
+                    break;
+                case SetCookieInstruction setCookie:
+                    ValidateSchemaDatabase(setCookie.Database, instructionIndex);
+                    ValidateSchemaCookie(setCookie.Cookie, instructionIndex);
+                    if (setCookie.P5 < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} has a negative SetCookie P5 flag word.");
+                    }
+
+                    break;
+                case ParseSchemaInstruction parseSchema:
+                    ValidateSchemaDatabase(parseSchema.Database, instructionIndex);
+                    if (parseSchema.WhereClause is not null && string.IsNullOrWhiteSpace(parseSchema.WhereClause))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} has a blank ParseSchema where clause; use null to reparse the whole schema.");
+                    }
+
+                    if (parseSchema.TriggerTargetDatabase is { } triggerTargetDatabase)
+                        ValidateSchemaDatabase(triggerTargetDatabase, instructionIndex);
+                    break;
+                case DropTableInstruction dropTable:
+                    ValidateSchemaDatabase(dropTable.Database, instructionIndex);
+                    ValidateSchemaObjectName(dropTable.TableName, "DropTable", instructionIndex);
+                    break;
+                case DropViewInstruction dropView:
+                    ValidateSchemaDatabase(dropView.Database, instructionIndex);
+                    ValidateSchemaObjectName(dropView.ViewName, "DropView", instructionIndex);
+                    break;
+                case DropIndexInstruction dropIndex:
+                    ValidateSchemaDatabase(dropIndex.Database, instructionIndex);
+                    ValidateSchemaObjectName(dropIndex.IndexName, "DropIndex", instructionIndex);
+                    break;
+                case DropTriggerInstruction dropTrigger:
+                    ValidateSchemaDatabase(dropTrigger.Database, instructionIndex);
+                    ValidateSchemaObjectName(dropTrigger.TriggerName, "DropTrigger", instructionIndex);
+                    break;
+                case RenameTableInstruction renameTable:
+                    ValidateSchemaDatabase(renameTable.Database, instructionIndex);
+                    ValidateSchemaObjectName(renameTable.From, "RenameTable", instructionIndex);
+                    ValidateSchemaObjectName(renameTable.To, "RenameTable", instructionIndex);
+                    break;
+                case AddColumnInstruction addColumn:
+                    ValidateSchemaDatabase(addColumn.Database, instructionIndex);
+                    ValidateSchemaObjectName(addColumn.TableName, "AddColumn", instructionIndex);
+                    ValidateSchemaObjectName(addColumn.ColumnName, "AddColumn", instructionIndex);
+                    ValidateSchemaObjectName(addColumn.ColumnDefinition, "AddColumn", instructionIndex);
+                    break;
+                case DropColumnInstruction dropColumn:
+                    ValidateSchemaDatabase(dropColumn.Database, instructionIndex);
+                    ValidateSchemaObjectName(dropColumn.TableName, "DropColumn", instructionIndex);
+                    ValidateSchemaColumnIndex(dropColumn.ColumnIndex, instructionIndex);
+                    break;
+                case AlterColumnInstruction alterColumn:
+                    ValidateSchemaDatabase(alterColumn.Database, instructionIndex);
+                    ValidateSchemaObjectName(alterColumn.TableName, "AlterColumn", instructionIndex);
+                    ValidateSchemaColumnIndex(alterColumn.ColumnIndex, instructionIndex);
+                    ValidateSchemaObjectName(alterColumn.ColumnDefinition, "AlterColumn", instructionIndex);
+                    break;
                 case VBeginInstruction vBegin:
                     ValidateCursor(vBegin.Cursor, instructionIndex);
                     break;
@@ -3875,6 +4563,34 @@ public sealed class VdbeProgram
                     break;
                 case InsertInstruction insert:
                     ValidateOpenCursor(insert.Cursor, openCursors, instructionIndex);
+                    if (insert.Record is { } insertRecord)
+                    {
+                        ValidateRegister(insertRecord, instructionIndex);
+                        if (insert.RowId is not { } insertRowId)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} inserts a record without a rowid register.");
+                        }
+
+                        ValidateRegister(insertRowId, instructionIndex);
+                        if (insertRowId.Index == insertRecord.Index)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} reads its record and its rowid from the same register {insertRecord.Index}.");
+                        }
+                    }
+                    else if (insert.RowId is not null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} supplies a rowid register without a record register.");
+                    }
+
+                    if (insert.TableName is not null && string.IsNullOrWhiteSpace(insert.TableName))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} has a blank Insert table name.");
+                    }
+
                     break;
                 case UpdateInstruction update:
                     ValidateOpenCursor(update.Cursor, openCursors, instructionIndex);
@@ -4560,7 +5276,10 @@ public sealed class VdbeProgram
 
     private static void ValidateIndexMethodBinding(VdbeIndexMethodBinding? binding, int instructionIndex)
     {
-        if (binding is null || binding.Attachment is null || binding.Source is null)
+        // Resolvability is checked instead of the operands themselves: a deferred binding cannot produce
+        // an attachment until the program is bound and run, and forcing it here would attach a method
+        // just to describe a program.
+        if (binding is null || !binding.IsResolvable)
         {
             throw new VdbeProgramValidationException(
                 $"VDBE instruction {instructionIndex} references a null index-method binding.");
@@ -4807,6 +5526,57 @@ public sealed class VdbeProgram
         {
             throw new VdbeProgramValidationException(
                 $"VDBE instruction {instructionIndex} references a savepoint with a null or empty name.");
+        }
+    }
+
+    private static string FormatRegisterRange(RegisterRange range)
+        => range.Count == 1
+            ? $"r[{range.Start.Index}]"
+            : $"r[{range.Start.Index}..{range.Start.Index + range.Count - 1}]";
+
+    private static void ValidateSchemaDatabase(int database, int instructionIndex)
+    {
+        if (database < 0)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} addresses a negative database index {database}.");
+        }
+    }
+
+    private static void ValidateSchemaRootPage(long rootPage, int instructionIndex)
+    {
+        // Page 1 is the database header/schema root and can never be cleared or destroyed by bytecode.
+        if (rootPage <= 1)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} addresses root page {rootPage}, which is not an allocatable b-tree root.");
+        }
+    }
+
+    private static void ValidateSchemaCookie(VdbeSchemaCookie cookie, int instructionIndex)
+    {
+        if (!Enum.IsDefined(cookie))
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} addresses an undefined header cookie {(int)cookie}.");
+        }
+    }
+
+    private static void ValidateSchemaObjectName(string name, string opcodeName, int instructionIndex)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} has a null or blank {opcodeName} name.");
+        }
+    }
+
+    private static void ValidateSchemaColumnIndex(int columnIndex, int instructionIndex)
+    {
+        if (columnIndex < 0)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} addresses a negative column index {columnIndex}.");
         }
     }
 }

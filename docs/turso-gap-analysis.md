@@ -155,6 +155,18 @@ real mapping, built variant-by-variant:
   construction handled at the pager boundary, `Not`/`Concat`/`And`/`Or` in the
   shared expression evaluator.
 
+> Superseded for the DDL group (2026-08-31). The eleven DDL opcodes are no
+> longer absent: `CreateBtree`, `Destroy`, `ReadCookie`, `SetCookie`,
+> `ParseSchema`, `DropTable`, `DropView`, `DropIndex`, `DropTrigger`,
+> `RenameTable`, `AddColumn`, `DropColumn` and `AlterColumn` exist and are
+> emitted, and every DDL family — `CREATE TABLE`/CTAS, `CREATE`/`DROP INDEX`,
+> `CREATE`/`DROP VIEW`, `CREATE`/`DROP TRIGGER`, the virtual-table lifecycle,
+> `DROP TABLE`, and every ordinary `ALTER TABLE` variant — compiles to a typed
+> `VdbeProgram` run over a transaction-local schema stage. See
+> `vdbe-ddl-executed-by-treewalker` in the inventory for the current shape.
+> `ClearBtree` stays unemitted because it is upstream's truncate primitive for
+> `DELETE FROM`, which is DML.
+
 Ahtola also carries **~32 extension opcodes** with no Turso counterpart,
 grouped in `vdbe-ext-window-buffer-family` (7 window-buffer opcodes) and
 `vdbe-ext-worktable-and-gate-families` (work-table, gate, distinct, filter,

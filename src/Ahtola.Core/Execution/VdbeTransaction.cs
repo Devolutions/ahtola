@@ -33,14 +33,14 @@ public sealed class VdbeTransactionException : InvalidOperationException
 /// <para>
 /// The stack mirrors SQLite's savepoint rules:
 /// <list type="bullet">
-///   <item><see cref="Begin"/> opens the outermost (anonymous) frame and fails if one is already open.</item>
-///   <item><see cref="Savepoint"/> pushes a named frame; opening one outside a transaction implicitly opens
+///   <item><see cref="Begin(SqlValue[])"/> opens the outermost (anonymous) frame and fails if one is already open.</item>
+///   <item><see cref="Savepoint(string, SqlValue[])"/> pushes a named frame; opening one outside a transaction implicitly opens
 ///     the transaction.</item>
 ///   <item><see cref="Commit"/> discards every frame, keeping the current register values.</item>
-///   <item><see cref="Rollback"/> restores the outermost frame's snapshot and discards every frame.</item>
+///   <item><see cref="Rollback(SqlValue[])"/> restores the outermost frame's snapshot and discards every frame.</item>
 ///   <item><see cref="Release"/> removes the named frame and all frames above it without restoring
 ///     registers — nested savepoints fold into the enclosing scope.</item>
-///   <item><see cref="RollbackTo"/> restores the named frame's snapshot and cancels the frames above it, but
+///   <item><see cref="RollbackTo(string, SqlValue[])"/> restores the named frame's snapshot and cancels the frames above it, but
 ///     keeps the named frame so it can be rolled back to again.</item>
 /// </list>
 /// Savepoint names are matched case-insensitively (ordinal, case-folded) exactly as SQLite compares
@@ -51,7 +51,10 @@ public sealed class VdbeTransactionException : InvalidOperationException
 /// </remarks>
 public sealed class VdbeTransactionContext
 {
-    private readonly record struct SavepointFrame(string? Name, SqlValue[] Snapshot);
+    private readonly record struct SavepointFrame(
+        string? Name,
+        SqlValue[] Snapshot,
+        VdbeRecordValue?[]? RecordSnapshot);
 
     private readonly List<SavepointFrame> _frames = [];
 
@@ -67,7 +70,7 @@ public sealed class VdbeTransactionContext
     /// <summary>The number of open frames: the outermost transaction plus any nested savepoints.</summary>
     public int Depth => _frames.Count;
 
-    /// <summary>The open savepoint names from outermost to innermost; the anonymous <see cref="Begin"/>
+    /// <summary>The open savepoint names from outermost to innermost; the anonymous <see cref="Begin(SqlValue[])"/>
     /// root reports <see langword="null"/>. Exposed so callers can observe the state machine directly.</summary>
     public IReadOnlyList<string?> SavepointNames
     {
@@ -81,22 +84,30 @@ public sealed class VdbeTransactionContext
     }
 
     /// <summary>Opens the outermost transaction, snapshotting <paramref name="registers"/>.</summary>
-    public void Begin(SqlValue[] registers)
+    public void Begin(SqlValue[] registers) => Begin(registers, records: null);
+
+    /// <summary>Opens the outermost transaction, snapshotting the scalar register file and the parallel
+    /// record slots so a rollback restores <c>MakeRecord</c> results as faithfully as scalars.</summary>
+    internal void Begin(SqlValue[] registers, VdbeRecordValue?[]? records)
     {
         ArgumentNullException.ThrowIfNull(registers);
         if (InTransaction)
             throw new VdbeTransactionException("cannot start a transaction within a transaction");
 
-        _frames.Add(new SavepointFrame(null, Snapshot(registers)));
+        _frames.Add(new SavepointFrame(null, Snapshot(registers), Snapshot(records)));
     }
 
     /// <summary>Opens a named savepoint, snapshotting <paramref name="registers"/>. Implicitly opens a
     /// transaction when none is active.</summary>
-    public void Savepoint(string name, SqlValue[] registers)
+    public void Savepoint(string name, SqlValue[] registers) => Savepoint(name, registers, records: null);
+
+    /// <summary>Opens a named savepoint, snapshotting the scalar register file and the parallel record
+    /// slots.</summary>
+    internal void Savepoint(string name, SqlValue[] registers, VdbeRecordValue?[]? records)
     {
         RequireName(name);
         ArgumentNullException.ThrowIfNull(registers);
-        _frames.Add(new SavepointFrame(name, Snapshot(registers)));
+        _frames.Add(new SavepointFrame(name, Snapshot(registers), Snapshot(records)));
     }
 
     /// <summary>Commits the active transaction, discarding every frame and keeping current register values.</summary>
@@ -119,13 +130,17 @@ public sealed class VdbeTransactionContext
 
     /// <summary>Rolls the active transaction back, restoring the outermost snapshot into
     /// <paramref name="registers"/> and discarding every frame.</summary>
-    public void Rollback(SqlValue[] registers)
+    public void Rollback(SqlValue[] registers) => Rollback(registers, records: null);
+
+    /// <summary>Rolls the active transaction back, restoring the outermost scalar and record snapshots.</summary>
+    internal void Rollback(SqlValue[] registers, VdbeRecordValue?[]? records)
     {
         ArgumentNullException.ThrowIfNull(registers);
         if (!InTransaction)
             throw new VdbeTransactionException("cannot rollback - no transaction is active");
 
         Restore(registers, _frames[0].Snapshot);
+        Restore(records, _frames[0].RecordSnapshot);
         _frames.Clear();
         DeferredForeignKeyViolations = 0;
     }
@@ -143,7 +158,10 @@ public sealed class VdbeTransactionContext
 
     /// <summary>Restores the named savepoint's snapshot into <paramref name="registers"/> and cancels the
     /// frames above it, keeping the named frame itself.</summary>
-    public void RollbackTo(string name, SqlValue[] registers)
+    public void RollbackTo(string name, SqlValue[] registers) => RollbackTo(name, registers, records: null);
+
+    /// <summary>Restores the named savepoint's scalar and record snapshots and cancels the frames above it.</summary>
+    internal void RollbackTo(string name, SqlValue[] registers, VdbeRecordValue?[]? records)
     {
         RequireName(name);
         ArgumentNullException.ThrowIfNull(registers);
@@ -152,6 +170,7 @@ public sealed class VdbeTransactionContext
             throw new VdbeTransactionException($"no such savepoint: {name}");
 
         Restore(registers, _frames[index].Snapshot);
+        Restore(records, _frames[index].RecordSnapshot);
         var above = _frames.Count - index - 1;
         if (above > 0)
             _frames.RemoveRange(index + 1, above);
@@ -188,6 +207,26 @@ public sealed class VdbeTransactionContext
 
     private static void Restore(SqlValue[] registers, SqlValue[] snapshot)
         => Array.Copy(snapshot, registers, registers.Length);
+
+    private static VdbeRecordValue?[]? Snapshot(VdbeRecordValue?[]? records)
+    {
+        if (records is null)
+            return null;
+
+        var copy = new VdbeRecordValue?[records.Length];
+        Array.Copy(records, copy, records.Length);
+        return copy;
+    }
+
+    // A frame opened through the public register-only overloads has no record snapshot, so a later
+    // rollback leaves record slots untouched rather than silently clearing tuples it never captured.
+    private static void Restore(VdbeRecordValue?[]? records, VdbeRecordValue?[]? snapshot)
+    {
+        if (records is null || snapshot is null)
+            return;
+
+        Array.Copy(snapshot, records, records.Length);
+    }
 
     private static void RequireName(string name)
     {
