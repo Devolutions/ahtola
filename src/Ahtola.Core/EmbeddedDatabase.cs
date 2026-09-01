@@ -22116,7 +22116,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
-        static bool IsNumericHashExpression(Expression expression, CompiledJoinSource source)
+        bool IsNumericHashExpression(Expression expression, CompiledJoinSource source)
         {
             while (expression is CollationExpression collation)
             {
@@ -22141,8 +22141,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
             }
 
-            return index >= source.Columns.Length
-                || IsNumericAffinity(GetJoinKeyAffinity(source.ResolveColumnDefinition(column)));
+            if (index >= source.Columns.Length)
+                return true;
+
+            var definition = source.ResolveColumnDefinition(column);
+            var declaredCollation = (definition?.Collation ?? "BINARY").ToUpperInvariant();
+            return IsNumericAffinity(GetJoinKeyAffinity(definition))
+                && IsHashableJoinKeyCollation(declaredCollation)
+                && !IsUnsafeCompiledCollation(declaredCollation);
         }
     }
 
@@ -33190,8 +33196,14 @@ out bool hasReturning)
                 return false;
             }
 
-            return EmbeddedTable.IsRowidAliasName(output.Name)
-                || IsNumericAffinity(GetJoinKeyAffinity(GetOutputColumnDefinition(side, output, context)));
+            if (EmbeddedTable.IsRowidAliasName(output.Name))
+                return true;
+
+            var definition = GetOutputColumnDefinition(side, output, context);
+            var declaredCollation = (definition?.Collation ?? "BINARY").ToUpperInvariant();
+            return IsNumericAffinity(GetJoinKeyAffinity(definition))
+                && IsHashableJoinKeyCollation(declaredCollation)
+                && !IsUnsafeCompiledCollation(declaredCollation);
         }
     }
 

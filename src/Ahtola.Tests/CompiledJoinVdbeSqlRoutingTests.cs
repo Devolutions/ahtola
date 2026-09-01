@@ -545,6 +545,22 @@ public class CompiledJoinVdbeSqlRoutingTests
     }
 
     [Test]
+    public void OverriddenBuiltInCollationNeverFallsThroughToBinaryHashing()
+    {
+        var database = new EmbeddedDatabase();
+        database.RegisterCollation("NOCASE", static (_, _) => 0);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE l(value INTEGER COLLATE NOCASE);");
+        Execute(connection, "CREATE TABLE r(value INTEGER COLLATE NOCASE);");
+        Execute(connection, "INSERT INTO l VALUES ('alpha');");
+        Execute(connection, "INSERT INTO r VALUES ('omega');");
+
+        ReadRows(connection, "SELECT l.value, r.value FROM l JOIN r ON l.value = r.value;")
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Text("alpha"), SqlValue.Text("omega"));
+    }
+
+    [Test]
     public void NWayOuterUsingChainsAreRejectedLikeTurso()
     {
         string[] setup =
