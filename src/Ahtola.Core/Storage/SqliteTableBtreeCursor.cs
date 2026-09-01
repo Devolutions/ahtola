@@ -72,6 +72,115 @@ public sealed class SqliteTableBtreeCursor
         return true;
     }
 
+    /// <summary>
+    /// Locates one physical record column without decoding or materializing any column body.
+    /// </summary>
+    public bool TryGetColumnLocation(
+        uint rootPage,
+        long rowId,
+        int columnIndex,
+        out SqliteRecordColumnLocation location)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(columnIndex);
+        if (!TrySeekCell(rootPage, rowId, out var cell))
+        {
+            location = default;
+            return false;
+        }
+
+        location = LocateColumn(cell, columnIndex);
+        return true;
+    }
+
+    /// <summary>
+    /// Gets the byte length of one TEXT or BLOB column without reading its body.
+    /// </summary>
+    public bool TryGetColumnLength(
+        uint rootPage,
+        long rowId,
+        int columnIndex,
+        out ulong length)
+    {
+        if (!TryGetColumnLocation(rootPage, rowId, columnIndex, out var location))
+        {
+            length = 0;
+            return false;
+        }
+
+        EnsureByteAddressable(location);
+        length = location.Length;
+        return true;
+    }
+
+    /// <summary>
+    /// Reads a bounded range from one TEXT or BLOB column without materializing the complete value.
+    /// </summary>
+    public bool TryReadColumn(
+        uint rootPage,
+        long rowId,
+        int columnIndex,
+        ulong offset,
+        Span<byte> destination,
+        out int bytesRead)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(columnIndex);
+        if (!TrySeekCell(rootPage, rowId, out var cell))
+        {
+            bytesRead = 0;
+            return false;
+        }
+
+        var location = LocateColumn(cell, columnIndex);
+        EnsureByteAddressable(location);
+        if (offset >= location.Length || destination.IsEmpty)
+        {
+            bytesRead = 0;
+            return true;
+        }
+
+        bytesRead = checked((int)Math.Min((ulong)destination.Length, location.Length - offset));
+        var payloadOffset = checked(location.PayloadOffset + offset);
+        new SqliteOverflowChainReader(_io)
+            .ReadPayloadRange(cell, payloadOffset, destination[..bytesRead]);
+        return true;
+    }
+
+    private SqliteRecordColumnLocation LocateColumn(SqliteTableLeafCell cell, int columnIndex)
+    {
+        var localPayload = cell.LocalPayload.Span;
+        if (!SqliteVarint.TryRead(localPayload, out var headerSizeValue, out var headerSizeLength))
+            throw new InvalidDataException("SQLite record header size is invalid.");
+        if (headerSizeValue < (ulong)headerSizeLength
+            || headerSizeValue > cell.PayloadLength
+            || headerSizeValue > SqliteRecordCodec.MaximumHeaderSize)
+        {
+            throw new InvalidDataException(
+                $"SQLite record header size {headerSizeValue} extends outside its payload.");
+        }
+
+        var headerSize = checked((int)headerSizeValue);
+        if (headerSize <= localPayload.Length)
+        {
+            return SqliteRecordCodec.LocateColumn(
+                localPayload[..headerSize],
+                cell.PayloadLength,
+                columnIndex);
+        }
+
+        var header = GC.AllocateUninitializedArray<byte>(headerSize);
+        new SqliteOverflowChainReader(_io).ReadPayloadRange(cell, 0, header);
+        return SqliteRecordCodec.LocateColumn(header, cell.PayloadLength, columnIndex);
+    }
+
+    private static void EnsureByteAddressable(SqliteRecordColumnLocation location)
+    {
+        if (!location.IsByteAddressable)
+        {
+            throw new InvalidOperationException(
+                $"SQLite incremental column reads require TEXT or BLOB storage, not {location.StorageClass}.");
+        }
+    }
+
     private bool TrySeekCell(uint rootPage, long rowId, out SqliteTableLeafCell cell)
     {
         var pageNumber = rootPage;

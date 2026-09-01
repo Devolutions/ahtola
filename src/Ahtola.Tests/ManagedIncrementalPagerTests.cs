@@ -186,6 +186,131 @@ public sealed class ManagedIncrementalPagerTests
     }
 
     [Test]
+    public void ColumnReadCrossesLocalAndOverflowPayloadBoundaries()
+    {
+        var pageIo = new CountingPageIo(pageSize: 512, usableSpace: 512, initialPageCount: 2);
+        pageIo.WritePage(2u, SqliteTableLeafPageBuilderImage(pageIo));
+        var target = Enumerable.Range(0, 2048)
+            .Select(static value => unchecked((byte)(value * 17)))
+            .ToArray();
+        byte[]? record = null;
+        var targetOffset = 0;
+        SqlitePayloadLayout? layout = null;
+        for (var prefixLength = 0; prefixLength < 2048; prefixLength++)
+        {
+            var candidate = SqliteRecordCodec.Encode(
+                [SqlValue.Blob(new byte[prefixLength]), SqlValue.Blob(target)]);
+            var headerSize = candidate.Length - prefixLength - target.Length;
+            var candidateLayout = SqlitePayloadLayout.Calculate(
+                SqliteBtreePageType.TableLeaf,
+                (ulong)candidate.Length,
+                pageIo.UsableSpace);
+            var candidateTargetOffset = headerSize + prefixLength;
+            if (candidateTargetOffset < candidateLayout.LocalPayloadLength
+                && candidateTargetOffset + target.Length > candidateLayout.LocalPayloadLength)
+            {
+                record = candidate;
+                targetOffset = candidateTargetOffset;
+                layout = candidateLayout;
+                break;
+            }
+        }
+
+        record.Should().NotBeNull("the fixture must place the target across the local/overflow boundary");
+        new SqliteIncrementalTableBtree(pageIo).Insert(2, 17, record!);
+        var cursor = new SqliteTableBtreeCursor(pageIo);
+        cursor.TryGetColumnLocation(2, 17, 1, out var location).Should().BeTrue();
+        location.PayloadOffset.Should().Be((ulong)targetOffset);
+        location.Length.Should().Be((ulong)target.Length);
+        location.StorageClass.Should().Be(SqliteRecordStorageClass.Blob);
+
+        var start = checked((ulong)(layout!.LocalPayloadLength - targetOffset - 16));
+        var destination = new byte[64];
+        pageIo.ResetReadCount();
+        cursor.TryReadColumn(2, 17, 1, start, destination, out var bytesRead).Should().BeTrue();
+
+        bytesRead.Should().Be(destination.Length);
+        destination.Should().Equal(target.AsSpan(checked((int)start), destination.Length).ToArray());
+        pageIo.ReadCount.Should().BeLessThanOrEqualTo(2);
+    }
+
+    [Test]
+    public void ColumnLocatorReadsAHeaderThatSpillsOntoOverflowPages()
+    {
+        var pageIo = new CountingPageIo(pageSize: 512, usableSpace: 512, initialPageCount: 2);
+        pageIo.WritePage(2u, SqliteTableLeafPageBuilderImage(pageIo));
+        var values = Enumerable.Repeat(SqlValue.Blob([]), 1000).ToList();
+        var target = Enumerable.Range(0, 4096).Select(static value => unchecked((byte)value)).ToArray();
+        values.Add(SqlValue.Blob(target));
+        var record = SqliteRecordCodec.Encode(values);
+        SqliteVarint.TryRead(record, out var headerSize, out _).Should().BeTrue();
+        var layout = SqlitePayloadLayout.Calculate(
+            SqliteBtreePageType.TableLeaf,
+            (ulong)record.Length,
+            pageIo.UsableSpace);
+        headerSize.Should().BeGreaterThan((ulong)layout.LocalPayloadLength);
+        new SqliteIncrementalTableBtree(pageIo).Insert(2, 23, record);
+
+        var cursor = new SqliteTableBtreeCursor(pageIo);
+        pageIo.ResetReadCount();
+        cursor.TryGetColumnLength(2, 23, values.Count - 1, out var length).Should().BeTrue();
+        length.Should().Be((ulong)target.Length);
+        pageIo.ReadCount.Should().BeLessThanOrEqualTo(3, "only the leaf and spilled header pages are needed");
+
+        var destination = new byte[48];
+        cursor.TryReadColumn(2, 23, values.Count - 1, 4070, destination, out var bytesRead).Should().BeTrue();
+        bytesRead.Should().Be(26);
+        destination[..bytesRead].Should().Equal(target.AsSpan(4070).ToArray());
+    }
+
+    [Test]
+    public void ColumnLocatorDoesNotMaterializeLargePrecedingBodies()
+    {
+        const int largeColumnLength = 1024 * 1024;
+        var pageIo = new CountingPageIo(pageSize: 4096, usableSpace: 4096, initialPageCount: 2);
+        pageIo.WritePage(2u, SqliteTableLeafPageBuilderImage(pageIo));
+        var record = SqliteRecordCodec.Encode(
+            [SqlValue.Blob(new byte[largeColumnLength]), SqlValue.Blob([1, 2, 3, 4])]);
+        new SqliteIncrementalTableBtree(pageIo).Insert(2, 29, record);
+        var cursor = new SqliteTableBtreeCursor(pageIo);
+
+        cursor.TryGetColumnLocation(2, 29, 1, out _).Should().BeTrue();
+        pageIo.ResetReadCount();
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+        cursor.TryGetColumnLocation(2, 29, 1, out var location).Should().BeTrue();
+
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        location.PayloadOffset.Should().Be((ulong)(record.Length - 4));
+        location.Length.Should().Be(4);
+        pageIo.ReadCount.Should().Be(1, "the preceding body is skipped using serial-type lengths");
+        allocated.Should().BeLessThan(
+            largeColumnLength / 8,
+            "locating a column must allocate for the leaf/header, not preceding value bodies");
+    }
+
+    [Test]
+    public void ColumnReadsRejectNonByteValuesAndMalformedHeaders()
+    {
+        var pageIo = new CountingPageIo(pageSize: 4096, usableSpace: 4096, initialPageCount: 2);
+        pageIo.WritePage(2u, SqliteTableLeafPageBuilderImage(pageIo));
+        var writer = new SqliteIncrementalTableBtree(pageIo);
+        writer.Insert(2, 31, SqliteRecordCodec.Encode([SqlValue.Integer(42)]));
+        writer.Insert(2, 32, [2, 10]);
+        writer.Insert(2, 33, [2, 0x81]);
+        var cursor = new SqliteTableBtreeCursor(pageIo);
+
+        Assert.Throws<InvalidOperationException>(
+            () => cursor.TryGetColumnLength(2, 31, 0, out _));
+        Assert.Throws<InvalidDataException>(
+            () => cursor.TryGetColumnLocation(2, 32, 0, out _));
+        Assert.Throws<InvalidDataException>(
+            () => cursor.TryGetColumnLocation(2, 33, 0, out _));
+        Assert.Throws<InvalidDataException>(
+            () => cursor.TryGetColumnLocation(2, 31, 1, out _));
+    }
+
+    [Test]
     public void IncrementalMutationsMatchSqliteAcrossIndexesOverflowAndDeletes()
     {
         var path = CreateDatabasePath("differential");
