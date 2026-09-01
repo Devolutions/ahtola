@@ -333,11 +333,12 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   `cache_size`-derived execution budget and spill deterministic runs/partitions
   through the managed temporary file system; skewed hash partitions fall back
   to bounded scans. With `temp_store=MEMORY`, exceeding that finite budget fails
-  instead of moving the same data into a heap-backed temporary file. Non-equijoin
-  build sides, DISTINCT/compound sets, recursive worktables, buffered windows,
-  ephemeral tables, and opaque aggregate state do not yet spill. Prefer modest
-  databases and explicit transactions for writes (managed writes are slower
-  than native SQLite and the gap grows with table size).
+  instead of moving the same data into a heap-backed temporary file. DISTINCT
+  and compound keyed sets use the same bounded temporary-file policy.
+  Non-equijoin build sides, recursive worktables, buffered windows, ephemeral
+  tables, and opaque aggregate state do not yet spill. Prefer modest databases
+  and explicit transactions for writes (managed writes are slower than native
+  SQLite and the gap grows with table size).
 - **Planner** — `ANALYZE` / `sqlite_stat1` and validated `sqlite_stat4`
   histograms feed index scoring, System-R DP join reordering for up to twelve
   freely reorderable INNER members (deterministic greedy planning through

@@ -134,6 +134,18 @@ comment "~190" understates the current count); Ahtola's `VdbeOpcode` has **74
 values (0–73)**. Name-matching would therefore grossly overstate the gap. The
 real mapping, built variant-by-variant:
 
+> Current reconciliation (2026-09-01). The pinned Turso
+> `v0.8.0-pre.7` source now declares **210** `Insn` variants and Ahtola declares
+> **136** stable opcode values (0–135). Every declared managed instruction has
+> validation, execution, and EXPLAIN handling; the remaining count difference
+> is primarily consolidation or intentionally out-of-band execution, not 74
+> undispatched opcodes. Since the historical matrix below was produced, Ahtola
+> also added subprograms, the seek/index/FK/ephemeral families, managed virtual
+> tables and index methods, schema/DDL opcodes, and spillable DISTINCT/compound
+> keyed sets. Newer Turso additions such as `ColumnRange`, `BlobRead`,
+> `BlobWrite`, `BlobLen`, `ChangeCount`, `AggInverse`, and `ResetOnce` must be
+> assessed by semantic family rather than by exact-name diff.
+
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).
 - **40 consolidated** — several Turso opcodes folded into one Ahtola opcode
