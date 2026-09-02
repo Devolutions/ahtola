@@ -91,6 +91,21 @@ public readonly record struct WindowFrameSpec(
         WindowBound.Following,
         EndOffset: m);
 
+    /// <summary>A moving frame: <c>ROWS n PRECEDING TO m PRECEDING</c>.</summary>
+    public static WindowFrameSpec PrecedingToPreceding(long n, long m) => new(
+        WindowFrameMode.Rows,
+        WindowBound.Preceding,
+        WindowBound.Preceding,
+        StartOffset: n,
+        EndOffset: m);
+
+    /// <summary>Whether this frame is <c>ROWS n PRECEDING TO m PRECEDING</c> for streaming-safe n, m.</summary>
+    public bool IsBoundedPrecedingToPreceding => Mode == WindowFrameMode.Rows
+        && Start == WindowBound.Preceding
+        && End == WindowBound.Preceding
+        && StartOffset is > 0 and <= MaxStreamingPreceding
+        && EndOffset is > 0 and <= MaxStreamingPreceding;
+
     /// <summary>A moving frame: <c>ROWS n PRECEDING TO m FOLLOWING</c>.</summary>
     public static WindowFrameSpec PrecedingAndFollowing(long n, long m) => new(
         WindowFrameMode.Rows,

@@ -23530,7 +23530,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             .Distinct(StringComparer.Ordinal)
             .ToArray();
         var rankingOnly = rankingNames.Length > 0
-            && rankingNames.All(name => name is "row_number" or "rank" or "dense_rank" or "lag" or "lead");
+            && rankingNames.All(name => name is "row_number" or "rank" or "dense_rank" or "lag" or "lead"
+                or "percent_rank" or "cume_dist" or "ntile");
         if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "row_number")
             frame = WindowFrameSpec.Running;
         else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "rank")
@@ -23545,6 +23546,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (offset > WindowFrameSpec.MaxStreamingPreceding)
                 return false;
             frame = WindowFrameSpec.Following(offset);
+        }
+        else if (rankingOnly
+            && rankingNames.All(name => name is "percent_rank" or "cume_dist" or "ntile"))
+        {
+            // These need the partition cardinality before the first emit, so the
+            // full-partition queue drains after every row has been AggStep'd.
+            frame = WindowFrameSpec.RowsFullPartition;
         }
         else if (rankingOnly)
             return false;
@@ -23741,6 +23749,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
 
             descendingOrder = spec.OrderBy[0].Descending;
+        }
+
+        if (frame.IsBoundedPrecedingToPreceding)
+        {
+            if (windows.Any(window => window.Aggregate.Inverse is null))
+                return false;
+
+            var start = frame.StartOffset!.Value;
+            var end = frame.EndOffset!.Value;
+            for (var index = 0; index < windows.Count; index++)
+            {
+                var window = windows[index];
+                windows[index] = window with
+                {
+                    Aggregate = WrapPrecedingToPreceding(window.Aggregate, start, end),
+                };
+            }
+
+            frame = WindowFrameSpec.Running with { Exclusion = frame.Exclusion };
         }
 
         program = WindowProgramBuilder.Build(
@@ -24102,7 +24129,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
 
         var window = function.Window!;
-        var ranking = function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK" or "LAG" or "LEAD";
+        var ranking = function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK" or "LAG" or "LEAD"
+            or "PERCENT_RANK" or "CUME_DIST" or "NTILE";
         var navigationOffset = 0;
         WindowFrameSpec frame;
         if (ranking)
@@ -24125,6 +24153,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     return false;
                 }
             }
+            else if (function.Name == "NTILE")
+            {
+                if (function.Arguments.Count != 1 || function.CountStar || function.Filter is not null)
+                    return false;
+                if (function.Arguments[0] is not LiteralExpression { Value.Kind: SqlValueKind.Integer } buckets
+                    || buckets.Value.AsInteger() is < 1 or > WindowFrameSpec.MaxStreamingPreceding)
+                {
+                    return false;
+                }
+
+                navigationOffset = (int)buckets.Value.AsInteger();
+            }
             else if (function.Arguments.Count != 0 || function.CountStar)
             {
                 return false;
@@ -24136,6 +24176,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 "RANK" => WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group },
                 "LAG" => WindowFrameSpec.Running with { Exclusion = WindowExclusion.CurrentRow },
                 "LEAD" => WindowFrameSpec.Following(Math.Max(1, navigationOffset)),
+                "PERCENT_RANK" or "CUME_DIST" or "NTILE" => WindowFrameSpec.RowsFullPartition,
                 _ => WindowFrameSpec.RangeRunning,
             };
         }
@@ -24178,11 +24219,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         if (windows.Count > 0)
         {
-            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank" or "dense_rank" or "lag" or "lead";
+            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank" or "dense_rank" or "lag" or "lead"
+                or "percent_rank" or "cume_dist" or "ntile";
             if (existingRanking != ranking)
                 return false;
-            if (ranking && windows[0].Aggregate.Name != function.Name.ToLowerInvariant())
+            if (ranking
+                && windows[0].Aggregate.Name != function.Name.ToLowerInvariant()
+                && !AreCompatiblePartitionRankings(windows[0].Aggregate.Name, function.Name))
+            {
                 return false;
+            }
         }
 
         // Arguments must be bare columns, folded constants (group_concat separators), or
@@ -24210,9 +24256,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
-        // dense_rank detects peer groups from the ORDER BY key, so those columns become
-        // the AggStep argument tuple even though the SQL function is nullary.
-        if (function.Name == "DENSE_RANK")
+        // dense_rank/percent_rank/cume_dist detect peer groups from the ORDER BY key, so
+        // those columns become the AggStep argument tuple even though the SQL function is nullary.
+        if (function.Name is "DENSE_RANK" or "PERCENT_RANK" or "CUME_DIST")
         {
             foreach (var term in window.OrderBy)
             {
@@ -24250,6 +24296,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return true;
     }
 
+    private static VdbeAggregate WrapPrecedingToPreceding(VdbeAggregate inner, long start, long end)
+    {
+        var capacity = start - end + 1;
+        return new VdbeAggregate
+        {
+            Name = inner.Name,
+            CreateContext = () => new PrecedingToPrecedingAccumulator(inner, end, capacity),
+            Accumulate = static (contextObject, arguments) =>
+            {
+                ((PrecedingToPrecedingAccumulator)contextObject!).Add(arguments);
+                return contextObject;
+            },
+            Finalize = static contextObject =>
+                ((PrecedingToPrecedingAccumulator)contextObject!).Finalize(),
+        };
+    }
+
     private VdbeAggregate ApplyWindowFilter(
         VdbeAggregate inner,
         Expression filter,
@@ -24278,6 +24341,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     Pass(arguments) ? inner.Inverse(contextObject, arguments) : contextObject,
             Finalize = inner.Finalize,
         };
+    }
+
+    private static bool AreCompatiblePartitionRankings(string left, string right)
+    {
+        static bool PartitionRank(string name) =>
+            name is "percent_rank" or "cume_dist" or "ntile"
+            or "PERCENT_RANK" or "CUME_DIST" or "NTILE";
+
+        return PartitionRank(left) && PartitionRank(right);
     }
 
     private static void AddUniqueWindowArgument(
@@ -24657,6 +24729,27 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
+        if (frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } startPreceding,
+            }
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } endPreceding,
+            })
+        {
+            var start = startPreceding.Value.AsInteger();
+            var end = endPreceding.Value.AsInteger();
+            if (start is > 0 and <= WindowFrameSpec.MaxStreamingPreceding
+                && end is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.PrecedingToPreceding(start, end);
+                return true;
+            }
+        }
+
         return false;
     }
 
@@ -24701,7 +24794,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     : new SourceRow(argumentNames, arguments, Parent: outerRow),
                 context);
 
-        if (function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK")
+        if (function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK"
+            or "PERCENT_RANK" or "CUME_DIST" or "NTILE")
         {
             if (function.Name == "DENSE_RANK")
             {
@@ -24716,6 +24810,42 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     },
                     Finalize = static contextObject =>
                         SqlValue.Integer(((DenseRankAccumulator)contextObject!).Rank),
+                };
+            }
+
+            if (function.Name is "PERCENT_RANK" or "CUME_DIST")
+            {
+                var cume = function.Name == "CUME_DIST";
+                return new VdbeAggregate
+                {
+                    Name = cume ? "cume_dist" : "percent_rank",
+                    CreateContext = () => new PartitionRankAccumulator(Compare, cume),
+                    Accumulate = static (contextObject, arguments) =>
+                    {
+                        ((PartitionRankAccumulator)contextObject!).Add(arguments);
+                        return contextObject;
+                    },
+                    Finalize = static contextObject =>
+                        ((PartitionRankAccumulator)contextObject!).Finalize(),
+                };
+            }
+
+            if (function.Name == "NTILE")
+            {
+                var buckets = function.Arguments[0] is LiteralExpression { Value.Kind: SqlValueKind.Integer } literal
+                    ? literal.Value.AsInteger()
+                    : 1;
+                return new VdbeAggregate
+                {
+                    Name = "ntile",
+                    CreateContext = () => new NtileAccumulator(buckets),
+                    Accumulate = static (contextObject, _) =>
+                    {
+                        ((NtileAccumulator)contextObject!).Add();
+                        return contextObject;
+                    },
+                    Finalize = static contextObject =>
+                        SqlValue.Integer(((NtileAccumulator)contextObject!).Finalize()),
                 };
             }
 
@@ -40385,6 +40515,137 @@ out bool hasReturning)
             }
 
             return true;
+        }
+    }
+
+    private sealed class PartitionRankAccumulator
+    {
+        private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private readonly bool _cumeDist;
+        private readonly List<SqlValue[]> _keys = [];
+        private int _emitIndex;
+
+        internal PartitionRankAccumulator(Func<SqlValue, SqlValue, string?, int> compare, bool cumeDist)
+        {
+            _compare = compare;
+            _cumeDist = cumeDist;
+        }
+
+        internal void Add(SqlValue[] key)
+        {
+            var copy = new SqlValue[key.Length];
+            Array.Copy(key, copy, key.Length);
+            _keys.Add(copy);
+        }
+
+        internal SqlValue Finalize()
+        {
+            var count = _keys.Count;
+            var position = _emitIndex;
+            _emitIndex++;
+            if (count == 0)
+                return SqlValue.Real(0);
+
+            if (_cumeDist)
+            {
+                var end = position;
+                while (end + 1 < count && KeysEqual(_keys[end + 1], _keys[position]))
+                    end++;
+                return SqlValue.Real((double)(end + 1) / count);
+            }
+
+            if (count == 1)
+                return SqlValue.Real(0);
+
+            var start = position;
+            while (start > 0 && KeysEqual(_keys[start - 1], _keys[position]))
+                start--;
+            return SqlValue.Real((double)start / (count - 1));
+        }
+
+        private bool KeysEqual(SqlValue[] left, SqlValue[] right)
+        {
+            if (left.Length != right.Length)
+                return false;
+
+            for (var index = 0; index < left.Length; index++)
+            {
+                if (_compare(left[index], right[index], null) != 0)
+                    return false;
+            }
+
+            return true;
+        }
+    }
+
+    private sealed class PrecedingToPrecedingAccumulator
+    {
+        private readonly VdbeAggregate _inner;
+        private readonly long _delay;
+        private readonly long _capacity;
+        private readonly Queue<SqlValue[]> _delayQueue = new();
+        private readonly Queue<SqlValue[]> _window = new();
+        private object? _context;
+        private bool _initialized;
+
+        internal PrecedingToPrecedingAccumulator(VdbeAggregate inner, long delay, long capacity)
+        {
+            _inner = inner;
+            _delay = delay;
+            _capacity = capacity;
+        }
+
+        internal void Add(SqlValue[] arguments)
+        {
+            var copy = new SqlValue[arguments.Length];
+            Array.Copy(arguments, copy, arguments.Length);
+            _delayQueue.Enqueue(copy);
+            if (_delayQueue.Count <= _delay || _capacity <= 0)
+                return;
+
+            var entering = _delayQueue.Dequeue();
+            if (!_initialized)
+            {
+                _context = _inner.CreateContext();
+                _initialized = true;
+            }
+
+            _context = _inner.Accumulate(_context, entering);
+            _window.Enqueue(entering);
+            if (_window.Count > _capacity && _inner.Inverse is not null)
+            {
+                var leaving = _window.Dequeue();
+                _context = _inner.Inverse(_context, leaving);
+            }
+        }
+
+        internal SqlValue Finalize()
+        {
+            if (!_initialized)
+                return _inner.Finalize(_inner.CreateContext());
+
+            return _inner.Finalize(_context);
+        }
+    }
+
+    private sealed class NtileAccumulator
+    {
+        private readonly long _buckets;
+        private int _count;
+        private int _emitIndex;
+
+        internal NtileAccumulator(long buckets)
+        {
+            _buckets = buckets;
+        }
+
+        internal void Add() => _count++;
+
+        internal long Finalize()
+        {
+            var position = _emitIndex;
+            _emitIndex++;
+            return ComputeNtile(position, _count, _buckets);
         }
     }
 
