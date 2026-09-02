@@ -151,9 +151,11 @@ real mapping, built variant-by-variant:
 > buffer; `GROUPS n PRECEDING … CURRENT ROW` inverses each departing peer
 > group; `RANGE n PRECEDING … CURRENT ROW` (single ORDER BY key) compact/inverses
 > history groups whose ORDER BY value falls outside the offset. Window-buffer
-> scanned rows spill through a temp file and reload for Compute. GROUPS/RANGE
-> FOLLOWING, unbounded-following frames, EXCLUDE, and MIN/MAX inverse retain the
-> buffered evaluator.
+> scanned rows spill through a temp file and reload for Compute.
+> `GROUPS CURRENT ROW … m FOLLOWING` streams through a delayed peer-group ring.
+> RANGE FOLLOWING, unbounded-following frames, EXCLUDE, and MIN/MAX inverse
+> retain the buffered evaluator. `GROUPS CURRENT ROW … m FOLLOWING` streams through a
+> delayed peer-group ring.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).
