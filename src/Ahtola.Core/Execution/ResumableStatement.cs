@@ -54,6 +54,8 @@ public sealed class ResumableStatement : IDisposable
     private readonly WorkTableRuntime?[] _workTables;
     private readonly WindowBufferRuntime?[] _windowBuffers;
     private readonly EphemeralTableRuntime?[] _ephemeralTables;
+    private readonly RegisterRange?[] _pseudoCursors;
+    private readonly HashSet<int> _onceVisited = [];
     private readonly ManagedVirtualTableCursor?[] _virtualCursors;
     private readonly Indexing.ManagedIndexMethodCursor?[] _indexMethodCursors;
     private readonly IReadOnlyList<VdbeCursorSource?>? _cursorSources;
@@ -168,6 +170,7 @@ public sealed class ResumableStatement : IDisposable
         _workTables = new WorkTableRuntime?[program.WorkTableCount];
         _windowBuffers = new WindowBufferRuntime?[program.WindowBufferCount];
         _ephemeralTables = new EphemeralTableRuntime?[program.CursorCount];
+        _pseudoCursors = new RegisterRange?[program.CursorCount];
         _virtualCursors = new ManagedVirtualTableCursor?[program.CursorCount];
         _indexMethodCursors = new Indexing.ManagedIndexMethodCursor?[program.CursorCount];
         _cursorSources = cursorSources;
@@ -410,9 +413,18 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case OpenEphemeralInstruction openEphemeral:
                     OpenCursor(openEphemeral.Cursor);
-                    _ephemeralTables[openEphemeral.Cursor.Index] = new EphemeralTableRuntime(openEphemeral.ColumnCount);
+                    _ephemeralTables[openEphemeral.Cursor.Index] = new EphemeralTableRuntime(
+                        openEphemeral.ColumnCount,
+                        _memory);
                     _cursorPositions[openEphemeral.Cursor.Index] = -1;
                     _materializedRows[openEphemeral.Cursor.Index] = null;
+                    AdvanceInstructionPointer();
+                    break;
+                case OpenPseudoInstruction openPseudo:
+                    OpenCursor(openPseudo.Cursor);
+                    _pseudoCursors[openPseudo.Cursor.Index] = openPseudo.Content;
+                    _cursorPositions[openPseudo.Cursor.Index] = -1;
+                    _materializedRows[openPseudo.Cursor.Index] = null;
                     AdvanceInstructionPointer();
                     break;
                 case EphemeralInsertInstruction ephemeralInsert:
@@ -439,14 +451,23 @@ public sealed class ResumableStatement : IDisposable
                             State = ResumableStatementState.Faulted;
                             throw;
                         }
+                        _ephemeralTables[close.Cursor.Index]?.Dispose();
                         _ephemeralTables[close.Cursor.Index] = null;
+                        _pseudoCursors[close.Cursor.Index] = null;
                         AdvanceInstructionPointer();
                         break;
                     }
                 case RewindCursorInstruction rewind:
                     {
                         _materializedRows[rewind.Cursor.Index] = null;
-                        if (_joinCursorStates[rewind.Cursor.Index] is { } joinState)
+                        if (_pseudoCursors[rewind.Cursor.Index] is { } pseudo)
+                        {
+                            _materializedRows[rewind.Cursor.Index] = ReadRegisters(pseudo);
+                            _materializedRowIds[rewind.Cursor.Index] = 1;
+                            _cursorPositions[rewind.Cursor.Index] = 0;
+                            AdvanceInstructionPointer();
+                        }
+                        else if (_joinCursorStates[rewind.Cursor.Index] is { } joinState)
                         {
                             // Streaming join cursor: the row count is not known up front, so
                             // emptiness is decided by pulling the first row. A successful pull
@@ -1798,17 +1819,17 @@ public sealed class ResumableStatement : IDisposable
                 case WindowBufferInsertInstruction windowInsert:
                     {
                         var runtime = RequireOpenWindowBuffer(windowInsert.Buffer);
-                        runtime.Insert(ReadRegisters(windowInsert.Record));
+                        runtime.Insert(ReadRegisters(windowInsert.Record), cancellationToken);
                         AdvanceInstructionPointer();
                         break;
                     }
                 case WindowBufferComputeInstruction windowCompute:
                     {
-                        // Ends the buffered phase: the whole buffer is handed to the window evaluator once,
-                        // which is what makes forward-looking and peer-relative frames representable, then
-                        // the buffer positions on its first row so the drain loop can emit.
+                        // Ends the buffered phase: the whole buffer is handed to the window evaluator
+                        // once (spilled partitions stay on disk and are read by index). The buffer
+                        // then positions on its first row so the drain loop can emit.
                         var runtime = RequireOpenWindowBuffer(windowCompute.Buffer);
-                        if (runtime.Compute())
+                        if (runtime.Compute(cancellationToken))
                             AdvanceInstructionPointer();
                         else
                             _instructionPointer = windowCompute.EmptyTarget;
@@ -1837,6 +1858,148 @@ public sealed class ResumableStatement : IDisposable
                     CloseWindowBuffer(closeWindowBuffer.Buffer);
                     AdvanceInstructionPointer();
                     break;
+                case ColumnRangeInstruction columnRange:
+                    {
+                        var row = CurrentCursorRow(columnRange.Cursor);
+                        for (var index = 0; index < columnRange.Count; index++)
+                        {
+                            var column = columnRange.StartColumn + index;
+                            SqlValue value;
+                            if (column < row.Length)
+                            {
+                                value = row[column];
+                            }
+                            else if (columnRange.Defaults is { } defaults && defaults[index] is { } fallback)
+                            {
+                                value = fallback;
+                            }
+                            else
+                            {
+                                value = SqlValue.Null;
+                            }
+
+                            _registers[columnRange.Destination.Index + index] = value;
+                        }
+
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case BlobLenInstruction blobLen:
+                    {
+                        try
+                        {
+                            var row = CurrentCursorRow(blobLen.Cursor);
+                            _registers[blobLen.Destination.Index] = SqlValue.Integer(
+                                BlobColumnLength(row, blobLen.ColumnIndex));
+                            AdvanceInstructionPointer();
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
+
+                        break;
+                    }
+                case BlobReadInstruction blobRead:
+                    {
+                        try
+                        {
+                            if (!TryCurrentCursorRow(blobRead.Cursor, out var row))
+                            {
+                                _registers[blobRead.Destination.Index] = SqlValue.Null;
+                            }
+                            else
+                            {
+                                var offset = ReadNonNegativeInteger(blobRead.Offset, "BlobRead offset");
+                                var amount = ReadNonNegativeInteger(blobRead.Amount, "BlobRead amount");
+                                _registers[blobRead.Destination.Index] = BlobColumnSlice(
+                                    row,
+                                    blobRead.ColumnIndex,
+                                    offset,
+                                    amount);
+                            }
+
+                            AdvanceInstructionPointer();
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
+
+                        break;
+                    }
+                case BlobWriteInstruction blobWrite:
+                    {
+                        try
+                        {
+                            if (!TryCurrentCursorRow(blobWrite.Cursor, out var row))
+                            {
+                                _registers[blobWrite.Destination.Index] = SqlValue.Null;
+                            }
+                            else
+                            {
+                                var offset = ReadNonNegativeInteger(blobWrite.Offset, "BlobWrite offset");
+                                var source = _registers[blobWrite.Source.Index];
+                                if (source.Kind != SqlValueKind.Blob)
+                                {
+                                    throw new InvalidOperationException(
+                                        $"BlobWrite source register must hold a blob, got {source.Kind}.");
+                                }
+
+                                var copy = row.ToArray();
+                                copy[blobWrite.ColumnIndex] = OverlayBlobColumn(
+                                    copy[blobWrite.ColumnIndex],
+                                    offset,
+                                    source.AsBlobSpan());
+                                _materializedRows[blobWrite.Cursor.Index] = copy;
+                                _registers[blobWrite.Destination.Index] = SqlValue.Integer(1);
+                            }
+
+                            AdvanceInstructionPointer();
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
+
+                        break;
+                    }
+                case TypeCheckInstruction typeCheck:
+                    {
+                        try
+                        {
+                            ApplyTypeCheck(typeCheck);
+                            AdvanceInstructionPointer();
+                        }
+                        catch (Exception exception)
+                        {
+                            FailExecution(exception);
+                        }
+
+                        break;
+                    }
+                case OnceInstruction once:
+                    {
+                        var pc = _instructionPointer.Offset;
+                        if (!_onceVisited.Add(pc))
+                            _instructionPointer = once.ReentryTarget;
+                        else
+                            AdvanceInstructionPointer();
+
+                        break;
+                    }
+                case ResetOnceInstruction resetOnce:
+                    {
+                        var start = _instructionPointer.Offset;
+                        var end = resetOnce.RegionEnd.Offset;
+                        _onceVisited.RemoveWhere(pc => pc > start && pc < end);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case ChangeCountInstruction changeCount:
+                    _registers[changeCount.Destination.Index] = SqlValue.Integer(RowsAffected);
+                    AdvanceInstructionPointer();
+                    break;
                 case HaltInstruction halt:
                     {
                         Array.Clear(_openCursors);
@@ -1851,6 +2014,7 @@ public sealed class ResumableStatement : IDisposable
                         }
                         Array.Clear(_windowBuffers);
                         Array.Clear(_ephemeralTables);
+                        Array.Clear(_pseudoCursors);
                         if (halt.ErrorCode != 0)
                             throw CreateHaltException(halt);
 
@@ -1874,6 +2038,7 @@ public sealed class ResumableStatement : IDisposable
                             }
                             Array.Clear(_windowBuffers);
                             Array.Clear(_ephemeralTables);
+                            Array.Clear(_pseudoCursors);
                             throw CreateHaltIfNullException(haltIfNull);
                         }
 
@@ -1921,6 +2086,8 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_workTables);
         Array.Clear(_windowBuffers);
         Array.Clear(_ephemeralTables);
+        Array.Clear(_pseudoCursors);
+        _onceVisited.Clear();
         // Owned transactions reset with the statement. A shared connection-scoped transaction
         // keeps its frames and deferred FK counter so multi-statement VDBE programs can share them.
         if (_ownsTransaction)
@@ -2159,6 +2326,9 @@ public sealed class ResumableStatement : IDisposable
         _subprogramStatements.Clear();
         Array.Clear(_workTables);
         Array.Clear(_windowBuffers);
+        Array.Clear(_ephemeralTables);
+        Array.Clear(_pseudoCursors);
+        _onceVisited.Clear();
         if (_ownsTransaction)
             _transaction.Reset();
         if (_ownsSchemaContext)
@@ -2367,6 +2537,8 @@ public sealed class ResumableStatement : IDisposable
         TryDispose(DisposeAllSorters, ref cleanupFailures);
         TryDispose(DisposeAllRowSets, ref cleanupFailures);
         TryDispose(DisposeAllVirtualCursors, ref cleanupFailures);
+        TryDispose(DisposeWorkTablesAndWindowBuffers, ref cleanupFailures);
+        TryDispose(DisposeEphemeralTables, ref cleanupFailures);
         ThrowCleanupFailures(cleanupFailures);
     }
 
@@ -2388,6 +2560,57 @@ public sealed class ResumableStatement : IDisposable
             {
                 _distinctSets[index]?.Dispose();
                 _distinctSets[index] = null;
+            }
+            catch (Exception exception)
+            {
+                (cleanupFailures ??= []).Add(exception);
+            }
+        }
+
+        ThrowCleanupFailures(cleanupFailures);
+    }
+
+    private void DisposeWorkTablesAndWindowBuffers()
+    {
+        List<Exception>? cleanupFailures = null;
+        for (var index = 0; index < _workTables.Length; index++)
+        {
+            try
+            {
+                _workTables[index]?.Dispose();
+                _workTables[index] = null;
+            }
+            catch (Exception exception)
+            {
+                (cleanupFailures ??= []).Add(exception);
+            }
+        }
+
+        for (var index = 0; index < _windowBuffers.Length; index++)
+        {
+            try
+            {
+                _windowBuffers[index]?.Dispose();
+                _windowBuffers[index] = null;
+            }
+            catch (Exception exception)
+            {
+                (cleanupFailures ??= []).Add(exception);
+            }
+        }
+
+        ThrowCleanupFailures(cleanupFailures);
+    }
+
+    private void DisposeEphemeralTables()
+    {
+        List<Exception>? cleanupFailures = null;
+        for (var index = 0; index < _ephemeralTables.Length; index++)
+        {
+            try
+            {
+                _ephemeralTables[index]?.Dispose();
+                _ephemeralTables[index] = null;
             }
             catch (Exception exception)
             {
@@ -2430,15 +2653,18 @@ public sealed class ResumableStatement : IDisposable
         _windowBuffers[instruction.Buffer.Index] = new WindowBufferRuntime(
             instruction.ColumnCount,
             instruction.WindowCount,
-            instruction.Evaluator);
+            instruction.Evaluator,
+            _executionOptions,
+            _memory);
     }
 
     private void CloseWindowBuffer(WindowBuffer buffer)
     {
-        if (_windowBuffers[buffer.Index] is null)
-            throw new InvalidOperationException($"Window buffer {buffer.Index} is not open.");
+        var runtime = _windowBuffers[buffer.Index]
+            ?? throw new InvalidOperationException($"Window buffer {buffer.Index} is not open.");
 
         _windowBuffers[buffer.Index] = null;
+        runtime.Dispose();
     }
 
     private WindowBufferRuntime RequireOpenWindowBuffer(WindowBuffer buffer)
@@ -2455,15 +2681,18 @@ public sealed class ResumableStatement : IDisposable
             instruction.Mode,
             instruction.MaxRows,
             instruction.MaxDepth,
-            instruction.Equality);
+            instruction.Equality,
+            _executionOptions,
+            _memory);
     }
 
     private void CloseWorkTable(WorkTable workTable)
     {
-        if (_workTables[workTable.Index] is null)
-            throw new InvalidOperationException($"Work table {workTable.Index} is not open.");
+        var runtime = _workTables[workTable.Index]
+            ?? throw new InvalidOperationException($"Work table {workTable.Index} is not open.");
 
         _workTables[workTable.Index] = null;
+        runtime.Dispose();
     }
 
     private WorkTableRuntime RequireOpenWorkTable(WorkTable workTable)
@@ -2552,6 +2781,9 @@ public sealed class ResumableStatement : IDisposable
     // the enumerator directly, since the row count is not known up front.
     private int CursorRowCount(Cursor cursor)
     {
+        if (_pseudoCursors[cursor.Index] is not null)
+            return 1;
+
         if (_joinCursorStates[cursor.Index] is not null)
         {
             throw new InvalidOperationException(
@@ -2725,6 +2957,119 @@ public sealed class ResumableStatement : IDisposable
         var values = new SqlValue[range.Count];
         _registers.CopyTo(range.Start.Index, values, 0, range.Count);
         return values;
+    }
+
+    private bool TryCurrentCursorRow(Cursor cursor, out SqlValue[] row)
+    {
+        try
+        {
+            row = CurrentCursorRow(cursor);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            row = [];
+            return false;
+        }
+    }
+
+    private long ReadNonNegativeInteger(Register register, string operand)
+    {
+        var value = _registers[register.Index];
+        if (value.Kind != SqlValueKind.Integer || value.AsInteger() < 0)
+        {
+            throw new InvalidOperationException(
+                $"{operand} must be a non-negative integer, got {value.Kind}.");
+        }
+
+        return value.AsInteger();
+    }
+
+    private static long BlobColumnLength(SqlValue[] row, int columnIndex)
+    {
+        if ((uint)columnIndex >= (uint)row.Length)
+            throw new InvalidOperationException($"Blob column {columnIndex} is outside the current row.");
+
+        return row[columnIndex].Kind switch
+        {
+            SqlValueKind.Blob => row[columnIndex].AsBlobSpan().Length,
+            SqlValueKind.Text => System.Text.Encoding.UTF8.GetByteCount(row[columnIndex].AsText()),
+            _ => throw new InvalidOperationException(
+                $"SQLite incremental column reads require TEXT or BLOB storage, not {row[columnIndex].Kind}."),
+        };
+    }
+
+    private static SqlValue BlobColumnSlice(SqlValue[] row, int columnIndex, long offset, long amount)
+    {
+        var bytes = GetBlobColumnBytes(row[columnIndex]);
+        if (offset >= bytes.Length || amount <= 0)
+            return SqlValue.Blob([]);
+
+        var start = checked((int)offset);
+        var count = checked((int)Math.Min(amount, bytes.Length - start));
+        return SqlValue.Blob(bytes.Slice(start, count));
+    }
+
+    private static SqlValue OverlayBlobColumn(SqlValue current, long offset, ReadOnlySpan<byte> source)
+    {
+        var bytes = GetBlobColumnBytes(current).ToArray();
+        if (offset < 0 || offset > bytes.Length || source.Length > bytes.Length - offset)
+        {
+            throw new InvalidOperationException(
+                "SQLite incremental column writes cannot change the stored value size.");
+        }
+
+        source.CopyTo(bytes.AsSpan(checked((int)offset)));
+        return SqlValue.BlobOwned(bytes);
+    }
+
+    private static ReadOnlySpan<byte> GetBlobColumnBytes(SqlValue value)
+        => value.Kind switch
+        {
+            SqlValueKind.Blob => value.AsBlobSpan(),
+            SqlValueKind.Text => System.Text.Encoding.UTF8.GetBytes(value.AsText()),
+            _ => throw new InvalidOperationException(
+                $"SQLite incremental column reads require TEXT or BLOB storage, not {value.Kind}."),
+        };
+
+    private void ApplyTypeCheck(TypeCheckInstruction typeCheck)
+    {
+        for (var index = 0; index < typeCheck.Values.Count; index++)
+        {
+            var value = _registers[typeCheck.Values.Start.Index + index];
+            if (value.Kind == SqlValueKind.Null)
+                continue;
+
+            var declared = typeCheck.ColumnTypes[index].Trim();
+            if (declared.Equals("ANY", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var storage = value.Kind;
+            var ok = declared.ToUpperInvariant() switch
+            {
+                "INTEGER" or "INT" => storage == SqlValueKind.Integer,
+                "REAL" => storage is SqlValueKind.Real or SqlValueKind.Integer,
+                "TEXT" => storage == SqlValueKind.Text,
+                "BLOB" => storage == SqlValueKind.Blob,
+                _ => true,
+            };
+            if (ok)
+                continue;
+
+            var storageClass = storage switch
+            {
+                SqlValueKind.Integer => "INTEGER",
+                SqlValueKind.Real => "REAL",
+                SqlValueKind.Text => "TEXT",
+                SqlValueKind.Blob => "BLOB",
+                _ => storage.ToString(),
+            };
+            var column = typeCheck.ColumnNames is { } names && index < names.Count
+                ? names[index]
+                : (index + 1).ToString();
+            throw new EmbeddedSqlException(
+                $"cannot store {storageClass} value in {declared.ToUpperInvariant()} column {typeCheck.TableName}.{column}");
+        }
     }
 
     // Whether a long rowid satisfies the supplied comparison against a bound. Used by the
@@ -3210,18 +3555,24 @@ public sealed class ResumableStatement : IDisposable
     /// Rows are append-only with sequential 1-based rowids for SeekRowid/NotExists/Found,
     /// and support IdxInsert/IdxDelete key maintenance.
     /// </summary>
-    private sealed class EphemeralTableRuntime
+    private sealed class EphemeralTableRuntime : IDisposable
     {
         private readonly int _columnCount;
+        private readonly VdbeExecutionMemory _memory;
         private readonly List<SqlValue[]> _rows = [];
         private readonly List<long> _rowIds = [];
         private VdbeCursorSource? _sourceView;
         private long _nextRowId = 1;
+        private long _retainedBytes;
+        private long _retainedRows;
+        private bool _disposed;
 
-        public EphemeralTableRuntime(int columnCount)
+        public EphemeralTableRuntime(int columnCount, VdbeExecutionMemory memory)
         {
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(columnCount);
+            ArgumentNullException.ThrowIfNull(memory);
             _columnCount = columnCount;
+            _memory = memory;
         }
 
         public int ColumnCount => _columnCount;
@@ -3230,6 +3581,7 @@ public sealed class ResumableStatement : IDisposable
 
         public void Insert(SqlValue[] row)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             ArgumentNullException.ThrowIfNull(row);
             if (row.Length != _columnCount)
             {
@@ -3237,7 +3589,12 @@ public sealed class ResumableStatement : IDisposable
                     $"Ephemeral insert has {row.Length} columns but the table has {_columnCount}.");
             }
 
-            _rows.Add(row.ToArray());
+            var owned = row.ToArray();
+            var bytes = VdbeManagedFootprint.EstimateSorterRow(owned);
+            _memory.RetainOrThrow(bytes);
+            _retainedBytes = checked(_retainedBytes + bytes);
+            _retainedRows = checked(_retainedRows + 1);
+            _rows.Add(owned);
             _rowIds.Add(_nextRowId);
             _nextRowId = checked(_nextRowId + 1);
             _sourceView = null;
@@ -3261,6 +3618,7 @@ public sealed class ResumableStatement : IDisposable
                 if (!RowMatchesKeyPrefix(_rows[i], key))
                     continue;
 
+                ReleaseRow(_rows[i]);
                 _rows.RemoveAt(i);
                 _rowIds.RemoveAt(i);
                 _sourceView = null;
@@ -3275,6 +3633,7 @@ public sealed class ResumableStatement : IDisposable
             if (position < 0 || position >= _rows.Count)
                 return false;
 
+            ReleaseRow(_rows[position]);
             _rows.RemoveAt(position);
             _rowIds.RemoveAt(position);
             _sourceView = null;
@@ -3283,6 +3642,26 @@ public sealed class ResumableStatement : IDisposable
 
         public VdbeCursorSource AsCursorSource()
             => _sourceView ??= new VdbeCursorSource(_rows, _rowIds);
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            if (_retainedBytes > 0 || _retainedRows > 0)
+                _memory.Release(_retainedBytes, _retainedRows);
+            _retainedBytes = 0;
+            _retainedRows = 0;
+        }
+
+        private void ReleaseRow(SqlValue[] row)
+        {
+            var bytes = VdbeManagedFootprint.EstimateSorterRow(row);
+            _memory.Release(bytes);
+            _retainedBytes = checked(_retainedBytes - bytes);
+            _retainedRows = checked(_retainedRows - 1);
+        }
     }
 
     // Turso's RowSetTest keeps inserts from the current batch separate so a batch cannot match itself.
@@ -4498,24 +4877,46 @@ public sealed class ResumableStatement : IDisposable
     // navigation functions) representable — and pins its result shape so a misbehaving evaluator fails
     // loudly instead of producing short or ragged rows. Draining then walks the buffer in insertion order,
     // handing out each row concatenated with its window values.
-    private sealed class WindowBufferRuntime
+    private sealed class WindowBufferRuntime : IDisposable
     {
         private readonly int _columnCount;
         private readonly int _windowCount;
         private readonly VdbeWindowEvaluator _evaluator;
+        private readonly VdbeExecutionOptions _options;
+        private readonly VdbeExecutionMemory _memory;
         private readonly List<SqlValue[]> _rows = [];
         private SqlValue[][]? _windowValues;
+        private VdbeTemporaryFile? _temporaryFile;
+        private VdbeMemoryReservation? _spillInfrastructure;
+        private readonly List<long> _recordStarts = [];
+        private SqlValue[]? _cachedRow;
+        private int _cachedIndex = -1;
+        private long _writePosition;
+        private int _count;
         private int _position = -1;
+        private long _retainedBytes;
+        private long _retainedRows;
+        private bool _disposed;
 
-        public WindowBufferRuntime(int columnCount, int windowCount, VdbeWindowEvaluator evaluator)
+        public WindowBufferRuntime(
+            int columnCount,
+            int windowCount,
+            VdbeWindowEvaluator evaluator,
+            VdbeExecutionOptions options,
+            VdbeExecutionMemory memory)
         {
             _columnCount = columnCount;
             _windowCount = windowCount;
             _evaluator = evaluator;
+            _options = options;
+            _memory = memory;
         }
 
-        public void Insert(SqlValue[] row)
+        public void Insert(SqlValue[] row, CancellationToken cancellationToken)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(row);
+            cancellationToken.ThrowIfCancellationRequested();
             if (_windowValues is not null)
             {
                 throw new InvalidOperationException(
@@ -4528,24 +4929,49 @@ public sealed class ResumableStatement : IDisposable
                     $"Window buffer stores {_columnCount}-column rows but received {row.Length} values.");
             }
 
-            _rows.Add(row);
+            if (_temporaryFile is null && TryBuffer(row))
+            {
+                _count++;
+                return;
+            }
+
+            if (!_options.AllowTemporaryFileSpill)
+            {
+                throw new VdbeMemoryLimitExceededException(
+                    _memory.LimitBytes,
+                    VdbeManagedFootprint.EstimateSorterRow(row));
+            }
+
+            EnsureSpilled(cancellationToken);
+            Append(row, cancellationToken);
+            _count++;
         }
 
-        // Computes every buffered row's window values and positions on the first row. Returns false (and
-        // leaves the buffer unpositioned) when there is nothing to drain.
-        public bool Compute()
+        // Computes every row's window values and positions on the first row. Spilled partitions are
+        // handed to the evaluator as a random-access view over the temp file so Compute does not
+        // reload the whole partition into the heap. Returns false when there is nothing to drain.
+        public bool Compute(CancellationToken cancellationToken)
         {
-            var computed = _evaluator(_rows)
+            // Release the spill-infrastructure reservation so Compute can retain window
+            // tuples; the temp file stays open for indexed reads until Dispose.
+            _spillInfrastructure?.Dispose();
+            _spillInfrastructure = null;
+
+            IReadOnlyList<SqlValue[]> input = _temporaryFile is null
+                ? _rows
+                : new SpilledWindowRowList(this, cancellationToken);
+            var computed = _evaluator(input)
                 ?? throw new InvalidOperationException("A window evaluator returned null.");
-            if (computed.Count != _rows.Count)
+            if (computed.Count != _count)
             {
                 throw new InvalidOperationException(
-                    $"A window evaluator returned {computed.Count} window tuples for {_rows.Count} buffered rows.");
+                    $"A window evaluator returned {computed.Count} window tuples for {_count} buffered rows.");
             }
 
             var values = new SqlValue[computed.Count][];
             for (var index = 0; index < computed.Count; index++)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var tuple = computed[index]
                     ?? throw new InvalidOperationException("A window evaluator returned a null window tuple.");
                 if (tuple.Length != _windowCount)
@@ -4555,12 +4981,185 @@ public sealed class ResumableStatement : IDisposable
                 }
 
                 values[index] = tuple;
+                Retain(VdbeManagedFootprint.EstimateSorterRow(tuple));
             }
 
             _windowValues = values;
-            _position = _rows.Count == 0 ? -1 : 0;
+            _position = _count == 0 ? -1 : 0;
             return _position >= 0;
         }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            List<Exception>? failures = null;
+            try
+            {
+                try
+                {
+                    _temporaryFile?.Dispose();
+                    _temporaryFile = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+
+                try
+                {
+                    _spillInfrastructure?.Dispose();
+                    _spillInfrastructure = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+            }
+            finally
+            {
+                if (_retainedBytes > 0 || _retainedRows > 0)
+                    _memory.Release(_retainedBytes, _retainedRows);
+                _retainedBytes = 0;
+                _retainedRows = 0;
+                _rows.Clear();
+                _disposed = failures is null;
+            }
+
+            if (failures is [var failure])
+                ExceptionDispatchInfo.Capture(failure).Throw();
+            if (failures is { Count: > 1 })
+                throw new AggregateException(failures);
+        }
+
+        private bool TryBuffer(SqlValue[] row)
+        {
+            var requiredCount = checked(_rows.Count + 1);
+            var capacity = VdbeManagedFootprint.GetListCapacityForCount(_rows.Capacity, requiredCount);
+            var currentListBytes = VdbeManagedFootprint.EstimateReferenceListStorage(_rows.Capacity);
+            var listGrowth = VdbeManagedFootprint.EstimateContainerReplacement(
+                currentListBytes,
+                VdbeManagedFootprint.EstimateReferenceListStorage(capacity));
+            var replacedListBytes = listGrowth > 0 ? currentListBytes : 0;
+            var rowBytes = VdbeManagedFootprint.EstimateSorterRow(row);
+            var retainedBytes = checked(rowBytes + listGrowth);
+            if (_rows.Count > 0
+                && _options.AllowTemporaryFileSpill
+                && retainedBytes > _memory.AvailableBytes - SpillInfrastructureBytes())
+            {
+                return false;
+            }
+
+            if (!_memory.TryRetain(retainedBytes))
+                return false;
+
+            try
+            {
+                if (capacity != _rows.Capacity)
+                    _rows.Capacity = capacity;
+                _rows.Add(row);
+                if (replacedListBytes > 0)
+                    _memory.Release(replacedListBytes, rows: 0);
+                _retainedBytes = checked(_retainedBytes + retainedBytes - replacedListBytes);
+                _retainedRows = checked(_retainedRows + 1);
+                return true;
+            }
+            catch
+            {
+                _memory.Release(retainedBytes);
+                throw;
+            }
+        }
+
+        private void EnsureSpilled(CancellationToken cancellationToken)
+        {
+            if (_temporaryFile is not null)
+                return;
+            if (!_options.AllowTemporaryFileSpill)
+            {
+                throw new VdbeMemoryLimitExceededException(
+                    _memory.LimitBytes,
+                    SpillInfrastructureBytes());
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            VdbeMemoryReservation? infrastructure =
+                VdbeMemoryReservation.Create(_memory, SpillInfrastructureBytes());
+            VdbeTemporaryFile? temporaryFile = null;
+            try
+            {
+                temporaryFile = VdbeTemporaryFile.Create(_options, "window-buffer");
+                _writePosition = VdbeSpillRecordCodec.InitializeFile(
+                    temporaryFile.File,
+                    VdbeSpillFileKind.WindowBuffer,
+                    _options.Metrics);
+                _temporaryFile = temporaryFile;
+                temporaryFile = null;
+                _spillInfrastructure = infrastructure;
+                infrastructure = null;
+
+                for (var index = 0; index < _rows.Count; index++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    WriteRecord(_rows[index]);
+                }
+
+                if (_retainedBytes > 0 || _retainedRows > 0)
+                    _memory.Release(_retainedBytes, _retainedRows);
+                _rows.Clear();
+                _rows.Capacity = 0;
+                _retainedBytes = 0;
+                _retainedRows = 0;
+                _options.Metrics.WindowBufferSpilled();
+            }
+            finally
+            {
+                temporaryFile?.Dispose();
+                infrastructure?.Dispose();
+            }
+        }
+
+        private void Append(SqlValue[] row, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var retainedBytes = VdbeManagedFootprint.EstimateSorterRow(row);
+            _memory.RetainOrThrow(retainedBytes);
+            try
+            {
+                WriteRecord(row);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            finally
+            {
+                _memory.Release(retainedBytes);
+            }
+        }
+
+        private void WriteRecord(SqlValue[] row)
+        {
+            var file = _temporaryFile?.File
+                ?? throw new InvalidOperationException("Window buffer has no spill file.");
+            _recordStarts.Add(_writePosition);
+            var recordStart = VdbeSpillRecordCodec.BeginRecord(ref _writePosition);
+            VdbeSpillRecordCodec.WriteValues(file, ref _writePosition, row, _options.Metrics);
+            VdbeSpillRecordCodec.CompleteRecord(
+                file,
+                recordStart,
+                _writePosition,
+                _options.Metrics);
+        }
+
+        private void Retain(long bytes, long rows = 1)
+        {
+            _memory.RetainOrThrow(bytes, rows);
+            _retainedBytes = checked(_retainedBytes + bytes);
+            _retainedRows = checked(_retainedRows + rows);
+        }
+
+        private long SpillInfrastructureBytes() =>
+            VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure(
+                _options.TemporaryDirectory);
 
         // The current row followed by that row's computed window values, as one contiguous record.
         public SqlValue[] Current()
@@ -4571,11 +5170,12 @@ public sealed class ResumableStatement : IDisposable
                     "Window buffer must compute its window values before reading a record.");
             }
 
-            if (_position < 0 || _position >= _rows.Count)
+            if (_position < 0 || _position >= _count)
                 throw new InvalidOperationException("Window buffer is not positioned on a row.");
 
+            var row = ReadRow(_position);
             var record = new SqlValue[_columnCount + _windowCount];
-            Array.Copy(_rows[_position], record, _columnCount);
+            Array.Copy(row, record, _columnCount);
             Array.Copy(_windowValues[_position], 0, record, _columnCount, _windowCount);
             return record;
         }
@@ -4590,7 +5190,65 @@ public sealed class ResumableStatement : IDisposable
             }
 
             _position++;
-            return _position < _rows.Count;
+            return _position < _count;
+        }
+
+        private SqlValue[] ReadRow(int index)
+        {
+            if (_temporaryFile is null)
+                return _rows[index];
+
+            if (_cachedIndex == index && _cachedRow is not null)
+                return _cachedRow;
+
+            if ((uint)index >= (uint)_recordStarts.Count)
+                throw new InvalidOperationException("Window buffer spill index is out of range.");
+
+            var file = _temporaryFile.File;
+            var position = _recordStarts[index];
+            var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(file, ref position, _options.Metrics);
+            var values = VdbeSpillRecordCodec.ReadValues(
+                file,
+                ref position,
+                _columnCount,
+                recordEnd,
+                _options.Metrics,
+                CancellationToken.None);
+            VdbeSpillRecordCodec.RequireRecordEnd(position, recordEnd);
+            _cachedIndex = index;
+            _cachedRow = values;
+            return values;
+        }
+
+        private sealed class SpilledWindowRowList : IReadOnlyList<SqlValue[]>
+        {
+            private readonly WindowBufferRuntime _owner;
+            private readonly CancellationToken _cancellationToken;
+
+            public SpilledWindowRowList(WindowBufferRuntime owner, CancellationToken cancellationToken)
+            {
+                _owner = owner;
+                _cancellationToken = cancellationToken;
+            }
+
+            public int Count => _owner._count;
+
+            public SqlValue[] this[int index]
+            {
+                get
+                {
+                    _cancellationToken.ThrowIfCancellationRequested();
+                    return _owner.ReadRow(index);
+                }
+            }
+
+            public IEnumerator<SqlValue[]> GetEnumerator()
+            {
+                for (var index = 0; index < Count; index++)
+                    yield return this[index];
+            }
+
+            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
         }
     }
 
@@ -4602,7 +5260,7 @@ public sealed class ResumableStatement : IDisposable
     // frontier row or a recorded distinct representative. The recursion itself — FIFO ordering, re-feeding
     // descendants, de-duplication, depth bounding, and the row cap — lives here and is driven step by step by
     // the interpreter loop; the transform delegate only computes one generation from one row.
-    private sealed class WorkTableRuntime
+    private sealed class WorkTableRuntime : IDisposable
     {
         private readonly int _columnCount;
         private readonly WorkTableDedupMode _mode;
@@ -4610,25 +5268,30 @@ public sealed class ResumableStatement : IDisposable
         private readonly int _maxDepth;
         private readonly VdbeRowEquality? _equality;
         private readonly Queue<(SqlValue[] Row, int Depth)> _frontier = new();
-        private readonly List<SqlValue[]>? _seen;
+        private readonly VdbeKeyedRowStore? _seen;
         private readonly List<SqlValue[]> _generation = [];
         private int _admitted;
         private bool _hasCurrent;
         private int _currentDepth;
+        private bool _disposed;
 
         public WorkTableRuntime(
             int columnCount,
             WorkTableDedupMode mode,
             int maxRows,
             int maxDepth,
-            VdbeRowEquality? equality)
+            VdbeRowEquality? equality,
+            VdbeExecutionOptions options,
+            VdbeExecutionMemory memory)
         {
             _columnCount = columnCount;
             _mode = mode;
             _maxRows = maxRows;
             _maxDepth = maxDepth;
             _equality = equality;
-            _seen = mode == WorkTableDedupMode.Distinct ? [] : null;
+            _seen = mode == WorkTableDedupMode.Distinct
+                ? new VdbeKeyedRowStore(options, memory)
+                : null;
         }
 
         // Admits a seed (anchor) row at depth 0. Distinct duplicates are dropped; admission counts against
@@ -4733,23 +5396,31 @@ public sealed class ResumableStatement : IDisposable
         // rejection path.
         private bool TryAdmit(SqlValue[] row, int depth)
         {
-            if (_seen is not null)
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_seen is not null
+                && _seen.Contains(row, _equality!, CancellationToken.None))
             {
-                foreach (var stored in _seen)
-                {
-                    if (_equality!(stored, row))
-                        return false;
-                }
+                return false;
             }
 
             if (_admitted >= _maxRows)
                 throw new RecursiveWorkTableOverflowException(_maxRows);
 
             var owned = CloneRow(row);
+            if (_seen is not null)
+                _seen.TryInsert(owned, _equality!, replaceExisting: false, CancellationToken.None);
             _admitted++;
-            _seen?.Add(owned);
             _frontier.Enqueue((owned, depth));
             return true;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            _seen?.Dispose();
         }
 
         // Shallow snapshot of a record. SqlValue is an immutable value type and blob payloads are exposed as

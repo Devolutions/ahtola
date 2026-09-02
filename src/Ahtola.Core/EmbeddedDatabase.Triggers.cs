@@ -643,9 +643,8 @@ public sealed partial class EmbeddedDatabase
     }
 
     // Turso lowers each SQL trigger to an Insn::Program with sparse NEW/OLD parameter registers.
-    // This first managed route deliberately admits only ordinary AFTER INSERT rows: each trigger
-    // gets its own reentrant Program frame, while its established evaluator remains the subprogram
-    // leaf until individual trigger statements are lowerable without changing their error ordering.
+    // BEFORE and AFTER INSERT share that frame; the evaluator remains the subprogram leaf until
+    // individual trigger-body statements are themselves lowerable.
     private bool TryCompileAfterInsertTriggerPrograms(
         InsertStatement statement,
         SqlValue[] parameters,
@@ -661,10 +660,11 @@ public sealed partial class EmbeddedDatabase
             || statement.Source is not null
             || statement.Returning is not null
             || context.CommonTableExpressions.Count != 0
-            || beforeTriggers.Count != 0
-            || afterTriggers.Count == 0
+            || (beforeTriggers.Count == 0 && afterTriggers.Count == 0)
+            || beforeTriggers.Any(static trigger => trigger.Temporary)
             || afterTriggers.Any(static trigger => trigger.Temporary)
-            || table.IsAutoIncrement && statement.Rows.Count > 1)
+            || table.IsAutoIncrement && statement.Rows.Count > 1
+            || TriggerChainMutatesTable(context, beforeTriggers.Concat(afterTriggers), statement.TableName))
         {
             return false;
         }
@@ -673,50 +673,61 @@ public sealed partial class EmbeddedDatabase
         var parameterRegisters = Enumerable.Range(0, parameterCount)
             .Select(static index => new Register(index))
             .ToArray();
-        var captureInstructions = new List<VdbeInstruction>(parameterCount + afterTriggers.Count);
-        for (var columnIndex = 0; columnIndex < table.Columns.Length; columnIndex++)
-        {
-            captureInstructions.Add(new ColumnInstruction(
-                new Cursor(0),
-                columnIndex,
-                parameterRegisters[columnIndex]));
-        }
-        captureInstructions.Add(new RowIdInstruction(new Cursor(0), parameterRegisters[^1]));
-
-        var ignoreTarget = new ProgramCounter(3 + parameterCount + afterTriggers.Count);
-        foreach (var trigger in afterTriggers)
-        {
-            captureInstructions.Add(new ProgramInstruction(
-                parameterRegisters,
-                CreateTriggerSubprogram(
-                    trigger,
-                    table,
-                    context,
-                    hasOld: false,
-                    hasNew: true),
-                ignoreTarget));
-        }
+        var beforeMutation = CreateTriggerProgramBlock(
+            table,
+            parameterRegisters,
+            beforeTriggers,
+            context,
+            hasOld: false,
+            hasNew: true);
+        var afterMutation = CreateTriggerProgramBlock(
+            table,
+            parameterRegisters,
+            afterTriggers,
+            context,
+            hasOld: false,
+            hasNew: true);
+        InsertStrictTypeCheck(beforeMutation, table, statement.TableName, parameterRegisters);
+        var nextAddr = 2 + beforeMutation.Count + 1 + afterMutation.Count;
+        var ignoreTarget = new ProgramCounter(nextAddr);
+        RetargetTriggerIgnore(beforeMutation, ignoreTarget);
+        RetargetTriggerIgnore(afterMutation, ignoreTarget);
 
         var plan = PrepareInsert(statement, table, context);
         IReadOnlyList<SqlValue>[]? inputRows = null;
+        var builtRows = new SqlValue[statement.Rows.Count][];
+        var builtRowIds = new long[statement.Rows.Count];
         long? lastInsertRowId = null;
+        (SqlValue[] Row, long RowId) EnsureRow(int index)
+        {
+            if (builtRows[index] is not null)
+                return (builtRows[index], builtRowIds[index]);
+
+            inputRows ??= statement.Rows.Select(row =>
+                (IReadOnlyList<SqlValue>)row.Select(expression =>
+                    Evaluate(expression, parameters, row: null, context)).ToArray()).ToArray();
+            ResetInsertPlan(table, plan);
+            var built = BuildInsertRow(
+                statement,
+                table,
+                plan,
+                inputRows[index],
+                parameters,
+                context);
+            builtRows[index] = built.Row;
+            builtRowIds[index] = built.RowId;
+            return built;
+        }
+
         var writeTarget = new VdbeWriteTarget
         {
             TableName = statement.TableName,
             RowCount = statement.Rows.Count,
+            GetRow = index => EnsureRow(index).Row,
+            GetRowId = index => EnsureRow(index).RowId,
             MutateRow = index =>
             {
-                inputRows ??= statement.Rows.Select(row =>
-                    (IReadOnlyList<SqlValue>)row.Select(expression =>
-                        Evaluate(expression, parameters, row: null, context)).ToArray()).ToArray();
-                ResetInsertPlan(table, plan);
-                var (row, rowId) = BuildInsertRow(
-                    statement,
-                    table,
-                    plan,
-                    inputRows[index],
-                    parameters,
-                    context);
+                var (row, rowId) = EnsureRow(index);
                 CommitInserts(context, statement.TableName, table, [row], [rowId]);
                 context.TriggerState!.Changed = true;
                 if (table.HasRowid)
@@ -733,8 +744,8 @@ public sealed partial class EmbeddedDatabase
             statement.TableName,
             table.Columns.Length,
             filter: null,
-            beforeMutation: Array.Empty<VdbeInstruction>(),
-            afterMutation: captureInstructions,
+            beforeMutation: beforeMutation,
+            afterMutation: afterMutation,
             registerCount: parameterCount);
         compiled = new CompiledDml(program, [writeTarget]);
         return true;
@@ -1153,10 +1164,10 @@ public sealed partial class EmbeddedDatabase
             || context.CommonTableExpressions.Count != 0
             || !table.HasRowid
             || statement.Assignments.Any(assignment => EmbeddedTable.IsRowidAliasName(assignment.Column))
-            || beforeTriggers.Count != 0
-            || afterTriggers.Count == 0
+            || (beforeTriggers.Count == 0 && afterTriggers.Count == 0)
+            || beforeTriggers.Any(static trigger => trigger.Temporary)
             || afterTriggers.Any(static trigger => trigger.Temporary)
-            || TriggerChainMutatesTable(context, afterTriggers, statement.TableName))
+            || TriggerChainMutatesTable(context, beforeTriggers.Concat(afterTriggers), statement.TableName))
         {
             return false;
         }
@@ -1174,22 +1185,13 @@ public sealed partial class EmbeddedDatabase
         var oldRegisters = Enumerable.Range(0, imageWidth).Select(static index => new Register(index)).ToArray();
         var newRegisters = Enumerable.Range(imageWidth, imageWidth).Select(static index => new Register(index)).ToArray();
         var allRegisters = oldRegisters.Concat(newRegisters).ToArray();
-        var beforeMutation = CreateTriggerImageCaptureInstructions(table, oldRegisters);
-        var afterMutation = CreateTriggerImageCaptureInstructions(table, newRegisters).ToList();
-        var ignoreTarget = new ProgramCounter(
-            4 + beforeMutation.Count + newRegisters.Length + afterTriggers.Count);
-        foreach (var trigger in afterTriggers)
-        {
-            afterMutation.Add(new ProgramInstruction(
-                allRegisters,
-                CreateTriggerSubprogram(trigger, table, context, hasOld: true, hasNew: true),
-                ignoreTarget));
-        }
-
+        var scanIndex = 0;
         var sourceRows = table.Rows.Select(static row => row.ToArray()).ToArray();
         var sourceRowIds = table.RowIds.ToArray();
         SqlValue[][]? candidateRows = null;
         long[]? candidateRowIds = null;
+        SqlValue[][]? proposedRows = null;
+        long[]? proposedRowIds = null;
         void EnsureCandidates()
         {
             if (candidateRows is not null)
@@ -1204,6 +1206,74 @@ public sealed partial class EmbeddedDatabase
             candidateRowIds = indices.Select(index => sourceRowIds[index]).ToArray();
         }
 
+        void EnsureProposed(int index)
+        {
+            EnsureCandidates();
+            var rows = candidateRows
+                ?? throw new InvalidOperationException("UPDATE trigger candidates were not materialized.");
+            var rowIds = candidateRowIds
+                ?? throw new InvalidOperationException("UPDATE trigger candidate rowids were not materialized.");
+            proposedRows ??= new SqlValue[rows.Length][];
+            proposedRowIds ??= new long[rows.Length];
+            if (proposedRows[index] is not null)
+                return;
+
+            var (updated, newRowId) = BuildUpdatedRow(
+                statement,
+                table,
+                plan,
+                rows[index],
+                rowIds[index],
+                parameters,
+                context with { PreserveSubqueryMemoSnapshot = true },
+                validateCheckConstraints: false,
+                enforceGeneratedNotNull: false);
+            proposedRows[index] = updated;
+            proposedRowIds[index] = newRowId;
+        }
+
+        var beforeMutation = CreateTriggerImageCaptureInstructions(table, oldRegisters).ToList();
+        if (beforeTriggers.Count != 0)
+        {
+            beforeMutation.AddRange(CreateProposedNewImageLoadInstructions(
+                newRegisters,
+                () => scanIndex,
+                index =>
+                {
+                    EnsureProposed(index);
+                    return proposedRows![index];
+                },
+                index =>
+                {
+                    EnsureProposed(index);
+                    return proposedRowIds![index];
+                }));
+            beforeMutation.AddRange(CreateTriggerProgramInstructions(
+                beforeTriggers,
+                table,
+                context,
+                allRegisters,
+                hasOld: true,
+                hasNew: true));
+        }
+
+        var afterMutation = new List<VdbeInstruction>();
+        if (afterTriggers.Count != 0)
+        {
+            afterMutation.AddRange(CreateTriggerImageCaptureInstructions(table, newRegisters));
+            afterMutation.AddRange(CreateTriggerProgramInstructions(
+                afterTriggers,
+                table,
+                context,
+                allRegisters,
+                hasOld: true,
+                hasNew: true));
+        }
+
+        var ignoreTarget = new ProgramCounter(4 + beforeMutation.Count + afterMutation.Count);
+        RetargetTriggerIgnore(beforeMutation, ignoreTarget);
+        RetargetTriggerIgnore(afterMutation, ignoreTarget);
+
         var writeTarget = new VdbeWriteTarget
         {
             TableName = statement.TableName,
@@ -1216,11 +1286,13 @@ public sealed partial class EmbeddedDatabase
             GetRow = index =>
             {
                 EnsureCandidates();
+                scanIndex = index;
                 return candidateRows![index];
             },
             GetRowId = index =>
             {
                 EnsureCandidates();
+                scanIndex = index;
                 return candidateRowIds![index];
             },
             MutateRow = index =>
@@ -1230,15 +1302,40 @@ public sealed partial class EmbeddedDatabase
                 var position = table.RowIds.IndexOf(sourceRowId);
                 if (position < 0)
                     throw new InvalidOperationException("An eligible AFTER UPDATE trigger removed a pending source row.");
-                var original = table.Rows[position].ToArray();
-                var (updated, newRowId) = BuildUpdatedRow(
-                    statement,
-                    table,
-                    plan,
-                    original,
-                    sourceRowId,
-                    parameters,
-                    context with { PreserveSubqueryMemoSnapshot = true });
+                SqlValue[] updated;
+                long newRowId;
+                if (beforeTriggers.Count != 0)
+                {
+                    EnsureProposed(index);
+                    updated = ReloadColumnsTheUpdateDoesNotAssign(
+                        table,
+                        plan,
+                        proposedRows![index],
+                        table.Rows[position]);
+                    newRowId = proposedRowIds![index];
+                    ResolveNotNullReplaceDefaults(context.ConflictAlgorithmOverride, table, updated, context);
+                    EnforceGeneratedNotNullConstraints(table, statement.TableName, updated);
+                    ValidateCheckConstraints(
+                        statement.TableName,
+                        table,
+                        updated,
+                        newRowId,
+                        parameters,
+                        context);
+                }
+                else
+                {
+                    var original = table.Rows[position].ToArray();
+                    (updated, newRowId) = BuildUpdatedRow(
+                        statement,
+                        table,
+                        plan,
+                        original,
+                        sourceRowId,
+                        parameters,
+                        context with { PreserveSubqueryMemoSnapshot = true });
+                }
+
                 CommitTriggerRowUpdate(
                     context,
                     statement.TableName,
@@ -1284,10 +1381,10 @@ public sealed partial class EmbeddedDatabase
             || statement.Returning is not null
             || context.CommonTableExpressions.Count != 0
             || !table.HasRowid
-            || beforeTriggers.Count != 0
-            || afterTriggers.Count == 0
+            || (beforeTriggers.Count == 0 && afterTriggers.Count == 0)
+            || beforeTriggers.Any(static trigger => trigger.Temporary)
             || afterTriggers.Any(static trigger => trigger.Temporary)
-            || TriggerChainMutatesTable(context, afterTriggers, statement.TableName))
+            || TriggerChainMutatesTable(context, beforeTriggers.Concat(afterTriggers), statement.TableName))
         {
             return false;
         }
@@ -1303,16 +1400,33 @@ public sealed partial class EmbeddedDatabase
 
         var imageWidth = table.Columns.Length + 1;
         var oldRegisters = Enumerable.Range(0, imageWidth).Select(static index => new Register(index)).ToArray();
-        var beforeMutation = CreateTriggerImageCaptureInstructions(table, oldRegisters);
-        var afterMutation = new List<VdbeInstruction>(afterTriggers.Count);
-        var ignoreTarget = new ProgramCounter(4 + beforeMutation.Count + afterTriggers.Count);
-        foreach (var trigger in afterTriggers)
+        var beforeMutation = CreateTriggerImageCaptureInstructions(table, oldRegisters).ToList();
+        if (beforeTriggers.Count != 0)
         {
-            afterMutation.Add(new ProgramInstruction(
+            beforeMutation.AddRange(CreateTriggerProgramInstructions(
+                beforeTriggers,
+                table,
+                context,
                 oldRegisters,
-                CreateTriggerSubprogram(trigger, table, context, hasOld: true, hasNew: false),
-                ignoreTarget));
+                hasOld: true,
+                hasNew: false));
         }
+
+        var afterMutation = new List<VdbeInstruction>();
+        if (afterTriggers.Count != 0)
+        {
+            afterMutation.AddRange(CreateTriggerProgramInstructions(
+                afterTriggers,
+                table,
+                context,
+                oldRegisters,
+                hasOld: true,
+                hasNew: false));
+        }
+
+        var ignoreTarget = new ProgramCounter(4 + beforeMutation.Count + afterMutation.Count);
+        RetargetTriggerIgnore(beforeMutation, ignoreTarget);
+        RetargetTriggerIgnore(afterMutation, ignoreTarget);
 
         var sourceRows = table.Rows.Select(static row => row.ToArray()).ToArray();
         var sourceRowIds = table.RowIds.ToArray();
@@ -1405,16 +1519,140 @@ public sealed partial class EmbeddedDatabase
         EmbeddedTable table,
         IReadOnlyList<Register> registers)
     {
-        var instructions = new List<VdbeInstruction>(table.Columns.Length + 1);
-        for (var columnIndex = 0; columnIndex < table.Columns.Length; columnIndex++)
+        var instructions = new List<VdbeInstruction>(2);
+        if (table.Columns.Length > 0)
         {
-            instructions.Add(new ColumnInstruction(
+            instructions.Add(new ColumnRangeInstruction(
                 new Cursor(0),
-                columnIndex,
-                registers[columnIndex]));
+                0,
+                registers[0],
+                table.Columns.Length));
         }
+
         instructions.Add(new RowIdInstruction(new Cursor(0), registers[^1]));
         return instructions;
+    }
+
+    private List<VdbeInstruction> CreateTriggerProgramBlock(
+        EmbeddedTable table,
+        IReadOnlyList<Register> registers,
+        IReadOnlyList<TriggerDefinition> triggers,
+        QueryContext context,
+        bool hasOld,
+        bool hasNew)
+    {
+        var instructions = new List<VdbeInstruction>();
+        if (triggers.Count == 0)
+            return instructions;
+
+        instructions.AddRange(CreateTriggerImageCaptureInstructions(table, registers));
+        instructions.AddRange(CreateTriggerProgramInstructions(
+            triggers,
+            table,
+            context,
+            registers,
+            hasOld,
+            hasNew));
+        return instructions;
+    }
+
+    private List<VdbeInstruction> CreateTriggerProgramInstructions(
+        IReadOnlyList<TriggerDefinition> triggers,
+        EmbeddedTable table,
+        QueryContext context,
+        IReadOnlyList<Register> registers,
+        bool hasOld,
+        bool hasNew)
+    {
+        var instructions = new List<VdbeInstruction>();
+        if (triggers.Count == 0)
+            return instructions;
+
+        instructions.Add(new ResetOnceInstruction(new ProgramCounter(0)));
+        foreach (var trigger in triggers)
+        {
+            instructions.Add(new ProgramInstruction(
+                registers,
+                CreateTriggerSubprogram(trigger, table, context, hasOld, hasNew),
+                new ProgramCounter(0)));
+        }
+
+        return instructions;
+    }
+
+    private static IEnumerable<VdbeInstruction> CreateProposedNewImageLoadInstructions(
+        IReadOnlyList<Register> newRegisters,
+        Func<int> currentIndex,
+        Func<int, SqlValue[]> getRow,
+        Func<int, long> getRowId)
+    {
+        for (var column = 0; column < newRegisters.Count - 1; column++)
+        {
+            var captured = column;
+            yield return new FunctionInstruction(
+                newRegisters[captured],
+                new VdbeScalarFunction
+                {
+                    Name = "new-image",
+                    Arity = 0,
+                    Invoke = _ => getRow(currentIndex())[captured],
+                },
+                new RegisterRange(new Register(0), 0));
+        }
+
+        yield return new FunctionInstruction(
+            newRegisters[^1],
+            new VdbeScalarFunction
+            {
+                Name = "new-rowid",
+                Arity = 0,
+                Invoke = _ => SqlValue.Integer(getRowId(currentIndex())),
+            },
+            new RegisterRange(new Register(0), 0));
+    }
+
+    private static void InsertStrictTypeCheck(
+        List<VdbeInstruction> beforeMutation,
+        EmbeddedTable table,
+        string tableName,
+        IReadOnlyList<Register> registers)
+    {
+        if (!table.Strict || table.Columns.Length == 0)
+            return;
+
+        var typeCheck = new TypeCheckInstruction(
+            new RegisterRange(registers[0], table.Columns.Length),
+            tableName,
+            [.. table.ColumnDefinitions.Select(static column => column.DeclaredType ?? string.Empty)],
+            CheckGenerated: true,
+            ColumnNames: table.Columns);
+        if (beforeMutation.Count == 0)
+        {
+            beforeMutation.AddRange(CreateTriggerImageCaptureInstructions(table, registers));
+            beforeMutation.Add(typeCheck);
+            return;
+        }
+
+        var captureCount = table.Columns.Length > 0 ? 2 : 1;
+        beforeMutation.Insert(Math.Min(captureCount, beforeMutation.Count), typeCheck);
+    }
+
+    private static void RetargetTriggerIgnore(
+        List<VdbeInstruction> instructions,
+        ProgramCounter ignoreTarget)
+    {
+        for (var index = 0; index < instructions.Count; index++)
+        {
+            instructions[index] = instructions[index] switch
+            {
+                ProgramInstruction program => new ProgramInstruction(
+                    program.ParameterRegisters,
+                    program.Subprogram,
+                    ignoreTarget),
+                ResetOnceInstruction => new ResetOnceInstruction(ignoreTarget),
+                _ => instructions[index],
+            };
+        }
     }
 
     private VdbeSubprogram CreateTriggerSubprogram(

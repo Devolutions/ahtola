@@ -7,8 +7,9 @@ using Ahtola.Core.Storage;
 namespace Ahtola.Tests;
 
 // Compiler-output and execution coverage for the direct window-function lowering
-// (WindowProgramBuilder). The builder lowers running-prefix, exact-current-row, and one-preceding
-// ROWS frames into the sorter + aggregate opcode families. These tests assert the emitted
+// (WindowProgramBuilder). The builder lowers running-prefix, exact-current-row, bounded
+// n-preceding/FOLLOWING ROWS frames, and RANGE/GROUPS peer frames into the sorter + aggregate
+// opcode families. These tests assert the emitted
 // bytecode shape/jump layout and run the programs
 // through the resumable state machine to confirm real observable rows: per-partition
 // running values, row_number ordering, tie/NULL handling, empty/single-row/replay
@@ -19,6 +20,10 @@ public class WindowProgramBuilderDirectTests
     private static AggregateFunctionSpec Sum(int column) => new(AggregateTestSupport.Sum(), [column]);
 
     private static AggregateFunctionSpec RowNumber() => new(AggregateTestSupport.CountStar(), []);
+
+    private static AggregateFunctionSpec InvertibleMin(int column) => new(
+        AggregateTestSupport.InvertibleMin(),
+        [column]);
 
     private static AggregateFunctionSpec InvertibleSum(int column) => new(
         new VdbeAggregate
@@ -263,6 +268,100 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void TwoPrecedingFrameRetainsATwoRowRingAndInversesTheOldest()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.Preceding(2));
+
+        var opcodes = program.Instructions.Select(static instruction => instruction.Opcode).ToList();
+        var result = opcodes.IndexOf(VdbeOpcode.ResultRow);
+        opcodes[result + 1].Should().Be(VdbeOpcode.JumpIf);
+        opcodes[result + 2].Should().Be(VdbeOpcode.AggInverse);
+        opcodes.Should().Contain(VdbeOpcode.Arithmetic);
+
+        var rows = Run(program, Rows([10], [20], [30], [40]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 10),
+            (20, 30),
+            (30, 60),
+            (40, 90));
+    }
+
+    [Test]
+    public void TwoPrecedingFrameRestartsTheRingOnPartitionBoundaries()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [0],
+            windows: [InvertibleSum(1)],
+            outputs:
+            [
+                WindowOutput.ForColumn(0),
+                WindowOutput.ForColumn(1),
+                WindowOutput.ForWindow(0),
+            ],
+            orderComparer: AggregateTestSupport.OrderByColumns(0, 1),
+            partitionComparer: AggregateTestSupport.GroupKeysEqual(),
+            frame: WindowFrameSpec.Preceding(2));
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [1, 30], [1, 40], [2, 5], [2, 7]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger(), row[2].AsInteger())).Should().Equal(
+            (1, 10, 10),
+            (1, 20, 30),
+            (1, 30, 60),
+            (1, 40, 90),
+            (2, 5, 5),
+            (2, 7, 12));
+    }
+
+    [Test]
+    public void OneFollowingFrameDelaysEmitUntilLookaheadArrives()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.Following(1));
+
+        var rows = Run(program, Rows([10], [20], [30], [40]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 30),
+            (20, 50),
+            (30, 70),
+            (40, 40));
+    }
+
+    [Test]
+    public void PrecedingAndFollowingFrameMatchesASlidingWindow()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.PrecedingAndFollowing(1, 1));
+
+        var rows = Run(program, Rows([10], [20], [30], [40]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 30),
+            (20, 60),
+            (30, 90),
+            (40, 70));
+    }
+
+    [Test]
     public void OnePrecedingFrameSpillsWithinBudgetAndCleansUpOnCancellation()
     {
         const long budget = 16384;
@@ -473,21 +572,481 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void RangeRunningFrameDelaysEmitUntilThePeerGroupEnds()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForColumn(1), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeRunning,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.Instructions.Select(static instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.OpenEphemeral)
+            .And.Contain(VdbeOpcode.EphemeralInsert)
+            .And.Contain(VdbeOpcode.ColumnRange);
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30]));
+        rows.Select(static row => row[2].AsInteger()).Should().Equal(30, 30, 60);
+    }
+
+    [Test]
+    public void RangeCurrentPeerFrameResetsBetweenPeerGroups()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeCurrentPeer,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30]));
+        rows.Select(static row => row[1].AsInteger()).Should().Equal(30, 30, 30);
+    }
+
+    [Test]
+    public void GroupsRunningFrameMatchesRangeRunningPeers()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.GroupsRunning,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 5]));
+        rows.Select(static row => row[1].AsInteger()).Should().Equal(30, 30, 35);
+    }
+
+    [Test]
+    public void RangeRunningFrameResetsAccumulatorsOnPartitionBoundaries()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 3,
+            partitionColumns: [0],
+            windows: [Sum(2)],
+            outputs:
+            [
+                WindowOutput.ForColumn(0),
+                WindowOutput.ForColumn(1),
+                WindowOutput.ForWindow(0),
+            ],
+            orderComparer: AggregateTestSupport.OrderByColumns(0, 1),
+            partitionComparer: AggregateTestSupport.GroupKeysEqual(),
+            frame: WindowFrameSpec.RangeRunning,
+            orderColumns: [1],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 1, 10], [1, 1, 20], [1, 2, 5], [2, 1, 7]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger(), row[2].AsInteger())).Should().Equal(
+            (1, 1, 30),
+            (1, 1, 30),
+            (1, 2, 35),
+            (2, 1, 7));
+    }
+
+    [Test]
+    public void RangeRunningWithoutOrderByTreatsThePartitionAsOnePeer()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [0],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0, 1),
+            partitionComparer: AggregateTestSupport.GroupKeysEqual(),
+            frame: WindowFrameSpec.RangeRunning);
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 7]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (1, 30),
+            (2, 7));
+    }
+
+    [Test]
+    public void PeerFrameOverAnEmptyTableProducesNoRows()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [Sum(0)],
+            outputs: [WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeRunning,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        Run(program, new VdbeCursorSource([])).Should().BeEmpty();
+    }
+
+    [Test]
+    public void GroupsOnePrecedingInversesTheOldestPeerGroup()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.GroupsPreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.CursorCount.Should().Be(3);
+        program.Instructions.Select(static instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.AggInverse)
+            .And.Contain(VdbeOpcode.OpenEphemeral);
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30], [2, 40], [3, 50]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (1, 30),
+            (2, 100),
+            (2, 100),
+            (3, 120));
+    }
+
+    [Test]
+    public void GroupsTwoPrecedingKeepsTwoPeerGroupsBehindTheCurrent()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.GroupsPreceding(2),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30], [2, 40], [3, 50], [4, 60]));
+        rows.Select(static row => row[1].AsInteger()).Should().Equal(30, 30, 100, 100, 150, 180);
+    }
+
+    [Test]
+    public void GroupsPrecedingResetsTheRingOnPartitionBoundaries()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 3,
+            partitionColumns: [0],
+            windows: [InvertibleSum(2)],
+            outputs:
+            [
+                WindowOutput.ForColumn(0),
+                WindowOutput.ForColumn(1),
+                WindowOutput.ForWindow(0),
+            ],
+            orderComparer: AggregateTestSupport.OrderByColumns(0, 1),
+            partitionComparer: AggregateTestSupport.GroupKeysEqual(),
+            frame: WindowFrameSpec.GroupsPreceding(1),
+            orderColumns: [1],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 1, 10], [1, 1, 20], [1, 2, 5], [2, 1, 7], [2, 2, 8]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger(), row[2].AsInteger())).Should().Equal(
+            (1, 1, 30),
+            (1, 1, 30),
+            (1, 2, 35),
+            (2, 1, 7),
+            (2, 2, 15));
+    }
+
+    [Test]
+    public void RangeOnePrecedingInversesKeysThatFallOutsideTheValueOffset()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.CursorCount.Should().Be(3);
+        program.Instructions.Select(static instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.AggInverse)
+            .And.Contain(VdbeOpcode.Compare)
+            .And.Contain(VdbeOpcode.OpenEphemeral);
+
+        var rows = Run(program, Rows([1, 10], [2, 20], [10, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 10),
+            (2, 30),
+            (10, 30));
+    }
+
+    [Test]
+    public void RangeOnePrecedingKeepsConsecutiveIntegerPeers()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30], [3, 40]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (1, 30),
+            (2, 60),
+            (3, 70));
+    }
+
+    [Test]
+    public void RangeOnePrecedingDescendingFlipsTheOffsetCompare()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: (left, right) => AggregateTestSupport.OrderByColumns(0)(right, left),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual(),
+            descendingOrder: true);
+
+        var rows = Run(program, Rows([10, 30], [2, 20], [1, 10]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 30),
+            (2, 20),
+            (1, 30));
+    }
+
+    [Test]
+    public void GroupsOneFollowingDelaysEmitUntilTheNextPeerGroup()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.GroupsFollowing(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.CursorCount.Should().Be(3);
+        program.Instructions.Select(static instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.AggInverse)
+            .And.Contain(VdbeOpcode.OpenEphemeral);
+
+        var rows = Run(program, Rows([1, 10], [2, 20], [3, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (2, 50),
+            (3, 30));
+    }
+
+    [Test]
+    public void RangeOneFollowingLooksAheadByOrderValue()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeFollowing(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.CursorCount.Should().Be(3);
+        program.Instructions.Select(static instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.AggInverse)
+            .And.Contain(VdbeOpcode.Compare);
+
+        var rows = Run(program, Rows([1, 10], [2, 20], [10, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (2, 20),
+            (10, 30));
+    }
+
+    [Test]
+    public void RangeUnboundedFollowingEmitsFromTheEndOfThePartition()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeUnboundedFollowing,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.CursorCount.Should().Be(3);
+        var rows = Run(program, Rows([1, 10], [2, 20], [3, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 60),
+            (2, 50),
+            (3, 30));
+    }
+
+    [Test]
+    public void RangeFullPartitionEmitsTheSameTotalOnEveryRow()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeFullPartition,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [2, 20], [3, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 60),
+            (2, 60),
+            (3, 60));
+    }
+
+    [Test]
+    public void RunningExcludeCurrentRowEmitsThenSteps()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [Sum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.Running with { Exclusion = WindowExclusion.CurrentRow });
+
+        var rows = Run(program, Rows([10], [20], [30]));
+        rows.Select(static row => (
+            row[0].AsInteger(),
+            row[1].Kind == SqlValueKind.Null ? (long?)null : row[1].AsInteger())).Should().Equal(
+            (10, null),
+            (20, 10L),
+            (30, 30L));
+    }
+
+    [Test]
+    public void RowsUnboundedFollowingDrainsFromTheEnd()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RowsUnboundedFollowing);
+
+        program.CursorCount.Should().Be(2);
+        var rows = Run(program, Rows([10], [20], [30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 60),
+            (20, 50),
+            (30, 30));
+    }
+
+    [Test]
+    public void RangeRunningExcludeGroupOmitsTheCurrentPeerGroup()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group },
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 0),
+            (1, 0),
+            (2, 30));
+    }
+
+    [Test]
+    public void OnePrecedingMinInversesTheDepartingRow()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleMin(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.OnePreceding);
+
+        var rows = Run(program, Rows([1, 30], [2, 10], [3, 20]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (2, 10),
+            (3, 10));
+    }
+
+    [Test]
+    public void RangePrecedingRequiresExactlyOneOrderColumn()
+    {
+        Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
+            "t",
+            2,
+            [],
+            [InvertibleSum(1)],
+            [WindowOutput.ForWindow(0)],
+            AggregateTestSupport.OrderByColumns(0, 1),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0, 1],
+            peerComparer: AggregateTestSupport.GroupKeysEqual()));
+    }
+
+    [Test]
     public void BuildRejectsFramesItCannotRepresent()
     {
-        // RANGE framing.
+        // Unbounded FOLLOWING and incomplete ROWS bounds stay unmodeled. RANGE n PRECEDING
+        // without a single ORDER BY column is also rejected.
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
             "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
             AggregateTestSupport.OrderByColumns(0),
-            frame: new WindowFrameSpec(WindowFrameMode.Range, WindowBound.UnboundedPreceding, WindowBound.CurrentRow)));
+            frame: new WindowFrameSpec(WindowFrameMode.Range, WindowBound.Preceding, WindowBound.CurrentRow, StartOffset: 1)));
 
-        // GROUPS framing.
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
             "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
             AggregateTestSupport.OrderByColumns(0),
-            frame: new WindowFrameSpec(WindowFrameMode.Groups, WindowBound.UnboundedPreceding, WindowBound.CurrentRow)));
+            frame: new WindowFrameSpec(WindowFrameMode.Groups, WindowBound.UnboundedPreceding, WindowBound.Following)));
 
-        // Bounded / forward-looking ROWS bounds.
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
             "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
             AggregateTestSupport.OrderByColumns(0),
@@ -497,6 +1056,16 @@ public class WindowProgramBuilderDirectTests
             "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
             AggregateTestSupport.OrderByColumns(0),
             frame: new WindowFrameSpec(WindowFrameMode.Rows, WindowBound.UnboundedPreceding, WindowBound.Following)));
+    }
+
+    [Test]
+    public void PeerFrameWithOrderColumnsRequiresAPeerComparer()
+    {
+        Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
+            "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
+            AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeRunning,
+            orderColumns: [0]));
     }
 
     [Test]
@@ -514,13 +1083,30 @@ public class WindowProgramBuilderDirectTests
     [Test]
     public void MovingFramesRejectAnAggregateWithoutInverse()
     {
-        foreach (var frame in new[] { WindowFrameSpec.CurrentRow, WindowFrameSpec.OnePreceding })
+        foreach (var frame in new[]
+                 {
+                     WindowFrameSpec.CurrentRow,
+                     WindowFrameSpec.OnePreceding,
+                     WindowFrameSpec.Preceding(2),
+                     WindowFrameSpec.GroupsPreceding(1),
+                 })
         {
             Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
                 "t", 1, [], [new AggregateFunctionSpec(AggregateTestSupport.Min(), [0])], [WindowOutput.ForWindow(0)],
                 AggregateTestSupport.OrderByColumns(0),
                 frame: frame));
         }
+
+        Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
+            "t",
+            1,
+            [],
+            [new AggregateFunctionSpec(AggregateTestSupport.Min(), [0])],
+            [WindowOutput.ForWindow(0)],
+            AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual()));
     }
 
     [Test]
@@ -618,7 +1204,9 @@ public class WindowProgramBuilderDirectTests
 
     private static List<SqlValue[]> Run(VdbeProgram program, VdbeCursorSource source)
     {
-        using var statement = new ResumableStatement(program, [source]);
+        var sources = new VdbeCursorSource?[program.CursorCount];
+        sources[0] = source;
+        using var statement = new ResumableStatement(program, sources);
         return Drain(statement);
     }
 

@@ -113,7 +113,65 @@ public sealed class VdbeAfterTriggerSqlRoutingTests
     }
 
     [Test]
-    public void UnsupportedBeforeReturningAndConflictShapesStayEvaluatorOwned()
+    public void SimpleBeforeInsertTriggersRouteThroughProgramAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE data(id INTEGER PRIMARY KEY, value INTEGER)",
+            "CREATE TABLE audit(kind TEXT, source_id INTEGER, value INTEGER)",
+            "CREATE TRIGGER data_before BEFORE INSERT ON data BEGIN "
+                + "INSERT INTO audit VALUES ('before', NEW.id, NEW.value); END",
+            "CREATE TRIGGER data_after AFTER INSERT ON data BEGIN "
+                + "INSERT INTO audit VALUES ('after', NEW.id, NEW.value); END",
+        ];
+
+        using var database = new EmbeddedDatabase();
+        using var managed = database.Connect();
+        using var sqlite = OpenSqlite();
+        ExecuteBoth(managed, sqlite, setup);
+
+        var opcodes = ReadRows(managed, "EXPLAIN INSERT INTO data VALUES (1, 10)")
+            .Select(row => row[1].AsText())
+            .ToList();
+        opcodes.Count(static opcode => opcode == "Program").Should().Be(2);
+        opcodes.Should().Contain("ColumnRange").And.Contain("ResetOnce");
+
+        Execute(managed, "INSERT INTO data VALUES (1, 10), (2, 20)");
+        Execute(sqlite, "INSERT INTO data VALUES (1, 10), (2, 20)");
+        AssertQueriesMatch(
+            managed,
+            sqlite,
+            "SELECT kind, source_id, value FROM audit ORDER BY rowid");
+    }
+
+    [Test]
+    public void BeforeInsertRaiseIgnoreSkipsTheInsertAndLaterTriggers()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE data(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE audit(value TEXT)",
+            "CREATE TRIGGER data_before BEFORE INSERT ON data BEGIN "
+                + "INSERT INTO audit VALUES ('before-' || NEW.id); "
+                + "SELECT CASE WHEN NEW.id = 2 THEN RAISE(IGNORE) END; END",
+            "CREATE TRIGGER data_after AFTER INSERT ON data BEGIN "
+                + "INSERT INTO audit VALUES ('after-' || NEW.id); END",
+        ];
+
+        using var database = new EmbeddedDatabase();
+        using var managed = database.Connect();
+        using var sqlite = OpenSqlite();
+        ExecuteBoth(managed, sqlite, setup);
+        Execute(managed, "INSERT INTO data VALUES (1), (2), (3)");
+        Execute(sqlite, "INSERT INTO data VALUES (1), (2), (3)");
+        AssertQueriesMatch(
+            managed,
+            sqlite,
+            "SELECT 'data', id FROM data UNION ALL SELECT 'audit', value FROM audit ORDER BY 1, 2");
+    }
+
+    [Test]
+    public void UnsupportedReturningAndConflictShapesStayEvaluatorOwned()
     {
         using var database = new EmbeddedDatabase();
         using var managed = database.Connect();
@@ -121,27 +179,10 @@ public sealed class VdbeAfterTriggerSqlRoutingTests
         Execute(managed, "CREATE TABLE audit(id INTEGER)");
         Execute(
             managed,
-            "CREATE TRIGGER data_before BEFORE INSERT ON data BEGIN INSERT INTO audit VALUES (NEW.id); END");
-        Execute(
-            managed,
             "CREATE TRIGGER data_after AFTER INSERT ON data BEGIN INSERT INTO audit VALUES (NEW.id); END");
 
-        AssertExplainFallsBack(managed, "EXPLAIN INSERT INTO data VALUES (1)");
         AssertExplainFallsBack(managed, "EXPLAIN INSERT INTO data VALUES (1) RETURNING id");
         AssertExplainFallsBack(managed, "EXPLAIN INSERT OR IGNORE INTO data VALUES (1)");
-
-        using var sqlite = OpenSqlite();
-        Execute(sqlite, "CREATE TABLE data(id INTEGER PRIMARY KEY)");
-        Execute(sqlite, "CREATE TABLE audit(id INTEGER)");
-        Execute(
-            sqlite,
-            "CREATE TRIGGER data_before BEFORE INSERT ON data BEGIN INSERT INTO audit VALUES (NEW.id); END");
-        Execute(
-            sqlite,
-            "CREATE TRIGGER data_after AFTER INSERT ON data BEGIN INSERT INTO audit VALUES (NEW.id); END");
-        Execute(managed, "INSERT INTO data VALUES (1)");
-        Execute(sqlite, "INSERT INTO data VALUES (1)");
-        AssertQueriesMatch(managed, sqlite, "SELECT id FROM audit ORDER BY rowid");
     }
 
     [Test]
@@ -196,6 +237,76 @@ public sealed class VdbeAfterTriggerSqlRoutingTests
             (SqliteChangeOperation.Insert, "audit", 1),
             (SqliteChangeOperation.Delete, "deleted", 1),
             (SqliteChangeOperation.Insert, "audit", 2));
+    }
+
+    [Test]
+    public void SimpleBeforeUpdateTriggersRouteOldAndNewThroughProgramAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE data(value INTEGER)",
+            "CREATE TABLE audit(kind TEXT, old_value INTEGER, new_value INTEGER)",
+            "INSERT INTO data VALUES (1), (2)",
+            "CREATE TRIGGER data_before BEFORE UPDATE ON data BEGIN "
+                + "INSERT INTO audit VALUES ('before', OLD.value, NEW.value); END",
+            "CREATE TRIGGER data_after AFTER UPDATE ON data BEGIN "
+                + "INSERT INTO audit VALUES ('after', OLD.value, NEW.value); END",
+        ];
+
+        using var database = new EmbeddedDatabase();
+        using var managed = database.Connect();
+        using var sqlite = OpenSqlite();
+        ExecuteBoth(managed, sqlite, setup);
+
+        var opcodes = ReadRows(managed, "EXPLAIN UPDATE data SET value = value + 10")
+            .Select(row => row[1].AsText())
+            .ToList();
+        opcodes.Count(static opcode => opcode == "Program").Should().Be(2);
+        opcodes.Should().Contain("ColumnRange").And.Contain("ResetOnce");
+
+        Execute(managed, "UPDATE data SET value = value + 10");
+        Execute(sqlite, "UPDATE data SET value = value + 10");
+        AssertQueriesMatch(managed, sqlite, "SELECT value FROM data ORDER BY rowid");
+        AssertQueriesMatch(
+            managed,
+            sqlite,
+            "SELECT kind, old_value, new_value FROM audit ORDER BY rowid");
+    }
+
+    [Test]
+    public void BeforeUpdateRaiseIgnoreSkipsTheUpdateAndLaterTriggers()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE data(value INTEGER)",
+            "CREATE TABLE audit(value TEXT)",
+            "INSERT INTO data VALUES (1), (2), (3)",
+            "CREATE TRIGGER data_before BEFORE UPDATE ON data BEGIN "
+                + "INSERT INTO audit VALUES ('before-' || NEW.value); "
+                + "SELECT CASE WHEN NEW.value = 12 THEN RAISE(IGNORE) END; END",
+            "CREATE TRIGGER data_after AFTER UPDATE ON data BEGIN "
+                + "INSERT INTO audit VALUES ('after-' || NEW.value); END",
+        ];
+
+        using var database = new EmbeddedDatabase();
+        using var managed = database.Connect();
+        using var sqlite = OpenSqlite();
+        ExecuteBoth(managed, sqlite, setup);
+        Execute(managed, "UPDATE data SET value = value + 10");
+        Execute(sqlite, "UPDATE data SET value = value + 10");
+        AssertQueriesMatch(managed, sqlite, "SELECT value FROM data ORDER BY rowid");
+        AssertQueriesMatch(managed, sqlite, "SELECT value FROM audit ORDER BY rowid");
+    }
+
+    [Test]
+    public void StrictInsertEmitsTypeCheck()
+    {
+        using var database = new EmbeddedDatabase();
+        using var managed = database.Connect();
+        Execute(managed, "CREATE TABLE data(id INTEGER PRIMARY KEY, value INTEGER) STRICT");
+        ReadRows(managed, "EXPLAIN INSERT INTO data VALUES (1, 10)")
+            .Select(row => row[1].AsText())
+            .Should().Contain("TypeCheck");
     }
 
     [Test]
@@ -366,9 +477,13 @@ public sealed class VdbeAfterTriggerSqlRoutingTests
             "CREATE TRIGGER delete_after AFTER DELETE ON deleted BEGIN "
                 + "INSERT INTO audit VALUES (OLD.id); END");
 
-        AssertExplainFallsBack(connection, "EXPLAIN UPDATE updated SET value = 1");
+        ReadRows(connection, "EXPLAIN UPDATE updated SET value = 1")
+            .Select(row => row[1].AsText())
+            .Should().Contain("Program");
+        ReadRows(connection, "EXPLAIN DELETE FROM deleted")
+            .Select(row => row[1].AsText())
+            .Should().Contain("Program");
         AssertExplainFallsBack(connection, "EXPLAIN UPDATE updated SET value = 1 RETURNING value");
-        AssertExplainFallsBack(connection, "EXPLAIN DELETE FROM deleted");
         AssertExplainFallsBack(connection, "EXPLAIN DELETE FROM deleted RETURNING id");
 
         Execute(connection, "DROP TRIGGER update_before");

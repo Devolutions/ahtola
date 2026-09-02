@@ -71,7 +71,8 @@ internal sealed record DmlReturningProgram(
 /// </summary>
 public readonly record struct DmlCompileOptions(
     VdbeInsertFlags MutationFlags = VdbeInsertFlags.None,
-    bool EmitForeignKeyChecks = false)
+    bool EmitForeignKeyChecks = false,
+    bool EmitChangeCount = false)
 {
     public static DmlCompileOptions Default => default;
 
@@ -397,6 +398,13 @@ public static class DmlStatementCompiler
 
         instructions.Add(new NextInstruction(cursor, new ProgramCounter(loopStart)));
         instructions.Add(new CommitInstruction(cursor));
+        if (options.EmitChangeCount)
+        {
+            registerCount = Math.Max(registerCount, 1);
+            instructions.Add(new ChangeCountInstruction(new Register(0)));
+            instructions.Add(new ResultRowInstruction(new RegisterRange(new Register(0), 1)));
+        }
+
         AppendForeignKeyChecks(instructions, options);
         instructions.Add(new CloseCursorInstruction(cursor));
         instructions.Add(new HaltInstruction());

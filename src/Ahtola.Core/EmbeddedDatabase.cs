@@ -530,6 +530,30 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    internal bool TryWriteBlobColumn(
+        EmbeddedTable table,
+        long rowId,
+        int physicalColumnIndex,
+        ulong offset,
+        ReadOnlySpan<byte> source)
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null || _readOnly || _fileCatalogWriteLock is null)
+                return false;
+
+            using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
+            {
+                if (!_fileStore.TryWriteBlobColumn(table, rowId, physicalColumnIndex, offset, source))
+                    return false;
+
+                _ownedCommittedGeneration = _fileStore.CommittedViewGeneration;
+                _ownedViewToken = _fileStore.CaptureCommittedViewToken();
+                return true;
+            }
+        }
+    }
+
     internal bool SetConnectionExclusiveLockingMode(bool exclusive, TimeSpan busyTimeout)
     {
         lock (_lockingModeGate)
@@ -23190,14 +23214,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // tried in order:
     //
     //  1. The streaming program (WindowProgramBuilder): the narrow shapes whose window calls all share
-    //     a running-prefix, exact-current-row, or literal 1 PRECEDING ROWS frame over aggregate
-    //     functions of bare columns. Moving shapes use AggInverse; none buffers a partition.
+    //     a running-prefix, exact-current-row, bounded ROWS n PRECEDING / m FOLLOWING, or RANGE/GROUPS
+    //     peer frame over aggregate functions of bare columns. Moving ROWS shapes use AggInverse;
+    //     peer frames delay emit in an ephemeral table until the ORDER BY group ends.
     //     See TryBuildStreamingWindowProgram for its exact grammar.
     //  2. The buffered-window program (BufferedWindowProgramBuilder): every other window shape whose
     //     inputs are computable from one scanned row. It buffers the scanned rows through the
     //     OpenWindowBuffer/WindowBufferInsert/WindowBufferCompute/WindowBufferData opcode family and
-    //     defers every window semantic — partitioning, per-partition ordering, peer groups, ROWS/RANGE/
-    //     GROUPS frames, EXCLUDE, FILTER, and the ranking/navigation/aggregate families — to the
+    //     defers remaining window semantics — value/group-offset RANGE/GROUPS frames, EXCLUDE, FILTER,
+    //     and the ranking/navigation families — to the
     //     evaluator's own ComputeWindowFunctions through a VdbeWindowEvaluator. That is what makes
     //     sliding, forward-looking and peer-relative frames representable exactly.
     //
@@ -23382,10 +23407,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        compiled = new CompiledSelect(
-            LimitOffsetProgramBuilder.Apply(program, offset, limit),
-            [new VdbeCursorSource(target.Rows)]);
+        var compiledProgram = LimitOffsetProgramBuilder.Apply(program, offset, limit);
+        compiled = new CompiledSelect(compiledProgram, BindWindowCursorSources(compiledProgram, target.Rows));
         return true;
+    }
+
+    private static VdbeCursorSource[] BindWindowCursorSources(VdbeProgram program, IReadOnlyList<SqlValue[]> rows)
+    {
+        var sources = new VdbeCursorSource[program.CursorCount];
+        sources[0] = new VdbeCursorSource(rows);
+        for (var index = 1; index < sources.Length; index++)
+            sources[index] = new VdbeCursorSource([]);
+        return sources;
     }
 
     private bool HasMismatchedWindowPartitionOrder(
@@ -23432,10 +23465,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // where the running frame supports the existing aggregate set, while moving frames admit
     // only inverse-capable count/sum/avg calls. Every call shares one OVER spec.
     //
-    // Exactness of the emitted (partition, order) sort order requires the top-level ORDER BY to be
-    // the partition columns (in any direction, as a bijective prefix) followed by the window ORDER BY
-    // terms verbatim; absent an ORDER BY the window must be unpartitioned and unordered so the sorter
-    // preserves scan order. Everything else declines to the buffered lowering.
+    // Accumulation is always (partition ASC, window ORDER BY). A matching top ORDER BY emits
+    // that stream directly; any other top ORDER BY is applied after the window pass. Absent a
+    // top ORDER BY, SQLite emits the window's own sort order.
     private bool TryBuildStreamingWindowProgram(
         SelectStatement select,
         ScanTarget target,
@@ -23487,8 +23519,68 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (!sawWindow || spec is null)
             return false;
-        if (!TryGetStreamingWindowFrame(spec.Frame, out var frame))
+
+        // Ranking functions ignore the SQL frame: row_number is always ROWS running,
+        // rank is RANGE running EXCLUDE GROUP (preceding-row count + 1). Mixed ranking
+        // kinds stay on the buffered evaluator. row_number may share a ROWS running or
+        // current-row frame with aggregates because both are per-physical-row.
+        WindowFrameSpec frame;
+        var rankingNames = windows
+            .Select(window => window.Aggregate.Name)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var rankingOnly = rankingNames.Length > 0
+            && rankingNames.All(name => name is "row_number" or "rank" or "dense_rank" or "lag" or "lead"
+                or "percent_rank" or "cume_dist" or "ntile");
+        if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "row_number")
+            frame = WindowFrameSpec.Running;
+        else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "rank")
+            frame = WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group };
+        else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "dense_rank")
+            frame = WindowFrameSpec.RangeRunning;
+        else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "lag")
+            frame = WindowFrameSpec.Running with { Exclusion = WindowExclusion.CurrentRow };
+        else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "lead")
+        {
+            var offset = windows.Max(window => Math.Max(1, window.NavigationOffset));
+            if (offset > WindowFrameSpec.MaxStreamingPreceding)
+                return false;
+            frame = WindowFrameSpec.Following(offset);
+        }
+        else if (rankingOnly
+            && rankingNames.All(name => name is "percent_rank" or "cume_dist" or "ntile"))
+        {
+            // These need the partition cardinality before the first emit, so the
+            // full-partition queue drains after every row has been AggStep'd.
+            frame = WindowFrameSpec.RowsFullPartition;
+        }
+        else if (rankingOnly)
             return false;
+        else if (!TryGetStreamingWindowFrame(spec.Frame, out frame))
+            return false;
+        else
+        {
+            var hasRowNumber = rankingNames.Contains("row_number");
+            var hasExclusiveRanking = rankingNames.Any(static name => name is "rank" or "dense_rank"
+                or "lag" or "lead" or "percent_rank" or "cume_dist" or "ntile");
+            var hasNavigation = rankingNames.Any(static name => name is "first_value" or "last_value" or "nth_value");
+            var hasAggregate = rankingNames.Any(static name => name is not ("row_number" or "rank" or "dense_rank"
+                or "lag" or "lead" or "percent_rank" or "cume_dist" or "ntile"
+                or "first_value" or "last_value" or "nth_value"));
+            var kindCount = (hasRowNumber ? 1 : 0)
+                + (hasExclusiveRanking ? 1 : 0)
+                + (hasNavigation ? 1 : 0)
+                + (hasAggregate ? 1 : 0);
+            if (kindCount > 1
+                && !((hasRowNumber || hasNavigation)
+                    && hasAggregate
+                    && !hasExclusiveRanking
+                    && kindCount == 2
+                    && (frame.IsRunning || frame.IsCurrentRow)))
+            {
+                return false;
+            }
+        }
 
         ValidateOrderByCollations(spec.OrderBy);
         ValidateGroupByCollations(spec.PartitionBy);
@@ -23543,20 +23635,31 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
         }
 
-        // The builder emits rows in its own (partition, order) sort order. That order is exact
-        // only when the evaluator would emit the same order:
-        //   * no ORDER BY  -> the evaluator emits scan order, which matches only the single
-        //     unordered, unpartitioned streaming frame; the sorter preserves scan order.
-        //   * ORDER BY      -> it must be [all partition columns as a bijective prefix] ++ [the
-        //     window ORDER BY terms verbatim], so the sort is partition-contiguous with window
-        //     order within each partition and equals the evaluator's output order term-for-term.
+        // The builder accumulates in (partition ASC, window ORDER BY) so partitions stay
+        // contiguous. SQLite emits that order when the SELECT has no top ORDER BY. A matching
+        // top ORDER BY is the same sort. Any other top ORDER BY is applied after the window
+        // pass by wrapping ResultRows in a second sorter.
         VdbeRowComparer orderComparer;
+        VdbeRowComparer? resultOrderComparer = null;
+        List<OrderByTerm>? emissionOrder = null;
+        if (partitionCount != 0 || windowOrderCount != 0)
+        {
+            emissionOrder = new List<OrderByTerm>(partitionCount + windowOrderCount);
+            foreach (var partitionExpression in spec.PartitionBy)
+                emissionOrder.Add(new OrderByTerm(partitionExpression, Descending: false));
+            emissionOrder.AddRange(spec.OrderBy);
+        }
+
         if (select.OrderBy.Count == 0)
         {
-            if (partitionCount != 0 || windowOrderCount != 0)
-                return false;
-
-            orderComparer = static (_, _) => 0;
+            orderComparer = emissionOrder is null
+                ? static (_, _) => 0
+                : (leftRow, rightRow) => CompareRows(
+                    CreateScanSourceRow(target, leftRow, context, outerRow),
+                    CreateScanSourceRow(target, rightRow, context, outerRow),
+                    emissionOrder,
+                    parameters,
+                    context);
         }
         else
         {
@@ -23567,40 +23670,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 return false;
             }
-            if (resolvedOrderBy.Count != partitionCount + windowOrderCount)
-                return false;
-
-            var partitionOrdinals = new HashSet<int>(partitionColumns);
-            var seenOrdinals = new HashSet<int>();
-            for (var index = 0; index < partitionCount; index++)
-            {
-                var topExpression = resolvedOrderBy[index].Expression;
-                if (UnwrapCollation(topExpression) is not ColumnExpression column
-                    || target.ResolveColumnIndex(column.Name) is not { } ordinal
-                    || !partitionOrdinals.Contains(ordinal)
-                    || !seenOrdinals.Add(ordinal))
-                {
-                    return false;
-                }
-
-                var partitionIndex = partitionColumns.IndexOf(ordinal);
-                if (!CollationsEquivalent(
-                        GetEffectiveCollation(topExpression, context),
-                        GetEffectiveCollation(spec.PartitionBy[partitionIndex], context)))
-                {
-                    return false;
-                }
-            }
-
-            for (var index = 0; index < windowOrderCount; index++)
-            {
-                var top = resolvedOrderBy[partitionCount + index];
-                var windowTerm = spec.OrderBy[index];
-                if (!top.Expression.Equals(windowTerm.Expression)
-                    || top.Descending != windowTerm.Descending
-                    || top.NullPlacement != windowTerm.NullPlacement)
-                    return false;
-            }
 
             foreach (var term in resolvedOrderBy)
             {
@@ -23608,12 +23677,81 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     return false;
             }
 
-            orderComparer = (leftRow, rightRow) => CompareRows(
-                CreateScanSourceRow(target, leftRow, context, outerRow),
-                CreateScanSourceRow(target, rightRow, context, outerRow),
-                resolvedOrderBy,
-                parameters,
-                context);
+            var matchesEmission = emissionOrder is not null
+                && resolvedOrderBy.Count == emissionOrder.Count;
+            if (matchesEmission)
+            {
+                var partitionOrdinals = new HashSet<int>(partitionColumns);
+                var seenOrdinals = new HashSet<int>();
+                for (var index = 0; index < partitionCount; index++)
+                {
+                    var topExpression = resolvedOrderBy[index].Expression;
+                    if (UnwrapCollation(topExpression) is not ColumnExpression column
+                        || target.ResolveColumnIndex(column.Name) is not { } ordinal
+                        || !partitionOrdinals.Contains(ordinal)
+                        || !seenOrdinals.Add(ordinal))
+                    {
+                        matchesEmission = false;
+                        break;
+                    }
+
+                    var partitionIndex = partitionColumns.IndexOf(ordinal);
+                    if (!CollationsEquivalent(
+                            GetEffectiveCollation(topExpression, context),
+                            GetEffectiveCollation(spec.PartitionBy[partitionIndex], context)))
+                    {
+                        matchesEmission = false;
+                        break;
+                    }
+                }
+
+                if (matchesEmission)
+                {
+                    for (var index = 0; index < windowOrderCount; index++)
+                    {
+                        var top = resolvedOrderBy[partitionCount + index];
+                        var windowTerm = spec.OrderBy[index];
+                        if (!top.Expression.Equals(windowTerm.Expression)
+                            || top.Descending != windowTerm.Descending
+                            || top.NullPlacement != windowTerm.NullPlacement)
+                        {
+                            matchesEmission = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            orderComparer = emissionOrder is null
+                ? (leftRow, rightRow) => CompareRows(
+                    CreateScanSourceRow(target, leftRow, context, outerRow),
+                    CreateScanSourceRow(target, rightRow, context, outerRow),
+                    resolvedOrderBy,
+                    parameters,
+                    context)
+                : (leftRow, rightRow) => CompareRows(
+                    CreateScanSourceRow(target, leftRow, context, outerRow),
+                    CreateScanSourceRow(target, rightRow, context, outerRow),
+                    emissionOrder,
+                    parameters,
+                    context);
+
+            if (!matchesEmission)
+            {
+                var outputNames = CollectStreamingWindowOutputNames(select, target);
+                if (outputNames.Length != outputs.Count
+                    || !resolvedOrderBy.All(term => OutputOrderByColumnsAreProjected(term.Expression, outputNames)))
+                {
+                    return false;
+                }
+
+                resultOrderComparer = (leftRow, rightRow) => CompareRows(
+                    new SourceRow(outputNames, leftRow),
+                    new SourceRow(outputNames, rightRow),
+                    resolvedOrderBy,
+                    parameters,
+                    context);
+            }
         }
 
         // Partition boundary detection reuses the evaluator's group-key equality so a routed
@@ -23627,6 +23765,97 @@ public sealed partial class EmbeddedDatabase : IDisposable
             partitionComparer = groupComparer;
         }
 
+        IReadOnlyList<int>? orderColumns = null;
+        VdbeGroupComparer? peerComparer = null;
+        if (frame.IsPeerFrame)
+        {
+            var peerColumns = new List<int>();
+            var peerNames = new List<string>();
+            foreach (var term in spec.OrderBy)
+            {
+                if (UnwrapCollation(term.Expression) is not ColumnExpression column
+                    || target.ResolveColumnIndex(column.Name) is not { } ordinal)
+                {
+                    return false;
+                }
+
+                peerColumns.Add(ordinal);
+                peerNames.Add(column.Name);
+            }
+
+            orderColumns = peerColumns;
+            if (peerColumns.Count > 0)
+            {
+                var orderExpressions = spec.OrderBy.Select(static term => term.Expression).ToArray();
+                var (_, groupComparer) = BuildGroupComparers(
+                    orderExpressions, peerNames, target, predicate, parameters, context, outerRow);
+                peerComparer = groupComparer;
+            }
+        }
+
+        var descendingOrder = false;
+        if (frame.IsRangePreceding || frame.IsRangeFollowing)
+        {
+            if (orderColumns is not { Count: 1 } || spec.OrderBy.Count != 1)
+                return false;
+
+            descendingOrder = spec.OrderBy[0].Descending;
+        }
+
+        if (frame.IsBoundedPrecedingToPreceding)
+        {
+            if (windows.Any(window => window.Aggregate.Inverse is null))
+                return false;
+
+            var start = frame.StartOffset!.Value;
+            var end = frame.EndOffset!.Value;
+            for (var index = 0; index < windows.Count; index++)
+            {
+                var window = windows[index];
+                windows[index] = window with
+                {
+                    Aggregate = WrapPrecedingToPreceding(window.Aggregate, start, end),
+                };
+            }
+
+            frame = WindowFrameSpec.Running with { Exclusion = frame.Exclusion };
+        }
+
+        if (frame.IsRangePrecedingFollowing
+            || frame.IsGroupsPrecedingFollowing
+            || frame.IsNonIntegerRangeOffset)
+        {
+            if (spec.OrderBy.Count != 1
+                || UnwrapCollation(spec.OrderBy[0].Expression) is not ColumnExpression orderColumn
+                || target.ResolveColumnIndex(orderColumn.Name) is not { } orderOrdinal)
+            {
+                return false;
+            }
+
+            var descending = spec.OrderBy[0].Descending;
+            var startOffset = BoundToDouble(frame.BoundValue, frame.Start == WindowBound.Preceding ? frame.StartOffset : 0);
+            var endOffset = BoundToDouble(frame.EndBoundValue, frame.End == WindowBound.Following ? frame.EndOffset : 0);
+            var groups = frame.IsGroupsPrecedingFollowing;
+            for (var index = 0; index < windows.Count; index++)
+            {
+                var window = windows[index];
+                var columns = window.ArgumentColumns.ToList();
+                if (!columns.Contains(orderOrdinal))
+                    columns.Add(orderOrdinal);
+
+                var keyIndex = columns.IndexOf(orderOrdinal);
+                windows[index] = window with
+                {
+                    ArgumentColumns = columns,
+                    Aggregate = groups
+                        ? WrapGroupsBound(window.Aggregate, keyIndex, (long)startOffset, (long)endOffset, Compare)
+                        : WrapRangeBound(window.Aggregate, keyIndex, startOffset, endOffset, descending),
+                };
+            }
+
+            frame = WindowFrameSpec.RowsFullPartition;
+        }
+
         program = WindowProgramBuilder.Build(
             target.TableName,
             target.Columns.Length,
@@ -23636,8 +23865,65 @@ public sealed partial class EmbeddedDatabase : IDisposable
             orderComparer,
             partitionComparer,
             predicate,
-            frame);
+            frame,
+            orderColumns,
+            peerComparer,
+            descendingOrder);
+        if (resultOrderComparer is not null)
+        {
+            // Inverse and peer-flush programs have jump-dense delay rings; re-sorting their
+            // ResultRows is left on the buffered lowering so those frames stay exact.
+            if (program.Instructions.Any(static instruction =>
+                    instruction is AggInverseInstruction or ColumnRangeInstruction))
+            {
+                program = null!;
+                return false;
+            }
+
+            program = LimitOffsetProgramBuilder.ApplyResultOrder(program, resultOrderComparer);
+        }
         return true;
+    }
+
+    private static string[] CollectStreamingWindowOutputNames(SelectStatement select, ScanTarget target)
+    {
+        var names = new List<string>();
+        foreach (var projection in select.Projections)
+        {
+            switch (projection.Expression)
+            {
+                case StarExpression:
+                    names.AddRange(target.Columns);
+                    break;
+                case ColumnExpression column:
+                    names.Add(projection.Alias ?? column.Name);
+                    break;
+                default:
+                    names.Add(projection.Alias ?? projection.SourceText ?? string.Empty);
+                    break;
+            }
+        }
+
+        return names.ToArray();
+    }
+
+    private static bool OutputOrderByColumnsAreProjected(Expression expression, string[] outputNames)
+    {
+        var names = new HashSet<string>(outputNames, StringComparer.OrdinalIgnoreCase);
+        return Visit(expression);
+
+        bool Visit(Expression node) => node switch
+        {
+            ColumnExpression column => names.Contains(column.Name),
+            CollationExpression collation => Visit(collation.Expression),
+            CastExpression cast => Visit(cast.Expression),
+            UnaryExpression unary => Visit(unary.Operand),
+            BinaryExpression binary => Visit(binary.Left) && Visit(binary.Right),
+            LiteralExpression or ParameterExpression or CurrentTimeExpression => true,
+            FunctionExpression function when function.Window is null && function.Filter is null
+                => function.Arguments.All(Visit),
+            _ => false,
+        };
     }
 
     // The general buffered-window lowering: every window shape whose inputs are computable from one
@@ -23815,14 +24101,39 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         var functions = windowFunctions.ToArray();
-        return bufferedRows =>
-        {
-            var rows = new List<SourceRow>(bufferedRows.Count);
-            foreach (var row in bufferedRows)
-                rows.Add(CreateScanSourceRow(target, row, context, outerRow));
+        return bufferedRows => ComputeWindowFunctionValueRows(
+            functions,
+            new LazyWindowSourceRows(
+                bufferedRows,
+                row => CreateScanSourceRow(target, row, context, outerRow)),
+            parameters,
+            context);
+    }
 
-            return ComputeWindowFunctionValueRows(functions, rows, parameters, context);
-        };
+    private sealed class LazyWindowSourceRows : IReadOnlyList<SourceRow>
+    {
+        private readonly IReadOnlyList<SqlValue[]> _rows;
+        private readonly Func<SqlValue[], SourceRow> _materialize;
+
+        public LazyWindowSourceRows(
+            IReadOnlyList<SqlValue[]> rows,
+            Func<SqlValue[], SourceRow> materialize)
+        {
+            _rows = rows;
+            _materialize = materialize;
+        }
+
+        public int Count => _rows.Count;
+
+        public SourceRow this[int index] => _materialize(_rows[index]);
+
+        public IEnumerator<SourceRow> GetEnumerator()
+        {
+            for (var index = 0; index < Count; index++)
+                yield return this[index];
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     // Lowers one computed projection over window results: the delegate receives the whole
@@ -23952,83 +24263,665 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         output = default;
 
-        // Frame/window modifiers the streaming accumulator cannot honor. FILTER would need to
-        // evaluate a predicate over columns the accumulator does not buffer; DISTINCT dedup is not
-        // modeled by the emitted AggStep.
-        if (function.Distinct || function.Filter is not null)
+        // DISTINCT window aggregates are rejected by ValidateWindowFunction; keep them off
+        // this route so the evaluator raises the same error.
+        if (function.Distinct)
             return false;
 
         var window = function.Window!;
-        if (!TryGetStreamingWindowFrame(window.Frame, out var frame))
-            return false;
-        if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG"))
-            return false;
-
-        // The bytecode shape only models aggregate accumulation. Dedicated ranking,
-        // navigation, and value functions decline to the evaluator; managed percentile
-        // aggregates also decline because they are not available as window functions.
-        if (!IsBuiltInAggregate(function)
-            && !TryGetAggregateFunction(function.Name, function.Arguments.Count, out _))
+        var ranking = function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK" or "LAG" or "LEAD"
+            or "PERCENT_RANK" or "CUME_DIST" or "NTILE";
+        var navigationOffset = 0;
+        WindowFrameSpec frame;
+        if (ranking)
         {
-            return false;
-        }
+            if (function.Name is "LAG" or "LEAD")
+            {
+                if (function.Arguments.Count is < 1 or > 3 || function.CountStar || function.Filter is not null)
+                    return false;
+                navigationOffset = 1;
+                if (function.Arguments.Count >= 2
+                    && function.Arguments[1] is LiteralExpression { Value.Kind: SqlValueKind.Integer } offset)
+                {
+                    var value = offset.Value.AsInteger();
+                    if (value is < 1 or > WindowFrameSpec.MaxStreamingPreceding)
+                        return false;
+                    navigationOffset = (int)value;
+                }
+                else if (function.Arguments.Count >= 2)
+                {
+                    return false;
+                }
+            }
+            else if (function.Name == "NTILE")
+            {
+                if (function.Arguments.Count != 1 || function.CountStar || function.Filter is not null)
+                    return false;
+                if (function.Arguments[0] is not LiteralExpression { Value.Kind: SqlValueKind.Integer } buckets
+                    || buckets.Value.AsInteger() is < 1 or > WindowFrameSpec.MaxStreamingPreceding)
+                {
+                    return false;
+                }
 
-        // Every window call must share one identical OVER spec so a single sorter pass and one
-        // partition/order layout serve them all.
-        if (spec is null)
-            spec = window;
-        else if (!WindowSpecsEqual(spec, window))
-            return false;
-
-        // Arguments must be bare, backed columns (or the nullary count(*)); group_concat(col, sep)
-        // and any computed argument decline because the accumulator only buffers column tuples.
-        var argumentColumns = new List<int>(function.Arguments.Count);
-        var argumentNames = new string[function.Arguments.Count];
-        for (var index = 0; index < function.Arguments.Count; index++)
-        {
-            if (function.Arguments[index] is not ColumnExpression column
-                || target.ResolveColumnIndex(column.Name) is not { } ordinal)
+                navigationOffset = (int)buckets.Value.AsInteger();
+            }
+            else if (function.Arguments.Count != 0 || function.CountStar)
             {
                 return false;
             }
 
-            argumentColumns.Add(ordinal);
-            argumentNames[index] = column.Name;
+            frame = function.Name switch
+            {
+                "ROW_NUMBER" => WindowFrameSpec.Running,
+                "RANK" => WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group },
+                "LAG" => WindowFrameSpec.Running with { Exclusion = WindowExclusion.CurrentRow },
+                "LEAD" => WindowFrameSpec.Following(Math.Max(1, navigationOffset)),
+                "PERCENT_RANK" or "CUME_DIST" or "NTILE" => WindowFrameSpec.RowsFullPartition,
+                _ => WindowFrameSpec.RangeRunning,
+            };
+        }
+        else
+        {
+            if (!TryGetStreamingWindowFrame(window.Frame, out frame))
+                return false;
+            if ((frame.IsRangePreceding
+                    || frame.IsRangeFollowing
+                    || frame.IsRangePrecedingFollowing
+                    || frame.IsNonIntegerRangeOffset)
+                && window.OrderBy.Count != 1)
+            {
+                return false;
+            }
+
+            // Dedicated navigation functions (ntile/percent_rank/cume_dist) and managed
+            // percentile aggregates stay on the buffered evaluator. Ranking, lag/lead,
+            // first_value/last_value, and nth_value are handled as streaming accumulators.
+            if (!IsBuiltInAggregate(function)
+                && function.Name is not ("FIRST_VALUE" or "LAST_VALUE" or "NTH_VALUE")
+                && !TryGetAggregateFunction(function.Name, function.Arguments.Count, out _))
+            {
+                return false;
+            }
+
+            if (function.Name == "NTH_VALUE")
+            {
+                if (function.Arguments.Count != 2
+                    || function.Arguments[1] is not LiteralExpression { Value.Kind: SqlValueKind.Integer } nth
+                    || nth.Value.AsInteger() is < 1 or > WindowFrameSpec.MaxStreamingPreceding)
+                {
+                    return false;
+                }
+
+                navigationOffset = (int)nth.Value.AsInteger();
+            }
         }
 
-        var aggregate = BuildAccumulatorAggregate(function, argumentNames, parameters, context, outerRow);
+        // Every window call must share one identical OVER spec so a single sorter pass and one
+        // partition/order layout serve them all. row_number may share a ROWS running/current
+        // frame with aggregates; other ranking kinds stay exclusive.
+        if (spec is null)
+            spec = window;
+        else if (!WindowSpecsEqual(spec, window))
+            return false;
+        if (windows.Count > 0)
+        {
+            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank" or "dense_rank" or "lag" or "lead"
+                or "percent_rank" or "cume_dist" or "ntile";
+            if (existingRanking != ranking)
+            {
+                var existingName = windows[0].Aggregate.Name;
+                if (ranking && function.Name != "ROW_NUMBER")
+                    return false;
+                if (!ranking && existingName != "row_number")
+                    return false;
+            }
+            else if (ranking
+                && windows[0].Aggregate.Name != function.Name.ToLowerInvariant()
+                && !AreCompatiblePartitionRankings(windows[0].Aggregate.Name, function.Name))
+            {
+                return false;
+            }
+        }
+
+        // Arguments must be bare columns, folded constants (group_concat separators), or
+        // scan-evaluable expressions whose referenced columns can be copied into AggStep.
+        var argumentColumns = new List<int>(function.Arguments.Count);
+        var argumentNames = new List<string>(function.Arguments.Count);
+        for (var index = 0; index < function.Arguments.Count; index++)
+        {
+            if (function.Arguments[index] is ColumnExpression column
+                && target.ResolveColumnIndex(column.Name) is { } ordinal)
+            {
+                AddUniqueWindowArgument(argumentColumns, argumentNames, ordinal, column.Name);
+                continue;
+            }
+
+            if (IsConstantScalarExpression(function.Arguments[index]))
+                continue;
+
+            if (!IsScanPredicate(function.Arguments[index])
+                || ReferencesUnbackedRowid(function.Arguments[index], target)
+                || !TryAddExpressionColumns(
+                    function.Arguments[index], target, argumentColumns, argumentNames))
+            {
+                return false;
+            }
+        }
+
+        // dense_rank/percent_rank/cume_dist detect peer groups from the ORDER BY key, so
+        // those columns become the AggStep argument tuple even though the SQL function is nullary.
+        if (function.Name is "DENSE_RANK" or "PERCENT_RANK" or "CUME_DIST")
+        {
+            foreach (var term in window.OrderBy)
+            {
+                if (UnwrapCollation(term.Expression) is not ColumnExpression column
+                    || target.ResolveColumnIndex(column.Name) is not { } ordinal)
+                {
+                    return false;
+                }
+
+                argumentColumns.Add(ordinal);
+            }
+        }
+
+        VdbeRowPredicate? filter = null;
+        if (function.Filter is not null && !ranking)
+        {
+            if (!TryAddExpressionColumns(function.Filter, target, argumentColumns, argumentNames))
+                return false;
+
+            filter = CompileRowPredicate(function.Filter, target, parameters, context, outerRow);
+            if (filter is null)
+                return false;
+        }
+
+        var names = argumentNames.ToArray();
+        var aggregate = BuildAccumulatorAggregate(function, names, parameters, context, outerRow);
+        if (function.Filter is not null && !ranking)
+            aggregate = ApplyWindowFilter(aggregate, function.Filter, names, parameters, context, outerRow);
         if (frame.RequiresInverse && aggregate.Inverse is null)
             return false;
 
         var windowIndex = windows.Count;
-        windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns));
+        windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns, filter, navigationOffset));
         output = WindowOutput.ForWindow(windowIndex);
         return true;
     }
 
-    // The streaming builder handles the running prefix, exact current row, and literal 1 PRECEDING.
-    // Moving frames follow Turso's order: step, emit, then inverse the departing row.
-    private static bool TryGetStreamingWindowFrame(WindowFrame? frame, out WindowFrameSpec spec)
+    private static double BoundToDouble(SqlValue? bound, long? fallback)
     {
-        spec = default;
-        if (frame is null
-            || frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows
-            || frame.Exclusion != FrameExclusion.NoOthers)
+        if (bound is { Kind: SqlValueKind.Integer } integer)
+            return integer.AsInteger();
+        if (bound is { Kind: SqlValueKind.Real } real)
+            return real.AsReal();
+        return fallback ?? 0;
+    }
+
+    private static VdbeAggregate WrapRangeBound(
+        VdbeAggregate inner,
+        int keyIndex,
+        double startOffset,
+        double endOffset,
+        bool descending)
+    {
+        return new VdbeAggregate
+        {
+            Name = inner.Name,
+            CreateContext = () => new RangeBoundAccumulator(inner, keyIndex, startOffset, endOffset, descending),
+            Accumulate = static (contextObject, arguments) =>
+            {
+                ((RangeBoundAccumulator)contextObject!).Add(arguments);
+                return contextObject;
+            },
+            Finalize = static contextObject => ((RangeBoundAccumulator)contextObject!).Finalize(),
+        };
+    }
+
+    private static VdbeAggregate WrapGroupsBound(
+        VdbeAggregate inner,
+        int keyIndex,
+        long startOffset,
+        long endOffset,
+        Func<SqlValue, SqlValue, string?, int> compare)
+    {
+        return new VdbeAggregate
+        {
+            Name = inner.Name,
+            CreateContext = () => new GroupsBoundAccumulator(inner, keyIndex, startOffset, endOffset, compare),
+            Accumulate = static (contextObject, arguments) =>
+            {
+                ((GroupsBoundAccumulator)contextObject!).Add(arguments);
+                return contextObject;
+            },
+            Finalize = static contextObject => ((GroupsBoundAccumulator)contextObject!).Finalize(),
+        };
+    }
+
+    private static VdbeAggregate WrapPrecedingToPreceding(VdbeAggregate inner, long start, long end)
+    {
+        var capacity = start - end + 1;
+        return new VdbeAggregate
+        {
+            Name = inner.Name,
+            CreateContext = () => new PrecedingToPrecedingAccumulator(inner, end, capacity),
+            Accumulate = static (contextObject, arguments) =>
+            {
+                ((PrecedingToPrecedingAccumulator)contextObject!).Add(arguments);
+                return contextObject;
+            },
+            Finalize = static contextObject =>
+                ((PrecedingToPrecedingAccumulator)contextObject!).Finalize(),
+        };
+    }
+
+    private VdbeAggregate ApplyWindowFilter(
+        VdbeAggregate inner,
+        Expression filter,
+        string[] argumentNames,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        bool Pass(SqlValue[] arguments)
+        {
+            var row = argumentNames.Length == 0
+                ? null
+                : new SourceRow(argumentNames, arguments, Parent: outerRow);
+            return IsTrue(Evaluate(filter, parameters, row, context));
+        }
+
+        return new VdbeAggregate
+        {
+            Name = inner.Name,
+            CreateContext = inner.CreateContext,
+            Accumulate = (contextObject, arguments) =>
+                Pass(arguments) ? inner.Accumulate(contextObject, arguments) : contextObject,
+            Inverse = inner.Inverse is null
+                ? null
+                : (contextObject, arguments) =>
+                    Pass(arguments) ? inner.Inverse(contextObject, arguments) : contextObject,
+            Finalize = inner.Finalize,
+        };
+    }
+
+    private static bool AreCompatiblePartitionRankings(string left, string right)
+    {
+        static bool PartitionRank(string name) =>
+            name is "percent_rank" or "cume_dist" or "ntile"
+            or "PERCENT_RANK" or "CUME_DIST" or "NTILE";
+
+        return PartitionRank(left) && PartitionRank(right);
+    }
+
+    private static void AddUniqueWindowArgument(
+        List<int> argumentColumns,
+        List<string> argumentNames,
+        int ordinal,
+        string name)
+    {
+        if (argumentColumns.Contains(ordinal))
+            return;
+
+        argumentColumns.Add(ordinal);
+        argumentNames.Add(name);
+    }
+
+    private bool TryAddExpressionColumns(
+        Expression expression,
+        ScanTarget target,
+        List<int> argumentColumns,
+        List<string> argumentNames)
+    {
+        switch (expression)
+        {
+            case LiteralExpression:
+            case ParameterExpression:
+            case CurrentTimeExpression:
+            case StarExpression:
+                return true;
+            case ColumnExpression column:
+                if (target.ResolveColumnIndex(column.Name) is not { } ordinal)
+                    return false;
+                AddUniqueWindowArgument(argumentColumns, argumentNames, ordinal, column.Name);
+                return true;
+            case CollationExpression collation:
+                return TryAddExpressionColumns(collation.Expression, target, argumentColumns, argumentNames);
+            case CastExpression cast:
+                return TryAddExpressionColumns(cast.Expression, target, argumentColumns, argumentNames);
+            case UnaryExpression unary:
+                return TryAddExpressionColumns(unary.Operand, target, argumentColumns, argumentNames);
+            case BinaryExpression binary:
+                return TryAddExpressionColumns(binary.Left, target, argumentColumns, argumentNames)
+                    && TryAddExpressionColumns(binary.Right, target, argumentColumns, argumentNames);
+            case FunctionExpression function when function.Window is null:
+                foreach (var argument in function.Arguments)
+                {
+                    if (!TryAddExpressionColumns(argument, target, argumentColumns, argumentNames))
+                        return false;
+                }
+
+                return true;
+            case CaseExpression cased:
+                if (cased.Operand is not null
+                    && !TryAddExpressionColumns(cased.Operand, target, argumentColumns, argumentNames))
+                {
+                    return false;
+                }
+
+                foreach (var clause in cased.Clauses)
+                {
+                    if (!TryAddExpressionColumns(clause.When, target, argumentColumns, argumentNames)
+                        || !TryAddExpressionColumns(clause.Then, target, argumentColumns, argumentNames))
+                    {
+                        return false;
+                    }
+                }
+
+                return cased.Else is null
+                    || TryAddExpressionColumns(cased.Else, target, argumentColumns, argumentNames);
+            case BetweenExpression between:
+                return TryAddExpressionColumns(between.Value, target, argumentColumns, argumentNames)
+                    && TryAddExpressionColumns(between.Lower, target, argumentColumns, argumentNames)
+                    && TryAddExpressionColumns(between.Upper, target, argumentColumns, argumentNames);
+            case LikeExpression like:
+                return TryAddExpressionColumns(like.Value, target, argumentColumns, argumentNames)
+                    && TryAddExpressionColumns(like.Pattern, target, argumentColumns, argumentNames)
+                    && (like.Escape is null
+                        || TryAddExpressionColumns(like.Escape, target, argumentColumns, argumentNames));
+            default:
+                return false;
+        }
+    }
+
+    private static bool TryGetRangeBound(
+        Ahtola.Core.Parsing.FrameBound bound,
+        FrameBoundKind expected,
+        out SqlValue value)
+    {
+        value = default;
+        if (bound.Kind != expected)
+            return false;
+        if (bound.Offset is not LiteralExpression literal)
+            return false;
+        if (literal.Value.Kind is not (SqlValueKind.Integer or SqlValueKind.Real))
+            return false;
+
+        if (literal.Value.Kind == SqlValueKind.Integer)
+        {
+            var integer = literal.Value.AsInteger();
+            if (integer is <= 0 or > WindowFrameSpec.MaxStreamingPreceding)
+                return false;
+        }
+        else if (literal.Value.AsReal() is <= 0 or > WindowFrameSpec.MaxStreamingPreceding)
         {
             return false;
         }
 
+        value = literal.Value;
+        return true;
+    }
+
+    // The streaming builder handles the running prefix, exact current row, bounded ROWS
+    // n PRECEDING / m FOLLOWING, RANGE/GROUPS peer frames (unbounded preceding or
+    // current row), GROUPS n PRECEDING, and RANGE n PRECEDING (single ORDER BY key).
+    // Moving ROWS frames follow Turso's order: step, emit, then inverse.
+    private static bool TryGetStreamingWindowFrame(WindowFrame? frame, out WindowFrameSpec spec)
+    {
+        spec = default;
+        var exclusion = frame?.Exclusion switch
+        {
+            FrameExclusion.CurrentRow => WindowExclusion.CurrentRow,
+            FrameExclusion.Group => WindowExclusion.Group,
+            FrameExclusion.Ties => WindowExclusion.Ties,
+            _ => WindowExclusion.NoOthers,
+        };
+        if (exclusion is WindowExclusion.Group or WindowExclusion.Ties
+            && frame is not null
+            && !((frame.Start.Kind is FrameBoundKind.UnboundedPreceding or FrameBoundKind.CurrentRow)
+                && frame.End.Kind == FrameBoundKind.CurrentRow
+                && frame.Start.Offset is null
+                && frame.End.Offset is null))
+        {
+            return false;
+        }
+
+        if (exclusion == WindowExclusion.CurrentRow
+            && (frame is null
+                || frame.End.Kind != FrameBoundKind.CurrentRow
+                || frame.Start.Kind is not (FrameBoundKind.UnboundedPreceding or FrameBoundKind.CurrentRow)
+                || frame.Start.Offset is not null
+                || frame.End.Offset is not null))
+        {
+            return false;
+        }
+
+        if (frame is null
+            || ((frame.Mode is Ahtola.Core.Parsing.WindowFrameMode.Range
+                    or Ahtola.Core.Parsing.WindowFrameMode.Groups)
+                && frame.Start.Kind == FrameBoundKind.UnboundedPreceding
+                && frame.End.Kind == FrameBoundKind.CurrentRow
+                && frame.Start.Offset is null
+                && frame.End.Offset is null))
+        {
+            spec = (frame is { Mode: Ahtola.Core.Parsing.WindowFrameMode.Groups }
+                ? WindowFrameSpec.GroupsRunning
+                : WindowFrameSpec.RangeRunning) with { Exclusion = exclusion };
+            return true;
+        }
+
+        if (frame.Mode is Ahtola.Core.Parsing.WindowFrameMode.Range
+                or Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+                ? WindowFrameSpec.GroupsCurrentPeer
+                : WindowFrameSpec.RangeCurrentPeer) with { Exclusion = exclusion };
+            return true;
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } groupsOffset,
+            }
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Offset is null)
+        {
+            var preceding = groupsOffset.Value.AsInteger();
+            if (preceding == 0)
+            {
+                spec = WindowFrameSpec.GroupsCurrentPeer with { Exclusion = exclusion };
+                return true;
+            }
+
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.GroupsPreceding(preceding);
+                return true;
+            }
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.Start.Offset is null
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Following,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } groupsFollowingOffset,
+            })
+        {
+            var following = groupsFollowingOffset.Value.AsInteger();
+            if (following == 0)
+            {
+                spec = WindowFrameSpec.GroupsCurrentPeer with { Exclusion = exclusion };
+                return true;
+            }
+
+            if (following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.GroupsFollowing(following);
+                return true;
+            }
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } rangeOffset,
+            }
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Offset is null)
+        {
+            var preceding = rangeOffset.Value.AsInteger();
+            if (preceding == 0)
+            {
+                spec = WindowFrameSpec.RangeCurrentPeer with { Exclusion = exclusion };
+                return true;
+            }
+
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.RangePreceding(preceding);
+                return true;
+            }
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.Start.Offset is null
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Following,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } rangeFollowingOffset,
+            })
+        {
+            var following = rangeFollowingOffset.Value.AsInteger();
+            if (following == 0)
+            {
+                spec = WindowFrameSpec.RangeCurrentPeer with { Exclusion = exclusion };
+                return true;
+            }
+
+            if (following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.RangeFollowing(following);
+                return true;
+            }
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && TryGetRangeBound(frame.Start, FrameBoundKind.Preceding, out var rangeStartBound)
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Offset is null
+            && rangeStartBound.Kind == SqlValueKind.Real)
+        {
+            spec = WindowFrameSpec.RangePrecedingBound(rangeStartBound);
+            return true;
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.Start.Offset is null
+            && TryGetRangeBound(frame.End, FrameBoundKind.Following, out var rangeEndBound)
+            && rangeEndBound.Kind == SqlValueKind.Real)
+        {
+            spec = WindowFrameSpec.RangeFollowingBound(rangeEndBound);
+            return true;
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && TryGetRangeBound(frame.Start, FrameBoundKind.Preceding, out var bothStart)
+            && TryGetRangeBound(frame.End, FrameBoundKind.Following, out var bothEnd))
+        {
+            spec = WindowFrameSpec.RangeBounds(bothStart, bothEnd);
+            return true;
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } groupsBothStart,
+            }
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Following,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } groupsBothEnd,
+            })
+        {
+            var preceding = groupsBothStart.Value.AsInteger();
+            var following = groupsBothEnd.Value.AsInteger();
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding
+                && following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.GroupsPrecedingAndFollowing(preceding, following);
+                return true;
+            }
+        }
+
+        if (frame.Mode is Ahtola.Core.Parsing.WindowFrameMode.Range
+                or Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Kind == FrameBoundKind.UnboundedFollowing
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+                ? WindowFrameSpec.GroupsUnboundedFollowing
+                : WindowFrameSpec.RangeUnboundedFollowing;
+            return true;
+        }
+
+        if (frame.Mode is Ahtola.Core.Parsing.WindowFrameMode.Range
+                or Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start.Kind == FrameBoundKind.UnboundedPreceding
+            && frame.End.Kind == FrameBoundKind.UnboundedFollowing
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+                ? WindowFrameSpec.GroupsFullPartition
+                : WindowFrameSpec.RangeFullPartition;
+            return true;
+        }
+
+        if (frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows)
+            return false;
+
         if (frame.Start.Kind == FrameBoundKind.UnboundedPreceding
             && frame.End.Kind == FrameBoundKind.CurrentRow)
         {
-            spec = WindowFrameSpec.Running;
+            spec = WindowFrameSpec.Running with { Exclusion = exclusion };
             return true;
         }
 
         if (frame.Start.Kind == FrameBoundKind.CurrentRow
             && frame.End.Kind == FrameBoundKind.CurrentRow)
         {
-            spec = WindowFrameSpec.CurrentRow;
+            spec = WindowFrameSpec.CurrentRow with { Exclusion = exclusion };
+            return true;
+        }
+
+        if (frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Kind == FrameBoundKind.UnboundedFollowing
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = WindowFrameSpec.RowsUnboundedFollowing;
+            return true;
+        }
+
+        if (frame.Start.Kind == FrameBoundKind.UnboundedPreceding
+            && frame.End.Kind == FrameBoundKind.UnboundedFollowing
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = WindowFrameSpec.RowsFullPartition;
             return true;
         }
 
@@ -24037,12 +24930,103 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 Kind: FrameBoundKind.Preceding,
                 Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } offset,
             }
-            && offset.Value.AsInteger() == 1
             && frame.End.Kind == FrameBoundKind.CurrentRow
             && frame.End.Offset is null)
         {
-            spec = WindowFrameSpec.OnePreceding;
-            return true;
+            var preceding = offset.Value.AsInteger();
+            if (preceding == 0)
+            {
+                spec = WindowFrameSpec.CurrentRow with { Exclusion = exclusion };
+                return true;
+            }
+
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.Preceding(preceding);
+                return true;
+            }
+        }
+
+        if (frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.Start.Offset is null
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Following,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } followingOffset,
+            })
+        {
+            var following = followingOffset.Value.AsInteger();
+            if (following == 0)
+            {
+                spec = WindowFrameSpec.CurrentRow with { Exclusion = exclusion };
+                return true;
+            }
+
+            if (following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.Following(following);
+                return true;
+            }
+        }
+
+        if (frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } startOffset,
+            }
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Following,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } endOffset,
+            })
+        {
+            var preceding = startOffset.Value.AsInteger();
+            var following = endOffset.Value.AsInteger();
+            if (preceding == 0 && following == 0)
+            {
+                spec = WindowFrameSpec.CurrentRow with { Exclusion = exclusion };
+                return true;
+            }
+
+            if (preceding == 0 && following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.Following(following);
+                return true;
+            }
+
+            if (following == 0 && preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.Preceding(preceding);
+                return true;
+            }
+
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding
+                && following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.PrecedingAndFollowing(preceding, following);
+                return true;
+            }
+        }
+
+        if (frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } startPreceding,
+            }
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } endPreceding,
+            })
+        {
+            var start = startPreceding.Value.AsInteger();
+            var end = endPreceding.Value.AsInteger();
+            if (start is > 0 and <= WindowFrameSpec.MaxStreamingPreceding
+                && end is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.PrecedingToPreceding(start, end);
+                return true;
+            }
         }
 
         return false;
@@ -24080,6 +25064,167 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        SqlValue ValueOf(Expression expression, SqlValue[] arguments) =>
+            Evaluate(
+                expression,
+                parameters,
+                argumentNames.Length == 0
+                    ? null
+                    : new SourceRow(argumentNames, arguments, Parent: outerRow),
+                context);
+
+        if (function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK"
+            or "PERCENT_RANK" or "CUME_DIST" or "NTILE")
+        {
+            if (function.Name == "DENSE_RANK")
+            {
+                return new VdbeAggregate
+                {
+                    Name = "dense_rank",
+                    CreateContext = () => new DenseRankAccumulator(Compare),
+                    Accumulate = static (contextObject, arguments) =>
+                    {
+                        ((DenseRankAccumulator)contextObject!).Add(arguments);
+                        return contextObject;
+                    },
+                    Finalize = static contextObject =>
+                        SqlValue.Integer(((DenseRankAccumulator)contextObject!).Rank),
+                };
+            }
+
+            if (function.Name is "PERCENT_RANK" or "CUME_DIST")
+            {
+                var cume = function.Name == "CUME_DIST";
+                return new VdbeAggregate
+                {
+                    Name = cume ? "cume_dist" : "percent_rank",
+                    CreateContext = () => new PartitionRankAccumulator(Compare, cume),
+                    Accumulate = static (contextObject, arguments) =>
+                    {
+                        ((PartitionRankAccumulator)contextObject!).Add(arguments);
+                        return contextObject;
+                    },
+                    Finalize = static contextObject =>
+                        ((PartitionRankAccumulator)contextObject!).Finalize(),
+                };
+            }
+
+            if (function.Name == "NTILE")
+            {
+                var buckets = function.Arguments[0] is LiteralExpression { Value.Kind: SqlValueKind.Integer } literal
+                    ? literal.Value.AsInteger()
+                    : 1;
+                return new VdbeAggregate
+                {
+                    Name = "ntile",
+                    CreateContext = () => new NtileAccumulator(buckets),
+                    Accumulate = static (contextObject, _) =>
+                    {
+                        ((NtileAccumulator)contextObject!).Add();
+                        return contextObject;
+                    },
+                    Finalize = static contextObject =>
+                        SqlValue.Integer(((NtileAccumulator)contextObject!).Finalize()),
+                };
+            }
+
+            var rank = function.Name == "RANK";
+            return new VdbeAggregate
+            {
+                Name = rank ? "rank" : "row_number",
+                CreateContext = static () => new CountAggregateAccumulator(),
+                Accumulate = static (contextObject, _) =>
+                {
+                    ((CountAggregateAccumulator)contextObject!).Add();
+                    return contextObject;
+                },
+                Inverse = static (contextObject, _) =>
+                {
+                    ((CountAggregateAccumulator)contextObject!).Remove();
+                    return contextObject;
+                },
+                Finalize = contextObject =>
+                {
+                    var count = ((CountAggregateAccumulator)contextObject!).Count;
+                    return SqlValue.Integer(rank ? count + 1 : count);
+                },
+            };
+        }
+
+        if (function.Name is "FIRST_VALUE" or "LAST_VALUE" or "LAG" or "LEAD" or "NTH_VALUE"
+            && function.Arguments.Count >= 1)
+        {
+            var keepFirst = function.Name == "FIRST_VALUE";
+            var defaultValue = SqlValue.Null;
+            var navigationOffset = 1L;
+            if (function.Name is "LAG" or "LEAD")
+            {
+                if (function.Arguments.Count >= 2
+                    && function.Arguments[1] is LiteralExpression { Value.Kind: SqlValueKind.Integer } offset)
+                {
+                    navigationOffset = offset.Value.AsInteger();
+                }
+
+                if (function.Arguments.Count == 3)
+                    defaultValue = Evaluate(function.Arguments[2], parameters, null, context);
+            }
+            else if (function.Name == "NTH_VALUE"
+                && function.Arguments[1] is LiteralExpression { Value.Kind: SqlValueKind.Integer } nth)
+            {
+                navigationOffset = nth.Value.AsInteger();
+            }
+
+            return new VdbeAggregate
+            {
+                Name = function.Name.ToLowerInvariant(),
+                CreateContext = () => function.Name switch
+                {
+                    "LAG" => new LagAccumulator(navigationOffset, defaultValue),
+                    "LEAD" => new LeadAccumulator(navigationOffset, defaultValue),
+                    "NTH_VALUE" => new NthValueAccumulator(navigationOffset),
+                    _ => new WindowValueAccumulator(keepFirst, defaultValue),
+                },
+                Accumulate = (contextObject, arguments) =>
+                {
+                    var value = ValueOf(function.Arguments[0], arguments);
+                    switch (contextObject)
+                    {
+                        case LagAccumulator lag:
+                            lag.Add(value);
+                            break;
+                        case LeadAccumulator lead:
+                            lead.Add(value);
+                            break;
+                        case NthValueAccumulator nthValue:
+                            nthValue.Add(value);
+                            break;
+                        default:
+                            ((WindowValueAccumulator)contextObject!).Add(value);
+                            break;
+                    }
+
+                    return contextObject;
+                },
+                Inverse = function.Name is "LEAD" or "NTH_VALUE"
+                    ? (contextObject, arguments) =>
+                    {
+                        if (contextObject is LeadAccumulator lead)
+                            lead.Remove();
+                        else
+                            ((NthValueAccumulator)contextObject!).Remove();
+                        return contextObject;
+                    }
+                    : null,
+                Finalize = static contextObject => contextObject switch
+                {
+                    LagAccumulator lag => lag.Finalize(),
+                    LeadAccumulator lead => lead.Finalize(),
+                    NthValueAccumulator nthValue => nthValue.Finalize(),
+                    _ => ((WindowValueAccumulator)contextObject!).Finalize(),
+                },
+            };
+        }
+
         if (function.Name == "COUNT" && (function.CountStar || function.Arguments.Count is 0 or 1))
         {
             var countAll = function.CountStar || function.Arguments.Count == 0;
@@ -24090,14 +25235,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 Accumulate = (contextObject, arguments) =>
                 {
                     var accumulator = (CountAggregateAccumulator)contextObject!;
-                    if (countAll || arguments[0].Kind != SqlValueKind.Null)
+                    if (countAll || ValueOf(function.Arguments[0], arguments).Kind != SqlValueKind.Null)
                         accumulator.Add();
                     return accumulator;
                 },
                 Inverse = (contextObject, arguments) =>
                 {
                     var accumulator = (CountAggregateAccumulator)contextObject!;
-                    if (countAll || arguments[0].Kind != SqlValueKind.Null)
+                    if (countAll || ValueOf(function.Arguments[0], arguments).Kind != SqlValueKind.Null)
                         accumulator.Remove();
                     return accumulator;
                 },
@@ -24111,9 +25256,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             Func<object?, SqlValue[], object?>? inverse = null;
             if (function.Name is "SUM" or "AVG")
             {
-                inverse = static (contextObject, arguments) =>
+                inverse = (contextObject, arguments) =>
                 {
-                    ((NumericAggregateAccumulator)contextObject!).Remove(arguments[0]);
+                    ((NumericAggregateAccumulator)contextObject!).Remove(ValueOf(function.Arguments[0], arguments));
                     return contextObject;
                 };
             }
@@ -24124,13 +25269,34 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 CreateContext = () => new NumericAggregateAccumulator(
                     forceReal: function.Name == "TOTAL",
                     average: function.Name == "AVG"),
-                Accumulate = static (contextObject, arguments) =>
+                Accumulate = (contextObject, arguments) =>
                 {
-                    ((NumericAggregateAccumulator)contextObject!).Accumulate(arguments[0]);
+                    ((NumericAggregateAccumulator)contextObject!).Accumulate(ValueOf(function.Arguments[0], arguments));
                     return contextObject;
                 },
                 Inverse = inverse,
                 Finalize = static contextObject => ((NumericAggregateAccumulator)contextObject!).Finalize(),
+            };
+        }
+
+        if (function.Name is "MIN" or "MAX" && function.Arguments.Count == 1)
+        {
+            var maximum = function.Name == "MAX";
+            return new VdbeAggregate
+            {
+                Name = function.Name.ToLowerInvariant(),
+                CreateContext = () => new ExtremumAggregateAccumulator(maximum, Compare),
+                Accumulate = (contextObject, arguments) =>
+                {
+                    ((ExtremumAggregateAccumulator)contextObject!).Add(ValueOf(function.Arguments[0], arguments));
+                    return contextObject;
+                },
+                Inverse = (contextObject, arguments) =>
+                {
+                    ((ExtremumAggregateAccumulator)contextObject!).Remove(ValueOf(function.Arguments[0], arguments));
+                    return contextObject;
+                },
+                Finalize = static contextObject => ((ExtremumAggregateAccumulator)contextObject!).Finalize(),
             };
         }
 
@@ -24140,8 +25306,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
             CreateContext = static () => new List<SqlValue[]>(),
             Accumulate = static (contextObject, arguments) =>
             {
-                ((List<SqlValue[]>)contextObject!).Add(arguments);
+                var copy = new SqlValue[arguments.Length];
+                Array.Copy(arguments, copy, arguments.Length);
+                ((List<SqlValue[]>)contextObject!).Add(copy);
                 return contextObject;
+            },
+            Inverse = static (contextObject, _) =>
+            {
+                var tuples = (List<SqlValue[]>)contextObject!;
+                if (tuples.Count == 0)
+                    throw new InvalidOperationException("Aggregate inverse removed a row from an empty window.");
+
+                tuples.RemoveAt(0);
+                return tuples;
             },
             Finalize = contextObject =>
             {
@@ -24747,6 +25924,82 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     MutationFlags: VdbeInsertFlags.None,
                     EmitForeignKeyChecks: context.ForeignKeysEnabled
                         && TableParticipatesInForeignKeys(context, statement.TableName, table));
+
+        if (table.Strict && !hasReturning)
+        {
+            SqlValue[][]? builtRows = null;
+            long[]? builtRowIds = null;
+            void EnsureBuiltRows()
+            {
+                if (builtRows is not null)
+                    return;
+
+                builtRows = new SqlValue[statement.Rows.Count][];
+                builtRowIds = new long[statement.Rows.Count];
+                for (var index = 0; index < statement.Rows.Count; index++)
+                {
+                    var (row, rowId) = BuildInsertRow(
+                        statement,
+                        table,
+                        plan,
+                        statement.Rows[index],
+                        parameters,
+                        context);
+                    builtRows[index] = row;
+                    builtRowIds[index] = rowId;
+                }
+            }
+
+            var parameterCount = table.Columns.Length + 1;
+            var parameterRegisters = Enumerable.Range(0, parameterCount)
+                .Select(static index => new Register(index))
+                .ToArray();
+            var beforeMutation = new List<VdbeInstruction>();
+            InsertStrictTypeCheck(beforeMutation, table, statement.TableName, parameterRegisters);
+            writeTarget = new VdbeWriteTarget
+            {
+                TableName = statement.TableName,
+                RowCount = statement.Rows.Count,
+                GetRow = index =>
+                {
+                    EnsureBuiltRows();
+                    return builtRows![index];
+                },
+                GetRowId = index =>
+                {
+                    EnsureBuiltRows();
+                    return builtRowIds![index];
+                },
+                MutateRow = index =>
+                {
+                    EnsureBuiltRows();
+                    var row = builtRows![index];
+                    var rowId = builtRowIds![index];
+                    rowsToInsert.Add(row);
+                    insertedRowIds.Add(rowId);
+                    return new VdbeRowMutation(row, rowId);
+                },
+                Commit = () =>
+                {
+                    CommitInserts(context, statement.TableName, table, rowsToInsert, insertedRowIds);
+                    return table.HasRowid && insertedRowIds.Count > 0
+                        ? insertedRowIds[^1]
+                        : (long?)null;
+                },
+            };
+            compiled = new CompiledDml(
+                DmlStatementCompiler.BuildProgramWithMutationPrograms(
+                    DmlKind.Insert,
+                    statement.TableName,
+                    table.Columns.Length,
+                    filter: null,
+                    beforeMutation,
+                    afterMutation: [],
+                    registerCount: parameterCount,
+                    options: dmlOptions),
+                [writeTarget]);
+            return true;
+        }
 
         compiled = hasReturning
             ? DmlStatementCompiler.CompileWithFilter(
@@ -26794,7 +28047,7 @@ out bool hasReturning)
             // describing one resolves nothing and can never attach a method.
             IndexMethodCreateInstruction => VdbeExplain.Describe(instruction),
             IndexMethodDestroyInstruction => VdbeExplain.Describe(instruction),
-            _ => throw new EmbeddedSqlException($"Cannot describe unsupported opcode {instruction.Opcode}."),
+            _ => VdbeExplain.Describe(instruction),
         };
     }
 
@@ -39439,6 +40692,60 @@ out bool hasReturning)
         return accumulator.Finalize();
     }
 
+    private sealed class ExtremumAggregateAccumulator
+    {
+        private readonly bool _maximum;
+        private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private readonly List<SqlValue> _values = [];
+
+        internal ExtremumAggregateAccumulator(bool maximum, Func<SqlValue, SqlValue, string?, int> compare)
+        {
+            _maximum = maximum;
+            _compare = compare;
+        }
+
+        internal void Add(SqlValue value)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+
+            _values.Add(value);
+        }
+
+        internal void Remove(SqlValue value)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+
+            for (var index = 0; index < _values.Count; index++)
+            {
+                if (_values[index].Equals(value))
+                {
+                    _values.RemoveAt(index);
+                    return;
+                }
+            }
+
+            throw new InvalidOperationException("Aggregate inverse removed a value that was not in the frame.");
+        }
+
+        internal SqlValue Finalize()
+        {
+            if (_values.Count == 0)
+                return SqlValue.Null;
+
+            var extremum = _values[0];
+            for (var index = 1; index < _values.Count; index++)
+            {
+                var comparison = _compare(_values[index], extremum, null);
+                if (_maximum ? comparison > 0 : comparison < 0)
+                    extremum = _values[index];
+            }
+
+            return extremum;
+        }
+    }
+
     private sealed class CountAggregateAccumulator
     {
         internal long Count { get; private set; }
@@ -39452,6 +40759,410 @@ out bool hasReturning)
 
             Count--;
         }
+    }
+
+    private sealed class DenseRankAccumulator
+    {
+        private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private SqlValue[]? _lastKey;
+
+        internal DenseRankAccumulator(Func<SqlValue, SqlValue, string?, int> compare)
+        {
+            _compare = compare;
+        }
+
+        internal long Rank { get; private set; }
+
+        internal void Add(SqlValue[] key)
+        {
+            if (_lastKey is not null && KeysEqual(_lastKey, key))
+                return;
+
+            Rank++;
+            _lastKey = key.Length == 0 ? [] : (SqlValue[])key.Clone();
+        }
+
+        private bool KeysEqual(SqlValue[] left, SqlValue[] right)
+        {
+            if (left.Length != right.Length)
+                return false;
+
+            for (var index = 0; index < left.Length; index++)
+            {
+                if (_compare(left[index], right[index], null) != 0)
+                    return false;
+            }
+
+            return true;
+        }
+    }
+
+    private sealed class PartitionRankAccumulator
+    {
+        private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private readonly bool _cumeDist;
+        private readonly List<SqlValue[]> _keys = [];
+        private int _emitIndex;
+
+        internal PartitionRankAccumulator(Func<SqlValue, SqlValue, string?, int> compare, bool cumeDist)
+        {
+            _compare = compare;
+            _cumeDist = cumeDist;
+        }
+
+        internal void Add(SqlValue[] key)
+        {
+            var copy = new SqlValue[key.Length];
+            Array.Copy(key, copy, key.Length);
+            _keys.Add(copy);
+        }
+
+        internal SqlValue Finalize()
+        {
+            var count = _keys.Count;
+            var position = _emitIndex;
+            _emitIndex++;
+            if (count == 0)
+                return SqlValue.Real(0);
+
+            if (_cumeDist)
+            {
+                var end = position;
+                while (end + 1 < count && KeysEqual(_keys[end + 1], _keys[position]))
+                    end++;
+                return SqlValue.Real((double)(end + 1) / count);
+            }
+
+            if (count == 1)
+                return SqlValue.Real(0);
+
+            var start = position;
+            while (start > 0 && KeysEqual(_keys[start - 1], _keys[position]))
+                start--;
+            return SqlValue.Real((double)start / (count - 1));
+        }
+
+        private bool KeysEqual(SqlValue[] left, SqlValue[] right)
+        {
+            if (left.Length != right.Length)
+                return false;
+
+            for (var index = 0; index < left.Length; index++)
+            {
+                if (_compare(left[index], right[index], null) != 0)
+                    return false;
+            }
+
+            return true;
+        }
+    }
+
+    private sealed class RangeBoundAccumulator
+    {
+        private readonly VdbeAggregate _inner;
+        private readonly int _keyIndex;
+        private readonly double _startOffset;
+        private readonly double _endOffset;
+        private readonly bool _descending;
+        private readonly List<SqlValue[]> _rows = [];
+        private int _emitIndex;
+
+        internal RangeBoundAccumulator(
+            VdbeAggregate inner,
+            int keyIndex,
+            double startOffset,
+            double endOffset,
+            bool descending)
+        {
+            _inner = inner;
+            _keyIndex = keyIndex;
+            _startOffset = startOffset;
+            _endOffset = endOffset;
+            _descending = descending;
+        }
+
+        internal void Add(SqlValue[] arguments)
+        {
+            var copy = new SqlValue[arguments.Length];
+            Array.Copy(arguments, copy, arguments.Length);
+            _rows.Add(copy);
+        }
+
+        internal SqlValue Finalize()
+        {
+            var current = _rows[_emitIndex][_keyIndex];
+            _emitIndex++;
+            var context = _inner.CreateContext();
+            foreach (var row in _rows)
+            {
+                if (InRange(row[_keyIndex], current))
+                    context = _inner.Accumulate(context, row);
+            }
+
+            return _inner.Finalize(context);
+        }
+
+        private bool InRange(SqlValue rowKey, SqlValue currentKey)
+        {
+            if (!TryToDouble(rowKey, out var row) || !TryToDouble(currentKey, out var current))
+                return false;
+
+            return _descending
+                ? row <= current + _startOffset && row >= current - _endOffset
+                : row >= current - _startOffset && row <= current + _endOffset;
+        }
+
+        private static bool TryToDouble(SqlValue value, out double number)
+        {
+            if (value.Kind == SqlValueKind.Integer)
+            {
+                number = value.AsInteger();
+                return true;
+            }
+
+            if (value.Kind == SqlValueKind.Real)
+            {
+                number = value.AsReal();
+                return true;
+            }
+
+            number = 0;
+            return false;
+        }
+    }
+
+    private sealed class GroupsBoundAccumulator
+    {
+        private readonly VdbeAggregate _inner;
+        private readonly int _keyIndex;
+        private readonly long _startOffset;
+        private readonly long _endOffset;
+        private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private readonly List<SqlValue[]> _rows = [];
+        private int _emitIndex;
+
+        internal GroupsBoundAccumulator(
+            VdbeAggregate inner,
+            int keyIndex,
+            long startOffset,
+            long endOffset,
+            Func<SqlValue, SqlValue, string?, int> compare)
+        {
+            _inner = inner;
+            _keyIndex = keyIndex;
+            _startOffset = startOffset;
+            _endOffset = endOffset;
+            _compare = compare;
+        }
+
+        internal void Add(SqlValue[] arguments)
+        {
+            var copy = new SqlValue[arguments.Length];
+            Array.Copy(arguments, copy, arguments.Length);
+            _rows.Add(copy);
+        }
+
+        internal SqlValue Finalize()
+        {
+            var groups = new List<int>();
+            var emitGroup = 0;
+            for (var index = 0; index < _rows.Count; index++)
+            {
+                if (index == 0
+                    || _compare(_rows[index][_keyIndex], _rows[index - 1][_keyIndex], null) != 0)
+                {
+                    groups.Add(index);
+                }
+
+                if (index == _emitIndex)
+                    emitGroup = groups.Count - 1;
+            }
+
+            var first = emitGroup - (int)_startOffset;
+            if (first < 0)
+                first = 0;
+            var last = emitGroup + (int)_endOffset;
+            if (last >= groups.Count)
+                last = groups.Count - 1;
+
+            var startRow = groups[first];
+            var endRow = last + 1 < groups.Count ? groups[last + 1] : _rows.Count;
+            var context = _inner.CreateContext();
+            for (var index = startRow; index < endRow; index++)
+                context = _inner.Accumulate(context, _rows[index]);
+
+            _emitIndex++;
+            return _inner.Finalize(context);
+        }
+    }
+
+    private sealed class PrecedingToPrecedingAccumulator
+    {
+        private readonly VdbeAggregate _inner;
+        private readonly long _delay;
+        private readonly long _capacity;
+        private readonly Queue<SqlValue[]> _delayQueue = new();
+        private readonly Queue<SqlValue[]> _window = new();
+        private object? _context;
+        private bool _initialized;
+
+        internal PrecedingToPrecedingAccumulator(VdbeAggregate inner, long delay, long capacity)
+        {
+            _inner = inner;
+            _delay = delay;
+            _capacity = capacity;
+        }
+
+        internal void Add(SqlValue[] arguments)
+        {
+            var copy = new SqlValue[arguments.Length];
+            Array.Copy(arguments, copy, arguments.Length);
+            _delayQueue.Enqueue(copy);
+            if (_delayQueue.Count <= _delay || _capacity <= 0)
+                return;
+
+            var entering = _delayQueue.Dequeue();
+            if (!_initialized)
+            {
+                _context = _inner.CreateContext();
+                _initialized = true;
+            }
+
+            _context = _inner.Accumulate(_context, entering);
+            _window.Enqueue(entering);
+            if (_window.Count > _capacity && _inner.Inverse is not null)
+            {
+                var leaving = _window.Dequeue();
+                _context = _inner.Inverse(_context, leaving);
+            }
+        }
+
+        internal SqlValue Finalize()
+        {
+            if (!_initialized)
+                return _inner.Finalize(_inner.CreateContext());
+
+            return _inner.Finalize(_context);
+        }
+    }
+
+    private sealed class NtileAccumulator
+    {
+        private readonly long _buckets;
+        private int _count;
+        private int _emitIndex;
+
+        internal NtileAccumulator(long buckets)
+        {
+            _buckets = buckets;
+        }
+
+        internal void Add() => _count++;
+
+        internal long Finalize()
+        {
+            var position = _emitIndex;
+            _emitIndex++;
+            return ComputeNtile(position, _count, _buckets);
+        }
+    }
+
+    private sealed class WindowValueAccumulator
+    {
+        private readonly bool _keepFirst;
+        private readonly SqlValue _defaultValue;
+        private SqlValue _value = SqlValue.Null;
+        private bool _set;
+
+        internal WindowValueAccumulator(bool keepFirst, SqlValue defaultValue)
+        {
+            _keepFirst = keepFirst;
+            _defaultValue = defaultValue;
+        }
+
+        internal void Add(SqlValue value)
+        {
+            if (_keepFirst && _set)
+                return;
+
+            _value = value;
+            _set = true;
+        }
+
+        internal SqlValue Finalize() => _set ? _value : _defaultValue;
+    }
+
+    private sealed class LagAccumulator
+    {
+        private readonly long _offset;
+        private readonly SqlValue _defaultValue;
+        private readonly Queue<SqlValue> _values = new();
+
+        internal LagAccumulator(long offset, SqlValue defaultValue)
+        {
+            _offset = offset;
+            _defaultValue = defaultValue;
+        }
+
+        internal void Add(SqlValue value)
+        {
+            _values.Enqueue(value);
+            while (_values.Count > _offset)
+                _values.Dequeue();
+        }
+
+        internal SqlValue Finalize() =>
+            _values.Count == _offset ? _values.Peek() : _defaultValue;
+    }
+
+    private sealed class LeadAccumulator
+    {
+        private readonly long _offset;
+        private readonly SqlValue _defaultValue;
+        private readonly List<SqlValue> _values = [];
+
+        internal LeadAccumulator(long offset, SqlValue defaultValue)
+        {
+            _offset = offset;
+            _defaultValue = defaultValue;
+        }
+
+        internal void Add(SqlValue value) => _values.Add(value);
+
+        internal void Remove()
+        {
+            if (_values.Count == 0)
+                throw new InvalidOperationException("Lead inverse removed a row from an empty window.");
+
+            _values.RemoveAt(0);
+        }
+
+        internal SqlValue Finalize() =>
+            _values.Count > _offset ? _values[(int)_offset] : _defaultValue;
+    }
+
+    private sealed class NthValueAccumulator
+    {
+        private readonly long _offset;
+        private readonly List<SqlValue> _values = [];
+
+        internal NthValueAccumulator(long offset)
+        {
+            _offset = offset;
+        }
+
+        internal void Add(SqlValue value) => _values.Add(value);
+
+        internal void Remove()
+        {
+            if (_values.Count == 0)
+                throw new InvalidOperationException("nth_value inverse removed a row from an empty window.");
+
+            _values.RemoveAt(0);
+        }
+
+        internal SqlValue Finalize() =>
+            _offset <= _values.Count ? _values[(int)_offset - 1] : SqlValue.Null;
     }
 
     private sealed class NumericAggregateAccumulator
@@ -50440,6 +52151,76 @@ public sealed partial class EmbeddedConnection : IDisposable
 
             return new SqlValueIncrementalBlobReadSource(row[columnIndex]);
         }
+    }
+
+    internal bool TryWritePageNativeBlob(
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowId,
+        long offset,
+        ReadOnlySpan<byte> source)
+    {
+        ThrowIfRecursiveTriggerCallbackReentry();
+        ThrowIfDisposed();
+        if (source.IsEmpty)
+            return true;
+        if (offset < 0)
+            return false;
+
+        var database = ResolveBlobDatabase(databaseName);
+        if (!database.IsFileBacked)
+            return false;
+
+        var transactionState = GetTransactionState(database);
+        if (transactionState is not null)
+            return false;
+        if (TryGetConcurrentMvccScope(database, out _, out _))
+            return false;
+
+        database.RefreshForeignCatalogForStatementIfNeeded();
+        database.RefreshOwnedCatalogForStatementIfNeeded();
+        var catalog = database.LiveCatalog;
+        if (!catalog.Tables.TryGetValue(tableName, out var table)
+            || table.WithoutRowid
+            || !table.TryGetColumnIndex(columnName, out var logicalColumnIndex)
+            || logicalColumnIndex == table.RowidAliasColumnIndex)
+        {
+            return false;
+        }
+
+        var column = table.ColumnDefinitions[logicalColumnIndex];
+        if (column.IsGenerated && !column.GeneratedStored)
+            return false;
+
+        var physicalColumnIndex = 0;
+        for (var index = 0; index < logicalColumnIndex; index++)
+        {
+            var preceding = table.ColumnDefinitions[index];
+            if (!preceding.IsGenerated || preceding.GeneratedStored)
+                physicalColumnIndex++;
+        }
+
+        if (!database.TryWriteBlobColumn(table, rowId, physicalColumnIndex, (ulong)offset, source))
+            return false;
+
+        var position = table.RowIds.IndexOf(rowId);
+        if (position >= 0)
+        {
+            var row = table.Rows[position];
+            if ((uint)logicalColumnIndex < (uint)row.Length && row[logicalColumnIndex].Kind == SqlValueKind.Blob)
+            {
+                var blob = row[logicalColumnIndex].AsBlobSpan().ToArray();
+                if (offset < blob.Length && source.Length <= blob.Length - offset)
+                {
+                    source.CopyTo(blob.AsSpan((int)offset));
+                    row[logicalColumnIndex] = SqlValue.BlobOwned(blob);
+                }
+            }
+        }
+
+        database.RecordBlobMutation(tableName, rowId);
+        return true;
     }
 
     internal IDisposable OpenBlobMutationLease(string databaseName, string tableName, long rowId)

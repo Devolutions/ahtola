@@ -35,6 +35,13 @@ public sealed class SqliteTableLeafCell
     /// <summary>The payload bytes stored directly in this cell.</summary>
     public ReadOnlyMemory<byte> LocalPayload => _localPayload;
 
+    /// <summary>
+    /// Offset of <see cref="LocalPayload"/> from the start of the encoded cell
+    /// (payload-length varint plus rowid varint).
+    /// </summary>
+    public int LocalPayloadOffset
+        => SqliteVarint.GetLength(PayloadLength) + SqliteVarint.GetLength(unchecked((ulong)RowId));
+
     /// <summary>The first overflow page, or <see langword="null"/> for local payloads.</summary>
     public uint? FirstOverflowPage { get; }
 

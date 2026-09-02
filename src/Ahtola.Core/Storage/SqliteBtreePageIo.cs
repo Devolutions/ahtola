@@ -446,6 +446,96 @@ public static class SqliteOverflowChainWriter
     }
 
     /// <summary>
+    /// Overwrites <paramref name="source"/> onto an existing overflow chain without
+    /// reallocating pages or changing the logical payload length.
+    /// </summary>
+    public static void WriteRange(
+        ISqliteBtreePageIo pageIo,
+        uint firstOverflowPage,
+        ulong overflowPayloadLength,
+        ulong offset,
+        ReadOnlySpan<byte> source)
+    {
+        ArgumentNullException.ThrowIfNull(pageIo);
+        if (source.IsEmpty)
+            return;
+        if (offset > overflowPayloadLength || (ulong)source.Length > overflowPayloadLength - offset)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(source),
+                "SQLite overflow payload write extends past the logical payload length.");
+        }
+
+        if (overflowPayloadLength == 0)
+        {
+            if (firstOverflowPage != 0)
+                throw new InvalidDataException("An empty SQLite overflow payload must not reference an overflow page.");
+
+            return;
+        }
+
+        if (firstOverflowPage == 0)
+            throw new InvalidDataException("A non-empty SQLite overflow payload has a zero first overflow page.");
+
+        var pageCount = pageIo.PageCount;
+        var payloadCapacity = checked((ulong)(pageIo.UsableSpace - SqliteOverflowPageView.HeaderLength));
+        var targetPageIndex = offset / payloadCapacity;
+        var offsetWithinTargetPage = offset % payloadCapacity;
+        var seen = new HashSet<uint>();
+        var currentPage = firstOverflowPage;
+        ulong pageIndex = 0;
+        var copied = 0;
+
+        while (true)
+        {
+            if (currentPage < 2 || currentPage > pageCount)
+            {
+                throw new InvalidDataException(
+                    $"SQLite overflow page {currentPage} is outside the valid non-root page range 2..{pageCount}.");
+            }
+
+            if (!seen.Add(currentPage))
+                throw new InvalidDataException($"SQLite overflow chain contains a cycle at page {currentPage}.");
+
+            var image = pageIo.ReadPage(currentPage);
+            var page = SqliteOverflowPageView.Parse(image, pageIo.UsableSpace);
+            var logicalPageStart = checked(pageIndex * payloadCapacity);
+            var logicalBytesOnPage = Math.Min(payloadCapacity, overflowPayloadLength - logicalPageStart);
+            var requiresNextPage = logicalPageStart + logicalBytesOnPage < overflowPayloadLength;
+            if (requiresNextPage)
+            {
+                if (page.NextPageNumber == 0)
+                    throw new InvalidDataException("SQLite overflow chain ends before its logical payload length.");
+                if (page.NextPageNumber < 2 || page.NextPageNumber > pageCount)
+                {
+                    throw new InvalidDataException(
+                        $"SQLite overflow page {page.NextPageNumber} is outside the valid non-root page range 2..{pageCount}.");
+                }
+            }
+            else if (page.NextPageNumber != 0)
+            {
+                throw new InvalidDataException("SQLite overflow chain continues past its logical payload length.");
+            }
+
+            if (pageIndex >= targetPageIndex)
+            {
+                var within = pageIndex == targetPageIndex ? offsetWithinTargetPage : 0UL;
+                var available = checked((int)(logicalBytesOnPage - within));
+                var count = Math.Min(available, source.Length - copied);
+                source.Slice(copied, count)
+                    .CopyTo(image.AsSpan(SqliteOverflowPageView.HeaderLength + checked((int)within), count));
+                pageIo.WritePage(currentPage, image);
+                copied += count;
+                if (copied == source.Length)
+                    return;
+            }
+
+            currentPage = page.NextPageNumber;
+            pageIndex = checked(pageIndex + 1);
+        }
+    }
+
+    /// <summary>
     /// Returns every page of an overflow chain to the freelist, matching Turso
     /// free-page handling when a cell with overflow is deleted or replaced.
     /// </summary>

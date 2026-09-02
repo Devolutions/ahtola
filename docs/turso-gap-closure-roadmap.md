@@ -59,9 +59,56 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   DISTINCT/compound keyed sets, page-native bounded record-column reads,
   read-only file-backed incremental-BLOB handles over pinned pager/transaction
   views, and `AggInverse` streaming for current-row and one-preceding
-  COUNT/SUM/AVG windows. Trigger-body lowering, the remaining heap-bound
-  intermediates, broader inverse frames, page-native incremental-BLOB writes,
-  and dedicated Blob VDBE opcodes remain explicit follow-up depth.
+  COUNT/SUM/AVG windows.
+- 2026-09-01: extended `AggInverse` streaming to `ROWS n PRECEDING … CURRENT ROW`
+  for n ≤ 1024 (COUNT/SUM/AVG). The builder keeps a departing-argument ring and
+  skip counter; 1 PRECEDING bytecode is unchanged. RANGE/GROUPS, FOLLOWING,
+  EXCLUDE, and non-invertible aggregates stay on the buffered evaluator.
+  Page-native incremental-BLOB writes overwrite leaf/overflow payload in place
+  for autocommit file-backed rowid tables.
+- 2026-09-01: deferred VDBE opcodes 137–144 (`BlobRead`/`BlobWrite`/`BlobLen`,
+  `ColumnRange`, `OpenPseudo`, `TypeCheck`, `Once`, `ResetOnce`) now have
+  validation, execution, and EXPLAIN. BEFORE INSERT/UPDATE/DELETE leaf bodies
+  route through `Program` with `ColumnRange` image capture; STRICT INSERT emits
+  `TypeCheck`. Distinct worktables spill through `VdbeKeyedRowStore`; window
+  buffers fail closed against the statement memory budget.
+- 2026-09-01: appended `ChangeCount` (opcode 145). Streaming `AggInverse` now
+  covers `ROWS CURRENT ROW … m FOLLOWING` and `ROWS n PRECEDING … m FOLLOWING`
+  (n,m ≤ 1024). Ephemeral tables fail closed against the statement memory
+  budget. Streaming now also covers default RANGE/GROUPS UNBOUNDED PRECEDING
+  … CURRENT ROW and RANGE/GROUPS CURRENT ROW peer frames via an ephemeral
+  delay buffer. Streaming `GROUPS n PRECEDING … CURRENT ROW` inverses each
+  departing peer group (n ≤ 1024). Window-buffer scanned rows spill to a
+  temp file under the statement memory budget and reload for Compute.
+  Streaming `RANGE n PRECEDING … CURRENT ROW` (single ORDER BY key, n ≤ 1024)
+  keeps a history ephemeral of in-frame prior groups and compact/inverses with
+  `Compare` + `AggInverse` (ASC: `row + n >= current`; DESC subtracts and
+  flips to `<=`). Streaming `GROUPS CURRENT ROW … m FOLLOWING` delays emit
+  until m later peer groups exist (m ≤ 1024). Streaming
+  `RANGE CURRENT ROW … n FOLLOWING` (single ORDER BY key) delays emit until the
+  next ORDER BY value falls outside the offset, then flushes/inverses the
+  oldest queued group. Streaming RANGE/GROUPS `CURRENT ROW … UNBOUNDED FOLLOWING`
+  drains the queued groups at partition end with inverse; `UNBOUNDED PRECEDING …
+  UNBOUNDED FOLLOWING` emits the full-partition aggregate on every row.
+  Streaming ROWS `CURRENT ROW`/`UNBOUNDED PRECEDING` to `UNBOUNDED FOLLOWING`
+  uses a delay ephemeral and drains at partition end. ROWS running
+  `EXCLUDE CURRENT ROW` emits before AggStep. MIN/MAX on moving frames stream
+  through a value-bag inverse. Window-buffer Compute reads spilled rows by index
+  instead of reloading the partition. EXCLUDE GROUP/TIES stream on running and
+  current-peer frames (per-row inverse for TIES). FILTER on non-moving frames
+  streams via FilterRegisters. row_number, rank, and dense_rank stream as
+  COUNT-style accumulators. first_value/last_value, lag(offset ≤ 1024), and
+  group_concat with a literal separator, and scan-evaluable computed arguments
+  stream. lead and nth_value stream; FILTER on moving frames skips AggInverse
+  when the predicate is false. group_concat-style list aggregates inverse via
+  a tuple queue. percent_rank/cume_dist/ntile stream via a full-partition
+  drain. ROWS n PRECEDING AND m PRECEDING streams through a delayed-step
+  wrapper. RANGE/GROUPS n PRECEDING AND m FOLLOWING and non-integer RANGE
+  offsets stream via a full-partition drain that re-folds in-range rows on
+  Finalize. Matching-spec `row_number` plus a ROWS running/current aggregate
+  streams; extra/missing top ORDER BY re-sorts projected ResultRows. Distinct
+  OVER specs, joins/GROUP BY/compounds, and DISTINCT still use OpenWindowBuffer
+  or the evaluator.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

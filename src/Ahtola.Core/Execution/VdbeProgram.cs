@@ -387,6 +387,33 @@ public enum VdbeOpcode
 
     /// <summary>Remove one prior aggregate step as a row leaves a window frame (Turso <c>AggInverse</c>).</summary>
     AggInverse = 136,
+
+    /// <summary>Read a byte range from the current cursor column (Turso <c>BlobRead</c>).</summary>
+    BlobRead = 137,
+
+    /// <summary>Overwrite a byte range of the current cursor column in place (Turso <c>BlobWrite</c>).</summary>
+    BlobWrite = 138,
+
+    /// <summary>Store the byte length of the current cursor column (Turso <c>BlobLen</c>).</summary>
+    BlobLen = 139,
+
+    /// <summary>Copy consecutive cursor columns into consecutive registers (Turso <c>ColumnRange</c>).</summary>
+    ColumnRange = 140,
+
+    /// <summary>Open a one-row cursor over a register block (Turso <c>OpenPseudo</c>).</summary>
+    OpenPseudo = 141,
+
+    /// <summary>Apply STRICT column types to a register block (Turso <c>TypeCheck</c>).</summary>
+    TypeCheck = 142,
+
+    /// <summary>Fall through once, then jump on re-entry (Turso <c>Once</c>).</summary>
+    Once = 143,
+
+    /// <summary>Forget Once flags in a bytecode region (Turso <c>ResetOnce</c>).</summary>
+    ResetOnce = 144,
+
+    /// <summary>Store the statement change count into a register (Turso <c>ChangeCount</c>).</summary>
+    ChangeCount = 145,
 }
 
 /// <summary>
@@ -2907,6 +2934,117 @@ public sealed record AggInverseInstruction(
     public override VdbeOpcode Opcode => VdbeOpcode.AggInverse;
 }
 
+/// <summary>
+/// Copies <c>registers[Amount]</c> bytes at <c>registers[Offset]</c> from column
+/// <paramref name="ColumnIndex"/> of <paramref name="Cursor"/> into <paramref name="Destination"/>
+/// as a blob (Turso <c>BlobRead</c>). A missing or expired row stores NULL.
+/// </summary>
+public sealed record BlobReadInstruction(
+    Cursor Cursor,
+    int ColumnIndex,
+    Register Offset,
+    Register Amount,
+    Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.BlobRead;
+}
+
+/// <summary>
+/// Writes the blob in <paramref name="Source"/> at <c>registers[Offset]</c> into column
+/// <paramref name="ColumnIndex"/> of <paramref name="Cursor"/> without changing its size
+/// (Turso <c>BlobWrite</c>). Stores 1 in <paramref name="Destination"/> on success, or NULL
+/// when the handle expired.
+/// </summary>
+public sealed record BlobWriteInstruction(
+    Cursor Cursor,
+    int ColumnIndex,
+    Register Offset,
+    Register Source,
+    Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.BlobWrite;
+}
+
+/// <summary>
+/// Stores the byte length of TEXT/BLOB column <paramref name="ColumnIndex"/> of
+/// <paramref name="Cursor"/> into <paramref name="Destination"/> (Turso <c>BlobLen</c>).
+/// </summary>
+public sealed record BlobLenInstruction(
+    Cursor Cursor,
+    int ColumnIndex,
+    Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.BlobLen;
+}
+
+/// <summary>
+/// Copies <paramref name="Count"/> consecutive columns starting at
+/// <paramref name="StartColumn"/> into consecutive registers starting at
+/// <paramref name="Destination"/>. Short records use <paramref name="Defaults"/>
+/// (Turso <c>ColumnRange</c>).
+/// </summary>
+public sealed record ColumnRangeInstruction(
+    Cursor Cursor,
+    int StartColumn,
+    Register Destination,
+    int Count,
+    IReadOnlyList<SqlValue?>? Defaults = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ColumnRange;
+}
+
+/// <summary>
+/// Opens <paramref name="Cursor"/> as a one-row pseudo-table over
+/// <paramref name="Content"/> (Turso <c>OpenPseudo</c>).
+/// </summary>
+public sealed record OpenPseudoInstruction(
+    Cursor Cursor,
+    RegisterRange Content) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OpenPseudo;
+}
+
+/// <summary>
+/// Applies STRICT type checks to <paramref name="Values"/> using
+/// <paramref name="ColumnTypes"/> (Turso <c>TypeCheck</c>).
+/// </summary>
+public sealed record TypeCheckInstruction(
+    RegisterRange Values,
+    string TableName,
+    IReadOnlyList<string> ColumnTypes,
+    bool CheckGenerated = true,
+    IReadOnlyList<string>? ColumnNames = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.TypeCheck;
+}
+
+/// <summary>
+/// Falls through on the first visit, then jumps to <paramref name="ReentryTarget"/>
+/// (Turso <c>Once</c>).
+/// </summary>
+public sealed record OnceInstruction(ProgramCounter ReentryTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Once;
+}
+
+/// <summary>
+/// Clears Once flags for instructions after this one and before
+/// <paramref name="RegionEnd"/> (Turso <c>ResetOnce</c>).
+/// </summary>
+public sealed record ResetOnceInstruction(ProgramCounter RegionEnd) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ResetOnce;
+}
+
+/// <summary>
+/// Writes the statement's change count (<c>n_change</c> / <c>RowsAffected</c>) into
+/// <paramref name="Destination"/> (Turso <c>ChangeCount</c>).
+/// </summary>
+public sealed record ChangeCountInstruction(Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ChangeCount;
+}
+
 /// <summary>Finalizes <paramref name="Accumulator"/> with <paramref name="Aggregate"/>
 /// and writes the result into <paramref name="Destination"/>. It does not reset the
 /// accumulator; grouped programs emit an explicit <c>AggReset</c> before the next group.</summary>
@@ -5291,6 +5429,107 @@ public sealed class VdbeProgram
                 case CloseWindowBufferInstruction closeWindowBuffer:
                     ValidateOpenWindowBuffer(closeWindowBuffer.Buffer, openWindowBuffers, instructionIndex);
                     openWindowBuffers[closeWindowBuffer.Buffer.Index] = false;
+                    break;
+                case BlobReadInstruction blobRead:
+                    ValidateOpenCursor(blobRead.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(blobRead.Offset, instructionIndex);
+                    ValidateRegister(blobRead.Amount, instructionIndex);
+                    ValidateRegister(blobRead.Destination, instructionIndex);
+                    if (blobRead.ColumnIndex < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} BlobRead uses a negative column index.");
+                    }
+
+                    break;
+                case BlobWriteInstruction blobWrite:
+                    ValidateOpenCursor(blobWrite.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(blobWrite.Offset, instructionIndex);
+                    ValidateRegister(blobWrite.Source, instructionIndex);
+                    ValidateRegister(blobWrite.Destination, instructionIndex);
+                    if (blobWrite.ColumnIndex < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} BlobWrite uses a negative column index.");
+                    }
+
+                    break;
+                case BlobLenInstruction blobLen:
+                    ValidateOpenCursor(blobLen.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(blobLen.Destination, instructionIndex);
+                    if (blobLen.ColumnIndex < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} BlobLen uses a negative column index.");
+                    }
+
+                    break;
+                case ColumnRangeInstruction columnRange:
+                    ValidateOpenCursor(columnRange.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(columnRange.Destination, instructionIndex);
+                    if (columnRange.StartColumn < 0 || columnRange.Count < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} ColumnRange has a negative start or count.");
+                    }
+
+                    if (columnRange.Count == 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} ColumnRange copies no columns.");
+                    }
+
+                    ValidateRegisterRange(
+                        new RegisterRange(columnRange.Destination, columnRange.Count),
+                        instructionIndex);
+                    if (columnRange.Defaults is { } defaults && defaults.Count != columnRange.Count)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} ColumnRange default count {defaults.Count} does not match column count {columnRange.Count}.");
+                    }
+
+                    break;
+                case OpenPseudoInstruction openPseudo:
+                    ValidateCursor(openPseudo.Cursor, instructionIndex);
+                    ValidateRegisterRange(openPseudo.Content, instructionIndex);
+                    if (openPseudo.Content.Count <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} OpenPseudo requires a positive field count.");
+                    }
+
+                    if (openCursors[openPseudo.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {openPseudo.Cursor.Index} twice.");
+                    }
+
+                    openCursors[openPseudo.Cursor.Index] = true;
+                    cursorColumnCounts[openPseudo.Cursor.Index] = openPseudo.Content.Count;
+                    break;
+                case TypeCheckInstruction typeCheck:
+                    ValidateRegisterRange(typeCheck.Values, instructionIndex);
+                    if (string.IsNullOrWhiteSpace(typeCheck.TableName))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} TypeCheck has a blank table name.");
+                    }
+
+                    if (typeCheck.ColumnTypes is null || typeCheck.ColumnTypes.Count != typeCheck.Values.Count)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} TypeCheck column type count does not match the register range.");
+                    }
+
+                    break;
+                case OnceInstruction once:
+                    ValidateJumpTarget(once.ReentryTarget, instructionIndex);
+                    break;
+                case ResetOnceInstruction resetOnce:
+                    ValidateJumpTarget(resetOnce.RegionEnd, instructionIndex);
+                    break;
+                case ChangeCountInstruction changeCount:
+                    ValidateRegister(changeCount.Destination, instructionIndex);
                     break;
                 case HaltInstruction halt:
                     // Clean halt (error code 0) is only legal as the terminal instruction.

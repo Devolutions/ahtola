@@ -136,17 +136,40 @@ real mapping, built variant-by-variant:
 
 > Current reconciliation (2026-09-01). The pinned Turso
 > `v0.8.0-pre.7` source now declares **210** `Insn` variants and Ahtola declares
-> **137** stable opcode values (0–136). Every declared managed instruction has
+> **146** stable opcode values (0–145). Every declared managed instruction has
 > validation, execution, and EXPLAIN handling; the remaining count difference
-> is primarily consolidation or intentionally out-of-band execution, not 74
+> is primarily consolidation or intentionally out-of-band execution, not 64
 > undispatched opcodes. Since the historical matrix below was produced, Ahtola
 > also added subprograms, the seek/index/FK/ephemeral families, managed virtual
-> tables and index methods, schema/DDL opcodes, and spillable DISTINCT/compound
-> keyed sets. Newer Turso additions such as `ColumnRange`, `BlobRead`,
-> `BlobWrite`, `BlobLen`, `ChangeCount`, and `ResetOnce` must be assessed by
-> semantic family rather than by exact-name diff. `AggInverse` is now appended
-> as opcode 136 and drives exact current-row and one-preceding COUNT/SUM/AVG
-> window frames while unsupported frames retain the buffered evaluator.
+> tables and index methods, schema/DDL opcodes, spillable DISTINCT/compound
+> keyed sets, `BlobRead`/`BlobWrite`/`BlobLen`, `ColumnRange`, `OpenPseudo`,
+> `TypeCheck`, `Once`, `ResetOnce`, and `ChangeCount`. `AggInverse` is opcode
+> 136 and drives exact current-row, bounded `ROWS n PRECEDING`, `ROWS m FOLLOWING`,
+> and `ROWS n PRECEDING … m FOLLOWING` COUNT/SUM/AVG frames (n,m ≤ 1024).
+> Default `RANGE`/`GROUPS UNBOUNDED PRECEDING … CURRENT ROW` and
+> `RANGE`/`GROUPS CURRENT ROW` peer frames stream through an ephemeral delay
+> buffer; `GROUPS n PRECEDING … CURRENT ROW` inverses each departing peer
+> group; `RANGE n PRECEDING … CURRENT ROW` (single ORDER BY key) compact/inverses
+> history groups whose ORDER BY value falls outside the offset. Window-buffer
+> scanned rows spill through a temp file; Compute indexes them in place.
+> `GROUPS CURRENT ROW … m FOLLOWING` streams through a delayed peer-group ring.
+> `RANGE CURRENT ROW … n FOLLOWING` (single ORDER BY key) queues completed
+> groups and flushes the oldest when the next ORDER BY value is out of range.
+> RANGE/GROUPS `CURRENT ROW` or `UNBOUNDED PRECEDING` to `UNBOUNDED FOLLOWING`
+> stream through the same queue. ROWS unbounded FOLLOWING drains a delay
+> ephemeral; ROWS running EXCLUDE CURRENT ROW emits before AggStep. MIN/MAX
+> moving frames stream with a value-bag inverse. Window-buffer Compute indexes
+> spilled rows instead of reloading the partition. EXCLUDE GROUP/TIES stream on
+> running and current-peer frames. FILTER on non-moving frames, row_number/rank/
+> dense_rank, first_value/last_value, lag(offset ≤ 1024), and group_concat with
+> a literal separator, scan-evaluable computed arguments, lead, nth_value, and
+> FILTER on moving frames, group_concat-style list aggregates,
+> percent_rank/cume_dist/ntile, and ROWS n PRECEDING AND m PRECEDING stream.
+> RANGE/GROUPS n PRECEDING AND m FOLLOWING, and non-integer RANGE offsets
+> stream via a full-partition re-fold. Matching-spec `row_number` plus a ROWS
+> running/current aggregate streams; extra/missing top ORDER BY re-sorts
+> projected ResultRows. Distinct OVER specs stay on OpenWindowBuffer.
+> DISTINCT window aggregates are rejected.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).

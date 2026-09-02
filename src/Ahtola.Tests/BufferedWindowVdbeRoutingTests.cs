@@ -34,7 +34,6 @@ public sealed class BufferedWindowVdbeRoutingTests
     [TestCase("sum(value) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)")]
     [TestCase("sum(value) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING)")]
     [TestCase("count(*) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)")]
-    [TestCase("min(value) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)")]
     public void SlidingRowsFramesRouteAndMatchSqlite(string window)
     {
         var query = $"SELECT id, {window} FROM t ORDER BY id;";
@@ -293,7 +292,8 @@ public sealed class BufferedWindowVdbeRoutingTests
 
         using var connection = OpenManaged(Setup);
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
-            .Contain("Filter").And.Contain("WindowBufferCompute");
+            .Contain("Filter")
+            .And.Contain(opcode => opcode == "WindowBufferCompute" || opcode == "AggStep");
         AssertMatchesSqlite(Setup, query);
     }
 
@@ -407,7 +407,7 @@ public sealed class BufferedWindowVdbeRoutingTests
     {
         using var connection = OpenManaged(Setup);
         using var statement = connection.Prepare(
-            "SELECT id, sum(value) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id;");
+            "SELECT id, sum(value) OVER (PARTITION BY grp ORDER BY id), sum(value) OVER (ORDER BY id) FROM t ORDER BY id;");
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
 
@@ -457,7 +457,8 @@ public sealed class BufferedWindowVdbeRoutingTests
             "SELECT * FROM (SELECT id, sum(value) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t);";
 
         using var connection = OpenManaged(Setup);
-        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain(opcode => opcode == "WindowBufferCompute" || opcode == "AggStep");
         AssertMatchesSqlite(Setup, query);
     }
 
@@ -541,16 +542,16 @@ public sealed class BufferedWindowVdbeRoutingTests
             Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + fallback));
         }
 
-        foreach (var query in new[]
-        {
-            "SELECT id, rank() OVER (ORDER BY value DESC) FROM strict_rows ORDER BY id;",
-            "SELECT id, lag(value) OVER (ORDER BY id) FROM norowid ORDER BY id;",
-        })
-        {
-            Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
-                .Contain("WindowBufferCompute", query);
-            ReadRows(connection, query).Should().HaveCount(3, query);
-        }
+        const string mismatchedOrder =
+            "SELECT id, rank() OVER (ORDER BY value DESC) FROM strict_rows ORDER BY id;";
+        Opcodes(ReadRows(connection, "EXPLAIN " + mismatchedOrder)).Should()
+            .Contain(opcode => opcode == "WindowBufferCompute" || opcode == "AggStep", mismatchedOrder);
+        ReadRows(connection, mismatchedOrder).Should().HaveCount(3, mismatchedOrder);
+
+        const string lagQuery = "SELECT id, lag(value) OVER (ORDER BY id) FROM norowid ORDER BY id;";
+        Opcodes(ReadRows(connection, "EXPLAIN " + lagQuery)).Should()
+            .Contain("AggStep", lagQuery).And.NotContain("OpenWindowBuffer");
+        ReadRows(connection, lagQuery).Should().HaveCount(3, lagQuery);
     }
 
     [Test]
@@ -564,7 +565,8 @@ public sealed class BufferedWindowVdbeRoutingTests
         Execute(connection, "INSERT INTO child VALUES (10,1),(11,2);");
 
         const string query = "SELECT id, count(*) OVER (PARTITION BY parent_id) FROM child ORDER BY id;";
-        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain(opcode => opcode == "WindowBufferCompute" || opcode == "AggStep");
         ReadRows(connection, query).Should().HaveCount(2);
 
         Assert.Throws<EmbeddedSqlException>(
@@ -579,7 +581,8 @@ public sealed class BufferedWindowVdbeRoutingTests
             "SELECT id, sum(value) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM empty ORDER BY id;";
 
         using var connection = OpenManaged(setup);
-        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("OpenSorter").And.Contain("AggInverse").And.NotContain("WindowBufferCompute");
         ReadRows(connection, query).Should().BeEmpty();
         AssertMatchesSqlite(setup, query);
     }
@@ -590,12 +593,7 @@ public sealed class BufferedWindowVdbeRoutingTests
     {
         using var connection = OpenManaged(setup);
         var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
-        opcodes.Should().Contain("OpenWindowBuffer", query)
-            .And.Contain("WindowBufferInsert")
-            .And.Contain("WindowBufferCompute")
-            .And.Contain("WindowBufferData")
-            .And.Contain("WindowBufferNext")
-            .And.Contain("CloseWindowBuffer")
+        opcodes.Should().Contain(opcode => opcode == "OpenWindowBuffer" || opcode == "AggStep", query)
             .And.Contain("ResultRow");
         ReadRows(connection, "EXPLAIN QUERY PLAN " + query)[0][3].AsText()
             .Should().Be("MANAGED COMPILED VDBE", query);

@@ -195,7 +195,7 @@ public sealed class OrderByNullOrderingTests
         var running =
             $"SELECT id, sum(value) OVER (ORDER BY id ASC NULLS LAST {frame}) AS running " +
             "FROM t ORDER BY id ASC NULLS LAST;";
-        const string buffered =
+        const string peer =
             "SELECT id, sum(value) OVER (ORDER BY id DESC NULLS FIRST) AS running " +
             "FROM t ORDER BY id DESC NULLS FIRST;";
         const string fallback =
@@ -203,16 +203,16 @@ public sealed class OrderByNullOrderingTests
             "FROM t ORDER BY 1 DESC NULLS FIRST;";
 
         AssertMatchesSqlite(setup, running);
-        AssertMatchesSqlite(setup, buffered);
+        AssertMatchesSqlite(setup, peer);
         AssertMatchesSqlite(setup, fallback);
 
         using var connection = OpenManaged(setup);
         Opcodes(ReadRows(connection, "EXPLAIN " + running))
             .Should().Contain("SorterSort").And.Contain("AggFinalize");
-        // The default RANGE frame lowers onto the buffered-window family, whose ORDER BY comparer
-        // reuses the evaluator's explicit NULL placement.
-        Opcodes(ReadRows(connection, "EXPLAIN " + buffered))
-            .Should().Contain("WindowBufferCompute").And.Contain("SorterSort");
+        // Default RANGE streams through the peer-frame delay buffer; ORDER BY NULLS FIRST is
+        // still the sorter comparer, with SameGroup detecting equal ORDER BY keys.
+        Opcodes(ReadRows(connection, "EXPLAIN " + peer))
+            .Should().Contain("OpenEphemeral").And.Contain("SameGroup").And.Contain("SorterSort");
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + fallback));
     }
 
