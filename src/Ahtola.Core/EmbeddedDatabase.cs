@@ -24159,8 +24159,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
         }
 
-        // Arguments must be bare, backed columns or folded constants (so group_concat(col, '|')
-        // can capture the separator in the aggregate AST). Computed non-constant arguments decline.
+        // Arguments must be bare columns, folded constants (group_concat separators), or
+        // scan-evaluable expressions whose referenced columns can be copied into AggStep.
         var argumentColumns = new List<int>(function.Arguments.Count);
         var argumentNames = new List<string>(function.Arguments.Count);
         for (var index = 0; index < function.Arguments.Count; index++)
@@ -24168,19 +24168,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (function.Arguments[index] is ColumnExpression column
                 && target.ResolveColumnIndex(column.Name) is { } ordinal)
             {
-                argumentColumns.Add(ordinal);
-                argumentNames.Add(column.Name);
+                AddUniqueWindowArgument(argumentColumns, argumentNames, ordinal, column.Name);
                 continue;
             }
 
             if (IsConstantScalarExpression(function.Arguments[index]))
                 continue;
 
-            return false;
+            if (!IsScanPredicate(function.Arguments[index])
+                || ReferencesUnbackedRowid(function.Arguments[index], target)
+                || !TryAddExpressionColumns(
+                    function.Arguments[index], target, argumentColumns, argumentNames))
+            {
+                return false;
+            }
         }
-
-        if (function.Name is "FIRST_VALUE" or "LAST_VALUE" or "LAG" && argumentColumns.Count != 1)
-            return false;
 
         // dense_rank detects peer groups from the ORDER BY key, so those columns become
         // the AggStep argument tuple even though the SQL function is nullary.
@@ -24217,6 +24219,86 @@ public sealed partial class EmbeddedDatabase : IDisposable
         windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns, filter));
         output = WindowOutput.ForWindow(windowIndex);
         return true;
+    }
+
+    private static void AddUniqueWindowArgument(
+        List<int> argumentColumns,
+        List<string> argumentNames,
+        int ordinal,
+        string name)
+    {
+        if (argumentColumns.Contains(ordinal))
+            return;
+
+        argumentColumns.Add(ordinal);
+        argumentNames.Add(name);
+    }
+
+    private bool TryAddExpressionColumns(
+        Expression expression,
+        ScanTarget target,
+        List<int> argumentColumns,
+        List<string> argumentNames)
+    {
+        switch (expression)
+        {
+            case LiteralExpression:
+            case ParameterExpression:
+            case CurrentTimeExpression:
+            case StarExpression:
+                return true;
+            case ColumnExpression column:
+                if (target.ResolveColumnIndex(column.Name) is not { } ordinal)
+                    return false;
+                AddUniqueWindowArgument(argumentColumns, argumentNames, ordinal, column.Name);
+                return true;
+            case CollationExpression collation:
+                return TryAddExpressionColumns(collation.Expression, target, argumentColumns, argumentNames);
+            case CastExpression cast:
+                return TryAddExpressionColumns(cast.Expression, target, argumentColumns, argumentNames);
+            case UnaryExpression unary:
+                return TryAddExpressionColumns(unary.Operand, target, argumentColumns, argumentNames);
+            case BinaryExpression binary:
+                return TryAddExpressionColumns(binary.Left, target, argumentColumns, argumentNames)
+                    && TryAddExpressionColumns(binary.Right, target, argumentColumns, argumentNames);
+            case FunctionExpression function when function.Window is null:
+                foreach (var argument in function.Arguments)
+                {
+                    if (!TryAddExpressionColumns(argument, target, argumentColumns, argumentNames))
+                        return false;
+                }
+
+                return true;
+            case CaseExpression cased:
+                if (cased.Operand is not null
+                    && !TryAddExpressionColumns(cased.Operand, target, argumentColumns, argumentNames))
+                {
+                    return false;
+                }
+
+                foreach (var clause in cased.Clauses)
+                {
+                    if (!TryAddExpressionColumns(clause.When, target, argumentColumns, argumentNames)
+                        || !TryAddExpressionColumns(clause.Then, target, argumentColumns, argumentNames))
+                    {
+                        return false;
+                    }
+                }
+
+                return cased.Else is null
+                    || TryAddExpressionColumns(cased.Else, target, argumentColumns, argumentNames);
+            case BetweenExpression between:
+                return TryAddExpressionColumns(between.Value, target, argumentColumns, argumentNames)
+                    && TryAddExpressionColumns(between.Lower, target, argumentColumns, argumentNames)
+                    && TryAddExpressionColumns(between.Upper, target, argumentColumns, argumentNames);
+            case LikeExpression like:
+                return TryAddExpressionColumns(like.Value, target, argumentColumns, argumentNames)
+                    && TryAddExpressionColumns(like.Pattern, target, argumentColumns, argumentNames)
+                    && (like.Escape is null
+                        || TryAddExpressionColumns(like.Escape, target, argumentColumns, argumentNames));
+            default:
+                return false;
+        }
     }
 
     // The streaming builder handles the running prefix, exact current row, bounded ROWS
@@ -24551,6 +24633,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        SqlValue ValueOf(Expression expression, SqlValue[] arguments) =>
+            Evaluate(
+                expression,
+                parameters,
+                argumentNames.Length == 0
+                    ? null
+                    : new SourceRow(argumentNames, arguments, Parent: outerRow),
+                context);
+
         if (function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK")
         {
             if (function.Name == "DENSE_RANK")
@@ -24616,12 +24707,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 CreateContext = () => function.Name == "LAG"
                     ? new LagAccumulator(lagOffset, defaultValue)
                     : new WindowValueAccumulator(keepFirst, defaultValue),
-                Accumulate = static (contextObject, arguments) =>
+                Accumulate = (contextObject, arguments) =>
                 {
+                    var value = ValueOf(function.Arguments[0], arguments);
                     if (contextObject is LagAccumulator lag)
-                        lag.Add(arguments[0]);
+                        lag.Add(value);
                     else
-                        ((WindowValueAccumulator)contextObject!).Add(arguments[0]);
+                        ((WindowValueAccumulator)contextObject!).Add(value);
                     return contextObject;
                 },
                 Finalize = static contextObject => contextObject is LagAccumulator lag
@@ -24640,14 +24732,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 Accumulate = (contextObject, arguments) =>
                 {
                     var accumulator = (CountAggregateAccumulator)contextObject!;
-                    if (countAll || arguments[0].Kind != SqlValueKind.Null)
+                    if (countAll || ValueOf(function.Arguments[0], arguments).Kind != SqlValueKind.Null)
                         accumulator.Add();
                     return accumulator;
                 },
                 Inverse = (contextObject, arguments) =>
                 {
                     var accumulator = (CountAggregateAccumulator)contextObject!;
-                    if (countAll || arguments[0].Kind != SqlValueKind.Null)
+                    if (countAll || ValueOf(function.Arguments[0], arguments).Kind != SqlValueKind.Null)
                         accumulator.Remove();
                     return accumulator;
                 },
@@ -24661,9 +24753,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             Func<object?, SqlValue[], object?>? inverse = null;
             if (function.Name is "SUM" or "AVG")
             {
-                inverse = static (contextObject, arguments) =>
+                inverse = (contextObject, arguments) =>
                 {
-                    ((NumericAggregateAccumulator)contextObject!).Remove(arguments[0]);
+                    ((NumericAggregateAccumulator)contextObject!).Remove(ValueOf(function.Arguments[0], arguments));
                     return contextObject;
                 };
             }
@@ -24674,9 +24766,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 CreateContext = () => new NumericAggregateAccumulator(
                     forceReal: function.Name == "TOTAL",
                     average: function.Name == "AVG"),
-                Accumulate = static (contextObject, arguments) =>
+                Accumulate = (contextObject, arguments) =>
                 {
-                    ((NumericAggregateAccumulator)contextObject!).Accumulate(arguments[0]);
+                    ((NumericAggregateAccumulator)contextObject!).Accumulate(ValueOf(function.Arguments[0], arguments));
                     return contextObject;
                 },
                 Inverse = inverse,
@@ -24691,14 +24783,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 Name = function.Name.ToLowerInvariant(),
                 CreateContext = () => new ExtremumAggregateAccumulator(maximum, Compare),
-                Accumulate = static (contextObject, arguments) =>
+                Accumulate = (contextObject, arguments) =>
                 {
-                    ((ExtremumAggregateAccumulator)contextObject!).Add(arguments[0]);
+                    ((ExtremumAggregateAccumulator)contextObject!).Add(ValueOf(function.Arguments[0], arguments));
                     return contextObject;
                 },
-                Inverse = static (contextObject, arguments) =>
+                Inverse = (contextObject, arguments) =>
                 {
-                    ((ExtremumAggregateAccumulator)contextObject!).Remove(arguments[0]);
+                    ((ExtremumAggregateAccumulator)contextObject!).Remove(ValueOf(function.Arguments[0], arguments));
                     return contextObject;
                 },
                 Finalize = static contextObject => ((ExtremumAggregateAccumulator)contextObject!).Finalize(),

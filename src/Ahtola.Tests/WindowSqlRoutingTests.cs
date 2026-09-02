@@ -1100,6 +1100,32 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
+    public void ComputedWindowArgumentsRouteThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+        ];
+        var query =
+            $"SELECT id, sum(v + 1) OVER (ORDER BY id {RunningFrame}), first_value(v + 1) OVER (ORDER BY id {RunningFrame}) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+
+        var moving =
+            $"SELECT id, sum(v + 1) OVER (ORDER BY id {OnePrecedingFrame}) FROM t ORDER BY id;";
+        Opcodes(ReadRows(connection, "EXPLAIN " + moving)).Should()
+            .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, moving), setup, moving);
+    }
+
+    [Test]
     public void MixedRankingAndAggregateKeepsBufferedFallback()
     {
         using var connection = new EmbeddedDatabase().Connect();

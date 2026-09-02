@@ -162,10 +162,11 @@ real mapping, built variant-by-variant:
 > spilled rows instead of reloading the partition. EXCLUDE GROUP/TIES stream on
 > running and current-peer frames. FILTER on non-moving frames, row_number/rank/
 > dense_rank, first_value/last_value, lag(offset ≤ 1024), and group_concat with
-> a literal separator stream. Remaining buffered cells: FILTER on moving frames, DISTINCT window
+> a literal separator, and scan-evaluable computed arguments stream. Remaining
+> buffered cells: FILTER on moving frames, DISTINCT window
 > aggregates, percent_rank/cume_dist/ntile/lead/nth_value, lag offsets above
-> 1024, group_concat on moving frames, both-bound peer frames, and computed
-> args / mixed OVER.
+> 1024, group_concat on moving frames, both-bound peer frames, and mixed OVER
+> specs.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).
