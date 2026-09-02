@@ -314,7 +314,13 @@ public readonly record struct WindowFrameSpec(
         || IsGroupsFollowing
         || IsRangeFollowing
         || IsUnboundedFollowing
-        || IsFullPartition;
+        || IsFullPartition
+        || (IsRunning && Exclusion is WindowExclusion.Group or WindowExclusion.Ties);
+
+    /// <summary>Whether EXCLUDE GROUP/TIES is representable on this frame.</summary>
+    public bool SupportsPeerExclusion => IsPeerRunning
+        || IsPeerCurrent
+        || IsRunning;
 
     /// <summary>Whether this frame is <c>ROWS CURRENT ROW TO UNBOUNDED FOLLOWING</c>.</summary>
     public bool IsRowsUnboundedFollowing => Mode == WindowFrameMode.Rows
@@ -334,7 +340,13 @@ public readonly record struct WindowFrameSpec(
     public bool ExcludesCurrentRow => Exclusion == WindowExclusion.CurrentRow;
 
     /// <summary>Whether this frame can be lowered by the streaming builder.</summary>
-    public bool IsSupported => Exclusion is WindowExclusion.NoOthers or WindowExclusion.CurrentRow
+    public bool IsSupported => (Exclusion switch
+        {
+            WindowExclusion.NoOthers => true,
+            WindowExclusion.CurrentRow => IsRunning || IsCurrentRow || IsPeerRunning || IsPeerCurrent,
+            WindowExclusion.Group or WindowExclusion.Ties => SupportsPeerExclusion,
+            _ => false,
+        })
         && (IsRunning
             || IsCurrentRow
             || IsBoundedPreceding
@@ -342,8 +354,7 @@ public readonly record struct WindowFrameSpec(
             || IsBoundedPrecedingFollowing
             || IsPeerFrame
             || IsRowsUnboundedFollowing
-            || IsRowsFullPartition)
-        && (!ExcludesCurrentRow || IsRunning || IsCurrentRow);
+            || IsRowsFullPartition);
 
     /// <summary>Whether rows leave this frame and require an inverse-capable aggregate.</summary>
     public bool RequiresInverse => IsCurrentRow
@@ -355,7 +366,9 @@ public readonly record struct WindowFrameSpec(
         || IsGroupsFollowing
         || IsRangeFollowing
         || IsUnboundedFollowing
-        || IsRowsUnboundedFollowing;
+        || IsRowsUnboundedFollowing
+        || Exclusion is WindowExclusion.Ties
+        || (Exclusion is WindowExclusion.CurrentRow && (IsPeerRunning || IsPeerCurrent));
 }
 
 /// <summary>The kind of value a window result column projects.</summary>
@@ -749,7 +762,8 @@ public static class WindowProgramBuilder
                 groupsFollowing,
                 rangeFollowing,
                 unboundedFollowing,
-                fullPartition);
+                fullPartition,
+                frame.Exclusion);
         }
 
         var rowsQueue = frame.IsRowsUnboundedFollowing || frame.IsRowsFullPartition;
@@ -1373,7 +1387,8 @@ public static class WindowProgramBuilder
         int groupsFollowing,
         int rangeFollowing,
         bool unboundedFollowing,
-        bool fullPartition)
+        bool fullPartition,
+        WindowExclusion exclusion)
     {
         var cursor = new Cursor(0);
         var partition = partitionColumns.Count;
@@ -1388,9 +1403,13 @@ public static class WindowProgramBuilder
             : groupsPreceding + 1;
         var rangeOffset = rangePreceding == 0 ? rangeFollowing : rangePreceding;
         var usesQueue = rangeOffset > 0 || unboundedFollowing || fullPartition;
-        var rangeCursors = usesQueue ? 2 : 0;
+        var excludeScratchNeeded = exclusion != WindowExclusion.NoOthers
+            && !usesQueue
+            && groupsPreceding == 0
+            && groupsFollowing == 0;
+        var rangeCursors = usesQueue ? 2 : excludeScratchNeeded ? 1 : 0;
         var history = new Cursor(1);
-        var scratch = new Cursor(2);
+        var scratch = new Cursor(usesQueue ? 2 : 1);
         var orderColumn = orderColumns.Count == 0 ? 0 : orderColumns[0];
         var rowReg = flushBase + width;
         var boundReg = rowReg + 1;
@@ -1406,6 +1425,11 @@ public static class WindowProgramBuilder
         {
             ins.Insert(sortIndex, new OpenEphemeralInstruction(history, width));
             sortIndex++;
+            ins.Insert(sortIndex, new OpenEphemeralInstruction(scratch, width));
+            sortIndex++;
+        }
+        else if (excludeScratchNeeded)
+        {
             ins.Insert(sortIndex, new OpenEphemeralInstruction(scratch, width));
             sortIndex++;
         }
@@ -1585,7 +1609,8 @@ public static class WindowProgramBuilder
                     oldestKeyReg,
                     peerComparer,
                     unboundedFollowing,
-                    fullPartition);
+                    fullPartition,
+                    exclusion);
                 if (resetAccumulatorOnPeerChange)
                 {
                     for (var i = 0; i < windows.Count; i++)
@@ -1655,7 +1680,8 @@ public static class WindowProgramBuilder
                 oldestKeyReg,
                 peerComparer,
                 unboundedFollowing,
-                fullPartition);
+                fullPartition,
+                exclusion);
             if (resetAccumulatorOnPeerChange)
             {
                 for (var i = 0; i < windows.Count; i++)
@@ -1682,7 +1708,8 @@ public static class WindowProgramBuilder
         }
 
         ins[primeGoto] = new GotoInstruction(new ProgramCounter(accumulate));
-        EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
+        if (exclusion is not (WindowExclusion.Group or WindowExclusion.Ties))
+            EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
         ins.Add(new EphemeralInsertInstruction(cursor, stagingRange));
         ins.Add(new SorterNextInstruction(sorter, new ProgramCounter(drainLoop)));
 
@@ -1729,6 +1756,22 @@ public static class WindowProgramBuilder
                 flushBase,
                 groupsFollowing,
                 skipInverseIndex,
+                drainRemaining: true);
+        }
+        else if (excludeScratchNeeded)
+        {
+            EmitExclusionPeerBoundary(
+                ins,
+                cursor,
+                windows,
+                outputs,
+                argOffsets,
+                argBase,
+                width,
+                aggOutBase,
+                outBase,
+                flushBase,
+                exclusion,
                 drainRemaining: true);
         }
         else
@@ -2196,8 +2239,33 @@ public static class WindowProgramBuilder
         int oldestKeyReg,
         VdbeGroupComparer? peerComparer,
         bool unboundedFollowing = false,
-        bool fullPartition = false)
+        bool fullPartition = false,
+        WindowExclusion exclusion = WindowExclusion.NoOthers)
     {
+        if (exclusion != WindowExclusion.NoOthers
+            && rangePreceding == 0
+            && rangeFollowing == 0
+            && groupsPreceding == 0
+            && groupsFollowing == 0
+            && !unboundedFollowing
+            && !fullPartition)
+        {
+            EmitExclusionPeerBoundary(
+                ins,
+                delay,
+                windows,
+                outputs,
+                argOffsets,
+                argBase,
+                width,
+                aggOutBase,
+                outBase,
+                flushBase,
+                exclusion,
+                drainRemaining: false);
+            return;
+        }
+
         if (rangeFollowing > 0 || unboundedFollowing || fullPartition)
         {
             EmitRangeFollowingBoundary(
@@ -2637,6 +2705,104 @@ public static class WindowProgramBuilder
         ins[rewind] = new RewindCursorInstruction(cursor, new ProgramCounter(afterFlush));
         ins.Add(new CloseCursorInstruction(cursor));
         ins.Add(new OpenEphemeralInstruction(cursor, width));
+    }
+
+    private static void EmitStepEphemeral(
+        List<VdbeInstruction> ins,
+        Cursor source,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        int[] argOffsets,
+        int argBase,
+        int rowBase,
+        int width)
+    {
+        var rewind = ins.Count;
+        ins.Add(new RewindCursorInstruction(source, new ProgramCounter(0)));
+        var loop = ins.Count;
+        if (width > 0)
+            ins.Add(new ColumnRangeInstruction(source, 0, new Register(rowBase), width));
+        GatherArgumentsFromRow(ins, windows, argOffsets, argBase, rowBase);
+        EmitWindowSteps(ins, windows, argOffsets, argBase, rowBase);
+        ins.Add(new NextInstruction(source, new ProgramCounter(loop)));
+        ins[rewind] = new RewindCursorInstruction(source, new ProgramCounter(ins.Count));
+    }
+
+    private static void EmitExclusionPeerBoundary(
+        List<VdbeInstruction> ins,
+        Cursor delay,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        IReadOnlyList<WindowOutput> outputs,
+        int[] argOffsets,
+        int argBase,
+        int width,
+        int aggOutBase,
+        int outBase,
+        int flushBase,
+        WindowExclusion exclusion,
+        bool drainRemaining)
+    {
+        var rewind = ins.Count;
+        ins.Add(new RewindCursorInstruction(delay, new ProgramCounter(0)));
+        var loop = ins.Count;
+        if (width > 0)
+            ins.Add(new ColumnRangeInstruction(delay, 0, new Register(flushBase), width));
+
+        if (exclusion == WindowExclusion.Ties)
+        {
+            GatherArgumentsFromRow(ins, windows, argOffsets, argBase, flushBase);
+            EmitWindowSteps(ins, windows, argOffsets, argBase, flushBase);
+        }
+        else if (exclusion == WindowExclusion.CurrentRow)
+        {
+            GatherArgumentsFromRow(ins, windows, argOffsets, argBase, flushBase);
+            EmitWindowInverses(ins, windows, argOffsets, argBase);
+        }
+
+        for (var i = 0; i < windows.Count; i++)
+        {
+            ins.Add(new AggFinalizeInstruction(
+                new Accumulator(i),
+                windows[i].Aggregate,
+                new Register(aggOutBase + i)));
+        }
+
+        for (var o = 0; o < outputs.Count; o++)
+        {
+            var output = outputs[o];
+            var destination = new Register(outBase + o);
+            ins.Add(output.Kind switch
+            {
+                WindowOutputKind.Column => new CopyInstruction(
+                    new Register(flushBase + output.Index),
+                    destination),
+                WindowOutputKind.Window => new CopyInstruction(
+                    new Register(aggOutBase + output.Index),
+                    destination),
+                _ => new LoadConstantInstruction(destination, output.Constant),
+            });
+        }
+
+        ins.Add(new ResultRowInstruction(new RegisterRange(new Register(outBase), outputs.Count)));
+
+        if (exclusion == WindowExclusion.Ties)
+        {
+            GatherArgumentsFromRow(ins, windows, argOffsets, argBase, flushBase);
+            EmitWindowInverses(ins, windows, argOffsets, argBase);
+        }
+        else if (exclusion == WindowExclusion.CurrentRow)
+        {
+            GatherArgumentsFromRow(ins, windows, argOffsets, argBase, flushBase);
+            EmitWindowSteps(ins, windows, argOffsets, argBase, flushBase);
+        }
+
+        ins.Add(new NextInstruction(delay, new ProgramCounter(loop)));
+        ins[rewind] = new RewindCursorInstruction(delay, new ProgramCounter(ins.Count));
+
+        if (exclusion is WindowExclusion.Group or WindowExclusion.Ties && !drainRemaining)
+            EmitStepEphemeral(ins, delay, windows, argOffsets, argBase, flushBase, width);
+
+        ins.Add(new CloseCursorInstruction(delay));
+        ins.Add(new OpenEphemeralInstruction(delay, width));
     }
 
     private static void EmitPrecedingFrameReset(

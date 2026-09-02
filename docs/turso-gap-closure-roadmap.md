@@ -94,7 +94,10 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   uses a delay ephemeral and drains at partition end. ROWS running
   `EXCLUDE CURRENT ROW` emits before AggStep. MIN/MAX on moving frames stream
   through a value-bag inverse. Window-buffer Compute reads spilled rows by index
-  instead of reloading the partition. Remaining: EXCLUDE GROUP/TIES.
+  instead of reloading the partition. EXCLUDE GROUP/TIES stream on running and
+  current-peer frames (per-row inverse for TIES). Remaining: FILTER/DISTINCT,
+  ranking/navigation, group_concat moving frames, both-bound peer frames,
+  computed args / mixed OVER.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

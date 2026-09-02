@@ -159,8 +159,10 @@ real mapping, built variant-by-variant:
 > stream through the same queue. ROWS unbounded FOLLOWING drains a delay
 > ephemeral; ROWS running EXCLUDE CURRENT ROW emits before AggStep. MIN/MAX
 > moving frames stream with a value-bag inverse. Window-buffer Compute indexes
-> spilled rows instead of reloading the partition. EXCLUDE GROUP/TIES retain the
-> buffered evaluator.
+> spilled rows instead of reloading the partition. EXCLUDE GROUP/TIES stream on
+> running and current-peer frames. FILTER/DISTINCT, ranking/navigation,
+> group_concat on moving frames, both-bound peer frames, and computed args
+> retain the buffered evaluator.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).

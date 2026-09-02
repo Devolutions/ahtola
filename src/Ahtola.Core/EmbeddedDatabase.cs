@@ -24113,18 +24113,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private static bool TryGetStreamingWindowFrame(WindowFrame? frame, out WindowFrameSpec spec)
     {
         spec = default;
-        if (frame is not null
-            && frame.Exclusion is not (FrameExclusion.NoOthers or FrameExclusion.CurrentRow))
+        var exclusion = frame?.Exclusion switch
+        {
+            FrameExclusion.CurrentRow => WindowExclusion.CurrentRow,
+            FrameExclusion.Group => WindowExclusion.Group,
+            FrameExclusion.Ties => WindowExclusion.Ties,
+            _ => WindowExclusion.NoOthers,
+        };
+        if (exclusion is WindowExclusion.Group or WindowExclusion.Ties
+            && frame is not null
+            && !((frame.Start.Kind is FrameBoundKind.UnboundedPreceding or FrameBoundKind.CurrentRow)
+                && frame.End.Kind == FrameBoundKind.CurrentRow
+                && frame.Start.Offset is null
+                && frame.End.Offset is null))
         {
             return false;
         }
 
-        var exclusion = frame?.Exclusion == FrameExclusion.CurrentRow
-            ? WindowExclusion.CurrentRow
-            : WindowExclusion.NoOthers;
         if (exclusion == WindowExclusion.CurrentRow
             && (frame is null
-                || frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows
                 || frame.End.Kind != FrameBoundKind.CurrentRow
                 || frame.Start.Kind is not (FrameBoundKind.UnboundedPreceding or FrameBoundKind.CurrentRow)
                 || frame.Start.Offset is not null
@@ -24141,9 +24148,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 && frame.Start.Offset is null
                 && frame.End.Offset is null))
         {
-            spec = frame is { Mode: Ahtola.Core.Parsing.WindowFrameMode.Groups }
+            spec = (frame is { Mode: Ahtola.Core.Parsing.WindowFrameMode.Groups }
                 ? WindowFrameSpec.GroupsRunning
-                : WindowFrameSpec.RangeRunning;
+                : WindowFrameSpec.RangeRunning) with { Exclusion = exclusion };
             return true;
         }
 
@@ -24154,9 +24161,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             && frame.Start.Offset is null
             && frame.End.Offset is null)
         {
-            spec = frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+            spec = (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
                 ? WindowFrameSpec.GroupsCurrentPeer
-                : WindowFrameSpec.RangeCurrentPeer;
+                : WindowFrameSpec.RangeCurrentPeer) with { Exclusion = exclusion };
             return true;
         }
 
@@ -24172,7 +24179,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var preceding = groupsOffset.Value.AsInteger();
             if (preceding == 0)
             {
-                spec = WindowFrameSpec.GroupsCurrentPeer;
+                spec = WindowFrameSpec.GroupsCurrentPeer with { Exclusion = exclusion };
                 return true;
             }
 
@@ -24195,7 +24202,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var following = groupsFollowingOffset.Value.AsInteger();
             if (following == 0)
             {
-                spec = WindowFrameSpec.GroupsCurrentPeer;
+                spec = WindowFrameSpec.GroupsCurrentPeer with { Exclusion = exclusion };
                 return true;
             }
 
@@ -24218,7 +24225,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var preceding = rangeOffset.Value.AsInteger();
             if (preceding == 0)
             {
-                spec = WindowFrameSpec.RangeCurrentPeer;
+                spec = WindowFrameSpec.RangeCurrentPeer with { Exclusion = exclusion };
                 return true;
             }
 
@@ -24241,7 +24248,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var following = rangeFollowingOffset.Value.AsInteger();
             if (following == 0)
             {
-                spec = WindowFrameSpec.RangeCurrentPeer;
+                spec = WindowFrameSpec.RangeCurrentPeer with { Exclusion = exclusion };
                 return true;
             }
 
@@ -24324,7 +24331,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var preceding = offset.Value.AsInteger();
             if (preceding == 0)
             {
-                spec = WindowFrameSpec.CurrentRow;
+                spec = WindowFrameSpec.CurrentRow with { Exclusion = exclusion };
                 return true;
             }
 
@@ -24346,7 +24353,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var following = followingOffset.Value.AsInteger();
             if (following == 0)
             {
-                spec = WindowFrameSpec.CurrentRow;
+                spec = WindowFrameSpec.CurrentRow with { Exclusion = exclusion };
                 return true;
             }
 
@@ -24372,7 +24379,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var following = endOffset.Value.AsInteger();
             if (preceding == 0 && following == 0)
             {
-                spec = WindowFrameSpec.CurrentRow;
+                spec = WindowFrameSpec.CurrentRow with { Exclusion = exclusion };
                 return true;
             }
 

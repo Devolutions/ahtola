@@ -978,6 +978,27 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void RangeRunningExcludeGroupOmitsTheCurrentPeerGroup()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group },
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 0),
+            (1, 0),
+            (2, 30));
+    }
+
+    [Test]
     public void OnePrecedingMinInversesTheDepartingRow()
     {
         var program = WindowProgramBuilder.Build(
