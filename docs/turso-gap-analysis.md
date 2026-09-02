@@ -166,7 +166,9 @@ real mapping, built variant-by-variant:
 > FILTER on moving frames, group_concat-style list aggregates,
 > percent_rank/cume_dist/ntile, and ROWS n PRECEDING AND m PRECEDING stream.
 > RANGE/GROUPS n PRECEDING AND m FOLLOWING, and non-integer RANGE offsets
-> stream via a full-partition re-fold. Mixed OVER stays on OpenWindowBuffer.
+> stream via a full-partition re-fold. Matching-spec `row_number` plus a ROWS
+> running/current aggregate streams; extra/missing top ORDER BY re-sorts
+> projected ResultRows. Distinct OVER specs stay on OpenWindowBuffer.
 > DISTINCT window aggregates are rejected.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,

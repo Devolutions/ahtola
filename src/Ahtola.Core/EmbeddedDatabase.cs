@@ -23465,10 +23465,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // where the running frame supports the existing aggregate set, while moving frames admit
     // only inverse-capable count/sum/avg calls. Every call shares one OVER spec.
     //
-    // Exactness of the emitted (partition, order) sort order requires the top-level ORDER BY to be
-    // the partition columns (in any direction, as a bijective prefix) followed by the window ORDER BY
-    // terms verbatim; absent an ORDER BY the window must be unpartitioned and unordered so the sorter
-    // preserves scan order. Everything else declines to the buffered lowering.
+    // Accumulation is always (partition ASC, window ORDER BY). A matching top ORDER BY emits
+    // that stream directly; any other top ORDER BY is applied after the window pass. Absent a
+    // top ORDER BY, SQLite emits the window's own sort order.
     private bool TryBuildStreamingWindowProgram(
         SelectStatement select,
         ScanTarget target,
@@ -23523,7 +23522,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         // Ranking functions ignore the SQL frame: row_number is always ROWS running,
         // rank is RANGE running EXCLUDE GROUP (preceding-row count + 1). Mixed ranking
-        // kinds or ranking mixed with aggregates stay on the buffered evaluator.
+        // kinds stay on the buffered evaluator. row_number may share a ROWS running or
+        // current-row frame with aggregates because both are per-physical-row.
         WindowFrameSpec frame;
         var rankingNames = windows
             .Select(window => window.Aggregate.Name)
@@ -23558,6 +23558,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         else if (!TryGetStreamingWindowFrame(spec.Frame, out frame))
             return false;
+        else
+        {
+            var hasRowNumber = rankingNames.Contains("row_number");
+            var hasExclusiveRanking = rankingNames.Any(static name => name is "rank" or "dense_rank"
+                or "lag" or "lead" or "percent_rank" or "cume_dist" or "ntile");
+            var hasNavigation = rankingNames.Any(static name => name is "first_value" or "last_value" or "nth_value");
+            var hasAggregate = rankingNames.Any(static name => name is not ("row_number" or "rank" or "dense_rank"
+                or "lag" or "lead" or "percent_rank" or "cume_dist" or "ntile"
+                or "first_value" or "last_value" or "nth_value"));
+            var kindCount = (hasRowNumber ? 1 : 0)
+                + (hasExclusiveRanking ? 1 : 0)
+                + (hasNavigation ? 1 : 0)
+                + (hasAggregate ? 1 : 0);
+            if (kindCount > 1
+                && !((hasRowNumber || hasNavigation)
+                    && hasAggregate
+                    && !hasExclusiveRanking
+                    && kindCount == 2
+                    && (frame.IsRunning || frame.IsCurrentRow)))
+            {
+                return false;
+            }
+        }
 
         ValidateOrderByCollations(spec.OrderBy);
         ValidateGroupByCollations(spec.PartitionBy);
@@ -23612,38 +23635,31 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
         }
 
-        // The builder emits rows in its own (partition, order) sort order. That order is exact
-        // only when the evaluator would emit the same order:
-        //   * no ORDER BY  -> the evaluator emits scan order, which matches only the single
-        //     unordered, unpartitioned streaming frame; the sorter preserves scan order.
-        //   * ORDER BY      -> it must be [all partition columns as a bijective prefix] ++ [the
-        //     window ORDER BY terms verbatim], so the sort is partition-contiguous with window
-        //     order within each partition and equals the evaluator's output order term-for-term.
+        // The builder accumulates in (partition ASC, window ORDER BY) so partitions stay
+        // contiguous. SQLite emits that order when the SELECT has no top ORDER BY. A matching
+        // top ORDER BY is the same sort. Any other top ORDER BY is applied after the window
+        // pass by wrapping ResultRows in a second sorter.
         VdbeRowComparer orderComparer;
+        VdbeRowComparer? resultOrderComparer = null;
+        List<OrderByTerm>? emissionOrder = null;
+        if (partitionCount != 0 || windowOrderCount != 0)
+        {
+            emissionOrder = new List<OrderByTerm>(partitionCount + windowOrderCount);
+            foreach (var partitionExpression in spec.PartitionBy)
+                emissionOrder.Add(new OrderByTerm(partitionExpression, Descending: false));
+            emissionOrder.AddRange(spec.OrderBy);
+        }
+
         if (select.OrderBy.Count == 0)
         {
-            // Unordered, unpartitioned windows preserve scan order. Ranking-only queries
-            // without a top ORDER BY emit in the window's own sort order, matching SQLite.
-            if (partitionCount != 0 || windowOrderCount != 0)
-            {
-                if (!rankingOnly)
-                    return false;
-
-                var emission = new List<OrderByTerm>(partitionCount + windowOrderCount);
-                foreach (var partitionExpression in spec.PartitionBy)
-                    emission.Add(new OrderByTerm(partitionExpression, Descending: false));
-                emission.AddRange(spec.OrderBy);
-                orderComparer = (leftRow, rightRow) => CompareRows(
+            orderComparer = emissionOrder is null
+                ? static (_, _) => 0
+                : (leftRow, rightRow) => CompareRows(
                     CreateScanSourceRow(target, leftRow, context, outerRow),
                     CreateScanSourceRow(target, rightRow, context, outerRow),
-                    emission,
+                    emissionOrder,
                     parameters,
                     context);
-            }
-            else
-            {
-                orderComparer = static (_, _) => 0;
-            }
         }
         else
         {
@@ -23654,40 +23670,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 return false;
             }
-            if (resolvedOrderBy.Count != partitionCount + windowOrderCount)
-                return false;
-
-            var partitionOrdinals = new HashSet<int>(partitionColumns);
-            var seenOrdinals = new HashSet<int>();
-            for (var index = 0; index < partitionCount; index++)
-            {
-                var topExpression = resolvedOrderBy[index].Expression;
-                if (UnwrapCollation(topExpression) is not ColumnExpression column
-                    || target.ResolveColumnIndex(column.Name) is not { } ordinal
-                    || !partitionOrdinals.Contains(ordinal)
-                    || !seenOrdinals.Add(ordinal))
-                {
-                    return false;
-                }
-
-                var partitionIndex = partitionColumns.IndexOf(ordinal);
-                if (!CollationsEquivalent(
-                        GetEffectiveCollation(topExpression, context),
-                        GetEffectiveCollation(spec.PartitionBy[partitionIndex], context)))
-                {
-                    return false;
-                }
-            }
-
-            for (var index = 0; index < windowOrderCount; index++)
-            {
-                var top = resolvedOrderBy[partitionCount + index];
-                var windowTerm = spec.OrderBy[index];
-                if (!top.Expression.Equals(windowTerm.Expression)
-                    || top.Descending != windowTerm.Descending
-                    || top.NullPlacement != windowTerm.NullPlacement)
-                    return false;
-            }
 
             foreach (var term in resolvedOrderBy)
             {
@@ -23695,12 +23677,81 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     return false;
             }
 
-            orderComparer = (leftRow, rightRow) => CompareRows(
-                CreateScanSourceRow(target, leftRow, context, outerRow),
-                CreateScanSourceRow(target, rightRow, context, outerRow),
-                resolvedOrderBy,
-                parameters,
-                context);
+            var matchesEmission = emissionOrder is not null
+                && resolvedOrderBy.Count == emissionOrder.Count;
+            if (matchesEmission)
+            {
+                var partitionOrdinals = new HashSet<int>(partitionColumns);
+                var seenOrdinals = new HashSet<int>();
+                for (var index = 0; index < partitionCount; index++)
+                {
+                    var topExpression = resolvedOrderBy[index].Expression;
+                    if (UnwrapCollation(topExpression) is not ColumnExpression column
+                        || target.ResolveColumnIndex(column.Name) is not { } ordinal
+                        || !partitionOrdinals.Contains(ordinal)
+                        || !seenOrdinals.Add(ordinal))
+                    {
+                        matchesEmission = false;
+                        break;
+                    }
+
+                    var partitionIndex = partitionColumns.IndexOf(ordinal);
+                    if (!CollationsEquivalent(
+                            GetEffectiveCollation(topExpression, context),
+                            GetEffectiveCollation(spec.PartitionBy[partitionIndex], context)))
+                    {
+                        matchesEmission = false;
+                        break;
+                    }
+                }
+
+                if (matchesEmission)
+                {
+                    for (var index = 0; index < windowOrderCount; index++)
+                    {
+                        var top = resolvedOrderBy[partitionCount + index];
+                        var windowTerm = spec.OrderBy[index];
+                        if (!top.Expression.Equals(windowTerm.Expression)
+                            || top.Descending != windowTerm.Descending
+                            || top.NullPlacement != windowTerm.NullPlacement)
+                        {
+                            matchesEmission = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            orderComparer = emissionOrder is null
+                ? (leftRow, rightRow) => CompareRows(
+                    CreateScanSourceRow(target, leftRow, context, outerRow),
+                    CreateScanSourceRow(target, rightRow, context, outerRow),
+                    resolvedOrderBy,
+                    parameters,
+                    context)
+                : (leftRow, rightRow) => CompareRows(
+                    CreateScanSourceRow(target, leftRow, context, outerRow),
+                    CreateScanSourceRow(target, rightRow, context, outerRow),
+                    emissionOrder,
+                    parameters,
+                    context);
+
+            if (!matchesEmission)
+            {
+                var outputNames = CollectStreamingWindowOutputNames(select, target);
+                if (outputNames.Length != outputs.Count
+                    || !resolvedOrderBy.All(term => OutputOrderByColumnsAreProjected(term.Expression, outputNames)))
+                {
+                    return false;
+                }
+
+                resultOrderComparer = (leftRow, rightRow) => CompareRows(
+                    new SourceRow(outputNames, leftRow),
+                    new SourceRow(outputNames, rightRow),
+                    resolvedOrderBy,
+                    parameters,
+                    context);
+            }
         }
 
         // Partition boundary detection reuses the evaluator's group-key equality so a routed
@@ -23818,7 +23869,61 @@ public sealed partial class EmbeddedDatabase : IDisposable
             orderColumns,
             peerComparer,
             descendingOrder);
+        if (resultOrderComparer is not null)
+        {
+            // Inverse and peer-flush programs have jump-dense delay rings; re-sorting their
+            // ResultRows is left on the buffered lowering so those frames stay exact.
+            if (program.Instructions.Any(static instruction =>
+                    instruction is AggInverseInstruction or ColumnRangeInstruction))
+            {
+                program = null!;
+                return false;
+            }
+
+            program = LimitOffsetProgramBuilder.ApplyResultOrder(program, resultOrderComparer);
+        }
         return true;
+    }
+
+    private static string[] CollectStreamingWindowOutputNames(SelectStatement select, ScanTarget target)
+    {
+        var names = new List<string>();
+        foreach (var projection in select.Projections)
+        {
+            switch (projection.Expression)
+            {
+                case StarExpression:
+                    names.AddRange(target.Columns);
+                    break;
+                case ColumnExpression column:
+                    names.Add(projection.Alias ?? column.Name);
+                    break;
+                default:
+                    names.Add(projection.Alias ?? projection.SourceText ?? string.Empty);
+                    break;
+            }
+        }
+
+        return names.ToArray();
+    }
+
+    private static bool OutputOrderByColumnsAreProjected(Expression expression, string[] outputNames)
+    {
+        var names = new HashSet<string>(outputNames, StringComparer.OrdinalIgnoreCase);
+        return Visit(expression);
+
+        bool Visit(Expression node) => node switch
+        {
+            ColumnExpression column => names.Contains(column.Name),
+            CollationExpression collation => Visit(collation.Expression),
+            CastExpression cast => Visit(cast.Expression),
+            UnaryExpression unary => Visit(unary.Operand),
+            BinaryExpression binary => Visit(binary.Left) && Visit(binary.Right),
+            LiteralExpression or ParameterExpression or CurrentTimeExpression => true,
+            FunctionExpression function when function.Window is null && function.Filter is null
+                => function.Arguments.All(Visit),
+            _ => false,
+        };
     }
 
     // The general buffered-window lowering: every window shape whose inputs are computable from one
@@ -24252,8 +24357,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         // Every window call must share one identical OVER spec so a single sorter pass and one
-        // partition/order layout serve them all. Ranking cannot share a physical frame with
-        // aggregates or with a different ranking kind.
+        // partition/order layout serve them all. row_number may share a ROWS running/current
+        // frame with aggregates; other ranking kinds stay exclusive.
         if (spec is null)
             spec = window;
         else if (!WindowSpecsEqual(spec, window))
@@ -24263,8 +24368,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank" or "dense_rank" or "lag" or "lead"
                 or "percent_rank" or "cume_dist" or "ntile";
             if (existingRanking != ranking)
-                return false;
-            if (ranking
+            {
+                var existingName = windows[0].Aggregate.Name;
+                if (ranking && function.Name != "ROW_NUMBER")
+                    return false;
+                if (!ranking && existingName != "row_number")
+                    return false;
+            }
+            else if (ranking
                 && windows[0].Aggregate.Name != function.Name.ToLowerInvariant()
                 && !AreCompatiblePartitionRankings(windows[0].Aggregate.Name, function.Name))
             {

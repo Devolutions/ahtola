@@ -215,6 +215,105 @@ public static class LimitOffsetProgramBuilder
     };
 
     /// <summary>
+    /// Wraps <paramref name="program"/> so its emitted rows are re-sorted by <paramref name="comparer"/>
+    /// after the original stream is fully produced. Used when a window accumulates in PARTITION/ORDER BY
+    /// order but the SELECT's top-level ORDER BY is a different key. LIMIT/OFFSET composes onto the
+    /// rewritten ResultRows afterwards.
+    /// </summary>
+    public static VdbeProgram ApplyResultOrder(VdbeProgram program, VdbeRowComparer comparer)
+    {
+        ArgumentNullException.ThrowIfNull(program);
+        ArgumentNullException.ThrowIfNull(comparer);
+
+        var original = program.Instructions;
+        if (original.Count == 0 || original[^1] is not HaltInstruction)
+        {
+            throw new StatementCompilationException(
+                "Result-order lowering requires a program that ends with Halt.");
+        }
+
+        RegisterRange? values = null;
+        var emitterCount = 0;
+        foreach (var instruction in original)
+        {
+            switch (instruction)
+            {
+                case ResultRowInstruction row:
+                    if (values is not null && (values.Value.Start.Index != row.Values.Start.Index
+                        || values.Value.Count != row.Values.Count))
+                    {
+                        throw new StatementCompilationException(
+                            "Result-order lowering requires every ResultRow to share one register range.");
+                    }
+
+                    values = row.Values;
+                    emitterCount++;
+                    break;
+                case DistinctResultRowInstruction:
+                case CompoundResultRowInstruction:
+                case OffsetGateInstruction:
+                case LimitGateInstruction:
+                    throw new StatementCompilationException(
+                        "Result-order lowering requires a program of plain ResultRows, applied before LIMIT/OFFSET.");
+            }
+        }
+
+        if (emitterCount == 0 || values is null)
+        {
+            throw new StatementCompilationException(
+                "Result-order lowering requires a program that emits at least one result row.");
+        }
+
+        var map = new int[original.Count];
+        for (var index = 0; index < original.Count; index++)
+            map[index] = index + 1;
+
+        var sorter = new Sorter(program.SorterCount);
+        var record = values.Value;
+        var lowered = new List<VdbeInstruction>(original.Count + 6)
+        {
+            new OpenSorterInstruction(sorter, comparer, record.Count),
+        };
+
+        for (var index = 0; index < original.Count; index++)
+        {
+            var instruction = original[index];
+            if (instruction is ResultRowInstruction row)
+            {
+                lowered.Add(new SorterInsertInstruction(sorter, row.Values));
+                continue;
+            }
+
+            if (instruction is HaltInstruction && index == original.Count - 1)
+                continue;
+
+            lowered.Add(RemapTargets(instruction, map));
+        }
+
+        var sortIndex = lowered.Count;
+        lowered.Add(new SorterSortInstruction(sorter, new ProgramCounter(0)));
+        var loop = lowered.Count;
+        lowered.Add(new SorterDataInstruction(sorter, record));
+        lowered.Add(new ResultRowInstruction(record));
+        lowered.Add(new SorterNextInstruction(sorter, new ProgramCounter(loop)));
+        var close = lowered.Count;
+        lowered.Add(new CloseSorterInstruction(sorter));
+        lowered.Add(new HaltInstruction());
+        lowered[sortIndex] = new SorterSortInstruction(sorter, new ProgramCounter(close));
+
+        return new VdbeProgram(
+            program.RegisterCount,
+            program.CursorCount,
+            lowered,
+            program.SorterCount + 1,
+            program.AccumulatorCount,
+            program.DistinctSetCount,
+            program.ParameterSlotCount,
+            program.WorkTableCount,
+            program.WindowBufferCount);
+    }
+
+    /// <summary>
     /// Applies <see cref="Apply(VdbeProgram, long, long?)"/> to a compiled <see cref="CompoundTerm"/>,
     /// gating its program while preserving its cursor sources unchanged (LIMIT/OFFSET adds no cursors).
     /// This is how a <c>UNION ALL</c> compound composes with LIMIT/OFFSET.
@@ -271,6 +370,8 @@ public static class LimitOffsetProgramBuilder
             JumpIfInstruction x => new JumpIfInstruction(x.Register, Pc(x.Target)),
             JumpIfNotTrueInstruction x => new JumpIfNotTrueInstruction(x.Value, Pc(x.FalseTarget)),
             SameGroupInstruction x => new SameGroupInstruction(x.CurrentKey, x.SavedKey, x.Comparer, Pc(x.SameGroupTarget)),
+            ResetOnceInstruction x => new ResetOnceInstruction(Pc(x.RegionEnd)),
+            OnceInstruction x => new OnceInstruction(Pc(x.ReentryTarget)),
             LoadConstantInstruction
                 or LoadParameterInstruction
                 or CopyInstruction
@@ -309,7 +410,14 @@ public static class LimitOffsetProgramBuilder
                 or YieldInstruction
                 or HaltInstruction
                 or OpenEphemeralInstruction
-                or EphemeralInsertInstruction => instruction,
+                or EphemeralInsertInstruction
+                or ColumnRangeInstruction
+                or OpenPseudoInstruction
+                or TypeCheckInstruction
+                or ChangeCountInstruction
+                or BlobReadInstruction
+                or BlobWriteInstruction
+                or BlobLenInstruction => instruction,
             _ => throw new StatementCompilationException(
                 $"Cannot lower opcode {instruction.Opcode} into a LIMIT/OFFSET program."),
         };

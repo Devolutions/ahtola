@@ -302,6 +302,33 @@ public class LimitOffsetProgramBuilderTests
     }
 
     [Test]
+    public void ApplyResultOrderResortsEmittedRows()
+    {
+        var (program, source) = ScanProgram(10, 20, 30);
+        VdbeRowComparer descending = (left, right) => right[0].AsInteger().CompareTo(left[0].AsInteger());
+
+        var ordered = LimitOffsetProgramBuilder.ApplyResultOrder(program, descending);
+
+        Integers(Run(ordered, source)).Should().Equal(30, 20, 10);
+        ordered.SorterCount.Should().Be(program.SorterCount + 1);
+        Opcodes(ordered).Should().Contain(VdbeOpcode.SorterInsert);
+        Opcodes(ordered).Should().Contain(VdbeOpcode.SorterSort);
+        ordered.Instructions[^1].Should().BeOfType<HaltInstruction>();
+    }
+
+    [Test]
+    public void ApplyResultOrderThenLimitGatesTheSortedStream()
+    {
+        var (program, source) = ScanProgram(10, 20, 30, 40);
+        VdbeRowComparer descending = (left, right) => right[0].AsInteger().CompareTo(left[0].AsInteger());
+
+        var ordered = LimitOffsetProgramBuilder.ApplyResultOrder(program, descending);
+        var gated = LimitOffsetProgramBuilder.Apply(ordered, offset: 1, limit: 2);
+
+        Integers(Run(gated, source)).Should().Equal(30, 20);
+    }
+
+    [Test]
     public void RejectsANullProgram()
     {
         Assert.Throws<ArgumentNullException>(

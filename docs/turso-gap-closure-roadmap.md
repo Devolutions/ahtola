@@ -105,7 +105,10 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   drain. ROWS n PRECEDING AND m PRECEDING streams through a delayed-step
   wrapper. RANGE/GROUPS n PRECEDING AND m FOLLOWING and non-integer RANGE
   offsets stream via a full-partition drain that re-folds in-range rows on
-  Finalize. Mixed OVER stays on OpenWindowBuffer.
+  Finalize. Matching-spec `row_number` plus a ROWS running/current aggregate
+  streams; extra/missing top ORDER BY re-sorts projected ResultRows. Distinct
+  OVER specs, joins/GROUP BY/compounds, and DISTINCT still use OpenWindowBuffer
+  or the evaluator.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

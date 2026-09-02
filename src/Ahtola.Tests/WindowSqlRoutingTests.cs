@@ -1325,7 +1325,7 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void MixedRankingAndAggregateKeepsBufferedFallback()
+    public void MixedRankingAndAggregateRoutesThroughStreaming()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
@@ -1333,6 +1333,25 @@ public class WindowSqlRoutingTests
 
         var query =
             $"SELECT row_number() OVER (ORDER BY id {RunningFrame}), sum(v) OVER (ORDER BY id {RunningFrame}) FROM t ORDER BY id;";
+        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(1), SqlValue.Integer(10)),
+            (SqlValue.Integer(2), SqlValue.Integer(30)));
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("WindowBufferCompute");
+    }
+
+    [Test]
+    public void MixedOverSpecsKeepBufferedFallback()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+        var query =
+            $"SELECT sum(v) OVER (ORDER BY id {RunningFrame}), sum(v) OVER (PARTITION BY id ORDER BY id {RunningFrame}) FROM t ORDER BY id;";
+        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(10), SqlValue.Integer(10)),
+            (SqlValue.Integer(30), SqlValue.Integer(20)));
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
     }
 
@@ -1358,9 +1377,8 @@ public class WindowSqlRoutingTests
         Execute(connection, "CREATE TABLE sales(region TEXT, amount INTEGER);");
         Execute(connection, "INSERT INTO sales VALUES ('a', 10), ('b', 5), ('a', 30);");
 
-        // The running-frame lowering needs the top ORDER BY to make partitions contiguous. A bare
-        // "ORDER BY amount" is not partition-contiguous, so the buffered lowering owns it and sorts
-        // the projected records after the window pass instead.
+        // Window accumulation stays partition-contiguous; the extra ORDER BY amount is applied
+        // after the window pass by a second sorter over the projected rows.
         var query =
             $"SELECT region, amount, sum(amount) OVER (PARTITION BY region ORDER BY amount {RunningFrame}) AS running " +
             "FROM sales ORDER BY amount;";
@@ -1369,7 +1387,8 @@ public class WindowSqlRoutingTests
             (SqlValue.Text("a"), SqlValue.Integer(10), SqlValue.Integer(10)),
             (SqlValue.Text("a"), SqlValue.Integer(30), SqlValue.Integer(40)));
 
-        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.Contain("OpenSorter").And.NotContain("WindowBufferCompute");
     }
 
     [Test]
@@ -1380,9 +1399,7 @@ public class WindowSqlRoutingTests
         Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (1, 30);");
 
         // With no top-level ORDER BY SQLite emits a windowed SELECT in the first window's sort order —
-        // its PARTITION BY keys ascending — so the buffered lowering sorts the projected records by the
-        // partition key (stable, preserving scan order within each partition) rather than emitting raw
-        // scan order.
+        // its PARTITION BY keys ascending — so the streaming sorter uses that emission order.
         var query = $"SELECT grp, sum(v) OVER (PARTITION BY grp {RunningFrame}) AS running FROM t;";
         ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
             (SqlValue.Integer(1), SqlValue.Integer(10)),
@@ -1390,7 +1407,7 @@ public class WindowSqlRoutingTests
             (SqlValue.Integer(2), SqlValue.Integer(20)));
 
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
-            .Contain("WindowBufferCompute").And.Contain("OpenSorter");
+            .Contain("AggStep").And.Contain("OpenSorter").And.NotContain("WindowBufferCompute");
     }
 
     // ---- Fallback boundaries (evaluator keeps ownership; EXPLAIN cannot describe them) ------
@@ -1497,8 +1514,7 @@ public class WindowSqlRoutingTests
         var query =
             $"SELECT sum(v) OVER (ORDER BY id {RunningFrame}) FROM t UNION ALL SELECT v FROM t;";
         ReadRows(connection, query).Should().HaveCount(4);
-
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("AggStep");
     }
 
     [Test]
