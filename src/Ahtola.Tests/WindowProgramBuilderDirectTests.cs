@@ -21,6 +21,10 @@ public class WindowProgramBuilderDirectTests
 
     private static AggregateFunctionSpec RowNumber() => new(AggregateTestSupport.CountStar(), []);
 
+    private static AggregateFunctionSpec InvertibleMin(int column) => new(
+        AggregateTestSupport.InvertibleMin(),
+        [column]);
+
     private static AggregateFunctionSpec InvertibleSum(int column) => new(
         new VdbeAggregate
         {
@@ -971,6 +975,25 @@ public class WindowProgramBuilderDirectTests
             (10, 60),
             (20, 50),
             (30, 30));
+    }
+
+    [Test]
+    public void OnePrecedingMinInversesTheDepartingRow()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleMin(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.OnePreceding);
+
+        var rows = Run(program, Rows([1, 30], [2, 10], [3, 20]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (2, 10),
+            (3, 10));
     }
 
     [Test]

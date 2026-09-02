@@ -23888,14 +23888,39 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         var functions = windowFunctions.ToArray();
-        return bufferedRows =>
-        {
-            var rows = new List<SourceRow>(bufferedRows.Count);
-            foreach (var row in bufferedRows)
-                rows.Add(CreateScanSourceRow(target, row, context, outerRow));
+        return bufferedRows => ComputeWindowFunctionValueRows(
+            functions,
+            new LazyWindowSourceRows(
+                bufferedRows,
+                row => CreateScanSourceRow(target, row, context, outerRow)),
+            parameters,
+            context);
+    }
 
-            return ComputeWindowFunctionValueRows(functions, rows, parameters, context);
-        };
+    private sealed class LazyWindowSourceRows : IReadOnlyList<SourceRow>
+    {
+        private readonly IReadOnlyList<SqlValue[]> _rows;
+        private readonly Func<SqlValue[], SourceRow> _materialize;
+
+        public LazyWindowSourceRows(
+            IReadOnlyList<SqlValue[]> rows,
+            Func<SqlValue[], SourceRow> materialize)
+        {
+            _rows = rows;
+            _materialize = materialize;
+        }
+
+        public int Count => _rows.Count;
+
+        public SourceRow this[int index] => _materialize(_rows[index]);
+
+        public IEnumerator<SourceRow> GetEnumerator()
+        {
+            for (var index = 0; index < Count; index++)
+                yield return this[index];
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     // Lowers one computed projection over window results: the delegate receives the whole
@@ -24036,7 +24061,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         if ((frame.IsRangePreceding || frame.IsRangeFollowing) && window.OrderBy.Count != 1)
             return false;
-        if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG"))
+        if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG" or "MIN" or "MAX"))
             return false;
 
         // The bytecode shape only models aggregate accumulation. Dedicated ranking,
@@ -24457,6 +24482,27 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 },
                 Inverse = inverse,
                 Finalize = static contextObject => ((NumericAggregateAccumulator)contextObject!).Finalize(),
+            };
+        }
+
+        if (function.Name is "MIN" or "MAX" && function.Arguments.Count == 1)
+        {
+            var maximum = function.Name == "MAX";
+            return new VdbeAggregate
+            {
+                Name = function.Name.ToLowerInvariant(),
+                CreateContext = () => new ExtremumAggregateAccumulator(maximum, Compare),
+                Accumulate = static (contextObject, arguments) =>
+                {
+                    ((ExtremumAggregateAccumulator)contextObject!).Add(arguments[0]);
+                    return contextObject;
+                },
+                Inverse = static (contextObject, arguments) =>
+                {
+                    ((ExtremumAggregateAccumulator)contextObject!).Remove(arguments[0]);
+                    return contextObject;
+                },
+                Finalize = static contextObject => ((ExtremumAggregateAccumulator)contextObject!).Finalize(),
             };
         }
 
@@ -39839,6 +39885,60 @@ out bool hasReturning)
         }
 
         return accumulator.Finalize();
+    }
+
+    private sealed class ExtremumAggregateAccumulator
+    {
+        private readonly bool _maximum;
+        private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private readonly List<SqlValue> _values = [];
+
+        internal ExtremumAggregateAccumulator(bool maximum, Func<SqlValue, SqlValue, string?, int> compare)
+        {
+            _maximum = maximum;
+            _compare = compare;
+        }
+
+        internal void Add(SqlValue value)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+
+            _values.Add(value);
+        }
+
+        internal void Remove(SqlValue value)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+
+            for (var index = 0; index < _values.Count; index++)
+            {
+                if (_values[index].Equals(value))
+                {
+                    _values.RemoveAt(index);
+                    return;
+                }
+            }
+
+            throw new InvalidOperationException("Aggregate inverse removed a value that was not in the frame.");
+        }
+
+        internal SqlValue Finalize()
+        {
+            if (_values.Count == 0)
+                return SqlValue.Null;
+
+            var extremum = _values[0];
+            for (var index = 1; index < _values.Count; index++)
+            {
+                var comparison = _compare(_values[index], extremum, null);
+                if (_maximum ? comparison > 0 : comparison < 0)
+                    extremum = _values[index];
+            }
+
+            return extremum;
+        }
     }
 
     private sealed class CountAggregateAccumulator

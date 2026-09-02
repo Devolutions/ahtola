@@ -92,8 +92,9 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   UNBOUNDED FOLLOWING` emits the full-partition aggregate on every row.
   Streaming ROWS `CURRENT ROW`/`UNBOUNDED PRECEDING` to `UNBOUNDED FOLLOWING`
   uses a delay ephemeral and drains at partition end. ROWS running
-  `EXCLUDE CURRENT ROW` emits before AggStep. Remaining: EXCLUDE GROUP/TIES,
-  MIN/MAX inverse, and Compute still needing the partition in-heap after reload.
+  `EXCLUDE CURRENT ROW` emits before AggStep. MIN/MAX on moving frames stream
+  through a value-bag inverse. Window-buffer Compute reads spilled rows by index
+  instead of reloading the partition. Remaining: EXCLUDE GROUP/TIES.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

@@ -223,19 +223,22 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void CurrentRowAggregateWithoutInverseKeepsBufferedFallback()
+    public void CurrentRowMinRoutesThroughInverseAndMatchSqlite()
     {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20);",
+        ];
+        var query = $"SELECT id, min(v) OVER (ORDER BY id {CurrentRowFrame}) FROM t ORDER BY id;";
+
         using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20);");
+        foreach (var statement in setup)
+            Execute(connection, statement);
 
-        var query =
-            $"SELECT id, min(v) OVER (ORDER BY id {CurrentRowFrame}) FROM t ORDER BY id;";
-        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
-
-        opcodes.Should().Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
-        opcodes.Should().NotContain("AggInverse");
-        ReadRows(connection, query).Select(static row => row[1].AsInteger()).Should().Equal(30, 10, 20);
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
     }
 
     [Test]
@@ -461,16 +464,36 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void GroupsPrecedingWithoutInverseKeepsBufferedFallback()
+    public void GroupsPrecedingGroupConcatKeepsBufferedFallback()
     {
         using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
+        Execute(connection, "CREATE TABLE t(k INTEGER, v TEXT);");
+        Execute(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b');");
 
         var query =
-            "SELECT k, min(v) OVER (ORDER BY k GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY k;";
+            "SELECT k, group_concat(v) OVER (ORDER BY k GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY k;";
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
             .Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
+    }
+
+    [Test]
+    public void GroupsPrecedingMinRoutesThroughInverseAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 5);",
+        ];
+        const string query =
+            "SELECT k, min(v) OVER (ORDER BY k GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY k;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
     }
 
     [Test]
@@ -695,16 +718,23 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void RangePrecedingWithoutInverseKeepsBufferedFallback()
+    public void RangePrecedingMinRoutesThroughInverseAndMatchSqlite()
     {
-        using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
-
-        var query =
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (10, 5);",
+        ];
+        const string query =
             "SELECT k, min(v) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY k;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
-            .Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
+            .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
     }
 
     [Test]

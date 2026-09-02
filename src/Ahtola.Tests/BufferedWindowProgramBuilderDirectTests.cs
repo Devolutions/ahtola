@@ -383,7 +383,7 @@ public class BufferedWindowProgramBuilderDirectTests
     }
 
     [Test]
-    public void WindowBufferSpillsScannedRowsAndReloadsForCompute()
+    public void WindowBufferSpillsScannedRowsAndComputesWithoutReloading()
     {
         const string temporaryDirectory = "window-buffer-spill-tests";
         var sampleRow = new[] { SqlValue.Integer(0) };
@@ -430,13 +430,14 @@ public class BufferedWindowProgramBuilderDirectTests
     }
 
     [Test]
-    public void WindowBufferComputeStillFailsClosedWhenTheReloadedPartitionDoesNotFit()
+    public void WindowBufferComputeReadsSpilledRowsWithoutReloadingThePartition()
     {
         const string temporaryDirectory = "window-buffer-spill-compute-limit";
         var sample = new[] { SqlValue.Text(new string('z', 64)) };
         var rowBytes = VdbeManagedFootprint.EstimateSorterRow(sample);
         var infrastructure = VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure(temporaryDirectory);
-        var budget = checked(infrastructure + (rowBytes * 2) + 128);
+        var windowTupleBytes = VdbeManagedFootprint.EstimateSorterRow([SqlValue.Integer(0)]);
+        var budget = checked(infrastructure + (windowTupleBytes * 16) + rowBytes + 128);
         var fileSystem = new TrackingFileSystem();
         var metrics = new VdbeExecutionMetrics();
         var options = new VdbeExecutionOptions(
@@ -458,13 +459,16 @@ public class BufferedWindowProgramBuilderDirectTests
             program,
             options,
             [new VdbeCursorSource(source)]);
-        Assert.Throws<VdbeMemoryLimitExceededException>(() => Drain(statement));
-        statement.Dispose();
+        var rows = Drain(statement);
 
+        rows.Should().HaveCount(16);
+        rows.Select(static row => row[0].AsInteger()).Should().Equal(Enumerable.Range(1, 16).Select(static n => (long)n));
         metrics.WindowBuffersSpilled.Should().Be(1);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
         metrics.CurrentRetainedBytes.Should().Be(0);
         metrics.ActiveSpillFiles.Should().Be(0);
         fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+        budget.Should().BeLessThan(checked(rowBytes * 16));
     }
 
     [Test]

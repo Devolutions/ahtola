@@ -100,6 +100,48 @@ internal static class AggregateTestSupport
         },
     };
 
+    // MIN(x) with inverse: bag of non-NULL values so a departing row can be removed.
+    public static VdbeAggregate InvertibleMin() => Extremum(maximum: false);
+
+    // MAX(x) with inverse: bag of non-NULL values so a departing row can be removed.
+    public static VdbeAggregate InvertibleMax() => Extremum(maximum: true);
+
+    private static VdbeAggregate Extremum(bool maximum) => new()
+    {
+        Name = maximum ? "max" : "min",
+        CreateContext = () => new List<SqlValue>(),
+        Accumulate = (context, arguments) =>
+        {
+            var values = (List<SqlValue>)context!;
+            if (arguments[0].Kind != SqlValueKind.Null)
+                values.Add(arguments[0]);
+            return values;
+        },
+        Inverse = (context, arguments) =>
+        {
+            var values = (List<SqlValue>)context!;
+            if (arguments[0].Kind != SqlValueKind.Null)
+                values.Remove(arguments[0]);
+            return values;
+        },
+        Finalize = context =>
+        {
+            var values = (List<SqlValue>)context!;
+            if (values.Count == 0)
+                return SqlValue.Null;
+
+            var extremum = values[0];
+            for (var index = 1; index < values.Count; index++)
+            {
+                var comparison = Compare(values[index], extremum);
+                if (maximum ? comparison > 0 : comparison < 0)
+                    extremum = values[index];
+            }
+
+            return extremum;
+        },
+    };
+
     // MIN(x): smallest non-NULL value; no non-NULL value yields NULL.
     public static VdbeAggregate Min() => new()
     {
