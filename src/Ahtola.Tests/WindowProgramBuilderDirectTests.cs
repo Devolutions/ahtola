@@ -692,6 +692,81 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void GroupsOnePrecedingInversesTheOldestPeerGroup()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.GroupsPreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.CursorCount.Should().Be(3);
+        program.Instructions.Select(static instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.AggInverse)
+            .And.Contain(VdbeOpcode.OpenEphemeral);
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30], [2, 40], [3, 50]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (1, 30),
+            (2, 100),
+            (2, 100),
+            (3, 120));
+    }
+
+    [Test]
+    public void GroupsTwoPrecedingKeepsTwoPeerGroupsBehindTheCurrent()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.GroupsPreceding(2),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30], [2, 40], [3, 50], [4, 60]));
+        rows.Select(static row => row[1].AsInteger()).Should().Equal(30, 30, 100, 100, 150, 180);
+    }
+
+    [Test]
+    public void GroupsPrecedingResetsTheRingOnPartitionBoundaries()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 3,
+            partitionColumns: [0],
+            windows: [InvertibleSum(2)],
+            outputs:
+            [
+                WindowOutput.ForColumn(0),
+                WindowOutput.ForColumn(1),
+                WindowOutput.ForWindow(0),
+            ],
+            orderComparer: AggregateTestSupport.OrderByColumns(0, 1),
+            partitionComparer: AggregateTestSupport.GroupKeysEqual(),
+            frame: WindowFrameSpec.GroupsPreceding(1),
+            orderColumns: [1],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 1, 10], [1, 1, 20], [1, 2, 5], [2, 1, 7], [2, 2, 8]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger(), row[2].AsInteger())).Should().Equal(
+            (1, 1, 30),
+            (1, 1, 30),
+            (1, 2, 35),
+            (2, 1, 7),
+            (2, 2, 15));
+    }
+
+    [Test]
     public void BuildRejectsFramesItCannotRepresent()
     {
         // RANGE/GROUPS value or group offsets, and forward-looking bounds, stay unmodeled.
@@ -741,7 +816,13 @@ public class WindowProgramBuilderDirectTests
     [Test]
     public void MovingFramesRejectAnAggregateWithoutInverse()
     {
-        foreach (var frame in new[] { WindowFrameSpec.CurrentRow, WindowFrameSpec.OnePreceding, WindowFrameSpec.Preceding(2) })
+        foreach (var frame in new[]
+                 {
+                     WindowFrameSpec.CurrentRow,
+                     WindowFrameSpec.OnePreceding,
+                     WindowFrameSpec.Preceding(2),
+                     WindowFrameSpec.GroupsPreceding(1),
+                 })
         {
             Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
                 "t", 1, [], [new AggregateFunctionSpec(AggregateTestSupport.Min(), [0])], [WindowOutput.ForWindow(0)],
@@ -845,7 +926,9 @@ public class WindowProgramBuilderDirectTests
 
     private static List<SqlValue[]> Run(VdbeProgram program, VdbeCursorSource source)
     {
-        using var statement = new ResumableStatement(program, [source]);
+        var sources = new VdbeCursorSource?[program.CursorCount];
+        sources[0] = source;
+        using var statement = new ResumableStatement(program, sources);
         return Drain(statement);
     }
 

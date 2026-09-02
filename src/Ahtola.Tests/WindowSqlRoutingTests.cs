@@ -440,6 +440,40 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
+    public void GroupsPrecedingFrameRoutesThroughInverseAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (1, 20), (2, 30), (2, 40), (3, 50);",
+        ];
+        const string query =
+            "SELECT k, sum(v) OVER (ORDER BY k GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) " +
+            "FROM t ORDER BY k;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
+        opcodes.Should().Contain("AggInverse").And.Contain("OpenEphemeral").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void GroupsPrecedingWithoutInverseKeepsBufferedFallback()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+        var query =
+            "SELECT k, min(v) OVER (ORDER BY k GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY k;";
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
+    }
+
+    [Test]
     public void RangeValueBoundsKeepBufferedFallback()
     {
         using var connection = new EmbeddedDatabase().Connect();

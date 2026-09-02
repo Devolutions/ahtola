@@ -148,7 +148,8 @@ real mapping, built variant-by-variant:
 > and `ROWS n PRECEDING … m FOLLOWING` COUNT/SUM/AVG frames (n,m ≤ 1024).
 > Default `RANGE`/`GROUPS UNBOUNDED PRECEDING … CURRENT ROW` and
 > `RANGE`/`GROUPS CURRENT ROW` peer frames stream through an ephemeral delay
-> buffer; RANGE/GROUPS value or group offsets and unbounded-following frames
+> buffer; `GROUPS n PRECEDING … CURRENT ROW` inverses each departing peer
+> group. RANGE value offsets, GROUPS FOLLOWING, and unbounded-following frames
 > retain the buffered evaluator.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,

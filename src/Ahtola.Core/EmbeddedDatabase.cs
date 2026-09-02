@@ -23407,10 +23407,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        compiled = new CompiledSelect(
-            LimitOffsetProgramBuilder.Apply(program, offset, limit),
-            [new VdbeCursorSource(target.Rows)]);
+        var compiledProgram = LimitOffsetProgramBuilder.Apply(program, offset, limit);
+        compiled = new CompiledSelect(compiledProgram, BindWindowCursorSources(compiledProgram, target.Rows));
         return true;
+    }
+
+    private static VdbeCursorSource[] BindWindowCursorSources(VdbeProgram program, IReadOnlyList<SqlValue[]> rows)
+    {
+        var sources = new VdbeCursorSource[program.CursorCount];
+        sources[0] = new VdbeCursorSource(rows);
+        for (var index = 1; index < sources.Length; index++)
+            sources[index] = new VdbeCursorSource([]);
+        return sources;
     }
 
     private bool HasMismatchedWindowPartitionOrder(
@@ -24095,6 +24103,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ? WindowFrameSpec.GroupsCurrentPeer
                 : WindowFrameSpec.RangeCurrentPeer;
             return true;
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } groupsOffset,
+            }
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Offset is null)
+        {
+            var preceding = groupsOffset.Value.AsInteger();
+            if (preceding == 0)
+            {
+                spec = WindowFrameSpec.GroupsCurrentPeer;
+                return true;
+            }
+
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.GroupsPreceding(preceding);
+                return true;
+            }
         }
 
         if (frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows)
