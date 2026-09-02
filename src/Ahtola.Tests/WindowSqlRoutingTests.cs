@@ -464,16 +464,23 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void GroupsPrecedingGroupConcatKeepsBufferedFallback()
+    public void GroupsPrecedingGroupConcatRoutesThroughStreamingAndMatchSqlite()
     {
-        using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(k INTEGER, v TEXT);");
-        Execute(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b');");
-
-        var query =
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v TEXT);",
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+        ];
+        const string query =
             "SELECT k, group_concat(v) OVER (ORDER BY k GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY k;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
-            .Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
+            .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
     }
 
     [Test]
@@ -1006,6 +1013,26 @@ public class WindowSqlRoutingTests
 
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
             .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void GroupConcatOnMovingFrameRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, label TEXT);",
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+        ];
+        var query =
+            $"SELECT id, group_concat(label, '|') OVER (ORDER BY id {OnePrecedingFrame}) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
         AssertMatchesSqlite(ReadRows(connection, query), setup, query);
     }
 

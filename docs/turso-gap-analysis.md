@@ -163,9 +163,10 @@ real mapping, built variant-by-variant:
 > running and current-peer frames. FILTER on non-moving frames, row_number/rank/
 > dense_rank, first_value/last_value, lag(offset ≤ 1024), and group_concat with
 > a literal separator, scan-evaluable computed arguments, lead, nth_value, and
-> FILTER on moving frames stream. Remaining buffered cells: DISTINCT window
-> aggregates, percent_rank/cume_dist/ntile, lag/lead offsets above 1024,
-> group_concat on moving frames, both-bound peer frames, and mixed OVER specs.
+> FILTER on moving frames, and group_concat-style list aggregates stream.
+> Remaining streaming cells (4): percent_rank/cume_dist/ntile, RANGE/GROUPS n
+> PRE AND m FOL, non-integer RANGE offsets, ROWS n PRE AND m PRE. Mixed OVER
+> stays on OpenWindowBuffer. DISTINCT window aggregates are rejected.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).

@@ -100,9 +100,10 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   COUNT-style accumulators. first_value/last_value, lag(offset ≤ 1024), and
   group_concat with a literal separator, and scan-evaluable computed arguments
   stream. lead and nth_value stream; FILTER on moving frames skips AggInverse
-  when the predicate is false. Remaining: DISTINCT window aggregates,
-  percent_rank/cume_dist/ntile, lag/lead offsets above 1024, group_concat on
-  moving frames, both-bound peer frames, mixed OVER specs.
+  when the predicate is false. group_concat-style list aggregates inverse via
+  a tuple queue. Remaining streaming cells (4): percent_rank/cume_dist/ntile,
+  RANGE/GROUPS n PRE AND m FOL, non-integer RANGE offsets, ROWS n PRE AND m PRE.
+  Mixed OVER stays on OpenWindowBuffer.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

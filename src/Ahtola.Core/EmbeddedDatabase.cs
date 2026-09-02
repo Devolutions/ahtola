@@ -24145,8 +24145,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
             if ((frame.IsRangePreceding || frame.IsRangeFollowing) && window.OrderBy.Count != 1)
                 return false;
-            if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG" or "MIN" or "MAX" or "NTH_VALUE"))
-                return false;
 
             // Dedicated navigation functions (ntile/percent_rank/cume_dist) and managed
             // percentile aggregates stay on the buffered evaluator. Ranking, lag/lead,
@@ -24899,8 +24897,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
             CreateContext = static () => new List<SqlValue[]>(),
             Accumulate = static (contextObject, arguments) =>
             {
-                ((List<SqlValue[]>)contextObject!).Add(arguments);
+                var copy = new SqlValue[arguments.Length];
+                Array.Copy(arguments, copy, arguments.Length);
+                ((List<SqlValue[]>)contextObject!).Add(copy);
                 return contextObject;
+            },
+            Inverse = static (contextObject, _) =>
+            {
+                var tuples = (List<SqlValue[]>)contextObject!;
+                if (tuples.Count == 0)
+                    throw new InvalidOperationException("Aggregate inverse removed a row from an empty window.");
+
+                tuples.RemoveAt(0);
+                return tuples;
             },
             Finalize = contextObject =>
             {
