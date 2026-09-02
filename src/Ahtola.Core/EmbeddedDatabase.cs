@@ -23530,7 +23530,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             .Distinct(StringComparer.Ordinal)
             .ToArray();
         var rankingOnly = rankingNames.Length > 0
-            && rankingNames.All(name => name is "row_number" or "rank" or "dense_rank" or "lag");
+            && rankingNames.All(name => name is "row_number" or "rank" or "dense_rank" or "lag" or "lead");
         if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "row_number")
             frame = WindowFrameSpec.Running;
         else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "rank")
@@ -23539,6 +23539,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             frame = WindowFrameSpec.RangeRunning;
         else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "lag")
             frame = WindowFrameSpec.Running with { Exclusion = WindowExclusion.CurrentRow };
+        else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "lead")
+        {
+            var offset = windows.Max(window => Math.Max(1, window.NavigationOffset));
+            if (offset > WindowFrameSpec.MaxStreamingPreceding)
+                return false;
+            frame = WindowFrameSpec.Following(offset);
+        }
         else if (rankingOnly)
             return false;
         else if (!TryGetStreamingWindowFrame(spec.Frame, out frame))
@@ -24095,17 +24102,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
 
         var window = function.Window!;
-        var ranking = function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK" or "LAG";
+        var ranking = function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK" or "LAG" or "LEAD";
+        var navigationOffset = 0;
         WindowFrameSpec frame;
         if (ranking)
         {
-            if (function.Name == "LAG")
+            if (function.Name is "LAG" or "LEAD")
             {
                 if (function.Arguments.Count is < 1 or > 3 || function.CountStar || function.Filter is not null)
                     return false;
+                navigationOffset = 1;
                 if (function.Arguments.Count >= 2
-                    && (function.Arguments[1] is not LiteralExpression { Value.Kind: SqlValueKind.Integer } offset
-                        || offset.Value.AsInteger() is < 1 or > WindowFrameSpec.MaxStreamingPreceding))
+                    && function.Arguments[1] is LiteralExpression { Value.Kind: SqlValueKind.Integer } offset)
+                {
+                    var value = offset.Value.AsInteger();
+                    if (value is < 1 or > WindowFrameSpec.MaxStreamingPreceding)
+                        return false;
+                    navigationOffset = (int)value;
+                }
+                else if (function.Arguments.Count >= 2)
                 {
                     return false;
                 }
@@ -24120,6 +24135,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 "ROW_NUMBER" => WindowFrameSpec.Running,
                 "RANK" => WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group },
                 "LAG" => WindowFrameSpec.Running with { Exclusion = WindowExclusion.CurrentRow },
+                "LEAD" => WindowFrameSpec.Following(Math.Max(1, navigationOffset)),
                 _ => WindowFrameSpec.RangeRunning,
             };
         }
@@ -24129,17 +24145,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
             if ((frame.IsRangePreceding || frame.IsRangeFollowing) && window.OrderBy.Count != 1)
                 return false;
-            if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG" or "MIN" or "MAX"))
+            if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG" or "MIN" or "MAX" or "NTH_VALUE"))
                 return false;
 
-            // Dedicated navigation functions (lag/lead/ntile/nth_value) and managed
-            // percentile aggregates stay on the buffered evaluator. Ranking and
-            // first_value/last_value are handled as streaming accumulators.
+            // Dedicated navigation functions (ntile/percent_rank/cume_dist) and managed
+            // percentile aggregates stay on the buffered evaluator. Ranking, lag/lead,
+            // first_value/last_value, and nth_value are handled as streaming accumulators.
             if (!IsBuiltInAggregate(function)
-                && function.Name is not ("FIRST_VALUE" or "LAST_VALUE")
+                && function.Name is not ("FIRST_VALUE" or "LAST_VALUE" or "NTH_VALUE")
                 && !TryGetAggregateFunction(function.Name, function.Arguments.Count, out _))
             {
                 return false;
+            }
+
+            if (function.Name == "NTH_VALUE")
+            {
+                if (function.Arguments.Count != 2
+                    || function.Arguments[1] is not LiteralExpression { Value.Kind: SqlValueKind.Integer } nth
+                    || nth.Value.AsInteger() is < 1 or > WindowFrameSpec.MaxStreamingPreceding)
+                {
+                    return false;
+                }
+
+                navigationOffset = (int)nth.Value.AsInteger();
             }
         }
 
@@ -24152,7 +24180,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         if (windows.Count > 0)
         {
-            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank" or "dense_rank" or "lag";
+            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank" or "dense_rank" or "lag" or "lead";
             if (existingRanking != ranking)
                 return false;
             if (ranking && windows[0].Aggregate.Name != function.Name.ToLowerInvariant())
@@ -24200,14 +24228,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
-        var aggregate = BuildAccumulatorAggregate(function, argumentNames.ToArray(), parameters, context, outerRow);
-        if (frame.RequiresInverse && aggregate.Inverse is null)
-            return false;
-
         VdbeRowPredicate? filter = null;
         if (function.Filter is not null && !ranking)
         {
-            if (frame.RequiresInverse)
+            if (!TryAddExpressionColumns(function.Filter, target, argumentColumns, argumentNames))
                 return false;
 
             filter = CompileRowPredicate(function.Filter, target, parameters, context, outerRow);
@@ -24215,10 +24239,47 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
         }
 
+        var names = argumentNames.ToArray();
+        var aggregate = BuildAccumulatorAggregate(function, names, parameters, context, outerRow);
+        if (function.Filter is not null && !ranking)
+            aggregate = ApplyWindowFilter(aggregate, function.Filter, names, parameters, context, outerRow);
+        if (frame.RequiresInverse && aggregate.Inverse is null)
+            return false;
+
         var windowIndex = windows.Count;
-        windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns, filter));
+        windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns, filter, navigationOffset));
         output = WindowOutput.ForWindow(windowIndex);
         return true;
+    }
+
+    private VdbeAggregate ApplyWindowFilter(
+        VdbeAggregate inner,
+        Expression filter,
+        string[] argumentNames,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        bool Pass(SqlValue[] arguments)
+        {
+            var row = argumentNames.Length == 0
+                ? null
+                : new SourceRow(argumentNames, arguments, Parent: outerRow);
+            return IsTrue(Evaluate(filter, parameters, row, context));
+        }
+
+        return new VdbeAggregate
+        {
+            Name = inner.Name,
+            CreateContext = inner.CreateContext,
+            Accumulate = (contextObject, arguments) =>
+                Pass(arguments) ? inner.Accumulate(contextObject, arguments) : contextObject,
+            Inverse = inner.Inverse is null
+                ? null
+                : (contextObject, arguments) =>
+                    Pass(arguments) ? inner.Inverse(contextObject, arguments) : contextObject,
+            Finalize = inner.Finalize,
+        };
     }
 
     private static void AddUniqueWindowArgument(
@@ -24683,42 +24744,77 @@ public sealed partial class EmbeddedDatabase : IDisposable
             };
         }
 
-        if (function.Name is "FIRST_VALUE" or "LAST_VALUE" or "LAG"
+        if (function.Name is "FIRST_VALUE" or "LAST_VALUE" or "LAG" or "LEAD" or "NTH_VALUE"
             && function.Arguments.Count >= 1)
         {
             var keepFirst = function.Name == "FIRST_VALUE";
             var defaultValue = SqlValue.Null;
-            var lagOffset = 1L;
-            if (function.Name == "LAG")
+            var navigationOffset = 1L;
+            if (function.Name is "LAG" or "LEAD")
             {
                 if (function.Arguments.Count >= 2
                     && function.Arguments[1] is LiteralExpression { Value.Kind: SqlValueKind.Integer } offset)
                 {
-                    lagOffset = offset.Value.AsInteger();
+                    navigationOffset = offset.Value.AsInteger();
                 }
 
                 if (function.Arguments.Count == 3)
                     defaultValue = Evaluate(function.Arguments[2], parameters, null, context);
             }
+            else if (function.Name == "NTH_VALUE"
+                && function.Arguments[1] is LiteralExpression { Value.Kind: SqlValueKind.Integer } nth)
+            {
+                navigationOffset = nth.Value.AsInteger();
+            }
 
             return new VdbeAggregate
             {
                 Name = function.Name.ToLowerInvariant(),
-                CreateContext = () => function.Name == "LAG"
-                    ? new LagAccumulator(lagOffset, defaultValue)
-                    : new WindowValueAccumulator(keepFirst, defaultValue),
+                CreateContext = () => function.Name switch
+                {
+                    "LAG" => new LagAccumulator(navigationOffset, defaultValue),
+                    "LEAD" => new LeadAccumulator(navigationOffset, defaultValue),
+                    "NTH_VALUE" => new NthValueAccumulator(navigationOffset),
+                    _ => new WindowValueAccumulator(keepFirst, defaultValue),
+                },
                 Accumulate = (contextObject, arguments) =>
                 {
                     var value = ValueOf(function.Arguments[0], arguments);
-                    if (contextObject is LagAccumulator lag)
-                        lag.Add(value);
-                    else
-                        ((WindowValueAccumulator)contextObject!).Add(value);
+                    switch (contextObject)
+                    {
+                        case LagAccumulator lag:
+                            lag.Add(value);
+                            break;
+                        case LeadAccumulator lead:
+                            lead.Add(value);
+                            break;
+                        case NthValueAccumulator nthValue:
+                            nthValue.Add(value);
+                            break;
+                        default:
+                            ((WindowValueAccumulator)contextObject!).Add(value);
+                            break;
+                    }
+
                     return contextObject;
                 },
-                Finalize = static contextObject => contextObject is LagAccumulator lag
-                    ? lag.Finalize()
-                    : ((WindowValueAccumulator)contextObject!).Finalize(),
+                Inverse = function.Name is "LEAD" or "NTH_VALUE"
+                    ? (contextObject, arguments) =>
+                    {
+                        if (contextObject is LeadAccumulator lead)
+                            lead.Remove();
+                        else
+                            ((NthValueAccumulator)contextObject!).Remove();
+                        return contextObject;
+                    }
+                    : null,
+                Finalize = static contextObject => contextObject switch
+                {
+                    LagAccumulator lag => lag.Finalize(),
+                    LeadAccumulator lead => lead.Finalize(),
+                    NthValueAccumulator nthValue => nthValue.Finalize(),
+                    _ => ((WindowValueAccumulator)contextObject!).Finalize(),
+                },
             };
         }
 
@@ -40329,6 +40425,56 @@ out bool hasReturning)
 
         internal SqlValue Finalize() =>
             _values.Count == _offset ? _values.Peek() : _defaultValue;
+    }
+
+    private sealed class LeadAccumulator
+    {
+        private readonly long _offset;
+        private readonly SqlValue _defaultValue;
+        private readonly List<SqlValue> _values = [];
+
+        internal LeadAccumulator(long offset, SqlValue defaultValue)
+        {
+            _offset = offset;
+            _defaultValue = defaultValue;
+        }
+
+        internal void Add(SqlValue value) => _values.Add(value);
+
+        internal void Remove()
+        {
+            if (_values.Count == 0)
+                throw new InvalidOperationException("Lead inverse removed a row from an empty window.");
+
+            _values.RemoveAt(0);
+        }
+
+        internal SqlValue Finalize() =>
+            _values.Count > _offset ? _values[(int)_offset] : _defaultValue;
+    }
+
+    private sealed class NthValueAccumulator
+    {
+        private readonly long _offset;
+        private readonly List<SqlValue> _values = [];
+
+        internal NthValueAccumulator(long offset)
+        {
+            _offset = offset;
+        }
+
+        internal void Add(SqlValue value) => _values.Add(value);
+
+        internal void Remove()
+        {
+            if (_values.Count == 0)
+                throw new InvalidOperationException("nth_value inverse removed a row from an empty window.");
+
+            _values.RemoveAt(0);
+        }
+
+        internal SqlValue Finalize() =>
+            _offset <= _values.Count ? _values[(int)_offset - 1] : SqlValue.Null;
     }
 
     private sealed class NumericAggregateAccumulator

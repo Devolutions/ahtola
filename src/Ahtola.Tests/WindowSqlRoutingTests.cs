@@ -971,16 +971,23 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void FilterClauseOnMovingFrameKeepsBufferedFallback()
+    public void FilterClauseOnMovingFrameRoutesThroughStreamingAndMatchSqlite()
     {
-        using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
-
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 5);",
+        ];
         var query =
             "SELECT id, sum(v) FILTER (WHERE v > 15) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
-            .Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
+            .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
     }
 
     [Test]
@@ -1120,6 +1127,52 @@ public class WindowSqlRoutingTests
 
         var moving =
             $"SELECT id, sum(v + 1) OVER (ORDER BY id {OnePrecedingFrame}) FROM t ORDER BY id;";
+        Opcodes(ReadRows(connection, "EXPLAIN " + moving)).Should()
+            .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, moving), setup, moving);
+    }
+
+    [Test]
+    public void LeadOffsetRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);",
+        ];
+        var query =
+            "SELECT id, lead(v) OVER (ORDER BY id), lead(v, 2, -1) OVER (ORDER BY id) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void NthValueRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+        ];
+        var query =
+            $"SELECT id, nth_value(v, 2) OVER (ORDER BY id {RunningFrame}) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+
+        var moving =
+            $"SELECT id, nth_value(v, 1) OVER (ORDER BY id {OnePrecedingFrame}) FROM t ORDER BY id;";
         Opcodes(ReadRows(connection, "EXPLAIN " + moving)).Should()
             .Contain("AggInverse").And.NotContain("OpenWindowBuffer");
         AssertMatchesSqlite(ReadRows(connection, moving), setup, moving);

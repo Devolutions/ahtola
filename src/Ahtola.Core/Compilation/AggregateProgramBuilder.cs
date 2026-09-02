@@ -73,7 +73,8 @@ public readonly record struct AggregateOutput
 public sealed record AggregateFunctionSpec(
     VdbeAggregate Aggregate,
     IReadOnlyList<int> ArgumentColumns,
-    VdbeRowPredicate? Filter = null)
+    VdbeRowPredicate? Filter = null,
+    int NavigationOffset = 0)
 {
     public int Arity => ArgumentColumns.Count;
 }

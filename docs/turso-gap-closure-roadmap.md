@@ -99,10 +99,10 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   streams via FilterRegisters. row_number, rank, and dense_rank stream as
   COUNT-style accumulators. first_value/last_value, lag(offset ≤ 1024), and
   group_concat with a literal separator, and scan-evaluable computed arguments
-  stream. Remaining: FILTER on moving
-  frames, DISTINCT window aggregates, percent_rank/cume_dist/ntile/lead/nth_value,
-  lag offsets above 1024, group_concat on moving frames, both-bound peer frames,
-  mixed OVER specs.
+  stream. lead and nth_value stream; FILTER on moving frames skips AggInverse
+  when the predicate is false. Remaining: DISTINCT window aggregates,
+  percent_rank/cume_dist/ntile, lag/lead offsets above 1024, group_concat on
+  moving frames, both-bound peer frames, mixed OVER specs.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
