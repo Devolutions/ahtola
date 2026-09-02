@@ -70,7 +70,10 @@ public readonly record struct AggregateOutput
 /// argument tuple. An empty <see cref="ArgumentColumns"/> models a nullary aggregate such
 /// as <c>COUNT(*)</c>.
 /// </summary>
-public sealed record AggregateFunctionSpec(VdbeAggregate Aggregate, IReadOnlyList<int> ArgumentColumns)
+public sealed record AggregateFunctionSpec(
+    VdbeAggregate Aggregate,
+    IReadOnlyList<int> ArgumentColumns,
+    VdbeRowPredicate? Filter = null)
 {
     public int Arity => ArgumentColumns.Count;
 }

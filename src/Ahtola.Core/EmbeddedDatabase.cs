@@ -23520,7 +23520,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (!sawWindow || spec is null)
             return false;
-        if (!TryGetStreamingWindowFrame(spec.Frame, out var frame))
+
+        // Ranking functions ignore the SQL frame: row_number is always ROWS running,
+        // rank is RANGE running EXCLUDE GROUP (preceding-row count + 1). Mixed ranking
+        // kinds or ranking mixed with aggregates stay on the buffered evaluator.
+        WindowFrameSpec frame;
+        var rankingNames = windows
+            .Select(window => window.Aggregate.Name)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var rankingOnly = rankingNames.Length > 0
+            && rankingNames.All(name => name is "row_number" or "rank");
+        if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "row_number")
+            frame = WindowFrameSpec.Running;
+        else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "rank")
+            frame = WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group };
+        else if (rankingOnly)
+            return false;
+        else if (!TryGetStreamingWindowFrame(spec.Frame, out frame))
             return false;
 
         ValidateOrderByCollations(spec.OrderBy);
@@ -23586,10 +23603,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeRowComparer orderComparer;
         if (select.OrderBy.Count == 0)
         {
+            // Unordered, unpartitioned windows preserve scan order. Ranking-only queries
+            // without a top ORDER BY emit in the window's own sort order, matching SQLite.
             if (partitionCount != 0 || windowOrderCount != 0)
-                return false;
+            {
+                if (!rankingOnly)
+                    return false;
 
-            orderComparer = static (_, _) => 0;
+                var emission = new List<OrderByTerm>(partitionCount + windowOrderCount);
+                foreach (var partitionExpression in spec.PartitionBy)
+                    emission.Add(new OrderByTerm(partitionExpression, Descending: false));
+                emission.AddRange(spec.OrderBy);
+                orderComparer = (leftRow, rightRow) => CompareRows(
+                    CreateScanSourceRow(target, leftRow, context, outerRow),
+                    CreateScanSourceRow(target, rightRow, context, outerRow),
+                    emission,
+                    parameters,
+                    context);
+            }
+            else
+            {
+                orderComparer = static (_, _) => 0;
+            }
         }
         else
         {
@@ -24050,58 +24085,93 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         output = default;
 
-        // Frame/window modifiers the streaming accumulator cannot honor. FILTER would need to
-        // evaluate a predicate over columns the accumulator does not buffer; DISTINCT dedup is not
-        // modeled by the emitted AggStep.
-        if (function.Distinct || function.Filter is not null)
+        // DISTINCT window aggregates are rejected by ValidateWindowFunction; keep them off
+        // this route so the evaluator raises the same error.
+        if (function.Distinct)
             return false;
 
         var window = function.Window!;
-        if (!TryGetStreamingWindowFrame(window.Frame, out var frame))
-            return false;
-        if ((frame.IsRangePreceding || frame.IsRangeFollowing) && window.OrderBy.Count != 1)
-            return false;
-        if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG" or "MIN" or "MAX"))
-            return false;
-
-        // The bytecode shape only models aggregate accumulation. Dedicated ranking,
-        // navigation, and value functions decline to the evaluator; managed percentile
-        // aggregates also decline because they are not available as window functions.
-        if (!IsBuiltInAggregate(function)
-            && !TryGetAggregateFunction(function.Name, function.Arguments.Count, out _))
+        var ranking = function.Name is "ROW_NUMBER" or "RANK";
+        WindowFrameSpec frame;
+        if (ranking)
         {
-            return false;
+            if (function.Arguments.Count != 0 || function.CountStar)
+                return false;
+            frame = function.Name == "ROW_NUMBER"
+                ? WindowFrameSpec.Running
+                : WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group };
+        }
+        else
+        {
+            if (!TryGetStreamingWindowFrame(window.Frame, out frame))
+                return false;
+            if ((frame.IsRangePreceding || frame.IsRangeFollowing) && window.OrderBy.Count != 1)
+                return false;
+            if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG" or "MIN" or "MAX"))
+                return false;
+
+            // Dedicated navigation/value functions and managed percentile aggregates stay
+            // on the buffered evaluator. Ranking is handled above.
+            if (!IsBuiltInAggregate(function)
+                && !TryGetAggregateFunction(function.Name, function.Arguments.Count, out _))
+            {
+                return false;
+            }
         }
 
         // Every window call must share one identical OVER spec so a single sorter pass and one
-        // partition/order layout serve them all.
+        // partition/order layout serve them all. Ranking cannot share a physical frame with
+        // aggregates or with a different ranking kind.
         if (spec is null)
             spec = window;
         else if (!WindowSpecsEqual(spec, window))
             return false;
-
-        // Arguments must be bare, backed columns (or the nullary count(*)); group_concat(col, sep)
-        // and any computed argument decline because the accumulator only buffers column tuples.
-        var argumentColumns = new List<int>(function.Arguments.Count);
-        var argumentNames = new string[function.Arguments.Count];
-        for (var index = 0; index < function.Arguments.Count; index++)
+        if (windows.Count > 0)
         {
-            if (function.Arguments[index] is not ColumnExpression column
-                || target.ResolveColumnIndex(column.Name) is not { } ordinal)
-            {
+            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank";
+            if (existingRanking != ranking)
                 return false;
-            }
-
-            argumentColumns.Add(ordinal);
-            argumentNames[index] = column.Name;
+            if (ranking && windows[0].Aggregate.Name != function.Name.ToLowerInvariant())
+                return false;
         }
 
-        var aggregate = BuildAccumulatorAggregate(function, argumentNames, parameters, context, outerRow);
+        // Arguments must be bare, backed columns or folded constants (so group_concat(col, '|')
+        // can capture the separator in the aggregate AST). Computed non-constant arguments decline.
+        var argumentColumns = new List<int>(function.Arguments.Count);
+        var argumentNames = new List<string>(function.Arguments.Count);
+        for (var index = 0; index < function.Arguments.Count; index++)
+        {
+            if (function.Arguments[index] is ColumnExpression column
+                && target.ResolveColumnIndex(column.Name) is { } ordinal)
+            {
+                argumentColumns.Add(ordinal);
+                argumentNames.Add(column.Name);
+                continue;
+            }
+
+            if (IsConstantScalarExpression(function.Arguments[index]))
+                continue;
+
+            return false;
+        }
+
+        var aggregate = BuildAccumulatorAggregate(function, argumentNames.ToArray(), parameters, context, outerRow);
         if (frame.RequiresInverse && aggregate.Inverse is null)
             return false;
 
+        VdbeRowPredicate? filter = null;
+        if (function.Filter is not null && !ranking)
+        {
+            if (frame.RequiresInverse)
+                return false;
+
+            filter = CompileRowPredicate(function.Filter, target, parameters, context, outerRow);
+            if (filter is null)
+                return false;
+        }
+
         var windowIndex = windows.Count;
-        windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns));
+        windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns, filter));
         output = WindowOutput.ForWindow(windowIndex);
         return true;
     }
@@ -24438,6 +24508,31 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        if (function.Name is "ROW_NUMBER" or "RANK")
+        {
+            var rank = function.Name == "RANK";
+            return new VdbeAggregate
+            {
+                Name = rank ? "rank" : "row_number",
+                CreateContext = static () => new CountAggregateAccumulator(),
+                Accumulate = static (contextObject, _) =>
+                {
+                    ((CountAggregateAccumulator)contextObject!).Add();
+                    return contextObject;
+                },
+                Inverse = static (contextObject, _) =>
+                {
+                    ((CountAggregateAccumulator)contextObject!).Remove();
+                    return contextObject;
+                },
+                Finalize = contextObject =>
+                {
+                    var count = ((CountAggregateAccumulator)contextObject!).Count;
+                    return SqlValue.Integer(rank ? count + 1 : count);
+                },
+            };
+        }
+
         if (function.Name == "COUNT" && (function.CountStar || function.Arguments.Count is 0 or 1))
         {
             var countAll = function.CountStar || function.Arguments.Count == 0;

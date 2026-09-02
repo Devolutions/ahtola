@@ -951,51 +951,104 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void FilterClauseRoutesThroughTheBufferedWindowProgram()
+    public void FilterClauseOnRunningFrameRoutesThroughStreamingAndMatchSqlite()
     {
-        using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
-
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+        ];
         var query =
             $"SELECT id, sum(v) FILTER (WHERE v > 15) OVER (ORDER BY id {RunningFrame}) AS running FROM t ORDER BY id;";
-        var rows = ReadRows(connection, query);
-        rows.Should().HaveCount(3);
-        rows[0][1].Kind.Should().Be(SqlValueKind.Null);
-        rows[1][1].Should().Be(SqlValue.Integer(20));
-        rows[2][1].Should().Be(SqlValue.Integer(50));
 
-        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
-    }
-
-    [Test]
-    public void GroupConcatWithSeparatorRoutesThroughTheBufferedWindowProgram()
-    {
         using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER, label TEXT);");
-        Execute(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+        foreach (var statement in setup)
+            Execute(connection, statement);
 
-        // A 2-argument group_concat's separator is not a bare column, so the running accumulator
-        // declines and the buffered lowering owns it.
-        var query = $"SELECT id, group_concat(label, '|') OVER (ORDER BY id {RunningFrame}) AS acc FROM t ORDER BY id;";
-        ReadRows(connection, query).Select(row => row[1]).Should().Equal(
-            SqlValue.Text("a"), SqlValue.Text("a|b"), SqlValue.Text("a|b|c"));
-
-        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("FilterRegisters").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
     }
 
     [Test]
-    public void RankingFunctionWindowRoutesThroughTheBufferedWindowProgram()
+    public void FilterClauseOnMovingFrameKeepsBufferedFallback()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
 
-        var query = $"SELECT row_number() OVER (ORDER BY id {RunningFrame}) FROM t;";
-        ReadRows(connection, query).Select(row => row[0]).Should().Equal(
-            SqlValue.Integer(1),
-            SqlValue.Integer(2));
+        var query =
+            "SELECT id, sum(v) FILTER (WHERE v > 15) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;";
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
+    }
 
+    [Test]
+    public void GroupConcatWithLiteralSeparatorRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, label TEXT);",
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+        ];
+        var query = $"SELECT id, group_concat(label, '|') OVER (ORDER BY id {RunningFrame}) AS acc FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void RankingFunctionWindowRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (2, 20);",
+        ];
+        var query = "SELECT id, row_number() OVER (ORDER BY id) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void RankFunctionWindowRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (2, 20), (3, 30);",
+        ];
+        var query = "SELECT id, rank() OVER (ORDER BY id) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void MixedRankingAndAggregateKeepsBufferedFallback()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+        var query =
+            $"SELECT row_number() OVER (ORDER BY id {RunningFrame}), sum(v) OVER (ORDER BY id {RunningFrame}) FROM t ORDER BY id;";
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
     }
 

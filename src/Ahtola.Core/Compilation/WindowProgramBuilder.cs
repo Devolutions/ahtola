@@ -852,13 +852,13 @@ public static class WindowProgramBuilder
         var emit = ins.Count;
         if (rowsQueue)
         {
-            EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
+            EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase, width);
             ins.Add(new EphemeralInsertInstruction(delay, stagingRange));
         }
         else if (frame.ExcludesCurrentRow && frame.IsRunning)
         {
             EmitCurrentRowResult(ins, windows, outputs, stagingBase, aggOutBase, outBase);
-            EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
+            EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase, width);
         }
         else if (frame.ExcludesCurrentRow && frame.IsCurrentRow)
         {
@@ -866,7 +866,7 @@ public static class WindowProgramBuilder
         }
         else
         {
-        EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
+        EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase, width);
         if (followingCount > 0)
         {
             EmitFollowingStep(
@@ -1709,7 +1709,7 @@ public static class WindowProgramBuilder
 
         ins[primeGoto] = new GotoInstruction(new ProgramCounter(accumulate));
         if (exclusion is not (WindowExclusion.Group or WindowExclusion.Ties))
-            EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
+            EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase, width);
         ins.Add(new EphemeralInsertInstruction(cursor, stagingRange));
         ins.Add(new SorterNextInstruction(sorter, new ProgramCounter(drainLoop)));
 
@@ -2722,7 +2722,7 @@ public static class WindowProgramBuilder
         if (width > 0)
             ins.Add(new ColumnRangeInstruction(source, 0, new Register(rowBase), width));
         GatherArgumentsFromRow(ins, windows, argOffsets, argBase, rowBase);
-        EmitWindowSteps(ins, windows, argOffsets, argBase, rowBase);
+        EmitWindowSteps(ins, windows, argOffsets, argBase, rowBase, width);
         ins.Add(new NextInstruction(source, new ProgramCounter(loop)));
         ins[rewind] = new RewindCursorInstruction(source, new ProgramCounter(ins.Count));
     }
@@ -2750,7 +2750,7 @@ public static class WindowProgramBuilder
         if (exclusion == WindowExclusion.Ties)
         {
             GatherArgumentsFromRow(ins, windows, argOffsets, argBase, flushBase);
-            EmitWindowSteps(ins, windows, argOffsets, argBase, flushBase);
+            EmitWindowSteps(ins, windows, argOffsets, argBase, flushBase, width);
         }
         else if (exclusion == WindowExclusion.CurrentRow)
         {
@@ -2792,7 +2792,7 @@ public static class WindowProgramBuilder
         else if (exclusion == WindowExclusion.CurrentRow)
         {
             GatherArgumentsFromRow(ins, windows, argOffsets, argBase, flushBase);
-            EmitWindowSteps(ins, windows, argOffsets, argBase, flushBase);
+            EmitWindowSteps(ins, windows, argOffsets, argBase, flushBase, width);
         }
 
         ins.Add(new NextInstruction(delay, new ProgramCounter(loop)));
@@ -2880,11 +2880,23 @@ public static class WindowProgramBuilder
         IReadOnlyList<AggregateFunctionSpec> windows,
         int[] argOffsets,
         int argBase,
-        int stagingBase)
+        int stagingBase,
+        int width = 0)
     {
         for (var i = 0; i < windows.Count; i++)
         {
             var spec = windows[i];
+            var skip = -1;
+            if (spec.Filter is not null)
+            {
+                skip = ins.Count;
+                ins.Add(new FilterRegistersInstruction(
+                    new RegisterRange(new Register(stagingBase), Math.Max(width, 1)),
+                    spec.Filter,
+                    new ProgramCounter(0),
+                    "skip AggStep when FILTER is false"));
+            }
+
             for (var k = 0; k < spec.Arity; k++)
                 ins.Add(new CopyInstruction(new Register(stagingBase + spec.ArgumentColumns[k]), new Register(argBase + argOffsets[i] + k)));
 
@@ -2892,6 +2904,15 @@ public static class WindowProgramBuilder
                 new Accumulator(i),
                 spec.Aggregate,
                 new RegisterRange(new Register(argBase + argOffsets[i]), spec.Arity)));
+
+            if (skip >= 0)
+            {
+                ins[skip] = new FilterRegistersInstruction(
+                    new RegisterRange(new Register(stagingBase), Math.Max(width, 1)),
+                    spec.Filter!,
+                    new ProgramCounter(ins.Count),
+                    "skip AggStep when FILTER is false");
+            }
         }
     }
 

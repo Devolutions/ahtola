@@ -95,9 +95,12 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   `EXCLUDE CURRENT ROW` emits before AggStep. MIN/MAX on moving frames stream
   through a value-bag inverse. Window-buffer Compute reads spilled rows by index
   instead of reloading the partition. EXCLUDE GROUP/TIES stream on running and
-  current-peer frames (per-row inverse for TIES). Remaining: FILTER/DISTINCT,
-  ranking/navigation, group_concat moving frames, both-bound peer frames,
-  computed args / mixed OVER.
+  current-peer frames (per-row inverse for TIES). FILTER on non-moving frames
+  streams via FilterRegisters. row_number and rank stream as COUNT-style
+  accumulators. group_concat with a literal separator streams on non-moving
+  frames. Remaining: FILTER on moving frames, DISTINCT window aggregates,
+  dense_rank/percent_rank/cume_dist/ntile/lag/lead/first_value/last_value/nth_value,
+  group_concat on moving frames, both-bound peer frames, computed args / mixed OVER.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
