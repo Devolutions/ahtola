@@ -160,11 +160,11 @@ real mapping, built variant-by-variant:
 > ephemeral; ROWS running EXCLUDE CURRENT ROW emits before AggStep. MIN/MAX
 > moving frames stream with a value-bag inverse. Window-buffer Compute indexes
 > spilled rows instead of reloading the partition. EXCLUDE GROUP/TIES stream on
-> running and current-peer frames. FILTER on non-moving frames, row_number/rank,
-> and group_concat with a literal separator stream. Remaining buffered cells:
-> FILTER on moving frames, DISTINCT window aggregates, other ranking/navigation
-> functions, group_concat on moving frames, both-bound peer frames, and
-> computed args / mixed OVER.
+> running and current-peer frames. FILTER on non-moving frames, row_number/rank/
+> dense_rank, first_value/last_value, and group_concat with a literal separator
+> stream. Remaining buffered cells: FILTER on moving frames, DISTINCT window
+> aggregates, percent_rank/cume_dist/ntile/lag/lead/nth_value, group_concat on
+> moving frames, both-bound peer frames, and computed args / mixed OVER.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).

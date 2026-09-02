@@ -23530,11 +23530,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             .Distinct(StringComparer.Ordinal)
             .ToArray();
         var rankingOnly = rankingNames.Length > 0
-            && rankingNames.All(name => name is "row_number" or "rank");
+            && rankingNames.All(name => name is "row_number" or "rank" or "dense_rank");
         if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "row_number")
             frame = WindowFrameSpec.Running;
         else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "rank")
             frame = WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group };
+        else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "dense_rank")
+            frame = WindowFrameSpec.RangeRunning;
         else if (rankingOnly)
             return false;
         else if (!TryGetStreamingWindowFrame(spec.Frame, out frame))
@@ -24091,15 +24093,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
 
         var window = function.Window!;
-        var ranking = function.Name is "ROW_NUMBER" or "RANK";
+        var ranking = function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK";
         WindowFrameSpec frame;
         if (ranking)
         {
             if (function.Arguments.Count != 0 || function.CountStar)
                 return false;
-            frame = function.Name == "ROW_NUMBER"
-                ? WindowFrameSpec.Running
-                : WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group };
+            frame = function.Name switch
+            {
+                "ROW_NUMBER" => WindowFrameSpec.Running,
+                "RANK" => WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group },
+                _ => WindowFrameSpec.RangeRunning,
+            };
         }
         else
         {
@@ -24110,9 +24115,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG" or "MIN" or "MAX"))
                 return false;
 
-            // Dedicated navigation/value functions and managed percentile aggregates stay
-            // on the buffered evaluator. Ranking is handled above.
+            // Dedicated navigation functions (lag/lead/ntile/nth_value) and managed
+            // percentile aggregates stay on the buffered evaluator. Ranking and
+            // first_value/last_value are handled as streaming accumulators.
             if (!IsBuiltInAggregate(function)
+                && function.Name is not ("FIRST_VALUE" or "LAST_VALUE")
                 && !TryGetAggregateFunction(function.Name, function.Arguments.Count, out _))
             {
                 return false;
@@ -24128,7 +24135,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         if (windows.Count > 0)
         {
-            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank";
+            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank" or "dense_rank";
             if (existingRanking != ranking)
                 return false;
             if (ranking && windows[0].Aggregate.Name != function.Name.ToLowerInvariant())
@@ -24153,6 +24160,22 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 continue;
 
             return false;
+        }
+
+        // dense_rank detects peer groups from the ORDER BY key, so those columns become
+        // the AggStep argument tuple even though the SQL function is nullary.
+        if (function.Name == "DENSE_RANK")
+        {
+            foreach (var term in window.OrderBy)
+            {
+                if (UnwrapCollation(term.Expression) is not ColumnExpression column
+                    || target.ResolveColumnIndex(column.Name) is not { } ordinal)
+                {
+                    return false;
+                }
+
+                argumentColumns.Add(ordinal);
+            }
         }
 
         var aggregate = BuildAccumulatorAggregate(function, argumentNames.ToArray(), parameters, context, outerRow);
@@ -24508,8 +24531,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        if (function.Name is "ROW_NUMBER" or "RANK")
+        if (function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK")
         {
+            if (function.Name == "DENSE_RANK")
+            {
+                return new VdbeAggregate
+                {
+                    Name = "dense_rank",
+                    CreateContext = () => new DenseRankAccumulator(Compare),
+                    Accumulate = static (contextObject, arguments) =>
+                    {
+                        ((DenseRankAccumulator)contextObject!).Add(arguments);
+                        return contextObject;
+                    },
+                    Finalize = static contextObject =>
+                        SqlValue.Integer(((DenseRankAccumulator)contextObject!).Rank),
+                };
+            }
+
             var rank = function.Name == "RANK";
             return new VdbeAggregate
             {
@@ -24530,6 +24569,22 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     var count = ((CountAggregateAccumulator)contextObject!).Count;
                     return SqlValue.Integer(rank ? count + 1 : count);
                 },
+            };
+        }
+
+        if (function.Name is "FIRST_VALUE" or "LAST_VALUE" && function.Arguments.Count == 1)
+        {
+            var keepFirst = function.Name == "FIRST_VALUE";
+            return new VdbeAggregate
+            {
+                Name = function.Name.ToLowerInvariant(),
+                CreateContext = () => new WindowValueAccumulator(keepFirst),
+                Accumulate = static (contextObject, arguments) =>
+                {
+                    ((WindowValueAccumulator)contextObject!).Add(arguments[0]);
+                    return contextObject;
+                },
+                Finalize = static contextObject => ((WindowValueAccumulator)contextObject!).Finalize(),
             };
         }
 
@@ -40056,6 +40111,65 @@ out bool hasReturning)
 
             Count--;
         }
+    }
+
+    private sealed class DenseRankAccumulator
+    {
+        private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private SqlValue[]? _lastKey;
+
+        internal DenseRankAccumulator(Func<SqlValue, SqlValue, string?, int> compare)
+        {
+            _compare = compare;
+        }
+
+        internal long Rank { get; private set; }
+
+        internal void Add(SqlValue[] key)
+        {
+            if (_lastKey is not null && KeysEqual(_lastKey, key))
+                return;
+
+            Rank++;
+            _lastKey = key.Length == 0 ? [] : (SqlValue[])key.Clone();
+        }
+
+        private bool KeysEqual(SqlValue[] left, SqlValue[] right)
+        {
+            if (left.Length != right.Length)
+                return false;
+
+            for (var index = 0; index < left.Length; index++)
+            {
+                if (_compare(left[index], right[index], null) != 0)
+                    return false;
+            }
+
+            return true;
+        }
+    }
+
+    private sealed class WindowValueAccumulator
+    {
+        private readonly bool _keepFirst;
+        private SqlValue _value = SqlValue.Null;
+        private bool _set;
+
+        internal WindowValueAccumulator(bool keepFirst)
+        {
+            _keepFirst = keepFirst;
+        }
+
+        internal void Add(SqlValue value)
+        {
+            if (_keepFirst && _set)
+                return;
+
+            _value = value;
+            _set = true;
+        }
+
+        internal SqlValue Finalize() => _set ? _value : SqlValue.Null;
     }
 
     private sealed class NumericAggregateAccumulator
