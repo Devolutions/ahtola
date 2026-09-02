@@ -1037,6 +1037,66 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
+    public void GroupsBothBoundPeerFrameRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);",
+        ];
+        var query =
+            "SELECT id, sum(v) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void RangeBothBoundPeerFrameRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);",
+        ];
+        var query =
+            "SELECT id, sum(v) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void RangeNonIntegerPrecedingRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+        ];
+        var query =
+            "SELECT id, sum(v) OVER (ORDER BY id RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
     public void RankingFunctionWindowRoutesThroughStreamingAndMatchSqlite()
     {
         string[] setup =

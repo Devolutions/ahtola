@@ -304,6 +304,78 @@ public readonly record struct WindowFrameSpec(
         && StartOffset is null
         && EndOffset is > 0 and <= MaxStreamingPreceding;
 
+    /// <summary>Whether this frame is <c>RANGE n PRECEDING TO m FOLLOWING</c>.</summary>
+    public bool IsRangePrecedingFollowing => Mode == WindowFrameMode.Range
+        && Start == WindowBound.Preceding
+        && End == WindowBound.Following
+        && StartOffset is > 0 and <= MaxStreamingPreceding
+        && EndOffset is > 0 and <= MaxStreamingPreceding;
+
+    /// <summary>Whether this frame is <c>GROUPS n PRECEDING TO m FOLLOWING</c>.</summary>
+    public bool IsGroupsPrecedingFollowing => Mode == WindowFrameMode.Groups
+        && Start == WindowBound.Preceding
+        && End == WindowBound.Following
+        && StartOffset is > 0 and <= MaxStreamingPreceding
+        && EndOffset is > 0 and <= MaxStreamingPreceding;
+
+    /// <summary>RANGE offset that is not a whole integer (compare uses a REAL bound).</summary>
+    public bool IsNonIntegerRangeOffset => Mode == WindowFrameMode.Range
+        && (BoundValue is { Kind: SqlValueKind.Real } || EndBoundValue is { Kind: SqlValueKind.Real });
+
+    /// <summary>Optional RANGE start bound when it is not a whole integer.</summary>
+    public SqlValue? BoundValue { get; init; }
+
+    /// <summary>Optional RANGE end bound when it is not a whole integer.</summary>
+    public SqlValue? EndBoundValue { get; init; }
+
+    /// <summary>A moving frame: <c>RANGE n PRECEDING TO m FOLLOWING</c>.</summary>
+    public static WindowFrameSpec RangePrecedingAndFollowing(long n, long m) => new(
+        WindowFrameMode.Range,
+        WindowBound.Preceding,
+        WindowBound.Following,
+        StartOffset: n,
+        EndOffset: m);
+
+    /// <summary>A moving frame: <c>GROUPS n PRECEDING TO m FOLLOWING</c>.</summary>
+    public static WindowFrameSpec GroupsPrecedingAndFollowing(long n, long m) => new(
+        WindowFrameMode.Groups,
+        WindowBound.Preceding,
+        WindowBound.Following,
+        StartOffset: n,
+        EndOffset: m);
+
+    /// <summary>RANGE preceding with a possibly non-integer bound.</summary>
+    public static WindowFrameSpec RangePrecedingBound(SqlValue bound) => new(
+        WindowFrameMode.Range,
+        WindowBound.Preceding,
+        WindowBound.CurrentRow,
+        StartOffset: 1)
+    {
+        BoundValue = bound,
+    };
+
+    /// <summary>RANGE following with a possibly non-integer bound.</summary>
+    public static WindowFrameSpec RangeFollowingBound(SqlValue bound) => new(
+        WindowFrameMode.Range,
+        WindowBound.CurrentRow,
+        WindowBound.Following,
+        EndOffset: 1)
+    {
+        EndBoundValue = bound,
+    };
+
+    /// <summary>RANGE both-bound with possibly non-integer offsets.</summary>
+    public static WindowFrameSpec RangeBounds(SqlValue start, SqlValue end) => new(
+        WindowFrameMode.Range,
+        WindowBound.Preceding,
+        WindowBound.Following,
+        StartOffset: 1,
+        EndOffset: 1)
+    {
+        BoundValue = start,
+        EndBoundValue = end,
+    };
+
     /// <summary>The <c>n</c> in a RANGE following frame; 0 when the frame is not one.</summary>
     public int RangeFollowingOffset => IsRangeFollowing ? (int)EndOffset!.Value : 0;
 

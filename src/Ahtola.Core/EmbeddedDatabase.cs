@@ -23770,6 +23770,41 @@ public sealed partial class EmbeddedDatabase : IDisposable
             frame = WindowFrameSpec.Running with { Exclusion = frame.Exclusion };
         }
 
+        if (frame.IsRangePrecedingFollowing
+            || frame.IsGroupsPrecedingFollowing
+            || frame.IsNonIntegerRangeOffset)
+        {
+            if (spec.OrderBy.Count != 1
+                || UnwrapCollation(spec.OrderBy[0].Expression) is not ColumnExpression orderColumn
+                || target.ResolveColumnIndex(orderColumn.Name) is not { } orderOrdinal)
+            {
+                return false;
+            }
+
+            var descending = spec.OrderBy[0].Descending;
+            var startOffset = BoundToDouble(frame.BoundValue, frame.Start == WindowBound.Preceding ? frame.StartOffset : 0);
+            var endOffset = BoundToDouble(frame.EndBoundValue, frame.End == WindowBound.Following ? frame.EndOffset : 0);
+            var groups = frame.IsGroupsPrecedingFollowing;
+            for (var index = 0; index < windows.Count; index++)
+            {
+                var window = windows[index];
+                var columns = window.ArgumentColumns.ToList();
+                if (!columns.Contains(orderOrdinal))
+                    columns.Add(orderOrdinal);
+
+                var keyIndex = columns.IndexOf(orderOrdinal);
+                windows[index] = window with
+                {
+                    ArgumentColumns = columns,
+                    Aggregate = groups
+                        ? WrapGroupsBound(window.Aggregate, keyIndex, (long)startOffset, (long)endOffset, Compare)
+                        : WrapRangeBound(window.Aggregate, keyIndex, startOffset, endOffset, descending),
+                };
+            }
+
+            frame = WindowFrameSpec.RowsFullPartition;
+        }
+
         program = WindowProgramBuilder.Build(
             target.TableName,
             target.Columns.Length,
@@ -24184,8 +24219,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             if (!TryGetStreamingWindowFrame(window.Frame, out frame))
                 return false;
-            if ((frame.IsRangePreceding || frame.IsRangeFollowing) && window.OrderBy.Count != 1)
+            if ((frame.IsRangePreceding
+                    || frame.IsRangeFollowing
+                    || frame.IsRangePrecedingFollowing
+                    || frame.IsNonIntegerRangeOffset)
+                && window.OrderBy.Count != 1)
+            {
                 return false;
+            }
 
             // Dedicated navigation functions (ntile/percent_rank/cume_dist) and managed
             // percentile aggregates stay on the buffered evaluator. Ranking, lag/lead,
@@ -24294,6 +24335,55 @@ public sealed partial class EmbeddedDatabase : IDisposable
         windows.Add(new AggregateFunctionSpec(aggregate, argumentColumns, filter, navigationOffset));
         output = WindowOutput.ForWindow(windowIndex);
         return true;
+    }
+
+    private static double BoundToDouble(SqlValue? bound, long? fallback)
+    {
+        if (bound is { Kind: SqlValueKind.Integer } integer)
+            return integer.AsInteger();
+        if (bound is { Kind: SqlValueKind.Real } real)
+            return real.AsReal();
+        return fallback ?? 0;
+    }
+
+    private static VdbeAggregate WrapRangeBound(
+        VdbeAggregate inner,
+        int keyIndex,
+        double startOffset,
+        double endOffset,
+        bool descending)
+    {
+        return new VdbeAggregate
+        {
+            Name = inner.Name,
+            CreateContext = () => new RangeBoundAccumulator(inner, keyIndex, startOffset, endOffset, descending),
+            Accumulate = static (contextObject, arguments) =>
+            {
+                ((RangeBoundAccumulator)contextObject!).Add(arguments);
+                return contextObject;
+            },
+            Finalize = static contextObject => ((RangeBoundAccumulator)contextObject!).Finalize(),
+        };
+    }
+
+    private static VdbeAggregate WrapGroupsBound(
+        VdbeAggregate inner,
+        int keyIndex,
+        long startOffset,
+        long endOffset,
+        Func<SqlValue, SqlValue, string?, int> compare)
+    {
+        return new VdbeAggregate
+        {
+            Name = inner.Name,
+            CreateContext = () => new GroupsBoundAccumulator(inner, keyIndex, startOffset, endOffset, compare),
+            Accumulate = static (contextObject, arguments) =>
+            {
+                ((GroupsBoundAccumulator)contextObject!).Add(arguments);
+                return contextObject;
+            },
+            Finalize = static contextObject => ((GroupsBoundAccumulator)contextObject!).Finalize(),
+        };
     }
 
     private static VdbeAggregate WrapPrecedingToPreceding(VdbeAggregate inner, long start, long end)
@@ -24430,6 +24520,34 @@ public sealed partial class EmbeddedDatabase : IDisposable
             default:
                 return false;
         }
+    }
+
+    private static bool TryGetRangeBound(
+        Ahtola.Core.Parsing.FrameBound bound,
+        FrameBoundKind expected,
+        out SqlValue value)
+    {
+        value = default;
+        if (bound.Kind != expected)
+            return false;
+        if (bound.Offset is not LiteralExpression literal)
+            return false;
+        if (literal.Value.Kind is not (SqlValueKind.Integer or SqlValueKind.Real))
+            return false;
+
+        if (literal.Value.Kind == SqlValueKind.Integer)
+        {
+            var integer = literal.Value.AsInteger();
+            if (integer is <= 0 or > WindowFrameSpec.MaxStreamingPreceding)
+                return false;
+        }
+        else if (literal.Value.AsReal() is <= 0 or > WindowFrameSpec.MaxStreamingPreceding)
+        {
+            return false;
+        }
+
+        value = literal.Value;
+        return true;
     }
 
     // The streaming builder handles the running prefix, exact current row, bounded ROWS
@@ -24581,6 +24699,56 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
             {
                 spec = WindowFrameSpec.RangeFollowing(following);
+                return true;
+            }
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && TryGetRangeBound(frame.Start, FrameBoundKind.Preceding, out var rangeStartBound)
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Offset is null
+            && rangeStartBound.Kind == SqlValueKind.Real)
+        {
+            spec = WindowFrameSpec.RangePrecedingBound(rangeStartBound);
+            return true;
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.Start.Offset is null
+            && TryGetRangeBound(frame.End, FrameBoundKind.Following, out var rangeEndBound)
+            && rangeEndBound.Kind == SqlValueKind.Real)
+        {
+            spec = WindowFrameSpec.RangeFollowingBound(rangeEndBound);
+            return true;
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && TryGetRangeBound(frame.Start, FrameBoundKind.Preceding, out var bothStart)
+            && TryGetRangeBound(frame.End, FrameBoundKind.Following, out var bothEnd))
+        {
+            spec = WindowFrameSpec.RangeBounds(bothStart, bothEnd);
+            return true;
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } groupsBothStart,
+            }
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Following,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } groupsBothEnd,
+            })
+        {
+            var preceding = groupsBothStart.Value.AsInteger();
+            var following = groupsBothEnd.Value.AsInteger();
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding
+                && following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.GroupsPrecedingAndFollowing(preceding, following);
                 return true;
             }
         }
@@ -40575,6 +40743,145 @@ out bool hasReturning)
             }
 
             return true;
+        }
+    }
+
+    private sealed class RangeBoundAccumulator
+    {
+        private readonly VdbeAggregate _inner;
+        private readonly int _keyIndex;
+        private readonly double _startOffset;
+        private readonly double _endOffset;
+        private readonly bool _descending;
+        private readonly List<SqlValue[]> _rows = [];
+        private int _emitIndex;
+
+        internal RangeBoundAccumulator(
+            VdbeAggregate inner,
+            int keyIndex,
+            double startOffset,
+            double endOffset,
+            bool descending)
+        {
+            _inner = inner;
+            _keyIndex = keyIndex;
+            _startOffset = startOffset;
+            _endOffset = endOffset;
+            _descending = descending;
+        }
+
+        internal void Add(SqlValue[] arguments)
+        {
+            var copy = new SqlValue[arguments.Length];
+            Array.Copy(arguments, copy, arguments.Length);
+            _rows.Add(copy);
+        }
+
+        internal SqlValue Finalize()
+        {
+            var current = _rows[_emitIndex][_keyIndex];
+            _emitIndex++;
+            var context = _inner.CreateContext();
+            foreach (var row in _rows)
+            {
+                if (InRange(row[_keyIndex], current))
+                    context = _inner.Accumulate(context, row);
+            }
+
+            return _inner.Finalize(context);
+        }
+
+        private bool InRange(SqlValue rowKey, SqlValue currentKey)
+        {
+            if (!TryToDouble(rowKey, out var row) || !TryToDouble(currentKey, out var current))
+                return false;
+
+            return _descending
+                ? row <= current + _startOffset && row >= current - _endOffset
+                : row >= current - _startOffset && row <= current + _endOffset;
+        }
+
+        private static bool TryToDouble(SqlValue value, out double number)
+        {
+            if (value.Kind == SqlValueKind.Integer)
+            {
+                number = value.AsInteger();
+                return true;
+            }
+
+            if (value.Kind == SqlValueKind.Real)
+            {
+                number = value.AsReal();
+                return true;
+            }
+
+            number = 0;
+            return false;
+        }
+    }
+
+    private sealed class GroupsBoundAccumulator
+    {
+        private readonly VdbeAggregate _inner;
+        private readonly int _keyIndex;
+        private readonly long _startOffset;
+        private readonly long _endOffset;
+        private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private readonly List<SqlValue[]> _rows = [];
+        private int _emitIndex;
+
+        internal GroupsBoundAccumulator(
+            VdbeAggregate inner,
+            int keyIndex,
+            long startOffset,
+            long endOffset,
+            Func<SqlValue, SqlValue, string?, int> compare)
+        {
+            _inner = inner;
+            _keyIndex = keyIndex;
+            _startOffset = startOffset;
+            _endOffset = endOffset;
+            _compare = compare;
+        }
+
+        internal void Add(SqlValue[] arguments)
+        {
+            var copy = new SqlValue[arguments.Length];
+            Array.Copy(arguments, copy, arguments.Length);
+            _rows.Add(copy);
+        }
+
+        internal SqlValue Finalize()
+        {
+            var groups = new List<int>();
+            var emitGroup = 0;
+            for (var index = 0; index < _rows.Count; index++)
+            {
+                if (index == 0
+                    || _compare(_rows[index][_keyIndex], _rows[index - 1][_keyIndex], null) != 0)
+                {
+                    groups.Add(index);
+                }
+
+                if (index == _emitIndex)
+                    emitGroup = groups.Count - 1;
+            }
+
+            var first = emitGroup - (int)_startOffset;
+            if (first < 0)
+                first = 0;
+            var last = emitGroup + (int)_endOffset;
+            if (last >= groups.Count)
+                last = groups.Count - 1;
+
+            var startRow = groups[first];
+            var endRow = last + 1 < groups.Count ? groups[last + 1] : _rows.Count;
+            var context = _inner.CreateContext();
+            for (var index = startRow; index < endRow; index++)
+                context = _inner.Accumulate(context, _rows[index]);
+
+            _emitIndex++;
+            return _inner.Finalize(context);
         }
     }
 

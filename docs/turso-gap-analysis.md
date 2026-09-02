@@ -165,9 +165,9 @@ real mapping, built variant-by-variant:
 > a literal separator, scan-evaluable computed arguments, lead, nth_value, and
 > FILTER on moving frames, group_concat-style list aggregates,
 > percent_rank/cume_dist/ntile, and ROWS n PRECEDING AND m PRECEDING stream.
-> Remaining streaming cells (2): RANGE/GROUPS n PRE AND m FOL, and non-integer
-> RANGE offsets. Mixed OVER stays on OpenWindowBuffer. DISTINCT window
-> aggregates are rejected.
+> RANGE/GROUPS n PRECEDING AND m FOLLOWING, and non-integer RANGE offsets
+> stream via a full-partition re-fold. Mixed OVER stays on OpenWindowBuffer.
+> DISTINCT window aggregates are rejected.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).
