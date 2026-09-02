@@ -767,9 +767,96 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void RangeOnePrecedingInversesKeysThatFallOutsideTheValueOffset()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.CursorCount.Should().Be(3);
+        program.Instructions.Select(static instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.AggInverse)
+            .And.Contain(VdbeOpcode.Compare)
+            .And.Contain(VdbeOpcode.OpenEphemeral);
+
+        var rows = Run(program, Rows([1, 10], [2, 20], [10, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 10),
+            (2, 30),
+            (10, 30));
+    }
+
+    [Test]
+    public void RangeOnePrecedingKeepsConsecutiveIntegerPeers()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30], [3, 40]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (1, 30),
+            (2, 60),
+            (3, 70));
+    }
+
+    [Test]
+    public void RangeOnePrecedingDescendingFlipsTheOffsetCompare()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: (left, right) => AggregateTestSupport.OrderByColumns(0)(right, left),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual(),
+            descendingOrder: true);
+
+        var rows = Run(program, Rows([10, 30], [2, 20], [1, 10]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 30),
+            (2, 20),
+            (1, 30));
+    }
+
+    [Test]
+    public void RangePrecedingRequiresExactlyOneOrderColumn()
+    {
+        Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
+            "t",
+            2,
+            [],
+            [InvertibleSum(1)],
+            [WindowOutput.ForWindow(0)],
+            AggregateTestSupport.OrderByColumns(0, 1),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0, 1],
+            peerComparer: AggregateTestSupport.GroupKeysEqual()));
+    }
+
+    [Test]
     public void BuildRejectsFramesItCannotRepresent()
     {
-        // RANGE/GROUPS value or group offsets, and forward-looking bounds, stay unmodeled.
+        // Unbounded FOLLOWING and incomplete ROWS bounds stay unmodeled. RANGE n PRECEDING
+        // without a single ORDER BY column is also rejected.
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
             "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
             AggregateTestSupport.OrderByColumns(0),
@@ -829,6 +916,17 @@ public class WindowProgramBuilderDirectTests
                 AggregateTestSupport.OrderByColumns(0),
                 frame: frame));
         }
+
+        Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
+            "t",
+            1,
+            [],
+            [new AggregateFunctionSpec(AggregateTestSupport.Min(), [0])],
+            [WindowOutput.ForWindow(0)],
+            AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangePreceding(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual()));
     }
 
     [Test]

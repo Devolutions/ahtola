@@ -474,14 +474,70 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void RangeValueBoundsKeepBufferedFallback()
+    public void RangePrecedingFrameRoutesThroughInverseAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (10, 30);",
+        ];
+        const string query =
+            "SELECT k, sum(v) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) " +
+            "FROM t ORDER BY k;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
+        opcodes.Should().Contain("AggInverse").And.Contain("OpenEphemeral").And.Contain("Compare")
+            .And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void RangePrecedingDescendingFrameMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (10, 30);",
+        ];
+        const string query =
+            "SELECT k, sum(v) OVER (ORDER BY k DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) " +
+            "FROM t ORDER BY k DESC;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggInverse").And.Contain("OpenEphemeral").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void RangePrecedingMultiKeyOrderByIsRejected()
     {
         using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+        Execute(connection, "CREATE TABLE t(a INTEGER, b INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 1, 10), (1, 2, 20);");
+
+        var error = Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+            connection,
+            "SELECT a, sum(v) OVER (ORDER BY a, b RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;"));
+        error!.Message.Should().Contain("RANGE with offset");
+    }
+
+    [Test]
+    public void RangePrecedingWithoutInverseKeepsBufferedFallback()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
 
         var query =
-            "SELECT id, sum(v) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;";
+            "SELECT k, min(v) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY k;";
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
             .Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
     }

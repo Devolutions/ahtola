@@ -80,8 +80,12 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   delay buffer. Streaming `GROUPS n PRECEDING … CURRENT ROW` inverses each
   departing peer group (n ≤ 1024). Window-buffer scanned rows spill to a
   temp file under the statement memory budget and reload for Compute.
-  Remaining: RANGE n PRECEDING (value bounds), GROUPS FOLLOWING, and
-  Compute still needing the partition in-heap after reload.
+  Streaming `RANGE n PRECEDING … CURRENT ROW` (single ORDER BY key, n ≤ 1024)
+  keeps a history ephemeral of in-frame prior groups and compact/inverses with
+  `Compare` + `AggInverse` (ASC: `row + n >= current`; DESC subtracts and
+  flips to `<=`). Remaining: GROUPS FOLLOWING, RANGE FOLLOWING,
+  unbounded-following frames, EXCLUDE, MIN/MAX inverse, and Compute still
+  needing the partition in-heap after reload.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

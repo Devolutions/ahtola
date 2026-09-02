@@ -23688,6 +23688,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
+        var descendingOrder = false;
+        if (frame.IsRangePreceding)
+        {
+            if (orderColumns is not { Count: 1 } || spec.OrderBy.Count != 1)
+                return false;
+
+            descendingOrder = spec.OrderBy[0].Descending;
+        }
+
         program = WindowProgramBuilder.Build(
             target.TableName,
             target.Columns.Length,
@@ -23699,7 +23708,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             predicate,
             frame,
             orderColumns,
-            peerComparer);
+            peerComparer,
+            descendingOrder);
         return true;
     }
 
@@ -24024,6 +24034,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var window = function.Window!;
         if (!TryGetStreamingWindowFrame(window.Frame, out var frame))
             return false;
+        if (frame.IsRangePreceding && window.OrderBy.Count != 1)
+            return false;
         if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG"))
             return false;
 
@@ -24070,8 +24082,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     // The streaming builder handles the running prefix, exact current row, bounded ROWS
-    // n PRECEDING / m FOLLOWING, and RANGE/GROUPS peer frames (unbounded preceding or
-    // current row). Moving ROWS frames follow Turso's order: step, emit, then inverse.
+    // n PRECEDING / m FOLLOWING, RANGE/GROUPS peer frames (unbounded preceding or
+    // current row), GROUPS n PRECEDING, and RANGE n PRECEDING (single ORDER BY key).
+    // Moving ROWS frames follow Turso's order: step, emit, then inverse.
     private static bool TryGetStreamingWindowFrame(WindowFrame? frame, out WindowFrameSpec spec)
     {
         spec = default;
@@ -24124,6 +24137,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
             {
                 spec = WindowFrameSpec.GroupsPreceding(preceding);
+                return true;
+            }
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } rangeOffset,
+            }
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Offset is null)
+        {
+            var preceding = rangeOffset.Value.AsInteger();
+            if (preceding == 0)
+            {
+                spec = WindowFrameSpec.RangeCurrentPeer;
+                return true;
+            }
+
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.RangePreceding(preceding);
                 return true;
             }
         }
