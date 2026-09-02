@@ -1080,6 +1080,26 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
+    public void LagOffsetOneRoutesThroughStreamingAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+        ];
+        var query =
+            "SELECT id, lag(v) OVER (ORDER BY id), lag(v, 1, -1) OVER (ORDER BY id), lag(v, 2) OVER (ORDER BY id) FROM t ORDER BY id;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("AggStep").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
     public void MixedRankingAndAggregateKeepsBufferedFallback()
     {
         using var connection = new EmbeddedDatabase().Connect();

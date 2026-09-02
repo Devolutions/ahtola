@@ -23530,13 +23530,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
             .Distinct(StringComparer.Ordinal)
             .ToArray();
         var rankingOnly = rankingNames.Length > 0
-            && rankingNames.All(name => name is "row_number" or "rank" or "dense_rank");
+            && rankingNames.All(name => name is "row_number" or "rank" or "dense_rank" or "lag");
         if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "row_number")
             frame = WindowFrameSpec.Running;
         else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "rank")
             frame = WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group };
         else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "dense_rank")
             frame = WindowFrameSpec.RangeRunning;
+        else if (rankingOnly && rankingNames.Length == 1 && rankingNames[0] == "lag")
+            frame = WindowFrameSpec.Running with { Exclusion = WindowExclusion.CurrentRow };
         else if (rankingOnly)
             return false;
         else if (!TryGetStreamingWindowFrame(spec.Frame, out frame))
@@ -24093,16 +24095,31 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
 
         var window = function.Window!;
-        var ranking = function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK";
+        var ranking = function.Name is "ROW_NUMBER" or "RANK" or "DENSE_RANK" or "LAG";
         WindowFrameSpec frame;
         if (ranking)
         {
-            if (function.Arguments.Count != 0 || function.CountStar)
+            if (function.Name == "LAG")
+            {
+                if (function.Arguments.Count is < 1 or > 3 || function.CountStar || function.Filter is not null)
+                    return false;
+                if (function.Arguments.Count >= 2
+                    && (function.Arguments[1] is not LiteralExpression { Value.Kind: SqlValueKind.Integer } offset
+                        || offset.Value.AsInteger() is < 1 or > WindowFrameSpec.MaxStreamingPreceding))
+                {
+                    return false;
+                }
+            }
+            else if (function.Arguments.Count != 0 || function.CountStar)
+            {
                 return false;
+            }
+
             frame = function.Name switch
             {
                 "ROW_NUMBER" => WindowFrameSpec.Running,
                 "RANK" => WindowFrameSpec.RangeRunning with { Exclusion = WindowExclusion.Group },
+                "LAG" => WindowFrameSpec.Running with { Exclusion = WindowExclusion.CurrentRow },
                 _ => WindowFrameSpec.RangeRunning,
             };
         }
@@ -24135,7 +24152,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         if (windows.Count > 0)
         {
-            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank" or "dense_rank";
+            var existingRanking = windows[0].Aggregate.Name is "row_number" or "rank" or "dense_rank" or "lag";
             if (existingRanking != ranking)
                 return false;
             if (ranking && windows[0].Aggregate.Name != function.Name.ToLowerInvariant())
@@ -24161,6 +24178,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             return false;
         }
+
+        if (function.Name is "FIRST_VALUE" or "LAST_VALUE" or "LAG" && argumentColumns.Count != 1)
+            return false;
 
         // dense_rank detects peer groups from the ORDER BY key, so those columns become
         // the AggStep argument tuple even though the SQL function is nullary.
@@ -24572,19 +24592,41 @@ public sealed partial class EmbeddedDatabase : IDisposable
             };
         }
 
-        if (function.Name is "FIRST_VALUE" or "LAST_VALUE" && function.Arguments.Count == 1)
+        if (function.Name is "FIRST_VALUE" or "LAST_VALUE" or "LAG"
+            && function.Arguments.Count >= 1)
         {
             var keepFirst = function.Name == "FIRST_VALUE";
+            var defaultValue = SqlValue.Null;
+            var lagOffset = 1L;
+            if (function.Name == "LAG")
+            {
+                if (function.Arguments.Count >= 2
+                    && function.Arguments[1] is LiteralExpression { Value.Kind: SqlValueKind.Integer } offset)
+                {
+                    lagOffset = offset.Value.AsInteger();
+                }
+
+                if (function.Arguments.Count == 3)
+                    defaultValue = Evaluate(function.Arguments[2], parameters, null, context);
+            }
+
             return new VdbeAggregate
             {
                 Name = function.Name.ToLowerInvariant(),
-                CreateContext = () => new WindowValueAccumulator(keepFirst),
+                CreateContext = () => function.Name == "LAG"
+                    ? new LagAccumulator(lagOffset, defaultValue)
+                    : new WindowValueAccumulator(keepFirst, defaultValue),
                 Accumulate = static (contextObject, arguments) =>
                 {
-                    ((WindowValueAccumulator)contextObject!).Add(arguments[0]);
+                    if (contextObject is LagAccumulator lag)
+                        lag.Add(arguments[0]);
+                    else
+                        ((WindowValueAccumulator)contextObject!).Add(arguments[0]);
                     return contextObject;
                 },
-                Finalize = static contextObject => ((WindowValueAccumulator)contextObject!).Finalize(),
+                Finalize = static contextObject => contextObject is LagAccumulator lag
+                    ? lag.Finalize()
+                    : ((WindowValueAccumulator)contextObject!).Finalize(),
             };
         }
 
@@ -40152,12 +40194,14 @@ out bool hasReturning)
     private sealed class WindowValueAccumulator
     {
         private readonly bool _keepFirst;
+        private readonly SqlValue _defaultValue;
         private SqlValue _value = SqlValue.Null;
         private bool _set;
 
-        internal WindowValueAccumulator(bool keepFirst)
+        internal WindowValueAccumulator(bool keepFirst, SqlValue defaultValue)
         {
             _keepFirst = keepFirst;
+            _defaultValue = defaultValue;
         }
 
         internal void Add(SqlValue value)
@@ -40169,7 +40213,30 @@ out bool hasReturning)
             _set = true;
         }
 
-        internal SqlValue Finalize() => _set ? _value : SqlValue.Null;
+        internal SqlValue Finalize() => _set ? _value : _defaultValue;
+    }
+
+    private sealed class LagAccumulator
+    {
+        private readonly long _offset;
+        private readonly SqlValue _defaultValue;
+        private readonly Queue<SqlValue> _values = new();
+
+        internal LagAccumulator(long offset, SqlValue defaultValue)
+        {
+            _offset = offset;
+            _defaultValue = defaultValue;
+        }
+
+        internal void Add(SqlValue value)
+        {
+            _values.Enqueue(value);
+            while (_values.Count > _offset)
+                _values.Dequeue();
+        }
+
+        internal SqlValue Finalize() =>
+            _values.Count == _offset ? _values.Peek() : _defaultValue;
     }
 
     private sealed class NumericAggregateAccumulator

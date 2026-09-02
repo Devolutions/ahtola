@@ -540,16 +540,16 @@ public sealed class BufferedWindowVdbeRoutingTests
             Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + fallback));
         }
 
-        foreach (var query in new[]
-        {
-            "SELECT id, rank() OVER (ORDER BY value DESC) FROM strict_rows ORDER BY id;",
-            "SELECT id, lag(value) OVER (ORDER BY id) FROM norowid ORDER BY id;",
-        })
-        {
-            Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
-                .Contain("WindowBufferCompute", query);
-            ReadRows(connection, query).Should().HaveCount(3, query);
-        }
+        const string mismatchedOrder =
+            "SELECT id, rank() OVER (ORDER BY value DESC) FROM strict_rows ORDER BY id;";
+        Opcodes(ReadRows(connection, "EXPLAIN " + mismatchedOrder)).Should()
+            .Contain("WindowBufferCompute", mismatchedOrder);
+        ReadRows(connection, mismatchedOrder).Should().HaveCount(3, mismatchedOrder);
+
+        const string lagQuery = "SELECT id, lag(value) OVER (ORDER BY id) FROM norowid ORDER BY id;";
+        Opcodes(ReadRows(connection, "EXPLAIN " + lagQuery)).Should()
+            .Contain("AggStep", lagQuery).And.NotContain("OpenWindowBuffer");
+        ReadRows(connection, lagQuery).Should().HaveCount(3, lagQuery);
     }
 
     [Test]

@@ -97,10 +97,11 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   instead of reloading the partition. EXCLUDE GROUP/TIES stream on running and
   current-peer frames (per-row inverse for TIES). FILTER on non-moving frames
   streams via FilterRegisters. row_number, rank, and dense_rank stream as
-  COUNT-style accumulators. first_value/last_value and group_concat with a
-  literal separator stream on non-moving frames. Remaining: FILTER on moving
-  frames, DISTINCT window aggregates, percent_rank/cume_dist/ntile/lag/lead/nth_value,
-  group_concat on moving frames, both-bound peer frames, computed args / mixed OVER.
+  COUNT-style accumulators. first_value/last_value, lag(offset ≤ 1024), and
+  group_concat with a literal separator stream on non-moving frames. Remaining: FILTER on moving
+  frames, DISTINCT window aggregates, percent_rank/cume_dist/ntile/lead/nth_value,
+  lag offsets above 1024, group_concat on moving frames, both-bound peer frames,
+  computed args / mixed OVER.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
