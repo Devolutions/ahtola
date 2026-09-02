@@ -134,8 +134,17 @@ public sealed class VdbeSchemaRuntimeTests
         ((int)VdbeOpcode.AlterColumn).Should().Be(134);
         ((int)VdbeOpcode.IndexBuild).Should().Be(135);
         ((int)VdbeOpcode.AggInverse).Should().Be(136);
+        ((int)VdbeOpcode.BlobRead).Should().Be(137);
+        ((int)VdbeOpcode.BlobWrite).Should().Be(138);
+        ((int)VdbeOpcode.BlobLen).Should().Be(139);
+        ((int)VdbeOpcode.ColumnRange).Should().Be(140);
+        ((int)VdbeOpcode.OpenPseudo).Should().Be(141);
+        ((int)VdbeOpcode.TypeCheck).Should().Be(142);
+        ((int)VdbeOpcode.Once).Should().Be(143);
+        ((int)VdbeOpcode.ResetOnce).Should().Be(144);
+        ((int)VdbeOpcode.ChangeCount).Should().Be(145);
 
-        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(136);
+        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(145);
     }
 
     [Test]
