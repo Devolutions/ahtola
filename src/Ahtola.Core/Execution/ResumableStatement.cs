@@ -413,7 +413,9 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case OpenEphemeralInstruction openEphemeral:
                     OpenCursor(openEphemeral.Cursor);
-                    _ephemeralTables[openEphemeral.Cursor.Index] = new EphemeralTableRuntime(openEphemeral.ColumnCount);
+                    _ephemeralTables[openEphemeral.Cursor.Index] = new EphemeralTableRuntime(
+                        openEphemeral.ColumnCount,
+                        _memory);
                     _cursorPositions[openEphemeral.Cursor.Index] = -1;
                     _materializedRows[openEphemeral.Cursor.Index] = null;
                     AdvanceInstructionPointer();
@@ -449,6 +451,7 @@ public sealed class ResumableStatement : IDisposable
                             State = ResumableStatementState.Faulted;
                             throw;
                         }
+                        _ephemeralTables[close.Cursor.Index]?.Dispose();
                         _ephemeralTables[close.Cursor.Index] = null;
                         _pseudoCursors[close.Cursor.Index] = null;
                         AdvanceInstructionPointer();
@@ -1993,6 +1996,10 @@ public sealed class ResumableStatement : IDisposable
                         AdvanceInstructionPointer();
                         break;
                     }
+                case ChangeCountInstruction changeCount:
+                    _registers[changeCount.Destination.Index] = SqlValue.Integer(RowsAffected);
+                    AdvanceInstructionPointer();
+                    break;
                 case HaltInstruction halt:
                     {
                         Array.Clear(_openCursors);
@@ -2531,6 +2538,7 @@ public sealed class ResumableStatement : IDisposable
         TryDispose(DisposeAllRowSets, ref cleanupFailures);
         TryDispose(DisposeAllVirtualCursors, ref cleanupFailures);
         TryDispose(DisposeWorkTablesAndWindowBuffers, ref cleanupFailures);
+        TryDispose(DisposeEphemeralTables, ref cleanupFailures);
         ThrowCleanupFailures(cleanupFailures);
     }
 
@@ -2584,6 +2592,25 @@ public sealed class ResumableStatement : IDisposable
             {
                 _windowBuffers[index]?.Dispose();
                 _windowBuffers[index] = null;
+            }
+            catch (Exception exception)
+            {
+                (cleanupFailures ??= []).Add(exception);
+            }
+        }
+
+        ThrowCleanupFailures(cleanupFailures);
+    }
+
+    private void DisposeEphemeralTables()
+    {
+        List<Exception>? cleanupFailures = null;
+        for (var index = 0; index < _ephemeralTables.Length; index++)
+        {
+            try
+            {
+                _ephemeralTables[index]?.Dispose();
+                _ephemeralTables[index] = null;
             }
             catch (Exception exception)
             {
@@ -3527,18 +3554,24 @@ public sealed class ResumableStatement : IDisposable
     /// Rows are append-only with sequential 1-based rowids for SeekRowid/NotExists/Found,
     /// and support IdxInsert/IdxDelete key maintenance.
     /// </summary>
-    private sealed class EphemeralTableRuntime
+    private sealed class EphemeralTableRuntime : IDisposable
     {
         private readonly int _columnCount;
+        private readonly VdbeExecutionMemory _memory;
         private readonly List<SqlValue[]> _rows = [];
         private readonly List<long> _rowIds = [];
         private VdbeCursorSource? _sourceView;
         private long _nextRowId = 1;
+        private long _retainedBytes;
+        private long _retainedRows;
+        private bool _disposed;
 
-        public EphemeralTableRuntime(int columnCount)
+        public EphemeralTableRuntime(int columnCount, VdbeExecutionMemory memory)
         {
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(columnCount);
+            ArgumentNullException.ThrowIfNull(memory);
             _columnCount = columnCount;
+            _memory = memory;
         }
 
         public int ColumnCount => _columnCount;
@@ -3547,6 +3580,7 @@ public sealed class ResumableStatement : IDisposable
 
         public void Insert(SqlValue[] row)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             ArgumentNullException.ThrowIfNull(row);
             if (row.Length != _columnCount)
             {
@@ -3554,7 +3588,12 @@ public sealed class ResumableStatement : IDisposable
                     $"Ephemeral insert has {row.Length} columns but the table has {_columnCount}.");
             }
 
-            _rows.Add(row.ToArray());
+            var owned = row.ToArray();
+            var bytes = VdbeManagedFootprint.EstimateSorterRow(owned);
+            _memory.RetainOrThrow(bytes);
+            _retainedBytes = checked(_retainedBytes + bytes);
+            _retainedRows = checked(_retainedRows + 1);
+            _rows.Add(owned);
             _rowIds.Add(_nextRowId);
             _nextRowId = checked(_nextRowId + 1);
             _sourceView = null;
@@ -3578,6 +3617,7 @@ public sealed class ResumableStatement : IDisposable
                 if (!RowMatchesKeyPrefix(_rows[i], key))
                     continue;
 
+                ReleaseRow(_rows[i]);
                 _rows.RemoveAt(i);
                 _rowIds.RemoveAt(i);
                 _sourceView = null;
@@ -3592,6 +3632,7 @@ public sealed class ResumableStatement : IDisposable
             if (position < 0 || position >= _rows.Count)
                 return false;
 
+            ReleaseRow(_rows[position]);
             _rows.RemoveAt(position);
             _rowIds.RemoveAt(position);
             _sourceView = null;
@@ -3600,6 +3641,26 @@ public sealed class ResumableStatement : IDisposable
 
         public VdbeCursorSource AsCursorSource()
             => _sourceView ??= new VdbeCursorSource(_rows, _rowIds);
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            if (_retainedBytes > 0 || _retainedRows > 0)
+                _memory.Release(_retainedBytes, _retainedRows);
+            _retainedBytes = 0;
+            _retainedRows = 0;
+        }
+
+        private void ReleaseRow(SqlValue[] row)
+        {
+            var bytes = VdbeManagedFootprint.EstimateSorterRow(row);
+            _memory.Release(bytes);
+            _retainedBytes = checked(_retainedBytes - bytes);
+            _retainedRows = checked(_retainedRows - 1);
+        }
     }
 
     // Turso's RowSetTest keeps inserts from the current batch separate so a batch cannot match itself.

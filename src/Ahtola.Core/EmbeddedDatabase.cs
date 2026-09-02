@@ -24078,6 +24078,67 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
+        if (frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.Start.Offset is null
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Following,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } followingOffset,
+            })
+        {
+            var following = followingOffset.Value.AsInteger();
+            if (following == 0)
+            {
+                spec = WindowFrameSpec.CurrentRow;
+                return true;
+            }
+
+            if (following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.Following(following);
+                return true;
+            }
+        }
+
+        if (frame.Start is
+            {
+                Kind: FrameBoundKind.Preceding,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } startOffset,
+            }
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Following,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } endOffset,
+            })
+        {
+            var preceding = startOffset.Value.AsInteger();
+            var following = endOffset.Value.AsInteger();
+            if (preceding == 0 && following == 0)
+            {
+                spec = WindowFrameSpec.CurrentRow;
+                return true;
+            }
+
+            if (preceding == 0 && following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.Following(following);
+                return true;
+            }
+
+            if (following == 0 && preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.Preceding(preceding);
+                return true;
+            }
+
+            if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding
+                && following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.PrecedingAndFollowing(preceding, following);
+                return true;
+            }
+        }
+
         return false;
     }
 

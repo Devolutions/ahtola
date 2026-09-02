@@ -149,6 +149,60 @@ public sealed class VdbeDeferredOpcodeTests
     }
 
     [Test]
+    public void ChangeCountWritesTheStatementRowCount()
+    {
+        var program = new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 1,
+            [
+                new OpenWriteCursorInstruction(new Cursor(0), "t", 1),
+                new RewindCursorInstruction(new Cursor(0), new ProgramCounter(4)),
+                new InsertInstruction(new Cursor(0)),
+                new NextInstruction(new Cursor(0), new ProgramCounter(2)),
+                new ChangeCountInstruction(new Register(0)),
+                new ResultRowInstruction(new RegisterRange(new Register(0), 1)),
+                new HaltInstruction(),
+            ]);
+
+        using var statement = new ResumableStatement(
+            program,
+            writeTargets:
+            [
+                new VdbeWriteTarget
+                {
+                    TableName = "t",
+                    RowCount = 3,
+                    MutateRow = _ => new VdbeRowMutation([SqlValue.Integer(1)], 1),
+                    Commit = static () => 1L,
+                },
+            ]);
+
+        Drain(statement).Should().ContainSingle().Subject.Should().Equal(SqlValue.Integer(3));
+    }
+
+    [Test]
+    public void EphemeralTableHonorsTheRetainedMemoryBudget()
+    {
+        var program = new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 1,
+            [
+                new OpenEphemeralInstruction(new Cursor(0), 1),
+                new LoadConstantInstruction(new Register(0), SqlValue.Text(new string('x', 64))),
+                new EphemeralInsertInstruction(new Cursor(0), new RegisterRange(new Register(0), 1)),
+                new EphemeralInsertInstruction(new Cursor(0), new RegisterRange(new Register(0), 1)),
+                new HaltInstruction(),
+            ]);
+
+        var options = new VdbeExecutionOptions(
+            new Ahtola.Core.Storage.InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 32,
+            allowTemporaryFileSpill: false);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        Assert.Throws<VdbeMemoryLimitExceededException>(() => Drain(statement));
+    }
+
+    [Test]
     public void OnceFallsThroughThenJumpsAndResetOnceReplays()
     {
         var program = new VdbeProgram(

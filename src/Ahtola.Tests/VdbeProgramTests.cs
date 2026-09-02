@@ -48,7 +48,8 @@ public class VdbeProgramTests
                 "DropIndex=129", "DropTrigger=130", "RenameTable=131", "AddColumn=132",
                 "DropColumn=133", "AlterColumn=134", "IndexBuild=135", "AggInverse=136",
                 "BlobRead=137", "BlobWrite=138", "BlobLen=139", "ColumnRange=140",
-                "OpenPseudo=141", "TypeCheck=142", "Once=143", "ResetOnce=144");
+                "OpenPseudo=141", "TypeCheck=142", "Once=143", "ResetOnce=144",
+                "ChangeCount=145");
 
         var constructors = typeof(VdbeProgram).GetConstructors();
         Type[] legacyParameterTypes =

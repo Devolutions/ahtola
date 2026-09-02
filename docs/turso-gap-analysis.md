@@ -136,17 +136,17 @@ real mapping, built variant-by-variant:
 
 > Current reconciliation (2026-09-01). The pinned Turso
 > `v0.8.0-pre.7` source now declares **210** `Insn` variants and Ahtola declares
-> **145** stable opcode values (0–144). Every declared managed instruction has
+> **146** stable opcode values (0–145). Every declared managed instruction has
 > validation, execution, and EXPLAIN handling; the remaining count difference
-> is primarily consolidation or intentionally out-of-band execution, not 65
+> is primarily consolidation or intentionally out-of-band execution, not 64
 > undispatched opcodes. Since the historical matrix below was produced, Ahtola
 > also added subprograms, the seek/index/FK/ephemeral families, managed virtual
 > tables and index methods, schema/DDL opcodes, spillable DISTINCT/compound
 > keyed sets, `BlobRead`/`BlobWrite`/`BlobLen`, `ColumnRange`, `OpenPseudo`,
-> `TypeCheck`, `Once`, and `ResetOnce`. `ChangeCnt` is still assessed by family.
-> `AggInverse` is opcode 136 and drives exact current-row and bounded
-> `ROWS n PRECEDING` COUNT/SUM/AVG window frames (n ≤ 1024) while unsupported
-> frames retain the buffered evaluator.
+> `TypeCheck`, `Once`, `ResetOnce`, and `ChangeCount`. `AggInverse` is opcode
+> 136 and drives exact current-row, bounded `ROWS n PRECEDING`, `ROWS m FOLLOWING`,
+> and `ROWS n PRECEDING … m FOLLOWING` COUNT/SUM/AVG frames (n,m ≤ 1024) while
+> RANGE/GROUPS and unbounded-following frames retain the buffered evaluator.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).

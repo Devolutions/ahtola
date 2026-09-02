@@ -71,10 +71,12 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   validation, execution, and EXPLAIN. BEFORE INSERT/UPDATE/DELETE leaf bodies
   route through `Program` with `ColumnRange` image capture; STRICT INSERT emits
   `TypeCheck`. Distinct worktables spill through `VdbeKeyedRowStore`; window
-  buffers fail closed against the statement memory budget. Remaining: RANGE /
-  GROUPS / FOLLOWING inverse frames, `ChangeCnt` as a dedicated opcode, and
-  window/ephemeral full-partition spill (compute still needs the partition
-  in-heap).
+  buffers fail closed against the statement memory budget.
+- 2026-09-01: appended `ChangeCount` (opcode 145). Streaming `AggInverse` now
+  covers `ROWS CURRENT ROW … m FOLLOWING` and `ROWS n PRECEDING … m FOLLOWING`
+  (n,m ≤ 1024). Ephemeral tables fail closed against the statement memory
+  budget. Remaining: RANGE / GROUPS inverse frames, and full-partition window
+  spill (compute still needs the partition in-heap).
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

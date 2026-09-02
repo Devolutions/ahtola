@@ -72,6 +72,21 @@ public readonly record struct WindowFrameSpec(
         WindowBound.CurrentRow,
         StartOffset: n);
 
+    /// <summary>A moving frame: <c>ROWS CURRENT ROW TO m FOLLOWING</c>.</summary>
+    public static WindowFrameSpec Following(long m) => new(
+        WindowFrameMode.Rows,
+        WindowBound.CurrentRow,
+        WindowBound.Following,
+        EndOffset: m);
+
+    /// <summary>A moving frame: <c>ROWS n PRECEDING TO m FOLLOWING</c>.</summary>
+    public static WindowFrameSpec PrecedingAndFollowing(long n, long m) => new(
+        WindowFrameMode.Rows,
+        WindowBound.Preceding,
+        WindowBound.Following,
+        StartOffset: n,
+        EndOffset: m);
+
     /// <summary>Whether this frame is the running-rows frame.</summary>
     public bool IsRunning => Mode == WindowFrameMode.Rows
         && Start == WindowBound.UnboundedPreceding
@@ -96,14 +111,42 @@ public readonly record struct WindowFrameSpec(
         && StartOffset is > 0 and <= MaxStreamingPreceding
         && EndOffset is null;
 
+    /// <summary>Whether this frame is <c>ROWS CURRENT ROW TO m FOLLOWING</c> for a streaming-safe m.</summary>
+    public bool IsBoundedFollowing => Mode == WindowFrameMode.Rows
+        && Start == WindowBound.CurrentRow
+        && End == WindowBound.Following
+        && StartOffset is null
+        && EndOffset is > 0 and <= MaxStreamingPreceding;
+
+    /// <summary>Whether this frame is <c>ROWS n PRECEDING TO m FOLLOWING</c> for streaming-safe n, m.</summary>
+    public bool IsBoundedPrecedingFollowing => Mode == WindowFrameMode.Rows
+        && Start == WindowBound.Preceding
+        && End == WindowBound.Following
+        && StartOffset is > 0 and <= MaxStreamingPreceding
+        && EndOffset is > 0 and <= MaxStreamingPreceding;
+
     /// <summary>The <c>n</c> in a bounded preceding frame; 0 when the frame is not one.</summary>
-    public int PrecedingCount => IsBoundedPreceding ? (int)StartOffset!.Value : 0;
+    public int PrecedingCount => IsBoundedPreceding || IsBoundedPrecedingFollowing
+        ? (int)StartOffset!.Value
+        : 0;
+
+    /// <summary>The <c>m</c> in a bounded following frame; 0 when the frame is not one.</summary>
+    public int FollowingCount => IsBoundedFollowing || IsBoundedPrecedingFollowing
+        ? (int)EndOffset!.Value
+        : 0;
 
     /// <summary>Whether this frame can be lowered by the streaming builder.</summary>
-    public bool IsSupported => IsRunning || IsCurrentRow || IsBoundedPreceding;
+    public bool IsSupported => IsRunning
+        || IsCurrentRow
+        || IsBoundedPreceding
+        || IsBoundedFollowing
+        || IsBoundedPrecedingFollowing;
 
     /// <summary>Whether rows leave this frame and require an inverse-capable aggregate.</summary>
-    public bool RequiresInverse => IsCurrentRow || IsBoundedPreceding;
+    public bool RequiresInverse => IsCurrentRow
+        || IsBoundedPreceding
+        || IsBoundedFollowing
+        || IsBoundedPrecedingFollowing;
 }
 
 /// <summary>The kind of value a window result column projects.</summary>
@@ -248,8 +291,9 @@ public static class WindowProgramBuilder
         {
             throw new ArgumentException(
                 "WindowProgramBuilder only models ROWS UNBOUNDED PRECEDING TO CURRENT ROW, " +
-                "ROWS CURRENT ROW TO CURRENT ROW, and ROWS n PRECEDING TO CURRENT ROW " +
-                $"(1 <= n <= {WindowFrameSpec.MaxStreamingPreceding}); " +
+                "ROWS CURRENT ROW TO CURRENT ROW, ROWS n PRECEDING TO CURRENT ROW, " +
+                "ROWS CURRENT ROW TO m FOLLOWING, and ROWS n PRECEDING TO m FOLLOWING " +
+                $"(1 <= n,m <= {WindowFrameSpec.MaxStreamingPreceding}); " +
                 $"frame ({effectiveFrame.Mode}, {effectiveFrame.Start}, {effectiveFrame.End}, " +
                 $"{effectiveFrame.StartOffset}, {effectiveFrame.EndOffset}) is not representable.",
                 nameof(frame));
@@ -339,15 +383,22 @@ public static class WindowProgramBuilder
         // skip-inverse counter (plus a constant 1 for n>1 decrement), finalized window values, and the
         // projected output block.
         var precedingCount = frame.PrecedingCount;
+        var followingCount = frame.FollowingCount;
         var stagingBase = 0;
         var savedKeyBase = width;
         var currentKeyBase = width + partition;
         var argBase = width + (2 * partition);
         var departingArgBase = argBase + totalArgs;
-        var skipInverseIndex = departingArgBase + (precedingCount * totalArgs);
-        var oneIndex = skipInverseIndex + 1;
-        var controlRegisters = precedingCount == 0 ? 0 : precedingCount == 1 ? 1 : 2;
-        var aggOutBase = skipInverseIndex + controlRegisters;
+        var delayBase = departingArgBase + (precedingCount * totalArgs);
+        var delayCountIndex = delayBase + (followingCount * width);
+        var followingOneIndex = delayCountIndex + 1;
+        var followingConstIndex = delayCountIndex + 2;
+        var followingTmpIndex = delayCountIndex + 3;
+        var followingControl = followingCount == 0 ? 0 : 5;
+        var skipInverseIndex = delayCountIndex + followingControl;
+        var oneIndex = followingCount == 0 ? skipInverseIndex + 1 : followingOneIndex;
+        var precedingControl = precedingCount == 0 ? 0 : precedingCount == 1 ? 1 : 2;
+        var aggOutBase = skipInverseIndex + precedingControl;
         var outBase = aggOutBase + windows.Count;
         var registerCount = outBase + outputs.Count;
 
@@ -406,13 +457,14 @@ public static class WindowProgramBuilder
         for (var i = 0; i < windows.Count; i++)
             ins.Add(new AggResetInstruction(new Accumulator(i)));
         EmitPrecedingFrameReset(ins, frame, skipInverseIndex, oneIndex);
+        EmitFollowingFrameReset(ins, frame, delayCountIndex, followingConstIndex, followingOneIndex);
 
         var primeGotoIndex = ins.Count;
         ins.Add(new GotoInstruction(new ProgramCounter(0)));
 
         var drainLoop = ins.Count;
         ins.Add(new SorterDataInstruction(sorter, stagingRange));
-        if (frame.IsOnePreceding)
+        if (frame.IsOnePreceding && followingCount == 0)
             ins.Add(new LoadConstantInstruction(new Register(skipInverseIndex), SqlValue.Integer(0)));
 
         var sameGroupIndex = -1;
@@ -429,64 +481,119 @@ public static class WindowProgramBuilder
                 ins.Add(new AggResetInstruction(new Accumulator(i)));
             for (var j = 0; j < partition; j++)
                 ins.Add(new CopyInstruction(new Register(currentKeyBase + j), new Register(savedKeyBase + j)));
+            if (followingCount > 0)
+            {
+                EmitFollowingDrain(
+                    ins,
+                    windows,
+                    outputs,
+                    argOffsets,
+                    delayBase,
+                    width,
+                    followingCount,
+                    delayCountIndex,
+                    followingOneIndex,
+                    argBase,
+                    aggOutBase,
+                    outBase,
+                    precedingCount,
+                    departingArgBase,
+                    skipInverseIndex,
+                    totalArgs);
+            }
+
             EmitPrecedingFrameReset(ins, frame, skipInverseIndex, oneIndex);
+            EmitFollowingFrameReset(ins, frame, delayCountIndex, followingConstIndex, followingOneIndex);
         }
 
         var emit = ins.Count;
         EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
-        for (var i = 0; i < windows.Count; i++)
+        if (followingCount > 0)
         {
-            ins.Add(new AggFinalizeInstruction(
-                new Accumulator(i),
-                windows[i].Aggregate,
-                new Register(aggOutBase + i)));
-        }
-
-        for (var o = 0; o < outputs.Count; o++)
-        {
-            var output = outputs[o];
-            var destination = new Register(outBase + o);
-            ins.Add(output.Kind switch
-            {
-                WindowOutputKind.Column => new CopyInstruction(new Register(stagingBase + output.Index), destination),
-                WindowOutputKind.Window => new CopyInstruction(new Register(aggOutBase + output.Index), destination),
-                _ => new LoadConstantInstruction(destination, output.Constant),
-            });
-        }
-
-        ins.Add(new ResultRowInstruction(new RegisterRange(new Register(outBase), outputs.Count)));
-        if (frame.IsCurrentRow)
-        {
-            EmitWindowInverses(ins, windows, argOffsets, argBase);
-        }
-        else if (frame.IsOnePreceding)
-        {
-            var skipInverseInstruction = ins.Count;
-            ins.Add(new JumpIfInstruction(new Register(skipInverseIndex), new ProgramCounter(0)));
-            EmitWindowInverses(ins, windows, argOffsets, departingArgBase);
-
-            var saveDepartingArguments = ins.Count;
-            for (var i = 0; i < totalArgs; i++)
-                ins.Add(new CopyInstruction(new Register(argBase + i), new Register(departingArgBase + i)));
-
-            ins[skipInverseInstruction] = new JumpIfInstruction(
-                new Register(skipInverseIndex),
-                new ProgramCounter(saveDepartingArguments));
-        }
-        else if (frame.IsBoundedPreceding)
-        {
-            EmitBoundedPrecedingInverse(
+            EmitFollowingStep(
                 ins,
                 windows,
+                outputs,
                 argOffsets,
+                stagingBase,
+                delayBase,
+                width,
+                followingCount,
+                delayCountIndex,
+                followingConstIndex,
+                followingTmpIndex,
+                followingOneIndex,
                 argBase,
+                aggOutBase,
+                outBase,
+                precedingCount,
                 departingArgBase,
                 skipInverseIndex,
-                totalArgs,
-                precedingCount);
+                totalArgs);
+        }
+        else
+        {
+            EmitCurrentRowResult(
+                ins,
+                windows,
+                outputs,
+                stagingBase,
+                aggOutBase,
+                outBase);
+            if (frame.IsCurrentRow)
+            {
+                EmitWindowInverses(ins, windows, argOffsets, argBase);
+            }
+            else if (frame.IsOnePreceding)
+            {
+                var skipInverseInstruction = ins.Count;
+                ins.Add(new JumpIfInstruction(new Register(skipInverseIndex), new ProgramCounter(0)));
+                EmitWindowInverses(ins, windows, argOffsets, departingArgBase);
+
+                var saveDepartingArguments = ins.Count;
+                for (var i = 0; i < totalArgs; i++)
+                    ins.Add(new CopyInstruction(new Register(argBase + i), new Register(departingArgBase + i)));
+
+                ins[skipInverseInstruction] = new JumpIfInstruction(
+                    new Register(skipInverseIndex),
+                    new ProgramCounter(saveDepartingArguments));
+            }
+            else if (frame.IsBoundedPreceding)
+            {
+                EmitBoundedPrecedingInverse(
+                    ins,
+                    windows,
+                    argOffsets,
+                    argBase,
+                    departingArgBase,
+                    skipInverseIndex,
+                    totalArgs,
+                    precedingCount);
+            }
         }
 
         ins.Add(new SorterNextInstruction(sorter, new ProgramCounter(drainLoop)));
+
+        if (followingCount > 0)
+        {
+            EmitFollowingDrain(
+                ins,
+                windows,
+                outputs,
+                argOffsets,
+                delayBase,
+                width,
+                followingCount,
+                delayCountIndex,
+                followingOneIndex,
+                argBase,
+                aggOutBase,
+                outBase,
+                precedingCount,
+                departingArgBase,
+                skipInverseIndex,
+                totalArgs);
+        }
 
         var doneAddr = ins.Count;
         ins.Add(new CloseSorterInstruction(sorter));
@@ -512,19 +619,323 @@ public static class WindowProgramBuilder
             accumulatorCount: windows.Count);
     }
 
+    private static void EmitCurrentRowResult(
+        List<VdbeInstruction> ins,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        IReadOnlyList<WindowOutput> outputs,
+        int rowBase,
+        int aggOutBase,
+        int outBase)
+    {
+        for (var i = 0; i < windows.Count; i++)
+        {
+            ins.Add(new AggFinalizeInstruction(
+                new Accumulator(i),
+                windows[i].Aggregate,
+                new Register(aggOutBase + i)));
+        }
+
+        for (var o = 0; o < outputs.Count; o++)
+        {
+            var output = outputs[o];
+            var destination = new Register(outBase + o);
+            ins.Add(output.Kind switch
+            {
+                WindowOutputKind.Column => new CopyInstruction(new Register(rowBase + output.Index), destination),
+                WindowOutputKind.Window => new CopyInstruction(new Register(aggOutBase + output.Index), destination),
+                _ => new LoadConstantInstruction(destination, output.Constant),
+            });
+        }
+
+        ins.Add(new ResultRowInstruction(new RegisterRange(new Register(outBase), outputs.Count)));
+    }
+
+    private static void EmitFollowingFrameReset(
+        List<VdbeInstruction> ins,
+        WindowFrameSpec frame,
+        int delayCountIndex,
+        int followingConstIndex,
+        int followingOneIndex)
+    {
+        if (frame.FollowingCount == 0)
+            return;
+
+        ins.Add(new LoadConstantInstruction(new Register(delayCountIndex), SqlValue.Integer(0)));
+        ins.Add(new LoadConstantInstruction(new Register(followingConstIndex), SqlValue.Integer(frame.FollowingCount)));
+        ins.Add(new LoadConstantInstruction(new Register(followingOneIndex), SqlValue.Integer(1)));
+    }
+
+    private static void EmitFollowingStep(
+        List<VdbeInstruction> ins,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        IReadOnlyList<WindowOutput> outputs,
+        int[] argOffsets,
+        int stagingBase,
+        int delayBase,
+        int width,
+        int followingCount,
+        int delayCountIndex,
+        int followingConstIndex,
+        int followingTmpIndex,
+        int followingOneIndex,
+        int argBase,
+        int aggOutBase,
+        int outBase,
+        int precedingCount,
+        int departingArgBase,
+        int skipInverseIndex,
+        int totalArgs)
+    {
+        // tmp = followingConst - delayCount; nonzero means the delay ring is not yet full.
+        ins.Add(new CopyInstruction(new Register(followingConstIndex), new Register(followingTmpIndex)));
+        ins.Add(new CopyInstruction(new Register(delayCountIndex), new Register(followingTmpIndex + 1)));
+        ins.Add(new ArithmeticInstruction(
+            new Register(followingTmpIndex),
+            ArithmeticOperator.Subtract,
+            new RegisterRange(new Register(followingTmpIndex), 2)));
+        var notFullJump = ins.Count;
+        ins.Add(new JumpIfInstruction(new Register(followingTmpIndex), new ProgramCounter(0)));
+
+        EmitFollowingEmitOldest(
+            ins,
+            windows,
+            outputs,
+            argOffsets,
+            delayBase,
+            width,
+            followingCount,
+            argBase,
+            aggOutBase,
+            outBase,
+            precedingCount,
+            departingArgBase,
+            skipInverseIndex,
+            totalArgs);
+        EmitShiftRowRing(ins, delayBase, width, followingCount);
+        for (var column = 0; column < width; column++)
+        {
+            ins.Add(new CopyInstruction(
+                new Register(stagingBase + column),
+                new Register(delayBase + ((followingCount - 1) * width) + column)));
+        }
+
+        var afterEnqueue = ins.Count;
+        ins.Add(new GotoInstruction(new ProgramCounter(0)));
+
+        var notFull = ins.Count;
+        ins[notFullJump] = new JumpIfInstruction(
+            new Register(followingTmpIndex),
+            new ProgramCounter(notFull));
+        EmitFollowingEnqueue(ins, stagingBase, delayBase, width, followingCount, delayCountIndex, followingOneIndex);
+        ins[afterEnqueue] = new GotoInstruction(new ProgramCounter(ins.Count));
+    }
+
+    private static void EmitFollowingEnqueue(
+        List<VdbeInstruction> ins,
+        int stagingBase,
+        int delayBase,
+        int width,
+        int followingCount,
+        int delayCountIndex,
+        int followingOneIndex)
+    {
+        var doneJumps = new int[followingCount];
+        var tmp = followingOneIndex + 2;
+        for (var slot = 0; slot < followingCount; slot++)
+        {
+            if (slot == 0)
+            {
+                var skip = ins.Count;
+                ins.Add(new JumpIfInstruction(new Register(delayCountIndex), new ProgramCounter(0)));
+                EmitCopyRow(ins, stagingBase, delayBase, width);
+                ins.Add(new ArithmeticInstruction(
+                    new Register(delayCountIndex),
+                    ArithmeticOperator.Add,
+                    new RegisterRange(new Register(delayCountIndex), 2)));
+                doneJumps[slot] = ins.Count;
+                ins.Add(new GotoInstruction(new ProgramCounter(0)));
+                ins[skip] = new JumpIfInstruction(new Register(delayCountIndex), new ProgramCounter(ins.Count));
+                continue;
+            }
+
+            ins.Add(new CopyInstruction(new Register(delayCountIndex), new Register(tmp)));
+            ins.Add(new LoadConstantInstruction(new Register(tmp + 1), SqlValue.Integer(slot)));
+            ins.Add(new ArithmeticInstruction(
+                new Register(tmp),
+                ArithmeticOperator.Subtract,
+                new RegisterRange(new Register(tmp), 2)));
+            var skipSlot = ins.Count;
+            ins.Add(new JumpIfInstruction(new Register(tmp), new ProgramCounter(0)));
+            EmitCopyRow(ins, stagingBase, delayBase + (slot * width), width);
+            ins.Add(new ArithmeticInstruction(
+                new Register(delayCountIndex),
+                ArithmeticOperator.Add,
+                new RegisterRange(new Register(delayCountIndex), 2)));
+            doneJumps[slot] = ins.Count;
+            ins.Add(new GotoInstruction(new ProgramCounter(0)));
+            ins[skipSlot] = new JumpIfInstruction(new Register(tmp), new ProgramCounter(ins.Count));
+        }
+
+        var after = ins.Count;
+        foreach (var done in doneJumps)
+            ins[done] = new GotoInstruction(new ProgramCounter(after));
+    }
+
+    private static void EmitCopyRow(List<VdbeInstruction> ins, int sourceBase, int destinationBase, int width)
+    {
+        for (var column = 0; column < width; column++)
+        {
+            ins.Add(new CopyInstruction(
+                new Register(sourceBase + column),
+                new Register(destinationBase + column)));
+        }
+    }
+
+    private static void EmitFollowingDrain(
+        List<VdbeInstruction> ins,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        IReadOnlyList<WindowOutput> outputs,
+        int[] argOffsets,
+        int delayBase,
+        int width,
+        int followingCount,
+        int delayCountIndex,
+        int followingOneIndex,
+        int argBase,
+        int aggOutBase,
+        int outBase,
+        int precedingCount,
+        int departingArgBase,
+        int skipInverseIndex,
+        int totalArgs)
+    {
+        var drainTop = ins.Count;
+        ins.Add(new JumpIfInstruction(new Register(delayCountIndex), new ProgramCounter(0)));
+        var skipDrain = ins.Count;
+        ins.Add(new GotoInstruction(new ProgramCounter(0)));
+        var drainBody = ins.Count;
+        ins[drainTop] = new JumpIfInstruction(new Register(delayCountIndex), new ProgramCounter(drainBody));
+        EmitFollowingEmitOldest(
+            ins,
+            windows,
+            outputs,
+            argOffsets,
+            delayBase,
+            width,
+            followingCount,
+            argBase,
+            aggOutBase,
+            outBase,
+            precedingCount,
+            departingArgBase,
+            skipInverseIndex,
+            totalArgs);
+        EmitShiftRowRing(ins, delayBase, width, followingCount);
+        ins.Add(new ArithmeticInstruction(
+            new Register(delayCountIndex),
+            ArithmeticOperator.Subtract,
+            new RegisterRange(new Register(delayCountIndex), 2)));
+        ins.Add(new GotoInstruction(new ProgramCounter(drainTop)));
+        ins[skipDrain] = new GotoInstruction(new ProgramCounter(ins.Count));
+    }
+
+    private static void EmitFollowingEmitOldest(
+        List<VdbeInstruction> ins,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        IReadOnlyList<WindowOutput> outputs,
+        int[] argOffsets,
+        int delayBase,
+        int width,
+        int followingCount,
+        int argBase,
+        int aggOutBase,
+        int outBase,
+        int precedingCount,
+        int departingArgBase,
+        int skipInverseIndex,
+        int totalArgs)
+    {
+        _ = width;
+        _ = followingCount;
+        EmitCurrentRowResult(ins, windows, outputs, delayBase, aggOutBase, outBase);
+        GatherArgumentsFromRow(ins, windows, argOffsets, argBase, delayBase);
+        if (precedingCount == 0)
+        {
+            EmitWindowInverses(ins, windows, argOffsets, argBase);
+            return;
+        }
+
+        if (precedingCount == 1)
+        {
+            var skipInverseInstruction = ins.Count;
+            ins.Add(new JumpIfInstruction(new Register(skipInverseIndex), new ProgramCounter(0)));
+            EmitWindowInverses(ins, windows, argOffsets, departingArgBase);
+            var saveDepartingArguments = ins.Count;
+            for (var i = 0; i < totalArgs; i++)
+                ins.Add(new CopyInstruction(new Register(argBase + i), new Register(departingArgBase + i)));
+            ins[skipInverseInstruction] = new JumpIfInstruction(
+                new Register(skipInverseIndex),
+                new ProgramCounter(saveDepartingArguments));
+            ins.Add(new LoadConstantInstruction(new Register(skipInverseIndex), SqlValue.Integer(0)));
+            return;
+        }
+
+        EmitBoundedPrecedingInverse(
+            ins,
+            windows,
+            argOffsets,
+            argBase,
+            departingArgBase,
+            skipInverseIndex,
+            totalArgs,
+            precedingCount);
+    }
+
+    private static void EmitShiftRowRing(List<VdbeInstruction> ins, int delayBase, int width, int followingCount)
+    {
+        for (var slot = 0; slot < followingCount - 1; slot++)
+        {
+            for (var column = 0; column < width; column++)
+            {
+                ins.Add(new CopyInstruction(
+                    new Register(delayBase + ((slot + 1) * width) + column),
+                    new Register(delayBase + (slot * width) + column)));
+            }
+        }
+    }
+
+    private static void GatherArgumentsFromRow(
+        List<VdbeInstruction> ins,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        int[] argOffsets,
+        int argBase,
+        int rowBase)
+    {
+        for (var i = 0; i < windows.Count; i++)
+        {
+            var spec = windows[i];
+            for (var k = 0; k < spec.Arity; k++)
+            {
+                ins.Add(new CopyInstruction(
+                    new Register(rowBase + spec.ArgumentColumns[k]),
+                    new Register(argBase + argOffsets[i] + k)));
+            }
+        }
+    }
+
     private static void EmitPrecedingFrameReset(
         List<VdbeInstruction> ins,
         WindowFrameSpec frame,
         int skipInverseIndex,
         int oneIndex)
     {
-        if (frame.IsOnePreceding)
+        if (frame.PrecedingCount == 1)
         {
             ins.Add(new LoadConstantInstruction(new Register(skipInverseIndex), SqlValue.Integer(1)));
             return;
         }
 
-        if (!frame.IsBoundedPreceding)
+        if (frame.PrecedingCount == 0)
             return;
 
         ins.Add(new LoadConstantInstruction(new Register(skipInverseIndex), SqlValue.Integer(frame.PrecedingCount)));

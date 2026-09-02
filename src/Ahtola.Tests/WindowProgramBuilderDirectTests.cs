@@ -317,6 +317,46 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void OneFollowingFrameDelaysEmitUntilLookaheadArrives()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.Following(1));
+
+        var rows = Run(program, Rows([10], [20], [30], [40]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 30),
+            (20, 50),
+            (30, 70),
+            (40, 40));
+    }
+
+    [Test]
+    public void PrecedingAndFollowingFrameMatchesASlidingWindow()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.PrecedingAndFollowing(1, 1));
+
+        var rows = Run(program, Rows([10], [20], [30], [40]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 30),
+            (20, 60),
+            (30, 90),
+            (40, 70));
+    }
+
+    [Test]
     public void OnePrecedingFrameSpillsWithinBudgetAndCleansUpOnCancellation()
     {
         const long budget = 16384;

@@ -626,6 +626,12 @@ public static class VdbeExplain
                 0,
                 null,
                 $"reset once flags before {resetOnce.RegionEnd.Offset}"),
+            ChangeCountInstruction changeCount => (
+                0,
+                changeCount.Destination.Index,
+                0,
+                null,
+                $"r[{changeCount.Destination.Index}]=changes"),
             AggFinalizeInstruction aggFinalize => (
                 aggFinalize.Accumulator.Index,
                 aggFinalize.Destination.Index,

@@ -411,6 +411,9 @@ public enum VdbeOpcode
 
     /// <summary>Forget Once flags in a bytecode region (Turso <c>ResetOnce</c>).</summary>
     ResetOnce = 144,
+
+    /// <summary>Store the statement change count into a register (Turso <c>ChangeCount</c>).</summary>
+    ChangeCount = 145,
 }
 
 /// <summary>
@@ -3033,6 +3036,15 @@ public sealed record ResetOnceInstruction(ProgramCounter RegionEnd) : VdbeInstru
     public override VdbeOpcode Opcode => VdbeOpcode.ResetOnce;
 }
 
+/// <summary>
+/// Writes the statement's change count (<c>n_change</c> / <c>RowsAffected</c>) into
+/// <paramref name="Destination"/> (Turso <c>ChangeCount</c>).
+/// </summary>
+public sealed record ChangeCountInstruction(Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ChangeCount;
+}
+
 /// <summary>Finalizes <paramref name="Accumulator"/> with <paramref name="Aggregate"/>
 /// and writes the result into <paramref name="Destination"/>. It does not reset the
 /// accumulator; grouped programs emit an explicit <c>AggReset</c> before the next group.</summary>
@@ -5515,6 +5527,9 @@ public sealed class VdbeProgram
                     break;
                 case ResetOnceInstruction resetOnce:
                     ValidateJumpTarget(resetOnce.RegionEnd, instructionIndex);
+                    break;
+                case ChangeCountInstruction changeCount:
+                    ValidateRegister(changeCount.Destination, instructionIndex);
                     break;
                 case HaltInstruction halt:
                     // Clean halt (error code 0) is only legal as the terminal instruction.
