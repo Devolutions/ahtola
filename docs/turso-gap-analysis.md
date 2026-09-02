@@ -145,8 +145,11 @@ real mapping, built variant-by-variant:
 > keyed sets, `BlobRead`/`BlobWrite`/`BlobLen`, `ColumnRange`, `OpenPseudo`,
 > `TypeCheck`, `Once`, `ResetOnce`, and `ChangeCount`. `AggInverse` is opcode
 > 136 and drives exact current-row, bounded `ROWS n PRECEDING`, `ROWS m FOLLOWING`,
-> and `ROWS n PRECEDING … m FOLLOWING` COUNT/SUM/AVG frames (n,m ≤ 1024) while
-> RANGE/GROUPS and unbounded-following frames retain the buffered evaluator.
+> and `ROWS n PRECEDING … m FOLLOWING` COUNT/SUM/AVG frames (n,m ≤ 1024).
+> Default `RANGE`/`GROUPS UNBOUNDED PRECEDING … CURRENT ROW` and
+> `RANGE`/`GROUPS CURRENT ROW` peer frames stream through an ephemeral delay
+> buffer; RANGE/GROUPS value or group offsets and unbounded-following frames
+> retain the buffered evaluator.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).

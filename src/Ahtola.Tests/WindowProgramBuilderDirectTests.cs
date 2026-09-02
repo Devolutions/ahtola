@@ -7,8 +7,9 @@ using Ahtola.Core.Storage;
 namespace Ahtola.Tests;
 
 // Compiler-output and execution coverage for the direct window-function lowering
-// (WindowProgramBuilder). The builder lowers running-prefix, exact-current-row, and bounded
-// n-preceding ROWS frames into the sorter + aggregate opcode families. These tests assert the emitted
+// (WindowProgramBuilder). The builder lowers running-prefix, exact-current-row, bounded
+// n-preceding/FOLLOWING ROWS frames, and RANGE/GROUPS peer frames into the sorter + aggregate
+// opcode families. These tests assert the emitted
 // bytecode shape/jump layout and run the programs
 // through the resumable state machine to confirm real observable rows: per-partition
 // running values, row_number ordering, tie/NULL handling, empty/single-row/replay
@@ -567,21 +568,143 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void RangeRunningFrameDelaysEmitUntilThePeerGroupEnds()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForColumn(1), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeRunning,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.Instructions.Select(static instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.OpenEphemeral)
+            .And.Contain(VdbeOpcode.EphemeralInsert)
+            .And.Contain(VdbeOpcode.ColumnRange);
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30]));
+        rows.Select(static row => row[2].AsInteger()).Should().Equal(30, 30, 60);
+    }
+
+    [Test]
+    public void RangeCurrentPeerFrameResetsBetweenPeerGroups()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeCurrentPeer,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 30]));
+        rows.Select(static row => row[1].AsInteger()).Should().Equal(30, 30, 30);
+    }
+
+    [Test]
+    public void GroupsRunningFrameMatchesRangeRunningPeers()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.GroupsRunning,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 5]));
+        rows.Select(static row => row[1].AsInteger()).Should().Equal(30, 30, 35);
+    }
+
+    [Test]
+    public void RangeRunningFrameResetsAccumulatorsOnPartitionBoundaries()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 3,
+            partitionColumns: [0],
+            windows: [Sum(2)],
+            outputs:
+            [
+                WindowOutput.ForColumn(0),
+                WindowOutput.ForColumn(1),
+                WindowOutput.ForWindow(0),
+            ],
+            orderComparer: AggregateTestSupport.OrderByColumns(0, 1),
+            partitionComparer: AggregateTestSupport.GroupKeysEqual(),
+            frame: WindowFrameSpec.RangeRunning,
+            orderColumns: [1],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 1, 10], [1, 1, 20], [1, 2, 5], [2, 1, 7]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger(), row[2].AsInteger())).Should().Equal(
+            (1, 1, 30),
+            (1, 1, 30),
+            (1, 2, 35),
+            (2, 1, 7));
+    }
+
+    [Test]
+    public void RangeRunningWithoutOrderByTreatsThePartitionAsOnePeer()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [0],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0, 1),
+            partitionComparer: AggregateTestSupport.GroupKeysEqual(),
+            frame: WindowFrameSpec.RangeRunning);
+
+        var rows = Run(program, Rows([1, 10], [1, 20], [2, 7]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (1, 30),
+            (2, 7));
+    }
+
+    [Test]
+    public void PeerFrameOverAnEmptyTableProducesNoRows()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [Sum(0)],
+            outputs: [WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeRunning,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        Run(program, new VdbeCursorSource([])).Should().BeEmpty();
+    }
+
+    [Test]
     public void BuildRejectsFramesItCannotRepresent()
     {
-        // RANGE framing.
+        // RANGE/GROUPS value or group offsets, and forward-looking bounds, stay unmodeled.
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
             "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
             AggregateTestSupport.OrderByColumns(0),
-            frame: new WindowFrameSpec(WindowFrameMode.Range, WindowBound.UnboundedPreceding, WindowBound.CurrentRow)));
+            frame: new WindowFrameSpec(WindowFrameMode.Range, WindowBound.Preceding, WindowBound.CurrentRow, StartOffset: 1)));
 
-        // GROUPS framing.
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
             "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
             AggregateTestSupport.OrderByColumns(0),
-            frame: new WindowFrameSpec(WindowFrameMode.Groups, WindowBound.UnboundedPreceding, WindowBound.CurrentRow)));
+            frame: new WindowFrameSpec(WindowFrameMode.Groups, WindowBound.UnboundedPreceding, WindowBound.Following)));
 
-        // Bounded / forward-looking ROWS bounds.
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
             "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
             AggregateTestSupport.OrderByColumns(0),
@@ -591,6 +714,16 @@ public class WindowProgramBuilderDirectTests
             "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
             AggregateTestSupport.OrderByColumns(0),
             frame: new WindowFrameSpec(WindowFrameMode.Rows, WindowBound.UnboundedPreceding, WindowBound.Following)));
+    }
+
+    [Test]
+    public void PeerFrameWithOrderColumnsRequiresAPeerComparer()
+    {
+        Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(
+            "t", 1, [], [Sum(0)], [WindowOutput.ForWindow(0)],
+            AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeRunning,
+            orderColumns: [0]));
     }
 
     [Test]

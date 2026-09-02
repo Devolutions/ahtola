@@ -23214,14 +23214,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // tried in order:
     //
     //  1. The streaming program (WindowProgramBuilder): the narrow shapes whose window calls all share
-    //     a running-prefix, exact-current-row, or literal 1 PRECEDING ROWS frame over aggregate
-    //     functions of bare columns. Moving shapes use AggInverse; none buffers a partition.
+    //     a running-prefix, exact-current-row, bounded ROWS n PRECEDING / m FOLLOWING, or RANGE/GROUPS
+    //     peer frame over aggregate functions of bare columns. Moving ROWS shapes use AggInverse;
+    //     peer frames delay emit in an ephemeral table until the ORDER BY group ends.
     //     See TryBuildStreamingWindowProgram for its exact grammar.
     //  2. The buffered-window program (BufferedWindowProgramBuilder): every other window shape whose
     //     inputs are computable from one scanned row. It buffers the scanned rows through the
     //     OpenWindowBuffer/WindowBufferInsert/WindowBufferCompute/WindowBufferData opcode family and
-    //     defers every window semantic — partitioning, per-partition ordering, peer groups, ROWS/RANGE/
-    //     GROUPS frames, EXCLUDE, FILTER, and the ranking/navigation/aggregate families — to the
+    //     defers remaining window semantics — value/group-offset RANGE/GROUPS frames, EXCLUDE, FILTER,
+    //     and the ranking/navigation families — to the
     //     evaluator's own ComputeWindowFunctions through a VdbeWindowEvaluator. That is what makes
     //     sliding, forward-looking and peer-relative frames representable exactly.
     //
@@ -23651,6 +23652,34 @@ public sealed partial class EmbeddedDatabase : IDisposable
             partitionComparer = groupComparer;
         }
 
+        IReadOnlyList<int>? orderColumns = null;
+        VdbeGroupComparer? peerComparer = null;
+        if (frame.IsPeerFrame)
+        {
+            var peerColumns = new List<int>();
+            var peerNames = new List<string>();
+            foreach (var term in spec.OrderBy)
+            {
+                if (UnwrapCollation(term.Expression) is not ColumnExpression column
+                    || target.ResolveColumnIndex(column.Name) is not { } ordinal)
+                {
+                    return false;
+                }
+
+                peerColumns.Add(ordinal);
+                peerNames.Add(column.Name);
+            }
+
+            orderColumns = peerColumns;
+            if (peerColumns.Count > 0)
+            {
+                var orderExpressions = spec.OrderBy.Select(static term => term.Expression).ToArray();
+                var (_, groupComparer) = BuildGroupComparers(
+                    orderExpressions, peerNames, target, predicate, parameters, context, outerRow);
+                peerComparer = groupComparer;
+            }
+        }
+
         program = WindowProgramBuilder.Build(
             target.TableName,
             target.Columns.Length,
@@ -23660,7 +23689,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             orderComparer,
             partitionComparer,
             predicate,
-            frame);
+            frame,
+            orderColumns,
+            peerComparer);
         return true;
     }
 
@@ -24030,17 +24061,44 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return true;
     }
 
-    // The streaming builder handles the running prefix, exact current row, and literal 1 PRECEDING.
-    // Moving frames follow Turso's order: step, emit, then inverse the departing row.
+    // The streaming builder handles the running prefix, exact current row, bounded ROWS
+    // n PRECEDING / m FOLLOWING, and RANGE/GROUPS peer frames (unbounded preceding or
+    // current row). Moving ROWS frames follow Turso's order: step, emit, then inverse.
     private static bool TryGetStreamingWindowFrame(WindowFrame? frame, out WindowFrameSpec spec)
     {
         spec = default;
-        if (frame is null
-            || frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows
-            || frame.Exclusion != FrameExclusion.NoOthers)
-        {
+        if (frame is not null && frame.Exclusion != FrameExclusion.NoOthers)
             return false;
+
+        if (frame is null
+            || ((frame.Mode is Ahtola.Core.Parsing.WindowFrameMode.Range
+                    or Ahtola.Core.Parsing.WindowFrameMode.Groups)
+                && frame.Start.Kind == FrameBoundKind.UnboundedPreceding
+                && frame.End.Kind == FrameBoundKind.CurrentRow
+                && frame.Start.Offset is null
+                && frame.End.Offset is null))
+        {
+            spec = frame is { Mode: Ahtola.Core.Parsing.WindowFrameMode.Groups }
+                ? WindowFrameSpec.GroupsRunning
+                : WindowFrameSpec.RangeRunning;
+            return true;
         }
+
+        if (frame.Mode is Ahtola.Core.Parsing.WindowFrameMode.Range
+                or Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+                ? WindowFrameSpec.GroupsCurrentPeer
+                : WindowFrameSpec.RangeCurrentPeer;
+            return true;
+        }
+
+        if (frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows)
+            return false;
 
         if (frame.Start.Kind == FrameBoundKind.UnboundedPreceding
             && frame.End.Kind == FrameBoundKind.CurrentRow)

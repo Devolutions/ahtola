@@ -2,20 +2,19 @@ using Ahtola.Core.Execution;
 
 namespace Ahtola.Core.Compilation;
 
-/// <summary>The frame kind a window's rows are drawn from. Only <see cref="Rows"/> is
-/// representable by <see cref="WindowProgramBuilder"/>; <see cref="Range"/> and
-/// <see cref="Groups"/> are declared so the builder can reject them explicitly rather than
-/// silently producing peer-inclusive results it does not model.</summary>
+/// <summary>The frame kind a window's rows are drawn from. <see cref="Rows"/> is the physical
+/// frame; <see cref="Range"/> and <see cref="Groups"/> share a peer-group delay for the
+/// unbounded-preceding and current-row bounds the streaming builder models.</summary>
 public enum WindowFrameMode
 {
     /// <summary>Physical <c>ROWS</c> framing: each row is an independent frame position,
     /// so ties in the ORDER BY key are not grouped into peers.</summary>
     Rows,
 
-    /// <summary>Logical <c>RANGE</c> framing (peer-inclusive). Not modeled.</summary>
+    /// <summary>Logical <c>RANGE</c> framing (peer-inclusive).</summary>
     Range,
 
-    /// <summary>Peer-group <c>GROUPS</c> framing. Not modeled.</summary>
+    /// <summary>Peer-group <c>GROUPS</c> framing.</summary>
     Groups,
 }
 
@@ -32,15 +31,15 @@ public enum WindowBound
 
 /// <summary>
 /// The frame a window function is evaluated over. <see cref="WindowProgramBuilder"/> models the running
-/// prefix (<see cref="Running"/>), the exact current row (<see cref="CurrentRow"/>), and bounded
-/// <c>ROWS n PRECEDING TO CURRENT ROW</c> frames (<see cref="OnePreceding"/>, <see cref="Preceding"/>).
-/// Other frames are rejected because they need forward-looking input or peer grouping that this
-/// streaming builder does not model.
+/// prefix (<see cref="Running"/>), the exact current row (<see cref="CurrentRow"/>), bounded
+/// <c>ROWS n PRECEDING / m FOLLOWING</c> frames, and peer-inclusive
+/// <c>RANGE/GROUPS UNBOUNDED PRECEDING TO CURRENT ROW</c> / <c>CURRENT ROW</c> frames.
+/// Other frames are rejected because they need value/group offsets, UNBOUNDED FOLLOWING, or EXCLUDE.
 /// </summary>
 /// <remarks>
 /// This is a VDBE-lowering primitive, distinct from the evaluator's SQL-level frame AST: it exists so the
 /// builder's caller can state the frame it lowered and the builder can honestly reject frames it does not
-/// implement (RANGE/GROUPS framing, forward-looking ROWS bounds, EXCLUDE clauses). A window's
+/// implement (RANGE/GROUPS value or group offsets, UNBOUNDED FOLLOWING, EXCLUDE clauses). A window's
 /// ORDER BY and PARTITION BY are supplied separately through the comparer delegates.
 /// </remarks>
 public readonly record struct WindowFrameSpec(
@@ -135,12 +134,57 @@ public readonly record struct WindowFrameSpec(
         ? (int)EndOffset!.Value
         : 0;
 
+    /// <summary>
+    /// Peer-inclusive running frame: <c>RANGE/GROUPS UNBOUNDED PRECEDING TO CURRENT ROW</c>.
+    /// Delayed until the current ORDER BY peer group ends.
+    /// </summary>
+    public static WindowFrameSpec RangeRunning => new(
+        WindowFrameMode.Range,
+        WindowBound.UnboundedPreceding,
+        WindowBound.CurrentRow);
+
+    /// <summary>Peer-inclusive running frame using <c>GROUPS</c> (same delay as <see cref="RangeRunning"/>).</summary>
+    public static WindowFrameSpec GroupsRunning => new(
+        WindowFrameMode.Groups,
+        WindowBound.UnboundedPreceding,
+        WindowBound.CurrentRow);
+
+    /// <summary>Current peer group only: <c>RANGE CURRENT ROW TO CURRENT ROW</c>.</summary>
+    public static WindowFrameSpec RangeCurrentPeer => new(
+        WindowFrameMode.Range,
+        WindowBound.CurrentRow,
+        WindowBound.CurrentRow);
+
+    /// <summary>Current peer group only: <c>GROUPS CURRENT ROW TO CURRENT ROW</c>.</summary>
+    public static WindowFrameSpec GroupsCurrentPeer => new(
+        WindowFrameMode.Groups,
+        WindowBound.CurrentRow,
+        WindowBound.CurrentRow);
+
+    /// <summary>Whether this frame is RANGE/GROUPS UNBOUNDED PRECEDING TO CURRENT ROW.</summary>
+    public bool IsPeerRunning => Mode is WindowFrameMode.Range or WindowFrameMode.Groups
+        && Start == WindowBound.UnboundedPreceding
+        && End == WindowBound.CurrentRow
+        && StartOffset is null
+        && EndOffset is null;
+
+    /// <summary>Whether this frame is RANGE/GROUPS CURRENT ROW TO CURRENT ROW.</summary>
+    public bool IsPeerCurrent => Mode is WindowFrameMode.Range or WindowFrameMode.Groups
+        && Start == WindowBound.CurrentRow
+        && End == WindowBound.CurrentRow
+        && StartOffset is null
+        && EndOffset is null;
+
+    /// <summary>Whether emit is delayed until the current ORDER BY peer group ends.</summary>
+    public bool IsPeerFrame => IsPeerRunning || IsPeerCurrent;
+
     /// <summary>Whether this frame can be lowered by the streaming builder.</summary>
     public bool IsSupported => IsRunning
         || IsCurrentRow
         || IsBoundedPreceding
         || IsBoundedFollowing
-        || IsBoundedPrecedingFollowing;
+        || IsBoundedPrecedingFollowing
+        || IsPeerFrame;
 
     /// <summary>Whether rows leave this frame and require an inverse-capable aggregate.</summary>
     public bool RequiresInverse => IsCurrentRow
@@ -232,7 +276,10 @@ public readonly record struct WindowOutput
 /// <c>count(*)</c> (a nullary window function), and running <c>sum</c>/<c>count</c>/<c>avg</c>/<c>min</c>/<c>max</c>
 /// follow from the corresponding accumulators. Because the finalize step runs once per row against the
 /// still-open accumulator, each window function's <see cref="VdbeAggregate.Finalize"/> must be side-effect
-/// free (as the standard aggregates are). Moving frames step, finalize, emit, and then apply
+/// free (as the standard aggregates are). Peer frames delay emit until the current ORDER BY peer
+/// group ends: rows of the group are stored in an ephemeral table, the aggregate is stepped for
+/// every peer, then the delayed rows are flushed with one shared Finalize. RANGE CURRENT ROW
+/// resets the accumulator after that flush. Moving frames step, finalize, emit, and then apply
 /// <c>AggInverse</c> to the departing row, so their aggregates must supply
 /// <see cref="VdbeAggregate.Inverse"/>. A bounded <c>ROWS n PRECEDING</c> frame retains n argument
 /// tuples and suppresses inverse for the first n rows of each partition.
@@ -278,7 +325,9 @@ public static class WindowProgramBuilder
         VdbeRowComparer orderComparer,
         VdbeGroupComparer? partitionComparer = null,
         VdbeRowPredicate? predicate = null,
-        WindowFrameSpec? frame = null)
+        WindowFrameSpec? frame = null,
+        IReadOnlyList<int>? orderColumns = null,
+        VdbeGroupComparer? peerComparer = null)
     {
         ArgumentNullException.ThrowIfNull(tableName);
         ArgumentNullException.ThrowIfNull(partitionColumns);
@@ -292,7 +341,8 @@ public static class WindowProgramBuilder
             throw new ArgumentException(
                 "WindowProgramBuilder only models ROWS UNBOUNDED PRECEDING TO CURRENT ROW, " +
                 "ROWS CURRENT ROW TO CURRENT ROW, ROWS n PRECEDING TO CURRENT ROW, " +
-                "ROWS CURRENT ROW TO m FOLLOWING, and ROWS n PRECEDING TO m FOLLOWING " +
+                "ROWS CURRENT ROW TO m FOLLOWING, ROWS n PRECEDING TO m FOLLOWING, " +
+                "and RANGE/GROUPS UNBOUNDED PRECEDING or CURRENT ROW peer frames " +
                 $"(1 <= n,m <= {WindowFrameSpec.MaxStreamingPreceding}); " +
                 $"frame ({effectiveFrame.Mode}, {effectiveFrame.Start}, {effectiveFrame.End}, " +
                 $"{effectiveFrame.StartOffset}, {effectiveFrame.EndOffset}) is not representable.",
@@ -351,6 +401,27 @@ public static class WindowProgramBuilder
         foreach (var output in outputs)
             ValidateOutput(output, tableColumnCount, windows.Count);
 
+        orderColumns ??= [];
+        if (effectiveFrame.IsPeerFrame)
+        {
+            foreach (var column in orderColumns)
+            {
+                if (column < 0 || column >= tableColumnCount)
+                {
+                    throw new ArgumentException(
+                        $"Order column {column} is outside the {tableColumnCount}-column table.",
+                        nameof(orderColumns));
+                }
+            }
+
+            if (orderColumns.Count > 0 && peerComparer is null)
+            {
+                throw new ArgumentException(
+                    "A RANGE/GROUPS peer frame with ORDER BY columns needs a peer comparer.",
+                    nameof(peerComparer));
+            }
+        }
+
         return BuildProgram(
             tableName,
             tableColumnCount,
@@ -360,7 +431,9 @@ public static class WindowProgramBuilder
             orderComparer,
             partitionComparer,
             predicate,
-            effectiveFrame);
+            effectiveFrame,
+            orderColumns,
+            peerComparer);
     }
 
     private static VdbeProgram BuildProgram(
@@ -372,22 +445,27 @@ public static class WindowProgramBuilder
         VdbeRowComparer orderComparer,
         VdbeGroupComparer? partitionComparer,
         VdbeRowPredicate? predicate,
-        WindowFrameSpec frame)
+        WindowFrameSpec frame,
+        IReadOnlyList<int> orderColumns,
+        VdbeGroupComparer? peerComparer)
     {
         var width = tableColumnCount;
         var partition = partitionColumns.Count;
+        var peer = frame.IsPeerFrame ? orderColumns.Count : 0;
         var argOffsets = ComputeArgOffsets(windows, out var totalArgs);
 
         // Register layout mirrors the grouped-aggregate builder: the full sorted row stages at r[0..W-1],
         // followed by partition keys, current argument blocks, the optional departing-argument ring and
         // skip-inverse counter (plus a constant 1 for n>1 decrement), finalized window values, and the
         // projected output block.
-        var precedingCount = frame.PrecedingCount;
-        var followingCount = frame.FollowingCount;
+        var precedingCount = frame.IsPeerFrame ? 0 : frame.PrecedingCount;
+        var followingCount = frame.IsPeerFrame ? 0 : frame.FollowingCount;
         var stagingBase = 0;
         var savedKeyBase = width;
         var currentKeyBase = width + partition;
-        var argBase = width + (2 * partition);
+        var savedPeerBase = width + (2 * partition);
+        var currentPeerBase = savedPeerBase + peer;
+        var argBase = currentPeerBase + peer;
         var departingArgBase = argBase + totalArgs;
         var delayBase = departingArgBase + (precedingCount * totalArgs);
         var delayCountIndex = delayBase + (followingCount * width);
@@ -446,6 +524,33 @@ public static class WindowProgramBuilder
                 predicate!,
                 new ProgramCounter(nextIngestAddr),
                 $"skip row when WHERE is false, goto {nextIngestAddr}");
+        }
+
+        if (frame.IsPeerFrame)
+        {
+            return CompletePeerFrame(
+                ins,
+                rewindIndex,
+                sortIndex,
+                sorter,
+                stagingRange,
+                stagingBase,
+                width,
+                partitionColumns,
+                savedKeyBase,
+                currentKeyBase,
+                partitionComparer,
+                orderColumns,
+                savedPeerBase,
+                currentPeerBase,
+                peerComparer,
+                windows,
+                argOffsets,
+                argBase,
+                aggOutBase,
+                outBase,
+                outputs,
+                resetAccumulatorOnPeerChange: frame.IsPeerCurrent);
         }
 
         // Prime the first partition from the first sorted row, then jump into the shared emit block so the
@@ -921,6 +1026,266 @@ public static class WindowProgramBuilder
                     new Register(argBase + argOffsets[i] + k)));
             }
         }
+    }
+
+    private static VdbeProgram CompletePeerFrame(
+        List<VdbeInstruction> ins,
+        int rewindIndex,
+        int sortIndex,
+        Sorter sorter,
+        RegisterRange stagingRange,
+        int stagingBase,
+        int width,
+        IReadOnlyList<int> partitionColumns,
+        int savedKeyBase,
+        int currentKeyBase,
+        VdbeGroupComparer? partitionComparer,
+        IReadOnlyList<int> orderColumns,
+        int savedPeerBase,
+        int currentPeerBase,
+        VdbeGroupComparer? peerComparer,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        int[] argOffsets,
+        int argBase,
+        int aggOutBase,
+        int outBase,
+        IReadOnlyList<WindowOutput> outputs,
+        bool resetAccumulatorOnPeerChange)
+    {
+        var cursor = new Cursor(0);
+        var partition = partitionColumns.Count;
+        var peer = orderColumns.Count;
+        var savedKeyRange = new RegisterRange(new Register(savedKeyBase), partition);
+        var currentKeyRange = new RegisterRange(new Register(currentKeyBase), partition);
+        var savedPeerRange = new RegisterRange(new Register(savedPeerBase), peer);
+        var currentPeerRange = new RegisterRange(new Register(currentPeerBase), peer);
+        var flushBase = outBase + outputs.Count;
+
+        // Open the delay buffer before SorterSort so a fully-filtered ingest still has a cursor
+        // to close at Halt (CloseCursor is not idempotent). Empty-table Rewind must skip this
+        // open — the table cursor is still live — and land on SorterSort instead.
+        ins.Insert(sortIndex, new OpenEphemeralInstruction(cursor, width));
+        sortIndex++;
+        ins[rewindIndex] = new RewindCursorInstruction(cursor, new ProgramCounter(sortIndex));
+
+        ins.Add(new SorterDataInstruction(sorter, stagingRange));
+        for (var j = 0; j < partition; j++)
+        {
+            ins.Add(new CopyInstruction(
+                new Register(stagingBase + partitionColumns[j]),
+                new Register(savedKeyBase + j)));
+        }
+
+        for (var j = 0; j < peer; j++)
+        {
+            ins.Add(new CopyInstruction(
+                new Register(stagingBase + orderColumns[j]),
+                new Register(savedPeerBase + j)));
+        }
+
+        for (var i = 0; i < windows.Count; i++)
+            ins.Add(new AggResetInstruction(new Accumulator(i)));
+
+        var primeGoto = ins.Count;
+        ins.Add(new GotoInstruction(new ProgramCounter(0)));
+
+        var drainLoop = ins.Count;
+        ins.Add(new SorterDataInstruction(sorter, stagingRange));
+
+        var accumulate = 0;
+        var samePartition = -1;
+        if (partition > 0)
+        {
+            for (var j = 0; j < partition; j++)
+            {
+                ins.Add(new CopyInstruction(
+                    new Register(stagingBase + partitionColumns[j]),
+                    new Register(currentKeyBase + j)));
+            }
+
+            samePartition = ins.Count;
+            ins.Add(new SameGroupInstruction(
+                currentKeyRange,
+                savedKeyRange,
+                partitionComparer!,
+                new ProgramCounter(0)));
+            EmitPeerFlush(ins, cursor, windows, outputs, width, aggOutBase, outBase, flushBase);
+            for (var i = 0; i < windows.Count; i++)
+                ins.Add(new AggResetInstruction(new Accumulator(i)));
+            for (var j = 0; j < partition; j++)
+            {
+                ins.Add(new CopyInstruction(
+                    new Register(currentKeyBase + j),
+                    new Register(savedKeyBase + j)));
+            }
+
+            for (var j = 0; j < peer; j++)
+            {
+                ins.Add(new CopyInstruction(
+                    new Register(stagingBase + orderColumns[j]),
+                    new Register(savedPeerBase + j)));
+            }
+
+            var skipPeerCheck = ins.Count;
+            ins.Add(new GotoInstruction(new ProgramCounter(0)));
+            accumulate = 0;
+            var afterPartition = ins.Count;
+            ins[samePartition] = new SameGroupInstruction(
+                currentKeyRange,
+                savedKeyRange,
+                partitionComparer!,
+                new ProgramCounter(afterPartition));
+
+            if (peer > 0)
+            {
+                for (var j = 0; j < peer; j++)
+                {
+                    ins.Add(new CopyInstruction(
+                        new Register(stagingBase + orderColumns[j]),
+                        new Register(currentPeerBase + j)));
+                }
+
+                var samePeer = ins.Count;
+                ins.Add(new SameGroupInstruction(
+                    currentPeerRange,
+                    savedPeerRange,
+                    peerComparer!,
+                    new ProgramCounter(0)));
+                EmitPeerFlush(ins, cursor, windows, outputs, width, aggOutBase, outBase, flushBase);
+                if (resetAccumulatorOnPeerChange)
+                {
+                    for (var i = 0; i < windows.Count; i++)
+                        ins.Add(new AggResetInstruction(new Accumulator(i)));
+                }
+
+                for (var j = 0; j < peer; j++)
+                {
+                    ins.Add(new CopyInstruction(
+                        new Register(currentPeerBase + j),
+                        new Register(savedPeerBase + j)));
+                }
+
+                accumulate = ins.Count;
+                ins[samePeer] = new SameGroupInstruction(
+                    currentPeerRange,
+                    savedPeerRange,
+                    peerComparer!,
+                    new ProgramCounter(accumulate));
+            }
+            else
+            {
+                accumulate = ins.Count;
+            }
+
+            ins[skipPeerCheck] = new GotoInstruction(new ProgramCounter(accumulate));
+        }
+        else if (peer > 0)
+        {
+            for (var j = 0; j < peer; j++)
+            {
+                ins.Add(new CopyInstruction(
+                    new Register(stagingBase + orderColumns[j]),
+                    new Register(currentPeerBase + j)));
+            }
+
+            var samePeer = ins.Count;
+            ins.Add(new SameGroupInstruction(
+                currentPeerRange,
+                savedPeerRange,
+                peerComparer!,
+                new ProgramCounter(0)));
+            EmitPeerFlush(ins, cursor, windows, outputs, width, aggOutBase, outBase, flushBase);
+            if (resetAccumulatorOnPeerChange)
+            {
+                for (var i = 0; i < windows.Count; i++)
+                    ins.Add(new AggResetInstruction(new Accumulator(i)));
+            }
+
+            for (var j = 0; j < peer; j++)
+            {
+                ins.Add(new CopyInstruction(
+                    new Register(currentPeerBase + j),
+                    new Register(savedPeerBase + j)));
+            }
+
+            accumulate = ins.Count;
+            ins[samePeer] = new SameGroupInstruction(
+                currentPeerRange,
+                savedPeerRange,
+                peerComparer!,
+                new ProgramCounter(accumulate));
+        }
+        else
+        {
+            accumulate = ins.Count;
+        }
+
+        ins[primeGoto] = new GotoInstruction(new ProgramCounter(accumulate));
+        EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
+        ins.Add(new EphemeralInsertInstruction(cursor, stagingRange));
+        ins.Add(new SorterNextInstruction(sorter, new ProgramCounter(drainLoop)));
+
+        EmitPeerFlush(ins, cursor, windows, outputs, width, aggOutBase, outBase, flushBase);
+        var doneAddr = ins.Count;
+        ins.Add(new CloseCursorInstruction(cursor));
+        ins.Add(new CloseSorterInstruction(sorter));
+        ins.Add(new HaltInstruction());
+        ins[sortIndex] = new SorterSortInstruction(sorter, new ProgramCounter(doneAddr));
+
+        return new VdbeProgram(
+            flushBase + width,
+            cursorCount: 1,
+            ins,
+            sorterCount: 1,
+            accumulatorCount: windows.Count);
+    }
+
+    private static void EmitPeerFlush(
+        List<VdbeInstruction> ins,
+        Cursor cursor,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        IReadOnlyList<WindowOutput> outputs,
+        int width,
+        int aggOutBase,
+        int outBase,
+        int flushBase)
+    {
+        var rewind = ins.Count;
+        ins.Add(new RewindCursorInstruction(cursor, new ProgramCounter(0)));
+        var flushLoop = ins.Count;
+        if (width > 0)
+            ins.Add(new ColumnRangeInstruction(cursor, 0, new Register(flushBase), width));
+
+        for (var i = 0; i < windows.Count; i++)
+        {
+            ins.Add(new AggFinalizeInstruction(
+                new Accumulator(i),
+                windows[i].Aggregate,
+                new Register(aggOutBase + i)));
+        }
+
+        for (var o = 0; o < outputs.Count; o++)
+        {
+            var output = outputs[o];
+            var destination = new Register(outBase + o);
+            ins.Add(output.Kind switch
+            {
+                WindowOutputKind.Column => new CopyInstruction(
+                    new Register(flushBase + output.Index),
+                    destination),
+                WindowOutputKind.Window => new CopyInstruction(
+                    new Register(aggOutBase + output.Index),
+                    destination),
+                _ => new LoadConstantInstruction(destination, output.Constant),
+            });
+        }
+
+        ins.Add(new ResultRowInstruction(new RegisterRange(new Register(outBase), outputs.Count)));
+        ins.Add(new NextInstruction(cursor, new ProgramCounter(flushLoop)));
+        var afterFlush = ins.Count;
+        ins[rewind] = new RewindCursorInstruction(cursor, new ProgramCounter(afterFlush));
+        ins.Add(new CloseCursorInstruction(cursor));
+        ins.Add(new OpenEphemeralInstruction(cursor, width));
     }
 
     private static void EmitPrecedingFrameReset(

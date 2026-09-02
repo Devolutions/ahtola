@@ -579,7 +579,8 @@ public sealed class BufferedWindowVdbeRoutingTests
             "SELECT id, sum(value) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM empty ORDER BY id;";
 
         using var connection = OpenManaged(setup);
-        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("OpenSorter").And.Contain("AggInverse").And.NotContain("WindowBufferCompute");
         ReadRows(connection, query).Should().BeEmpty();
         AssertMatchesSqlite(setup, query);
     }

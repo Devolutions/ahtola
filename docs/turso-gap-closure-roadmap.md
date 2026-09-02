@@ -75,8 +75,11 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 - 2026-09-01: appended `ChangeCount` (opcode 145). Streaming `AggInverse` now
   covers `ROWS CURRENT ROW … m FOLLOWING` and `ROWS n PRECEDING … m FOLLOWING`
   (n,m ≤ 1024). Ephemeral tables fail closed against the statement memory
-  budget. Remaining: RANGE / GROUPS inverse frames, and full-partition window
-  spill (compute still needs the partition in-heap).
+  budget. Streaming now also covers default RANGE/GROUPS UNBOUNDED PRECEDING
+  … CURRENT ROW and RANGE/GROUPS CURRENT ROW peer frames via an ephemeral
+  delay buffer. Remaining: RANGE n PRECEDING (value bounds), GROUPS n
+  PRECEDING, and full-partition window spill (compute still needs the
+  partition in-heap).
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
