@@ -24088,8 +24088,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private static bool TryGetStreamingWindowFrame(WindowFrame? frame, out WindowFrameSpec spec)
     {
         spec = default;
-        if (frame is not null && frame.Exclusion != FrameExclusion.NoOthers)
+        if (frame is not null
+            && frame.Exclusion is not (FrameExclusion.NoOthers or FrameExclusion.CurrentRow))
+        {
             return false;
+        }
+
+        var exclusion = frame?.Exclusion == FrameExclusion.CurrentRow
+            ? WindowExclusion.CurrentRow
+            : WindowExclusion.NoOthers;
+        if (exclusion == WindowExclusion.CurrentRow
+            && (frame is null
+                || frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows
+                || frame.End.Kind != FrameBoundKind.CurrentRow
+                || frame.Start.Kind is not (FrameBoundKind.UnboundedPreceding or FrameBoundKind.CurrentRow)
+                || frame.Start.Offset is not null
+                || frame.End.Offset is not null))
+        {
+            return false;
+        }
 
         if (frame is null
             || ((frame.Mode is Ahtola.Core.Parsing.WindowFrameMode.Range
@@ -24242,14 +24259,32 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (frame.Start.Kind == FrameBoundKind.UnboundedPreceding
             && frame.End.Kind == FrameBoundKind.CurrentRow)
         {
-            spec = WindowFrameSpec.Running;
+            spec = WindowFrameSpec.Running with { Exclusion = exclusion };
             return true;
         }
 
         if (frame.Start.Kind == FrameBoundKind.CurrentRow
             && frame.End.Kind == FrameBoundKind.CurrentRow)
         {
-            spec = WindowFrameSpec.CurrentRow;
+            spec = WindowFrameSpec.CurrentRow with { Exclusion = exclusion };
+            return true;
+        }
+
+        if (frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Kind == FrameBoundKind.UnboundedFollowing
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = WindowFrameSpec.RowsUnboundedFollowing;
+            return true;
+        }
+
+        if (frame.Start.Kind == FrameBoundKind.UnboundedPreceding
+            && frame.End.Kind == FrameBoundKind.UnboundedFollowing
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = WindowFrameSpec.RowsFullPartition;
             return true;
         }
 

@@ -933,6 +933,47 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void RunningExcludeCurrentRowEmitsThenSteps()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [Sum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.Running with { Exclusion = WindowExclusion.CurrentRow });
+
+        var rows = Run(program, Rows([10], [20], [30]));
+        rows.Select(static row => (
+            row[0].AsInteger(),
+            row[1].Kind == SqlValueKind.Null ? (long?)null : row[1].AsInteger())).Should().Equal(
+            (10, null),
+            (20, 10L),
+            (30, 30L));
+    }
+
+    [Test]
+    public void RowsUnboundedFollowingDrainsFromTheEnd()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 1,
+            partitionColumns: [],
+            windows: [InvertibleSum(0)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RowsUnboundedFollowing);
+
+        program.CursorCount.Should().Be(2);
+        var rows = Run(program, Rows([10], [20], [30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (10, 60),
+            (20, 50),
+            (30, 30));
+    }
+
+    [Test]
     public void RangePrecedingRequiresExactlyOneOrderColumn()
     {
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(

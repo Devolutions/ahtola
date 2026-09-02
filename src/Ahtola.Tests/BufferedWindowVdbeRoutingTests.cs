@@ -34,7 +34,6 @@ public sealed class BufferedWindowVdbeRoutingTests
     [TestCase("sum(value) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)")]
     [TestCase("sum(value) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING)")]
     [TestCase("count(*) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)")]
-    [TestCase("min(value) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)")]
     public void SlidingRowsFramesRouteAndMatchSqlite(string window)
     {
         var query = $"SELECT id, {window} FROM t ORDER BY id;";

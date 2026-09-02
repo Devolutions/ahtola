@@ -29,6 +29,16 @@ public enum WindowBound
     UnboundedFollowing,
 }
 
+/// <summary>SQL <c>EXCLUDE</c> clause. Streaming currently models <see cref="NoOthers"/> and
+/// <see cref="CurrentRow"/> on ROWS running/current-row frames.</summary>
+public enum WindowExclusion
+{
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
 /// <summary>
 /// The frame a window function is evaluated over. <see cref="WindowProgramBuilder"/> models the running
 /// prefix (<see cref="Running"/>), the exact current row (<see cref="CurrentRow"/>), bounded
@@ -49,7 +59,8 @@ public readonly record struct WindowFrameSpec(
     WindowBound Start,
     WindowBound End,
     long? StartOffset = null,
-    long? EndOffset = null)
+    long? EndOffset = null,
+    WindowExclusion Exclusion = WindowExclusion.NoOthers)
 {
     /// <summary>
     /// The largest <c>n</c> a streaming <c>ROWS n PRECEDING</c> program will retain as departing
@@ -184,6 +195,18 @@ public readonly record struct WindowFrameSpec(
         WindowBound.Following,
         EndOffset: n);
 
+    /// <summary><c>ROWS CURRENT ROW TO UNBOUNDED FOLLOWING</c>.</summary>
+    public static WindowFrameSpec RowsUnboundedFollowing => new(
+        WindowFrameMode.Rows,
+        WindowBound.CurrentRow,
+        WindowBound.UnboundedFollowing);
+
+    /// <summary><c>ROWS UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING</c>.</summary>
+    public static WindowFrameSpec RowsFullPartition => new(
+        WindowFrameMode.Rows,
+        WindowBound.UnboundedPreceding,
+        WindowBound.UnboundedFollowing);
+
     /// <summary>A moving frame: <c>RANGE CURRENT ROW TO n FOLLOWING</c>.</summary>
     public static WindowFrameSpec RangeFollowing(long n) => new(
         WindowFrameMode.Range,
@@ -293,13 +316,34 @@ public readonly record struct WindowFrameSpec(
         || IsUnboundedFollowing
         || IsFullPartition;
 
+    /// <summary>Whether this frame is <c>ROWS CURRENT ROW TO UNBOUNDED FOLLOWING</c>.</summary>
+    public bool IsRowsUnboundedFollowing => Mode == WindowFrameMode.Rows
+        && Start == WindowBound.CurrentRow
+        && End == WindowBound.UnboundedFollowing
+        && StartOffset is null
+        && EndOffset is null;
+
+    /// <summary>Whether this frame is <c>ROWS UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING</c>.</summary>
+    public bool IsRowsFullPartition => Mode == WindowFrameMode.Rows
+        && Start == WindowBound.UnboundedPreceding
+        && End == WindowBound.UnboundedFollowing
+        && StartOffset is null
+        && EndOffset is null;
+
+    /// <summary>Whether the frame omits the current physical row via <c>EXCLUDE CURRENT ROW</c>.</summary>
+    public bool ExcludesCurrentRow => Exclusion == WindowExclusion.CurrentRow;
+
     /// <summary>Whether this frame can be lowered by the streaming builder.</summary>
-    public bool IsSupported => IsRunning
-        || IsCurrentRow
-        || IsBoundedPreceding
-        || IsBoundedFollowing
-        || IsBoundedPrecedingFollowing
-        || IsPeerFrame;
+    public bool IsSupported => Exclusion is WindowExclusion.NoOthers or WindowExclusion.CurrentRow
+        && (IsRunning
+            || IsCurrentRow
+            || IsBoundedPreceding
+            || IsBoundedFollowing
+            || IsBoundedPrecedingFollowing
+            || IsPeerFrame
+            || IsRowsUnboundedFollowing
+            || IsRowsFullPartition)
+        && (!ExcludesCurrentRow || IsRunning || IsCurrentRow);
 
     /// <summary>Whether rows leave this frame and require an inverse-capable aggregate.</summary>
     public bool RequiresInverse => IsCurrentRow
@@ -310,7 +354,8 @@ public readonly record struct WindowFrameSpec(
         || IsRangePreceding
         || IsGroupsFollowing
         || IsRangeFollowing
-        || IsUnboundedFollowing;
+        || IsUnboundedFollowing
+        || IsRowsUnboundedFollowing;
 }
 
 /// <summary>The kind of value a window result column projects.</summary>
@@ -466,7 +511,8 @@ public static class WindowProgramBuilder
                 "RANGE/GROUPS UNBOUNDED PRECEDING or CURRENT ROW peer frames, " +
                 "GROUPS n PRECEDING TO CURRENT ROW, RANGE n PRECEDING TO CURRENT ROW, " +
                 "GROUPS CURRENT ROW TO m FOLLOWING, RANGE CURRENT ROW TO n FOLLOWING, " +
-                "and RANGE/GROUPS CURRENT ROW or UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING " +
+                "RANGE/GROUPS CURRENT ROW or UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING, " +
+                "ROWS unbounded FOLLOWING, and ROWS running EXCLUDE CURRENT ROW " +
                 $"(1 <= n,m <= {WindowFrameSpec.MaxStreamingPreceding}); " +
                 $"frame ({effectiveFrame.Mode}, {effectiveFrame.Start}, {effectiveFrame.End}, " +
                 $"{effectiveFrame.StartOffset}, {effectiveFrame.EndOffset}) is not representable.",
@@ -706,6 +752,15 @@ public static class WindowProgramBuilder
                 fullPartition);
         }
 
+        var rowsQueue = frame.IsRowsUnboundedFollowing || frame.IsRowsFullPartition;
+        var delay = new Cursor(1);
+        if (rowsQueue)
+        {
+            ins.Insert(sortIndex, new OpenEphemeralInstruction(delay, width));
+            sortIndex++;
+            ins[rewindIndex] = new RewindCursorInstruction(cursor, new ProgramCounter(sortIndex));
+        }
+
         // Prime the first partition from the first sorted row, then jump into the shared emit block so the
         // first row also produces a result.
         ins.Add(new SorterDataInstruction(sorter, stagingRange));
@@ -733,6 +788,22 @@ public static class WindowProgramBuilder
 
             sameGroupIndex = ins.Count;
             ins.Add(new SameGroupInstruction(currentKeyRange, savedKeyRange, partitionComparer!, new ProgramCounter(0)));
+
+            if (rowsQueue)
+            {
+                EmitRowsQueueDrain(
+                    ins,
+                    delay,
+                    windows,
+                    outputs,
+                    argOffsets,
+                    argBase,
+                    width,
+                    aggOutBase,
+                    outBase,
+                    outBase + outputs.Count,
+                    inverse: frame.IsRowsUnboundedFollowing);
+            }
 
             // New partition boundary: restart the accumulators and adopt the new key, then fall into emit.
             for (var i = 0; i < windows.Count; i++)
@@ -765,6 +836,22 @@ public static class WindowProgramBuilder
         }
 
         var emit = ins.Count;
+        if (rowsQueue)
+        {
+            EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
+            ins.Add(new EphemeralInsertInstruction(delay, stagingRange));
+        }
+        else if (frame.ExcludesCurrentRow && frame.IsRunning)
+        {
+            EmitCurrentRowResult(ins, windows, outputs, stagingBase, aggOutBase, outBase);
+            EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
+        }
+        else if (frame.ExcludesCurrentRow && frame.IsCurrentRow)
+        {
+            EmitCurrentRowResult(ins, windows, outputs, stagingBase, aggOutBase, outBase);
+        }
+        else
+        {
         EmitWindowSteps(ins, windows, argOffsets, argBase, stagingBase);
         if (followingCount > 0)
         {
@@ -829,10 +916,27 @@ public static class WindowProgramBuilder
                     precedingCount);
             }
         }
+        }
 
         ins.Add(new SorterNextInstruction(sorter, new ProgramCounter(drainLoop)));
 
-        if (followingCount > 0)
+        if (rowsQueue)
+        {
+            EmitRowsQueueDrain(
+                ins,
+                delay,
+                windows,
+                outputs,
+                argOffsets,
+                argBase,
+                width,
+                aggOutBase,
+                outBase,
+                outBase + outputs.Count,
+                inverse: frame.IsRowsUnboundedFollowing);
+            ins.Add(new CloseCursorInstruction(delay));
+        }
+        else if (followingCount > 0)
         {
             EmitFollowingDrain(
                 ins,
@@ -870,11 +974,68 @@ public static class WindowProgramBuilder
         }
 
         return new VdbeProgram(
-            registerCount,
-            cursorCount: 1,
+            rowsQueue ? outBase + outputs.Count + width : registerCount,
+            cursorCount: rowsQueue ? 2 : 1,
             ins,
             sorterCount: 1,
             accumulatorCount: windows.Count);
+    }
+
+    private static void EmitRowsQueueDrain(
+        List<VdbeInstruction> ins,
+        Cursor queue,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        IReadOnlyList<WindowOutput> outputs,
+        int[] argOffsets,
+        int argBase,
+        int width,
+        int aggOutBase,
+        int outBase,
+        int flushBase,
+        bool inverse)
+    {
+        if (!inverse)
+        {
+            EmitPeerFlush(ins, queue, windows, outputs, width, aggOutBase, outBase, flushBase);
+            return;
+        }
+
+        var rewind = ins.Count;
+        ins.Add(new RewindCursorInstruction(queue, new ProgramCounter(0)));
+        var loop = ins.Count;
+        if (width > 0)
+            ins.Add(new ColumnRangeInstruction(queue, 0, new Register(flushBase), width));
+        for (var i = 0; i < windows.Count; i++)
+        {
+            ins.Add(new AggFinalizeInstruction(
+                new Accumulator(i),
+                windows[i].Aggregate,
+                new Register(aggOutBase + i)));
+        }
+
+        for (var o = 0; o < outputs.Count; o++)
+        {
+            var output = outputs[o];
+            var destination = new Register(outBase + o);
+            ins.Add(output.Kind switch
+            {
+                WindowOutputKind.Column => new CopyInstruction(
+                    new Register(flushBase + output.Index),
+                    destination),
+                WindowOutputKind.Window => new CopyInstruction(
+                    new Register(aggOutBase + output.Index),
+                    destination),
+                _ => new LoadConstantInstruction(destination, output.Constant),
+            });
+        }
+
+        ins.Add(new ResultRowInstruction(new RegisterRange(new Register(outBase), outputs.Count)));
+        GatherArgumentsFromRow(ins, windows, argOffsets, argBase, flushBase);
+        EmitWindowInverses(ins, windows, argOffsets, argBase);
+        ins.Add(new NextInstruction(queue, new ProgramCounter(loop)));
+        ins[rewind] = new RewindCursorInstruction(queue, new ProgramCounter(ins.Count));
+        ins.Add(new CloseCursorInstruction(queue));
+        ins.Add(new OpenEphemeralInstruction(queue, width));
     }
 
     private static void EmitCurrentRowResult(

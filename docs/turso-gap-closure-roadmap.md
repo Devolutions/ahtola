@@ -90,8 +90,10 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   oldest queued group. Streaming RANGE/GROUPS `CURRENT ROW … UNBOUNDED FOLLOWING`
   drains the queued groups at partition end with inverse; `UNBOUNDED PRECEDING …
   UNBOUNDED FOLLOWING` emits the full-partition aggregate on every row.
-  Remaining: EXCLUDE, MIN/MAX inverse, ROWS unbounded FOLLOWING, and Compute
-  still needing the partition in-heap after reload.
+  Streaming ROWS `CURRENT ROW`/`UNBOUNDED PRECEDING` to `UNBOUNDED FOLLOWING`
+  uses a delay ephemeral and drains at partition end. ROWS running
+  `EXCLUDE CURRENT ROW` emits before AggStep. Remaining: EXCLUDE GROUP/TIES,
+  MIN/MAX inverse, and Compute still needing the partition in-heap after reload.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
