@@ -24210,6 +24210,32 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
+        if (frame.Mode is Ahtola.Core.Parsing.WindowFrameMode.Range
+                or Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.End.Kind == FrameBoundKind.UnboundedFollowing
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+                ? WindowFrameSpec.GroupsUnboundedFollowing
+                : WindowFrameSpec.RangeUnboundedFollowing;
+            return true;
+        }
+
+        if (frame.Mode is Ahtola.Core.Parsing.WindowFrameMode.Range
+                or Ahtola.Core.Parsing.WindowFrameMode.Groups
+            && frame.Start.Kind == FrameBoundKind.UnboundedPreceding
+            && frame.End.Kind == FrameBoundKind.UnboundedFollowing
+            && frame.Start.Offset is null
+            && frame.End.Offset is null)
+        {
+            spec = frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
+                ? WindowFrameSpec.GroupsFullPartition
+                : WindowFrameSpec.RangeFullPartition;
+            return true;
+        }
+
         if (frame.Mode != Ahtola.Core.Parsing.WindowFrameMode.Rows)
             return false;
 

@@ -155,8 +155,9 @@ real mapping, built variant-by-variant:
 > `GROUPS CURRENT ROW … m FOLLOWING` streams through a delayed peer-group ring.
 > `RANGE CURRENT ROW … n FOLLOWING` (single ORDER BY key) queues completed
 > groups and flushes the oldest when the next ORDER BY value is out of range.
-> Unbounded-following frames, EXCLUDE, and MIN/MAX inverse retain the buffered
-> evaluator.
+> RANGE/GROUPS `CURRENT ROW` or `UNBOUNDED PRECEDING` to `UNBOUNDED FOLLOWING`
+> stream through the same queue. EXCLUDE, MIN/MAX inverse, and ROWS unbounded
+> FOLLOWING retain the buffered evaluator.
 
 - **26 direct** — same opcode on both sides (`Rewind`, `Next`, `Column`,
   `AggStep`, `Sorter*`, `Function`, `ResultRow`, …).

@@ -514,6 +514,48 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
+    public void RangeUnboundedFollowingFrameRoutesAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+        ];
+        const string query =
+            "SELECT k, sum(v) OVER (ORDER BY k RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) " +
+            "FROM t ORDER BY k;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("OpenEphemeral").And.Contain("AggInverse").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void GroupsFullPartitionFrameRoutesAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+        ];
+        const string query =
+            "SELECT k, sum(v) OVER (ORDER BY k GROUPS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) " +
+            "FROM t ORDER BY k;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("OpenEphemeral").And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
     public void RangeFollowingFrameRoutesThroughInverseAndMatchSqlite()
     {
         string[] setup =

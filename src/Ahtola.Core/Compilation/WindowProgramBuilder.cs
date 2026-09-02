@@ -191,6 +191,30 @@ public readonly record struct WindowFrameSpec(
         WindowBound.Following,
         EndOffset: n);
 
+    /// <summary><c>RANGE CURRENT ROW TO UNBOUNDED FOLLOWING</c>.</summary>
+    public static WindowFrameSpec RangeUnboundedFollowing => new(
+        WindowFrameMode.Range,
+        WindowBound.CurrentRow,
+        WindowBound.UnboundedFollowing);
+
+    /// <summary><c>GROUPS CURRENT ROW TO UNBOUNDED FOLLOWING</c>.</summary>
+    public static WindowFrameSpec GroupsUnboundedFollowing => new(
+        WindowFrameMode.Groups,
+        WindowBound.CurrentRow,
+        WindowBound.UnboundedFollowing);
+
+    /// <summary><c>RANGE UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING</c> (whole partition).</summary>
+    public static WindowFrameSpec RangeFullPartition => new(
+        WindowFrameMode.Range,
+        WindowBound.UnboundedPreceding,
+        WindowBound.UnboundedFollowing);
+
+    /// <summary><c>GROUPS UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING</c> (whole partition).</summary>
+    public static WindowFrameSpec GroupsFullPartition => new(
+        WindowFrameMode.Groups,
+        WindowBound.UnboundedPreceding,
+        WindowBound.UnboundedFollowing);
+
     /// <summary>Whether this frame is RANGE/GROUPS UNBOUNDED PRECEDING TO CURRENT ROW.</summary>
     public bool IsPeerRunning => Mode is WindowFrameMode.Range or WindowFrameMode.Groups
         && Start == WindowBound.UnboundedPreceding
@@ -245,13 +269,29 @@ public readonly record struct WindowFrameSpec(
     /// <summary>The <c>n</c> in a RANGE following frame; 0 when the frame is not one.</summary>
     public int RangeFollowingOffset => IsRangeFollowing ? (int)EndOffset!.Value : 0;
 
+    /// <summary>Whether this frame is RANGE/GROUPS CURRENT ROW TO UNBOUNDED FOLLOWING.</summary>
+    public bool IsUnboundedFollowing => Mode is WindowFrameMode.Range or WindowFrameMode.Groups
+        && Start == WindowBound.CurrentRow
+        && End == WindowBound.UnboundedFollowing
+        && StartOffset is null
+        && EndOffset is null;
+
+    /// <summary>Whether this frame is RANGE/GROUPS UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING.</summary>
+    public bool IsFullPartition => Mode is WindowFrameMode.Range or WindowFrameMode.Groups
+        && Start == WindowBound.UnboundedPreceding
+        && End == WindowBound.UnboundedFollowing
+        && StartOffset is null
+        && EndOffset is null;
+
     /// <summary>Whether emit is delayed until the current ORDER BY peer group ends.</summary>
     public bool IsPeerFrame => IsPeerRunning
         || IsPeerCurrent
         || IsGroupsPreceding
         || IsRangePreceding
         || IsGroupsFollowing
-        || IsRangeFollowing;
+        || IsRangeFollowing
+        || IsUnboundedFollowing
+        || IsFullPartition;
 
     /// <summary>Whether this frame can be lowered by the streaming builder.</summary>
     public bool IsSupported => IsRunning
@@ -269,7 +309,8 @@ public readonly record struct WindowFrameSpec(
         || IsGroupsPreceding
         || IsRangePreceding
         || IsGroupsFollowing
-        || IsRangeFollowing;
+        || IsRangeFollowing
+        || IsUnboundedFollowing;
 }
 
 /// <summary>The kind of value a window result column projects.</summary>
@@ -424,7 +465,8 @@ public static class WindowProgramBuilder
                 "ROWS CURRENT ROW TO m FOLLOWING, ROWS n PRECEDING TO m FOLLOWING, " +
                 "RANGE/GROUPS UNBOUNDED PRECEDING or CURRENT ROW peer frames, " +
                 "GROUPS n PRECEDING TO CURRENT ROW, RANGE n PRECEDING TO CURRENT ROW, " +
-                "GROUPS CURRENT ROW TO m FOLLOWING, and RANGE CURRENT ROW TO n FOLLOWING " +
+                "GROUPS CURRENT ROW TO m FOLLOWING, RANGE CURRENT ROW TO n FOLLOWING, " +
+                "and RANGE/GROUPS CURRENT ROW or UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING " +
                 $"(1 <= n,m <= {WindowFrameSpec.MaxStreamingPreceding}); " +
                 $"frame ({effectiveFrame.Mode}, {effectiveFrame.Start}, {effectiveFrame.End}, " +
                 $"{effectiveFrame.StartOffset}, {effectiveFrame.EndOffset}) is not representable.",
@@ -556,6 +598,8 @@ public static class WindowProgramBuilder
         var rangePreceding = frame.IsRangePreceding ? frame.RangePrecedingOffset : 0;
         var rangeFollowing = frame.IsRangeFollowing ? frame.RangeFollowingOffset : 0;
         var groupsFollowing = frame.IsGroupsFollowing ? frame.GroupsFollowingCount : 0;
+        var unboundedFollowing = frame.IsUnboundedFollowing;
+        var fullPartition = frame.IsFullPartition;
         var stagingBase = 0;
         var savedKeyBase = width;
         var currentKeyBase = width + partition;
@@ -657,7 +701,9 @@ public static class WindowProgramBuilder
                 rangePreceding,
                 descendingOrder,
                 groupsFollowing,
-                rangeFollowing);
+                rangeFollowing,
+                unboundedFollowing,
+                fullPartition);
         }
 
         // Prime the first partition from the first sorted row, then jump into the shared emit block so the
@@ -1164,7 +1210,9 @@ public static class WindowProgramBuilder
         int rangePreceding,
         bool descendingOrder,
         int groupsFollowing,
-        int rangeFollowing)
+        int rangeFollowing,
+        bool unboundedFollowing,
+        bool fullPartition)
     {
         var cursor = new Cursor(0);
         var partition = partitionColumns.Count;
@@ -1178,10 +1226,11 @@ public static class WindowProgramBuilder
             ? groupsFollowing == 0 ? 0 : groupsFollowing + 1
             : groupsPreceding + 1;
         var rangeOffset = rangePreceding == 0 ? rangeFollowing : rangePreceding;
-        var rangeCursors = rangeOffset == 0 ? 0 : 2;
+        var usesQueue = rangeOffset > 0 || unboundedFollowing || fullPartition;
+        var rangeCursors = usesQueue ? 2 : 0;
         var history = new Cursor(1);
         var scratch = new Cursor(2);
-        var orderColumn = rangeOffset == 0 || orderColumns.Count == 0 ? 0 : orderColumns[0];
+        var orderColumn = orderColumns.Count == 0 ? 0 : orderColumns[0];
         var rowReg = flushBase + width;
         var boundReg = rowReg + 1;
         var flagReg = rowReg + 2;
@@ -1192,7 +1241,7 @@ public static class WindowProgramBuilder
         // open — the table cursor is still live — and land on SorterSort instead.
         ins.Insert(sortIndex, new OpenEphemeralInstruction(cursor, width));
         sortIndex++;
-        if (rangeOffset > 0)
+        if (usesQueue)
         {
             ins.Insert(sortIndex, new OpenEphemeralInstruction(history, width));
             sortIndex++;
@@ -1223,7 +1272,7 @@ public static class WindowProgramBuilder
             ins, ringSlots, width, skipInverseIndex, oneIndex, groupsPreceding, openRing: true);
         EmitGroupsFollowingReset(
             ins, ringSlots, width, skipInverseIndex, oneIndex, groupsFollowing, openRing: true);
-        EmitRangeHistoryReset(ins, width, skipInverseIndex, rangeOffset, openHistory: true);
+        EmitRangeHistoryReset(ins, width, skipInverseIndex, rangeOffset, openHistory: true, needsQueue: usesQueue);
 
         var primeGoto = ins.Count;
         ins.Add(new GotoInstruction(new ProgramCounter(0)));
@@ -1248,7 +1297,7 @@ public static class WindowProgramBuilder
                 savedKeyRange,
                 partitionComparer!,
                 new ProgramCounter(0)));
-            if (rangeFollowing > 0)
+            if (rangeFollowing > 0 || unboundedFollowing || fullPartition)
             {
                 EmitRangeFollowingBoundary(
                     ins,
@@ -1273,7 +1322,8 @@ public static class WindowProgramBuilder
                     flagReg,
                     oldestKeyReg,
                     peerComparer,
-                    drainRemaining: true);
+                    drainRemaining: true,
+                    fullPartition);
             }
             else
             {
@@ -1307,7 +1357,7 @@ public static class WindowProgramBuilder
                 ins, ringSlots, width, skipInverseIndex, oneIndex, groupsPreceding, openRing: false);
             EmitGroupsFollowingReset(
                 ins, ringSlots, width, skipInverseIndex, oneIndex, groupsFollowing, openRing: false);
-            EmitRangeHistoryReset(ins, width, skipInverseIndex, rangeOffset, openHistory: false);
+            EmitRangeHistoryReset(ins, width, skipInverseIndex, rangeOffset, openHistory: false, needsQueue: usesQueue);
             for (var j = 0; j < partition; j++)
             {
                 ins.Add(new CopyInstruction(
@@ -1372,7 +1422,9 @@ public static class WindowProgramBuilder
                     groupsFollowing,
                     rangeFollowing,
                     oldestKeyReg,
-                    peerComparer);
+                    peerComparer,
+                    unboundedFollowing,
+                    fullPartition);
                 if (resetAccumulatorOnPeerChange)
                 {
                     for (var i = 0; i < windows.Count; i++)
@@ -1440,7 +1492,9 @@ public static class WindowProgramBuilder
                 groupsFollowing,
                 rangeFollowing,
                 oldestKeyReg,
-                peerComparer);
+                peerComparer,
+                unboundedFollowing,
+                fullPartition);
             if (resetAccumulatorOnPeerChange)
             {
                 for (var i = 0; i < windows.Count; i++)
@@ -1471,7 +1525,7 @@ public static class WindowProgramBuilder
         ins.Add(new EphemeralInsertInstruction(cursor, stagingRange));
         ins.Add(new SorterNextInstruction(sorter, new ProgramCounter(drainLoop)));
 
-        if (rangeFollowing > 0)
+        if (rangeFollowing > 0 || unboundedFollowing || fullPartition)
         {
             EmitRangeFollowingBoundary(
                 ins,
@@ -1496,7 +1550,8 @@ public static class WindowProgramBuilder
                 flagReg,
                 oldestKeyReg,
                 peerComparer,
-                drainRemaining: true);
+                drainRemaining: true,
+                fullPartition);
         }
         else if (groupsFollowing > 0)
         {
@@ -1551,7 +1606,7 @@ public static class WindowProgramBuilder
         ins[sortIndex] = new SorterSortInstruction(sorter, new ProgramCounter(doneAddr));
 
         return new VdbeProgram(
-            rangeFollowing > 0 ? oldestKeyReg + 1 : rangePreceding == 0 ? flushBase + width : flagReg + 1,
+            usesQueue ? oldestKeyReg + 2 : rangePreceding == 0 ? flushBase + width : flagReg + 1,
             cursorCount: 1 + ringSlots + rangeCursors,
             ins,
             sorterCount: 1,
@@ -1736,9 +1791,10 @@ public static class WindowProgramBuilder
         int width,
         int offsetIndex,
         int rangePreceding,
-        bool openHistory)
+        bool openHistory,
+        bool needsQueue = false)
     {
-        if (rangePreceding == 0)
+        if (rangePreceding == 0 && !needsQueue)
             return;
 
         var history = new Cursor(1);
@@ -1751,7 +1807,8 @@ public static class WindowProgramBuilder
             ins.Add(new OpenEphemeralInstruction(scratch, width));
         }
 
-        ins.Add(new LoadConstantInstruction(new Register(offsetIndex), SqlValue.Integer(rangePreceding)));
+        if (rangePreceding > 0)
+            ins.Add(new LoadConstantInstruction(new Register(offsetIndex), SqlValue.Integer(rangePreceding)));
     }
 
     private static void EmitRangeFollowingBoundary(
@@ -1777,9 +1834,9 @@ public static class WindowProgramBuilder
         int flagReg,
         int oldestKeyReg,
         VdbeGroupComparer? peerComparer,
-        bool drainRemaining)
+        bool drainRemaining,
+        bool fullPartition = false)
     {
-        _ = rangeFollowing;
         EmitCopyEphemeral(ins, delay, scratch, flushBase, width);
         ins.Add(new CloseCursorInstruction(delay));
         ins.Add(new OpenEphemeralInstruction(delay, width));
@@ -1789,6 +1846,12 @@ public static class WindowProgramBuilder
 
         if (drainRemaining)
         {
+            if (fullPartition || peerComparer is null)
+            {
+                EmitPeerFlush(ins, queue, windows, outputs, width, aggOutBase, outBase, flushBase);
+                return;
+            }
+
             var drainLoop = ins.Count;
             var drainRewind = ins.Count;
             ins.Add(new RewindCursorInstruction(queue, new ProgramCounter(0)));
@@ -1811,6 +1874,9 @@ public static class WindowProgramBuilder
             ins[drainRewind] = new RewindCursorInstruction(queue, new ProgramCounter(ins.Count));
             return;
         }
+
+        if (rangeFollowing == 0)
+            return;
 
         var flushLoop = ins.Count;
         var probeRewind = ins.Count;
@@ -1967,9 +2033,11 @@ public static class WindowProgramBuilder
         int groupsFollowing,
         int rangeFollowing,
         int oldestKeyReg,
-        VdbeGroupComparer? peerComparer)
+        VdbeGroupComparer? peerComparer,
+        bool unboundedFollowing = false,
+        bool fullPartition = false)
     {
-        if (rangeFollowing > 0)
+        if (rangeFollowing > 0 || unboundedFollowing || fullPartition)
         {
             EmitRangeFollowingBoundary(
                 ins,
@@ -1994,7 +2062,8 @@ public static class WindowProgramBuilder
                 flagReg,
                 oldestKeyReg,
                 peerComparer,
-                drainRemaining: false);
+                drainRemaining: false,
+                fullPartition);
             return;
         }
 

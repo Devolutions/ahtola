@@ -890,6 +890,49 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void RangeUnboundedFollowingEmitsFromTheEndOfThePartition()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeUnboundedFollowing,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.CursorCount.Should().Be(3);
+        var rows = Run(program, Rows([1, 10], [2, 20], [3, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 60),
+            (2, 50),
+            (3, 30));
+    }
+
+    [Test]
+    public void RangeFullPartitionEmitsTheSameTotalOnEveryRow()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [Sum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeFullPartition,
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        var rows = Run(program, Rows([1, 10], [2, 20], [3, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 60),
+            (2, 60),
+            (3, 60));
+    }
+
+    [Test]
     public void RangePrecedingRequiresExactlyOneOrderColumn()
     {
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(

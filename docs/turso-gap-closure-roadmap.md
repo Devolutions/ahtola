@@ -87,8 +87,11 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   until m later peer groups exist (m ≤ 1024). Streaming
   `RANGE CURRENT ROW … n FOLLOWING` (single ORDER BY key) delays emit until the
   next ORDER BY value falls outside the offset, then flushes/inverses the
-  oldest queued group. Remaining: unbounded-following frames, EXCLUDE,
-  MIN/MAX inverse, and Compute still needing the partition in-heap after reload.
+  oldest queued group. Streaming RANGE/GROUPS `CURRENT ROW … UNBOUNDED FOLLOWING`
+  drains the queued groups at partition end with inverse; `UNBOUNDED PRECEDING …
+  UNBOUNDED FOLLOWING` emits the full-partition aggregate on every row.
+  Remaining: EXCLUDE, MIN/MAX inverse, ROWS unbounded FOLLOWING, and Compute
+  still needing the partition in-heap after reload.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
