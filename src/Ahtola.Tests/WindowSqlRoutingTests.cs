@@ -514,6 +514,47 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
+    public void RangeFollowingFrameRoutesThroughInverseAndMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (10, 30);",
+        ];
+        const string query =
+            "SELECT k, sum(v) OVER (ORDER BY k RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) " +
+            "FROM t ORDER BY k;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
+        opcodes.Should().Contain("AggInverse").And.Contain("OpenEphemeral").And.Contain("Compare")
+            .And.NotContain("OpenWindowBuffer");
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
+    public void RangeFollowingDescendingFrameMatchSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(k INTEGER, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10), (2, 20), (10, 30);",
+        ];
+        const string query =
+            "SELECT k, sum(v) OVER (ORDER BY k DESC RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) " +
+            "FROM t ORDER BY k DESC;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        AssertMatchesSqlite(ReadRows(connection, query), setup, query);
+    }
+
+    [Test]
     public void RangePrecedingFrameRoutesThroughInverseAndMatchSqlite()
     {
         string[] setup =

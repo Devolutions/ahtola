@@ -864,6 +864,32 @@ public class WindowProgramBuilderDirectTests
     }
 
     [Test]
+    public void RangeOneFollowingLooksAheadByOrderValue()
+    {
+        var program = WindowProgramBuilder.Build(
+            "t",
+            tableColumnCount: 2,
+            partitionColumns: [],
+            windows: [InvertibleSum(1)],
+            outputs: [WindowOutput.ForColumn(0), WindowOutput.ForWindow(0)],
+            orderComparer: AggregateTestSupport.OrderByColumns(0),
+            frame: WindowFrameSpec.RangeFollowing(1),
+            orderColumns: [0],
+            peerComparer: AggregateTestSupport.GroupKeysEqual());
+
+        program.CursorCount.Should().Be(3);
+        program.Instructions.Select(static instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.AggInverse)
+            .And.Contain(VdbeOpcode.Compare);
+
+        var rows = Run(program, Rows([1, 10], [2, 20], [10, 30]));
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger())).Should().Equal(
+            (1, 30),
+            (2, 20),
+            (10, 30));
+    }
+
+    [Test]
     public void RangePrecedingRequiresExactlyOneOrderColumn()
     {
         Assert.Throws<ArgumentException>(() => WindowProgramBuilder.Build(

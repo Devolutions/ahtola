@@ -84,9 +84,11 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   keeps a history ephemeral of in-frame prior groups and compact/inverses with
   `Compare` + `AggInverse` (ASC: `row + n >= current`; DESC subtracts and
   flips to `<=`). Streaming `GROUPS CURRENT ROW … m FOLLOWING` delays emit
-  until m later peer groups exist (m ≤ 1024). Remaining: RANGE FOLLOWING,
-  unbounded-following frames, EXCLUDE, MIN/MAX inverse, and Compute still
-  needing the partition in-heap after reload.
+  until m later peer groups exist (m ≤ 1024). Streaming
+  `RANGE CURRENT ROW … n FOLLOWING` (single ORDER BY key) delays emit until the
+  next ORDER BY value falls outside the offset, then flushes/inverses the
+  oldest queued group. Remaining: unbounded-following frames, EXCLUDE,
+  MIN/MAX inverse, and Compute still needing the partition in-heap after reload.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.

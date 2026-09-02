@@ -184,6 +184,13 @@ public readonly record struct WindowFrameSpec(
         WindowBound.Following,
         EndOffset: n);
 
+    /// <summary>A moving frame: <c>RANGE CURRENT ROW TO n FOLLOWING</c>.</summary>
+    public static WindowFrameSpec RangeFollowing(long n) => new(
+        WindowFrameMode.Range,
+        WindowBound.CurrentRow,
+        WindowBound.Following,
+        EndOffset: n);
+
     /// <summary>Whether this frame is RANGE/GROUPS UNBOUNDED PRECEDING TO CURRENT ROW.</summary>
     public bool IsPeerRunning => Mode is WindowFrameMode.Range or WindowFrameMode.Groups
         && Start == WindowBound.UnboundedPreceding
@@ -228,12 +235,23 @@ public readonly record struct WindowFrameSpec(
     /// <summary>The <c>m</c> in a GROUPS following frame; 0 when the frame is not one.</summary>
     public int GroupsFollowingCount => IsGroupsFollowing ? (int)EndOffset!.Value : 0;
 
+    /// <summary>Whether this frame is <c>RANGE CURRENT ROW TO n FOLLOWING</c> for a streaming-safe n.</summary>
+    public bool IsRangeFollowing => Mode == WindowFrameMode.Range
+        && Start == WindowBound.CurrentRow
+        && End == WindowBound.Following
+        && StartOffset is null
+        && EndOffset is > 0 and <= MaxStreamingPreceding;
+
+    /// <summary>The <c>n</c> in a RANGE following frame; 0 when the frame is not one.</summary>
+    public int RangeFollowingOffset => IsRangeFollowing ? (int)EndOffset!.Value : 0;
+
     /// <summary>Whether emit is delayed until the current ORDER BY peer group ends.</summary>
     public bool IsPeerFrame => IsPeerRunning
         || IsPeerCurrent
         || IsGroupsPreceding
         || IsRangePreceding
-        || IsGroupsFollowing;
+        || IsGroupsFollowing
+        || IsRangeFollowing;
 
     /// <summary>Whether this frame can be lowered by the streaming builder.</summary>
     public bool IsSupported => IsRunning
@@ -250,7 +268,8 @@ public readonly record struct WindowFrameSpec(
         || IsBoundedPrecedingFollowing
         || IsGroupsPreceding
         || IsRangePreceding
-        || IsGroupsFollowing;
+        || IsGroupsFollowing
+        || IsRangeFollowing;
 }
 
 /// <summary>The kind of value a window result column projects.</summary>
@@ -405,7 +424,7 @@ public static class WindowProgramBuilder
                 "ROWS CURRENT ROW TO m FOLLOWING, ROWS n PRECEDING TO m FOLLOWING, " +
                 "RANGE/GROUPS UNBOUNDED PRECEDING or CURRENT ROW peer frames, " +
                 "GROUPS n PRECEDING TO CURRENT ROW, RANGE n PRECEDING TO CURRENT ROW, " +
-                "and GROUPS CURRENT ROW TO m FOLLOWING " +
+                "GROUPS CURRENT ROW TO m FOLLOWING, and RANGE CURRENT ROW TO n FOLLOWING " +
                 $"(1 <= n,m <= {WindowFrameSpec.MaxStreamingPreceding}); " +
                 $"frame ({effectiveFrame.Mode}, {effectiveFrame.Start}, {effectiveFrame.End}, " +
                 $"{effectiveFrame.StartOffset}, {effectiveFrame.EndOffset}) is not representable.",
@@ -484,10 +503,11 @@ public static class WindowProgramBuilder
                     nameof(peerComparer));
             }
 
-            if (effectiveFrame.IsRangePreceding && orderColumns.Count != 1)
+            if ((effectiveFrame.IsRangePreceding || effectiveFrame.IsRangeFollowing)
+                && orderColumns.Count != 1)
             {
                 throw new ArgumentException(
-                    "RANGE n PRECEDING requires exactly one ORDER BY column.",
+                    "RANGE n PRECEDING/FOLLOWING requires exactly one ORDER BY column.",
                     nameof(orderColumns));
             }
         }
@@ -534,6 +554,7 @@ public static class WindowProgramBuilder
         var followingCount = frame.IsPeerFrame ? 0 : frame.FollowingCount;
         var groupsPreceding = frame.IsGroupsPreceding ? frame.GroupsPrecedingCount : 0;
         var rangePreceding = frame.IsRangePreceding ? frame.RangePrecedingOffset : 0;
+        var rangeFollowing = frame.IsRangeFollowing ? frame.RangeFollowingOffset : 0;
         var groupsFollowing = frame.IsGroupsFollowing ? frame.GroupsFollowingCount : 0;
         var stagingBase = 0;
         var savedKeyBase = width;
@@ -554,7 +575,7 @@ public static class WindowProgramBuilder
         var groupsControl = groupsPreceding == 0 && groupsFollowing == 0
             ? 0
             : groupsFollowing == 0 ? 2 : 4;
-        var rangeControl = rangePreceding == 0 ? 0 : 1;
+        var rangeControl = rangePreceding == 0 && rangeFollowing == 0 ? 0 : 1;
         var aggOutBase = skipInverseIndex + precedingControl + groupsControl + rangeControl;
         var outBase = aggOutBase + windows.Count;
         var registerCount = outBase + outputs.Count;
@@ -635,7 +656,8 @@ public static class WindowProgramBuilder
                 oneIndex,
                 rangePreceding,
                 descendingOrder,
-                groupsFollowing);
+                groupsFollowing,
+                rangeFollowing);
         }
 
         // Prime the first partition from the first sorted row, then jump into the shared emit block so the
@@ -1141,7 +1163,8 @@ public static class WindowProgramBuilder
         int oneIndex,
         int rangePreceding,
         bool descendingOrder,
-        int groupsFollowing)
+        int groupsFollowing,
+        int rangeFollowing)
     {
         var cursor = new Cursor(0);
         var partition = partitionColumns.Count;
@@ -1154,20 +1177,22 @@ public static class WindowProgramBuilder
         var ringSlots = groupsPreceding == 0
             ? groupsFollowing == 0 ? 0 : groupsFollowing + 1
             : groupsPreceding + 1;
-        var rangeCursors = rangePreceding == 0 ? 0 : 2;
+        var rangeOffset = rangePreceding == 0 ? rangeFollowing : rangePreceding;
+        var rangeCursors = rangeOffset == 0 ? 0 : 2;
         var history = new Cursor(1);
         var scratch = new Cursor(2);
-        var orderColumn = rangePreceding == 0 || orderColumns.Count == 0 ? 0 : orderColumns[0];
+        var orderColumn = rangeOffset == 0 || orderColumns.Count == 0 ? 0 : orderColumns[0];
         var rowReg = flushBase + width;
         var boundReg = rowReg + 1;
         var flagReg = rowReg + 2;
+        var oldestKeyReg = flagReg + 1;
 
         // Open the delay buffer before SorterSort so a fully-filtered ingest still has a cursor
         // to close at Halt (CloseCursor is not idempotent). Empty-table Rewind must skip this
         // open — the table cursor is still live — and land on SorterSort instead.
         ins.Insert(sortIndex, new OpenEphemeralInstruction(cursor, width));
         sortIndex++;
-        if (rangePreceding > 0)
+        if (rangeOffset > 0)
         {
             ins.Insert(sortIndex, new OpenEphemeralInstruction(history, width));
             sortIndex++;
@@ -1198,7 +1223,7 @@ public static class WindowProgramBuilder
             ins, ringSlots, width, skipInverseIndex, oneIndex, groupsPreceding, openRing: true);
         EmitGroupsFollowingReset(
             ins, ringSlots, width, skipInverseIndex, oneIndex, groupsFollowing, openRing: true);
-        EmitRangeHistoryReset(ins, width, skipInverseIndex, rangePreceding, openHistory: true);
+        EmitRangeHistoryReset(ins, width, skipInverseIndex, rangeOffset, openHistory: true);
 
         var primeGoto = ins.Count;
         ins.Add(new GotoInstruction(new ProgramCounter(0)));
@@ -1223,35 +1248,66 @@ public static class WindowProgramBuilder
                 savedKeyRange,
                 partitionComparer!,
                 new ProgramCounter(0)));
-            EmitRangePeerBoundary(
-                ins,
-                cursor,
-                history,
-                scratch,
-                windows,
-                outputs,
-                argOffsets,
-                argBase,
-                width,
-                aggOutBase,
-                outBase,
-                flushBase,
-                rangePreceding,
-                descendingOrder,
-                orderColumn,
-                savedPeerBase,
-                skipInverseIndex,
-                rowReg,
-                boundReg,
-                flagReg,
-                retainFlushedGroup: false);
+            if (rangeFollowing > 0)
+            {
+                EmitRangeFollowingBoundary(
+                    ins,
+                    cursor,
+                    history,
+                    scratch,
+                    windows,
+                    outputs,
+                    argOffsets,
+                    argBase,
+                    width,
+                    aggOutBase,
+                    outBase,
+                    flushBase,
+                    rangeFollowing,
+                    descendingOrder,
+                    orderColumn,
+                    currentPeerBase,
+                    skipInverseIndex,
+                    rowReg,
+                    boundReg,
+                    flagReg,
+                    oldestKeyReg,
+                    peerComparer,
+                    drainRemaining: true);
+            }
+            else
+            {
+                EmitRangePeerBoundary(
+                    ins,
+                    cursor,
+                    history,
+                    scratch,
+                    windows,
+                    outputs,
+                    argOffsets,
+                    argBase,
+                    width,
+                    aggOutBase,
+                    outBase,
+                    flushBase,
+                    rangePreceding,
+                    descendingOrder,
+                    orderColumn,
+                    savedPeerBase,
+                    skipInverseIndex,
+                    rowReg,
+                    boundReg,
+                    flagReg,
+                    retainFlushedGroup: false);
+            }
+
             for (var i = 0; i < windows.Count; i++)
                 ins.Add(new AggResetInstruction(new Accumulator(i)));
             EmitGroupsPrecedingReset(
                 ins, ringSlots, width, skipInverseIndex, oneIndex, groupsPreceding, openRing: false);
             EmitGroupsFollowingReset(
                 ins, ringSlots, width, skipInverseIndex, oneIndex, groupsFollowing, openRing: false);
-            EmitRangeHistoryReset(ins, width, skipInverseIndex, rangePreceding, openHistory: false);
+            EmitRangeHistoryReset(ins, width, skipInverseIndex, rangeOffset, openHistory: false);
             for (var j = 0; j < partition; j++)
             {
                 ins.Add(new CopyInstruction(
@@ -1313,7 +1369,10 @@ public static class WindowProgramBuilder
                     rowReg,
                     boundReg,
                     flagReg,
-                    groupsFollowing);
+                    groupsFollowing,
+                    rangeFollowing,
+                    oldestKeyReg,
+                    peerComparer);
                 if (resetAccumulatorOnPeerChange)
                 {
                     for (var i = 0; i < windows.Count; i++)
@@ -1378,7 +1437,10 @@ public static class WindowProgramBuilder
                 rowReg,
                 boundReg,
                 flagReg,
-                groupsFollowing);
+                groupsFollowing,
+                rangeFollowing,
+                oldestKeyReg,
+                peerComparer);
             if (resetAccumulatorOnPeerChange)
             {
                 for (var i = 0; i < windows.Count; i++)
@@ -1409,7 +1471,34 @@ public static class WindowProgramBuilder
         ins.Add(new EphemeralInsertInstruction(cursor, stagingRange));
         ins.Add(new SorterNextInstruction(sorter, new ProgramCounter(drainLoop)));
 
-        if (groupsFollowing > 0)
+        if (rangeFollowing > 0)
+        {
+            EmitRangeFollowingBoundary(
+                ins,
+                cursor,
+                history,
+                scratch,
+                windows,
+                outputs,
+                argOffsets,
+                argBase,
+                width,
+                aggOutBase,
+                outBase,
+                flushBase,
+                rangeFollowing,
+                descendingOrder,
+                orderColumn,
+                currentPeerBase,
+                skipInverseIndex,
+                rowReg,
+                boundReg,
+                flagReg,
+                oldestKeyReg,
+                peerComparer,
+                drainRemaining: true);
+        }
+        else if (groupsFollowing > 0)
         {
             EmitGroupsFollowingBoundary(
                 ins,
@@ -1462,7 +1551,7 @@ public static class WindowProgramBuilder
         ins[sortIndex] = new SorterSortInstruction(sorter, new ProgramCounter(doneAddr));
 
         return new VdbeProgram(
-            rangePreceding == 0 ? flushBase + width : flagReg + 1,
+            rangeFollowing > 0 ? oldestKeyReg + 1 : rangePreceding == 0 ? flushBase + width : flagReg + 1,
             cursorCount: 1 + ringSlots + rangeCursors,
             ins,
             sorterCount: 1,
@@ -1665,6 +1754,194 @@ public static class WindowProgramBuilder
         ins.Add(new LoadConstantInstruction(new Register(offsetIndex), SqlValue.Integer(rangePreceding)));
     }
 
+    private static void EmitRangeFollowingBoundary(
+        List<VdbeInstruction> ins,
+        Cursor delay,
+        Cursor queue,
+        Cursor scratch,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        IReadOnlyList<WindowOutput> outputs,
+        int[] argOffsets,
+        int argBase,
+        int width,
+        int aggOutBase,
+        int outBase,
+        int flushBase,
+        int rangeFollowing,
+        bool descendingOrder,
+        int orderColumn,
+        int currentKeyIndex,
+        int offsetIndex,
+        int rowReg,
+        int boundReg,
+        int flagReg,
+        int oldestKeyReg,
+        VdbeGroupComparer? peerComparer,
+        bool drainRemaining)
+    {
+        _ = rangeFollowing;
+        EmitCopyEphemeral(ins, delay, scratch, flushBase, width);
+        ins.Add(new CloseCursorInstruction(delay));
+        ins.Add(new OpenEphemeralInstruction(delay, width));
+        EmitCopyEphemeral(ins, scratch, queue, flushBase, width);
+        ins.Add(new CloseCursorInstruction(scratch));
+        ins.Add(new OpenEphemeralInstruction(scratch, width));
+
+        if (drainRemaining)
+        {
+            var drainLoop = ins.Count;
+            var drainRewind = ins.Count;
+            ins.Add(new RewindCursorInstruction(queue, new ProgramCounter(0)));
+            EmitFlushOldestPeerGroup(
+                ins,
+                queue,
+                scratch,
+                windows,
+                outputs,
+                argOffsets,
+                argBase,
+                width,
+                aggOutBase,
+                outBase,
+                flushBase,
+                orderColumn,
+                oldestKeyReg,
+                peerComparer!);
+            ins.Add(new GotoInstruction(new ProgramCounter(drainLoop)));
+            ins[drainRewind] = new RewindCursorInstruction(queue, new ProgramCounter(ins.Count));
+            return;
+        }
+
+        var flushLoop = ins.Count;
+        var probeRewind = ins.Count;
+        ins.Add(new RewindCursorInstruction(queue, new ProgramCounter(0)));
+        if (width > 0)
+            ins.Add(new ColumnRangeInstruction(queue, 0, new Register(flushBase), width));
+        var drop = EmitRangeOffsetCompare(
+            ins,
+            flushBase,
+            orderColumn,
+            currentKeyIndex,
+            offsetIndex,
+            descendingOrder,
+            rowReg,
+            boundReg,
+            flagReg);
+        var inRange = ins.Count;
+        ins.Add(new GotoInstruction(new ProgramCounter(0)));
+        ins[drop] = new JumpIfNotTrueInstruction(new Register(flagReg), new ProgramCounter(ins.Count));
+        EmitFlushOldestPeerGroup(
+            ins,
+            queue,
+            scratch,
+            windows,
+            outputs,
+            argOffsets,
+            argBase,
+            width,
+            aggOutBase,
+            outBase,
+            flushBase,
+            orderColumn,
+            oldestKeyReg,
+            peerComparer!);
+        ins.Add(new GotoInstruction(new ProgramCounter(flushLoop)));
+        var after = ins.Count;
+        ins[probeRewind] = new RewindCursorInstruction(queue, new ProgramCounter(after));
+        ins[inRange] = new GotoInstruction(new ProgramCounter(after));
+    }
+
+    private static void EmitFlushOldestPeerGroup(
+        List<VdbeInstruction> ins,
+        Cursor queue,
+        Cursor scratch,
+        IReadOnlyList<AggregateFunctionSpec> windows,
+        IReadOnlyList<WindowOutput> outputs,
+        int[] argOffsets,
+        int argBase,
+        int width,
+        int aggOutBase,
+        int outBase,
+        int flushBase,
+        int orderColumn,
+        int oldestKeyReg,
+        VdbeGroupComparer peerComparer)
+    {
+        var rewind = ins.Count;
+        ins.Add(new RewindCursorInstruction(queue, new ProgramCounter(0)));
+        if (width > 0)
+            ins.Add(new ColumnRangeInstruction(queue, 0, new Register(flushBase), width));
+        ins.Add(new CopyInstruction(new Register(flushBase + orderColumn), new Register(oldestKeyReg)));
+
+        var emit = ins.Count;
+        for (var i = 0; i < windows.Count; i++)
+        {
+            ins.Add(new AggFinalizeInstruction(
+                new Accumulator(i),
+                windows[i].Aggregate,
+                new Register(aggOutBase + i)));
+        }
+
+        for (var o = 0; o < outputs.Count; o++)
+        {
+            var output = outputs[o];
+            var destination = new Register(outBase + o);
+            ins.Add(output.Kind switch
+            {
+                WindowOutputKind.Column => new CopyInstruction(
+                    new Register(flushBase + output.Index),
+                    destination),
+                WindowOutputKind.Window => new CopyInstruction(
+                    new Register(aggOutBase + output.Index),
+                    destination),
+                _ => new LoadConstantInstruction(destination, output.Constant),
+            });
+        }
+
+        ins.Add(new ResultRowInstruction(new RegisterRange(new Register(outBase), outputs.Count)));
+        GatherArgumentsFromRow(ins, windows, argOffsets, argBase, flushBase);
+        EmitWindowInverses(ins, windows, argOffsets, argBase);
+
+        var next = ins.Count;
+        ins.Add(new NextInstruction(queue, new ProgramCounter(0)));
+        ins.Add(new CloseCursorInstruction(queue));
+        ins.Add(new OpenEphemeralInstruction(queue, width));
+        var gotoDoneFromEmpty = ins.Count;
+        ins.Add(new GotoInstruction(new ProgramCounter(0)));
+
+        var loadNext = ins.Count;
+        ins[next] = new NextInstruction(queue, new ProgramCounter(loadNext));
+        if (width > 0)
+            ins.Add(new ColumnRangeInstruction(queue, 0, new Register(flushBase), width));
+        ins.Add(new SameGroupInstruction(
+            new RegisterRange(new Register(flushBase + orderColumn), 1),
+            new RegisterRange(new Register(oldestKeyReg), 1),
+            peerComparer,
+            new ProgramCounter(emit)));
+
+        ins.Add(new EphemeralInsertInstruction(scratch, new RegisterRange(new Register(flushBase), width)));
+        var leftoverNext = ins.Count;
+        ins.Add(new NextInstruction(queue, new ProgramCounter(0)));
+        var skipLeftoverBody = ins.Count;
+        ins.Add(new GotoInstruction(new ProgramCounter(0)));
+        var leftoverBody = ins.Count;
+        ins[leftoverNext] = new NextInstruction(queue, new ProgramCounter(leftoverBody));
+        if (width > 0)
+            ins.Add(new ColumnRangeInstruction(queue, 0, new Register(flushBase), width));
+        ins.Add(new EphemeralInsertInstruction(scratch, new RegisterRange(new Register(flushBase), width)));
+        ins.Add(new NextInstruction(queue, new ProgramCounter(leftoverBody)));
+        var compact = ins.Count;
+        ins[skipLeftoverBody] = new GotoInstruction(new ProgramCounter(compact));
+        ins.Add(new CloseCursorInstruction(queue));
+        ins.Add(new OpenEphemeralInstruction(queue, width));
+        EmitCopyEphemeral(ins, scratch, queue, flushBase, width);
+        ins.Add(new CloseCursorInstruction(scratch));
+        ins.Add(new OpenEphemeralInstruction(scratch, width));
+        var done = ins.Count;
+        ins[rewind] = new RewindCursorInstruction(queue, new ProgramCounter(done));
+        ins[gotoDoneFromEmpty] = new GotoInstruction(new ProgramCounter(done));
+    }
+
     private static void EmitMovingPeerBoundary(
         List<VdbeInstruction> ins,
         Cursor delay,
@@ -1687,8 +1964,40 @@ public static class WindowProgramBuilder
         int rowReg,
         int boundReg,
         int flagReg,
-        int groupsFollowing)
+        int groupsFollowing,
+        int rangeFollowing,
+        int oldestKeyReg,
+        VdbeGroupComparer? peerComparer)
     {
+        if (rangeFollowing > 0)
+        {
+            EmitRangeFollowingBoundary(
+                ins,
+                delay,
+                history,
+                scratch,
+                windows,
+                outputs,
+                argOffsets,
+                argBase,
+                width,
+                aggOutBase,
+                outBase,
+                flushBase,
+                rangeFollowing,
+                descendingOrder,
+                orderColumn,
+                currentKeyIndex,
+                skipInverseIndex,
+                rowReg,
+                boundReg,
+                flagReg,
+                oldestKeyReg,
+                peerComparer,
+                drainRemaining: false);
+            return;
+        }
+
         if (groupsFollowing > 0)
         {
             EmitGroupsFollowingBoundary(
@@ -1814,7 +2123,10 @@ public static class WindowProgramBuilder
             rowReg,
             boundReg,
             flagReg,
-            groupsFollowing: 0);
+            groupsFollowing: 0,
+            rangeFollowing: 0,
+            oldestKeyReg: 0,
+            peerComparer: null);
     }
 
     private static void EmitRangeCompact(

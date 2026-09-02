@@ -23689,7 +23689,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var descendingOrder = false;
-        if (frame.IsRangePreceding)
+        if (frame.IsRangePreceding || frame.IsRangeFollowing)
         {
             if (orderColumns is not { Count: 1 } || spec.OrderBy.Count != 1)
                 return false;
@@ -24034,7 +24034,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var window = function.Window!;
         if (!TryGetStreamingWindowFrame(window.Frame, out var frame))
             return false;
-        if (frame.IsRangePreceding && window.OrderBy.Count != 1)
+        if ((frame.IsRangePreceding || frame.IsRangeFollowing) && window.OrderBy.Count != 1)
             return false;
         if (frame.RequiresInverse && function.Name is not ("COUNT" or "SUM" or "AVG"))
             return false;
@@ -24183,6 +24183,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (preceding is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
             {
                 spec = WindowFrameSpec.RangePreceding(preceding);
+                return true;
+            }
+        }
+
+        if (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Range
+            && frame.Start.Kind == FrameBoundKind.CurrentRow
+            && frame.Start.Offset is null
+            && frame.End is
+            {
+                Kind: FrameBoundKind.Following,
+                Offset: LiteralExpression { Value.Kind: SqlValueKind.Integer } rangeFollowingOffset,
+            })
+        {
+            var following = rangeFollowingOffset.Value.AsInteger();
+            if (following == 0)
+            {
+                spec = WindowFrameSpec.RangeCurrentPeer;
+                return true;
+            }
+
+            if (following is > 0 and <= WindowFrameSpec.MaxStreamingPreceding)
+            {
+                spec = WindowFrameSpec.RangeFollowing(following);
                 return true;
             }
         }
