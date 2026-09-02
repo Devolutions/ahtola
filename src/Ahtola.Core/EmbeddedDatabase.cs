@@ -24781,6 +24781,82 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     EmitForeignKeyChecks: context.ForeignKeysEnabled
                         && TableParticipatesInForeignKeys(context, statement.TableName, table));
 
+        if (table.Strict && !hasReturning)
+        {
+            SqlValue[][]? builtRows = null;
+            long[]? builtRowIds = null;
+            void EnsureBuiltRows()
+            {
+                if (builtRows is not null)
+                    return;
+
+                builtRows = new SqlValue[statement.Rows.Count][];
+                builtRowIds = new long[statement.Rows.Count];
+                for (var index = 0; index < statement.Rows.Count; index++)
+                {
+                    var (row, rowId) = BuildInsertRow(
+                        statement,
+                        table,
+                        plan,
+                        statement.Rows[index],
+                        parameters,
+                        context);
+                    builtRows[index] = row;
+                    builtRowIds[index] = rowId;
+                }
+            }
+
+            var parameterCount = table.Columns.Length + 1;
+            var parameterRegisters = Enumerable.Range(0, parameterCount)
+                .Select(static index => new Register(index))
+                .ToArray();
+            var beforeMutation = new List<VdbeInstruction>();
+            InsertStrictTypeCheck(beforeMutation, table, statement.TableName, parameterRegisters);
+            writeTarget = new VdbeWriteTarget
+            {
+                TableName = statement.TableName,
+                RowCount = statement.Rows.Count,
+                GetRow = index =>
+                {
+                    EnsureBuiltRows();
+                    return builtRows![index];
+                },
+                GetRowId = index =>
+                {
+                    EnsureBuiltRows();
+                    return builtRowIds![index];
+                },
+                MutateRow = index =>
+                {
+                    EnsureBuiltRows();
+                    var row = builtRows![index];
+                    var rowId = builtRowIds![index];
+                    rowsToInsert.Add(row);
+                    insertedRowIds.Add(rowId);
+                    return new VdbeRowMutation(row, rowId);
+                },
+                Commit = () =>
+                {
+                    CommitInserts(context, statement.TableName, table, rowsToInsert, insertedRowIds);
+                    return table.HasRowid && insertedRowIds.Count > 0
+                        ? insertedRowIds[^1]
+                        : (long?)null;
+                },
+            };
+            compiled = new CompiledDml(
+                DmlStatementCompiler.BuildProgramWithMutationPrograms(
+                    DmlKind.Insert,
+                    statement.TableName,
+                    table.Columns.Length,
+                    filter: null,
+                    beforeMutation,
+                    afterMutation: [],
+                    registerCount: parameterCount,
+                    options: dmlOptions),
+                [writeTarget]);
+            return true;
+        }
+
         compiled = hasReturning
             ? DmlStatementCompiler.CompileWithFilter(
                 DmlKind.Insert,
@@ -26827,7 +26903,7 @@ out bool hasReturning)
             // describing one resolves nothing and can never attach a method.
             IndexMethodCreateInstruction => VdbeExplain.Describe(instruction),
             IndexMethodDestroyInstruction => VdbeExplain.Describe(instruction),
-            _ => throw new EmbeddedSqlException($"Cannot describe unsupported opcode {instruction.Opcode}."),
+            _ => VdbeExplain.Describe(instruction),
         };
     }
 

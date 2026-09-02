@@ -520,6 +520,26 @@ public class RecursiveWorkTableOpcodeExecutionTests
     }
 
     [Test]
+    public void DistinctWorkTableHonorsTheRetainedMemoryBudget()
+    {
+        var seeds = Enumerable.Range(0, 64).Select(static value => Row(value)).ToArray();
+        var program = Recursive(
+            width: 1,
+            mode: WorkTableDedupMode.Distinct,
+            equality: ByteExactRows,
+            maxRows: 1000,
+            maxDepth: 0,
+            Increment,
+            seeds);
+        var options = new VdbeExecutionOptions(
+            new Ahtola.Core.Storage.InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 64,
+            allowTemporaryFileSpill: false);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        Assert.Throws<VdbeMemoryLimitExceededException>(() => Drain(statement));
+    }
+
+    [Test]
     public void ExplainDescribesOpenWorkTableWithItsShapeGuardsAndMode()
     {
         var instruction = new OpenWorkTableInstruction(

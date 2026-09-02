@@ -64,12 +64,17 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   for n ≤ 1024 (COUNT/SUM/AVG). The builder keeps a departing-argument ring and
   skip counter; 1 PRECEDING bytecode is unchanged. RANGE/GROUPS, FOLLOWING,
   EXCLUDE, and non-invertible aggregates stay on the buffered evaluator.
-  Remaining VDBE follow-up: trigger-body lowering, heap-bound intermediates,
-  and dedicated `BlobRead`/`BlobWrite`/`BlobLen` opcodes. Page-native
-  incremental-BLOB writes now overwrite leaf/overflow payload in place for
-  autocommit file-backed rowid tables. Newer Turso instructions (`ColumnRange`,
-  `ChangeCount`, `ResetOnce`, `OpenPseudo`, `TypeCheck`) are still assessed by
-  family.
+  Page-native incremental-BLOB writes overwrite leaf/overflow payload in place
+  for autocommit file-backed rowid tables.
+- 2026-09-01: deferred VDBE opcodes 137–144 (`BlobRead`/`BlobWrite`/`BlobLen`,
+  `ColumnRange`, `OpenPseudo`, `TypeCheck`, `Once`, `ResetOnce`) now have
+  validation, execution, and EXPLAIN. BEFORE INSERT/UPDATE/DELETE leaf bodies
+  route through `Program` with `ColumnRange` image capture; STRICT INSERT emits
+  `TypeCheck`. Distinct worktables spill through `VdbeKeyedRowStore`; window
+  buffers fail closed against the statement memory budget. Remaining: RANGE /
+  GROUPS / FOLLOWING inverse frames, `ChangeCnt` as a dedicated opcode, and
+  window/ephemeral full-partition spill (compute still needs the partition
+  in-heap).
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
