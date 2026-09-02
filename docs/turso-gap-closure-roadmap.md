@@ -78,9 +78,10 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   budget. Streaming now also covers default RANGE/GROUPS UNBOUNDED PRECEDING
   … CURRENT ROW and RANGE/GROUPS CURRENT ROW peer frames via an ephemeral
   delay buffer. Streaming `GROUPS n PRECEDING … CURRENT ROW` inverses each
-  departing peer group (n ≤ 1024). Remaining: RANGE n PRECEDING (value
-  bounds), GROUPS FOLLOWING, and full-partition window spill (compute still
-  needs the partition in-heap).
+  departing peer group (n ≤ 1024). Window-buffer scanned rows spill to a
+  temp file under the statement memory budget and reload for Compute.
+  Remaining: RANGE n PRECEDING (value bounds), GROUPS FOLLOWING, and
+  Compute still needing the partition in-heap after reload.
 - 2026-08-29: closed `planner-access-path-depth` with costed AND intersections,
   validated STAT4 selectivity, automatic covering indexes, and direct durable
   index-btree seeks.
