@@ -409,6 +409,126 @@ public static class VdbeExplain
                 ephemeralInsert.Values.Count,
                 null,
                 $"insert into ephemeral cursor {ephemeralInsert.Cursor.Index} from {FormatRange(ephemeralInsert.Values)}"),
+            OpenAutoindexInstruction openAutoindex => (
+                openAutoindex.Cursor.Index,
+                openAutoindex.ColumnCount,
+                0,
+                null,
+                $"open autoindex cursor {openAutoindex.Cursor.Index} cols={openAutoindex.ColumnCount}"),
+            OpenDupInstruction openDup => (
+                openDup.NewCursor.Index,
+                openDup.OriginalCursor.Index,
+                0,
+                null,
+                $"duplicate ephemeral cursor {openDup.OriginalCursor.Index} to cursor {openDup.NewCursor.Index}"),
+            ResetSorterInstruction resetSorter => (
+                resetSorter.Cursor.Index,
+                0,
+                0,
+                null,
+                $"reset ephemeral cursor {resetSorter.Cursor.Index}"),
+            ColumnHasFieldInstruction columnHasField => (
+                columnHasField.Cursor.Index,
+                columnHasField.Column,
+                columnHasField.Target.Offset,
+                null,
+                $"jump to {columnHasField.Target.Offset} when cursor {columnHasField.Cursor.Index} has column {columnHasField.Column}"),
+            DeferredSeekInstruction deferredSeek => (
+                deferredSeek.IndexCursor.Index,
+                deferredSeek.TableCursor.Index,
+                0,
+                null,
+                $"deferred seek table cursor {deferredSeek.TableCursor.Index} via index cursor {deferredSeek.IndexCursor.Index}"),
+            SeekEndInstruction seekEnd => (
+                seekEnd.Cursor.Index,
+                0,
+                0,
+                null,
+                $"position cursor {seekEnd.Cursor.Index} past its last row for a reverse scan"),
+            BloomFilterInstruction bloomFilter => (
+                bloomFilter.Cursor.Index,
+                bloomFilter.NotPresentTarget.Offset,
+                bloomFilter.Key.Start.Index,
+                FormatRange(bloomFilter.Key),
+                $"if !bloom_filter({FormatRange(bloomFilter.Key)}) goto {bloomFilter.NotPresentTarget.Offset}"),
+            BloomFilterAddInstruction bloomAdd => (
+                bloomAdd.Cursor.Index,
+                0,
+                bloomAdd.Key.Start.Index,
+                FormatRange(bloomAdd.Key),
+                $"bloom_filter_add({FormatRange(bloomAdd.Key)})"),
+            HashBuildInstruction hashBuild => (
+                hashBuild.Cursor.Index,
+                hashBuild.Key.Start.Index,
+                hashBuild.Key.Count,
+                FormatRange(hashBuild.Key),
+                $"hash_build c[{hashBuild.Cursor.Index}] keys {FormatRange(hashBuild.Key)} -> hash_table[{hashBuild.HashTableId}] budget={hashBuild.MemoryBudget}"
+                    + (hashBuild.Payload is { } payload ? $" payload {FormatRange(payload)}" : string.Empty)
+                    + (hashBuild.TrackMatched ? " track_matched" : string.Empty)),
+            HashDistinctInstruction hashDistinct => (
+                hashDistinct.HashTableId,
+                hashDistinct.Key.Start.Index,
+                hashDistinct.Key.Count,
+                FormatRange(hashDistinct.Key),
+                $"hash_distinct {FormatRange(hashDistinct.Key)} jmp={hashDistinct.DuplicateTarget.Offset}"),
+            HashBuildFinalizeInstruction hashFinalize => (
+                hashFinalize.HashTableId,
+                0,
+                0,
+                null,
+                $"hash_build_finalize hash_table[{hashFinalize.HashTableId}]"),
+            HashProbeInstruction hashProbe => (
+                hashProbe.HashTableId,
+                hashProbe.Key.Start.Index,
+                hashProbe.Key.Count,
+                FormatRange(hashProbe.Key),
+                $"r[{hashProbe.Destination.Index}]=hash_probe({FormatRange(hashProbe.Key)}) goto {hashProbe.NotFoundTarget.Offset} if not found"
+                    + (hashProbe.PayloadDestination is { } payloadDest ? $" payload {FormatRange(payloadDest)}" : string.Empty)),
+            HashNextInstruction hashNext => (
+                hashNext.HashTableId,
+                hashNext.Destination.Index,
+                hashNext.ExhaustedTarget.Offset,
+                null,
+                $"r[{hashNext.Destination.Index}]=hash_next goto {hashNext.ExhaustedTarget.Offset} if exhausted"
+                    + (hashNext.PayloadDestination is { } payloadDest ? $" payload {FormatRange(payloadDest)}" : string.Empty)),
+            HashCloseInstruction hashClose => (
+                hashClose.HashTableId,
+                0,
+                0,
+                null,
+                $"hash_close hash_table[{hashClose.HashTableId}]"),
+            HashClearInstruction hashClear => (
+                hashClear.HashTableId,
+                0,
+                0,
+                null,
+                $"hash_clear hash_table[{hashClear.HashTableId}]"),
+            HashMarkMatchedInstruction hashMarkMatched => (
+                hashMarkMatched.HashTableId,
+                0,
+                0,
+                null,
+                $"hash_mark_matched hash_table[{hashMarkMatched.HashTableId}]"),
+            HashResetMatchedInstruction hashResetMatched => (
+                hashResetMatched.HashTableId,
+                0,
+                0,
+                null,
+                $"hash_reset_matched hash_table[{hashResetMatched.HashTableId}]"),
+            HashScanUnmatchedInstruction hashScanUnmatched => (
+                hashScanUnmatched.HashTableId,
+                hashScanUnmatched.Destination.Index,
+                hashScanUnmatched.ExhaustedTarget.Offset,
+                null,
+                $"r[{hashScanUnmatched.Destination.Index}]=hash_scan_unmatched goto {hashScanUnmatched.ExhaustedTarget.Offset} if exhausted"
+                    + (hashScanUnmatched.PayloadDestination is { } payloadDest ? $" payload {FormatRange(payloadDest)}" : string.Empty)),
+            HashNextUnmatchedInstruction hashNextUnmatched => (
+                hashNextUnmatched.HashTableId,
+                hashNextUnmatched.Destination.Index,
+                hashNextUnmatched.ExhaustedTarget.Offset,
+                null,
+                $"r[{hashNextUnmatched.Destination.Index}]=hash_next_unmatched goto {hashNextUnmatched.ExhaustedTarget.Offset} if exhausted"
+                    + (hashNextUnmatched.PayloadDestination is { } payloadDest ? $" payload {FormatRange(payloadDest)}" : string.Empty)),
             NoConflictInstruction noConflict => (
                 noConflict.Cursor.Index,
                 noConflict.NoConflictTarget.Offset,
@@ -638,6 +758,12 @@ public static class VdbeExplain
                 0,
                 aggFinalize.Aggregate.Name,
                 $"r[{aggFinalize.Destination.Index}]={aggFinalize.Aggregate.Name} finalize accumulator {aggFinalize.Accumulator.Index}"),
+            AggValueInstruction aggValue => (
+                aggValue.Accumulator.Index,
+                aggValue.Destination.Index,
+                0,
+                aggValue.Aggregate.Name,
+                $"r[{aggValue.Destination.Index}]={aggValue.Aggregate.Name} value accumulator {aggValue.Accumulator.Index} (no reset)"),
             SameGroupInstruction sameGroup => (
                 sameGroup.CurrentKey.Start.Index,
                 sameGroup.SameGroupTarget.Offset,

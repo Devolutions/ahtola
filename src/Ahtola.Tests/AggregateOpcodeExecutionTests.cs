@@ -82,6 +82,54 @@ public class AggregateOpcodeExecutionTests
     }
 
     [Test]
+    public void AggValueDoesNotResetTheAccumulator()
+    {
+        // AggValue reads the current value without touching the accumulator: a second step
+        // afterwards must fold into the same context, unlike AggFinalize which pairs with a
+        // reset in SQLite's classic flow.
+        VdbeInstruction[] instructions =
+        [
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(5)),
+            new AggStepInstruction(new Accumulator(0), AggregateTestSupport.Sum(), new RegisterRange(new Register(0), 1)),
+            new AggValueInstruction(new Accumulator(0), AggregateTestSupport.Sum(), new Register(1)),
+            new ResultRowInstruction(new RegisterRange(new Register(1), 1)),
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(7)),
+            new AggStepInstruction(new Accumulator(0), AggregateTestSupport.Sum(), new RegisterRange(new Register(0), 1)),
+            new AggValueInstruction(new Accumulator(0), AggregateTestSupport.Sum(), new Register(1)),
+            new ResultRowInstruction(new RegisterRange(new Register(1), 1)),
+            new HaltInstruction(),
+        ];
+
+        var program = new VdbeProgram(registerCount: 2, cursorCount: 0, instructions, accumulatorCount: 1);
+
+        var rows = RunToCompletion(program);
+
+        rows.Select(row => row[0].AsInteger()).Should().Equal(5, 12);
+    }
+
+    [Test]
+    public void AggValueOnNeverSteppedAccumulatorYieldsTheEmptyInputValue()
+    {
+        // Reading a never-stepped accumulator must behave like finalizing a fresh context:
+        // SUM yields NULL and COUNT(*) yields 0.
+        VdbeInstruction[] instructions =
+        [
+            new AggValueInstruction(new Accumulator(0), AggregateTestSupport.Sum(), new Register(0)),
+            new AggValueInstruction(new Accumulator(1), AggregateTestSupport.CountStar(), new Register(1)),
+            new ResultRowInstruction(new RegisterRange(new Register(0), 2)),
+            new HaltInstruction(),
+        ];
+
+        var program = new VdbeProgram(registerCount: 2, cursorCount: 0, instructions, accumulatorCount: 2);
+
+        var rows = RunToCompletion(program);
+
+        rows.Should().ContainSingle();
+        rows[0][0].Kind.Should().Be(SqlValueKind.Null);
+        rows[0][1].Should().Be(SqlValue.Integer(0));
+    }
+
+    [Test]
     public void AggResetDiscardsAccumulatedState()
     {
         VdbeInstruction[] instructions =
@@ -394,6 +442,16 @@ public class AggregateOpcodeExecutionTests
             ],
             accumulatorCount: 1));
 
+        // Reading with a null aggregate.
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 0,
+            [
+                new AggValueInstruction(new Accumulator(0), null!, new Register(0)),
+                new HaltInstruction(),
+            ],
+            accumulatorCount: 1));
+
         // Stepping arguments that reach outside the register file.
         Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
             registerCount: 1,
@@ -681,6 +739,26 @@ public class AggregateOpcodeExecutionTests
         ((int)VdbeOpcode.GroupKey).Should().Be(58);
         ((int)VdbeOpcode.DistinctGate).Should().Be(59);
         ((int)VdbeOpcode.AggInverse).Should().Be(136);
+        ((int)VdbeOpcode.ResetSorter).Should().Be(146);
+        ((int)VdbeOpcode.AggValue).Should().Be(147);
+        ((int)VdbeOpcode.OpenDup).Should().Be(148);
+        ((int)VdbeOpcode.OpenAutoindex).Should().Be(149);
+        ((int)VdbeOpcode.ColumnHasField).Should().Be(150);
+        ((int)VdbeOpcode.DeferredSeek).Should().Be(151);
+        ((int)VdbeOpcode.SeekEnd).Should().Be(152);
+        ((int)VdbeOpcode.BloomFilter).Should().Be(153);
+        ((int)VdbeOpcode.BloomFilterAdd).Should().Be(154);
+        ((int)VdbeOpcode.HashBuild).Should().Be(155);
+        ((int)VdbeOpcode.HashDistinct).Should().Be(156);
+        ((int)VdbeOpcode.HashBuildFinalize).Should().Be(157);
+        ((int)VdbeOpcode.HashProbe).Should().Be(158);
+        ((int)VdbeOpcode.HashNext).Should().Be(159);
+        ((int)VdbeOpcode.HashClose).Should().Be(160);
+        ((int)VdbeOpcode.HashClear).Should().Be(161);
+        ((int)VdbeOpcode.HashMarkMatched).Should().Be(162);
+        ((int)VdbeOpcode.HashResetMatched).Should().Be(163);
+        ((int)VdbeOpcode.HashScanUnmatched).Should().Be(164);
+        ((int)VdbeOpcode.HashNextUnmatched).Should().Be(165);
     }
 
     // Loads saved/current keys, compares them with SameGroup, and returns the value the

@@ -146,6 +146,7 @@ public static class CompoundProgramBuilder
         var distinctBase = new int[count];
         var instructionBase = new int[count];
         var parameterSlotBase = new int[count];
+        var hashTableBase = new int[count];
 
         var totalRegisters = 0;
         var totalCursors = 0;
@@ -154,6 +155,7 @@ public static class CompoundProgramBuilder
         var totalDistinctSets = 0;
         var totalInstructions = 0;
         var totalParameterSlots = 0;
+        var totalHashTables = 0;
         for (var i = 0; i < count; i++)
         {
             var program = terms[i].Program;
@@ -164,6 +166,7 @@ public static class CompoundProgramBuilder
             distinctBase[i] = totalDistinctSets;
             instructionBase[i] = totalInstructions;
             parameterSlotBase[i] = totalParameterSlots;
+            hashTableBase[i] = totalHashTables;
 
             totalRegisters += program.RegisterCount;
             totalCursors += program.CursorCount;
@@ -173,6 +176,7 @@ public static class CompoundProgramBuilder
             totalInstructions += KeptInstructionCount(program, isLast: i == count - 1)
                 + (i == count - 1 ? 0 : program.AccumulatorCount);
             totalParameterSlots += program.ParameterSlotCount;
+            totalHashTables += program.HashTableCount;
         }
 
         // The outer distinct set (for BuildUnionDistinct) is allocated after every term's own sets; the
@@ -198,6 +202,7 @@ public static class CompoundProgramBuilder
                     distinctBase[i],
                     instructionBase[i],
                     parameterSlotBase[i],
+                    hashTableBase[i],
                     distinctEquality,
                     outerDistinctSet));
             }
@@ -220,7 +225,8 @@ public static class CompoundProgramBuilder
             totalSorters,
             totalAccumulators,
             combinedDistinctSets,
-            totalParameterSlots);
+            totalParameterSlots,
+            hashTableCount: totalHashTables);
         return new CompoundTerm(combined, cursorSources);
     }
 
@@ -271,6 +277,7 @@ public static class CompoundProgramBuilder
         var distinctBase = new int[count];
         var instructionBase = new int[count];
         var parameterSlotBase = new int[count];
+        var hashTableBase = new int[count];
 
         var totalRegisters = 0;
         var totalCursors = 0;
@@ -279,6 +286,7 @@ public static class CompoundProgramBuilder
         var totalDistinctSets = 0;
         var totalInstructions = 0;
         var totalParameterSlots = 0;
+        var totalHashTables = 0;
         for (var termIndex = 0; termIndex < count; termIndex++)
         {
             var program = terms[termIndex].Program;
@@ -289,6 +297,7 @@ public static class CompoundProgramBuilder
             distinctBase[termIndex] = totalDistinctSets;
             instructionBase[termIndex] = totalInstructions;
             parameterSlotBase[termIndex] = totalParameterSlots;
+            hashTableBase[termIndex] = totalHashTables;
 
             totalRegisters += program.RegisterCount;
             totalCursors += program.CursorCount;
@@ -298,6 +307,7 @@ public static class CompoundProgramBuilder
             totalInstructions += KeptInstructionCount(program, isLast: false)
                 + program.AccumulatorCount;
             totalParameterSlots += program.ParameterSlotCount;
+            totalHashTables += program.HashTableCount;
         }
 
         var capturesSingleSet = mode is null;
@@ -331,6 +341,7 @@ public static class CompoundProgramBuilder
                     distinctBase[termIndex],
                     instructionBase[termIndex],
                     parameterSlotBase[termIndex],
+                    hashTableBase[termIndex],
                     rowEquality,
                     captureSets[termIndex]));
             }
@@ -370,7 +381,8 @@ public static class CompoundProgramBuilder
             totalSorters,
             totalAccumulators,
             combinedDistinctSets,
-            totalParameterSlots);
+            totalParameterSlots,
+            hashTableCount: totalHashTables);
         return new CompoundTerm(combinedSetOp, cursorSources);
     }
 
@@ -425,6 +437,7 @@ public static class CompoundProgramBuilder
         int distinctBase,
         int instructionBase,
         int parameterSlotBase,
+        int hashTableBase,
         VdbeRowEquality? distinctEquality,
         int outerDistinctSet)
     {
@@ -436,7 +449,8 @@ public static class CompoundProgramBuilder
                 accumulatorBase,
                 distinctBase,
                 instructionBase,
-                parameterSlotBase)
+                parameterSlotBase,
+                hashTableBase)
             is { } structural)
         {
             return structural;
@@ -520,6 +534,7 @@ public static class CompoundProgramBuilder
         int distinctBase,
         int instructionBase,
         int parameterSlotBase,
+        int hashTableBase,
         VdbeRowEquality equality,
         int captureSet)
     {
@@ -531,7 +546,8 @@ public static class CompoundProgramBuilder
                 accumulatorBase,
                 distinctBase,
                 instructionBase,
-                parameterSlotBase)
+                parameterSlotBase,
+                hashTableBase)
             is { } structural)
         {
             return structural;
@@ -593,7 +609,8 @@ public static class CompoundProgramBuilder
         int accumulatorBase,
         int distinctBase,
         int instructionBase,
-        int parameterSlotBase)
+        int parameterSlotBase,
+        int hashTableBase)
     {
         Register Reg(Register register) => new(register.Index + registerBase);
         Cursor Cur(Cursor cursor) => new(cursor.Index + cursorBase);
@@ -636,6 +653,7 @@ public static class CompoundProgramBuilder
             AggStepInstruction x => new AggStepInstruction(Acc(x.Accumulator), x.Aggregate, Range(x.Arguments)),
             AggInverseInstruction x => new AggInverseInstruction(Acc(x.Accumulator), x.Aggregate, Range(x.Arguments)),
             AggFinalizeInstruction x => new AggFinalizeInstruction(Acc(x.Accumulator), x.Aggregate, Reg(x.Destination)),
+            AggValueInstruction x => new AggValueInstruction(Acc(x.Accumulator), x.Aggregate, Reg(x.Destination)),
             SameGroupInstruction x => new SameGroupInstruction(Range(x.CurrentKey), Range(x.SavedKey), x.Comparer, Pc(x.SameGroupTarget)),
             RowSetInsertInstruction x => new RowSetInsertInstruction(
                 Range(x.Values),
@@ -658,6 +676,53 @@ public static class CompoundProgramBuilder
                         destination.Equality,
                         destination.RowSetIndex + distinctBase)),
             RewindCursorInstruction x => new RewindCursorInstruction(Cur(x.Cursor), Pc(x.EmptyTarget)),
+            OpenAutoindexInstruction x => new OpenAutoindexInstruction(Cur(x.Cursor), x.ColumnCount),
+            OpenDupInstruction x => new OpenDupInstruction(Cur(x.NewCursor), Cur(x.OriginalCursor)),
+            ResetSorterInstruction x => new ResetSorterInstruction(Cur(x.Cursor)),
+            ColumnHasFieldInstruction x => new ColumnHasFieldInstruction(Cur(x.Cursor), x.Column, Pc(x.Target)),
+            DeferredSeekInstruction x => new DeferredSeekInstruction(Cur(x.IndexCursor), Cur(x.TableCursor)),
+            SeekEndInstruction x => new SeekEndInstruction(Cur(x.Cursor)),
+            BloomFilterInstruction x => new BloomFilterInstruction(Cur(x.Cursor), Range(x.Key), Pc(x.NotPresentTarget)),
+            BloomFilterAddInstruction x => new BloomFilterAddInstruction(Cur(x.Cursor), Range(x.Key)),
+            HashBuildInstruction x => new HashBuildInstruction(
+                Cur(x.Cursor),
+                Range(x.Key),
+                x.HashTableId + hashTableBase,
+                x.MemoryBudget,
+                x.Collations,
+                x.Payload is { } payload ? Range(payload) : null,
+                x.TrackMatched),
+            HashDistinctInstruction x => new HashDistinctInstruction(
+                Range(x.Key),
+                x.Collations,
+                x.HashTableId + hashTableBase,
+                Pc(x.DuplicateTarget)),
+            HashBuildFinalizeInstruction x => new HashBuildFinalizeInstruction(x.HashTableId + hashTableBase),
+            HashProbeInstruction x => new HashProbeInstruction(
+                x.HashTableId + hashTableBase,
+                Range(x.Key),
+                Reg(x.Destination),
+                x.PayloadDestination is { } payloadDest ? Range(payloadDest) : null,
+                Pc(x.NotFoundTarget)),
+            HashNextInstruction x => new HashNextInstruction(
+                x.HashTableId + hashTableBase,
+                Reg(x.Destination),
+                x.PayloadDestination is { } payloadDest ? Range(payloadDest) : null,
+                Pc(x.ExhaustedTarget)),
+            HashCloseInstruction x => new HashCloseInstruction(x.HashTableId + hashTableBase),
+            HashClearInstruction x => new HashClearInstruction(x.HashTableId + hashTableBase),
+            HashMarkMatchedInstruction x => new HashMarkMatchedInstruction(x.HashTableId + hashTableBase),
+            HashResetMatchedInstruction x => new HashResetMatchedInstruction(x.HashTableId + hashTableBase),
+            HashScanUnmatchedInstruction x => new HashScanUnmatchedInstruction(
+                x.HashTableId + hashTableBase,
+                Reg(x.Destination),
+                x.PayloadDestination is { } payloadDest ? Range(payloadDest) : null,
+                Pc(x.ExhaustedTarget)),
+            HashNextUnmatchedInstruction x => new HashNextUnmatchedInstruction(
+                x.HashTableId + hashTableBase,
+                Reg(x.Destination),
+                x.PayloadDestination is { } payloadDest ? Range(payloadDest) : null,
+                Pc(x.ExhaustedTarget)),
             ColumnInstruction x => new ColumnInstruction(Cur(x.Cursor), x.ColumnIndex, Reg(x.Destination)),
             RowIdInstruction x => new RowIdInstruction(Cur(x.Cursor), Reg(x.Destination)),
             DeleteInstruction x => new DeleteInstruction(Cur(x.Cursor)),

@@ -414,6 +414,121 @@ public enum VdbeOpcode
 
     /// <summary>Store the statement change count into a register (Turso <c>ChangeCount</c>).</summary>
     ChangeCount = 145,
+
+    /// <summary>
+    /// Clear an ephemeral table in place, keeping the cursor open (Turso <c>ResetSorter</c>).
+    /// </summary>
+    ResetSorter = 146,
+
+    /// <summary>
+    /// Materialize an aggregate accumulator into a register without resetting it
+    /// (Turso <c>AggValue</c>).
+    /// </summary>
+    AggValue = 147,
+
+    /// <summary>
+    /// Open a second cursor over the same ephemeral data as an existing cursor
+    /// (Turso <c>OpenDup</c>).
+    /// </summary>
+    OpenDup = 148,
+
+    /// <summary>
+    /// Open an ephemeral index cursor used for automatic indexes (Turso <c>OpenAutoindex</c>).
+    /// </summary>
+    OpenAutoindex = 149,
+
+    /// <summary>
+    /// Jump when the current record of a cursor carries a given column (Turso <c>ColumnHasField</c>).
+    /// </summary>
+    ColumnHasField = 150,
+
+    /// <summary>
+    /// Record a pending lazy seek of a table cursor to the rowid of an index cursor's
+    /// current entry, resolved at the next <c>Column</c>/<c>RowId</c> on the table cursor
+    /// (Turso <c>DeferredSeek</c>).
+    /// </summary>
+    DeferredSeek = 151,
+
+    /// <summary>
+    /// Position a cursor one row past its last row so a following <c>Prev</c> scan walks it
+    /// backwards from the end (Turso <c>SeekEnd</c>).
+    /// </summary>
+    SeekEnd = 152,
+
+    /// <summary>
+    /// Probe the per-cursor bloom filter for a key; jump when the key is definitely not
+    /// present (Turso <c>Filter</c>).
+    /// </summary>
+    BloomFilter = 153,
+
+    /// <summary>
+    /// Insert a key into the per-cursor bloom filter (Turso <c>FilterAdd</c>).
+    /// </summary>
+    BloomFilterAdd = 154,
+
+    /// <summary>
+    /// Insert the current row of a cursor into a hash table keyed on a register range
+    /// (Turso <c>HashBuild</c>).
+    /// </summary>
+    HashBuild = 155,
+
+    /// <summary>
+    /// Insert a key into a hash table if absent, jumping to the duplicate target when the
+    /// key already exists (Turso <c>HashDistinct</c>).
+    /// </summary>
+    HashDistinct = 156,
+
+    /// <summary>
+    /// Finalize a hash table's build phase so probing becomes legal (Turso
+    /// <c>HashBuildFinalize</c>).
+    /// </summary>
+    HashBuildFinalize = 157,
+
+    /// <summary>
+    /// Look up the first entry matching a key in a finalized hash table; jump when no match
+    /// exists (Turso <c>HashProbe</c>).
+    /// </summary>
+    HashProbe = 158,
+
+    /// <summary>
+    /// Continue the match chain started by <see cref="HashProbe"/>; jump when exhausted
+    /// (Turso <c>HashNext</c>).
+    /// </summary>
+    HashNext = 159,
+
+    /// <summary>
+    /// Remove a hash table from the statement registry (Turso <c>HashClose</c>).
+    /// </summary>
+    HashClose = 160,
+
+    /// <summary>
+    /// Empty a hash table and return it to the building state for a rebuild (Turso
+    /// <c>HashClear</c>).
+    /// </summary>
+    HashClear = 161,
+
+    /// <summary>
+    /// Mark the entry most recently matched by <see cref="HashProbe"/>/<see cref="HashNext"/>
+    /// so anti-join scans can skip it (Turso <c>HashMarkMatched</c>).
+    /// </summary>
+    HashMarkMatched = 162,
+
+    /// <summary>
+    /// Clear every matched bit of a hash table (Turso <c>HashResetMatched</c>).
+    /// </summary>
+    HashResetMatched = 163,
+
+    /// <summary>
+    /// Begin scanning the entries of a hash table that were never marked matched, returning
+    /// the first one; jump when none exist (Turso <c>HashScanUnmatched</c>).
+    /// </summary>
+    HashScanUnmatched = 164,
+
+    /// <summary>
+    /// Continue an unmatched-entry scan started by <see cref="HashScanUnmatched"/>; jump when
+    /// exhausted (Turso <c>HashNextUnmatched</c>).
+    /// </summary>
+    HashNextUnmatched = 165,
 }
 
 /// <summary>
@@ -3056,6 +3171,20 @@ public sealed record AggFinalizeInstruction(
     public override VdbeOpcode Opcode => VdbeOpcode.AggFinalize;
 }
 
+/// <summary>Reads the current value of <paramref name="Accumulator"/> with
+/// <paramref name="Aggregate"/> into <paramref name="Destination"/> without resetting it,
+/// so the aggregate can still be stepped afterwards (Turso <c>AggValue</c>, used for
+/// running aggregates and window-function value extraction). Shares the finalize semantics
+/// of <see cref="AggFinalizeInstruction"/>; an accumulator that was reset but never stepped
+/// yields the aggregate's empty-input value.</summary>
+public sealed record AggValueInstruction(
+    Accumulator Accumulator,
+    VdbeAggregate Aggregate,
+    Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.AggValue;
+}
+
 /// <summary>Compares the group-key tuple in <paramref name="CurrentKey"/> against the
 /// saved tuple in <paramref name="SavedKey"/> with <paramref name="Comparer"/> and jumps
 /// to <paramref name="SameGroupTarget"/> when they fall in the same group, falling through
@@ -3689,6 +3818,256 @@ public sealed record EphemeralInsertInstruction(Cursor Cursor, RegisterRange Val
 }
 
 /// <summary>
+/// Opens an ephemeral index cursor on <paramref name="Cursor"/> with
+/// <paramref name="ColumnCount"/> columns, used to hold automatic indexes (Turso
+/// <c>OpenAutoindex</c> — <c>OpenEphemeral</c> with <c>is_table=false</c>). The managed
+/// ephemeral runtime has a single shape, so this shares the
+/// <see cref="OpenEphemeralInstruction"/> open path and scans through the normal
+/// Rewind/Next/Column/Found family.
+/// </summary>
+public sealed record OpenAutoindexInstruction(Cursor Cursor, int ColumnCount) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OpenAutoindex;
+}
+
+/// <summary>
+/// Opens <paramref name="NewCursor"/> as a second cursor over the same underlying
+/// ephemeral data as <paramref name="OriginalCursor"/> (Turso <c>OpenDup</c>). Both
+/// cursors share one storage instance: inserting through either is visible to both, and
+/// closing either disposes the shared storage for both — programs must keep their
+/// lifetimes coupled, exactly as in Turso.
+/// </summary>
+public sealed record OpenDupInstruction(Cursor NewCursor, Cursor OriginalCursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OpenDup;
+}
+
+/// <summary>
+/// Clears all rows from the ephemeral table on <paramref name="Cursor"/> in place,
+/// leaving the cursor open and rewound, with rowids restarting from 1 (Turso
+/// <c>ResetSorter</c>, which clears the ephemeral b-tree). Validated to target only
+/// ephemeral cursors — callers (window partition boundaries) own that guarantee.
+/// </summary>
+public sealed record ResetSorterInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ResetSorter;
+}
+
+/// <summary>
+/// Jumps to <paramref name="Target"/> when the record currently positioned on
+/// <paramref name="Cursor"/> carries <paramref name="Column"/> (that is, has at least
+/// <c>Column + 1</c> columns); otherwise falls through (Turso <c>ColumnHasField</c>,
+/// used to detect short rows before reading a trailing field). A cursor with no current
+/// record falls through.
+/// </summary>
+public sealed record ColumnHasFieldInstruction(
+    Cursor Cursor,
+    int Column,
+    ProgramCounter Target) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ColumnHasField;
+}
+
+/// <summary>
+/// Records a pending seek of <paramref name="TableCursor"/> without moving it: the table
+/// cursor will be repositioned onto the rowid of <paramref name="IndexCursor"/>'s current
+/// entry lazily, at the next <c>Column</c> or <c>RowId</c> read of the table cursor (Turso
+/// <c>DeferredSeek</c>). If the index cursor has no current entry when the read resolves,
+/// the pending seek is discarded and the column read observes the table cursor's existing
+/// position. Reopening or closing either cursor invalidates the pending seek.
+/// </summary>
+public sealed record DeferredSeekInstruction(Cursor IndexCursor, Cursor TableCursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DeferredSeek;
+}
+
+/// <summary>
+/// Positions <paramref name="Cursor"/> one row past its last row (Turso <c>SeekEnd</c>).
+/// The cursor itself reports no current row in this state; a following <c>Prev</c>
+/// instruction lands on the last row, enabling backwards full scans.
+/// </summary>
+public sealed record SeekEndInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SeekEnd;
+}
+
+/// <summary>
+/// Probes the bloom filter attached to <paramref name="Cursor"/> for the key held in
+/// <paramref name="Key"/>. Jumps to <paramref name="NotPresentTarget"/> when the key is
+/// definitely absent (or contains a NULL component); otherwise falls through — a match
+/// is possible but not guaranteed (Turso <c>Filter</c>). A cursor with no filter yet
+/// falls through.
+/// </summary>
+public sealed record BloomFilterInstruction(
+    Cursor Cursor,
+    RegisterRange Key,
+    ProgramCounter NotPresentTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.BloomFilter;
+}
+
+/// <summary>
+/// Inserts the key held in <paramref name="Key"/> into the bloom filter attached to
+/// <paramref name="Cursor"/>, creating the filter on first use (Turso <c>FilterAdd</c>).
+/// A single NULL key contributes nothing; NULL components of a composite key are hashed
+/// as absent while the remaining components still participate.
+/// </summary>
+public sealed record BloomFilterAddInstruction(Cursor Cursor, RegisterRange Key) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.BloomFilterAdd;
+}
+
+/// <summary>
+/// Inserts the current row of <paramref name="Cursor"/> into hash table
+/// <paramref name="HashTableId"/>, creating the table on first use (Turso <c>HashBuild</c>).
+/// The key is read from the <paramref name="Key"/> registers, the rowid from the cursor, and
+/// optional payload columns from the <paramref name="Payload"/> registers. Rows whose key
+/// contains NULL are dropped unless <paramref name="TrackMatched"/> is set (anti-joins must
+/// retain them for the unmatched scan).
+/// </summary>
+public sealed record HashBuildInstruction(
+    Cursor Cursor,
+    RegisterRange Key,
+    int HashTableId,
+    long MemoryBudget,
+    IReadOnlyList<string?> Collations,
+    RegisterRange? Payload,
+    bool TrackMatched) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashBuild;
+}
+
+/// <summary>
+/// Inserts the key held in the <paramref name="Key"/> registers into hash table
+/// <paramref name="HashTableId"/> if it is not already present (Turso <c>HashDistinct</c>),
+/// creating the table on first use. Falls through for a new key; jumps to
+/// <paramref name="DuplicateTarget"/> when the key already exists. NULL compares equal to
+/// NULL, so NULL keys deduplicate.
+/// </summary>
+public sealed record HashDistinctInstruction(
+    RegisterRange Key,
+    IReadOnlyList<string?> Collations,
+    int HashTableId,
+    ProgramCounter DuplicateTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashDistinct;
+}
+
+/// <summary>
+/// Finalizes hash table <paramref name="HashTableId"/>, ending the build phase (Turso
+/// <c>HashBuildFinalize</c>). A missing table is a no-op, mirroring Turso.
+/// </summary>
+public sealed record HashBuildFinalizeInstruction(int HashTableId) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashBuildFinalize;
+}
+
+/// <summary>
+/// Looks up the first entry of hash table <paramref name="HashTableId"/> whose keys equal the
+/// <paramref name="Key"/> registers (Turso <c>HashProbe</c>). On a match, writes the entry's
+/// rowid to <paramref name="Destination"/> and any payload columns to
+/// <paramref name="PayloadDestination"/>; otherwise jumps to
+/// <paramref name="NotFoundTarget"/> — also when the table does not exist.
+/// </summary>
+public sealed record HashProbeInstruction(
+    int HashTableId,
+    RegisterRange Key,
+    Register Destination,
+    RegisterRange? PayloadDestination,
+    ProgramCounter NotFoundTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashProbe;
+}
+
+/// <summary>
+/// Continues the match chain started by <see cref="HashProbeInstruction"/> on hash table
+/// <paramref name="HashTableId"/> (Turso <c>HashNext</c>), writing the next matching entry's
+/// rowid to <paramref name="Destination"/> (and payload to
+/// <paramref name="PayloadDestination"/>) or jumping to <paramref name="ExhaustedTarget"/>
+/// when the chain is exhausted. A missing table is an error.
+/// </summary>
+public sealed record HashNextInstruction(
+    int HashTableId,
+    Register Destination,
+    RegisterRange? PayloadDestination,
+    ProgramCounter ExhaustedTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashNext;
+}
+
+/// <summary>
+/// Removes hash table <paramref name="HashTableId"/> from the statement registry and closes
+/// it (Turso <c>HashClose</c>).
+/// </summary>
+public sealed record HashCloseInstruction(int HashTableId) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashClose;
+}
+
+/// <summary>
+/// Empties hash table <paramref name="HashTableId"/> and returns it to the building state
+/// (Turso <c>HashClear</c>) so a correlated subquery can rebuild it for the next outer row.
+/// A missing table is a no-op, mirroring Turso.
+/// </summary>
+public sealed record HashClearInstruction(int HashTableId) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashClear;
+}
+
+/// <summary>
+/// Marks the entry most recently matched by <see cref="HashProbeInstruction"/>/
+/// <see cref="HashNextInstruction"/> on hash table <paramref name="HashTableId"/> as matched
+/// (Turso <c>HashMarkMatched</c>). Tables that do not track matches ignore it, as does a
+/// missing table.
+/// </summary>
+public sealed record HashMarkMatchedInstruction(int HashTableId) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashMarkMatched;
+}
+
+/// <summary>
+/// Clears every matched bit of hash table <paramref name="HashTableId"/> (Turso
+/// <c>HashResetMatched</c>). A missing table is a no-op, mirroring Turso.
+/// </summary>
+public sealed record HashResetMatchedInstruction(int HashTableId) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashResetMatched;
+}
+
+/// <summary>
+/// Starts a scan over the entries of hash table <paramref name="HashTableId"/> that were
+/// never marked matched (Turso <c>HashScanUnmatched</c>), writing the first unmatched entry's
+/// rowid to <paramref name="Destination"/> (and payload to
+/// <paramref name="PayloadDestination"/>) or jumping to <paramref name="ExhaustedTarget"/>
+/// when every entry matched — also when the table does not exist.
+/// </summary>
+public sealed record HashScanUnmatchedInstruction(
+    int HashTableId,
+    Register Destination,
+    RegisterRange? PayloadDestination,
+    ProgramCounter ExhaustedTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashScanUnmatched;
+}
+
+/// <summary>
+/// Continues the unmatched-entry scan started by
+/// <see cref="HashScanUnmatchedInstruction"/> on hash table
+/// <paramref name="HashTableId"/> (Turso <c>HashNextUnmatched</c>), writing the next unmatched
+/// entry's rowid to <paramref name="Destination"/> (and payload to
+/// <paramref name="PayloadDestination"/>) or jumping to <paramref name="ExhaustedTarget"/>
+/// when the scan is exhausted. A missing table is an error.
+/// </summary>
+public sealed record HashNextUnmatchedInstruction(
+    int HashTableId,
+    Register Destination,
+    RegisterRange? PayloadDestination,
+    ProgramCounter ExhaustedTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.HashNextUnmatched;
+}
+
+/// <summary>
 /// Probes <paramref name="Cursor"/> for a row whose leading columns equal
 /// <paramref name="Key"/>. Jumps to <paramref name="NoConflictTarget"/> when any key
 /// register is NULL or no match exists (Turso/SQLite <c>NoConflict</c> — NULL never
@@ -4123,7 +4502,8 @@ public sealed class VdbeProgram
         int distinctSetCount = 0,
         int parameterSlotCount = 0,
         int workTableCount = 0,
-        int windowBufferCount = 0)
+        int windowBufferCount = 0,
+        int hashTableCount = 0)
     {
         if (registerCount < 0)
             throw new ArgumentOutOfRangeException(nameof(registerCount));
@@ -4141,6 +4521,8 @@ public sealed class VdbeProgram
             throw new ArgumentOutOfRangeException(nameof(workTableCount));
         if (windowBufferCount < 0)
             throw new ArgumentOutOfRangeException(nameof(windowBufferCount));
+        if (hashTableCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(hashTableCount));
         ArgumentNullException.ThrowIfNull(instructions);
 
         RegisterCount = registerCount;
@@ -4151,6 +4533,7 @@ public sealed class VdbeProgram
         ParameterSlotCount = parameterSlotCount;
         WorkTableCount = workTableCount;
         WindowBufferCount = windowBufferCount;
+        HashTableCount = hashTableCount;
         _instructions = Array.AsReadOnly(instructions.ToArray());
         Validate();
     }
@@ -4180,6 +4563,11 @@ public sealed class VdbeProgram
     /// window functions.</summary>
     public int WindowBufferCount { get; }
 
+    /// <summary>The number of in-memory hash tables the program references via the
+    /// <see cref="VdbeOpcode.HashBuild"/> family. Hash tables are created lazily at run time and
+    /// shared across subprogram statements of one resumable statement.</summary>
+    public int HashTableCount { get; }
+
     public IReadOnlyList<VdbeInstruction> Instructions => _instructions;
 
     public void Validate()
@@ -4191,6 +4579,7 @@ public sealed class VdbeProgram
 
         var openCursors = new bool[CursorCount];
         var cursorColumnCounts = new int[CursorCount];
+        var ephemeralCursors = new bool[CursorCount];
         var openSorters = new bool[SorterCount];
         var sorterColumnCounts = new int[SorterCount];
         var openWorkTables = new bool[WorkTableCount];
@@ -4696,7 +5085,76 @@ public sealed class VdbeProgram
                     }
 
                     openCursors[openEphemeral.Cursor.Index] = true;
+                    ephemeralCursors[openEphemeral.Cursor.Index] = true;
                     cursorColumnCounts[openEphemeral.Cursor.Index] = openEphemeral.ColumnCount;
+                    break;
+                case OpenAutoindexInstruction openAutoindex:
+                    ValidateCursor(openAutoindex.Cursor, instructionIndex);
+                    if (openCursors[openAutoindex.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {openAutoindex.Cursor.Index} twice.");
+                    }
+
+                    if (openAutoindex.ColumnCount <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens autoindex cursor {openAutoindex.Cursor.Index} with a non-positive column count.");
+                    }
+
+                    openCursors[openAutoindex.Cursor.Index] = true;
+                    ephemeralCursors[openAutoindex.Cursor.Index] = true;
+                    cursorColumnCounts[openAutoindex.Cursor.Index] = openAutoindex.ColumnCount;
+                    break;
+                case OpenDupInstruction openDup:
+                    ValidateCursor(openDup.NewCursor, instructionIndex);
+                    ValidateCursor(openDup.OriginalCursor, instructionIndex);
+                    if (openDup.NewCursor.Index == openDup.OriginalCursor.Index)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} duplicates cursor {openDup.OriginalCursor.Index} onto itself.");
+                    }
+
+                    if (!openCursors[openDup.OriginalCursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} duplicates cursor {openDup.OriginalCursor.Index} before opening it.");
+                    }
+
+                    if (!ephemeralCursors[openDup.OriginalCursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} duplicates cursor {openDup.OriginalCursor.Index}, which is not an ephemeral cursor.");
+                    }
+
+                    if (openCursors[openDup.NewCursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {openDup.NewCursor.Index} twice.");
+                    }
+
+                    openCursors[openDup.NewCursor.Index] = true;
+                    ephemeralCursors[openDup.NewCursor.Index] = true;
+                    cursorColumnCounts[openDup.NewCursor.Index] = cursorColumnCounts[openDup.OriginalCursor.Index];
+                    break;
+                case ResetSorterInstruction resetSorter:
+                    ValidateOpenCursor(resetSorter.Cursor, openCursors, instructionIndex);
+                    if (!ephemeralCursors[resetSorter.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} resets cursor {resetSorter.Cursor.Index}, which is not an ephemeral cursor.");
+                    }
+
+                    break;
+                case ColumnHasFieldInstruction columnHasField:
+                    ValidateOpenCursor(columnHasField.Cursor, openCursors, instructionIndex);
+                    if (columnHasField.Column < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} checks negative column {columnHasField.Column} on cursor {columnHasField.Cursor.Index}.");
+                    }
+
+                    ValidateJumpTarget(columnHasField.Target, instructionIndex);
                     break;
                 case EphemeralInsertInstruction ephemeralInsert:
                     ValidateOpenCursor(ephemeralInsert.Cursor, openCursors, instructionIndex);
@@ -4815,6 +5273,162 @@ public sealed class VdbeProgram
                     ValidateOpenCursor(seekRowid.Cursor, openCursors, instructionIndex);
                     ValidateRegister(seekRowid.RowIdRegister, instructionIndex);
                     ValidateJumpTarget(seekRowid.NotFoundTarget, instructionIndex);
+                    break;
+                case DeferredSeekInstruction deferredSeek:
+                    ValidateOpenCursor(deferredSeek.IndexCursor, openCursors, instructionIndex);
+                    ValidateOpenCursor(deferredSeek.TableCursor, openCursors, instructionIndex);
+                    if (deferredSeek.IndexCursor.Index == deferredSeek.TableCursor.Index)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} deferred-seeks cursor {deferredSeek.TableCursor.Index} against itself.");
+                    }
+
+                    break;
+                case SeekEndInstruction seekEnd:
+                    ValidateOpenCursor(seekEnd.Cursor, openCursors, instructionIndex);
+                    break;
+                case BloomFilterInstruction bloomFilter:
+                    ValidateOpenCursor(bloomFilter.Cursor, openCursors, instructionIndex);
+                    ValidateRegisterRange(bloomFilter.Key, instructionIndex);
+                    if (bloomFilter.Key.Count <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} BloomFilter requires a positive key width.");
+                    }
+
+                    ValidateJumpTarget(bloomFilter.NotPresentTarget, instructionIndex);
+                    break;
+                case BloomFilterAddInstruction bloomAdd:
+                    ValidateOpenCursor(bloomAdd.Cursor, openCursors, instructionIndex);
+                    ValidateRegisterRange(bloomAdd.Key, instructionIndex);
+                    if (bloomAdd.Key.Count <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} BloomFilterAdd requires a positive key width.");
+                    }
+
+                    break;
+                case HashBuildInstruction hashBuild:
+                    ValidateOpenCursor(hashBuild.Cursor, openCursors, instructionIndex);
+                    ValidateRegisterRange(hashBuild.Key, instructionIndex);
+                    if (hashBuild.Key.Count <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} HashBuild requires a positive key width.");
+                    }
+
+                    ValidateHashTable(hashBuild.HashTableId, instructionIndex);
+                    if (hashBuild.MemoryBudget < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} HashBuild has a negative memory budget of {hashBuild.MemoryBudget}.");
+                    }
+
+                    ValidateHashCollations(hashBuild.Collations, hashBuild.Key.Count, instructionIndex, nameof(HashBuildInstruction));
+                    if (hashBuild.Payload is { } buildPayload)
+                    {
+                        ValidateRegisterRange(buildPayload, instructionIndex);
+                        if (buildPayload.Count <= 0)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} HashBuild payload range must carry at least one register.");
+                        }
+                    }
+
+                    break;
+                case HashDistinctInstruction hashDistinct:
+                    ValidateRegisterRange(hashDistinct.Key, instructionIndex);
+                    if (hashDistinct.Key.Count <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} HashDistinct requires a positive key width.");
+                    }
+
+                    ValidateHashCollations(hashDistinct.Collations, hashDistinct.Key.Count, instructionIndex, nameof(HashDistinctInstruction));
+                    ValidateHashTable(hashDistinct.HashTableId, instructionIndex);
+                    ValidateJumpTarget(hashDistinct.DuplicateTarget, instructionIndex);
+                    break;
+                case HashBuildFinalizeInstruction hashFinalize:
+                    ValidateHashTable(hashFinalize.HashTableId, instructionIndex);
+                    break;
+                case HashProbeInstruction hashProbe:
+                    ValidateHashTable(hashProbe.HashTableId, instructionIndex);
+                    ValidateRegisterRange(hashProbe.Key, instructionIndex);
+                    if (hashProbe.Key.Count <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} HashProbe requires a positive key width.");
+                    }
+
+                    ValidateRegister(hashProbe.Destination, instructionIndex);
+                    if (hashProbe.PayloadDestination is { } probePayload)
+                    {
+                        ValidateRegisterRange(probePayload, instructionIndex);
+                        if (probePayload.Count <= 0)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} HashProbe payload range must carry at least one register.");
+                        }
+                    }
+
+                    ValidateJumpTarget(hashProbe.NotFoundTarget, instructionIndex);
+                    break;
+                case HashNextInstruction hashNext:
+                    ValidateHashTable(hashNext.HashTableId, instructionIndex);
+                    ValidateRegister(hashNext.Destination, instructionIndex);
+                    if (hashNext.PayloadDestination is { } nextPayload)
+                    {
+                        ValidateRegisterRange(nextPayload, instructionIndex);
+                        if (nextPayload.Count <= 0)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} HashNext payload range must carry at least one register.");
+                        }
+                    }
+
+                    ValidateJumpTarget(hashNext.ExhaustedTarget, instructionIndex);
+                    break;
+                case HashCloseInstruction hashClose:
+                    ValidateHashTable(hashClose.HashTableId, instructionIndex);
+                    break;
+                case HashClearInstruction hashClear:
+                    ValidateHashTable(hashClear.HashTableId, instructionIndex);
+                    break;
+                case HashMarkMatchedInstruction hashMarkMatched:
+                    ValidateHashTable(hashMarkMatched.HashTableId, instructionIndex);
+                    break;
+                case HashResetMatchedInstruction hashResetMatched:
+                    ValidateHashTable(hashResetMatched.HashTableId, instructionIndex);
+                    break;
+                case HashScanUnmatchedInstruction hashScanUnmatched:
+                    ValidateHashTable(hashScanUnmatched.HashTableId, instructionIndex);
+                    ValidateRegister(hashScanUnmatched.Destination, instructionIndex);
+                    if (hashScanUnmatched.PayloadDestination is { } scanPayload)
+                    {
+                        ValidateRegisterRange(scanPayload, instructionIndex);
+                        if (scanPayload.Count <= 0)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} HashScanUnmatched payload range must carry at least one register.");
+                        }
+                    }
+
+                    ValidateJumpTarget(hashScanUnmatched.ExhaustedTarget, instructionIndex);
+                    break;
+                case HashNextUnmatchedInstruction hashNextUnmatched:
+                    ValidateHashTable(hashNextUnmatched.HashTableId, instructionIndex);
+                    ValidateRegister(hashNextUnmatched.Destination, instructionIndex);
+                    if (hashNextUnmatched.PayloadDestination is { } nextUnmatchedPayload)
+                    {
+                        ValidateRegisterRange(nextUnmatchedPayload, instructionIndex);
+                        if (nextUnmatchedPayload.Count <= 0)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} HashNextUnmatched payload range must carry at least one register.");
+                        }
+                    }
+
+                    ValidateJumpTarget(hashNextUnmatched.ExhaustedTarget, instructionIndex);
                     break;
                 case NotExistsInstruction notExists:
                     ValidateOpenCursor(notExists.Cursor, openCursors, instructionIndex);
@@ -5096,6 +5710,16 @@ public sealed class VdbeProgram
                     }
 
                     ValidateRegister(aggFinalize.Destination, instructionIndex);
+                    break;
+                case AggValueInstruction aggValue:
+                    ValidateAccumulator(aggValue.Accumulator, instructionIndex);
+                    if (aggValue.Aggregate is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} reads accumulator {aggValue.Accumulator.Index} with a null aggregate.");
+                    }
+
+                    ValidateRegister(aggValue.Destination, instructionIndex);
                     break;
                 case SameGroupInstruction sameGroup:
                     if (sameGroup.Comparer is null)
@@ -5817,6 +6441,37 @@ public sealed class VdbeProgram
         {
             throw new VdbeProgramValidationException(
                 $"VDBE instruction {instructionIndex} references parameter slot {slot.Index}, but the program has {ParameterSlotCount} parameter slots.");
+        }
+    }
+
+    private void ValidateHashTable(int hashTableId, int instructionIndex)
+    {
+        if (hashTableId < 0 || hashTableId >= HashTableCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references hash table {hashTableId}, but the program has {HashTableCount} hash tables.");
+        }
+    }
+
+    private static void ValidateHashCollations(
+        IReadOnlyList<string?> collations,
+        int keyCount,
+        int instructionIndex,
+        string instructionName)
+    {
+        if (collations.Count != keyCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} {instructionName} declares {collations.Count} collations for {keyCount} key columns.");
+        }
+
+        for (int index = 0; index < collations.Count; index++)
+        {
+            if (!SqliteIndexRecordComparer.IsSupportedCollation(collations[index]))
+            {
+                throw new VdbeProgramValidationException(
+                    $"VDBE instruction {instructionIndex} {instructionName} uses unsupported collation '{collations[index]}' for key column {index}.");
+            }
         }
     }
 

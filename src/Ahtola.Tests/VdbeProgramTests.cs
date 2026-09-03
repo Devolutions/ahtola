@@ -49,7 +49,12 @@ public class VdbeProgramTests
                 "DropColumn=133", "AlterColumn=134", "IndexBuild=135", "AggInverse=136",
                 "BlobRead=137", "BlobWrite=138", "BlobLen=139", "ColumnRange=140",
                 "OpenPseudo=141", "TypeCheck=142", "Once=143", "ResetOnce=144",
-                "ChangeCount=145");
+                "ChangeCount=145", "ResetSorter=146", "AggValue=147", "OpenDup=148",
+                "OpenAutoindex=149", "ColumnHasField=150", "DeferredSeek=151",
+                "SeekEnd=152", "BloomFilter=153", "BloomFilterAdd=154", "HashBuild=155",
+                "HashDistinct=156", "HashBuildFinalize=157", "HashProbe=158",
+                "HashNext=159", "HashClose=160", "HashClear=161", "HashMarkMatched=162",
+                "HashResetMatched=163", "HashScanUnmatched=164", "HashNextUnmatched=165");
 
         var constructors = typeof(VdbeProgram).GetConstructors();
         Type[] legacyParameterTypes =
@@ -63,7 +68,7 @@ public class VdbeProgramTests
             typeof(int),
             typeof(int),
         ];
-        Type[] currentParameterTypes = [.. legacyParameterTypes, typeof(int)];
+        Type[] currentParameterTypes = [.. legacyParameterTypes, typeof(int), typeof(int)];
         constructors.Any(constructor => constructor.GetParameters()
             .Select(static parameter => parameter.ParameterType)
             .SequenceEqual(legacyParameterTypes)).Should().BeTrue();
@@ -99,8 +104,10 @@ public class VdbeProgramTests
             distinctSetCount: 0,
             parameterSlotCount: 0,
             workTableCount: 0,
-            windowBufferCount: 0);
+            windowBufferCount: 0,
+            hashTableCount: 0);
         currentProgram.WindowBufferCount.Should().Be(0);
+        currentProgram.HashTableCount.Should().Be(0);
 
         var legacyInsert = new InsertInstruction(new Cursor(3), VdbeInsertFlags.SkipLastRowid);
         var (legacyCursor, legacyFlags) = legacyInsert;
