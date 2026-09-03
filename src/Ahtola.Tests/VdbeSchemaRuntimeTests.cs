@@ -143,8 +143,28 @@ public sealed class VdbeSchemaRuntimeTests
         ((int)VdbeOpcode.Once).Should().Be(143);
         ((int)VdbeOpcode.ResetOnce).Should().Be(144);
         ((int)VdbeOpcode.ChangeCount).Should().Be(145);
+        ((int)VdbeOpcode.ResetSorter).Should().Be(146);
+        ((int)VdbeOpcode.AggValue).Should().Be(147);
+        ((int)VdbeOpcode.OpenDup).Should().Be(148);
+        ((int)VdbeOpcode.OpenAutoindex).Should().Be(149);
+        ((int)VdbeOpcode.ColumnHasField).Should().Be(150);
+        ((int)VdbeOpcode.DeferredSeek).Should().Be(151);
+        ((int)VdbeOpcode.SeekEnd).Should().Be(152);
+        ((int)VdbeOpcode.BloomFilter).Should().Be(153);
+        ((int)VdbeOpcode.BloomFilterAdd).Should().Be(154);
+        ((int)VdbeOpcode.HashBuild).Should().Be(155);
+        ((int)VdbeOpcode.HashDistinct).Should().Be(156);
+        ((int)VdbeOpcode.HashBuildFinalize).Should().Be(157);
+        ((int)VdbeOpcode.HashProbe).Should().Be(158);
+        ((int)VdbeOpcode.HashNext).Should().Be(159);
+        ((int)VdbeOpcode.HashClose).Should().Be(160);
+        ((int)VdbeOpcode.HashClear).Should().Be(161);
+        ((int)VdbeOpcode.HashMarkMatched).Should().Be(162);
+        ((int)VdbeOpcode.HashResetMatched).Should().Be(163);
+        ((int)VdbeOpcode.HashScanUnmatched).Should().Be(164);
+        ((int)VdbeOpcode.HashNextUnmatched).Should().Be(165);
 
-        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(145);
+        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(165);
     }
 
     [Test]

@@ -38,6 +38,7 @@ public sealed class ResumableStatement : IDisposable
     private readonly VdbeRecordValue?[] _recordRegisters;
     private readonly bool[] _openCursors;
     private readonly int[] _cursorPositions;
+    private readonly (int IndexCursor, int TableCursor)?[] _deferredSeeks;
     private readonly bool[] _skipLastInsertRowId;
     private readonly SqlValue[]?[] _materializedRows;
     private readonly long[] _materializedRowIds;
@@ -50,6 +51,8 @@ public sealed class ResumableStatement : IDisposable
     private readonly List<SqlValue[]>?[] _groupKeys;
     private readonly Dictionary<SqlValue[], int>?[] _groupIndexes;
     private readonly Dictionary<int, IntegerRowSet> _integerRowSets = [];
+    private readonly Dictionary<int, VdbeBloomFilter> _bloomFilters = [];
+    private readonly Dictionary<int, VdbeHashTable> _hashTables = [];
     private readonly Dictionary<int, ResumableStatement> _subprogramStatements = [];
     private readonly WorkTableRuntime?[] _workTables;
     private readonly WindowBufferRuntime?[] _windowBuffers;
@@ -156,6 +159,7 @@ public sealed class ResumableStatement : IDisposable
         _recordRegisters = _registers.Records;
         _openCursors = new bool[program.CursorCount];
         _cursorPositions = new int[program.CursorCount];
+        _deferredSeeks = new (int IndexCursor, int TableCursor)?[program.CursorCount];
         _skipLastInsertRowId = new bool[program.CursorCount];
         _materializedRows = new SqlValue[program.CursorCount][];
         _materializedRowIds = new long[program.CursorCount];
@@ -420,6 +424,251 @@ public sealed class ResumableStatement : IDisposable
                     _materializedRows[openEphemeral.Cursor.Index] = null;
                     AdvanceInstructionPointer();
                     break;
+                case OpenAutoindexInstruction openAutoindex:
+                    // Turso's OpenAutoindex is OpenEphemeral with is_table=false; the managed
+                    // ephemeral runtime has no separate index shape, so both share one path.
+                    OpenCursor(openAutoindex.Cursor);
+                    _ephemeralTables[openAutoindex.Cursor.Index] = new EphemeralTableRuntime(
+                        openAutoindex.ColumnCount,
+                        _memory);
+                    _cursorPositions[openAutoindex.Cursor.Index] = -1;
+                    _materializedRows[openAutoindex.Cursor.Index] = null;
+                    AdvanceInstructionPointer();
+                    break;
+                case OpenDupInstruction openDup:
+                    {
+                        // Turso's OpenDup opens a fresh cursor over the same underlying data.
+                        // Both cursors share one runtime, so closing either disposes it for both.
+                        var original = RequireEphemeralTable(openDup.OriginalCursor);
+                        OpenCursor(openDup.NewCursor);
+                        _ephemeralTables[openDup.NewCursor.Index] = original;
+                        _cursorPositions[openDup.NewCursor.Index] = -1;
+                        _materializedRows[openDup.NewCursor.Index] = null;
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case ResetSorterInstruction resetSorter:
+                    {
+                        // Turso clears the ephemeral b-tree; callers ensure this only targets
+                        // ephemeral tables (window partition boundaries).
+                        var table = RequireEphemeralTable(resetSorter.Cursor);
+                        table.Clear();
+                        _cursorPositions[resetSorter.Cursor.Index] = -1;
+                        _materializedRows[resetSorter.Cursor.Index] = null;
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case DeferredSeekInstruction deferredSeek:
+                    // Mirrors Turso's op_deferred_seek: record the (index, table) pairing and let
+                    // the next Column/RowId read on the table cursor perform the actual seek.
+                    _deferredSeeks[deferredSeek.TableCursor.Index] =
+                        (deferredSeek.IndexCursor.Index, deferredSeek.TableCursor.Index);
+                    AdvanceInstructionPointer();
+                    break;
+                case SeekEndInstruction seekEnd:
+                    // Mirrors Turso's op_seek_end: position past the last row so Prev walks the
+                    // rows backwards while Next exits immediately.
+                    _materializedRows[seekEnd.Cursor.Index] = null;
+                    _cursorPositions[seekEnd.Cursor.Index] = CursorRowCount(seekEnd.Cursor);
+                    AdvanceInstructionPointer();
+                    break;
+                case BloomFilterAddInstruction bloomAdd:
+                    {
+                        // Mirrors Turso's op_filter_add: register the key (or composite key) in
+                        // the bloom filter attached to the cursor's hash table / ephemeral index.
+                        if (!_bloomFilters.TryGetValue(bloomAdd.Cursor.Index, out var filter))
+                        {
+                            filter = new VdbeBloomFilter();
+                            _bloomFilters[bloomAdd.Cursor.Index] = filter;
+                        }
+
+                        if (bloomAdd.Key.Count == 1)
+                        {
+                            filter.InsertValue(_registers[bloomAdd.Key.Start.Index]);
+                        }
+                        else
+                        {
+                            filter.InsertValues(ReadRegisters(bloomAdd.Key));
+                        }
+
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case BloomFilterInstruction bloomFilter:
+                    {
+                        // Mirrors Turso's op_filter: jump when the key is definitely absent. A
+                        // cursor that never built a filter can't exclude anything, so fall through.
+                        if (_bloomFilters.TryGetValue(bloomFilter.Cursor.Index, out var filter))
+                        {
+                            var mightContain = bloomFilter.Key.Count == 1
+                                ? filter.ContainsValue(_registers[bloomFilter.Key.Start.Index])
+                                : filter.ContainsValues(ReadRegisters(bloomFilter.Key));
+                            if (!mightContain)
+                            {
+                                _instructionPointer = bloomFilter.NotPresentTarget;
+                                break;
+                            }
+                        }
+
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashBuildInstruction hashBuild:
+                    {
+                        // Mirrors Turso's op_hash_build: append the current cursor row (key +
+                        // rowid + optional payload) to the build-side hash table, creating it
+                        // on first use. NULL-keyed rows are dropped by the table itself
+                        // unless matched-tracking (anti-join) retains them for the unmatched scan.
+                        var table = GetOrBuildHashTable(hashBuild.HashTableId, hashBuild.Collations, hashBuild.Key.Count, hashBuild.TrackMatched, hashBuild.MemoryBudget);
+                        ResolveDeferredSeekForRowIdRead(hashBuild.Cursor);
+                        var keys = ReadRegisters(hashBuild.Key);
+                        var payload = hashBuild.Payload is { } payloadRange ? ReadRegisters(payloadRange) : [];
+                        table.InsertPending(keys, CurrentCursorRowId(hashBuild.Cursor), payload);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashDistinctInstruction hashDistinct:
+                    {
+                        // Mirrors Turso's op_hash_distinct: insert the key when it is new,
+                        // jumping over the duplicate otherwise. NULL compares equal to NULL.
+                        var table = GetOrBuildHashTable(hashDistinct.HashTableId, hashDistinct.Collations, hashDistinct.Key.Count, trackMatched: false, memoryBudget: 0);
+                        if (!table.InsertDistinct(ReadRegisters(hashDistinct.Key)))
+                        {
+                            _instructionPointer = hashDistinct.DuplicateTarget;
+                            break;
+                        }
+
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashBuildFinalizeInstruction hashFinalize:
+                    {
+                        // Mirrors Turso's op_hash_build_finalize: flip the table to probing.
+                        // A never-built table is simply absent.
+                        if (_hashTables.TryGetValue(hashFinalize.HashTableId, out var table))
+                            table.FinalizeBuild();
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashProbeInstruction hashProbe:
+                    {
+                        // Mirrors Turso's op_hash_probe: a missing table is a miss.
+                        if (!_hashTables.TryGetValue(hashProbe.HashTableId, out var table))
+                        {
+                            _instructionPointer = hashProbe.NotFoundTarget;
+                            break;
+                        }
+
+                        var entry = table.Probe(ReadRegisters(hashProbe.Key));
+                        if (entry is null)
+                        {
+                            _instructionPointer = hashProbe.NotFoundTarget;
+                            break;
+                        }
+
+                        _registers[hashProbe.Destination.Index] = SqlValue.Integer(entry.RowId);
+                        WriteHashPayload(hashProbe.PayloadDestination, entry.Payload);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashNextInstruction hashNext:
+                    {
+                        // Mirrors Turso's op_hash_next: continues the probe chain started by
+                        // HashProbe. Without a table the program is malformed.
+                        if (!_hashTables.TryGetValue(hashNext.HashTableId, out var table))
+                        {
+                            throw new InvalidOperationException($"Hash table not found with ID: {hashNext.HashTableId}");
+                        }
+
+                        var entry = table.NextMatch();
+                        if (entry is null)
+                        {
+                            _instructionPointer = hashNext.ExhaustedTarget;
+                            break;
+                        }
+
+                        _registers[hashNext.Destination.Index] = SqlValue.Integer(entry.RowId);
+                        WriteHashPayload(hashNext.PayloadDestination, entry.Payload);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashCloseInstruction hashClose:
+                    {
+                        // Mirrors Turso's op_hash_close: drop the table from the statement registry.
+                        if (_hashTables.Remove(hashClose.HashTableId, out var table))
+                            table.Close();
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashClearInstruction hashClear:
+                    {
+                        // Mirrors Turso's op_hash_clear: empty the table for a correlated rebuild.
+                        if (_hashTables.TryGetValue(hashClear.HashTableId, out var table))
+                            table.Clear();
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashMarkMatchedInstruction hashMarkMatched:
+                    {
+                        // Mirrors Turso's op_hash_mark_matched: no-op for tables that don't
+                        // track matches (or that never materialized).
+                        if (_hashTables.TryGetValue(hashMarkMatched.HashTableId, out var table))
+                            table.MarkCurrentMatched();
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashResetMatchedInstruction hashResetMatched:
+                    {
+                        // Mirrors Turso's op_hash_reset_matched: clear the matched bits so an
+                        // anti-join loop can restart the unmatched scan.
+                        if (_hashTables.TryGetValue(hashResetMatched.HashTableId, out var table))
+                            table.ResetMatchedBits();
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashScanUnmatchedInstruction hashScanUnmatched:
+                    {
+                        // Mirrors Turso's op_hash_scan_unmatched: a missing table is already exhausted.
+                        if (!_hashTables.TryGetValue(hashScanUnmatched.HashTableId, out var table))
+                        {
+                            _instructionPointer = hashScanUnmatched.ExhaustedTarget;
+                            break;
+                        }
+
+                        table.BeginUnmatchedScan();
+                        var entry = table.NextUnmatched();
+                        if (entry is null)
+                        {
+                            _instructionPointer = hashScanUnmatched.ExhaustedTarget;
+                            break;
+                        }
+
+                        _registers[hashScanUnmatched.Destination.Index] = SqlValue.Integer(entry.RowId);
+                        WriteHashPayload(hashScanUnmatched.PayloadDestination, entry.Payload);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case HashNextUnmatchedInstruction hashNextUnmatched:
+                    {
+                        // Mirrors Turso's op_hash_next_unmatched: continues the scan started by
+                        // HashScanUnmatched. Without a table the program is malformed.
+                        if (!_hashTables.TryGetValue(hashNextUnmatched.HashTableId, out var table))
+                        {
+                            throw new InvalidOperationException($"Hash table not found with ID: {hashNextUnmatched.HashTableId}");
+                        }
+
+                        var entry = table.NextUnmatched();
+                        if (entry is null)
+                        {
+                            _instructionPointer = hashNextUnmatched.ExhaustedTarget;
+                            break;
+                        }
+
+                        _registers[hashNextUnmatched.Destination.Index] = SqlValue.Integer(entry.RowId);
+                        WriteHashPayload(hashNextUnmatched.PayloadDestination, entry.Payload);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
                 case OpenPseudoInstruction openPseudo:
                     OpenCursor(openPseudo.Cursor);
                     _pseudoCursors[openPseudo.Cursor.Index] = openPseudo.Content;
@@ -459,6 +708,9 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case RewindCursorInstruction rewind:
                     {
+                        // Turso clears the cursor's bloom filter unconditionally on rewind, before
+                        // deciding whether the cursor is empty.
+                        _bloomFilters.Remove(rewind.Cursor.Index);
                         _materializedRows[rewind.Cursor.Index] = null;
                         if (_pseudoCursors[rewind.Cursor.Index] is { } pseudo)
                         {
@@ -526,6 +778,8 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case ColumnInstruction column:
                     {
+                        if (!ResolveDeferredSeekForColumnRead(column))
+                            break;
                         var row = CurrentCursorRow(column.Cursor);
                         _registers[column.Destination.Index] = row[column.ColumnIndex];
                         AdvanceInstructionPointer();
@@ -547,6 +801,7 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case RowIdInstruction rowId:
                     {
+                        ResolveDeferredSeekForRowIdRead(rowId.Cursor);
                         _registers[rowId.Destination.Index] = SqlValue.Integer(CurrentCursorRowId(rowId.Cursor));
                         AdvanceInstructionPointer();
                         break;
@@ -713,6 +968,18 @@ public sealed class ResumableStatement : IDisposable
                             AdvanceInstructionPointer();
                         else
                             _instructionPointer = noConflict.NoConflictTarget;
+                        break;
+                    }
+                case ColumnHasFieldInstruction columnHasField:
+                    {
+                        // Turso: jump when the current record carries the column. A cursor with no
+                        // current record behaves like Turso's missing-record case and falls through.
+                        var hasField = TryCurrentCursorRow(columnHasField.Cursor, out var row)
+                            && row.Length > columnHasField.Column;
+                        if (hasField)
+                            _instructionPointer = columnHasField.Target;
+                        else
+                            AdvanceInstructionPointer();
                         break;
                     }
                 case FkCounterInstruction fkCounter:
@@ -1405,6 +1672,28 @@ public sealed class ResumableStatement : IDisposable
 
                         break;
                     }
+                case AggValueInstruction aggValue:
+                    {
+                        try
+                        {
+                            var index = aggValue.Accumulator.Index;
+                            // Turso's AggValue shares op_agg_final but leaves the accumulator
+                            // untouched, so the aggregate can still be stepped afterwards.
+                            var context = _accumulatorInitialized[index]
+                                ? _accumulatorContexts[index]
+                                : aggValue.Aggregate.CreateContext();
+                            _registers[aggValue.Destination.Index] =
+                                aggValue.Aggregate.Finalize(context);
+                            AdvanceInstructionPointer();
+                        }
+                        catch
+                        {
+                            State = ResumableStatementState.Faulted;
+                            throw;
+                        }
+
+                        break;
+                    }
                 case SameGroupInstruction sameGroup:
                     {
                         var current = ReadRegisters(sameGroup.CurrentKey);
@@ -2015,6 +2304,9 @@ public sealed class ResumableStatement : IDisposable
                         Array.Clear(_windowBuffers);
                         Array.Clear(_ephemeralTables);
                         Array.Clear(_pseudoCursors);
+                        Array.Clear(_deferredSeeks);
+                        _bloomFilters.Clear();
+                        _hashTables.Clear();
                         if (halt.ErrorCode != 0)
                             throw CreateHaltException(halt);
 
@@ -2039,6 +2331,9 @@ public sealed class ResumableStatement : IDisposable
                             Array.Clear(_windowBuffers);
                             Array.Clear(_ephemeralTables);
                             Array.Clear(_pseudoCursors);
+                            Array.Clear(_deferredSeeks);
+                            _bloomFilters.Clear();
+                            _hashTables.Clear();
                             throw CreateHaltIfNullException(haltIfNull);
                         }
 
@@ -2070,6 +2365,7 @@ public sealed class ResumableStatement : IDisposable
         _registers.Clear();
         Array.Clear(_openCursors);
         Array.Clear(_cursorPositions);
+        Array.Clear(_deferredSeeks);
         Array.Clear(_skipLastInsertRowId);
         Array.Clear(_materializedRows);
         Array.Clear(_materializedRowIds);
@@ -2081,6 +2377,8 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_groupKeys);
         Array.Clear(_groupIndexes);
         _integerRowSets.Clear();
+        _bloomFilters.Clear();
+        _hashTables.Clear();
         foreach (var subprogram in _subprogramStatements.Values)
             subprogram.Reset();
         Array.Clear(_workTables);
@@ -2321,6 +2619,8 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_groupKeys);
         Array.Clear(_groupIndexes);
         _integerRowSets.Clear();
+        _bloomFilters.Clear();
+        _hashTables.Clear();
         foreach (var subprogram in _subprogramStatements.Values)
             subprogram.Dispose();
         _subprogramStatements.Clear();
@@ -2328,6 +2628,7 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_windowBuffers);
         Array.Clear(_ephemeralTables);
         Array.Clear(_pseudoCursors);
+        Array.Clear(_deferredSeeks);
         _onceVisited.Clear();
         if (_ownsTransaction)
             _transaction.Reset();
@@ -2345,6 +2646,14 @@ public sealed class ResumableStatement : IDisposable
             throw new InvalidOperationException($"Cursor {cursor.Index} is already open.");
 
         _openCursors[cursor.Index] = true;
+        // Mirrors Turso's invalidate_deferred_seeks_for_cursor: (re)opening a cursor drops any
+        // pending deferred seek that references it on either the index or the table side.
+        for (var i = 0; i < _deferredSeeks.Length; i++)
+        {
+            if (_deferredSeeks[i] is { } pending
+                && (pending.IndexCursor == cursor.Index || pending.TableCursor == cursor.Index))
+                _deferredSeeks[i] = null;
+        }
     }
 
     private void CloseCursor(Cursor cursor)
@@ -2353,6 +2662,8 @@ public sealed class ResumableStatement : IDisposable
             throw new InvalidOperationException($"Cursor {cursor.Index} is not open.");
 
         _openCursors[cursor.Index] = false;
+        // Mirrors Turso's op_close: closing a cursor drops its own pending deferred seek.
+        _deferredSeeks[cursor.Index] = null;
         _virtualCursors[cursor.Index]?.Dispose();
         _virtualCursors[cursor.Index] = null;
         _indexMethodCursors[cursor.Index]?.Dispose();
@@ -2925,6 +3236,18 @@ public sealed class ResumableStatement : IDisposable
         if (_virtualCursors[cursor.Index] is { } virtualCursor)
             return virtualCursor.RowId;
 
+        // Ephemeral tables are not bound write targets; their rowids come from the
+        // table's own sequential insertion order, exactly like RequireCursorSource.
+        if (_ephemeralTables[cursor.Index] is { } ephemeral)
+        {
+            var ephemeralPosition = _cursorPositions[cursor.Index];
+            var ephemeralRowIds = ephemeral.AsCursorSource().RowIds
+                ?? throw new InvalidOperationException($"Cursor {cursor.Index} has no rowid source bound.");
+            if (ephemeralPosition < 0 || ephemeralPosition >= ephemeralRowIds.Count)
+                throw new InvalidOperationException($"Cursor {cursor.Index} is not positioned on a row.");
+            return ephemeralRowIds[ephemeralPosition];
+        }
+
         if (_joinCursorStates[cursor.Index] is not null)
         {
             throw new InvalidOperationException(
@@ -2957,6 +3280,32 @@ public sealed class ResumableStatement : IDisposable
         var values = new SqlValue[range.Count];
         _registers.CopyTo(range.Start.Index, values, 0, range.Count);
         return values;
+    }
+
+    private VdbeHashTable GetOrBuildHashTable(
+        int hashTableId,
+        IReadOnlyList<string?> collations,
+        int keyCount,
+        bool trackMatched,
+        long memoryBudget)
+    {
+        if (!_hashTables.TryGetValue(hashTableId, out var table))
+        {
+            table = new VdbeHashTable(keyCount, collations, trackMatched, memoryBudget);
+            _hashTables[hashTableId] = table;
+        }
+
+        return table;
+    }
+
+    private void WriteHashPayload(RegisterRange? payloadDestination, SqlValue[] payload)
+    {
+        if (payloadDestination is not { } range || payload.Length == 0)
+            return;
+
+        var count = Math.Min(range.Count, payload.Length);
+        for (var index = 0; index < count; index++)
+            _registers[range.Start.Index + index] = payload[index];
     }
 
     private bool TryCurrentCursorRow(Cursor cursor, out SqlValue[] row)
@@ -3234,6 +3583,80 @@ public sealed class ResumableStatement : IDisposable
         for (var i = 0; i < rowIds.Count; i++)
         {
             if (rowIds[i] != target)
+                continue;
+
+            _cursorPositions[cursor.Index] = i;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves a pending <see cref="DeferredSeekInstruction"/> before a column read, mirroring
+    /// Turso's op_column slow path. Returns true when the caller should proceed with the ordinary
+    /// column read; returns false when the index cursor had no current record and the destination
+    /// register was already written NULL with the instruction pointer advanced (Turso's
+    /// write_null_regs).
+    /// </summary>
+    private bool ResolveDeferredSeekForColumnRead(ColumnInstruction column)
+    {
+        var pending = _deferredSeeks[column.Cursor.Index];
+        if (pending is null)
+            return true;
+
+        _deferredSeeks[column.Cursor.Index] = null;
+        var indexCursor = new Cursor(pending.Value.IndexCursor);
+        if (!TryCurrentCursorRow(indexCursor, out _))
+        {
+            _registers[column.Destination.Index] = SqlValue.Null;
+            AdvanceInstructionPointer();
+            return false;
+        }
+
+        TryPositionCursorOnRowIdValue(column.Cursor, CurrentCursorRowId(indexCursor));
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves a pending <see cref="DeferredSeekInstruction"/> before a rowid read, mirroring
+    /// Turso's op_row_id slow path. Turso expects the index cursor to hold a record at this
+    /// point; the managed engine surfaces the same contract as an error instead of panicking.
+    /// </summary>
+    private void ResolveDeferredSeekForRowIdRead(Cursor cursor)
+    {
+        var pending = _deferredSeeks[cursor.Index];
+        if (pending is null)
+            return;
+
+        _deferredSeeks[cursor.Index] = null;
+        var indexCursor = new Cursor(pending.Value.IndexCursor);
+        if (!TryCurrentCursorRow(indexCursor, out _))
+        {
+            throw new InvalidOperationException(
+                $"Deferred seek of cursor {cursor.Index} requires index cursor {indexCursor.Index} to be positioned on a record.");
+        }
+
+        TryPositionCursorOnRowIdValue(cursor, CurrentCursorRowId(indexCursor));
+    }
+
+    /// <summary>
+    /// Positions <paramref name="cursor"/> on the row whose rowid equals
+    /// <paramref name="rowId"/>. Returns false when the cursor's source exposes no rowids or the
+    /// rowid is absent; deferred-seek resolution treats such a miss the way the subsequent column
+    /// or rowid read would for an unpositioned cursor.
+    /// </summary>
+    private bool TryPositionCursorOnRowIdValue(Cursor cursor, long rowId)
+    {
+        _materializedRows[cursor.Index] = null;
+        var source = RequireCursorSource(cursor);
+        var rowIds = source.RowIds;
+        if (rowIds is null)
+            return false;
+
+        for (var i = 0; i < rowIds.Count; i++)
+        {
+            if (rowIds[i] != rowId)
                 continue;
 
             _cursorPositions[cursor.Index] = i;
@@ -3638,6 +4061,21 @@ public sealed class ResumableStatement : IDisposable
             _rowIds.RemoveAt(position);
             _sourceView = null;
             return true;
+        }
+
+        // Turso's ResetSorter clears the ephemeral b-tree (clear_btree) at partition boundaries.
+        // The rowid space restarts from 1 to match a freshly opened table.
+        public void Clear()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_retainedBytes > 0 || _retainedRows > 0)
+                _memory.Release(_retainedBytes, _retainedRows);
+            _rows.Clear();
+            _rowIds.Clear();
+            _sourceView = null;
+            _retainedBytes = 0;
+            _retainedRows = 0;
+            _nextRowId = 1;
         }
 
         public VdbeCursorSource AsCursorSource()
