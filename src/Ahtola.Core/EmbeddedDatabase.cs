@@ -342,9 +342,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // max_page_count on databases that have no file store. The memory database
     // starts with zero pages (matching SQLite's empty pager) and materializes
     // pages the way the pager would: the first header write creates the header
-    // page, and each table or index adds one page.
+    // page, and each table or index adds one page. Dropped b-trees move their
+    // pages onto the freelist rather than shrinking the database, so
+    // page_count is a high-water mark the way SQLite's header field is.
     internal bool _inMemoryInitialized;
     internal int? _inMemoryPageSize;
+    private uint _inMemoryFreelistPages;
+    private uint _inMemoryHighWaterPages;
     private uint _maxPageCount = 4294967294;
     private readonly EmbeddedTransactionLock _transactionLock;
     /// <summary>
@@ -2395,6 +2399,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 {
                                     SchemaVersion = unchecked(_inMemoryPragmaHeader.SchemaVersion + 1),
                                 };
+                            // The first mutating statement materializes the database: SQLite writes
+                            // the header page (and any b-tree roots) at that commit, so page_count
+                            // moves off zero and PRAGMA page_size can no longer change.
+                            _inMemoryInitialized = true;
+                            ReconcileInMemoryPageModel();
                             _version++;
                         }
 
@@ -3851,20 +3860,37 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 // An uninitialized in-memory database has no pages yet (SQLite
                 // reports 0 until the first page is written). Once initialized,
-                // model the pager: one header page plus one page per table and
-                // index b-tree.
+                // the count is the high-water mark of allocated pages — SQLite's
+                // header field only grows; drops move pages onto the freelist.
                 if (!_inMemoryInitialized)
                     return 0;
 
-                var pages = 1;
-                foreach (var table in _tables.Values)
-                    pages += 1 + table.Indexes.Count;
-
-                return (uint)pages;
+                return _inMemoryHighWaterPages;
             }
 
             return _fileCatalogVersion.DatabaseSizeInPages;
         }
+    }
+
+    /// <summary>
+    /// Reconciles the managed in-memory page model after a committed catalog change.
+    /// The model mirrors SQLite's pager: the header page count is a high-water mark
+    /// that only grows, and the freelist is the gap between the high-water mark and
+    /// the live b-tree count. Dropping a b-tree moves its pages onto the freelist
+    /// without shrinking <c>PRAGMA page_count</c>; creating one consumes freelist
+    /// pages first and only raises the mark beyond the previous peak. Callers must
+    /// hold <c>_gate</c>.
+    /// </summary>
+    private void ReconcileInMemoryPageModel()
+    {
+        var live = 1;
+        foreach (var table in _tables.Values)
+            live += 1 + table.Indexes.Count;
+
+        if (live > _inMemoryHighWaterPages)
+            _inMemoryHighWaterPages = (uint)live;
+
+        _inMemoryFreelistPages = _inMemoryHighWaterPages - (uint)live;
     }
 
     // An in-memory database models PRAGMA max_page_count at the catalog level: each new
@@ -3877,7 +3903,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (_fileStore is not null)
             return;
 
-        var required = GetPageCount() + (uint)additionalPages + (_inMemoryInitialized ? 0u : 1u);
+        // Freelist pages satisfy new b-trees before the database grows (SQLite
+        // allocates from the freelist first), so only the growth beyond the current
+        // high-water mark counts against the limit.
+        var live = (long)_inMemoryHighWaterPages - _inMemoryFreelistPages;
+        var required = Math.Max((long)_inMemoryHighWaterPages, live + additionalPages)
+            + (_inMemoryInitialized ? 0 : 1);
         if (required > MaxPageCount)
             throw new EmbeddedSqlException("database or disk is full");
     }
@@ -3886,10 +3917,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         lock (_gate)
         {
-            // An in-memory database never frees pages, so the count is always zero
-            // (SQLite reports 0 rather than an error for :memory: databases).
+            // In-memory drops move pages onto the freelist the way SQLite's pager does;
+            // the file-backed path reads the real header field.
             if (_fileStore is null)
-                return 0;
+                return _inMemoryFreelistPages;
             return _fileCatalogVersion.FreelistPageCount;
         }
     }
@@ -4417,10 +4448,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 {
                     // Even a no-op header write materializes the header page.
                     _inMemoryInitialized = true;
+                    ReconcileInMemoryPageModel();
                     return;
                 }
                 _inMemoryPragmaHeader = updated;
                 _inMemoryInitialized = true;
+                ReconcileInMemoryPageModel();
                 _version++;
                 return;
             }
@@ -4938,7 +4971,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (fileCatalogVersion is { } version)
             _fileCatalogVersion = version;
         else if (_fileStore is null)
+        {
             _inMemoryInitialized = true;
+            ReconcileInMemoryPageModel();
+        }
         _version++;
 
         // Pin the storage generation and durable view token to this commit/reload so
