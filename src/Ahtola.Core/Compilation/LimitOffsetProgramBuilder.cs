@@ -369,6 +369,22 @@ public static class LimitOffsetProgramBuilder
             GotoInstruction x => new GotoInstruction(Pc(x.Target)),
             JumpIfInstruction x => new JumpIfInstruction(x.Register, Pc(x.Target)),
             JumpIfNotTrueInstruction x => new JumpIfNotTrueInstruction(x.Value, Pc(x.FalseTarget)),
+            IfPosInstruction x => new IfPosInstruction(x.Register, Pc(x.Target), x.DecrementBy),
+            IfNegInstruction x => new IfNegInstruction(x.Register, Pc(x.Target)),
+            DecrJumpZeroInstruction x => new DecrJumpZeroInstruction(x.Register, Pc(x.Target)),
+            MustBeIntInstruction x => new MustBeIntInstruction(x.Register, x.Target is { } t ? Pc(t) : null),
+            GosubInstruction x => new GosubInstruction(Pc(x.Target), x.ReturnRegister),
+            SequenceTestInstruction x => new SequenceTestInstruction(x.Cursor, Pc(x.Target), x.ValueRegister),
+            NotExistsInstruction x => new NotExistsInstruction(x.Cursor, x.RowIdRegister, Pc(x.JumpTarget), x.Description),
+            FoundInstruction x => new FoundInstruction(x.Cursor, x.RowIdRegister, Pc(x.FoundTarget), x.Description),
+            SoftNullInstruction
+                or MemMaxInstruction
+                or AddImmInstruction
+                or ZeroOrNullInstruction
+                or ReturnInstruction
+                or BeginSubrtnInstruction
+                or SequenceInstruction
+                or HaltIfNullInstruction => instruction,
             SameGroupInstruction x => new SameGroupInstruction(x.CurrentKey, x.SavedKey, x.Comparer, Pc(x.SameGroupTarget)),
             ResetOnceInstruction x => new ResetOnceInstruction(Pc(x.RegionEnd)),
             OnceInstruction x => new OnceInstruction(Pc(x.ReentryTarget)),

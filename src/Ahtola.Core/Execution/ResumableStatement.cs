@@ -38,6 +38,7 @@ public sealed class ResumableStatement : IDisposable
     private readonly VdbeRecordValue?[] _recordRegisters;
     private readonly bool[] _openCursors;
     private readonly int[] _cursorPositions;
+    private readonly long[] _cursorSequences;
     private readonly (int IndexCursor, int TableCursor)?[] _deferredSeeks;
     private readonly bool[] _skipLastInsertRowId;
     private readonly SqlValue[]?[] _materializedRows;
@@ -159,6 +160,7 @@ public sealed class ResumableStatement : IDisposable
         _recordRegisters = _registers.Records;
         _openCursors = new bool[program.CursorCount];
         _cursorPositions = new int[program.CursorCount];
+        _cursorSequences = new long[program.CursorCount];
         _deferredSeeks = new (int IndexCursor, int TableCursor)?[program.CursorCount];
         _skipLastInsertRowId = new bool[program.CursorCount];
         _materializedRows = new SqlValue[program.CursorCount][];
@@ -1597,6 +1599,222 @@ public sealed class ResumableStatement : IDisposable
 
                         break;
                     }
+                case IfPosInstruction ifPos:
+                    {
+                        try
+                        {
+                            var value = _registers[ifPos.Register.Index];
+                            if (value.Kind == SqlValueKind.Integer)
+                            {
+                                var n = value.AsInteger();
+                                if (n > 0)
+                                {
+                                    // Turso sets pc to the target BEFORE writing the decremented
+                                    // value back, so the write happens only on the jump path.
+                                    _instructionPointer = ifPos.Target;
+                                    _registers[ifPos.Register.Index] =
+                                        SqlValue.Integer(unchecked(n - ifPos.DecrementBy));
+                                }
+                                else
+                                {
+                                    AdvanceInstructionPointer();
+                                }
+                            }
+                            else
+                            {
+                                throw new InvalidOperationException(
+                                    "IfPos: the value in the register is not an integer");
+                            }
+                        }
+                        catch
+                        {
+                            State = ResumableStatementState.Faulted;
+                            throw;
+                        }
+
+                        break;
+                    }
+                case IfNegInstruction ifNeg:
+                    {
+                        var value = _registers[ifNeg.Register.Index];
+                        var jump = value.Kind switch
+                        {
+                            SqlValueKind.Integer => value.AsInteger() < 0,
+                            SqlValueKind.Real => value.AsReal() < 0.0,
+                            _ => false,
+                        };
+                        if (jump)
+                            _instructionPointer = ifNeg.Target;
+                        else
+                            AdvanceInstructionPointer();
+
+                        break;
+                    }
+                case DecrJumpZeroInstruction decrJumpZero:
+                    {
+                        var value = _registers[decrJumpZero.Register.Index];
+                        if (value.Kind != SqlValueKind.Integer)
+                        {
+                            throw new EmbeddedSqlException(
+                                "datatype mismatch",
+                                SqliteResultCode.Constraint,
+                                InsertConflictAlgorithm.Abort);
+                        }
+
+                        var n = value.AsInteger();
+                        // Rust saturating_sub: long.MinValue decrements to itself.
+                        n = n == long.MinValue ? long.MinValue : n - 1;
+                        _registers[decrJumpZero.Register.Index] = SqlValue.Integer(n);
+                        if (n == 0)
+                            _instructionPointer = decrJumpZero.Target;
+                        else
+                            AdvanceInstructionPointer();
+
+                        break;
+                    }
+                case MustBeIntInstruction mustBeInt:
+                    {
+                        var value = _registers[mustBeInt.Register.Index];
+                        if (EmbeddedDatabase.TryCoerceRegisterToInteger(value, out var integer))
+                        {
+                            _registers[mustBeInt.Register.Index] = SqlValue.Integer(integer);
+                            AdvanceInstructionPointer();
+                        }
+                        else if (mustBeInt.Target is { } target)
+                        {
+                            _instructionPointer = target;
+                        }
+                        else
+                        {
+                            throw new EmbeddedSqlException(
+                                "datatype mismatch",
+                                SqliteResultCode.Constraint,
+                                InsertConflictAlgorithm.Abort);
+                        }
+
+                        break;
+                    }
+                case SoftNullInstruction softNull:
+                    _registers[softNull.Register.Index] = SqlValue.Null;
+                    AdvanceInstructionPointer();
+                    break;
+                case MemMaxInstruction memMax:
+                    {
+                        var destination = EmbeddedDatabase.ExtractIntValue(_registers[memMax.Destination.Index]);
+                        var source = EmbeddedDatabase.ExtractIntValue(_registers[memMax.Source.Index]);
+                        if (destination < source)
+                            _registers[memMax.Destination.Index] = SqlValue.Integer(source);
+
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case AddImmInstruction addImm:
+                    {
+                        // Rust wrapping_add: overflow wraps in release builds.
+                        var lhs = EmbeddedDatabase.ExtractIntValue(_registers[addImm.Register.Index]);
+                        _registers[addImm.Register.Index] = SqlValue.Integer(unchecked(lhs + addImm.Value));
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case ZeroOrNullInstruction zeroOrNull:
+                    {
+                        var isNull = _registers[zeroOrNull.Left.Index].Kind == SqlValueKind.Null
+                            || _registers[zeroOrNull.Right.Index].Kind == SqlValueKind.Null;
+                        _registers[zeroOrNull.Destination.Index] =
+                            isNull ? SqlValue.Null : SqlValue.Integer(0);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case GosubInstruction gosub:
+                    {
+                        // Turso op_gosub: save the return address, then jump. Ahtola's
+                        // ProgramCounter is always concrete (labels are resolved before
+                        // the program runs), so Turso's "Unresolved label" bail cannot occur.
+                        _registers[gosub.ReturnRegister.Index] =
+                            SqlValue.Integer(_instructionPointer.Offset + 1);
+                        _instructionPointer = gosub.Target;
+                        break;
+                    }
+                case ReturnInstruction @return:
+                    {
+                        var value = _registers[@return.ReturnRegister.Index];
+                        if (value.Kind == SqlValueKind.Integer)
+                        {
+                            var targetPc = value.AsInteger();
+                            if (targetPc < 0)
+                            {
+                                // Turso panics ("Return register is negative"); map to an
+                                // internal fault that terminates the statement.
+                                try
+                                {
+                                    throw new InvalidOperationException(
+                                        "Return register holds a negative program counter.");
+                                }
+                                catch
+                                {
+                                    State = ResumableStatementState.Faulted;
+                                    throw;
+                                }
+                            }
+
+                            _instructionPointer = new ProgramCounter((int)targetPc);
+                        }
+                        else if (@return.CanFallThrough)
+                        {
+                            AdvanceInstructionPointer();
+                        }
+                        else
+                        {
+                            // Turso returns InternalError; map to an internal fault.
+                            try
+                            {
+                                throw new InvalidOperationException(
+                                    "Return register is not an integer.");
+                            }
+                            catch
+                            {
+                                State = ResumableStatementState.Faulted;
+                                throw;
+                            }
+                        }
+
+                        break;
+                    }
+                case BeginSubrtnInstruction beginSubrtn:
+                    {
+                        // Turso's shared Null|BeginSubrtn arm null-fills the inclusive
+                        // destination range. Ahtola has no register-keyed rowset side map,
+                        // so there is nothing else to clear.
+                        var endIndex = beginSubrtn.DestinationEnd?.Index ?? beginSubrtn.Destination.Index;
+                        for (var i = beginSubrtn.Destination.Index; i <= endIndex; i++)
+                        {
+                            _registers[i] = SqlValue.Null;
+                        }
+
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case SequenceInstruction sequence:
+                    {
+                        // Turso op_sequence: publish the counter, then increment it. The
+                        // cursor does not need to be open — the counter is per cursor id.
+                        _registers[sequence.Destination.Index] = SqlValue.Integer(_cursorSequences[sequence.Cursor.Index]);
+                        _cursorSequences[sequence.Cursor.Index]++;
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case SequenceTestInstruction sequenceTest:
+                    {
+                        // Turso op_sequence_test: jump when the counter was zero; the
+                        // counter increments either way. The value register is not read.
+                        var wasZero = _cursorSequences[sequenceTest.Cursor.Index] == 0;
+                        _cursorSequences[sequenceTest.Cursor.Index]++;
+                        if (wasZero)
+                            _instructionPointer = sequenceTest.Target;
+                        else
+                            AdvanceInstructionPointer();
+                        break;
+                    }
                 case AggResetInstruction aggReset:
                     _accumulatorInitialized[aggReset.Accumulator.Index] = false;
                     _accumulatorContexts[aggReset.Accumulator.Index] = null;
@@ -2365,6 +2583,12 @@ public sealed class ResumableStatement : IDisposable
         _registers.Clear();
         Array.Clear(_openCursors);
         Array.Clear(_cursorPositions);
+        // Per-cursor sequence counters restart at zero on each run, matching SQLite
+        // where OP_Sequence state lives on the cursor (recreated per execution).
+        // Turso keeps stale values across reset because Vec::resize no-ops when the
+        // cursor count is unchanged; that persistence is an upstream artifact no
+        // observable program depends on.
+        Array.Clear(_cursorSequences);
         Array.Clear(_deferredSeeks);
         Array.Clear(_skipLastInsertRowId);
         Array.Clear(_materializedRows);

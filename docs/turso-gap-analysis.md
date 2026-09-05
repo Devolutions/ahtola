@@ -41,10 +41,10 @@ The gaps concentrate in four areas:
 1. **Planner/compiler depth** (compilation layer, 38 entries): no subquery
    flattening or decorrelation, no cost-based join ordering, no partial or
    expression indexes, and only selected compiled source shapes.
-2. **VDBE execution machinery** (35 entries): no trigger subprogram opcodes
-   (`Gosub`/`Return`), no native/loadable virtual-table ABI, no hash-join/bloom
-   family, partial ephemeral and seek/index-cursor families,
-   write-time affinity enforcement (`TypeCheck`) scattered — the root cause of
+2. **VDBE execution machinery** (35 entries): no native/loadable
+   virtual-table ABI, evaluator-side (not opcode-emitted) PRAGMA/cookie paths,
+   partial ephemeral and seek/index-cursor families, write-time affinity
+   enforcement (`TypeCheck`) scattered — the root cause of
    the largest wrong-values conformance cluster.
 3. **Parser surface** (22 entries): dominated by one astonishingly cheap fix —
    the missing implicit (AS-less) column alias maps to **144 of 606** failure
@@ -134,16 +134,24 @@ comment "~190" understates the current count); Ahtola's `VdbeOpcode` has **74
 values (0–73)**. Name-matching would therefore grossly overstate the gap. The
 real mapping, built variant-by-variant:
 
-> Current reconciliation (2026-09-01). The pinned Turso
+> Current reconciliation (2026-09-04). The pinned Turso
 > `v0.8.0-pre.7` source now declares **210** `Insn` variants and Ahtola declares
-> **146** stable opcode values (0–145). Every declared managed instruction has
+> **179** stable opcode values (0–178). Every declared managed instruction has
 > validation, execution, and EXPLAIN handling; the remaining count difference
 > is primarily consolidation or intentionally out-of-band execution, not 64
 > undispatched opcodes. Since the historical matrix below was produced, Ahtola
 > also added subprograms, the seek/index/FK/ephemeral families, managed virtual
 > tables and index methods, schema/DDL opcodes, spillable DISTINCT/compound
 > keyed sets, `BlobRead`/`BlobWrite`/`BlobLen`, `ColumnRange`, `OpenPseudo`,
-> `TypeCheck`, `Once`, `ResetOnce`, and `ChangeCount`. `AggInverse` is opcode
+> `TypeCheck`, `Once`, `ResetOnce`, and `ChangeCount`; the micro-cursor and
+> deferred-seek batches; the bloom-filter and in-memory hash-join opcode
+> families (153–165, with joins run by `VdbeHashJoinRuntime` rather than
+> opcode emission); the scalar-control batch (`IfPos`/`IfNeg`/`DecrJumpZero`/
+> `MustBeInt`/`SoftNull`/`MemMax`/`AddImm`/`ZeroOrNull`, 166–173); the
+> subroutine machinery (`Gosub`/`Return`/`BeginSubrtn`, 174–176); and the
+> per-cursor sequence counters (`Sequence`/`SequenceTest`, 177–178). The grace
+> (disk-spill) hash-join opcodes stay unported by design — the managed engine
+> keeps hash joins fully in memory. `AggInverse` is opcode
 > 136 and drives exact current-row, bounded `ROWS n PRECEDING`, `ROWS m FOLLOWING`,
 > and `ROWS n PRECEDING … m FOLLOWING` COUNT/SUM/AVG frames (n,m ≤ 1024).
 > Default `RANGE`/`GROUPS UNBOUNDED PRECEDING … CURRENT ROW` and
@@ -276,26 +284,26 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | ---: | --- | --- | --- | --- |
 | 1 | `Init` | bydesign | — (resumable-statement dispatch, no init-block jump) | `vdbe-coroutine-machinery` |
 | 2 | `Null` | consolidated | LoadConstant |  |
-| 3 | `BeginSubrtn` | missing | — | `vdbe-trigger-subprogram-machinery` |
+| 3 | `BeginSubrtn` | direct | BeginSubrtn (176) |  |
 | 4 | `NullRow` | consolidated | GuardedRow (outer-join null row) |  |
 | 5 | `Add` | consolidated | Arithmetic(Add) |  |
 | 6 | `Subtract` | consolidated | Arithmetic(Subtract) |  |
 | 7 | `Multiply` | consolidated | Arithmetic(Multiply) |  |
-| 8 | `MemMax` | missing | — | `vdbe-scalar-control-opcodes` |
+| 8 | `MemMax` | direct | MemMax (171) |  |
 | 9 | `Divide` | consolidated | Arithmetic(Divide) |  |
 | 10 | `Compare` | direct | Compare (66) | `vdbe-comparison-opcode-consolidation` |
 | 11 | `BitAnd` | consolidated | Arithmetic(BitwiseAnd) |  |
 | 12 | `BitOr` | consolidated | Arithmetic(BitwiseOr) |  |
 | 13 | `BitNot` | consolidated | Arithmetic(BitwiseNot) |  |
-| 14 | `Checkpoint` | missing | — (coordinator exists internally, no opcode/SQL path) | `vdbe-checkpoint-opcode` |
+| 14 | `Checkpoint` | bydesign | — (PRAGMA wal_checkpoint executes via the managed checkpoint coordinator, no opcode) | `vdbe-checkpoint-opcode` |
 | 15 | `Remainder` | consolidated | Arithmetic(Modulo) |  |
 | 16 | `Jump` | consolidated | Goto / JumpIf |  |
 | 17 | `Move` | consolidated | Copy |  |
-| 18 | `IfPos` | missing | — | `vdbe-scalar-control-opcodes` |
+| 18 | `IfPos` | direct | IfPos (166) |  |
 | 19 | `NotNull` | consolidated | Compare + JumpIfNotTrue |  |
 | 20 | `Eq` | consolidated | Compare + JumpIfNotTrue | `vdbe-comparison-opcode-consolidation` |
-| 21 | `Filter` | missing | — (bloom probe; ⚠ Ahtola Filter is a row predicate) | `vdbe-bloom-filter-opcodes` |
-| 22 | `FilterAdd` | missing | — | `vdbe-bloom-filter-opcodes` |
+| 21 | `Filter` | direct | BloomFilter (153) probe — ⚠ Ahtola Filter (12) is a row predicate | `vdbe-bloom-filter-opcodes` |
+| 22 | `FilterAdd` | direct | BloomFilterAdd (154) | `vdbe-bloom-filter-opcodes` |
 | 23 | `Ne` | consolidated | Compare + JumpIfNotTrue |  |
 | 24 | `Lt` | consolidated | Compare + JumpIfNotTrue |  |
 | 25 | `Le` | consolidated | Compare + JumpIfNotTrue |  |
@@ -313,11 +321,11 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 37 | `VDestroy` | direct | `VDestroyInstruction` | `vdbe-virtual-table-opcodes` |
 | 38 | `VBegin` | direct | `VBeginInstruction` | `vdbe-virtual-table-opcodes` |
 | 39 | `VRename` | direct | `VRenameInstruction` | `vdbe-virtual-table-opcodes` |
-| 40 | `OpenPseudo` | missing | — | `vdbe-open-ephemeral` |
+| 40 | `OpenPseudo` | direct | OpenPseudo (141) — evaluator-supported; not compiler-emitted | `vdbe-open-ephemeral` |
 | 41 | `Rewind` | direct | Rewind |  |
 | 42 | `Last` | direct | Last |  |
 | 43 | `Column` | divergent | Column (no DEFAULT operand for short records) | `vdbe-column-default-short-record` |
-| 44 | `ColumnHasField` | missing | — | `vdbe-typed-value-opcode-family` |
+| 44 | `ColumnHasField` | direct | ColumnHasField (150) |  |
 | 45 | `TypeCheck` | missing | — (affinity/CHECK scattered across write delegates) | `vdbe-typecheck-on-write` |
 | 46 | `ArrayEncode` | missing | — | `vdbe-typed-value-opcode-family` |
 | 47 | `ArrayDecode` | missing | — | `vdbe-typed-value-opcode-family` |
@@ -338,13 +346,13 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 62 | `Next` | direct | Next |  |
 | 63 | `Prev` | direct | Prev |  |
 | 64 | `Halt` | divergent | Halt (clean stop only; errors are .NET exceptions mapped at provider boundary) | `vdbe-halt-error-model` |
-| 65 | `HaltIfNull` | missing | — | `vdbe-scalar-control-opcodes` |
+| 65 | `HaltIfNull` | direct | HaltIfNull (78) — evaluator-supported; RAISE/NOT NULL enforced evaluator-side | `vdbe-halt-error-model` |
 | 66 | `Transaction` | divergent | BeginTransaction / CommitTransaction / RollbackTransaction | `vdbe-transaction-opcode-model` |
 | 67 | `AutoCommit` | consolidated | CommitTransaction |  |
 | 68 | `Savepoint` | direct | Savepoint / ReleaseSavepoint / RollbackToSavepoint (op enum split) |  |
 | 69 | `Goto` | direct | Goto |  |
-| 70 | `Gosub` | missing | — | `vdbe-trigger-subprogram-machinery` |
-| 71 | `Return` | missing | — | `vdbe-trigger-subprogram-machinery` |
+| 70 | `Gosub` | direct | Gosub (174) |  |
+| 71 | `Return` | direct | Return (175) |  |
 | 72 | `Program` | missing | — | `vdbe-trigger-subprogram-machinery` |
 | 73 | `ResetCount` | bydesign | — (change counting inside write delegates) |  |
 | 74 | `Integer` | consolidated | LoadConstant |  |
@@ -356,8 +364,8 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 80 | `RowId` | direct | RowId |  |
 | 81 | `IdxRowId` | missing | — | `vdbe-index-cursor-opcode-family` |
 | 82 | `SeekRowid` | direct | SeekRowid (folds Found/NotFound targets) | `vdbe-seek-op-family-partial` |
-| 83 | `SeekEnd` | missing | — | `vdbe-deferred-seek` |
-| 84 | `DeferredSeek` | missing | — | `vdbe-deferred-seek` |
+| 83 | `SeekEnd` | direct | SeekEnd (152) |  |
+| 84 | `DeferredSeek` | direct | DeferredSeek (151) |  |
 | 85 | `SeekGE` | missing | — | `vdbe-seek-op-family-partial` |
 | 86 | `SeekGT` | missing | — | `vdbe-seek-op-family-partial` |
 | 87 | `IdxInsert` | missing | — (index maintenance inside write delegates) | `vdbe-index-cursor-opcode-family` |
@@ -367,10 +375,10 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 91 | `IdxGT` | missing | — | `vdbe-index-cursor-opcode-family` |
 | 92 | `IdxLE` | missing | — | `vdbe-index-cursor-opcode-family` |
 | 93 | `IdxLT` | missing | — | `vdbe-index-cursor-opcode-family` |
-| 94 | `DecrJumpZero` | missing | — | `vdbe-scalar-control-opcodes` |
+| 94 | `DecrJumpZero` | direct | DecrJumpZero (168) |  |
 | 95 | `AggStep` | direct | AggStep | `vdbe-aggregate-overflow-semantics` |
 | 96 | `AggFinal` | direct | AggFinalize |  |
-| 97 | `AggValue` | missing | — | `vdbe-misc-cursor-opcodes` |
+| 97 | `AggValue` | direct | AggValue (147) |  |
 | 98 | `SorterOpen` | direct | OpenSorter |  |
 | 99 | `SorterInsert` | direct | SorterInsert |  |
 | 100 | `SorterCompare` | consolidated | SorterSort (comparison internal) |  |
@@ -390,10 +398,10 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 114 | `Delete` | direct | Delete |  |
 | 115 | `IdxDelete` | missing | — | `vdbe-index-cursor-opcode-family` |
 | 116 | `NewRowid` | divergent | — (allocation inside write-target Commit) | `vdbe-newrowid-semantics` |
-| 117 | `MustBeInt` | missing | — | `vdbe-scalar-control-opcodes` |
-| 118 | `SoftNull` | missing | — | `vdbe-scalar-control-opcodes` |
+| 117 | `MustBeInt` | direct | MustBeInt (169) |  |
+| 118 | `SoftNull` | direct | SoftNull (170) |  |
 | 119 | `NoConflict` | missing | — (uniqueness inside write delegates) | `vdbe-seek-op-family-partial` |
-| 120 | `NotExists` | missing | — | `vdbe-seek-op-family-partial` |
+| 120 | `NotExists` | direct | NotExists (76) — evaluator-supported; uniqueness probes run inside write delegates | `vdbe-seek-op-family-partial` |
 | 121 | `OffsetLimit` | consolidated | OffsetGate + LimitGate |  |
 | 122 | `OpenWrite` | direct | OpenWriteCursor |  |
 | 123 | `Copy` | direct | Copy |  |
@@ -404,7 +412,7 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 128 | `IndexMethodQuery` | ported (110) | `IndexMethodQueryInstruction` (+ Ahtola-only Next/Column/RowId/Insert/Delete 111-115) | `vdbe-index-method-opcodes` |
 | 129 | `ClearBtree` | bydesign | — (DDL tree-walked) | `vdbe-ddl-executed-by-treewalker` |
 | 130 | `Destroy` | bydesign | — (DDL tree-walked) | `vdbe-ddl-executed-by-treewalker` |
-| 131 | `ResetSorter` | missing | — | `vdbe-misc-cursor-opcodes` |
+| 131 | `ResetSorter` | direct | ResetSorter (146) |  |
 | 132 | `DropTable` | bydesign | — (DDL tree-walked) | `vdbe-ddl-executed-by-treewalker` |
 | 133 | `DropView` | bydesign | — (DDL tree-walked) | `vdbe-ddl-executed-by-treewalker` |
 | 134 | `DropIndex` | bydesign | — (DDL tree-walked) | `vdbe-ddl-executed-by-treewalker` |
@@ -426,9 +434,9 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 150 | `PopulateMaterializedViews` | missing | — | `vdbe-materialized-view-opcodes` |
 | 151 | `ShiftRight` | consolidated | Arithmetic(ShiftRight) |  |
 | 152 | `ShiftLeft` | consolidated | Arithmetic(ShiftLeft) |  |
-| 153 | `AddImm` | missing | — | `vdbe-scalar-control-opcodes` |
+| 153 | `AddImm` | direct | AddImm (172) |  |
 | 154 | `Variable` | direct | LoadParameter |  |
-| 155 | `ZeroOrNull` | missing | — | `vdbe-scalar-control-opcodes` |
+| 155 | `ZeroOrNull` | direct | ZeroOrNull (173) |  |
 | 156 | `Not` | bydesign | — (expression evaluator / JumpIf gates) |  |
 | 157 | `IsTrue` | consolidated | JumpIfNotTrue tri-state | `vdbe-comparison-opcode-consolidation` |
 | 158 | `Concat` | bydesign | — (expression evaluator: ApplyConcatenation) |  |
@@ -439,8 +447,8 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 163 | `ReadCookie` | missing | — | `vdbe-schema-cookie-opcodes` |
 | 164 | `SetCookie` | missing | — | `vdbe-schema-cookie-opcodes` |
 | 165 | `OpenEphemeral` | missing | — (OpenWorkTable is recursive-CTE-only) | `vdbe-open-ephemeral` |
-| 166 | `OpenAutoindex` | missing | — | `vdbe-autoindex-for-joins` |
-| 167 | `OpenDup` | missing | — | `vdbe-misc-cursor-opcodes` |
+| 166 | `OpenAutoindex` | direct | OpenAutoindex (149) |  |
+| 167 | `OpenDup` | direct | OpenDup (148) |  |
 | 168 | `Once` | missing | — | `vdbe-scalar-control-opcodes` |
 | 169 | `Found` | consolidated | SeekRowid FoundTarget |  |
 | 170 | `NotFound` | consolidated | SeekRowid NotFoundTarget |  |
@@ -453,71 +461,71 @@ Four pairs of **same-name/different-meaning** opcodes are landmines:
 | 177 | `AlterColumn` | bydesign | — (DDL tree-walked) | `vdbe-ddl-executed-by-treewalker` |
 | 178 | `MaxPgcnt` | missing | — | `vdbe-schema-cookie-opcodes` |
 | 179 | `JournalMode` | missing | — (journal_mode partially tree-walked) | `vdbe-schema-cookie-opcodes` |
-| 180 | `IfNeg` | missing | — | `vdbe-scalar-control-opcodes` |
-| 181 | `Sequence` | divergent | — (AUTOINCREMENT partial, delegate-side) | `vdbe-newrowid-semantics` |
-| 182 | `SequenceTest` | missing | — | `vdbe-newrowid-semantics` |
+| 180 | `IfNeg` | direct | IfNeg (167) |  |
+| 181 | `Sequence` | direct | Sequence (177) |  |
+| 182 | `SequenceTest` | direct | SequenceTest (178) |  |
 | 183 | `Explain` | divergent | VdbeExplain.cs (Ahtola opcode names, no p1-p5 columns) | `vdbe-explain-output-parity` |
 | 184 | `FkCounter` | divergent | — (FK checks inside write delegates) | `vdbe-fk-enforcement-opcodes` |
 | 185 | `FkIfZero` | divergent | — | `vdbe-fk-enforcement-opcodes` |
 | 186 | `FkCheck` | divergent | — | `vdbe-fk-enforcement-opcodes` |
-| 187 | `HashBuild` | missing | — | `vdbe-hash-join-opcodes` |
-| 188 | `HashDistinct` | missing | — | `vdbe-hash-join-opcodes` |
-| 189 | `HashBuildFinalize` | missing | — | `vdbe-hash-join-opcodes` |
-| 190 | `HashProbe` | missing | — | `vdbe-hash-join-opcodes` |
-| 191 | `HashNext` | missing | — | `vdbe-hash-join-opcodes` |
-| 192 | `HashClose` | missing | — | `vdbe-hash-join-opcodes` |
-| 193 | `HashClear` | missing | — | `vdbe-hash-join-opcodes` |
-| 194 | `HashMarkMatched` | missing | — | `vdbe-hash-join-opcodes` |
-| 195 | `HashResetMatched` | missing | — | `vdbe-hash-join-opcodes` |
-| 196 | `HashScanUnmatched` | missing | — | `vdbe-hash-join-opcodes` |
-| 197 | `HashNextUnmatched` | missing | — | `vdbe-hash-join-opcodes` |
-| 198 | `HashGraceInit` | missing | — | `vdbe-hash-join-opcodes` |
-| 199 | `HashGraceLoadPartition` | missing | — | `vdbe-hash-join-opcodes` |
-| 200 | `HashGraceNextProbe` | missing | — | `vdbe-hash-join-opcodes` |
-| 201 | `HashGraceAdvancePartition` | missing | — | `vdbe-hash-join-opcodes` |
+| 187 | `HashBuild` | direct | HashBuild (155) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 188 | `HashDistinct` | direct | HashDistinct (156) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 189 | `HashBuildFinalize` | direct | HashBuildFinalize (157) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 190 | `HashProbe` | direct | HashProbe (158) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 191 | `HashNext` | direct | HashNext (159) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 192 | `HashClose` | direct | HashClose (160) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 193 | `HashClear` | direct | HashClear (161) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 194 | `HashMarkMatched` | direct | HashMarkMatched (162) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 195 | `HashResetMatched` | direct | HashResetMatched (163) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 196 | `HashScanUnmatched` | direct | HashScanUnmatched (164) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 197 | `HashNextUnmatched` | direct | HashNextUnmatched (165) — evaluator-supported; joins run via VdbeHashJoinRuntime | `vdbe-hash-join-opcodes` |
+| 198 | `HashGraceInit` | bydesign | — (grace exists solely for disk spill; managed joins stay in memory) | `vdbe-hash-join-opcodes` |
+| 199 | `HashGraceLoadPartition` | bydesign | — (grace exists solely for disk spill; managed joins stay in memory) | `vdbe-hash-join-opcodes` |
+| 200 | `HashGraceNextProbe` | bydesign | — (grace exists solely for disk spill; managed joins stay in memory) | `vdbe-hash-join-opcodes` |
+| 201 | `HashGraceAdvancePartition` | bydesign | — (grace exists solely for disk spill; managed joins stay in memory) | `vdbe-hash-join-opcodes` |
 | 202 | `VacuumInto` | bydesign | — (tree-walked; file-backed source only) | `vdbe-ddl-executed-by-treewalker` |
 | 203 | `Vacuum` | bydesign | — (tree-walked) | `vdbe-ddl-executed-by-treewalker` |
 | 204 | `InitCdcVersion` | bydesign | — (tree-walked connection CDC) | `vdbe-cdc-opcode` |
 
-Status totals: bydesign 25, consolidated 40, direct 26, divergent 10, missing 103 (of 204).
+Status totals: bydesign 34 (30 + grace 4), consolidated 40, direct 75 (71 + index-method 4), divergent 9, missing 46 (of 204).
 
 ### 3.7 VDBE gap inventory
 
 | ID | Kind | Severity | Effort | Mapped fails | Cited | Summary |
 | --- | --- | --- | --- | ---: | ---: | --- |
 | `vdbe-ddl-executed-by-treewalker` | divergent | s4-intentional | L | 178 | 0 | Ahtola retains tree-walked catalog publication for ordinary DDL. Managed virtual-table create/drop/rename now execute their module callback through VCreate/VDestroy/VRename, while the surrounding catalog rewrite remains statement-atomic managed code. |
-| `vdbe-trigger-subprogram-machinery` | missing | s2-capability | L | 111 | 0 | No subprogram or subroutine machinery: triggers cannot fire from compiled DML because there is no Program opcode to invoke a sub-program with its own register frame, and… |
+| `vdbe-trigger-subprogram-machinery` | closed | s2-capability | L | 111 | 0 | Closed in two steps: trigger subprograms already ran via the `Program` opcode with their own register frames (opcodes 75, `ResumableStatement._subprogramStatements`), and the subroutine control opcodes `Gosub`/`Return`/`BeginSubrtn` were ported in 2026-09 (174–176) mirroring `op_gosub`/`op_return`/the shared Null\|BeginSubrtn arm. Return with a program counter past the end fails closed where Turso's loop returns Done — falling off a validated Ahtola program is an integrity error. |
 | `vdbe-insert-update-flag-semantics` | partial | s2-capability | M | 31 | 1 | Ahtola models UPDATE as its own opcode plus delegate mutation, with change counting present. Missing flag semantics: REQUIRE_SEEK (position-before-write), UPDATE_ROWID_CH… |
 | `vdbe-typecheck-on-write` | partial | s1-correctness | M | 31 | 15 | Turso centralizes write-time coercion in TypeCheck; Ahtola scatters it across write delegates and the compiler's NumericAffinityInstruction emission. The 148-case wrong-v… |
 | `vdbe-seek-op-family-partial` | partial | s2-capability | M | 21 | 0 | Ahtola consolidates point seeks into SeekRowid (with Found/NotFound targets folded in — a faithful merge of SeekRowid+Found/NotFound) and has SeekRowidRange for rowid ran… |
 | `vdbe-fk-enforcement-opcodes` | divergent | s2-capability | M | 17 | 7 | FK enforcement exists but lives in the write-target delegates, not opcodes. defer_foreign_keys and immediate checking work for common shapes; the divergence is structural… |
 | `vdbe-halt-error-model` | divergent | s2-capability | M | 16 | 0 | Turso's Halt terminates with a SQLite error code, message, and on_error disposition (abort/ignore/fail), and HaltIfNull raises constraint errors from NULL registers (RAIS… |
-| `vdbe-hash-join-opcodes` | missing | s3-perf | L | 15 | 3 | Entire hash-join execution family absent, including the grace (disk-partitioned) variant for outsized build sides and the unmatched-scan support for outer joins. Ahtola j… |
+| `vdbe-hash-join-opcodes` | divergent | s3-perf | L | 15 | 3 | The in-memory hash-join opcode family is fully ported (HashBuild…HashNextUnmatched, 155–165, with the `VdbeHashTable` runtime, validation, explain, and builder relocation). Production joins intentionally execute through `VdbeJoinOperatorPlan` + `VdbeHashJoinRuntime` (.NET iterators) instead of opcode emission — both layers are complete and tested. The grace (disk-partitioned) variants are not ported by design: they exist solely to spill oversized build sides, and the managed engine keeps hash joins fully in memory. |
 | `vdbe-transaction-opcode-model` | divergent | s4-intentional | S | 12 | 0 | Different factoring, verified semantics: Ahtola splits into Begin/Commit/Rollback opcodes over VdbeTransaction (register-snapshot stack) with savepoint trio Savepoint/Rel… |
 | `vdbe-newrowid-semantics` | divergent | s2-capability | S | 7 | 3 | Rowid allocation is delegated to the write target's Commit rather than a NewRowid opcode. The autoinc failure (explicit max-rowid insert followed by plain INSERT) suggest… |
 | `vdbe-column-default-short-record` | partial | s2-capability | S | 6 | 0 | Turso's Column carries the column's DEFAULT as an operand so rows physically written before ALTER TABLE ADD COLUMN read back the default. Ahtola's ColumnInstruction docum… |
 | `vdbe-index-cursor-opcode-family` | divergent | s2-capability | M | 6 | 0 | Turso has a full index-cursor family: range seeks with eq_only over index records, rowid extraction from index entries, index insert/delete with IdxInsertFlags (no-op dup… |
 | `vdbe-aggregate-overflow-semantics` | divergent | s1-correctness | S | 3 | 3 | SUM/TOTAL/AVG over very large REAL values: Ahtola diverges from SQLite/Turso on infinity/overflow results for float aggregates. Verify Kahan/compensated summation and int… |
 | `vdbe-autoindex-for-joins` | missing | s3-perf | M | 3 | 3 | Turso can build a transient auto-index when no usable index exists for a join. Combined with the missing cost-based join order (compilation entry), Ahtola's joins are O(N… |
-| `vdbe-checkpoint-opcode` | missing | s2-capability | S | 3 | 1 | Checkpoint coordination exists internally (storage layer) but there is no Checkpoint opcode, so `PRAGMA wal_checkpoint(...)` has no execution path — directly causes the t… |
+| `vdbe-checkpoint-opcode` | bydesign | s2-capability | S | 3 | 1 | `PRAGMA wal_checkpoint(...)` has a complete evaluator-side execution path (`ExecutePragmaWalCheckpoint`): MVCC checkpoints materialize and retire the logical log; classic-path engines checkpoint trivially; temp reports -1/-1. Turso instead emits a `Checkpoint` opcode — the divergence is structural, not a capability hole. No opcode is modeled. |
 | `vdbe-comparison-opcode-consolidation` | divergent | s4-intentional | S | 2 | 0 | Verified near-parity consolidation: Ahtola evaluates the comparison to a tri-state value (IS/IS NOT handled null-safely; NULL -> NULL; affinities applied per side; collat… |
 | `vdbe-cdc-opcode` | bydesign | s4-intentional | M | 0 | 0 | Public SQL CDC is implemented by the managed tree-walking connection: `capture_data_changes_conn` provisions pinned Turso V1/V2 tables, captures transactional rows/schema changes, and writes V2 COMMIT records. It deliberately has no VDBE `InitCdcVersion` opcode because Ahtola's DDL/connection-state execution is tree-walked. The managed replica journal remains separate. |
 | `vdbe-explain-output-parity` | partial | s3-perf | M | 1 | 0 | Ahtola has a real EXPLAIN implementation over its own opcode set, so output necessarily diverges from SQLite/Turso text (different opcode names, no p1-p5 operand columns)… |
 | `vdbe-open-ephemeral` | missing | s2-capability | M | 1 | 0 | No general-purpose ephemeral btree opcode: Turso materializes IN (...) sets, DISTINCT intermediates, subquery results, and auto-indexes into ephemeral tables with full cu… |
-| `vdbe-bloom-filter-opcodes` | missing | s3-perf | M | 0 | 0 | Turso builds a bloom filter over a join/IN side and probes it to skip btree seeks. Ahtola has no bloom machinery. NAME COLLISION: Ahtola's VdbeOpcode.Filter (12) is a row… |
+| `vdbe-bloom-filter-opcodes` | divergent | s3-perf | M | 0 | 0 | Bloom machinery is ported: `BloomFilter`/`BloomFilterAdd` (153–154) with the `VdbeBloomFilter` runtime and full builder relocation. NAME COLLISION: Ahtola's VdbeOpcode.Filter (12) is a row predicate — Turso's bloom-probe `Filter` maps to BloomFilter (153). Production join/IN plans do not emit bloom opcodes (no seek-skipping btree path needs them yet); the divergence is emission policy, not capability. |
 | `vdbe-coroutine-machinery` | divergent | s4-intentional | M | 0 | 0 | Turso implements co-routines (FROM-clause subqueries, scalar subqueries, CTEs) as register-machine coroutines with Yield; Ahtola uses .NET enumerators and dedicated runti… |
-| `vdbe-deferred-seek` | missing | s3-perf | M | 0 | 0 | DeferredSeek lets an index scan postpone the table-btree seek until a column outside the index is actually read (covering-index fast path); SeekEnd positions a cursor pas… |
+| `vdbe-deferred-seek` | closed | s3-perf | M | 0 | 0 | Closed: DeferredSeek (151) postpones the table-btree seek until a non-index column is read (covering-index fast path); SeekEnd (152) positions past the tail. Ported with evaluator arms and compound-builder relocation (2026-09). |
 | `vdbe-ext-window-buffer-family` | extension | s4-intentional | S | 0 | 0 | Ahtola-only buffered-window evaluation: the whole partition is buffered, then computed in one pass, enabling forward-looking and peer-relative frames cleanly. Semanticall… |
 | `vdbe-ext-worktable-and-gate-families` | extension | s4-intentional | S | 0 | 0 | Ahtola's higher-level opcode families: FIFO recursive work tables (recursive CTE), streaming join cursor, and gate opcodes that fuse what Turso does with primitive jump/c… |
 | `vdbe-index-method-opcodes` | partial | s4-intentional | M | 0 | 0 | Ported 2026-08-24 as a managed index-method foundation plus opcodes 107-115 (`IndexMethodCreate/Destroy/Optimize/Query` + Ahtola-only `Next/Column/RowId/Insert/Delete`); no existing opcode renumbered. See docs/managed-index-methods.md. |
 | `vdbe-integrity-check-opcode` | missing | s2-capability | M | 0 | 0 | PRAGMA integrity_check/quick_check needs the opcode-driven btree walk; Ahtola has no integrity checker. Pairs with the parser-layer pragma catch-all gap. |
 | `vdbe-materialized-view-opcodes` | missing | s4-intentional | L | 0 | 0 | Turso's incremental-materialized-view extension: CREATE MATERIALIZED VIEW, dependent-view capture in DML opcodes, MV cursor types. Parser layer confirms no Ahtola grammar… |
-| `vdbe-misc-cursor-opcodes` | missing | s3-perf | S | 0 | 0 | Micro-opcodes: ResetSorter (re-drain a sorter for correlated subqueries without rebuilding), AggValue (read aggregate mid-iteration), OpenDup (cheap cursor clone), Column… |
+| `vdbe-misc-cursor-opcodes` | closed | s3-perf | S | 0 | 0 | Closed: ResetSorter (146), AggValue (147), OpenDup (148), OpenAutoindex (149), ColumnHasField (150) all ported with evaluator arms, validation, explain, and builder relocation (2026-09). |
 | `vdbe-record-construction-model` | divergent | s4-intentional | M | 0 | 0 | No MakeRecord: Ahtola rows live as materialized SqlValue arrays end-to-end and are only encoded to SQLite record format by the pager when a page is written. Format parity… |
 | `vdbe-rowset-test` | missing | s3-perf | S | 0 | 0 | Ahtola's RowSet trio maps Turso's RowSetAdd/RowSetRead (insert + drain) but lacks RowSetTest, the membership probe used to deduplicate rowids from OR'd index scans. Witho… |
-| `vdbe-scalar-control-opcodes` | missing | s2-capability | S | 0 | 0 | Mostly compiler machinery Ahtola's different program shapes do not need (counter loops, init-once blocks). Two carry user-visible semantics that deserve a check when the… |
+| `vdbe-scalar-control-opcodes` | closed | s2-capability | S | 0 | 0 | Closed 2026-09: IfPos/IfNeg/DecrJumpZero/MustBeInt/SoftNull/MemMax/AddImm/ZeroOrNull ported (166–173) with exact Turso semantics — IfPos writes back the decremented value only on the jump path, DecrJumpZero raises datatype mismatch on non-integers, MustBeInt jumps or raises per its optional target. Ahtola compilers still build different program shapes (LimitGate/OffsetGate instead of counter loops), so emission diverges by design; engine-level parity is complete. |
 | `vdbe-schema-cookie-opcodes` | missing | s2-capability | M | 0 | 0 | No cookie opcodes: user_version/application_id read-write and schema-cookie validation (stale-schema detection, 'database schema has changed' errors) are not modeled at t… |
-| `vdbe-sequence-opcode-family` | missing | s4-intentional | M | 0 | 0 | Turso's CREATE SEQUENCE extension (8 opcodes), not SQLite syntax. Note: distinct from AUTOINCREMENT support (sqlite_sequence), which Ahtola partially has — see vdbe-newro… |
+| `vdbe-sequence-opcode-family` | closed | s4-intentional | M | 0 | 0 | The two SQLite-standard members are ported: `Sequence`/`SequenceTest` (177–178) mirror `op_sequence`/`op_sequence_test` per-cursor counters (cleared on Reset per SQLite cursor lifetime; Turso's reset persistence is an upstream `Vec::resize` artifact). The 8 CREATE SEQUENCE extension opcodes remain intentionally unadopted (not SQLite syntax, tracked separately). AUTOINCREMENT continues via `AutoIncrementTracker`. |
 | `vdbe-typed-value-opcode-family` | missing | s4-intentional | L | 0 | 0 | Turso's typed-values extension (arrays/structs/unions/UDTs) — 17 opcodes, none SQLite. Ahtola has not adopted the extension; no conformance corpus coverage. Record as ups… |
 | `vdbe-virtual-table-opcodes` | parity | s4-intentional | L | 0 | 0 | Managed VOpen/VFilter/VColumn/VNext production scans, VUpdate, lifecycle/transaction instructions, constraint-cost-order planning, and shared streaming TVF cursors support statically registered modules with durable private payloads. The native extension ABI and arbitrary loadable modules remain intentionally out of scope. |
 
@@ -1401,6 +1409,7 @@ aggregates because the EF Core provider depends on them).
 | **F2.38 — fifty-source-gap parity batch** | 2026-08-09 | Closed exactly 50 independently testable gaps from fresh v0.7.2 audits. **Connection/SQL (20):** ordered `percentile_disc` type preservation, cumulative rank, direct-fraction evaluation, and `ALL` rejection; unsigned composite date modifiers; DISTINCT aggregate ORDER BY; four `function_list` metadata defects (arity rows, window-capable type, flags/determinism, registered callbacks); distinct nested INSERT-trigger chains; four per-schema PRAGMA states; two pooled cache resets plus database busy-timeout reset; attachment timeout inheritance; and file-backed-main `:memory:` attachment. **Compiled expressions (17):** `IS TRUE`, `IS FALSE`, `IS NOT TRUE`, `IS NOT FALSE`, `BETWEEN`, `NOT BETWEEN`, `IN`, `NOT IN`, `AND`, `OR`, unary `NOT`, concat, arbitrary simple `CASE`, `LIKE`, `NOT LIKE`, `GLOB`, and `NOT GLOB` (including LIKE ESCAPE coverage). **Storage (13):** empty-only schema format zero; write-version, read-version, text-encoding, and b-tree-type enum validation; exact fragmented-byte accounting and untracked-gap rejection; literal 64-KiB WAL headers and persisted-zero rejection; restart sequence wrap; restart salt/WAL-index propagation; impossible commit-frame rejection across write/recovery/read; and short/unsafe rollback-journal header rejection. Broader MVCC savepoint atomicity, physical synchronous/locking behavior, and pointer-map auto-vacuum remain outside this closure claim. | 11 → 11 |
 | **F2.39 — next-50 transaction/schema remainder** | 2026-08-10 | Closed the remaining transaction/schema/ATTACH/MVCC items from the next-50 ledger (gaps 39–50). **MVCC write fidelity:** multi-row and trigger-body INSERT/UPDATE/DELETE mirror into `MvStore` via `ReportRowChange` (with concurrent rowid promotion); named SAVEPOINT / RELEASE / ROLLBACK TO watermarks on MVCC txs; `BEGIN CONCURRENT` scopes version-store mutations to **main only** (attached/temp writes rejected). **ATTACH layout:** fresh attachments inherit main page size and MVCC mode; initialized attachments reject page-size and journal-mode (MVCC vs WAL) mismatches; Turso-known URI options (`modeof`, `cache`, `immutable`, `vfs`, `cipher`, `hexkey`) accepted as no-ops. **REINDEX / EXPLAIN:** bare and collation REINDEX fan out temp→main→attached (Turso `collect_all_reindex_targets`) and reject under MVCC; EXPLAIN/EQP route attached schema-qualified inners. **Cap:** keep SQLite-default max 10 attachments (Turso unlimited left intentional). Residuals: full attach+MVCC multi-writer inheritance; multi-DB writes inside one classic transaction. | 11 → 11 |
 | **F2.40 — zero remaining `kind: partial`** | 2026-08-10 | Cleared all **18** inventory entries still marked `kind: partial`. **Code residual closed:** `vdbe-insert-update-flag-semantics` — `SkipLastRowid` freezes `last_insert_rowid` on Commit; multi-row intermediate then final Insert updates it; `UpdateRowidChange` forces pre-mutation old-rowid read; `SkipAllChangeCounts` covered (Turso has no PreferUpdate bit). **Promoted partial→parity (delivered claim complete):** seek family + SEARCH emission, typecheck-on-write slice, short-record defaults, ORDER BY elision, ATTACH supported slice, CTE materialization, duplicate PK rejection, pragma equals-form, RAISE messages, freelist DML path, hot-journal single-DB recovery, cache_size/savepoint surface. **Reclassified intentional (not incomplete ports):** EXPLAIN dialect policy; Hrana v2-only remote client; sync pool replica awareness (companion-not-shipped); WAL-index SHM multi-conn roadmap; MVCC checkpoint lock guard N/A on classic Stage-0. Inventory now **0 partial · 53 parity · 211 closed · 0 open**. Deeper work still tracked only under other entries (btree rebalance, super-journal, multi-table covering, P7/sync). | 11 → 11 |
+| **F2.41 — in-memory pager page model** | 2026-09-05 | Closed `pragma-in-memory-page-count-freelist-model`, found by behavioral probing against SQLite/Turso semantics. **Gap A:** the in-memory autocommit fast path never set `_inMemoryInitialized`, so `PRAGMA page_count` stayed 0 after CREATE TABLE/INDEX (SQLite reports header+root=2) and `max_page_count` enforcement compared against a stale zero count (unlimited catalog growth under `max_page_count=2`). **Gap B:** DROP shrank `page_count` and `freelist_count` was hardcoded 0 — the old comment claimed SQLite reports 0 for `:memory:`, but SQLite maintains a real freelist there. The model now mirrors SQLite's pager: first committed mutation materializes the header page; `page_count` is a high-water mark that only grows; dropped roots move onto the freelist; new b-trees consume freelist pages before growing; enforcement counts only growth beyond the mark. Tests: `InMemoryPageModelTests` (8). File-backed databases read real header fields, unaffected. | 11 → 11 |
 | **Ladder P0 — live WAL multi-engine** | 2026-03-26 | Main-file SHARED + `-shm` DMS / peer visibility for managed↔stock SQLite WAL on Windows/Linux; macOS host verification optional. Contract: `docs/wal-interoperability-contract.md`. | 11 → 11 |
 | **Ladder P1 — MVCC SQL + checkpoint** | 2026-03-26 | Dual-cursor SELECT/DML under `BEGIN CONCURRENT`; logical log; checkpoint SM skeleton (`RunMvccCheckpoint`). Residuals: schema cookie polish, full per-page SM. Contract: `docs/mvcc-port-contract.md`. | 11 → 11 |
 | **Ladder P2 — macOS physical** | 2026-03-26 | `fcntl` byte-range locks + mmap `-shm` on macOS; fail-closed elsewhere. Multi-engine claims on macOS still need host proof. | 11 → 11 |

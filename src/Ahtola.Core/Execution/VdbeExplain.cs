@@ -680,6 +680,89 @@ public static class VdbeExplain
                 0,
                 null,
                 $"goto {jumpIf.Target.Offset} if r[{jumpIf.Register.Index}]"),
+            IfPosInstruction ifPos => (
+                ifPos.Register.Index,
+                ifPos.Target.Offset,
+                (int)ifPos.DecrementBy,
+                null,
+                $"goto {ifPos.Target.Offset} if r[{ifPos.Register.Index}]>{ifPos.DecrementBy}"),
+            IfNegInstruction ifNeg => (
+                ifNeg.Register.Index,
+                ifNeg.Target.Offset,
+                0,
+                null,
+                $"goto {ifNeg.Target.Offset} if r[{ifNeg.Register.Index}]<0"),
+            DecrJumpZeroInstruction decrJumpZero => (
+                decrJumpZero.Register.Index,
+                decrJumpZero.Target.Offset,
+                0,
+                null,
+                $"r[{decrJumpZero.Register.Index}]--; goto {decrJumpZero.Target.Offset} if r[{decrJumpZero.Register.Index}]==0"),
+            MustBeIntInstruction mustBeInt => (
+                mustBeInt.Register.Index,
+                mustBeInt.Target?.Offset ?? 0,
+                0,
+                null,
+                mustBeInt.Target is { } target
+                    ? $"r[{mustBeInt.Register.Index}] must be integer, goto {target.Offset} if not"
+                    : $"r[{mustBeInt.Register.Index}] must be integer"),
+            SoftNullInstruction softNull => (
+                softNull.Register.Index,
+                0,
+                0,
+                null,
+                $"set r[{softNull.Register.Index}] to NULL (preserving record slots)"),
+            MemMaxInstruction memMax => (
+                memMax.Destination.Index,
+                memMax.Source.Index,
+                0,
+                null,
+                $"r[{memMax.Destination.Index}] = max(r[{memMax.Destination.Index}], r[{memMax.Source.Index}])"),
+            AddImmInstruction addImm => (
+                addImm.Register.Index,
+                (int)addImm.Value,
+                0,
+                null,
+                $"r[{addImm.Register.Index}] += {addImm.Value}"),
+            ZeroOrNullInstruction zeroOrNull => (
+                zeroOrNull.Destination.Index,
+                zeroOrNull.Left.Index,
+                zeroOrNull.Right.Index,
+                null,
+                $"r[{zeroOrNull.Destination.Index}] = NULL if r[{zeroOrNull.Left.Index}]==NULL or r[{zeroOrNull.Right.Index}]==NULL else 0"),
+            GosubInstruction gosub => (
+                gosub.ReturnRegister.Index,
+                gosub.Target.Offset,
+                0,
+                null,
+                $"r[{gosub.ReturnRegister.Index}] = pc+1; goto {gosub.Target.Offset}"),
+            ReturnInstruction @return => (
+                @return.ReturnRegister.Index,
+                0,
+                @return.CanFallThrough ? 1 : 0,
+                null,
+                $"return to r[{@return.ReturnRegister.Index}]"
+                    + (@return.CanFallThrough ? " (fallthrough allowed)" : string.Empty)),
+            BeginSubrtnInstruction beginSubrtn => (
+                beginSubrtn.Destination.Index,
+                beginSubrtn.DestinationEnd?.Index ?? 0,
+                0,
+                null,
+                beginSubrtn.DestinationEnd is { } end
+                    ? $"r[{beginSubrtn.Destination.Index}..r[{end.Index}] = NULL"
+                    : $"r[{beginSubrtn.Destination.Index}] = NULL"),
+            SequenceInstruction sequence => (
+                sequence.Cursor.Index,
+                sequence.Destination.Index,
+                0,
+                null,
+                $"r[{sequence.Destination.Index}] = cursor[{sequence.Cursor.Index}].seq++"),
+            SequenceTestInstruction sequenceTest => (
+                sequenceTest.Cursor.Index,
+                sequenceTest.Target.Offset,
+                sequenceTest.ValueRegister.Index,
+                null,
+                $"if cursor[{sequenceTest.Cursor.Index}].seq == 0 goto {sequenceTest.Target.Offset}; cursor[{sequenceTest.Cursor.Index}].seq++"),
             AggResetInstruction aggReset => (
                 aggReset.Accumulator.Index,
                 0,

@@ -163,8 +163,21 @@ public sealed class VdbeSchemaRuntimeTests
         ((int)VdbeOpcode.HashResetMatched).Should().Be(163);
         ((int)VdbeOpcode.HashScanUnmatched).Should().Be(164);
         ((int)VdbeOpcode.HashNextUnmatched).Should().Be(165);
+        ((int)VdbeOpcode.IfPos).Should().Be(166);
+        ((int)VdbeOpcode.IfNeg).Should().Be(167);
+        ((int)VdbeOpcode.DecrJumpZero).Should().Be(168);
+        ((int)VdbeOpcode.MustBeInt).Should().Be(169);
+        ((int)VdbeOpcode.SoftNull).Should().Be(170);
+        ((int)VdbeOpcode.MemMax).Should().Be(171);
+        ((int)VdbeOpcode.AddImm).Should().Be(172);
+        ((int)VdbeOpcode.ZeroOrNull).Should().Be(173);
+        ((int)VdbeOpcode.Gosub).Should().Be(174);
+        ((int)VdbeOpcode.Return).Should().Be(175);
+        ((int)VdbeOpcode.BeginSubrtn).Should().Be(176);
+        ((int)VdbeOpcode.Sequence).Should().Be(177);
+        ((int)VdbeOpcode.SequenceTest).Should().Be(178);
 
-        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(165);
+        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(178);
     }
 
     [Test]

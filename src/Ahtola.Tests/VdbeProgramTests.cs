@@ -54,7 +54,11 @@ public class VdbeProgramTests
                 "SeekEnd=152", "BloomFilter=153", "BloomFilterAdd=154", "HashBuild=155",
                 "HashDistinct=156", "HashBuildFinalize=157", "HashProbe=158",
                 "HashNext=159", "HashClose=160", "HashClear=161", "HashMarkMatched=162",
-                "HashResetMatched=163", "HashScanUnmatched=164", "HashNextUnmatched=165");
+                "HashResetMatched=163", "HashScanUnmatched=164", "HashNextUnmatched=165",
+                "IfPos=166", "IfNeg=167", "DecrJumpZero=168", "MustBeInt=169",
+                "SoftNull=170", "MemMax=171", "AddImm=172", "ZeroOrNull=173",
+                "Gosub=174", "Return=175", "BeginSubrtn=176",
+                "Sequence=177", "SequenceTest=178");
 
         var constructors = typeof(VdbeProgram).GetConstructors();
         Type[] legacyParameterTypes =
