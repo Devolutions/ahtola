@@ -1629,6 +1629,30 @@ FTS5/R-Tree shadow storage, and embedded sync-history rewrites. Foreign SQLite
 R-Tree shadow layouts are rejected explicitly; Ahtola does not claim two-way
 file interoperability for payload-backed virtual tables.
 
+### F7 — inventory housekeeping (2026-09-05)
+
+Record-keeping only; no engine behavior changed. An exhaustive review of the
+55 `s4-intentional` entries found 9 whose 2026-08-06 closure rationales
+predated later waves: the three `mvcc-*` entries still claimed MVCC was
+fail-closed/ignored (superseded by the MVCC phases 1–3.7 port,
+`docs/mvcc-port-contract.md`), and six `sync-*` entries still cited the
+companion-not-shipped scope for CDC, MVCC-logical replay, page-protocol
+pull, partial/query bootstrap, the EF sync surface, and the checkpoint
+policy (all superseded by the managed sync engine, roadmap workstream
+`sync-engine-depth`). Each entry received a dated `Reconciled 2026-09-05`
+postscript and a corrected `ahtola_ref` pointing at the shipped
+implementation; original rationale text is preserved per the append-only
+audit-trail convention. The meta block was repaired (`entry_count` 216 →
+217, recounted `counts` including the `pragma` layer and the
+`intentional-divergence` kind, `last_reconciled` → 2026-09-05, schema
+enums extended, `conformance_links` documented as historical keys, and a
+note that the 2 remaining expected failures are the intentional
+STORED-generated-column markers). The actionable s4 remainder —
+SEQUENCE family, typed values, materialized views, multi-DB atomic
+commit, and the generated-column error-message split — stays
+`s4-intentional` pending an explicit product decision; this wave records
+that status, it does not flip it.
+
 
 ## Appendix A — Inventory JSON schema
 
@@ -1683,7 +1707,9 @@ they are listed below for completeness — absence of mapped failures means
 ## Appendix C — Entries with zero mapped failure lines (by layer)
 
 > Historical source-evidence list from analysis time. As of F5 the live
-> inventory is **0 open / 216 closed**; entries below may be closed intentional
+> inventory is **0 open / 217 closed** (216 after F5, plus the 2026-09-05
+> `pragma`-layer entry `pragma-in-memory-page-count-freelist-model`);
+> entries below may be closed intentional
 > or delivered surfaces that simply had no conf corpus line.
 
 - **vdbe** (16): `vdbe-bloom-filter-opcodes`, `vdbe-virtual-table-opcodes`, `vdbe-index-method-opcodes`, `vdbe-schema-cookie-opcodes`, `vdbe-deferred-seek`, `vdbe-rowset-test`, `vdbe-record-construction-model`, `vdbe-scalar-control-opcodes`, `vdbe-integrity-check-opcode`, `vdbe-coroutine-machinery`, `vdbe-misc-cursor-opcodes`, `vdbe-typed-value-opcode-family`, `vdbe-sequence-opcode-family`, `vdbe-materialized-view-opcodes`, `vdbe-ext-window-buffer-family`, `vdbe-ext-worktable-and-gate-families`

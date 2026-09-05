@@ -15,51 +15,52 @@
     },
     "conformance_ground_truth": "src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt (606 failure lines at analysis time)",
     "current_conformance_expected_failures": 2,
-    "last_reconciled": "2026-08-31",
-    "entry_count": 216,
+    "current_conformance_expected_failures_note": "The 2 remaining expected failures are intentional SQLite-compatible extensions: gencol.sqltest::gencol_stored_rejected and gencol.sqltest::gencol_stored_generated_always_rejected (Ahtola accepts STORED generated columns where the pinned Turso corpus expects rejection).",
+    "last_reconciled": "2026-09-05",
+    "entry_count": 217,
     "counts": {
       "by_layer": {
+        "vdbe": 38,
         "compilation": 68,
-        "functions": 26,
-        "mvcc": 14,
         "parser": 29,
+        "functions": 26,
         "storage": 23,
+        "mvcc": 14,
         "sync": 18,
-        "vdbe": 38
+        "pragma": 1
       },
       "by_kind": {
+        "missing": 69,
+        "partial": 8,
         "divergent": 73,
         "extension": 9,
-        "intentional-divergence": 1,
-        "missing": 70,
-        "parity": 56,
-        "partial": 7
+        "parity": 57,
+        "intentional-divergence": 1
       },
       "by_severity": {
         "s1-correctness": 39,
-        "s2-capability": 89,
+        "s2-capability": 90,
         "s3-perf": 33,
         "s4-intentional": 55
       },
       "by_effort": {
-        "L": 40,
+        "S": 101,
         "M": 76,
-        "S": 100
+        "L": 40
       },
       "by_status": {
-        "closed": 216,
-        "open": 0
+        "closed": 217
       }
     },
     "schema": {
       "id": "stable kebab-case, layer-prefixed (vdbe-, compile-, parser-, func-, storage-, mvcc-, sync-)",
-      "layer": "vdbe | compilation | parser | functions | storage | mvcc | sync",
-      "kind": "missing (no Ahtola counterpart) | partial (subset ported) | divergent (both exist, behavior differs) | extension (Ahtola-only) | parity (audited, no gap; status closed)",
+      "layer": "vdbe | compilation | parser | functions | storage | mvcc | sync | pragma",
+      "kind": "missing (no Ahtola counterpart) | partial (subset ported) | divergent (both exist, behavior differs) | extension (Ahtola-only) | parity (audited, no gap; status closed) | intentional-divergence (documented deliberate divergence with no upstream counterpart to port)",
       "turso_ref": "upstream file::symbol citation inside turso-src/ at the pinned tag",
       "ahtola_ref": "Ahtola source citation, or \"none\"",
       "severity": "s1-correctness (wrong results) | s2-capability (SQL surface blocked) | s3-perf | s4-intentional (documented product divergence)",
       "effort": "S | M | L (rough porting cost)",
-      "conformance_links": "failure keys file.sqltest::test-name from the expected-failures file; empty = source-evidence-only gap",
+      "conformance_links": "historical failure keys (file.sqltest::test-name) that mapped to this entry at analysis time; they were removed from the expected-failures file when the gap closed, so they no longer appear there; empty = source-evidence-only gap",
       "notes": "finding detail and porting guidance",
       "status": "open | closed (flip to closed when the gap lands; drop resolved keys from the expected-failures file in the same change)"
     }
@@ -2380,11 +2381,11 @@
       "layer": "mvcc",
       "kind": "missing",
       "turso_ref": "turso-src/core/mvcc/database/mod.rs::drop_unused_row_versions, drop_unused_row_versions_and_slots, drop_unused_row_versions_inner (lines ~6995-7275)",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Core/Mvcc/MvStore.cs (row-version chains, GarbageCollectAfterCheckpoint), src/Ahtola.Core/Mvcc/EmbeddedMvStoreRegistry.cs; docs/mvcc-port-contract.md phases 1.5/3",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional classic-path-only scope. Managed Ahtola is the SQLite-compatible pager/WAL/b-tree engine; BEGIN CONCURRENT and PRAGMA journal_mode=mvcc are fail-closed / ignored (ManagedDocumentedBoundaryTests, ManagedAdvancedFeatureBoundaryTests). The 11 managed-sqltest expected failures remain MVCC-mode corpus markers, not a claim of concurrent correctness. Do not fake journal_mode=mvcc or a partial MvStore.",
+      "notes": "Closed 2026-08-06 as intentional classic-path-only scope. Managed Ahtola is the SQLite-compatible pager/WAL/b-tree engine; BEGIN CONCURRENT and PRAGMA journal_mode=mvcc are fail-closed / ignored (ManagedDocumentedBoundaryTests, ManagedAdvancedFeatureBoundaryTests). The 11 managed-sqltest expected failures remain MVCC-mode corpus markers, not a claim of concurrent correctness. Do not fake journal_mode=mvcc or a partial MvStore. Reconciled 2026-09-05: the 2026-08-06 classic-path-only rationale predates the MVCC port. Row-version chains (Insert/Update/Delete/TryRead/ScanVisible), commit stamp rewrite, rollback drop, and reader-generation-aware GC after checkpoint shipped with MVCC phases 1.5 and 3 (docs/mvcc-port-contract.md; MvccStoreUnitTests, MvccHeaderAndDualCursorTests, MvccCheckpointStateMachineTests). Remaining deliberate depth (full cooperative per-page checkpoint-state-machine parity) is tracked in docs/mvcc-port-contract.md, not here.",
       "status": "closed"
     },
     {
@@ -2392,11 +2393,11 @@
       "layer": "mvcc",
       "kind": "missing",
       "turso_ref": "turso-src/core/mvcc/cursor.rs::MvccCursorType, turso-src/core/vdbe/execute.rs::maybe_promote_to_mvcc_cursor, turso-src/core/mvcc/mod.rs::test_mvcc_dual_cursor_transaction_isolation",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Core/Mvcc/MvccDualCursor.cs (+ SQL SELECT/DML routing under concurrent scope, phase 3.5; page-native direct-index accessor, phase 3.7)",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional classic-path-only scope. Managed Ahtola is the SQLite-compatible pager/WAL/b-tree engine; BEGIN CONCURRENT and PRAGMA journal_mode=mvcc are fail-closed / ignored (ManagedDocumentedBoundaryTests, ManagedAdvancedFeatureBoundaryTests). The 11 managed-sqltest expected failures remain MVCC-mode corpus markers, not a claim of concurrent correctness. Do not fake journal_mode=mvcc or a partial MvStore.",
+      "notes": "Closed 2026-08-06 as intentional classic-path-only scope. Managed Ahtola is the SQLite-compatible pager/WAL/b-tree engine; BEGIN CONCURRENT and PRAGMA journal_mode=mvcc are fail-closed / ignored (ManagedDocumentedBoundaryTests, ManagedAdvancedFeatureBoundaryTests). The 11 managed-sqltest expected failures remain MVCC-mode corpus markers, not a claim of concurrent correctness. Do not fake journal_mode=mvcc or a partial MvStore. Reconciled 2026-09-05: the 2026-08-06 classic-path-only rationale predates the MVCC port. Typed dual cursors over base B-trees and version chains (two-peek merge per core/mvcc/cursor.rs), snapshot isolation after peer commit, and first-committer-wins on typed identities shipped with MVCC phases 3.5/3.7, including page-native direct-index access for eligible index paths (MvccSelectDualCursorRoutingTests). Cross-process scope remains process-local by design.",
       "status": "closed"
     },
     {
@@ -2404,11 +2405,11 @@
       "layer": "mvcc",
       "kind": "missing",
       "turso_ref": "turso-src/core/mvcc/persistent_storage/logical_log.rs, turso-src/core/mvcc/persistent_storage/mod.rs, turso-src/core/mvcc/database/checkpoint_state_machine.rs::CheckpointStateMachine, BootstrapState",
-      "ahtola_ref": "src/Ahtola.Core/Storage/SqliteWalWriterCheckpointCoordinator.cs (classic WAL checkpoint only)",
+      "ahtola_ref": "src/Ahtola.Core/Mvcc/MvccLogicalLog.cs (durable *.db-log, LML2/MVTX framing, CRC32C, encrypted payload chunks), MvccCheckpoint + EmbeddedDatabase.RunMvccCheckpoint; docs/mvcc-port-contract.md phases 2/3.6",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional classic-path-only scope. Managed Ahtola is the SQLite-compatible pager/WAL/b-tree engine; BEGIN CONCURRENT and PRAGMA journal_mode=mvcc are fail-closed / ignored (ManagedDocumentedBoundaryTests, ManagedAdvancedFeatureBoundaryTests). The 11 managed-sqltest expected failures remain MVCC-mode corpus markers, not a claim of concurrent correctness. Do not fake journal_mode=mvcc or a partial MvStore.",
+      "notes": "Closed 2026-08-06 as intentional classic-path-only scope. Managed Ahtola is the SQLite-compatible pager/WAL/b-tree engine; BEGIN CONCURRENT and PRAGMA journal_mode=mvcc are fail-closed / ignored (ManagedDocumentedBoundaryTests, ManagedAdvancedFeatureBoundaryTests). The 11 managed-sqltest expected failures remain MVCC-mode corpus markers, not a claim of concurrent correctness. Do not fake journal_mode=mvcc or a partial MvStore. Reconciled 2026-09-05: the 2026-08-06 classic-path-only rationale predates the MVCC port. The durable logical log with Turso LML2/MVTX framing constants (plus encrypted-database AES-GCM payload chunks), header version 255 via SwitchJournalMode(Mvcc), cold-open replay, and the crash-ordered synchronous page-WAL checkpoint state machine shipped with MVCC phases 2, 3, and 3.6 (MvccCheckpointStateMachineTests). The synchronous adaptation of Turso's cooperative per-page I/O state machine remains the recorded divergence in docs/mvcc-port-contract.md.",
       "status": "closed"
     },
     {
@@ -2527,11 +2528,11 @@
       "layer": "sync",
       "kind": "missing",
       "turso_ref": "turso-src/sync/engine/src/database_sync_engine.rs::CDC_PRAGMA_NAME, acknowledge_existing_cdc_for_client, max_local_change_id, count_local_changes",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Core/ChangeDataCapture.cs (PRAGMA capture_data_changes_conn, V1/V2 CDC tables, transactional COMMIT records)",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Reconciled 2026-09-05: the 2026-08-06 companion-not-shipped rationale predates the managed CDC surface. PRAGMA capture_data_changes_conn implements Turso v0.7.2's per-connection V1/V2 change-capture tables and transactional COMMIT records (README \"SQL CDC\"; ManagedChangeDataCaptureTests, ManagedReplicaChangeCaptureBridgeTests). It remains independent of the managed replica's private journal and is not a full logical-replication replay engine.",
       "status": "closed"
     },
     {
@@ -2551,11 +2552,11 @@
       "layer": "sync",
       "kind": "missing",
       "turso_ref": "turso-src/sync/engine/src/client_proto.rs::LogicalOp/LogicalTxnData/LogicalOpType, turso-src/sync/engine/src/database_replay_generator.rs (INSERT ... ON CONFLICT replay), turso-src/sync/engine/src/server_proto.rs::MvccLogicalLogRangeProto/MvccLogicalLogMetadataProto",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Data/ManagedReplicaConnectionHost.cs + ManagedReplicaBootstrapper.cs (persisted Pages/MvccLogical protocol detection, LML3 logical replay)",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Reconciled 2026-09-05: the 2026-08-06 companion-not-shipped rationale predates the managed sync engine. The managed replica detects and persists physical-page vs MVCC-logical protocols explicitly and replays LML3 logical transactions (roadmap workstream sync-engine-depth, closed 2026-08-29). Turso's native sdk-kit remains intentionally not ported (sync-sdk-kit-native-companion-intentional).",
       "status": "closed"
     },
     {
@@ -2563,11 +2564,11 @@
       "layer": "sync",
       "kind": "missing",
       "turso_ref": "turso-src/sync/engine/src/server_proto.rs::PullUpdatesReqProtoBody/PullUpdatesRespProtoBody/PageData/PageUpdatesEncodingReq/PageSetZstdEncodingProto",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Data/ManagedReplicaConnectionHost.cs (raw page-protocol pull: explicit raw PagesEncodingReq=0 negotiation, fail-closed zstd rejection)",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Updated 2026-08-23: the managed request writer now emits PullUpdatesReqProtoBody tag 7 (server_query_selector, UTF-8 string) for query bootstrap, mutually exclusive with tag 5 (server_pages_selector) and only on the single bootstrap request; zstd stays rejected.",
+      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Updated 2026-08-23: the managed request writer now emits PullUpdatesReqProtoBody tag 7 (server_query_selector, UTF-8 string) for query bootstrap, mutually exclusive with tag 5 (server_pages_selector) and only on the single bootstrap request; zstd stays rejected. Reconciled 2026-09-05: the 2026-08-06 companion-not-shipped rationale predates the managed sync engine. Raw page-protocol pulls are decoded and applied by the managed replica with explicit raw-encoding negotiation; zstd-compressed page sets remain fail-closed because no approved pure-managed, trim-safe zstd implementation is shipped (deliberate, documented choice).",
       "status": "closed"
     },
     {
@@ -2659,11 +2660,11 @@
       "layer": "sync",
       "kind": "missing",
       "turso_ref": "turso-src/sync/engine/src/database_sync_lazy_storage.rs::DatabaseSyncLazyStorage (segment-based lazy page fetch, prefetch)",
-      "ahtola_ref": "src/Ahtola.Data/AhtolaSyncOptions.cs::AhtolaPartialBootstrapOptions (Prefix/Query, SegmentSize, Prefetch)",
+      "ahtola_ref": "src/Ahtola.Data/AhtolaSyncOptions.cs::AhtolaPartialBootstrapOptions (Prefix/QueryPages, durable page-state sidecar, lazy page faulting); docs/replica-bootstrap-publication.md",
       "severity": "s4-intentional",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Updated 2026-08-23: the managed replica now also supports Query selection (AhtolaPartialBootstrapOptions.QueryPages) end to end, reusing the same arbitrary-range sidecar, lazy materializer, coalescing, ownership and publication ordering as Prefix. Residuals: it requires a remote that honours Turso's server_query_selector (the vendored dev server ignores tag 7 by design, so all coverage is fake-server based), and the run-list sidecar costs one run per page for worst-case scattered selections.",
+      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Updated 2026-08-23: the managed replica now also supports Query selection (AhtolaPartialBootstrapOptions.QueryPages) end to end, reusing the same arbitrary-range sidecar, lazy materializer, coalescing, ownership and publication ordering as Prefix. Residuals: it requires a remote that honours Turso's server_query_selector (the vendored dev server ignores tag 7 by design, so all coverage is fake-server based), and the run-list sidecar costs one run per page for worst-case scattered selections. Reconciled 2026-09-05: the 2026-08-06 companion-not-shipped rationale predates the managed sync engine. Sparse prefix and server_query_selector query bootstraps install a durable page-state sidecar and fault missing pages from the pinned bootstrap revision (docs/replica-bootstrap-publication.md). Mutual exclusion with remote encryption, the QueryPages/PullBytesThreshold conflict, and the tag-7 dev-server caveat remain documented boundaries.",
       "status": "closed"
     },
     {
@@ -2683,11 +2684,11 @@
       "layer": "sync",
       "kind": "missing",
       "turso_ref": "turso-src/sync/engine/src/database_sync_engine.rs (whole module, as consumed conceptually by any embedding SDK)",
-      "ahtola_ref": "src/Ahtola.EntityFrameworkCore.Sqlite (UseAhtola extension surface)",
+      "ahtola_ref": "src/Ahtola.EntityFrameworkCore.Sqlite/AhtolaDbContextOptionsBuilderExtensions.cs (UseAhtola: AhtolaConnectionMode.EmbeddedReplica + AhtolaReplicaSqliteQueryGeneratorFactory)",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Reconciled 2026-09-05: the 2026-08-06 companion-not-shipped rationale predates the managed sync engine. UseAhtola recognizes embedded-replica connection strings and swaps in the replica-aware query SQL generator factory (AhtolaConnectionModeClassifier/AhtolaConnectionMode.EmbeddedReplica); migrations/history stay at EF's default relational surface. The optional native Turso.Data.Sync companion remains intentionally not shipped.",
       "status": "closed"
     },
     {
@@ -2707,11 +2708,11 @@
       "layer": "sync",
       "kind": "divergent",
       "turso_ref": "turso-src/sync/engine/src/database_sync_engine.rs::checkpoint (turso_core::CheckpointMode::Truncate / CheckpointMode::Passive)",
-      "ahtola_ref": "none (no CheckpointMode consumer in Ahtola.Data sync path; Ahtola.Core WAL checkpoint is out of this layer's scope)",
+      "ahtola_ref": "src/Ahtola.Data/ManagedReplicaRevertWal.cs (CaptureAndCheckpoint recovery bundle), src/Ahtola.Core/Storage/SqliteWalWriterCheckpointCoordinator.cs (CheckpointPassiveValidated)",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work.",
+      "notes": "Closed 2026-08-06 as intentional companion-not-shipped scope (with sync-sdk-kit-native-companion-intentional / sync-native-provider-companion-intentional). README: Native/Sync companions are not shipped from this repo and fail closed. AhtolaReplicaProvider loads Turso.Data.Sync when present and throws NotSupportedException otherwise; DTOs/options without an in-tree engine are not a managed sync port. Satellite gaps (CDC, revert-WAL, page pull, EF surface, pool wait_changes) are features of that missing companion, not independent managed work. Reconciled 2026-09-05: the 2026-08-06 companion-not-shipped rationale predates the managed sync engine. The managed equivalent of Turso's passive synced-prefix/history checkpoint policy shipped with roadmap workstream sync-engine-depth (closed 2026-08-29): ManagedReplicaRevertWal.CaptureAndCheckpoint publishes a complete pre-checkpoint page image through ambiguous push outcomes, and CheckpointPassiveValidated exposes an inclusive safe-backfill watermark bound to WAL salts and the WAL-index change counter. Turso's reusable revert-WAL page replay is intentionally not mirrored on the MVCC-logical path (no page-frame watermark is invented for logical transactions).",
       "status": "closed"
     },
     {
