@@ -175,7 +175,7 @@
       "severity": "s2-capability",
       "effort": "L",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 for the managed trigger/FK execution model. SQL triggers run via EmbeddedDatabase.Triggers treewalker (full conf trigger surface); VdbeSubprogram/ProgramInstruction lower trigger-free self-referential ON DELETE/UPDATE CASCADE and SET NULL. Evidence: ManagedForeignKeyFullSemanticsTests.SelfReferential*. Residual Gosub/Return/BeginSubrtn and multi-FK cross-table Program lowering are optional VDBE shape parity, not a blocked trigger capability.",
+      "notes": "Closed 2026-08-06 for the managed trigger/FK execution model; subroutine opcodes landed 2026-09. SQL triggers run via EmbeddedDatabase.Triggers treewalker (full conf trigger surface); VdbeSubprogram/ProgramInstruction lower trigger-free self-referential ON DELETE/UPDATE CASCADE and SET NULL. Evidence: ManagedForeignKeyFullSemanticsTests.SelfReferential*. The residual Gosub/Return/BeginSubrtn VDBE shape parity was completed 2026-09 (opcodes 174-176, mirroring op_gosub/op_return and the shared Null|BeginSubrtn arm) with builder relocation and explain support; multi-FK cross-table Program lowering remains a compile-shape choice, not an engine gap.",
       "status": "closed"
     },
     {
@@ -235,7 +235,7 @@
       "severity": "s3-perf",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as a future covering-index optimization tracked by compile-select-compiler-no-multi-table-covering-index. Correctness does not depend on DeferredSeek/SeekEnd; port them with the planner that can prove index coverage.",
+      "notes": "Opcode parity landed 2026-09: DeferredSeek (151) and SeekEnd (152) are ported with evaluator arms and compound-builder relocation, mirroring op_deferred_seek and op_seek_end. Production compilers do not yet emit them (covering-index planning remains tracked by compile-select-compiler-no-multi-table-covering-index); the opcodes are ready for that planner.",
       "status": "closed"
     },
     {
@@ -359,7 +359,7 @@
       "severity": "s2-capability",
       "effort": "S",
       "conformance_links": [],
-      "notes": "Audited as parity. Ahtola intentionally does not model Turso's register-level control opcodes one-for-one: its program shapes inline the required behavior. TryCoerceRowid matches MustBeInt's finite, integral, strict-i64-bound coercion and 'datatype mismatch' failure; constraint enforcement supplies HaltIfNull's NOT NULL error and conflict policy; AutoIncrementTracker maintains MemMax's monotonic AUTOINCREMENT high-water mark. The remaining opcodes are program-shape machinery with no independent SQL surface.",
+      "notes": "Opcode-level parity landed 2026-09: IfPos/IfNeg/DecrJumpZero/MustBeInt/SoftNull/MemMax/AddImm/ZeroOrNull are ported (166-173) with exact Turso semantics and builder relocation. Ahtola's compilers intentionally build different program shapes (LimitGate/OffsetGate instead of counter loops; rowid coercion evaluator-side via TryCoerceRowid; constraint enforcement supplies HaltIfNull's NOT NULL error; AutoIncrementTracker maintains MemMax's monotonic high-water mark), so emission diverges by design while engine-level parity is complete. HaltIfNull (78) remains evaluator-supported without compiler emission.",
       "status": "closed"
     },
     {
@@ -431,7 +431,7 @@
       "severity": "s3-perf",
       "effort": "S",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as structural parity. ResetSorter, AggValue, OpenDup, and ColumnsUsed are Turso program-shape/performance machinery with no independent SQL surface in the shapes Ahtola currently plans. OffsetLimit maps faithfully onto Ahtola's OffsetGate/LimitGate pair. Any future planner that needs sorter redraining, mid-iteration aggregate reads, or cursor cloning should add the corresponding machinery with its feature, not as dead opcodes now.",
+      "notes": "Opcode parity landed 2026-09: ResetSorter (146), AggValue (147), OpenDup (148), OpenAutoindex (149), and ColumnHasField (150) are ported with evaluator arms, validation, explain, and builder relocation. ColumnsUsed remains unported program-shape machinery with no independent SQL surface. OffsetLimit maps faithfully onto Ahtola's OffsetGate/LimitGate pair.",
       "status": "closed"
     },
     {
@@ -467,7 +467,7 @@
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as an unadopted Turso-only CREATE SEQUENCE extension. AUTOINCREMENT/sqlite_sequence support is tracked separately and is not part of this opcode family.",
+      "notes": "The two SQLite-standard members landed 2026-09: Sequence/SequenceTest (177-178) mirror op_sequence/op_sequence_test per-cursor counters, cleared on Reset per SQLite cursor lifetime (Turso's reset persistence is an upstream Vec::resize artifact). The remaining 6 opcodes (AddSequence, DropSequence, NextSequenceValue, ResetSequenceValue, CopySequenceValue, SequenceRegisterAllocation) stay unadopted as the Turso-only CREATE SEQUENCE extension. AUTOINCREMENT/sqlite_sequence support is tracked separately and is not part of this opcode family.",
       "status": "closed"
     },
     {
