@@ -14,6 +14,8 @@ internal enum VdbeSpillFileKind : byte
     KeyedRowSetIndex = 6,
     WindowBuffer = 7,
     WorkTableFrontier = 8,
+    EphemeralTable = 9,
+    EphemeralTableIndex = 10,
 }
 
 internal sealed class VdbeTemporaryFile : IDisposable

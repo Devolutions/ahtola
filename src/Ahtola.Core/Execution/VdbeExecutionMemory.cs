@@ -55,6 +55,8 @@ public sealed class VdbeExecutionMetrics
 
     public long WorkTableFrontiersSpilled { get; private set; }
 
+    public long EphemeralTablesSpilled { get; private set; }
+
     internal void Retain(long bytes, long rows)
     {
         CurrentRetainedBytes = checked(CurrentRetainedBytes + bytes);
@@ -109,6 +111,9 @@ public sealed class VdbeExecutionMetrics
 
     internal void WorkTableFrontierSpilled() =>
         WorkTableFrontiersSpilled = checked(WorkTableFrontiersSpilled + 1);
+
+    internal void EphemeralTableSpilled() =>
+        EphemeralTablesSpilled = checked(EphemeralTablesSpilled + 1);
 }
 
 internal sealed class VdbeExecutionMemory(long limitBytes, VdbeExecutionMetrics metrics)
@@ -258,6 +263,7 @@ internal static class VdbeManagedFootprint
     private const long KeyedRowSetSpillObjectBytes = 104;
     private const long WindowBufferSpillObjectBytes = 96;
     private const long WorkTableFrontierSpillObjectBytes = 96;
+    private const long EphemeralTableSpillObjectBytes = 96;
     private const long HashPartitionObjectBytes = 32;
     private const long TemporaryFileObjectBytes = 64;
     private const long TemporaryFileWrapperBytes = 128;
@@ -434,6 +440,19 @@ internal static class VdbeManagedFootprint
             + EstimateTemporaryFileInfrastructure(
                 temporaryDirectory.Length,
                 "worktable-frontier".Length));
+    }
+
+    public static long EstimateEphemeralTableSpillInfrastructure(string temporaryDirectory)
+    {
+        ArgumentNullException.ThrowIfNull(temporaryDirectory);
+        return checked(
+            EphemeralTableSpillObjectBytes
+            + EstimateTemporaryFileInfrastructure(
+                temporaryDirectory.Length,
+                "ephemeral-table".Length)
+            + EstimateTemporaryFileInfrastructure(
+                temporaryDirectory.Length,
+                "ephemeral-index".Length));
     }
 
     public static int GetListCapacityForCount(int currentCapacity, int requiredCount)

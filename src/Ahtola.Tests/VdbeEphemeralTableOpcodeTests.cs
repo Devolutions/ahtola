@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using Ahtola.Core;
 using Ahtola.Core.Execution;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
 
@@ -131,5 +132,93 @@ public sealed class VdbeEphemeralTableOpcodeTests
         p2.Should().Be(4);
         comment.Should().Contain("ephemeral");
         open.Opcode.Should().Be(VdbeOpcode.OpenEphemeral);
+    }
+
+    [Test]
+    public void EphemeralTableSpillsAndPreservesScanOrderAndRowIds()
+    {
+        // Insert enough text rows to cross a budget that can hold only a couple of them, then scan:
+        // the spill must preserve insertion order, the sequential rowids, and every value.
+        const string temporaryDirectory = "ephemeral-spill-scan-tests";
+        const int rowCount = 12;
+
+        // Assemble the drain loop by hand: open -> (load+insert)*n -> rewind -> column -> result
+        // -> next -> close -> halt.
+        var body = new List<VdbeInstruction>
+        {
+            new OpenEphemeralInstruction(new Cursor(0), ColumnCount: 1),
+        };
+        for (var index = 0; index < rowCount; index++)
+        {
+            body.Add(new LoadConstantInstruction(new Register(0), SqlValue.Text(new string('v', 64) + index.ToString("00"))));
+            body.Add(new EphemeralInsertInstruction(new Cursor(0), new RegisterRange(new Register(0), 1)));
+        }
+
+        var loopTop = body.Count;
+        var doneTarget = new ProgramCounter(loopTop + 4);
+        body.Add(new RewindCursorInstruction(new Cursor(0), doneTarget));
+        body.Add(new ColumnInstruction(new Cursor(0), ColumnIndex: 0, new Register(2)));
+        body.Add(new ResultRowInstruction(new RegisterRange(new Register(2), 1)));
+        body.Add(new NextInstruction(new Cursor(0), new ProgramCounter(loopTop + 1)));
+        body.Add(new CloseCursorInstruction(new Cursor(0)));
+        body.Add(new HaltInstruction());
+
+        var program = new VdbeProgram(registerCount: 3, cursorCount: 1, [.. body]);
+
+        var sample = new[] { SqlValue.Text(new string('v', 64)) };
+        var rowBytes = VdbeManagedFootprint.EstimateSorterRow(sample);
+        var infrastructure = VdbeManagedFootprint.EstimateEphemeralTableSpillInfrastructure(
+            temporaryDirectory);
+        // Room for two buffered rows plus the spill infrastructure: the third insert trips the spill.
+        var budget = checked((rowBytes * 2) + infrastructure + 64);
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory,
+            metrics: metrics);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        var rows = new List<string>();
+        while (statement.StepResumable() == ResumableStatementStepResult.Row)
+            rows.Add(statement.CurrentRow![0].AsText());
+
+        rows.Should().HaveCount(rowCount);
+        rows.Select(static value => value[^2..]).Should().Equal(
+            Enumerable.Range(0, rowCount).Select(static index => index.ToString("00")));
+
+        metrics.EphemeralTablesSpilled.Should().Be(1);
+        metrics.SpillBytesWritten.Should().BeGreaterThan(0);
+        metrics.SpillBytesRead.Should().BeGreaterThan(0);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    private sealed class TrackingFileSystem : IFileSystem
+    {
+        private readonly IFileSystem _inner = new Ahtola.Core.Storage.InMemoryFileSystem();
+
+        public List<string> Created { get; } = [];
+
+        public List<string> Deleted { get; } = [];
+
+        public bool FileExists(string path) => _inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+        {
+            var file = _inner.OpenFile(path, mode, readOnly);
+            if (mode == FileOpenMode.CreateNew)
+                Created.Add(path);
+            return file;
+        }
+
+        public void DeleteFile(string path)
+        {
+            Deleted.Add(path);
+            _inner.DeleteFile(path);
+        }
     }
 }
