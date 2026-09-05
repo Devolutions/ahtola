@@ -476,11 +476,11 @@
       "layer": "vdbe",
       "kind": "missing",
       "turso_ref": "turso-src/core/vdbe/insn.rs::Insn::AddSequence, DropSequence, Sequence, SequenceTest, NextSequenceValue, ResetSequenceValue, CopySequenceValue, SequenceRegisterAllocation",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.cs::EvaluateNextVal/EvaluateCurrVal/EvaluateSetVal (evaluator dispatch instead of opcode arms)",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "The two SQLite-standard members landed 2026-09: Sequence/SequenceTest (177-178) mirror op_sequence/op_sequence_test per-cursor counters, cleared on Reset per SQLite cursor lifetime (Turso's reset persistence is an upstream Vec::resize artifact). The remaining 6 opcodes (AddSequence, DropSequence, NextSequenceValue, ResetSequenceValue, CopySequenceValue, SequenceRegisterAllocation) stay unadopted as the Turso-only CREATE SEQUENCE extension. AUTOINCREMENT/sqlite_sequence support is tracked separately and is not part of this opcode family.",
+      "notes": "The two SQLite-standard members landed 2026-09: Sequence/SequenceTest (177-178) mirror op_sequence/op_sequence_test per-cursor counters, cleared on Reset per SQLite cursor lifetime (Turso's reset persistence is an upstream Vec::resize artifact). The remaining 6 opcodes (AddSequence, DropSequence, NextSequenceValue, ResetSequenceValue, CopySequenceValue, SequenceRegisterAllocation) stay unadopted as the Turso-only CREATE SEQUENCE extension. AUTOINCREMENT/sqlite_sequence support is tracked separately and is not part of this opcode family. Reconciled 2026-09-05: the remaining six opcodes (AddSequence, DropSequence, NextSequenceValue, ResetSequenceValue, CopySequenceValue, SequenceRegisterAllocation) are unneeded in the managed architecture: Turso needs them because CREATE SEQUENCE mutates the in-memory schema map from bytecode and nextval allocates through cursor/MakeRecord/Insert sequences, while Ahtola persists the descriptor row in the backing table (created/dropped through compiled DDL programs) and rewrites the watermark row directly inside the scalar function. The observable SQL surface is identical; the divergence is recorded here as the deliberate managed idiom, consistent with vdbe-record-construction-model.",
       "status": "closed"
     },
     {
@@ -740,7 +740,7 @@
       "severity": "s4-intentional",
       "effort": "S",
       "conformance_links": [],
-      "notes": "Ahtola correctly rejects aggregate/window functions in generated column expressions but with a single combined message (\"aggregate and window functions are not allowed in a generated column\") instead of Turso's two distinct messages (aggregate-specific vs window-specific). Behaviorally equivalent (both reject), differs only in error text -- low-severity wording divergence, not a capability gap. (Previously linked keys cleared by earlier wave work: gencol_error_aggregate_star, gencol_error_window_function, gencol_error_nested_window_function, gencol_error_nested_aggregate_star.) Closed 2026-08-05 as part of gencol Group A: the whole generated-column diagnostic surface now matches Turso's validate_generated_expr wording exactly (aggregate/window split messages were already aligned in Wave F1; the remaining bind-parameter, subquery, dot-operator, and non-deterministic messages were aligned under compile-generated-column-determinism-validation).",
+      "notes": "Ahtola correctly rejects aggregate/window functions in generated column expressions but with a single combined message (\"aggregate and window functions are not allowed in a generated column\") instead of Turso's two distinct messages (aggregate-specific vs window-specific). Behaviorally equivalent (both reject), differs only in error text -- low-severity wording divergence, not a capability gap. (Previously linked keys cleared by earlier wave work: gencol_error_aggregate_star, gencol_error_window_function, gencol_error_nested_window_function, gencol_error_nested_aggregate_star.) Closed 2026-08-05 as part of gencol Group A: the whole generated-column diagnostic surface now matches Turso's validate_generated_expr wording exactly (aggregate/window split messages were already aligned in Wave F1; the remaining bind-parameter, subquery, dot-operator, and non-deterministic messages were aligned under compile-generated-column-determinism-validation). Reconciled 2026-09-05: verified against the pinned v0.8.0-pre.7 sources that the managed engine already emits the two distinct Turso diagnostics (\"window functions prohibited in generated columns\", core/schema.rs:4315/4337, vs \"aggregate functions prohibited in generated columns\", core/schema.rs:4325/4347) — the recorded single-combined-message claim was stale, not the engine. Added focused parity tests GeneratedColumnsTests.AggregateFunctionInGenerationUsesTursoAggregateDiagnostic / WindowFunctionInGenerationUsesTursoWindowDiagnostic / WindowOnlyFunctionInGenerationUsesMisuseDiagnostic (all 32 GeneratedColumnsTests pass). No engine change was needed.",
       "status": "closed"
     },
     {
@@ -1505,11 +1505,11 @@
       "layer": "parser",
       "kind": "partial",
       "turso_ref": "turso-src/sqlite/parser/src/ast.rs::Stmt::CreateSequence / DropSequence / Stmt::Optimize { idx_name } (Turso-only, non-SQLite extensions)",
-      "ahtola_ref": "src/Ahtola.Core/Parsing/SqlAst.cs::OptimizeIndexStatement; src/Ahtola.Core/Parsing/SqlParser.cs; src/Ahtola.Core/EmbeddedDatabase.cs::ExecuteOptimizeIndex",
+      "ahtola_ref": "src/Ahtola.Core/Parsing/SqlAst.cs::CreateSequenceStatement/DropSequenceStatement; src/Ahtola.Core/Parsing/SqlParser.cs::ParseCreateSequence/ParseDropSequence",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Updated 2026-08-29: named and bare OPTIMIZE INDEX are implemented for managed index methods and execute through each method's transactional Optimize hook. CREATE/DROP SEQUENCE remain intentionally unadopted Turso-only extensions.",
+      "notes": "Updated 2026-08-29: named and bare OPTIMIZE INDEX are implemented for managed index methods and execute through each method's transactional Optimize hook. CREATE/DROP SEQUENCE remain intentionally unadopted Turso-only extensions. Reconciled 2026-09-05: CREATE SEQUENCE and DROP SEQUENCE are now implemented (full Turso grammar: IF NOT EXISTS/IF EXISTS, START WITH, INCREMENT BY, MINVALUE, MAXVALUE, CYCLE/NO CYCLE), alongside the previously landed OPTIMIZE INDEX. Sequences persist as backing tables (the same storage shape AUTOINCREMENT uses) through compiled DDL programs; nextval/currval/setval evaluate over the backing row. See ManagedSequenceTests. The entry closes as delivered, not intentional-absence.",
       "status": "closed"
     },
     {
@@ -1717,11 +1717,11 @@
       "layer": "functions",
       "kind": "missing",
       "turso_ref": "turso-src/core/function.rs::ScalarFunc::NextVal, CurrVal, SetVal",
-      "ahtola_ref": "none",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.cs::EvaluateNextVal/EvaluateCurrVal/EvaluateSetVal; src/Ahtola.Core/ManagedSequence.cs; src/Ahtola.Core/ManagedSequenceSession.cs",
       "severity": "s4-intentional",
       "effort": "M",
       "conformance_links": [],
-      "notes": "Closed 2026-08-06 as an unadopted Turso-only extension. nextval/currval/setval depend on the experimental SEQUENCE object and connection transaction state; they have no SQLite equivalent or conformance coverage.",
+      "notes": "Closed 2026-08-06 as an unadopted Turso-only extension. nextval/currval/setval depend on the experimental SEQUENCE object and connection transaction state; they have no SQLite equivalent or conformance coverage. Reconciled 2026-09-05: nextval/currval/setval ship as evaluator-managed scalar functions over the disk-only backing-table model (Turso core/translate/sequence.rs): the watermark row is read and rewritten per call, allocation durability follows the surrounding transaction (rolled-back values can be re-emitted), and currval is per-connection session state cleared on DROP. Exhaustion, cycle-wrap, setval range, and session-undefined diagnostics match Turso exactly. ManagedSequenceTests covers asc/desc, cycle, bounds, cross-connection visibility, reopen persistence, and rollback re-emission.",
       "status": "closed"
     },
     {

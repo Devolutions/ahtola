@@ -811,8 +811,103 @@ internal sealed class SqlParser
             ExpectKeyword("TABLE");
             return ParseCreateVirtualTable();
         }
+        if (ConsumeKeyword("SEQUENCE"))
+            return ParseCreateSequence();
 
         return ParseCreateTable(temporary: false);
+    }
+
+    /// <summary>
+    /// Parses Turso's <c>CREATE SEQUENCE</c> grammar (parser.rs parse_create_sequence): the options are
+    /// keyword-led, each accepts an optional connective (START WITH / INCREMENT BY), and the signed
+    /// integer forms allow a leading plus or minus.
+    /// </summary>
+    private ParsedStatement ParseCreateSequence()
+    {
+        var ifNotExists = ParseIfNotExists();
+        var name = ParseSchemaQualifiedName();
+
+        long? start = null;
+        long? increment = null;
+        long? minValue = null;
+        long? maxValue = null;
+        var cycle = false;
+
+        while (true)
+        {
+            if (ConsumeKeyword("START"))
+            {
+                ConsumeKeyword("WITH");
+                start = ParseSequenceOptionInteger();
+                continue;
+            }
+            if (ConsumeKeyword("INCREMENT"))
+            {
+                ConsumeKeyword("BY");
+                increment = ParseSequenceOptionInteger();
+                continue;
+            }
+            if (ConsumeKeyword("MINVALUE"))
+            {
+                minValue = ParseSequenceOptionInteger();
+                continue;
+            }
+            if (ConsumeKeyword("MAXVALUE"))
+            {
+                maxValue = ParseSequenceOptionInteger();
+                continue;
+            }
+            if (ConsumeKeyword("CYCLE"))
+            {
+                cycle = true;
+                continue;
+            }
+            if (ConsumeKeyword("NO"))
+            {
+                ExpectKeyword("CYCLE");
+                cycle = false;
+                continue;
+            }
+
+            break;
+        }
+
+        return new CreateSequenceStatement(name, start, increment, minValue, maxValue, cycle, ifNotExists);
+    }
+
+    /// <summary>
+    /// Parses the signed 64-bit integer a sequence option carries. Turso's parse_sequence_i64 accepts an
+    /// optional sign before a required integer token; anything else is a syntax error.
+    /// </summary>
+    private long ParseSequenceOptionInteger()
+    {
+        var sign = 1L;
+        if (Consume(TokenKind.Minus))
+            sign = -1;
+        else if (Consume(TokenKind.Plus))
+            sign = 1;
+
+        if (_lexer.Current.Kind != TokenKind.Integer)
+            throw Error("invalid integer in sequence definition");
+
+        var token = _lexer.Current;
+        _lexer.Next();
+        if (!long.TryParse(token.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var magnitude))
+            throw Error("invalid integer in sequence definition");
+
+        return checked(sign * magnitude);
+    }
+
+    private ParsedStatement ParseDropSequence()
+    {
+        var ifExists = false;
+        if (ConsumeKeyword("IF"))
+        {
+            ExpectKeyword("EXISTS");
+            ifExists = true;
+        }
+
+        return new DropSequenceStatement(ParseSchemaQualifiedName(), ifExists);
     }
 
     private ParsedStatement ParseCreateVirtualTable()
@@ -1590,6 +1685,8 @@ internal sealed class SqlParser
             return ParseDropView();
         if (ConsumeKeyword("TRIGGER"))
             return ParseDropTrigger();
+        if (ConsumeKeyword("SEQUENCE"))
+            return ParseDropSequence();
 
         return ParseDropTable();
     }

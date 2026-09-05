@@ -426,8 +426,11 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   raw pages explicitly and reject zstd responses because no approved
   pure-managed, trim-safe zstd implementation is shipped.
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
-  is null), zstd-compressed replica page sets, `CREATE SEQUENCE`, and
-  typed-value extensions.
+  is null), zstd-compressed replica page sets, and typed-value extensions.
+  `CREATE SEQUENCE` / `DROP SEQUENCE` and the `nextval` / `currval` / `setval`
+  functions are supported as a Turso-compatible extension: sequences persist a
+  backing table whose watermark row is ordinary transactional state (a rolled-back
+  allocation can be re-emitted), and `currval` is per-connection session state.
 - **Native / Sync companions** — not shipped. Connection-string paths that need
   them fail closed. OS P/Invoke in the pager for locks/WAL is intentional engine
   code, not a Rust SDK binding.

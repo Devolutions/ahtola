@@ -790,6 +790,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         internal bool Changed { get; set; }
         internal bool ForceFullCatalogRewrite { get; set; }
         internal long? LastInsertRowId { get; set; }
+
+        /// <summary>
+        /// Marks the statement as having mutated table state without going through a writable CTE —
+        /// a <c>nextval</c>/<c>setval</c> backing-row rewrite inside a plain SELECT. The flag flows to
+        /// <c>ExecutionResult.Changed</c> so the commit boundary publishes the mutated clone.
+        /// </summary>
+        internal void MarkChanged() => Changed = true;
     }
 
     internal sealed record QueryContext(
@@ -844,7 +851,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         TransactionMutationOverlay? TransactionOverlay = null,
         EmbeddedFileReadSnapshot? TransactionPinnedSnapshot = null,
         Action<string, long>? TransactionBlobMutation = null,
-        ManagedSchemaRowSet? StagedSchemaRows = null)
+        ManagedSchemaRowSet? StagedSchemaRows = null,
+        ManagedSequenceSession? SequenceSession = null)
     {
         /// <summary>
         /// Per-statement cache of opened managed index-method scan state. Derived contexts created
@@ -2135,7 +2143,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ChangeDataCaptureSession? changeDataCapture = null,
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
-        ManagedVirtualTableTransaction? virtualTableTransaction = null)
+        ManagedVirtualTableTransaction? virtualTableTransaction = null,
+        ManagedSequenceSession? sequenceSession = null)
     {
         var result = ExecuteCore(
             statement,
@@ -2155,7 +2164,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             changeDataCapture,
             vdbeExecutionOptions,
             synchronousMode,
-            virtualTableTransaction);
+            virtualTableTransaction,
+            sequenceSession);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -2197,7 +2207,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ChangeDataCaptureSession? changeDataCapture = null,
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
-        ManagedVirtualTableTransaction? virtualTableTransaction = null)
+        ManagedVirtualTableTransaction? virtualTableTransaction = null,
+        ManagedSequenceSession? sequenceSession = null)
     {
         synchronousMode.Validate(nameof(synchronousMode));
         ThrowIfRecursiveTriggerCallbackReentry();
@@ -2225,7 +2236,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 changeDataCapture,
                 vdbeExecutionOptions,
                 synchronousMode,
-                virtualTableTransaction));
+                virtualTableTransaction,
+                sequenceSession));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -2285,7 +2297,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                     externalTables,
                                     changeDataCapture: changeDataCapture,
                                     vdbeExecutionOptions: vdbeExecutionOptions,
-                                    virtualTableTransaction: statementVirtualTableTransaction);
+                                    virtualTableTransaction: statementVirtualTableTransaction,
+                                    sequenceSession: sequenceSession);
                             }
                             catch (EmbeddedConflictFailException)
                             {
@@ -2385,7 +2398,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 executeTableList,
                                 externalTables,
                                 changeDataCapture: changeDataCapture,
-                                vdbeExecutionOptions: vdbeExecutionOptions);
+                                vdbeExecutionOptions: vdbeExecutionOptions,
+                                sequenceSession: sequenceSession);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -2432,7 +2446,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             executeTableList,
                             externalTables,
                             changeDataCapture: changeDataCapture,
-                            vdbeExecutionOptions: vdbeExecutionOptions);
+                            vdbeExecutionOptions: vdbeExecutionOptions,
+                            sequenceSession: sequenceSession);
 
                     var working = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
                     try
@@ -2458,7 +2473,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 externalTables,
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
-                                virtualTableTransaction: virtualTableTransaction);
+                                virtualTableTransaction: virtualTableTransaction,
+                                sequenceSession: sequenceSession);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -2691,6 +2707,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (statement is
             CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
             or DropTableStatement or CreateIndexStatement or DropIndexStatement
+            or CreateSequenceStatement or DropSequenceStatement
             or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
             or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
             or AlterTableAlterColumnStatement or AlterTableDropColumnStatement
@@ -2828,7 +2845,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             orderedSet.Expression,
                             views,
                             visibleCtes,
-                            activeViews));
+                            activeViews))
+                    // nextval/setval advance the sequence's backing-table watermark, so any statement
+                    // evaluating one takes the write path (upstream translates them as writers).
+                    || IsSequenceMutationFunction(function);
             case RaiseExpression raise:
                 return ExpressionMayMutate(raise.Message, views, visibleCtes, activeViews);
             case RowValueExpression rowValue:
@@ -2881,9 +2901,20 @@ public sealed partial class EmbeddedDatabase : IDisposable
             || ExpressionMayMutate(window.Frame?.Start.Offset, views, visibleCtes, activeViews)
             || ExpressionMayMutate(window.Frame?.End.Offset, views, visibleCtes, activeViews);
 
+    /// <summary>
+    /// Whether a call advances a sequence: <c>nextval</c> and <c>setval</c> rewrite the sequence's
+    /// backing-table watermark row, so a statement containing one is a mutation even when it is a bare
+    /// SELECT. <c>currval</c> only reads this connection's session state and stays read-only.
+    /// </summary>
+    private static bool IsSequenceMutationFunction(FunctionExpression function)
+        => function.Window is null
+            && (function.Name.Equals("nextval", StringComparison.OrdinalIgnoreCase)
+                || function.Name.Equals("setval", StringComparison.OrdinalIgnoreCase));
+
     internal static bool MayChangeSchema(ParsedStatement statement) => statement is
         CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
         or DropTableStatement or CreateIndexStatement or DropIndexStatement
+        or CreateSequenceStatement or DropSequenceStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableAlterColumnStatement or AlterTableDropColumnStatement;
@@ -5312,7 +5343,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
         TransactionMutationOverlay? transactionOverlay = null,
         EmbeddedFileReadSnapshot? transactionPinnedSnapshot = null,
-        Action<string, long>? transactionBlobMutation = null)
+        Action<string, long>? transactionBlobMutation = null,
+        ManagedSequenceSession? sequenceSession = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -5344,7 +5376,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 virtualTableTransaction,
                 transactionOverlay,
                 transactionPinnedSnapshot,
-                transactionBlobMutation));
+                transactionBlobMutation,
+                sequenceSession));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -5394,7 +5427,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             Database: this,
             TransactionOverlay: transactionOverlay,
             TransactionPinnedSnapshot: transactionPinnedSnapshot,
-            TransactionBlobMutation: transactionBlobMutation);
+            TransactionBlobMutation: transactionBlobMutation,
+            SequenceSession: sequenceSession);
         try
         {
             EnsureConcurrentMvccDmlTargetIsSupported(statement, tables, context);
@@ -5415,6 +5449,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             () => ExecuteDropTable(drop, catalog, scoped))
                         : ExecuteDropTable(drop, catalog, scoped)),
                 CreateIndexStatement createIndex => ExecuteCreateIndex(createIndex, catalog, cancellationToken),
+                CreateSequenceStatement createSequence => ExecuteCreateSequence(
+                    createSequence,
+                    catalog,
+                    cancellationToken),
+                DropSequenceStatement dropSequence => ExecuteDropSequence(
+                    dropSequence,
+                    catalog,
+                    cancellationToken,
+                    sequenceSession),
                 DropIndexStatement dropIndex => ExecuteDropIndex(dropIndex, catalog, cancellationToken),
                 CreateViewStatement createView => ExecuteCreateView(createView, catalog, cancellationToken),
                 DropViewStatement dropView => ExecuteDropView(dropView, catalog, cancellationToken),
@@ -6771,6 +6814,46 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return ExecutionResult.Empty;
 
         RunSchemaProgram(compiled, catalog, cancellationToken);
+        return new ExecutionResult([], [], 0, true);
+    }
+
+    /// <summary>
+    /// Runs <c>CREATE SEQUENCE</c> as a compiled schema program: one backing table, its schema row, the
+    /// seeded descriptor row, and the cookie bump, staged so a failure leaves the catalog untouched.
+    /// </summary>
+    private ExecutionResult ExecuteCreateSequence(
+        CreateSequenceStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
+    {
+        var compiled = DdlStatementCompiler.CompileCreateSequence(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
+
+        RunSchemaProgram(compiled, catalog, cancellationToken);
+        return new ExecutionResult([], [], 0, true);
+    }
+
+    /// <summary>
+    /// Runs <c>DROP SEQUENCE</c> as a compiled schema program and clears this connection's
+    /// <c>currval</c> session entry so a recreated same-name sequence cannot inherit it.
+    /// </summary>
+    private ExecutionResult ExecuteDropSequence(
+        DropSequenceStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken,
+        ManagedSequenceSession? sequenceSession)
+    {
+        var compiled = DdlStatementCompiler.CompileDropSequence(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
+
+        RunSchemaProgram(compiled, catalog, cancellationToken);
+        sequenceSession?.ClearCurrval(statement.Name);
         return new ExecutionResult([], [], 0, true);
     }
 
@@ -27290,6 +27373,14 @@ out bool hasReturning)
                 return DescribeProgram(DdlStatementCompiler.CompileDropIndex(
                     dropIndex,
                     CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case CreateSequenceStatement createSequence:
+                return DescribeProgram(DdlStatementCompiler.CompileCreateSequence(
+                    createSequence,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
+            case DropSequenceStatement dropSequence:
+                return DescribeProgram(DdlStatementCompiler.CompileDropSequence(
+                    dropSequence,
+                    CreateExplainDdlCompilationContext(compilationContext)).Program);
             case CreateViewStatement createView:
                 return DescribeProgram(DdlStatementCompiler.CompileCreateView(
                     createView,
@@ -35347,6 +35438,51 @@ out bool hasReturning)
     internal static bool IsAutoIncrementSequenceBackingTable(string name)
         => name.StartsWith(TursoSequenceBackingTablePrefix, StringComparison.OrdinalIgnoreCase);
 
+    internal static string GetSequenceBackingTableName(string sequenceName)
+        => TursoSequenceBackingTablePrefix + sequenceName;
+
+    /// <summary>
+    /// Whether <paramref name="name"/> is the reserved internal AUTOINCREMENT sequence namespace, which a
+    /// user-created <c>CREATE SEQUENCE</c> may not enter: the backing-table classification treats every
+    /// <c>__turso_internal_autoincrement_</c> name as AUTOINCREMENT-backed and mirrors its watermark into
+    /// <c>sqlite_sequence</c> under an attacker-chosen table name (upstream sequence.rs:832).
+    /// </summary>
+    internal static bool IsReservedSequenceName(string name)
+        => name.StartsWith(TursoAutoIncrementSequencePrefix, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Creates the sequence backing table (<c>__turso_internal_seq_&lt;name&gt;</c>) for a user sequence,
+    /// seeded with the descriptor row Turso's <c>emit_sequence_backing_table</c> writes: the start value
+    /// keyed by its own rowid, <c>is_called = 0</c>, and the immutable descriptor suffix.
+    /// </summary>
+    internal static EmbeddedTable CreateSequenceBackingTable(string backingName, ManagedSequence sequence)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(backingName);
+        var backing = new EmbeddedTable(
+            backingName,
+            [
+                new EmbeddedColumn("value", "INTEGER", true, false, false, null),
+                new EmbeddedColumn("is_called", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("start", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("inc", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("min", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("max", "INTEGER", false, false, false, null),
+                new EmbeddedColumn("cycle", "INTEGER", false, false, false, null),
+            ]);
+        backing.Rows.Add(
+        [
+            SqlValue.Integer(sequence.StartValue),
+            SqlValue.Integer(0),
+            SqlValue.Integer(sequence.StartValue),
+            SqlValue.Integer(sequence.IncrementBy),
+            SqlValue.Integer(sequence.MinValue),
+            SqlValue.Integer(sequence.MaxValue),
+            SqlValue.Integer(sequence.Cycle ? 1 : 0),
+        ]);
+        backing.RowIds.Add(sequence.StartValue);
+        return backing;
+    }
+
     // SQLite rejects any user-created object whose name begins with "sqlite_" (case
     // insensitive); those names are reserved for the internal schema.
     internal static bool IsReservedObjectName(string name)
@@ -41998,6 +42134,9 @@ out bool hasReturning)
             "RTREECHECK" => EvaluateRTreeCheck(arguments, context),
             "RTREENODE" => Spatial.ManagedRTreeFunctions.Node(arguments),
             "RTREEDEPTH" => Spatial.ManagedRTreeFunctions.Depth(arguments),
+            "NEXTVAL" => EvaluateNextVal(arguments, context),
+            "CURRVAL" => EvaluateCurrVal(arguments, context),
+            "SETVAL" => EvaluateSetVal(arguments, context),
             _ => throw new EmbeddedSqlException($"no such function: {function.Name}"),
         };
     }
@@ -42024,6 +42163,192 @@ out bool hasReturning)
 
         var problems = definition.Table.CheckIntegrity();
         return SqlValue.Text(problems.Count == 0 ? "ok" : string.Join('\n', problems));
+    }
+
+    /// <summary>
+    /// The shape of the watermark row a sequence backing table holds: (value, is_called, start, inc, min,
+    /// max, cycle) with <c>value</c> as the rowid alias, matching the AUTOINCREMENT backing table the
+    /// catalog already persists and validates.
+    /// </summary>
+    private const int SequenceBackingColumnCount = 7;
+
+    /// <summary>
+    /// Resolves the sequence a nextval/currval/setval argument names, following upstream's
+    /// <c>translate_sequence_function</c> split: an unqualified name is main-local, and a
+    /// <c>schema.name</c> spelling keeps the bare name for the backing-table lookup. The raw spelling is
+    /// what the error diagnostics and the per-connection currval key preserve.
+    /// </summary>
+    private static EmbeddedTable ResolveSequenceBackingTable(
+        IReadOnlyList<SqlValue> arguments,
+        QueryContext context,
+        out string rawName,
+        out string sequenceName)
+    {
+        if (arguments.Count == 0 || arguments[0].Kind != SqlValueKind.Text)
+            throw new EmbeddedSqlException("wrong number of arguments to function nextval()");
+
+        rawName = arguments[0].AsText();
+        sequenceName = rawName;
+        var dot = rawName.LastIndexOf('.');
+        if (dot >= 0)
+            sequenceName = rawName[(dot + 1)..];
+
+        var backingTableName = GetSequenceBackingTableName(sequenceName);
+        if (!context.Tables.TryGetValue(backingTableName, out var backing))
+            throw new EmbeddedSqlException($"sequence \"{rawName}\" does not exist");
+
+        return backing;
+    }
+
+    /// <summary>
+    /// Reads the backing table's watermark row: the last row for an ascending sequence, the first for a
+    /// descending one (upstream reads Last/Rewind of the rowid-aliased <c>value</c> column), plus a flag
+    /// reporting whether the table holds no row at all.
+    /// </summary>
+    private static (long Value, bool IsCalled, bool WasEmpty, int RowIndex) ReadSequenceWatermark(
+        EmbeddedTable backing,
+        bool ascending)
+    {
+        if (backing.Rows.Count == 0)
+            return (0, false, true, -1);
+
+        var rowIndex = 0;
+        for (var index = 1; index < backing.Rows.Count; index++)
+        {
+            var candidate = backing.RowIds[index];
+            if (ascending ? candidate > backing.RowIds[rowIndex] : candidate < backing.RowIds[rowIndex])
+                rowIndex = index;
+        }
+
+        return (CoerceSqliteInteger(backing.Rows[rowIndex][0]), IsTrue(backing.Rows[rowIndex][1]), false, rowIndex);
+    }
+
+    /// <summary>
+    /// Replaces the backing table's rows with the single watermark row an allocation or setval leaves
+    /// behind (upstream compacts to one row at commit; the managed catalog is statement-atomic, so the
+    /// replacement is exact here).
+    /// </summary>
+    private static void WriteSequenceWatermark(
+        EmbeddedTable backing,
+        long value,
+        long isCalled,
+        ManagedSequence sequence)
+    {
+        backing.Rows.Clear();
+        backing.RowIds.Clear();
+        backing.Rows.Add(
+        [
+            SqlValue.Integer(value),
+            SqlValue.Integer(isCalled),
+            SqlValue.Integer(sequence.StartValue),
+            SqlValue.Integer(sequence.IncrementBy),
+            SqlValue.Integer(sequence.MinValue),
+            SqlValue.Integer(sequence.MaxValue),
+            SqlValue.Integer(sequence.Cycle ? 1 : 0),
+        ]);
+        backing.RowIds.Add(value);
+    }
+
+    /// <summary>
+    /// Rebuilds the immutable descriptor from the backing row, validating the shape the catalog persists
+    /// (upstream <c>install_sequence_descriptor</c> reads the same five trailing columns at open).
+    /// </summary>
+    private static ManagedSequence ReadSequenceDescriptor(string sequenceName, EmbeddedTable backing)
+    {
+        if (backing.Rows.Count == 0
+            || backing.ColumnDefinitions.Length != SequenceBackingColumnCount)
+        {
+            throw new EmbeddedSqlException($"sequence \"{sequenceName}\" does not exist");
+        }
+
+        var row = backing.Rows[0];
+        return ManagedSequence.Create(
+            sequenceName,
+            CoerceSqliteInteger(row[2]),
+            CoerceSqliteInteger(row[3]),
+            CoerceSqliteInteger(row[4]),
+            CoerceSqliteInteger(row[5]),
+            IsTrue(row[6]));
+    }
+
+    /// <summary>
+    /// Evaluates <c>nextval('name')</c>: reads the watermark row, derives the next value by Turso's
+    /// <c>SequenceComputeNext</c> rules, rewrites the backing row, and records this connection's currval.
+    /// </summary>
+    /// <remarks>
+    /// The backing-table row is ordinary table state: an in-transaction allocation becomes durable only
+    /// at commit, so a rolled-back value may be re-emitted — the documented Turso/SQLite behavior. The
+    /// <c>currval</c> session entry is recorded immediately, exactly as upstream's
+    /// <c>SetSequenceCurrval</c> opcode does.
+    /// </remarks>
+    private static SqlValue EvaluateNextVal(IReadOnlyList<SqlValue> arguments, QueryContext context)
+    {
+        if (arguments.Count != 1 || arguments[0].Kind != SqlValueKind.Text)
+            throw new EmbeddedSqlException("wrong number of arguments to function nextval()");
+
+        var backing = ResolveSequenceBackingTable(arguments, context, out var rawName, out var sequenceName);
+        var descriptor = ReadSequenceDescriptor(sequenceName, backing);
+        var (current, isCalled, wasEmpty, _) = ReadSequenceWatermark(backing, descriptor.Ascending);
+        var next = descriptor.ComputeNext(current, isCalled, wasEmpty);
+        WriteSequenceWatermark(backing, next, 1, descriptor);
+        context.SequenceSession?.SetCurrval(rawName, next);
+        // The watermark rewrite is a real catalog mutation even though this SELECT returns rows: flag it
+        // so the statement's commit path publishes the clone (the writable-CTE state doubles as the
+        // generic statement-mutation side-channel for row-returning writers).
+        context.CteMutationState?.MarkChanged();
+        return SqlValue.Integer(next);
+    }
+
+    /// <summary>
+    /// Evaluates <c>currval('name')</c>: the last value nextval/setval produced on this connection, or
+    /// upstream's "not yet defined in this session" diagnostic when no call has established one.
+    /// </summary>
+    private static SqlValue EvaluateCurrVal(IReadOnlyList<SqlValue> arguments, QueryContext context)
+    {
+        if (arguments.Count != 1 || arguments[0].Kind != SqlValueKind.Text)
+            throw new EmbeddedSqlException("wrong number of arguments to function currval()");
+
+        ResolveSequenceBackingTable(arguments, context, out var rawName, out _);
+        if (context.SequenceSession is not null
+            && context.SequenceSession.TryGetCurrval(rawName, out var value))
+        {
+            return SqlValue.Integer(value);
+        }
+
+        throw new EmbeddedSqlException(
+            $"currval of sequence \"{rawName}\" is not yet defined in this session");
+    }
+
+    /// <summary>
+    /// Evaluates <c>setval('name', value[, is_called])</c>: validates the range against the descriptor,
+    /// rewrites the backing row at the requested value, and records this connection's currval. The
+    /// default <c>is_called</c> is 1, so the next nextval advances past the value.
+    /// </summary>
+    private static SqlValue EvaluateSetVal(IReadOnlyList<SqlValue> arguments, QueryContext context)
+    {
+        if (arguments.Count is < 2 or > 3)
+            throw new EmbeddedSqlException("wrong number of arguments to function setval()");
+
+        var backing = ResolveSequenceBackingTable(arguments, context, out var rawName, out var sequenceName);
+        if (arguments[1].Kind != SqlValueKind.Integer)
+            throw new EmbeddedSqlException("setval() requires an integer value");
+        var value = arguments[1].AsInteger();
+        if (arguments.Count == 3 && arguments[2].Kind != SqlValueKind.Integer)
+            throw new EmbeddedSqlException("setval() requires an integer is_called argument");
+
+        var descriptor = ReadSequenceDescriptor(sequenceName, backing);
+        if (value < descriptor.MinValue || value > descriptor.MaxValue)
+        {
+            throw new EmbeddedSqlException(
+                $"setval: value {value} is out of bounds for sequence \"{sequenceName}\" "
+                + $"({descriptor.MinValue}..{descriptor.MaxValue})");
+        }
+
+        var isCalled = arguments.Count == 3 ? arguments[2].AsInteger() : 1;
+        WriteSequenceWatermark(backing, value, isCalled, descriptor);
+        context.SequenceSession?.SetCurrval(rawName, value);
+        context.CteMutationState?.MarkChanged();
+        return SqlValue.Integer(value);
     }
 
     private SqlValue EvaluateIif(
@@ -50731,6 +51056,13 @@ public sealed partial class EmbeddedConnection : IDisposable
     private long _nextMvccStatementSavepoint;
     private readonly List<SavepointEntry> _savepoints = [];
     private long _lastInsertRowId;
+    /// <summary>
+    /// The last value <c>nextval</c>/<c>setval</c> produced for each named sequence on this connection,
+    /// keyed by the user's spelling (Turso's per-connection <c>sequence_currvals</c> map). An entry is
+    /// established only by a successful <c>nextval</c>/<c>setval</c> call and is cleared when the
+    /// sequence is dropped, so a recreated same-name sequence cannot inherit it.
+    /// </summary>
+    private readonly ManagedSequenceSession _sequenceSession = new();
     private bool _queryOnly;
     private bool _foreignKeys;
     private bool _deferForeignKeys;
@@ -52840,7 +53172,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 concurrentMvccTxId: concurrentTxId,
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
-                                virtualTableTransaction: transactionState?.VirtualTableTransaction);
+                                virtualTableTransaction: transactionState?.VirtualTableTransaction,
+                                sequenceSession: _sequenceSession);
                         }
                         else if (transactionState is null)
                         {
@@ -52864,7 +53197,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     externalTables: routed.ExternalTables,
                                     changeDataCapture: changeDataCapture,
                                     vdbeExecutionOptions: vdbeExecutionOptions,
-                                    synchronousMode: GetSynchronousMode(routed.Database));
+                                    synchronousMode: GetSynchronousMode(routed.Database),
+                                    sequenceSession: _sequenceSession);
                             }
                             catch (Exception failure)
                                 when (failure is not EmbeddedConflictFailException
@@ -52912,7 +53246,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 transactionPinnedSnapshot: transactionState.HasSchemaChanges
                                     ? null
                                     : transactionState.PinnedSnapshot,
-                                transactionBlobMutation: transactionState.RecordBlobMutation);
+                                transactionBlobMutation: transactionState.RecordBlobMutation,
+                                sequenceSession: _sequenceSession);
                             if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not

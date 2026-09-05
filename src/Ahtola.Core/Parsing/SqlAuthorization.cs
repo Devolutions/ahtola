@@ -146,6 +146,28 @@ internal static class SqlAuthorization
                         break;
                     }
 
+                case CreateSequenceStatement createSequence:
+                    {
+                        var (schema, name) = Split(createSequence.Name);
+                        Require(
+                            SqliteAuthorizerAction.CreateIndex,
+                            name,
+                            null,
+                            schema ?? "main");
+                        break;
+                    }
+
+                case DropSequenceStatement dropSequence:
+                    {
+                        var (schema, name) = Split(dropSequence.Name);
+                        Require(
+                            SqliteAuthorizerAction.DropIndex,
+                            name,
+                            null,
+                            schema ?? "main");
+                        break;
+                    }
+
                 case CreateViewStatement createView:
                     {
                         var (schema, name) = Split(createView.Name);
