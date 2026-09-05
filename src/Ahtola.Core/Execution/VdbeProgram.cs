@@ -529,6 +529,76 @@ public enum VdbeOpcode
     /// exhausted (Turso <c>HashNextUnmatched</c>).
     /// </summary>
     HashNextUnmatched = 165,
+
+    /// <summary>
+    /// Jump to the instruction at P2 when register P1 holds a positive integer, after
+    /// subtracting P3 from it; fall through otherwise (Turso <c>IfPos</c>).
+    /// </summary>
+    IfPos = 166,
+
+    /// <summary>
+    /// Jump to the instruction at P2 when register P1 holds a negative integer or real;
+    /// fall through otherwise, including on NULL and non-numeric values (Turso <c>IfNeg</c>).
+    /// </summary>
+    IfNeg = 167,
+
+    /// <summary>
+    /// Decrement the integer in register P1 and jump to the instruction at P2 when it
+    /// reaches zero; fall through otherwise. A non-integer register raises a datatype
+    /// mismatch (Turso <c>DecrJumpZero</c>).
+    /// </summary>
+    DecrJumpZero = 168,
+
+    /// <summary>
+    /// Coerce register P1 to an integer, jumping to the instruction at P2 when the value
+    /// cannot be converted without loss; with no target, a failed conversion raises a
+    /// datatype mismatch instead (Turso <c>MustBeInt</c>).
+    /// </summary>
+    MustBeInt = 169,
+
+    /// <summary>
+    /// Set register P1 to NULL, leaving the register file's record slots untouched
+    /// (Turso <c>SoftNull</c>).
+    /// </summary>
+    SoftNull = 170,
+
+    /// <summary>
+    /// Set register P1 to the integer from register P2 when that integer is larger — the
+    /// running-maximum idiom used for AUTOINCREMENT bookkeeping (Turso <c>MemMax</c>).
+    /// </summary>
+    MemMax = 171,
+
+    /// <summary>
+    /// Add the constant P2 to the integer view of register P1 (NULL and unparseable text
+    /// count as 0) and store the wrapped sum back (Turso <c>AddImm</c>).
+    /// </summary>
+    AddImm = 172,
+
+    /// <summary>
+    /// Set register P3 to NULL when either register P1 or P2 is NULL, to integer 0
+    /// otherwise (Turso <c>ZeroOrNull</c>).
+    /// </summary>
+    ZeroOrNull = 173,
+
+    /// <summary>
+    /// Jumps to a target program counter, saving the return address in a register.
+    /// Mirrors Turso <c>Insn::Gosub</c> (core/vdbe/execute.rs <c>op_gosub</c>).
+    /// </summary>
+    Gosub = 174,
+
+    /// <summary>
+    /// Returns to the program counter stored in a register, or falls through when the
+    /// register does not hold an integer and fallthrough is allowed.
+    /// Mirrors Turso <c>Insn::Return</c> (core/vdbe/execute.rs <c>op_return</c>).
+    /// </summary>
+    Return = 175,
+
+    /// <summary>
+    /// Null-fills one register, or an inclusive range of registers. Identical semantics
+    /// to <c>Null</c>; the distinct name only makes bytecode easier to read.
+    /// Mirrors Turso <c>Insn::BeginSubrtn</c>.
+    /// </summary>
+    BeginSubrtn = 176,
 }
 
 /// <summary>
@@ -3013,6 +3083,129 @@ public sealed record GotoInstruction(ProgramCounter Target) : VdbeInstruction
 public sealed record JumpIfInstruction(Register Register, ProgramCounter Target) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.JumpIf;
+}
+
+/// <summary>
+/// Jumps to <paramref name="Target"/> — formally, to the instruction following it — when
+/// <paramref name="Register"/> holds a positive integer, after subtracting
+/// <paramref name="DecrementBy"/> from it; falls through otherwise. Mirrors Turso's
+/// <c>IfPos</c> (core/vdbe/execute.rs <c>op_if_pos</c>): the register is only written on the
+/// jump path, and a non-integer value is an internal error.
+/// </summary>
+public sealed record IfPosInstruction(Register Register, ProgramCounter Target, long DecrementBy = 1) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IfPos;
+}
+
+/// <summary>
+/// Jumps to <paramref name="Target"/> when <paramref name="Register"/> holds a negative
+/// integer or a negative real; falls through on NULL and every non-negative value. Mirrors
+/// Turso's <c>IfNeg</c> (core/vdbe/execute.rs <c>op_if_neg</c>).
+/// </summary>
+public sealed record IfNegInstruction(Register Register, ProgramCounter Target) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IfNeg;
+}
+
+/// <summary>
+/// Decrements the integer in <paramref name="Register"/> and jumps to
+/// <paramref name="Target"/> when the result is zero; falls through otherwise. A non-integer
+/// register raises a datatype mismatch constraint error. Mirrors Turso's
+/// <c>DecrJumpZero</c> (core/vdbe/execute.rs <c>op_decr_jump_zero</c>), including
+/// saturation at <see cref="long.MinValue"/> (Rust's <c>saturating_sub</c>).
+/// </summary>
+public sealed record DecrJumpZeroInstruction(Register Register, ProgramCounter Target) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DecrJumpZero;
+}
+
+/// <summary>
+/// Coerces <paramref name="Register"/> to an integer, jumping to
+/// <paramref name="Target"/> when the value cannot be converted losslessly. When
+/// <paramref name="Target"/> is null, a failed conversion raises a datatype mismatch
+/// constraint error instead. A successful coercion replaces the register with
+/// <c>SqlValue.Integer</c>, so <c>Real 2.0</c> becomes <c>Integer 2</c>. Mirrors Turso's
+/// <c>MustBeInt</c> (core/vdbe/execute.rs <c>op_must_be_int</c> +
+/// <c>coerce_register_to_integer</c>).
+/// </summary>
+public sealed record MustBeIntInstruction(Register Register, ProgramCounter? Target = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.MustBeInt;
+}
+
+/// <summary>
+/// Sets <paramref name="Register"/> to NULL without disturbing record slots. Mirrors
+/// Turso's <c>SoftNull</c> (core/vdbe/execute.rs <c>op_soft_null</c>).
+/// </summary>
+public sealed record SoftNullInstruction(Register Register) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SoftNull;
+}
+
+/// <summary>
+/// Sets <paramref name="Destination"/> to the integer extracted from <paramref name="Source"/>
+/// when it is larger than the integer extracted from <paramref name="Destination"/> — the
+/// running-maximum bookkeeping AUTOINCREMENT uses to track the largest inserted rowid.
+/// Values are compared in their lossy integer view, so NULL counts as 0. Mirrors Turso's
+/// <c>MemMax</c> (core/vdbe/execute.rs <c>op_mem_max</c> + <c>extract_int_value</c>).
+/// </summary>
+public sealed record MemMaxInstruction(Register Destination, Register Source) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.MemMax;
+}
+
+/// <summary>
+/// Adds the constant <paramref name="Value"/> to the integer view of
+/// <paramref name="Register"/> — NULL and unparseable text count as 0, reals truncate —
+/// and stores the wrapped sum back as an integer. Mirrors Turso's <c>AddImm</c>
+/// (core/vdbe/execute.rs <c>op_add_imm</c>).
+/// </summary>
+public sealed record AddImmInstruction(Register Register, long Value) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.AddImm;
+}
+
+/// <summary>
+/// Sets <paramref name="Destination"/> to NULL when either <paramref name="Left"/> or
+/// <paramref name="Right"/> is NULL, and to <c>Integer(0)</c> otherwise — the NULL-handling
+/// wrapper for arithmetic whose real work happens in another instruction. Mirrors Turso's
+/// <c>ZeroOrNull</c> (core/vdbe/execute.rs <c>op_zero_or_null</c>).
+/// </summary>
+public sealed record ZeroOrNullInstruction(Register Left, Register Right, Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ZeroOrNull;
+}
+
+/// <summary>
+/// Jumps to the target program counter and stores the return address (the program
+/// counter of the instruction following this one) in the return register.
+/// Mirrors Turso <c>Insn::Gosub</c> (core/vdbe/execute.rs <c>op_gosub</c>).
+/// </summary>
+public sealed record GosubInstruction(ProgramCounter Target, Register ReturnRegister) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Gosub;
+}
+
+/// <summary>
+/// Returns to the program counter stored in the return register. When the register
+/// does not hold an integer, falls through when <paramref name="CanFallThrough"/> is
+/// set, otherwise faults. Mirrors Turso <c>Insn::Return</c> (core/vdbe/execute.rs
+/// <c>op_return</c>).
+/// </summary>
+public sealed record ReturnInstruction(Register ReturnRegister, bool CanFallThrough) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Return;
+}
+
+/// <summary>
+/// Null-fills the destination register, or the inclusive range from <paramref name="Destination"/>
+/// through <paramref name="DestinationEnd"/> when it is set. Semantically identical to a
+/// null-fill; the distinct name only makes subroutine boundaries easier to read in bytecode.
+/// Mirrors Turso <c>Insn::BeginSubrtn</c>.
+/// </summary>
+public sealed record BeginSubrtnInstruction(Register Destination, Register? DestinationEnd = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.BeginSubrtn;
 }
 
 /// <summary>Resets an aggregate accumulator to its uninitialized state so the next
@@ -6154,6 +6347,50 @@ public sealed class VdbeProgram
                     break;
                 case ChangeCountInstruction changeCount:
                     ValidateRegister(changeCount.Destination, instructionIndex);
+                    break;
+                case IfPosInstruction ifPos:
+                    ValidateRegister(ifPos.Register, instructionIndex);
+                    ValidateJumpTarget(ifPos.Target, instructionIndex);
+                    break;
+                case IfNegInstruction ifNeg:
+                    ValidateRegister(ifNeg.Register, instructionIndex);
+                    ValidateJumpTarget(ifNeg.Target, instructionIndex);
+                    break;
+                case DecrJumpZeroInstruction decrJumpZero:
+                    ValidateRegister(decrJumpZero.Register, instructionIndex);
+                    ValidateJumpTarget(decrJumpZero.Target, instructionIndex);
+                    break;
+                case MustBeIntInstruction mustBeInt:
+                    ValidateRegister(mustBeInt.Register, instructionIndex);
+                    if (mustBeInt.Target is { } target)
+                        ValidateJumpTarget(target, instructionIndex);
+                    break;
+                case SoftNullInstruction softNull:
+                    ValidateRegister(softNull.Register, instructionIndex);
+                    break;
+                case MemMaxInstruction memMax:
+                    ValidateRegister(memMax.Destination, instructionIndex);
+                    ValidateRegister(memMax.Source, instructionIndex);
+                    break;
+                case AddImmInstruction addImm:
+                    ValidateRegister(addImm.Register, instructionIndex);
+                    break;
+                case ZeroOrNullInstruction zeroOrNull:
+                    ValidateRegister(zeroOrNull.Left, instructionIndex);
+                    ValidateRegister(zeroOrNull.Right, instructionIndex);
+                    ValidateRegister(zeroOrNull.Destination, instructionIndex);
+                    break;
+                case GosubInstruction gosub:
+                    ValidateRegister(gosub.ReturnRegister, instructionIndex);
+                    ValidateJumpTarget(gosub.Target, instructionIndex);
+                    break;
+                case ReturnInstruction @return:
+                    ValidateRegister(@return.ReturnRegister, instructionIndex);
+                    break;
+                case BeginSubrtnInstruction beginSubrtn:
+                    ValidateRegister(beginSubrtn.Destination, instructionIndex);
+                    if (beginSubrtn.DestinationEnd is { } destinationEnd)
+                        ValidateRegister(destinationEnd, instructionIndex);
                     break;
                 case HaltInstruction halt:
                     // Clean halt (error code 0) is only legal as the terminal instruction.

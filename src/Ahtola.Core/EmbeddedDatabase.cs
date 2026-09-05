@@ -46899,6 +46899,266 @@ out bool hasReturning)
     private static bool IsSqlSpace(char character)
         => character is ' ' or '\t' or '\n' or '\v' or '\f' or '\r';
 
+    /// <summary>
+    /// Strict real-to-integer cast mirroring Turso's <c>cast_real_to_integer</c>
+    /// (core/util.rs): rejects non-finite and inexact values, saturated casts, and
+    /// values outside the i64 range. Unlike the lossy
+    /// <see cref="ToSqliteInteger(double)"/>, failure is reported as <c>false</c>
+    /// rather than clamped.
+    /// </summary>
+    internal static bool TryCastRealToInteger(double value, out long integer)
+    {
+        integer = 0;
+        if (!double.IsFinite(value) || Math.Truncate(value) != value)
+            return false;
+
+        // unchecked: Rust `as` saturates; the range checks below make saturation
+        // unreachable anyway, but keep the cast context-free of overflow checks.
+        var candidate = unchecked((long)value);
+        if (candidate == long.MinValue || candidate == long.MaxValue)
+            return false;
+
+        if ((double)candidate != value)
+            return false;
+
+        integer = candidate;
+        return true;
+    }
+
+    /// <summary>
+    /// Lossy text-to-integer extraction mirroring Turso's <c>str_to_i64</c>
+    /// (core/numeric/mod.rs): trims SQL whitespace (which includes '\v'), consumes an
+    /// optional sign and a run of ASCII digits, and parses just that slice. Text with no
+    /// digits, or whose slice overflows i64, yields 0 — except that an overflowing
+    /// magnitude saturates to long.MaxValue/long.MinValue by sign, matching Rust.
+    /// </summary>
+    internal static long StrToInt64Lossy(ReadOnlySpan<char> text)
+    {
+        var start = 0;
+        while (start < text.Length && IsSqlSpace(text[start]))
+            start++;
+
+        var sign = 1;
+        if (start < text.Length && (text[start] == '+' || text[start] == '-'))
+        {
+            if (text[start] == '-')
+                sign = -1;
+            start++;
+        }
+
+        var digitsStart = start;
+        while (start < text.Length && text[start] >= '0' && text[start] <= '9')
+            start++;
+
+        if (start == digitsStart)
+            return 0;
+
+        if (!long.TryParse(text.Slice(digitsStart, start - digitsStart), out var magnitude))
+            return sign < 0 ? long.MinValue : long.MaxValue;
+
+        return sign < 0 ? -magnitude : magnitude;
+    }
+
+    /// <summary>
+    /// Port of Turso's <c>parse_numeric_str</c> (core/util.rs): classifies the leading
+    /// numeric token of <paramref name="text"/> after a Rust-stdlib ASCII-whitespace trim
+    /// (which, unlike SQL whitespace, excludes '\v') and reports how many characters were
+    /// consumed. Quirks preserved verbatim: <c>"5."</c> and <c>".5"</c> classify as Float;
+    /// <c>"1e3"</c> is Float; a trailing bare 'e'/'E' or exponent sign is stripped from the
+    /// consumed slice and classified as Float; <c>"."</c> and <c>"-."</c> are valid Float
+    /// tokens whose f64 parse later fails to 0.0; <c>"+e"</c> strips to a sign-only
+    /// Float token (rejected by the lossless caller).
+    /// </summary>
+    private static bool TryClassifyNumericToken(ReadOnlySpan<char> text, out bool isInteger, out int consumed)
+    {
+        // Rust trim_ascii_whitespace: space and \t..\r only ('\v' is NOT trimmed), both ends.
+        var trimStart = 0;
+        while (trimStart < text.Length && text[trimStart] is ' ' or '\t' or '\n' or '\f' or '\r')
+            trimStart++;
+        var trimEnd = text.Length;
+        while (trimEnd > trimStart && text[trimEnd - 1] is ' ' or '\t' or '\n' or '\f' or '\r')
+            trimEnd--;
+        text = text[trimStart..trimEnd];
+
+        isInteger = false;
+        consumed = 0;
+
+        // Initial rejects: empty, leading 'e'/'E', or ".e"/".E" prefix.
+        if (text.IsEmpty || text[0] == 'e' || text[0] == 'E'
+            || (text[0] == '.' && text.Length > 1 && (text[1] == 'e' || text[1] == 'E')))
+        {
+            return false;
+        }
+
+        var sign = text[0] == '+' || text[0] == '-' ? text[0] : '\0';
+        var end = sign != '\0' ? 1 : 0;
+        var hasDecimal = false;
+        var hasExponent = false;
+
+        while (end < text.Length)
+        {
+            var c = text[end];
+            if (c is >= '0' and <= '9')
+            {
+                end++;
+                continue;
+            }
+
+            if (c == '.' && !hasDecimal && !hasExponent)
+            {
+                hasDecimal = true;
+                end++;
+                continue;
+            }
+
+            if ((c == 'e' || c == 'E') && !hasExponent)
+            {
+                hasExponent = true;
+                end++;
+                if (end < text.Length && (text[end] == '+' || text[end] == '-'))
+                    end++;
+                continue;
+            }
+
+            break;
+        }
+
+        if (end == 0 || (end == 1 && sign != '\0'))
+            return false;
+
+        // Edge cases: a token ending in a bare exponent marker is stripped of the marker
+        // and classified as Float; one ending in an exponent sign is stripped of the sign
+        // and its marker. Rust applies no further reject here — the lossless caller
+        // rejects partial consumption via its length comparison.
+        var last = text[end - 1];
+        if (last == 'e' || last == 'E')
+        {
+            isInteger = false;
+            consumed = end - 1;
+            return true;
+        }
+
+        if (hasExponent && (last == '+' || last == '-')
+            && end > 1 && (text[end - 2] == 'e' || text[end - 2] == 'E'))
+        {
+            isInteger = false;
+            consumed = end - 2;
+            return true;
+        }
+
+        isInteger = !hasDecimal && !hasExponent;
+        consumed = end;
+        return true;
+    }
+
+    /// <summary>
+    /// Port of Turso's <c>checked_cast_text_to_numeric(text, lossless: true)</c>
+    /// (core/util.rs): converts text to a numeric <see cref="SqlValue"/> only when the
+    /// entire trimmed text is one numeric token. Integer overflow falls back to a real
+    /// rounded to 15 significant digits exactly as upstream does (with Rust's
+    /// half-away-from-zero rounding, not banker's). Float-kind results pass through
+    /// <see cref="DowngradeRealToNumeric"/> to fold integral reals back to integers.
+    /// </summary>
+    private static bool TryCastTextToNumericLossless(string text, out SqlValue value)
+    {
+        value = SqlValue.Null;
+        // Rust compares the consumed token against trim_ascii_whitespace(text).len(),
+        // which trims BOTH ends ('\v' is not trimmed).
+        var trimmedStart = 0;
+        while (trimmedStart < text.Length
+            && text[trimmedStart] is ' ' or '\t' or '\n' or '\f' or '\r')
+            trimmedStart++;
+        var trimmedEnd = text.Length;
+        while (trimmedEnd > trimmedStart
+            && text[trimmedEnd - 1] is ' ' or '\t' or '\n' or '\f' or '\r')
+            trimmedEnd--;
+        var trimmed = text.AsSpan(trimmedStart, trimmedEnd - trimmedStart);
+
+        if (!TryClassifyNumericToken(trimmed, out var isInteger, out var consumed))
+            return false;
+
+        // lossless: the whole (Rust-trimmed) text must be one token.
+        if (consumed != trimmed.Length)
+            return false;
+
+        var token = trimmed[..consumed];
+        if (isInteger)
+        {
+            if (long.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
+            {
+                value = SqlValue.Integer(integer);
+                return true;
+            }
+
+            // Overflow: reparse as f64, then round to 15 significant digits.
+            if (double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var real))
+            {
+                var factor = Math.Pow(10, 15 - (int)Math.Ceiling(Math.Log10(Math.Abs(real))));
+                value = DowngradeRealToNumeric(SqlValue.Real(Math.Round(real * factor, MidpointRounding.AwayFromZero) / factor));
+                return true;
+            }
+
+            return false;
+        }
+
+        if (!double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var floatResult))
+            floatResult = 0.0;
+
+        value = DowngradeRealToNumeric(SqlValue.Real(floatResult));
+        return true;
+    }
+
+    /// <summary>
+    /// Port of Turso's <c>coerce_register_to_integer</c> (core/vdbe/execute.rs): coerces a
+    /// register value to an integer in place, reporting success. Integers pass through
+    /// untouched; reals must survive the strict <see cref="TryCastRealToInteger"/> cast;
+    /// text must be one entire lossless numeric token (so <c>"1.0"</c> coerces to 1 while
+    /// <c>"12abc"</c> fails, and a Float-kind result like <c>"1e3"</c> is itself strictly
+    /// cast). Blobs and NULLs never coerce.
+    /// </summary>
+    internal static bool TryCoerceRegisterToInteger(SqlValue value, out long integer)
+    {
+        integer = 0;
+        switch (value.Kind)
+        {
+            case SqlValueKind.Integer:
+                integer = value.AsInteger();
+                return true;
+            case SqlValueKind.Real:
+                return TryCastRealToInteger(value.AsReal(), out integer);
+            case SqlValueKind.Text:
+                if (!TryCastTextToNumericLossless(value.AsText(), out var numeric))
+                    return false;
+                if (numeric.Kind == SqlValueKind.Integer)
+                {
+                    integer = numeric.AsInteger();
+                    return true;
+                }
+
+                // Float-kind result (e.g. "1.5", "1e3"): strictly cast.
+                return numeric.Kind == SqlValueKind.Real
+                    && TryCastRealToInteger(numeric.AsReal(), out integer);
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Port of Turso's <c>extract_int_value</c> (core/vdbe/execute.rs): the lossy
+    /// integer view of any register value used by MemMax and the LIMIT machinery. Reals
+    /// clamp via <see cref="ToSqliteInteger(double)"/>, text and blobs parse a leading integer
+    /// prefix via <see cref="StrToInt64Lossy"/> (0 when absent), and NULL is 0.
+    /// </summary>
+    internal static long ExtractIntValue(SqlValue value)
+        => value.Kind switch
+        {
+            SqlValueKind.Integer => value.AsInteger(),
+            SqlValueKind.Real => ToSqliteInteger(value.AsReal()),
+            SqlValueKind.Text => StrToInt64Lossy(value.AsText().AsSpan()),
+            SqlValueKind.Blob => StrToInt64Lossy(DecodeBlobAsLatin1(value.AsBlobSpan()).AsSpan()),
+            _ => 0,
+        };
+
     private static long RequireInteger(SqlValue value)
     {
         if (value.Kind != SqlValueKind.Integer)
