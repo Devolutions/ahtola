@@ -330,14 +330,15 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
 
 - **Working set** — base-table rows and several intermediates still stay in the
   process heap. Sorters, compiled equijoin build sides, DISTINCT/compound keyed
-  sets, and buffered window partitions bound retained rows to the
-  `cache_size`-derived execution budget and spill deterministic runs/partitions
-  through the managed temporary file system; skewed hash partitions fall back
-  to bounded scans. With `temp_store=MEMORY`, exceeding that finite budget fails
-  instead of moving the same data into a heap-backed temporary file.
-  Non-equijoin build sides, recursive worktables, ephemeral tables, and opaque
-  aggregate state do not yet spill (ephemeral tables fail closed against the
-  statement memory budget). Prefer modest databases
+  sets, buffered window partitions, and recursive-worktable frontiers bound
+  retained rows to the `cache_size`-derived execution budget and spill
+  deterministic runs/partitions through the managed temporary file system;
+  skewed hash partitions fall back to bounded scans. With `temp_store=MEMORY`,
+  exceeding that finite budget fails instead of moving the same data into a
+  heap-backed temporary file. Non-equijoin build sides and ephemeral tables do
+  not yet spill (ephemeral tables fail closed against the statement memory
+  budget); an aggregate's own accumulator is a single bounded value per group.
+  Prefer modest databases
   and explicit transactions for writes (managed writes are slower than native
   SQLite and the gap grows with table size).
 - **Planner** — `ANALYZE` / `sqlite_stat1` and validated `sqlite_stat4`

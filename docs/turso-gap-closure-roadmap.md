@@ -72,6 +72,26 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   route through `Program` with `ColumnRange` image capture; STRICT INSERT emits
   `TypeCheck`. Distinct worktables spill through `VdbeKeyedRowStore`; window
   buffers fail closed against the statement memory budget.
+- 2026-09-05: recursive-worktable frontiers now spill through the managed temporary
+  file system. `WorkTableRuntime` retains buffered frontier rows against the
+  statement memory budget and, once the budget can no longer hold the queue,
+  drains it to a `worktable-frontier` spill file (a new `VdbeSpillFileKind`);
+  FIFO order is append order, so dequeues drain the buffered prefix and then
+  read records sequentially. `TryPeek` spans the spill boundary for
+  generation-at-a-time recursion, and the per-generation buffer is retained
+  and fails closed (the transform contract takes in-memory rows). Distinct
+  worktables therefore coexist with two spill stores (seen set + frontier) in
+  one statement. New `WorkTableFrontiersSpilled` metric. Coverage:
+  `RecursiveWorkTableOpcodeExecutionTests` spill cases (binary-tree level order
+  across the boundary, interleaved fan-out, distinct coexistence, and
+  no-spill fail-closed with `AllowTemporaryFileSpill=false`).
+  Also verified the earlier "window buffers fail closed" claim was superseded:
+  buffered window partitions already spill (`WindowBufferRuntime.EnsureSpilled`,
+  2026-09-01, indexed Compute reads), and the README working-set matrix now
+  says so. Remaining non-spilling structures: evaluator non-equijoin build
+  sides and ephemeral tables (deliberately fail-closed); an aggregate's own
+  accumulator is a single bounded value per group, so there is no engine-owned
+  growing aggregate state to spill.
 - 2026-09-01: appended `ChangeCount` (opcode 145). Streaming `AggInverse` now
   covers `ROWS CURRENT ROW … m FOLLOWING` and `ROWS n PRECEDING … m FOLLOWING`
   (n,m ≤ 1024). Ephemeral tables fail closed against the statement memory
