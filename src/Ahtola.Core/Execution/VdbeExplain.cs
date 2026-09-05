@@ -751,6 +751,18 @@ public static class VdbeExplain
                 beginSubrtn.DestinationEnd is { } end
                     ? $"r[{beginSubrtn.Destination.Index}..r[{end.Index}] = NULL"
                     : $"r[{beginSubrtn.Destination.Index}] = NULL"),
+            SequenceInstruction sequence => (
+                sequence.Cursor.Index,
+                sequence.Destination.Index,
+                0,
+                null,
+                $"r[{sequence.Destination.Index}] = cursor[{sequence.Cursor.Index}].seq++"),
+            SequenceTestInstruction sequenceTest => (
+                sequenceTest.Cursor.Index,
+                sequenceTest.Target.Offset,
+                sequenceTest.ValueRegister.Index,
+                null,
+                $"if cursor[{sequenceTest.Cursor.Index}].seq == 0 goto {sequenceTest.Target.Offset}; cursor[{sequenceTest.Cursor.Index}].seq++"),
             AggResetInstruction aggReset => (
                 aggReset.Accumulator.Index,
                 0,

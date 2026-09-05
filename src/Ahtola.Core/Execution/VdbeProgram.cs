@@ -599,6 +599,18 @@ public enum VdbeOpcode
     /// Mirrors Turso <c>Insn::BeginSubrtn</c>.
     /// </summary>
     BeginSubrtn = 176,
+
+    /// <summary>
+    /// Writes the per-cursor sequence counter to the destination register, then increments
+    /// the counter (Turso <c>Sequence</c>).
+    /// </summary>
+    Sequence = 177,
+
+    /// <summary>
+    /// Jumps to the target when the per-cursor sequence counter is zero; the counter is
+    /// incremented regardless of whether the jump is taken (Turso <c>SequenceTest</c>).
+    /// </summary>
+    SequenceTest = 178,
 }
 
 /// <summary>
@@ -3206,6 +3218,27 @@ public sealed record ReturnInstruction(Register ReturnRegister, bool CanFallThro
 public sealed record BeginSubrtnInstruction(Register Destination, Register? DestinationEnd = null) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.BeginSubrtn;
+}
+
+/// <summary>
+/// Writes the cursor's per-cursor sequence counter to <paramref name="Destination"/>, then
+/// increments the counter. Mirrors Turso <c>Insn::Sequence</c> (core/vdbe/execute.rs
+/// <c>op_sequence</c>).
+/// </summary>
+public sealed record SequenceInstruction(Cursor Cursor, Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Sequence;
+}
+
+/// <summary>
+/// Jumps to <paramref name="Target"/> when the cursor's sequence counter is zero; the
+/// counter is incremented regardless of whether the jump is taken. The value register is
+/// not read at run time — it exists so bytecode mirrors Turso's three-operand shape.
+/// Mirrors Turso <c>Insn::SequenceTest</c> (core/vdbe/execute.rs <c>op_sequence_test</c>).
+/// </summary>
+public sealed record SequenceTestInstruction(Cursor Cursor, ProgramCounter Target, Register ValueRegister) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SequenceTest;
 }
 
 /// <summary>Resets an aggregate accumulator to its uninitialized state so the next
@@ -6391,6 +6424,15 @@ public sealed class VdbeProgram
                     ValidateRegister(beginSubrtn.Destination, instructionIndex);
                     if (beginSubrtn.DestinationEnd is { } destinationEnd)
                         ValidateRegister(destinationEnd, instructionIndex);
+                    break;
+                case SequenceInstruction sequence:
+                    ValidateCursor(sequence.Cursor, instructionIndex);
+                    ValidateRegister(sequence.Destination, instructionIndex);
+                    break;
+                case SequenceTestInstruction sequenceTest:
+                    ValidateCursor(sequenceTest.Cursor, instructionIndex);
+                    ValidateRegister(sequenceTest.ValueRegister, instructionIndex);
+                    ValidateJumpTarget(sequenceTest.Target, instructionIndex);
                     break;
                 case HaltInstruction halt:
                     // Clean halt (error code 0) is only legal as the terminal instruction.

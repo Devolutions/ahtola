@@ -57,7 +57,8 @@ public class VdbeProgramTests
                 "HashResetMatched=163", "HashScanUnmatched=164", "HashNextUnmatched=165",
                 "IfPos=166", "IfNeg=167", "DecrJumpZero=168", "MustBeInt=169",
                 "SoftNull=170", "MemMax=171", "AddImm=172", "ZeroOrNull=173",
-                "Gosub=174", "Return=175", "BeginSubrtn=176");
+                "Gosub=174", "Return=175", "BeginSubrtn=176",
+                "Sequence=177", "SequenceTest=178");
 
         var constructors = typeof(VdbeProgram).GetConstructors();
         Type[] legacyParameterTypes =

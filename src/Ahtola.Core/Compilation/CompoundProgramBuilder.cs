@@ -660,6 +660,8 @@ public static class CompoundProgramBuilder
             GosubInstruction x => new GosubInstruction(Pc(x.Target), Reg(x.ReturnRegister)),
             ReturnInstruction x => new ReturnInstruction(Reg(x.ReturnRegister), x.CanFallThrough),
             BeginSubrtnInstruction x => new BeginSubrtnInstruction(Reg(x.Destination), x.DestinationEnd is { } e ? Reg(e) : null),
+            SequenceInstruction x => new SequenceInstruction(Cur(x.Cursor), Reg(x.Destination)),
+            SequenceTestInstruction x => new SequenceTestInstruction(Cur(x.Cursor), Pc(x.Target), Reg(x.ValueRegister)),
             AggResetInstruction x => new AggResetInstruction(Acc(x.Accumulator)),
             AggStepInstruction x => new AggStepInstruction(Acc(x.Accumulator), x.Aggregate, Range(x.Arguments)),
             AggInverseInstruction x => new AggInverseInstruction(Acc(x.Accumulator), x.Aggregate, Range(x.Arguments)),

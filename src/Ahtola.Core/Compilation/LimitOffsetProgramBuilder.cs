@@ -374,12 +374,14 @@ public static class LimitOffsetProgramBuilder
             DecrJumpZeroInstruction x => new DecrJumpZeroInstruction(x.Register, Pc(x.Target)),
             MustBeIntInstruction x => new MustBeIntInstruction(x.Register, x.Target is { } t ? Pc(t) : null),
             GosubInstruction x => new GosubInstruction(Pc(x.Target), x.ReturnRegister),
+            SequenceTestInstruction x => new SequenceTestInstruction(x.Cursor, Pc(x.Target), x.ValueRegister),
             SoftNullInstruction
                 or MemMaxInstruction
                 or AddImmInstruction
                 or ZeroOrNullInstruction
                 or ReturnInstruction
-                or BeginSubrtnInstruction => instruction,
+                or BeginSubrtnInstruction
+                or SequenceInstruction => instruction,
             SameGroupInstruction x => new SameGroupInstruction(x.CurrentKey, x.SavedKey, x.Comparer, Pc(x.SameGroupTarget)),
             ResetOnceInstruction x => new ResetOnceInstruction(Pc(x.RegionEnd)),
             OnceInstruction x => new OnceInstruction(Pc(x.ReentryTarget)),

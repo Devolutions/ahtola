@@ -38,6 +38,7 @@ public sealed class ResumableStatement : IDisposable
     private readonly VdbeRecordValue?[] _recordRegisters;
     private readonly bool[] _openCursors;
     private readonly int[] _cursorPositions;
+    private readonly long[] _cursorSequences;
     private readonly (int IndexCursor, int TableCursor)?[] _deferredSeeks;
     private readonly bool[] _skipLastInsertRowId;
     private readonly SqlValue[]?[] _materializedRows;
@@ -159,6 +160,7 @@ public sealed class ResumableStatement : IDisposable
         _recordRegisters = _registers.Records;
         _openCursors = new bool[program.CursorCount];
         _cursorPositions = new int[program.CursorCount];
+        _cursorSequences = new long[program.CursorCount];
         _deferredSeeks = new (int IndexCursor, int TableCursor)?[program.CursorCount];
         _skipLastInsertRowId = new bool[program.CursorCount];
         _materializedRows = new SqlValue[program.CursorCount][];
@@ -1792,6 +1794,27 @@ public sealed class ResumableStatement : IDisposable
                         AdvanceInstructionPointer();
                         break;
                     }
+                case SequenceInstruction sequence:
+                    {
+                        // Turso op_sequence: publish the counter, then increment it. The
+                        // cursor does not need to be open — the counter is per cursor id.
+                        _registers[sequence.Destination.Index] = SqlValue.Integer(_cursorSequences[sequence.Cursor.Index]);
+                        _cursorSequences[sequence.Cursor.Index]++;
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case SequenceTestInstruction sequenceTest:
+                    {
+                        // Turso op_sequence_test: jump when the counter was zero; the
+                        // counter increments either way. The value register is not read.
+                        var wasZero = _cursorSequences[sequenceTest.Cursor.Index] == 0;
+                        _cursorSequences[sequenceTest.Cursor.Index]++;
+                        if (wasZero)
+                            _instructionPointer = sequenceTest.Target;
+                        else
+                            AdvanceInstructionPointer();
+                        break;
+                    }
                 case AggResetInstruction aggReset:
                     _accumulatorInitialized[aggReset.Accumulator.Index] = false;
                     _accumulatorContexts[aggReset.Accumulator.Index] = null;
@@ -2560,6 +2583,12 @@ public sealed class ResumableStatement : IDisposable
         _registers.Clear();
         Array.Clear(_openCursors);
         Array.Clear(_cursorPositions);
+        // Per-cursor sequence counters restart at zero on each run, matching SQLite
+        // where OP_Sequence state lives on the cursor (recreated per execution).
+        // Turso keeps stale values across reset because Vec::resize no-ops when the
+        // cursor count is unchanged; that persistence is an upstream artifact no
+        // observable program depends on.
+        Array.Clear(_cursorSequences);
         Array.Clear(_deferredSeeks);
         Array.Clear(_skipLastInsertRowId);
         Array.Clear(_materializedRows);
