@@ -385,7 +385,7 @@ public sealed class VdbeScalarControlOpcodeTests
         // cast fails, so the coercion fails and the jump is taken.
         var program = new VdbeProgram(
             registerCount: 1,
-            cursorCount:  0,
+            cursorCount: 0,
             [
                 new LoadConstantInstruction(new Register(0), SqlValue.Text("99999999999999999999")),
                 new MustBeIntInstruction(new Register(0), new ProgramCounter(3)),
