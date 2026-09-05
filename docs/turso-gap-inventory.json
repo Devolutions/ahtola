@@ -66,6 +66,18 @@
   },
   "gaps": [
     {
+      "id": "pragma-in-memory-page-count-freelist-model",
+      "layer": "pragma",
+      "kind": "partial",
+      "turso_ref": "turso-src/core/vdbe/execute.rs::op_page_count (header database_size), op_max_pgcnt (pager.set_max_page_count); SQLite pager freelist semantics on :memory: databases",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.cs::{GetPageCount,GetFreelistCount,EnforceMaxPageCountForCatalogChange,ReconcileInMemoryPageModel,_inMemoryInitialized}; src/Ahtola.Tests/InMemoryPageModelTests.cs",
+      "severity": "s2-capability",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Closed 2026-09-05. Two defects in the managed in-memory page model (no file store): (1) the autocommit fast path never set _inMemoryInitialized, so PRAGMA page_count stayed 0 after CREATE TABLE/INDEX (SQLite reports header+root=2) and max_page_count enforcement compared against a stale zero count, accepting unlimited catalog growth under max_page_count=2; (2) DROP shrank page_count and freelist_count was hardcoded 0 (the old comment claimed SQLite reports 0 for :memory:, but SQLite maintains a real freelist there). The model now mirrors SQLite's pager: the first committed mutation materializes the header page; page_count is a high-water mark that only grows; dropped b-tree roots move onto the freelist; new b-trees consume freelist pages before growing; and EnforceMaxPageCountForCatalogChange counts only growth beyond the high-water mark, so freelist pages satisfy new trees within the limit. File-backed databases read the real header fields and are unaffected.",
+      "status": "closed"
+    },
+    {
       "id": "vdbe-bloom-filter-opcodes",
       "layer": "vdbe",
       "kind": "missing",
