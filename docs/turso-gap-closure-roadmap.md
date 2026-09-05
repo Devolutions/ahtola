@@ -72,6 +72,41 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   route through `Program` with `ColumnRange` image capture; STRICT INSERT emits
   `TypeCheck`. Distinct worktables spill through `VdbeKeyedRowStore`; window
   buffers fail closed against the statement memory budget.
+- 2026-09-05: recursive-worktable frontiers now spill through the managed temporary
+  file system. `WorkTableRuntime` retains buffered frontier rows against the
+  statement memory budget and, once the budget can no longer hold the queue,
+  drains it to a `worktable-frontier` spill file (a new `VdbeSpillFileKind`);
+  FIFO order is append order, so dequeues drain the buffered prefix and then
+  read records sequentially. `TryPeek` spans the spill boundary for
+  generation-at-a-time recursion, and the per-generation buffer is retained
+  and fails closed (the transform contract takes in-memory rows). Distinct
+  worktables therefore coexist with two spill stores (seen set + frontier) in
+  one statement. New `WorkTableFrontiersSpilled` metric. Coverage:
+  `RecursiveWorkTableOpcodeExecutionTests` spill cases (binary-tree level order
+  across the boundary, interleaved fan-out, distinct coexistence, and
+  no-spill fail-closed with `AllowTemporaryFileSpill=false`).
+  Also verified the earlier "window buffers fail closed" claim was superseded:
+  buffered window partitions already spill (`WindowBufferRuntime.EnsureSpilled`,
+  2026-09-01, indexed Compute reads), and the README working-set matrix now
+  says so. Remaining non-spilling structures: evaluator non-equijoin build
+  sides and ephemeral tables (deliberately fail-closed); an aggregate's own
+  accumulator is a single bounded value per group, so there is no engine-owned
+  growing aggregate state to spill.
+- 2026-09-05: ephemeral tables spill too — the last VDBE-side fail-closed
+  structure. `EphemeralTableRuntime` keeps its full access contract
+  (sequential scan, positional delete, key-prefix delete/contains, ResetSorter
+  clears, cursor-source rowids) across a spill transition: rows flush to an
+  `ephemeral-table` append-log of (slot, rowid, values) records with an
+  `ephemeral-index` slot→offset file (the keyed-row-set layout), and a compact
+  live-slot list preserves positional semantics afterwards (one reference per
+  live row, itself retained against the budget). The lazy
+  `SpilledEphemeralRowList`/`RowIdList` views give `VdbeCursorSource` indexed
+  reads without reloading the table. New `EphemeralTablesSpilled` metric.
+  Coverage: `VdbeEphemeralTableOpcodeTests` spill case (order, values, metrics,
+  file lifecycle). With this, every VDBE execution intermediate either spills
+  or is a bounded per-group/per-row value; the only non-spilling remainder is
+  the evaluator's materializing nested-loop join, which is an architectural
+  property of the evaluator, not a missing spill path.
 - 2026-09-01: appended `ChangeCount` (opcode 145). Streaming `AggInverse` now
   covers `ROWS CURRENT ROW … m FOLLOWING` and `ROWS n PRECEDING … m FOLLOWING`
   (n,m ≤ 1024). Ephemeral tables fail closed against the statement memory

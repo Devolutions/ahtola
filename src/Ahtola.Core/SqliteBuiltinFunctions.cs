@@ -41,6 +41,7 @@ internal static class SqliteBuiltinFunctions
         "UUID4_STR", "GEN_RANDOM_UUID", "UUID4", "UUID7_STR", "UUID7", "UUID7_TIMESTAMP_MS",
         "UUID_STR", "UUID_BLOB",
         "BOOLEAN_TO_INT", "INT_TO_BOOLEAN", "VALIDATE_IPADDR",
+        "NEXTVAL", "CURRVAL", "SETVAL",
         "VECTOR", "VECTOR32", "VECTOR32_SPARSE", "VECTOR64", "VECTOR8", "VECTOR1BIT",
         "VECTOR_EXTRACT", "VECTOR_DISTANCE_COS", "VECTOR_DISTANCE_L2",
         "VECTOR_DISTANCE_JACCARD", "VECTOR_DISTANCE_DOT", "VECTOR_CONCAT", "VECTOR_SLICE",
@@ -102,6 +103,9 @@ internal static class SqliteBuiltinFunctions
         "HIGHLIGHT",
         "SNIPPET",
         "RTREECHECK",
+        "NEXTVAL",
+        "CURRVAL",
+        "SETVAL",
     };
 
     public static bool Contains(string name)
@@ -172,6 +176,10 @@ internal static class SqliteBuiltinFunctions
             return [1, 2, 3];
         if (normalized is "LIKE" or "SUBSTR" or "SUBSTRING" or "LPAD" or "RPAD")
             return [2, 3];
+        if (normalized == "SETVAL")
+            return [2, 3];
+        if (normalized is "NEXTVAL" or "CURRVAL")
+            return [1];
         if (normalized is "TRIM" or "BTRIM" or "LTRIM" or "RTRIM" or "ROUND" or "LOG"
             or "UNHEX" or "JSON_ARRAY_LENGTH" or "JSON_TYPE" or "JSON_PRETTY" or "RTREECHECK")
         {
@@ -182,7 +190,8 @@ internal static class SqliteBuiltinFunctions
             or "PI" or "RANDOM" or "SQLITE_VERSION" or "TURSO_VERSION" or "SQLITE_SOURCE_ID"
             or "CHANGES" or "TOTAL_CHANGES" or "LAST_INSERT_ROWID" or "UUID4_STR"
             or "IS_AUTOCOMMIT"
-            or "GEN_RANDOM_UUID" or "UUID4" or "UUID7_STR" or "UUID7")
+            or "GEN_RANDOM_UUID" or "UUID4" or "UUID7_STR" or "UUID7"
+        )
         {
             return [0];
         }

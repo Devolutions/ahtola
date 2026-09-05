@@ -712,6 +712,171 @@ internal static class DdlStatementCompiler
     }
 
     /// <summary>
+    /// Lowers <c>CREATE SEQUENCE</c>, following <c>translate_create_sequence</c> (sequence.rs:793).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A sequence is persisted as its backing table: the program allocates one b-tree, writes its
+    /// <c>sqlite_schema</c> row, adopts it with <c>ParseSchema</c>, seeds the descriptor row, and bumps
+    /// the cookie — the same shape <c>CREATE TABLE ... AUTOINCREMENT</c> uses for its implicit backing
+    /// table. The descriptor (start/increment/min/max/cycle) is immutable, so the seed row carries it
+    /// once and every later <c>nextval</c>/<c>setval</c> rewrites the watermark row in place.
+    /// </para>
+    /// <para>
+    /// All decisions happen here, in upstream's order: the reserved AUTOINCREMENT namespace, existence
+    /// and <c>IF NOT EXISTS</c>, option validation, and the backing-table name's availability. The
+    /// runtime watermark is never part of the descriptor — it is read from the backing row on every
+    /// allocation, exactly as upstream's disk-only design prescribes.
+    /// </para>
+    /// </remarks>
+    public static CompiledSchemaProgram CompileCreateSequence(
+        CreateSequenceStatement statement,
+        DdlCompilationContext context)
+    {
+        ArgumentNullException.ThrowIfNull(statement);
+        ArgumentNullException.ThrowIfNull(context);
+
+        var catalog = context.Catalog;
+        if (EmbeddedDatabase.IsReservedSequenceName(statement.Name))
+        {
+            throw new EmbeddedSqlException(
+                $"sequence name \"{statement.Name}\" is reserved for internal AUTOINCREMENT use");
+        }
+
+        var sequence = ManagedSequence.Create(
+            statement.Name,
+            statement.Start,
+            statement.Increment,
+            statement.MinValue,
+            statement.MaxValue,
+            statement.Cycle);
+
+        var backingTableName = EmbeddedDatabase.GetSequenceBackingTableName(statement.Name);
+        if (catalog.Tables.TryGetValue(backingTableName, out var existingBacking))
+        {
+            EmbeddedDatabase.ValidateAutoIncrementSequenceBackingTable(existingBacking);
+            if (statement.IfNotExists)
+                return CompileNoOp(context);
+
+            throw new EmbeddedSqlException($"sequence \"{statement.Name}\" already exists");
+        }
+
+        if (catalog.Views.ContainsKey(backingTableName)
+            || catalog.Triggers.ContainsKey(backingTableName)
+            || EmbeddedDatabase.TryFindIndex(catalog.Tables, backingTableName, out _, out _))
+        {
+            throw new EmbeddedSqlException($"object name reserved for internal use: {backingTableName}");
+        }
+
+        context.EnforceMaxPageCount(1);
+
+        var builder = new SchemaProgramBuilder(context.Database);
+        var schemaCursor = builder.AllocateCursor();
+        builder.Emit(new OpenWriteCursorInstruction(
+            schemaCursor,
+            ManagedSchemaProgramBindings.SchemaTableName,
+            ManagedSchemaProgramBindings.SchemaColumnCount));
+
+        var backing = EmbeddedDatabase.CreateSequenceBackingTable(backingTableName, sequence);
+        var backingRoot = builder.EmitCreateBtree(VdbeCreateBtreeFlags.Table);
+        builder.EmitSchemaEntry(
+            schemaCursor,
+            ManagedSchemaRow.TableType,
+            backingTableName,
+            backingTableName,
+            backingRoot,
+            EmbeddedDatabase.BuildCreateTableSql(backingTableName, backing));
+
+        var stagedSchemaVersion = NextSchemaVersion(context.SchemaVersion);
+        builder.Emit(new SetCookieInstruction(
+            context.Database,
+            VdbeSchemaCookie.SchemaVersion,
+            checked((int)stagedSchemaVersion)));
+        builder.Emit(ParseSchemaFor(context.Database, backingTableName));
+
+        var populations = new List<CompiledSchemaPopulation>(1)
+        {
+            EmitPopulation(
+                builder,
+                backingTableName,
+                [.. backing.Rows],
+                backing.ColumnDefinitions.Length),
+        };
+
+        return new CompiledSchemaProgram(
+            builder.Build(),
+            schemaCursor,
+            populations,
+            stagedSchemaVersion,
+            IsNoOp: false);
+    }
+
+    /// <summary>
+    /// Lowers <c>DROP SEQUENCE</c>, following <c>translate_drop_sequence</c> (sequence.rs:948) and the
+    /// backing-table teardown <c>emit_drop_sequence_cleanup</c> performs.
+    /// </summary>
+    /// <remarks>
+    /// The program deletes the backing table's <c>sqlite_schema</c> row, retires its b-tree, and evicts
+    /// the catalog entry — the same three steps <c>DROP TABLE</c> uses for an implicit AUTOINCREMENT
+    /// backing table, because the two kinds are one storage shape.
+    /// </remarks>
+    public static CompiledSchemaProgram CompileDropSequence(
+        DropSequenceStatement statement,
+        DdlCompilationContext context)
+    {
+        ArgumentNullException.ThrowIfNull(statement);
+        ArgumentNullException.ThrowIfNull(context);
+
+        var catalog = context.Catalog;
+        var backingTableName = EmbeddedDatabase.GetSequenceBackingTableName(statement.Name);
+        if (!catalog.Tables.TryGetValue(backingTableName, out var backing))
+        {
+            if (statement.IfExists)
+                return CompileNoOp(context);
+
+            throw new EmbeddedSqlException($"sequence \"{statement.Name}\" does not exist");
+        }
+
+        EmbeddedDatabase.ValidateAutoIncrementSequenceBackingTable(backing);
+        // Names resolve case-insensitively but every scan compares the name column with BINARY semantics,
+        // so the program has to search for the spelling the schema rows carry.
+        var catalogBackingName = ResolveCatalogName(catalog.Tables, backingTableName);
+
+        var builder = new SchemaProgramBuilder(context.Database);
+        var schemaCursor = builder.AllocateCursor();
+        builder.Emit(new OpenWriteCursorInstruction(
+            schemaCursor,
+            ManagedSchemaProgramBindings.SchemaTableName,
+            ManagedSchemaProgramBindings.SchemaColumnCount));
+
+        var backingRoot = builder.EmitSchemaRowDeleteScan(
+            schemaCursor,
+            ManagedSchemaRow.TableType,
+            catalogBackingName);
+        builder.Emit(new DestroyInstruction(
+            context.Database,
+            RootPage: 0,
+            builder.AllocateRegister(),
+            IsTemporary: false,
+            backingRoot));
+        builder.Emit(new DropTableInstruction(context.Database, catalogBackingName));
+
+        var stagedSchemaVersion = NextSchemaVersion(context.SchemaVersion);
+        builder.Emit(new SetCookieInstruction(
+            context.Database,
+            VdbeSchemaCookie.SchemaVersion,
+            checked((int)stagedSchemaVersion)));
+        builder.Emit(new CloseCursorInstruction(schemaCursor));
+
+        return new CompiledSchemaProgram(
+            builder.Build(),
+            schemaCursor,
+            [],
+            stagedSchemaVersion,
+            IsNoOp: false);
+    }
+
+    /// <summary>
     /// Lowers <c>CREATE VIEW</c>, following <c>translate_create_view</c> (view.rs:312).
     /// </summary>
     /// <remarks>

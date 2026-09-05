@@ -245,6 +245,43 @@ public class GeneratedColumnsTests
     }
 
     [Test]
+    public void AggregateFunctionInGenerationUsesTursoAggregateDiagnostic()
+    {
+        // Turso's validate_generated_expr emits a distinct aggregate-specific diagnostic
+        // (core/schema.rs: "aggregate functions prohibited in generated columns") before
+        // the determinism allow-list is consulted. The managed engine mirrors the split.
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        var act = () => Execute(connection, "CREATE TABLE t(a INT, v AS (sum(a)))");
+        act.Should().Throw<EmbeddedSqlException>().WithMessage("aggregate functions prohibited in generated columns");
+    }
+
+    [Test]
+    public void WindowFunctionInGenerationUsesTursoWindowDiagnostic()
+    {
+        // Window calls get Turso's separate window-specific diagnostic
+        // (core/schema.rs: "window functions prohibited in generated columns").
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        var act = () => Execute(connection, "CREATE TABLE t(a INT, v AS (sum(a) OVER (ORDER BY a)))");
+        act.Should().Throw<EmbeddedSqlException>().WithMessage("window functions prohibited in generated columns");
+    }
+
+    [Test]
+    public void WindowOnlyFunctionInGenerationUsesMisuseDiagnostic()
+    {
+        // Window-only functions (row_number etc.) that are not aggregates report SQLite's
+        // misuse diagnostic through the determinism allow-list path.
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        var act = () => Execute(connection, "CREATE TABLE t(a INT, v AS (row_number() OVER (ORDER BY a)))");
+        act.Should().Throw<EmbeddedSqlException>().WithMessage("window functions prohibited in generated columns");
+    }
+
+    [Test]
     public void BoundParameterInGenerationIsRejectedByManagedEngine()
     {
         var database = new EmbeddedDatabase();

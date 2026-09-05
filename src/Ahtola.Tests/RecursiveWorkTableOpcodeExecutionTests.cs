@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using Ahtola.Core;
 using Ahtola.Core.Execution;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
 
@@ -540,6 +541,213 @@ public class RecursiveWorkTableOpcodeExecutionTests
     }
 
     [Test]
+    public void KeepAllWorkTableHonorsTheRetainedMemoryBudgetWithoutSpill()
+    {
+        // With spill disabled the frontier is the only unbounded structure (maxDepth 0 means no
+        // expansion), so a budget smaller than the seeds must fail closed exactly like the distinct
+        // set does.
+        var seeds = Enumerable.Range(0, 64).Select(static value => Row(value)).ToArray();
+        var program = Recursive(
+            width: 1,
+            mode: WorkTableDedupMode.KeepAll,
+            equality: null,
+            maxRows: 1000,
+            maxDepth: 0,
+            Increment,
+            seeds);
+        var options = new VdbeExecutionOptions(
+            new Ahtola.Core.Storage.InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 64,
+            allowTemporaryFileSpill: false);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        Assert.Throws<VdbeMemoryLimitExceededException>(() => Drain(statement));
+    }
+
+    [Test]
+    public void FrontierSpillsToTheTemporaryFileAndPreservesBreadthFirstOrder()
+    {
+        // A binary tree 1..7 with a budget that cannot hold the whole frontier: the drain must spill
+        // through the managed temporary file system and still emit the exact level order.
+        const string temporaryDirectory = "worktable-frontier-spill-tests";
+        VdbeRecursiveTransform branch = row =>
+        {
+            var n = row[0].AsInteger();
+            var left = 2 * n;
+            var right = 2 * n + 1;
+            if (right > 7)
+                return [];
+
+            return [[SqlValue.Integer(left)], [SqlValue.Integer(right)]];
+        };
+
+        var program = Recursive(
+            width: 1,
+            mode: WorkTableDedupMode.KeepAll,
+            equality: null,
+            maxRows: 100,
+            maxDepth: 100,
+            branch,
+            Row(1));
+
+        var sampleRow = new[] { SqlValue.Integer(0) };
+        var rowBytes = VdbeManagedFootprint.EstimateSorterRow(sampleRow);
+        var infrastructure = VdbeManagedFootprint.EstimateWorkTableFrontierSpillInfrastructure(
+            temporaryDirectory);
+        // Enough for a few buffered rows plus the spill infrastructure — the rest must go to disk.
+        var budget = checked((rowBytes * 3) + infrastructure + 64);
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory,
+            metrics: metrics);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        Integers(Drain(statement)).Should().Equal(1, 2, 3, 4, 5, 6, 7);
+
+        metrics.WorkTableFrontiersSpilled.Should().Be(1);
+        metrics.SpillBytesWritten.Should().BeGreaterThan(0);
+        metrics.SpillBytesRead.Should().BeGreaterThan(0);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void FrontierSpillSurvivesMidRecursionAcrossDepthLevels()
+    {
+        // Fan-out recursion with a budget for a single buffered row: each expansion enqueues several
+        // children, so the frontier crosses the budget on every step and the drain interleaves
+        // buffered dequeues with spilled writes and reads. The exact FIFO level order must survive.
+        const string temporaryDirectory = "worktable-frontier-spill-depth";
+        VdbeRecursiveTransform fanOut = row =>
+        {
+            var n = row[0].AsInteger();
+            if (n > 40)
+                return [];
+
+            // Four children each: the queue grows faster than the drain consumes it, forcing the
+            // spill path to stay in play across depth levels.
+            return
+            [
+                [SqlValue.Integer(n * 10 + 1)],
+                [SqlValue.Integer(n * 10 + 2)],
+                [SqlValue.Integer(n * 10 + 3)],
+                [SqlValue.Integer(n * 10 + 4)],
+            ];
+        };
+
+        var program = Recursive(
+            width: 1,
+            mode: WorkTableDedupMode.KeepAll,
+            equality: null,
+            maxRows: 100,
+            maxDepth: 100,
+            fanOut,
+            Row(1));
+
+        var sampleRow = new[] { SqlValue.Integer(0) };
+        var rowBytes = VdbeManagedFootprint.EstimateSorterRow(sampleRow);
+        var infrastructure = VdbeManagedFootprint.EstimateWorkTableFrontierSpillInfrastructure(
+            temporaryDirectory);
+        // Room for exactly one buffered frontier row: the first fan-out must trip the spill.
+        var budget = checked(rowBytes + infrastructure + 32);
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory,
+            metrics: metrics);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        var rows = Integers(Drain(statement));
+
+        // Level order: 1; then 11..14; then the children of 11 (111..114) etc. — the anchor and the
+        // first generation's prefixes prove FIFO survived the spill boundary.
+        rows[0].Should().Be(1);
+        rows.Should().ContainInOrder(1L, 11L, 12L, 13L, 14L, 111L, 112L, 113L, 114L);
+        rows.Count.Should().Be(21); // 1 + 4 + 16: depth guard cuts off after the third level's seeds exceed 40.
+
+        metrics.WorkTableFrontiersSpilled.Should().Be(1);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void DistinctWorkTableSpillsBothTheSeenSetAndTheFrontier()
+    {
+        // A wide distinct recursion: the dedup set (already spill-capable) and the frontier both
+        // cross the budget, proving the two spill stores coexist within one statement.
+        const string temporaryDirectory = "worktable-frontier-spill-distinct";
+        VdbeRecursiveTransform fanOutOnce = row =>
+        {
+            var n = row[0].AsInteger();
+            if (n > 90)
+                return [];
+
+            return
+            [
+                [SqlValue.Integer(n * 10 + 1)],
+                [SqlValue.Integer(n * 10 + 2)],
+                [SqlValue.Integer(n * 10 + 3)],
+                [SqlValue.Integer(n * 10 + 4)],
+                [SqlValue.Integer(n * 10 + 5)],
+                [SqlValue.Integer(n * 10 + 6)],
+                [SqlValue.Integer(n * 10 + 7)],
+                [SqlValue.Integer(n * 10 + 8)],
+            ];
+        };
+
+        var program = Recursive(
+            width: 1,
+            mode: WorkTableDedupMode.Distinct,
+            equality: ByteExactRows,
+            maxRows: 1000,
+            maxDepth: 100,
+            fanOutOnce,
+            Row(1));
+
+        var sampleRow = new[] { SqlValue.Integer(0) };
+        var rowBytes = VdbeManagedFootprint.EstimateSorterRow(sampleRow);
+        var frontierInfrastructure = VdbeManagedFootprint.EstimateWorkTableFrontierSpillInfrastructure(
+            temporaryDirectory);
+        var seenInfrastructure = VdbeManagedFootprint.EstimateKeyedRowSetSpillInfrastructure(
+            temporaryDirectory);
+        // The frontier and the distinct set spill at different moments, but both infrastructures stay
+        // retained for the statement's lifetime, so the budget must hold them simultaneously. The
+        // buffered-row allowance (two rows) is far below the eight-child fan-out, so the first
+        // expansion trips the frontier spill while the seen set still has its own headroom.
+        var budget = checked(
+            (rowBytes * 2)
+            + (frontierInfrastructure * 2)
+            + (seenInfrastructure * 2)
+            + 2048);
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem,
+            sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory,
+            metrics: metrics);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        var rows = Integers(Drain(statement));
+
+        // 1; 11..18; the 64 grandchildren — every admitted row is distinct, so the full fan-out surfaces.
+        rows.Should().HaveCount(73);
+        rows.Should().ContainInOrder(1L, 11L, 12L, 13L, 14L, 15L, 16L, 17L, 18L, 111L, 112L, 113L, 114L);
+
+        metrics.WorkTableFrontiersSpilled.Should().Be(1);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
     public void ExplainDescribesOpenWorkTableWithItsShapeGuardsAndMode()
     {
         var instruction = new OpenWorkTableInstruction(
@@ -616,6 +824,31 @@ public class RecursiveWorkTableOpcodeExecutionTests
     }
 
     private static long[] Row(params long[] values) => values;
+
+    private sealed class TrackingFileSystem : IFileSystem
+    {
+        private readonly IFileSystem _inner = new Ahtola.Core.Storage.InMemoryFileSystem();
+
+        public List<string> Created { get; } = [];
+
+        public List<string> Deleted { get; } = [];
+
+        public bool FileExists(string path) => _inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+        {
+            var file = _inner.OpenFile(path, mode, readOnly);
+            if (mode == FileOpenMode.CreateNew)
+                Created.Add(path);
+            return file;
+        }
+
+        public void DeleteFile(string path)
+        {
+            Deleted.Add(path);
+            _inner.DeleteFile(path);
+        }
+    }
 
     private static List<long> Integers(IEnumerable<SqlValue[]> rows)
         => rows.Select(row => row[0].AsInteger()).ToList();

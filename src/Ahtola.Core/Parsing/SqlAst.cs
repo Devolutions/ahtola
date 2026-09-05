@@ -407,6 +407,22 @@ internal sealed record ReindexStatement(
 /// <summary>Turso <c>OPTIMIZE INDEX [name]</c>; a null name optimizes every method index.</summary>
 internal sealed record OptimizeIndexStatement(string? IndexName) : ParsedStatement;
 
+/// <summary>
+/// Turso <c>CREATE SEQUENCE [IF NOT EXISTS] name [START [WITH] n] [INCREMENT [BY] n]
+/// [MINVALUE n] [MAXVALUE n] [CYCLE|NO CYCLE]</c>. Null options take Turso's defaults.
+/// </summary>
+internal sealed record CreateSequenceStatement(
+    string Name,
+    long? Start,
+    long? Increment,
+    long? MinValue,
+    long? MaxValue,
+    bool Cycle,
+    bool IfNotExists) : ParsedStatement;
+
+/// <summary>Turso <c>DROP SEQUENCE [IF EXISTS] name</c>.</summary>
+internal sealed record DropSequenceStatement(string Name, bool IfExists) : ParsedStatement;
+
 internal sealed record VacuumStatement(string? Schema, Expression? Into) : ParsedStatement;
 
 internal sealed record AttachDatabaseStatement(

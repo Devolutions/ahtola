@@ -1629,6 +1629,112 @@ FTS5/R-Tree shadow storage, and embedded sync-history rewrites. Foreign SQLite
 R-Tree shadow layouts are rejected explicitly; Ahtola does not claim two-way
 file interoperability for payload-backed virtual tables.
 
+### F7 — inventory housekeeping (2026-09-05)
+
+Record-keeping only; no engine behavior changed. An exhaustive review of the
+55 `s4-intentional` entries found 9 whose 2026-08-06 closure rationales
+predated later waves: the three `mvcc-*` entries still claimed MVCC was
+fail-closed/ignored (superseded by the MVCC phases 1–3.7 port,
+`docs/mvcc-port-contract.md`), and six `sync-*` entries still cited the
+companion-not-shipped scope for CDC, MVCC-logical replay, page-protocol
+pull, partial/query bootstrap, the EF sync surface, and the checkpoint
+policy (all superseded by the managed sync engine, roadmap workstream
+`sync-engine-depth`). Each entry received a dated `Reconciled 2026-09-05`
+postscript and a corrected `ahtola_ref` pointing at the shipped
+implementation; original rationale text is preserved per the append-only
+audit-trail convention. The meta block was repaired (`entry_count` 216 →
+217, recounted `counts` including the `pragma` layer and the
+`intentional-divergence` kind, `last_reconciled` → 2026-09-05, schema
+enums extended, `conformance_links` documented as historical keys, and a
+note that the 2 remaining expected failures are the intentional
+STORED-generated-column markers). The actionable s4 remainder —
+SEQUENCE family, typed values, materialized views, multi-DB atomic
+commit, and the generated-column error-message split — stays
+`s4-intentional` pending an explicit product decision; this wave records
+that status, it does not flip it.
+
+### F8 — generated-column error-message parity verification (2026-09-05)
+
+Verified against the pinned v0.8.0-pre.7 sources that the engine already
+emits Turso's two distinct generated-column diagnostics
+(`core/schema.rs`: "window functions prohibited in generated columns" vs
+"aggregate functions prohibited in generated columns"); the
+`compile-generated-column-error-message-mismatch` entry's
+single-combined-message claim was stale, not the engine. Added focused
+parity tests
+(`GeneratedColumnsTests.AggregateFunctionInGenerationUsesTursoAggregateDiagnostic`
+/ `WindowFunctionInGenerationUsesTursoWindowDiagnostic` /
+`WindowOnlyFunctionInGenerationUsesMisuseDiagnostic`); all 32
+GeneratedColumnsTests pass. No engine change was needed.
+
+### F9 — SEQUENCE family port (2026-09-05)
+
+Flipped the first actionable `s4-intentional` candidate into a delivered
+surface, porting Turso's SEQUENCE extension end to end:
+
+- **Parser/AST**: `CREATE SEQUENCE [IF NOT EXISTS] name [START [WITH] n]
+  [INCREMENT [BY] n] [MINVALUE n] [MAXVALUE n] [CYCLE|NO CYCLE]` and
+  `DROP SEQUENCE [IF EXISTS] name`, matching upstream's
+  `parse_create_sequence`/`parse_drop_stmt` grammar and AST
+  (`CreateSequenceStatement`/`DropSequenceStatement`).
+- **Descriptor + validation** (`ManagedSequence`): Turso's
+  `Sequence::new` defaults and exact diagnostics — increment ≠ 0, min/max
+  defaults by direction, `min < max`, start clamped to bounds.
+- **Persistence**: the disk-only backing-table model
+  (`__turso_internal_seq_<name>`, the same 7-column shape AUTOINCREMENT
+  uses) — CREATE/DROP lower to compiled DDL programs
+  (`DdlStatementCompiler.CompileCreateSequence/CompileDropSequence`)
+  that allocate the b-tree, write/adopt the schema row, seed the
+  descriptor row, and bump the cookie; DROP tears the backing table down
+  exactly as `emit_drop_sequence_cleanup` does and clears the
+  connection's currval session entry.
+- **Functions**: `nextval`/`currval`/`setval` as evaluator-managed
+  scalars over the backing row (watermark read/rewrite per call,
+  Turso's `SequenceComputeNext` exhaustion/cycle/is_called rules,
+  setval range validation, per-connection currval via
+  `ManagedSequenceSession` threaded through `QueryContext` like the
+  CDC session). A statement containing `nextval`/`setval` is classified
+  as a mutation (so bare `SELECT nextval(...)` takes the write path),
+  and the watermark rewrite reports `Changed` through the
+  `CteMutationState` side-channel, which makes autocommit persist and
+  transaction rollback discard the advance — Turso's documented
+  "rolled-back values can be re-emitted" behavior.
+- **Tests**: `ManagedSequenceTests` (26 cases) — asc/desc, cycle wrap,
+  exhaustion diagnostics, setval/is_called, per-connection currval,
+  cross-connection visibility, rollback re-emission, file-backed reopen
+  persistence, reserved AUTOINCREMENT-namespace rejection, validation
+  errors, INSERT integration.
+
+Inventory entries
+`parser-turso-only-sequence-and-optimize-statements`,
+`func-sequence-nextval-family`, and `vdbe-sequence-opcode-family` closed
+as delivered (the six remaining upstream opcodes are recorded as the
+deliberate managed idiom: the evaluator rewrites the backing row where
+Turso needs bytecode cursor sequences). README updated.
+
+
+Record-keeping only; no engine behavior changed. An exhaustive review of the
+55 `s4-intentional` entries found 9 whose 2026-08-06 closure rationales
+predated later waves: the three `mvcc-*` entries still claimed MVCC was
+fail-closed/ignored (superseded by the MVCC phases 1–3.7 port,
+`docs/mvcc-port-contract.md`), and six `sync-*` entries still cited the
+companion-not-shipped scope for CDC, MVCC-logical replay, page-protocol
+pull, partial/query bootstrap, the EF sync surface, and the checkpoint
+policy (all superseded by the managed sync engine, roadmap workstream
+`sync-engine-depth`). Each entry received a dated `Reconciled 2026-09-05`
+postscript and a corrected `ahtola_ref` pointing at the shipped
+implementation; original rationale text is preserved per the append-only
+audit-trail convention. The meta block was repaired (`entry_count` 216 →
+217, recounted `counts` including the `pragma` layer and the
+`intentional-divergence` kind, `last_reconciled` → 2026-09-05, schema
+enums extended, `conformance_links` documented as historical keys, and a
+note that the 2 remaining expected failures are the intentional
+STORED-generated-column markers). The actionable s4 remainder —
+SEQUENCE family, typed values, materialized views, multi-DB atomic
+commit, and the generated-column error-message split — stays
+`s4-intentional` pending an explicit product decision; this wave records
+that status, it does not flip it.
+
 
 ## Appendix A — Inventory JSON schema
 
@@ -1683,7 +1789,9 @@ they are listed below for completeness — absence of mapped failures means
 ## Appendix C — Entries with zero mapped failure lines (by layer)
 
 > Historical source-evidence list from analysis time. As of F5 the live
-> inventory is **0 open / 216 closed**; entries below may be closed intentional
+> inventory is **0 open / 217 closed** (216 after F5, plus the 2026-09-05
+> `pragma`-layer entry `pragma-in-memory-page-count-freelist-model`);
+> entries below may be closed intentional
 > or delivered surfaces that simply had no conf corpus line.
 
 - **vdbe** (16): `vdbe-bloom-filter-opcodes`, `vdbe-virtual-table-opcodes`, `vdbe-index-method-opcodes`, `vdbe-schema-cookie-opcodes`, `vdbe-deferred-seek`, `vdbe-rowset-test`, `vdbe-record-construction-model`, `vdbe-scalar-control-opcodes`, `vdbe-integrity-check-opcode`, `vdbe-coroutine-machinery`, `vdbe-misc-cursor-opcodes`, `vdbe-typed-value-opcode-family`, `vdbe-sequence-opcode-family`, `vdbe-materialized-view-opcodes`, `vdbe-ext-window-buffer-family`, `vdbe-ext-worktable-and-gate-families`

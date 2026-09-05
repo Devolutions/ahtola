@@ -329,14 +329,17 @@ connection, and a managed embedded replica — see
 Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
 
 - **Working set** — base-table rows and several intermediates still stay in the
-  process heap. Sorters and compiled equijoins bound retained rows to the
-  `cache_size`-derived execution budget and spill deterministic runs/partitions
-  through the managed temporary file system; skewed hash partitions fall back
-  to bounded scans. With `temp_store=MEMORY`, exceeding that finite budget fails
-  instead of moving the same data into a heap-backed temporary file. DISTINCT
-  and compound keyed sets use the same bounded temporary-file policy.
-  Non-equijoin build sides, recursive worktables, buffered windows, ephemeral
-  tables, and opaque aggregate state do not yet spill. Prefer modest databases
+  process heap. Sorters, compiled equijoin build sides, DISTINCT/compound keyed
+  sets, buffered window partitions, recursive-worktable frontiers, and ephemeral
+  tables bound retained rows to the `cache_size`-derived execution budget and
+  spill deterministic runs/partitions through the managed temporary file
+  system; skewed hash partitions fall back to bounded scans. With
+  `temp_store=MEMORY`, exceeding that finite budget fails instead of moving the
+  same data into a heap-backed temporary file. The evaluator's nested-loop join
+  materializes both sides as the query result by design, so it is not a spill
+  candidate (an architectural property of the evaluator, not a missing spill
+  path); an aggregate's own accumulator is a single bounded value per group.
+  Prefer modest databases
   and explicit transactions for writes (managed writes are slower than native
   SQLite and the gap grows with table size).
 - **Planner** — `ANALYZE` / `sqlite_stat1` and validated `sqlite_stat4`
@@ -426,8 +429,11 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   raw pages explicitly and reject zstd responses because no approved
   pure-managed, trim-safe zstd implementation is shipped.
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
-  is null), zstd-compressed replica page sets, `CREATE SEQUENCE`, and
-  typed-value extensions.
+  is null), zstd-compressed replica page sets, and typed-value extensions.
+  `CREATE SEQUENCE` / `DROP SEQUENCE` and the `nextval` / `currval` / `setval`
+  functions are supported as a Turso-compatible extension: sequences persist a
+  backing table whose watermark row is ordinary transactional state (a rolled-back
+  allocation can be re-emitted), and `currval` is per-connection session state.
 - **Native / Sync companions** — not shipped. Connection-string paths that need
   them fail closed. OS P/Invoke in the pager for locks/WAL is intentional engine
   code, not a Rust SDK binding.

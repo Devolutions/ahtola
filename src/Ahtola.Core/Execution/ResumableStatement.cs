@@ -421,6 +421,7 @@ public sealed class ResumableStatement : IDisposable
                     OpenCursor(openEphemeral.Cursor);
                     _ephemeralTables[openEphemeral.Cursor.Index] = new EphemeralTableRuntime(
                         openEphemeral.ColumnCount,
+                        _executionOptions,
                         _memory);
                     _cursorPositions[openEphemeral.Cursor.Index] = -1;
                     _materializedRows[openEphemeral.Cursor.Index] = null;
@@ -432,6 +433,7 @@ public sealed class ResumableStatement : IDisposable
                     OpenCursor(openAutoindex.Cursor);
                     _ephemeralTables[openAutoindex.Cursor.Index] = new EphemeralTableRuntime(
                         openAutoindex.ColumnCount,
+                        _executionOptions,
                         _memory);
                     _cursorPositions[openAutoindex.Cursor.Index] = -1;
                     _materializedRows[openAutoindex.Cursor.Index] = null;
@@ -4202,29 +4204,49 @@ public sealed class ResumableStatement : IDisposable
     /// Rows are append-only with sequential 1-based rowids for SeekRowid/NotExists/Found,
     /// and support IdxInsert/IdxDelete key maintenance.
     /// </summary>
+    /// <remarks>
+    /// Rows are retained against the statement memory budget while they fit; once the budget can no
+    /// longer hold the table, it spills through the managed temporary file system exactly like the
+    /// keyed row set: an append-log of (slot, rowid, values) records plus a fixed-width slot index,
+    /// with a compact in-memory live-slot list preserving positional semantics (deletes shift the
+    /// live list, never the file). After the switch, retained memory is one slot reference per live
+    /// row instead of the full row payload.
+    /// </remarks>
     private sealed class EphemeralTableRuntime : IDisposable
     {
         private readonly int _columnCount;
+        private readonly VdbeExecutionOptions _options;
         private readonly VdbeExecutionMemory _memory;
         private readonly List<SqlValue[]> _rows = [];
         private readonly List<long> _rowIds = [];
+        // Spilled state: slot s holds the latest append-log record for that slot; _liveSlots maps
+        // position -> slot for the rows that have not been deleted.
+        private VdbeTemporaryFile? _dataFile;
+        private VdbeTemporaryFile? _indexFile;
+        private VdbeMemoryReservation? _spillInfrastructure;
+        private readonly List<long> _liveSlots = [];
+        private long _writePosition;
+        private int _nextSlot;
+        private long _slotListRetainedBytes;
         private VdbeCursorSource? _sourceView;
         private long _nextRowId = 1;
         private long _retainedBytes;
         private long _retainedRows;
         private bool _disposed;
 
-        public EphemeralTableRuntime(int columnCount, VdbeExecutionMemory memory)
+        public EphemeralTableRuntime(int columnCount, VdbeExecutionOptions options, VdbeExecutionMemory memory)
         {
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(columnCount);
+            ArgumentNullException.ThrowIfNull(options);
             ArgumentNullException.ThrowIfNull(memory);
             _columnCount = columnCount;
+            _options = options;
             _memory = memory;
         }
 
         public int ColumnCount => _columnCount;
 
-        public int RowCount => _rows.Count;
+        public int RowCount => _dataFile is null ? _rows.Count : _liveSlots.Count;
 
         public void Insert(SqlValue[] row)
         {
@@ -4238,20 +4260,153 @@ public sealed class ResumableStatement : IDisposable
 
             var owned = row.ToArray();
             var bytes = VdbeManagedFootprint.EstimateSorterRow(owned);
-            _memory.RetainOrThrow(bytes);
-            _retainedBytes = checked(_retainedBytes + bytes);
-            _retainedRows = checked(_retainedRows + 1);
-            _rows.Add(owned);
-            _rowIds.Add(_nextRowId);
+            if (_dataFile is null)
+            {
+                if (_options.AllowTemporaryFileSpill
+                    && bytes + SpillInfrastructureBytes() > _memory.AvailableBytes)
+                {
+                    Spill();
+                }
+                else
+                {
+                    _memory.RetainOrThrow(bytes);
+                    _retainedBytes = checked(_retainedBytes + bytes);
+                    _retainedRows = checked(_retainedRows + 1);
+                    _rows.Add(owned);
+                    _rowIds.Add(_nextRowId);
+                    _nextRowId = checked(_nextRowId + 1);
+                    _sourceView = null;
+                    return;
+                }
+            }
+
+            var slot = _nextSlot;
+            _nextSlot = checked(_nextSlot + 1);
+            AppendRecord(slot, _nextRowId, owned);
+            RetainSlotListGrowth();
+            _liveSlots.Add(slot);
             _nextRowId = checked(_nextRowId + 1);
             _sourceView = null;
         }
 
+        // After the switch to spill, the only per-row retention left is the live-slot list's backing
+        // storage (one reference per live row), so its growth stays inside the budget too.
+        private void RetainSlotListGrowth()
+        {
+            var requiredCount = checked(_liveSlots.Count + 1);
+            var capacity = VdbeManagedFootprint.GetListCapacityForCount(_liveSlots.Capacity, requiredCount);
+            var currentListBytes = VdbeManagedFootprint.EstimateReferenceListStorage(_liveSlots.Capacity);
+            var replacementBytes = VdbeManagedFootprint.EstimateContainerReplacement(
+                currentListBytes,
+                VdbeManagedFootprint.EstimateReferenceListStorage(capacity));
+            if (replacementBytes <= 0)
+                return;
+
+            _memory.RetainOrThrow(replacementBytes, rows: 0);
+            _slotListRetainedBytes = checked(_slotListRetainedBytes + replacementBytes);
+        }
+
+        private void Spill()
+        {
+            VdbeMemoryReservation? infrastructure = null;
+            VdbeTemporaryFile? dataFile = null;
+            VdbeTemporaryFile? indexFile = null;
+            try
+            {
+                infrastructure = VdbeMemoryReservation.Create(
+                    _memory,
+                    SpillInfrastructureBytes());
+                dataFile = VdbeTemporaryFile.Create(_options, "ephemeral-table");
+                indexFile = VdbeTemporaryFile.Create(_options, "ephemeral-index");
+                _writePosition = VdbeSpillRecordCodec.InitializeFile(
+                    dataFile.File,
+                    VdbeSpillFileKind.EphemeralTable,
+                    _options.Metrics);
+                VdbeSpillRecordCodec.InitializeFile(
+                    indexFile.File,
+                    VdbeSpillFileKind.EphemeralTableIndex,
+                    _options.Metrics);
+
+                // Buffered rows become slots 0..n-1 in insertion order, so the live-slot list is
+                // the identity permutation and positions keep their meaning across the switch.
+                for (var slot = 0; slot < _rows.Count; slot++)
+                {
+                    AppendRecordCore(
+                        dataFile,
+                        indexFile,
+                        ref _writePosition,
+                        slot,
+                        _rowIds[slot],
+                        _rows[slot],
+                        _options.Metrics);
+                }
+
+                if (_retainedBytes > 0 || _retainedRows > 0)
+                    _memory.Release(_retainedBytes, _retainedRows);
+                _retainedBytes = 0;
+                _retainedRows = 0;
+                _liveSlots.AddRange(Enumerable.Range(0, _rows.Count).Select(static value => (long)value));
+                _slotListRetainedBytes = VdbeManagedFootprint.EstimateReferenceListStorage(_liveSlots.Capacity);
+                _memory.RetainOrThrow(_slotListRetainedBytes, rows: 0);
+                // The flushed buffered rows own slots 0..n-1; every later insert takes a fresh slot
+                // so it can never overwrite a flushed row's record.
+                _nextSlot = _rows.Count;
+                _rows.Clear();
+                _rowIds.Clear();
+
+                _dataFile = dataFile;
+                dataFile = null;
+                _indexFile = indexFile;
+                indexFile = null;
+                _spillInfrastructure = infrastructure;
+                infrastructure = null;
+                // The buffered-phase cursor view wrapped the now-emptied row list; drop it so the
+                // next AsCursorSource builds the spilled lazy view.
+                _sourceView = null;
+                _options.Metrics.EphemeralTableSpilled();
+            }
+            finally
+            {
+                indexFile?.Dispose();
+                dataFile?.Dispose();
+                infrastructure?.Dispose();
+            }
+        }
+
+        private void AppendRecord(int slot, long rowId, SqlValue[] row)
+        {
+            var data = _dataFile ?? throw new InvalidOperationException("Ephemeral table has no spill file.");
+            var index = _indexFile ?? throw new InvalidOperationException("Ephemeral table has no spill index.");
+            AppendRecordCore(data, index, ref _writePosition, slot, rowId, row, _options.Metrics);
+        }
+
+        private static void AppendRecordCore(
+            VdbeTemporaryFile dataFile,
+            VdbeTemporaryFile indexFile,
+            ref long writePosition,
+            int slot,
+            long rowId,
+            SqlValue[] row,
+            VdbeExecutionMetrics metrics)
+        {
+            var file = dataFile.File;
+            var index = indexFile.File;
+            var recordStart = VdbeSpillRecordCodec.BeginRecord(ref writePosition);
+            VdbeSpillRecordCodec.WriteInt32(file, ref writePosition, slot, metrics);
+            VdbeSpillRecordCodec.WriteInt64(file, ref writePosition, rowId, metrics);
+            VdbeSpillRecordCodec.WriteValues(file, ref writePosition, row, metrics);
+            VdbeSpillRecordCodec.CompleteRecord(file, recordStart, writePosition, metrics);
+            var indexPosition = checked(
+                (long)VdbeSpillRecordCodec.FileHeaderSize
+                + ((long)slot * sizeof(long)));
+            VdbeSpillRecordCodec.WriteInt64(index, ref indexPosition, recordStart, metrics);
+        }
+
         public bool ContainsKeyPrefix(SqlValue[] key)
         {
-            foreach (var row in _rows)
+            for (var i = 0; i < RowCount; i++)
             {
-                if (RowMatchesKeyPrefix(row, key))
+                if (RowMatchesKeyPrefix(this[i], key))
                     return true;
             }
 
@@ -4260,15 +4415,12 @@ public sealed class ResumableStatement : IDisposable
 
         public bool TryDeleteKeyPrefix(SqlValue[] key)
         {
-            for (var i = 0; i < _rows.Count; i++)
+            for (var i = 0; i < RowCount; i++)
             {
-                if (!RowMatchesKeyPrefix(_rows[i], key))
+                if (!RowMatchesKeyPrefix(this[i], key))
                     continue;
 
-                ReleaseRow(_rows[i]);
-                _rows.RemoveAt(i);
-                _rowIds.RemoveAt(i);
-                _sourceView = null;
+                DeleteAt(i);
                 return true;
             }
 
@@ -4277,14 +4429,101 @@ public sealed class ResumableStatement : IDisposable
 
         public bool TryDeleteAt(int position)
         {
-            if (position < 0 || position >= _rows.Count)
+            if (position < 0 || position >= RowCount)
                 return false;
 
-            ReleaseRow(_rows[position]);
-            _rows.RemoveAt(position);
-            _rowIds.RemoveAt(position);
-            _sourceView = null;
+            DeleteAt(position);
             return true;
+        }
+
+        private void DeleteAt(int position)
+        {
+            if (_dataFile is null)
+            {
+                ReleaseRow(_rows[position]);
+                _rows.RemoveAt(position);
+                _rowIds.RemoveAt(position);
+                _sourceView = null;
+                return;
+            }
+
+            _liveSlots.RemoveAt(position);
+            _sourceView = null;
+        }
+
+        public SqlValue[] this[int position]
+        {
+            get
+            {
+                if (_dataFile is null)
+                {
+                    if ((uint)position >= (uint)_rows.Count)
+                        throw new InvalidOperationException("Ephemeral table position is out of range.");
+                    return _rows[position];
+                }
+
+                if ((uint)position >= (uint)_liveSlots.Count)
+                    throw new InvalidOperationException("Ephemeral table position is out of range.");
+                return ReadSpilledSlot(checked((int)_liveSlots[position]));
+            }
+        }
+
+        public long RowIdAt(int position)
+        {
+            if (_dataFile is null)
+            {
+                if ((uint)position >= (uint)_rowIds.Count)
+                    throw new InvalidOperationException("Ephemeral table position is out of range.");
+                return _rowIds[position];
+            }
+
+            if ((uint)position >= (uint)_liveSlots.Count)
+                throw new InvalidOperationException("Ephemeral table position is out of range.");
+            return ReadSpilledSlotRowId(checked((int)_liveSlots[position]));
+        }
+
+        private SqlValue[] ReadSpilledSlot(int slot)
+        {
+            var file = _dataFile!.File;
+            var index = _indexFile!.File;
+            var indexPosition = checked(
+                (long)VdbeSpillRecordCodec.FileHeaderSize
+                + ((long)slot * sizeof(long)));
+            var recordStart = VdbeSpillRecordCodec.ReadInt64(index, ref indexPosition, _options.Metrics);
+            if (recordStart < VdbeSpillRecordCodec.FileHeaderSize || recordStart >= file.Length)
+                throw new InvalidDataException($"Ephemeral spill index points slot {slot} outside the data file.");
+
+            var position = recordStart;
+            var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(file, ref position, _options.Metrics);
+            var recordSlot = VdbeSpillRecordCodec.ReadInt32(file, ref position, _options.Metrics);
+            if (recordSlot != slot)
+                throw new InvalidDataException($"Ephemeral spill index maps slot {slot} to record {recordSlot}.");
+            _ = VdbeSpillRecordCodec.ReadInt64(file, ref position, _options.Metrics);
+            var values = VdbeSpillRecordCodec.ReadValues(
+                file,
+                ref position,
+                _columnCount,
+                recordEnd,
+                _options.Metrics,
+                CancellationToken.None);
+            VdbeSpillRecordCodec.RequireRecordEnd(position, recordEnd);
+            return values;
+        }
+
+        private long ReadSpilledSlotRowId(int slot)
+        {
+            var file = _dataFile!.File;
+            var index = _indexFile!.File;
+            var indexPosition = checked(
+                (long)VdbeSpillRecordCodec.FileHeaderSize
+                + ((long)slot * sizeof(long)));
+            var recordStart = VdbeSpillRecordCodec.ReadInt64(index, ref indexPosition, _options.Metrics);
+            var position = recordStart;
+            var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(file, ref position, _options.Metrics);
+            var recordSlot = VdbeSpillRecordCodec.ReadInt32(file, ref position, _options.Metrics);
+            if (recordSlot != slot)
+                throw new InvalidDataException($"Ephemeral spill index maps slot {slot} to record {recordSlot}.");
+            return VdbeSpillRecordCodec.ReadInt64(file, ref position, _options.Metrics);
         }
 
         // Turso's ResetSorter clears the ephemeral b-tree (clear_btree) at partition boundaries.
@@ -4294,28 +4533,95 @@ public sealed class ResumableStatement : IDisposable
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_retainedBytes > 0 || _retainedRows > 0)
                 _memory.Release(_retainedBytes, _retainedRows);
+            if (_slotListRetainedBytes > 0)
+                _memory.Release(_slotListRetainedBytes, rows: 0);
             _rows.Clear();
             _rowIds.Clear();
+            _liveSlots.Clear();
             _sourceView = null;
             _retainedBytes = 0;
             _retainedRows = 0;
+            _slotListRetainedBytes = 0;
             _nextRowId = 1;
+            // Slots are never reused after a clear: the spill files keep their history and new rows
+            // continue from the next slot, exactly as a fresh table would never recycle rowids.
         }
 
         public VdbeCursorSource AsCursorSource()
-            => _sourceView ??= new VdbeCursorSource(_rows, _rowIds);
+        {
+            if (_sourceView is not null)
+                return _sourceView;
+
+            if (_dataFile is null)
+                return _sourceView = new VdbeCursorSource(_rows, _rowIds);
+
+            return _sourceView = new VdbeCursorSource(
+                new SpilledEphemeralRowList(this),
+                new SpilledEphemeralRowIdList(this));
+        }
 
         public void Dispose()
         {
             if (_disposed)
                 return;
 
-            _disposed = true;
-            if (_retainedBytes > 0 || _retainedRows > 0)
-                _memory.Release(_retainedBytes, _retainedRows);
-            _retainedBytes = 0;
-            _retainedRows = 0;
+            List<Exception>? failures = null;
+            try
+            {
+                try
+                {
+                    _dataFile?.Dispose();
+                    _dataFile = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+
+                try
+                {
+                    _indexFile?.Dispose();
+                    _indexFile = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+
+                try
+                {
+                    _spillInfrastructure?.Dispose();
+                    _spillInfrastructure = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+            }
+            finally
+            {
+                if (_retainedBytes > 0 || _retainedRows > 0)
+                    _memory.Release(_retainedBytes, _retainedRows);
+                if (_slotListRetainedBytes > 0)
+                    _memory.Release(_slotListRetainedBytes, rows: 0);
+                _retainedBytes = 0;
+                _retainedRows = 0;
+                _slotListRetainedBytes = 0;
+                _rows.Clear();
+                _rowIds.Clear();
+                _liveSlots.Clear();
+                _disposed = failures is null;
+            }
+
+            if (failures is [var failure])
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+            if (failures is { Count: > 1 })
+                throw new AggregateException(failures);
         }
+
+        private long SpillInfrastructureBytes() =>
+            VdbeManagedFootprint.EstimateEphemeralTableSpillInfrastructure(
+                _options.TemporaryDirectory);
 
         private void ReleaseRow(SqlValue[] row)
         {
@@ -4323,6 +4629,36 @@ public sealed class ResumableStatement : IDisposable
             _memory.Release(bytes);
             _retainedBytes = checked(_retainedBytes - bytes);
             _retainedRows = checked(_retainedRows - 1);
+        }
+
+        private sealed class SpilledEphemeralRowList(EphemeralTableRuntime owner) : IReadOnlyList<SqlValue[]>
+        {
+            public int Count => owner._liveSlots.Count;
+
+            public SqlValue[] this[int index] => owner[index];
+
+            public IEnumerator<SqlValue[]> GetEnumerator()
+            {
+                for (var index = 0; index < Count; index++)
+                    yield return owner[index];
+            }
+
+            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+        }
+
+        private sealed class SpilledEphemeralRowIdList(EphemeralTableRuntime owner) : IReadOnlyList<long>
+        {
+            public int Count => owner._liveSlots.Count;
+
+            public long this[int index] => owner.RowIdAt(index);
+
+            public IEnumerator<long> GetEnumerator()
+            {
+                for (var index = 0; index < Count; index++)
+                    yield return owner.RowIdAt(index);
+            }
+
+            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
         }
     }
 
@@ -5931,7 +6267,17 @@ public sealed class ResumableStatement : IDisposable
         private readonly VdbeRowEquality? _equality;
         private readonly Queue<(SqlValue[] Row, int Depth)> _frontier = new();
         private readonly VdbeKeyedRowStore? _seen;
+        private readonly VdbeExecutionOptions _options;
+        private readonly VdbeExecutionMemory _memory;
         private readonly List<SqlValue[]> _generation = [];
+        private VdbeTemporaryFile? _frontierFile;
+        private VdbeMemoryReservation? _frontierSpillInfrastructure;
+        private long _frontierWritePosition;
+        private long _frontierReadPosition;
+        private int _spilledCount;
+        private long _frontierRetainedBytes;
+        private long _frontierRetainedRows;
+        private long _generationRetainedBytes;
         private int _admitted;
         private bool _hasCurrent;
         private int _currentDepth;
@@ -5951,10 +6297,13 @@ public sealed class ResumableStatement : IDisposable
             _maxRows = maxRows;
             _maxDepth = maxDepth;
             _equality = equality;
+            _options = options;
+            _memory = memory;
             _seen = mode == WorkTableDedupMode.Distinct
                 ? new VdbeKeyedRowStore(options, memory)
                 : null;
         }
+
 
         // Admits a seed (anchor) row at depth 0. Distinct duplicates are dropped; admission counts against
         // the row guard.
@@ -5964,21 +6313,187 @@ public sealed class ResumableStatement : IDisposable
             TryAdmit(row, depth: 0);
         }
 
+        // Admits a row: dropped as a duplicate under Distinct, otherwise counted against the row guard,
+        // recorded for future de-duplication, and enqueued for later draining. Returns whether it was admitted.
+        //
+        // Admission is the ownership boundary. `row` is transient storage the caller may keep mutating: a
+        // seed's register snapshot is discarded after this call, but more importantly a recursive transform
+        // is free to reuse one output buffer across the rows it emits and across successive expansions.
+        // Snapshot the row here so the de-duplication representative and the queued frontier entry reference
+        // storage this runtime owns and never mutates in place. Without the copy a later overwrite of that
+        // buffer would rewrite an already-admitted row, corrupting the frontier (a queued row would surface
+        // with the wrong values) and the distinct set (a genuinely new row would be misread as a duplicate).
+        // The dedup scan compares the caller's `row` before copying, so the snapshot adds no work to the
+        // rejection path.
+        private bool TryAdmit(SqlValue[] row, int depth)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_seen is not null
+                && _seen.Contains(row, _equality!, CancellationToken.None))
+            {
+                return false;
+            }
+
+            if (_admitted >= _maxRows)
+                throw new RecursiveWorkTableOverflowException(_maxRows);
+
+            var owned = CloneRow(row);
+            if (_seen is not null)
+                _seen.TryInsert(owned, _equality!, replaceExisting: false, CancellationToken.None);
+            _admitted++;
+            EnqueueFrontier(owned, depth);
+            return true;
+        }
+
+        // Enqueues a frontier entry, retaining it against the statement memory budget while it stays
+        // buffered, and spilling the whole frontier to the managed temporary file system once the
+        // budget can no longer hold it. After the switch, new entries append to the file and dequeues
+        // drain the buffered prefix first and then read records sequentially — FIFO order is exactly
+        // append order, so one forward read position serves every dequeue.
+        private void EnqueueFrontier(SqlValue[] row, int depth)
+        {
+            if (_frontierFile is null)
+            {
+                var rowBytes = VdbeManagedFootprint.EstimateSorterRow(row);
+                if (_options.AllowTemporaryFileSpill
+                    && rowBytes + FrontierSpillInfrastructureBytes() > _memory.AvailableBytes)
+                {
+                    SpillFrontier();
+                }
+                else
+                {
+                    _memory.RetainOrThrow(rowBytes);
+                    _frontierRetainedBytes = checked(_frontierRetainedBytes + rowBytes);
+                    _frontierRetainedRows = checked(_frontierRetainedRows + 1);
+                    _frontier.Enqueue((row, depth));
+                    return;
+                }
+            }
+
+            AppendFrontierRecord(row, depth);
+        }
+
+        private void SpillFrontier()
+        {
+            VdbeMemoryReservation? infrastructure = null;
+            VdbeTemporaryFile? temporaryFile = null;
+            try
+            {
+                infrastructure = VdbeMemoryReservation.Create(
+                    _memory,
+                    FrontierSpillInfrastructureBytes());
+                temporaryFile = VdbeTemporaryFile.Create(_options, "worktable-frontier");
+                _frontierWritePosition = VdbeSpillRecordCodec.InitializeFile(
+                    temporaryFile.File,
+                    VdbeSpillFileKind.WorkTableFrontier,
+                    _options.Metrics);
+
+                while (_frontier.Count > 0)
+                {
+                    var (row, depth) = _frontier.Dequeue();
+                    AppendFrontierRecordCore(temporaryFile, row, depth);
+                }
+
+                if (_frontierRetainedBytes > 0 || _frontierRetainedRows > 0)
+                    _memory.Release(_frontierRetainedBytes, _frontierRetainedRows);
+                _frontierRetainedBytes = 0;
+                _frontierRetainedRows = 0;
+
+                _frontierFile = temporaryFile;
+                temporaryFile = null;
+                _frontierSpillInfrastructure = infrastructure;
+                infrastructure = null;
+                _frontierReadPosition = _frontierWritePosition > VdbeSpillRecordCodec.FileHeaderSize
+                    ? VdbeSpillRecordCodec.FileHeaderSize
+                    : _frontierWritePosition;
+                _options.Metrics.WorkTableFrontierSpilled();
+            }
+            finally
+            {
+                temporaryFile?.Dispose();
+                infrastructure?.Dispose();
+            }
+        }
+
+        private void AppendFrontierRecord(SqlValue[] row, int depth)
+        {
+            var file = _frontierFile?.File
+                ?? throw new InvalidOperationException("Work table frontier has no spill file.");
+            AppendFrontierRecordCore(_frontierFile!, row, depth);
+        }
+
+        private long FrontierSpillInfrastructureBytes() =>
+            VdbeManagedFootprint.EstimateWorkTableFrontierSpillInfrastructure(
+                _options.TemporaryDirectory);
+
+        private void AppendFrontierRecordCore(VdbeTemporaryFile file, SqlValue[] row, int depth)
+        {
+            // The write is a bounded I/O step: only the scratch the codec allocates is transient, so
+            // no per-row retention is held while the record travels to disk.
+            var recordStart = VdbeSpillRecordCodec.BeginRecord(ref _frontierWritePosition);
+            var fileHandle = file.File;
+            VdbeSpillRecordCodec.WriteValues(
+                fileHandle,
+                ref _frontierWritePosition,
+                [SqlValue.Integer(depth)],
+                _options.Metrics);
+            VdbeSpillRecordCodec.WriteValues(fileHandle, ref _frontierWritePosition, row, _options.Metrics);
+            VdbeSpillRecordCodec.CompleteRecord(
+                fileHandle,
+                recordStart,
+                _frontierWritePosition,
+                _options.Metrics);
+            _spilledCount++;
+        }
+
         // Dequeues the next frontier row and records its depth as the current expansion depth. Returns false
         // (and clears the current row) when the frontier is drained.
         public bool TryStep(out SqlValue[] row)
         {
-            if (_frontier.Count == 0)
+            if (_frontier.Count > 0)
+            {
+                var (buffered, depth) = _frontier.Dequeue();
+                var bufferedBytes = VdbeManagedFootprint.EstimateSorterRow(buffered);
+                _memory.Release(bufferedBytes);
+                _frontierRetainedBytes = checked(_frontierRetainedBytes - bufferedBytes);
+                _frontierRetainedRows = checked(_frontierRetainedRows - 1);
+                _hasCurrent = true;
+                _currentDepth = depth;
+                row = buffered;
+                return true;
+            }
+
+            if (_frontierFile is null || _spilledCount == 0)
             {
                 _hasCurrent = false;
                 row = [];
                 return false;
             }
 
-            var (dequeued, depth) = _frontier.Dequeue();
+            var file = _frontierFile.File;
+            var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(
+                file,
+                ref _frontierReadPosition,
+                _options.Metrics);
+            var depthValue = VdbeSpillRecordCodec.ReadValues(
+                file,
+                ref _frontierReadPosition,
+                count: 1,
+                recordEnd,
+                _options.Metrics,
+                CancellationToken.None)[0];
+            var values = VdbeSpillRecordCodec.ReadValues(
+                file,
+                ref _frontierReadPosition,
+                _columnCount,
+                recordEnd,
+                _options.Metrics,
+                CancellationToken.None);
+            VdbeSpillRecordCodec.RequireRecordEnd(_frontierReadPosition, recordEnd);
+            _spilledCount--;
             _hasCurrent = true;
-            _currentDepth = depth;
-            row = dequeued;
+            _currentDepth = (int)depthValue.AsInteger();
+            row = values;
             return true;
         }
 
@@ -6023,12 +6538,13 @@ public sealed class ResumableStatement : IDisposable
                 return;
 
             RequireWidth(frontierRow);
+            RetainGenerationRow(frontierRow);
             _generation.Add([.. frontierRow]);
-            if (_frontier.TryPeek(out var next) && next.Depth == _currentDepth)
+            if (TryPeekFrontier(out var next) && next.Depth == _currentDepth)
                 return;
 
             var frontier = _generation.ToArray();
-            _generation.Clear();
+            ReleaseGeneration();
             var children = transform(frontier)
                 ?? throw new InvalidOperationException(
                     "A recursive generation transform must not return a null row list.");
@@ -6044,35 +6560,60 @@ public sealed class ResumableStatement : IDisposable
             }
         }
 
-        // Admits a row: dropped as a duplicate under Distinct, otherwise counted against the row guard,
-        // recorded for future de-duplication, and enqueued for later draining. Returns whether it was admitted.
-        //
-        // Admission is the ownership boundary. `row` is transient storage the caller may keep mutating: a
-        // seed's register snapshot is discarded after this call, but more importantly a recursive transform
-        // is free to reuse one output buffer across the rows it emits and across successive expansions.
-        // Snapshot the row here so the de-duplication representative and the queued frontier entry reference
-        // storage this runtime owns and never mutates in place. Without the copy a later overwrite of that
-        // buffer would rewrite an already-admitted row, corrupting the frontier (a queued row would surface
-        // with the wrong values) and the distinct set (a genuinely new row would be misread as a duplicate).
-        // The dedup scan compares the caller's `row` before copying, so the snapshot adds no work to the
-        // rejection path.
-        private bool TryAdmit(SqlValue[] row, int depth)
+        // The generation buffer hands one whole depth level to the transform as an array, so it must stay
+        // materialized; it is retained against the statement budget and fails closed rather than spilling
+        // (the transform contract takes in-memory rows).
+        private void RetainGenerationRow(SqlValue[] row)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_seen is not null
-                && _seen.Contains(row, _equality!, CancellationToken.None))
+            var bytes = VdbeManagedFootprint.EstimateSorterRow(row);
+            _memory.RetainOrThrow(bytes);
+            _generationRetainedBytes = checked(_generationRetainedBytes + bytes);
+        }
+
+        private void ReleaseGeneration()
+        {
+            if (_generationRetainedBytes > 0)
+                _memory.Release(_generationRetainedBytes, _generation.Count);
+            _generationRetainedBytes = 0;
+            _generation.Clear();
+        }
+
+        // Peeks the next frontier depth without dequeuing. The buffered queue holds the head while the
+        // spilled remainder has not been reached; once only the file remains, the head record is read
+        // (and left in place — a peek, not a dequeue).
+        private bool TryPeekFrontier(out (SqlValue[] Row, int Depth) next)
+        {
+            if (_frontier.Count > 0)
             {
+                next = _frontier.Peek();
+                return true;
+            }
+
+            if (_frontierFile is null || _spilledCount == 0)
+            {
+                next = default;
                 return false;
             }
 
-            if (_admitted >= _maxRows)
-                throw new RecursiveWorkTableOverflowException(_maxRows);
-
-            var owned = CloneRow(row);
-            if (_seen is not null)
-                _seen.TryInsert(owned, _equality!, replaceExisting: false, CancellationToken.None);
-            _admitted++;
-            _frontier.Enqueue((owned, depth));
+            var file = _frontierFile.File;
+            var position = _frontierReadPosition;
+            var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(file, ref position, _options.Metrics);
+            var depth = VdbeSpillRecordCodec.ReadValues(
+                file,
+                ref position,
+                count: 1,
+                recordEnd,
+                _options.Metrics,
+                CancellationToken.None)[0].AsInteger();
+            var row = VdbeSpillRecordCodec.ReadValues(
+                file,
+                ref position,
+                _columnCount,
+                recordEnd,
+                _options.Metrics,
+                CancellationToken.None);
+            VdbeSpillRecordCodec.RequireRecordEnd(position, recordEnd);
+            next = (row, (int)depth);
             return true;
         }
 
@@ -6081,8 +6622,48 @@ public sealed class ResumableStatement : IDisposable
             if (_disposed)
                 return;
 
-            _disposed = true;
-            _seen?.Dispose();
+            List<Exception>? failures = null;
+            try
+            {
+                try
+                {
+                    _frontierFile?.Dispose();
+                    _frontierFile = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+
+                try
+                {
+                    _frontierSpillInfrastructure?.Dispose();
+                    _frontierSpillInfrastructure = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+            }
+            finally
+            {
+                if (_frontierRetainedBytes > 0 || _frontierRetainedRows > 0)
+                    _memory.Release(_frontierRetainedBytes, _frontierRetainedRows);
+                _frontierRetainedBytes = 0;
+                _frontierRetainedRows = 0;
+                if (_generationRetainedBytes > 0)
+                    _memory.Release(_generationRetainedBytes, _generation.Count);
+                _generationRetainedBytes = 0;
+                _frontier.Clear();
+                _generation.Clear();
+                _seen?.Dispose();
+                _disposed = failures is null;
+            }
+
+            if (failures is [var failure])
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+            if (failures is { Count: > 1 })
+                throw new AggregateException(failures);
         }
 
         // Shallow snapshot of a record. SqlValue is an immutable value type and blob payloads are exposed as
