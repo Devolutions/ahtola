@@ -38,10 +38,11 @@ public class ManagedSqltestConformanceTests
         }
 
         var file = SqltestCorpus.LoadFile(relativePath, runnable[0].FullPath);
+        var allTests = file.Tests.Concat(file.ExpandedMatrixTests()).ToList();
         var problems = new List<string>();
         foreach (var candidate in runnable)
         {
-            var test = file.Tests.Single(entry => entry.Name == candidate.TestName);
+            var test = allTests.Single(entry => entry.Name == candidate.TestName);
             var outcome = SqltestManagedRunner.Run(file, test);
             var isExpectedFailure = SqltestCorpus.ExpectedFailures.ContainsKey(candidate.Id);
 
@@ -71,9 +72,17 @@ public class ManagedSqltestConformanceTests
                 continue;
 
             var file = SqltestCorpus.LoadFile(discovered.RelativePath, discovered.FullPath);
-            var test = file.Tests.Single(candidate => candidate.Name == discovered.TestName);
-            SqltestOutcome outcome;
-            try
+            var allTests = file.Tests.Concat(file.ExpandedMatrixTests()).ToList();
+            var matches = allTests.Where(candidate => candidate.Name == discovered.TestName).ToList();
+            if (matches.Count != 1)
+            {
+                failures.Add(
+                    $"{discovered.Id} | DUPLICATE-OR-MISSING case name ({matches.Count} matches in {discovered.RelativePath})");
+                continue;
+            }
+
+            var test = matches[0];
+            SqltestOutcome outcome; try
             {
                 outcome = SqltestManagedRunner.Run(file, test);
             }

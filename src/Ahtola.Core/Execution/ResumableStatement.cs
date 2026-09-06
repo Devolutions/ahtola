@@ -4141,16 +4141,18 @@ public sealed class ResumableStatement : IDisposable
         if (string.IsNullOrEmpty(description))
             description = "constraint failed";
 
+        // sqlite3_errmsg carries no result-code suffix; the "(19)" the sqlite3 shell
+        // shows is added by the shell, so the engine keeps the bare message.
         return errorCode switch
         {
             SqliteResultCode.ConstraintPrimaryKey
-                => $"UNIQUE constraint failed: {description} ({errorCode})",
+                => $"UNIQUE constraint failed: {description}",
             SqliteResultCode.ConstraintUnique
-                => $"UNIQUE constraint failed: {description} ({errorCode})",
+                => $"UNIQUE constraint failed: {description}",
             SqliteResultCode.ConstraintCheck
-                => $"CHECK constraint failed: {description} ({errorCode})",
+                => $"CHECK constraint failed: {description}",
             SqliteResultCode.ConstraintNotNull
-                => $"NOT NULL constraint failed: {description} ({errorCode})",
+                => $"NOT NULL constraint failed: {description}",
             SqliteResultCode.ConstraintForeignKey
                 => description,
             SqliteResultCode.Constraint or SqliteResultCode.ConstraintTrigger

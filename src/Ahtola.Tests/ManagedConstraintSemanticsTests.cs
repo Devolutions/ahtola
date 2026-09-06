@@ -638,7 +638,7 @@ public sealed class ManagedConstraintSemanticsTests
                 Execute(connection, "INSERT INTO new_name VALUES (1);");
                 Action invalid = () => Execute(connection, "INSERT INTO new_name VALUES (0);");
                 invalid.Should().Throw<EmbeddedSqlException>()
-                    .WithMessage("CHECK constraint failed: \"new_name\".value > 0");
+                    .WithMessage("CHECK constraint failed: new_name");
             }
 
             using (var reopened = EmbeddedDatabase.OpenFile(path))
@@ -646,7 +646,7 @@ public sealed class ManagedConstraintSemanticsTests
             {
                 Action reopenedInvalid = () => Execute(reopenedConnection, "INSERT INTO new_name VALUES (-1);");
                 reopenedInvalid.Should().Throw<EmbeddedSqlException>()
-                    .WithMessage("CHECK constraint failed: \"new_name\".value > 0");
+                    .WithMessage("CHECK constraint failed: new_name");
             }
 
             using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
@@ -861,7 +861,7 @@ public sealed class ManagedConstraintSemanticsTests
                 managed,
                 """INSERT INTO dotted("dotted.value", value) VALUES (-1, 1);""");
             invalid.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("CHECK constraint failed: \"dotted.value\" > 0");
+                .WithMessage("CHECK constraint failed: dotted.value");
         }
 
         using (var sqlite = new MsData.SqliteConnection("Data Source=:memory:"))
@@ -892,7 +892,7 @@ public sealed class ManagedConstraintSemanticsTests
                     reopenedConnection,
                     """INSERT INTO dotted("dotted.value", value) VALUES (0, 1);""");
                 reopenedInvalid.Should().Throw<EmbeddedSqlException>()
-                    .WithMessage("CHECK constraint failed: \"dotted.value\" > 0");
+                    .WithMessage("CHECK constraint failed: dotted.value");
             }
 
             using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
@@ -1065,7 +1065,7 @@ public sealed class ManagedConstraintSemanticsTests
                     reopenedConnection,
                     """INSERT INTO "a.b"(rowid, value) VALUES (-1, 4);""");
                 invalid.Should().Throw<EmbeddedSqlException>()
-                    .WithMessage("""CHECK constraint failed: "a.b".rowid > 0""");
+                    .WithMessage("""CHECK constraint failed: a.b""");
                 ReadRows(reopenedConnection, """SELECT rowid, value FROM "a.b" ORDER BY rowid;""")
                     .Select(row => row[0].AsInteger())
                     .Should().Equal(1, 3);

@@ -26,6 +26,7 @@ internal static class SqliteBuiltinFunctions
         "ASINH", "ACOSH", "ATANH",
         "SUBSTR", "SUBSTRING", "REPLACE", "STRING_REVERSE", "REVERSE", "SOUNDEX", "REPEAT", "LPAD", "RPAD", "TRIM", "BTRIM", "LTRIM", "RTRIM", "QUOTE",
         "CHAR", "CHR", "UNICODE", "UNISTR", "UNISTR_QUOTE", "UNHEX", "ZEROBLOB", "RANDOMBLOB", "RANDOM", "CONCAT", "CONCAT_WS",
+        "GET_BYTE", "SET_BYTE",
         "IF", "IIF", "LIKELY", "UNLIKELY", "LIKELIHOOD",
         "SQLITE_VERSION", "TURSO_VERSION", "SQLITE_SOURCE_ID", "CHANGES", "TOTAL_CHANGES", "TIMEDIFF",
         "TIME_DATE",
@@ -132,7 +133,7 @@ internal static class SqliteBuiltinFunctions
         => AggregateNames.Contains(name.ToUpperInvariant());
 
     public static bool IsExposedByFunctionList(string name)
-        => name.ToUpperInvariant() is not ("PERCENT_RANK" or "CUME_DIST" or "IS_AUTOCOMMIT");
+        => name.ToUpperInvariant() is not "IS_AUTOCOMMIT";
 
     public static bool AcceptsCall(string name, int argumentCount, bool star)
     {
@@ -140,6 +141,10 @@ internal static class SqliteBuiltinFunctions
         if (!Names.Contains(normalized))
             return false;
         if (star && normalized == "COUNT")
+            return argumentCount == 0;
+        // json_object(*) / jsonb_object(*) expand to the current row's columns
+        // (the Turso extension pinned by turso-sqltests/json_object_star.sqltest).
+        if (star && normalized is "JSON_OBJECT" or "JSONB_OBJECT")
             return argumentCount == 0;
 
         var arities = GetArities(normalized);
@@ -176,6 +181,8 @@ internal static class SqliteBuiltinFunctions
             return [1, 2, 3];
         if (normalized is "LIKE" or "SUBSTR" or "SUBSTRING" or "LPAD" or "RPAD")
             return [2, 3];
+        if (normalized is "GET_BYTE" or "SET_BYTE")
+            return normalized == "GET_BYTE" ? [2] : [3];
         if (normalized == "SETVAL")
             return [2, 3];
         if (normalized is "NEXTVAL" or "CURRVAL")

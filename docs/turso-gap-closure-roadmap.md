@@ -31,12 +31,68 @@ scope decision; it does not mean Ahtola implements every newer Turso feature.
 | 8 | `planner-access-path-depth` | Access-path depth completed | `core/translate/optimizer/`, `planner.rs`, `main_loop/` | Done |
 | 9 | `mvcc-page-native-depth` | Documented runtime limit | `core/mvcc/` | Done |
 | 10 | `sync-engine-depth` | Split wait/apply lifecycle and crash-safe checkpoint policy | `sync/engine/src/` | Done |
+| 11 | `corpus-refresh-v0.8.0-pre.7` | 51 new files vendored, 30 refreshed, matrix runner added | `sqlite/conformance/sqlite-sqltests/`, `testing/sqltest/src/` | Done |
+| 12 | `upstream-delta-correctness` | ~180 newly vendored cases closed by engine fixes | `core/vdbe/value.rs`, `sqlite/parser/src/parser.rs`, `core/translate/select.rs` | Done |
+| 13 | `eqp-format-json` | Parser clause + plan_json envelope | `core/translate/eqp.rs`, `docs/eqp-json.md` | Done |
+| 14 | `get-set-byte-json-object-star` | Built-in `get_byte`/`set_byte` + `json_object(*)` | `turso-sqltests/get-set-byte.sqltest`, `json_object_star.sqltest` | Done |
+| 15 | `time-family`, `regexp-family`, `turso-sqltests-adoption` | Not started | `core/time/`, sqlean regexp, `turso-sqltests/` | Open |
 
 The sqltest counts overlap by subsystem only in implementation, not in this
 classification: ranks 1-7 account for 133 distinct expected-failure entries.
 
 ## Progress
 
+- 2026-09-05: **corpus refresh to the v0.8.0-pre.7 pin.** The vendored
+  `conformance/sqlite-sqltests/` corpus was stale at the v0.7.2 vintage while
+  `turso-src/` had moved to v0.8.0-pre.7 (`277ddd050`). Vendored the 51
+  post-v0.7.2 files (~707 test blocks: the window-frame matrix suite,
+  `recursive-cte` (118), `unnest-correlated` (90), `json-valid-strict` (101),
+  error-message/affinity/trigger regression files) and refreshed the 30 drifted
+  files (90 net-new tests). Added the upstream `@var`/`matrix` grammar to the
+  managed sqltest parser with a differential SQLite oracle
+  (`SqltestMatrixOracle` over Microsoft.Data.Sqlite, mirroring
+  `matrix_oracle.rs`): every matrix expansion runs against bundled SQLite and
+  the managed engine must agree. Fixed the slug/dedup semantics so operator
+  values (`=`, `<=`) that slug identically get `~N` suffixes.
+- 2026-09-05: **upstream-delta correctness wave** (~180 newly vendored cases
+  closed by engine fixes): `char()` now coerces every argument to an integer
+  codepoint (text/blob numeric prefix, real truncation, NULL as 0) per
+  `exec_char` in `core/vdbe/value.rs`; `IN ((SELECT ...))` is subquery
+  membership, not a one-element value list (parser.rs
+  `is_bare_subquery`); ORDER BY/GROUP BY ordinals only reference a column when
+  the literal fits an i32 (select.rs `resolve_order_by_or_group_by_expr`),
+  so `ORDER BY 6641019685895816357` is a constant and `ORDER BY -1` errors;
+  compound ORDER BY before an operator reports
+  "ORDER BY clause should come after UNION not before"; missing
+  qualified tables report the user-written name (`no such table: main.nosuch`)
+  for SELECT/DML/DDL/CREATE INDEX/CREATE TRIGGER, with pre-routing validation
+  that respects transaction-local catalogs, temp virtual tables, and
+  `no such database` precedence for unknown schemas; "already exists"
+  collision errors echo the user's written quoting
+  (`table "t""q" already exists`) and view/table cross-namespace clashes use
+  SQLite's "view v already exists" / "there is already a table named t"
+  spellings; CHECK-constraint failures dequote the leading quoted token and
+  carry no `(19)` shell suffix (matching sqlite3_errmsg); `printf` precision
+  cap raised to 1,000,000 (upstream `MAX_WIDTH`) for the overflow-payload
+  fixtures; `PRAGMA count_changes` implemented (DML returns one changes row);
+  `pragma_function_list` now lists `percent_rank`/`cume_dist`;
+  `ANALYZE sqlite_schema` re-analyzes main.
+- 2026-09-05: **new upstream extensions**: `EXPLAIN QUERY PLAN FORMAT=JSON`
+  (case-insensitive clause, `plan_json` row with the documented
+  version/sql/result_columns/nodes envelope; the structured `op` objects are a
+  documented follow-up), built-in `get_byte`/`set_byte`
+  (PostgreSQL-parity byte access with wrap semantics and range errors), and
+  `json_object(*)`/`jsonb_object(*)` star expansion over the current FROM row.
+- 2026-09-05: expected-failures baseline regenerated for the refreshed
+  corpus: 177 entries. The newly exposed remaining gaps are concentrated in
+  json_valid strict flags (45), recursive-CTE depth semantics (36), the
+  window frame matrix edge families (23), `unnest` correlated-plan EQP shapes
+  (21), timediff negative-month asymmetry (8), DELETE/UPDATE LIMIT
+  rejections (8 — intentional extension, documented), plus scattered
+  smaller clusters (partial-index EQP labels, aggregate-of-outer-column,
+  ALTER default negate overflow, SUM inverse-mode persistence). The
+  sqlean-time family, the sqlean regexp extension functions, and adopting
+  the supported subset of `turso-sqltests/` remain open (rank 15).
 - 2026-08-28: closed `scalar-expression-parity` (31 markers).
 - 2026-08-28: closed `pragma-introspection-parity` (29 markers).
 - 2026-08-29: closed `json-jsonb-parity` (21 markers).

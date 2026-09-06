@@ -240,7 +240,7 @@ public sealed class CreateTableBytecodeTests
     }
 
     [TestCase("CREATE TABLE t(a);", "table t already exists")]
-    [TestCase("CREATE TABLE v(a);", "there is already a view named v")]
+    [TestCase("CREATE TABLE v(a);", "view v already exists")]
     [TestCase("CREATE TABLE t_index(a);", "there is already an index named t_index")]
     [TestCase("CREATE TABLE sqlite_thing(a);", "object name reserved for internal use: sqlite_thing")]
     [TestCase("CREATE TABLE bad(a, b) WITHOUT ROWID;", "PRIMARY KEY missing on table bad")]

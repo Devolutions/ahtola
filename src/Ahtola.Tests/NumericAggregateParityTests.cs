@@ -101,13 +101,14 @@ public sealed class NumericAggregateParityTests
     [TestCase("SELECT hex(char(0)), hex(char(-1)), hex(char(1114112))")]
     public void CharTreatsEveryArgumentAsAnIntegerLikeSqlite(string sql) => AssertMatchesSqlite(sql);
 
-    // Turso's exec_char (turso-src/core/vdbe/value.rs:1344) only accepts Numeric::Integer and Null;
-    // REAL/TEXT/BLOB arguments are omitted via filter_map(_ => None), so char('x')/char(2.7) yield
-    // the empty string rather than coercing to 0/2 as stock SQLite does. The conformance corpus
-    // (char.sqltest::char-non-integer) expects this Turso behavior.
-    [TestCase("SELECT hex(char('x'))", "")]
-    [TestCase("SELECT hex(char(2.7)), hex(char('65')), hex(char('abc'))", "||")]
-    public void CharOmitsNonIntegerArgumentsMatchingTurso(string sql, string expected)
+    // char() coerces every argument to an integer codepoint exactly like the pinned Turso
+    // exec_char (turso-src/core/vdbe/value.rs): text/blob by their numeric prefix (0 if none),
+    // REAL by truncation, NULL as 0. The refreshed conformance corpus
+    // (char-coerces-arguments-to-integers.sqltest) pins this behavior.
+    [TestCase("SELECT hex(char('x'))", "00")]
+    [TestCase("SELECT hex(char(2.7)), hex(char('65')), hex(char('abc'))", "02|41|00")]
+    [TestCase("SELECT hex(char(65, 1.5, '66', X'43', 67))", "4101420043")]
+    public void CharCoercesEveryArgumentToAnIntegerCodePoint(string sql, string expected)
     {
         RunManaged(sql).Should().Be(expected, because: sql);
     }

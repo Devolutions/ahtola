@@ -429,11 +429,23 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   raw pages explicitly and reject zstd responses because no approved
   pure-managed, trim-safe zstd implementation is shipped.
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
-  is null), zstd-compressed replica page sets, and typed-value extensions.
-  `CREATE SEQUENCE` / `DROP SEQUENCE` and the `nextval` / `currval` / `setval`
-  functions are supported as a Turso-compatible extension: sequences persist a
-  backing table whose watermark row is ordinary transactional state (a rolled-back
+  is null), zstd-compressed replica page sets, typed-value extensions, the
+  sqlean-compatible `time_*`/`dur_*` function family, and the sqlean
+  `regexp_*` extension functions (the `X REGEXP Y` operator works through a
+  registered `regexp` function, matching SQLite). `CREATE SEQUENCE` /
+  `DROP SEQUENCE` and the `nextval` / `currval` / `setval` functions are
+  supported as a Turso-compatible extension: sequences persist a backing table
+  whose watermark row is ordinary transactional state (a rolled-back
   allocation can be re-emitted), and `currval` is per-connection session state.
+  `DELETE`/`UPDATE ... ORDER BY`/`LIMIT`/`OFFSET` are supported as a
+  deliberate extension (the SQLite `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` build
+  option); the upstream conformance corpus pins the default-build rejection,
+  which is recorded as an intentional expected-failure.
+  `EXPLAIN QUERY PLAN FORMAT=JSON` emits one `plan_json` row with the
+  machine-readable envelope from `docs/eqp-json.md`; the structured per-node
+  `op` objects are not yet modeled. Built-in `get_byte`/`set_byte`
+  (PostgreSQL-compatible byte access) and `json_object(*)`/`jsonb_object(*)`
+  (one label/value pair per FROM-row column) match the pinned Turso corpus.
 - **Native / Sync companions** — not shipped. Connection-string paths that need
   them fail closed. OS P/Invoke in the pager for locks/WAL is intentional engine
   code, not a Rust SDK binding.

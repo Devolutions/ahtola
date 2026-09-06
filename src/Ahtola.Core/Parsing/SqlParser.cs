@@ -65,6 +65,33 @@ internal sealed class SqlParser
         return expression;
     }
 
+    /// <summary>
+    /// Parses the optional <c>FORMAT=JSON</c> / <c>FORMAT=TEXT</c> clause after
+    /// <c>EXPLAIN QUERY PLAN</c>, mirroring <c>parse_explain_query_plan_format</c>
+    /// (parser.rs): the clause is case-insensitive and an unknown format errors.
+    /// </summary>
+    private ExplainQueryPlanFormat ParseExplainQueryPlanFormat()
+    {
+        if (!CurrentIsKeyword("FORMAT"))
+            return ExplainQueryPlanFormat.Text;
+
+        _lexer.Next();
+        if (!Consume(TokenKind.Equal))
+            throw Error("Expected '=' after FORMAT in EXPLAIN QUERY PLAN.");
+
+        var token = _lexer.Current;
+        if (token.Kind is not (TokenKind.Identifier or TokenKind.String) || token.IsQuoted)
+            throw Error("Expected a format name after FORMAT= in EXPLAIN QUERY PLAN.");
+
+        _lexer.Next();
+        if (token.Text.Equals("JSON", StringComparison.OrdinalIgnoreCase))
+            return ExplainQueryPlanFormat.Json;
+        if (token.Text.Equals("TEXT", StringComparison.OrdinalIgnoreCase))
+            return ExplainQueryPlanFormat.Text;
+
+        throw Error($"unknown EXPLAIN QUERY PLAN format: {token.Text} (supported formats: TEXT, JSON)");
+    }
+
     private ParsedStatement ParseStatement()
     {
         if (ConsumeKeyword("EXPLAIN"))
@@ -72,7 +99,11 @@ internal sealed class SqlParser
             if (ConsumeKeyword("QUERY"))
             {
                 ExpectKeyword("PLAN");
-                return new ExplainQueryPlanStatement(ParseStatement());
+                var format = ParseExplainQueryPlanFormat();
+                var innerStart = _lexer.Current.Offset;
+                var inner = ParseStatement();
+                var innerSql = _sql[innerStart..].Trim();
+                return new ExplainQueryPlanStatement(inner, format, InnerSql: innerSql);
             }
 
             return new ExplainStatement(ParseStatement());
@@ -256,6 +287,8 @@ internal sealed class SqlParser
         }
         if (name.Equals("query_only", StringComparison.OrdinalIgnoreCase))
             return new PragmaQueryOnlyStatement(ParseOptionalPragmaBoolean(name), schema);
+        if (name.Equals("count_changes", StringComparison.OrdinalIgnoreCase))
+            return new PragmaCountChangesStatement(ParseOptionalPragmaBoolean(name), schema);
         if (name.Equals("foreign_keys", StringComparison.OrdinalIgnoreCase))
             return new PragmaForeignKeysStatement(ParseOptionalPragmaBoolean(name), schema);
         if (name.Equals("defer_foreign_keys", StringComparison.OrdinalIgnoreCase))
@@ -1103,7 +1136,8 @@ internal sealed class SqlParser
             tableForeignKeys,
             strict,
             InitialRows: null,
-            Sql: NormalizeObjectSql("CREATE TABLE ", tableNameToken));
+            Sql: NormalizeObjectSql("CREATE TABLE ", tableNameToken),
+            WrittenName: tableNameToken.WrittenForm);
         _spans?.RecordQualifier(createTable, columnListCloseParen);
         _spans?.RecordName(createTable, tableNameToken);
         return createTable;
@@ -1739,7 +1773,14 @@ internal sealed class SqlParser
             throw Error("Expected a SELECT query in the view definition.");
 
         var query = ParseQuery();
-        return new CreateViewStatement(name, columns, query, NormalizeObjectSql("CREATE VIEW ", viewNameToken), ifNotExists, temporary);
+        return new CreateViewStatement(
+            name,
+            columns,
+            query,
+            NormalizeObjectSql("CREATE VIEW ", viewNameToken),
+            ifNotExists,
+            temporary,
+            WrittenName: viewNameToken.WrittenForm);
     }
 
     private ParsedStatement ParseCreateTrigger(bool temporary)
@@ -1801,7 +1842,8 @@ internal sealed class SqlParser
                 body,
                 NormalizeObjectSql("CREATE TRIGGER ", triggerNameToken),
                 ifNotExists,
-                temporary);
+                temporary,
+                WrittenName: triggerNameToken.WrittenForm);
             if (_spans is not null && _pendingUpdateOfTokens is not null)
                 _spans.RecordList(trigger, _pendingUpdateOfTokens);
             _spans?.RecordQualifier(trigger, triggerTableToken);
@@ -2234,6 +2276,19 @@ internal sealed class SqlParser
         var (orderBy, limit, offset) = terms[^1] is ValuesClause
             ? ([], null, null)
             : ParseOrderByAndLimit();
+
+        // An ORDER BY/LIMIT clause followed by another compound operator was misplaced:
+        // SQLite rejects it with "ORDER BY clause should come after UNION not before"
+        // (parser.rs: the clause/operator swap check after parsing ORDER BY/LIMIT).
+        if ((orderBy.Count != 0 || limit is not null)
+            && (CurrentIsKeyword("UNION") || CurrentIsKeyword("INTERSECT") || CurrentIsKeyword("EXCEPT")))
+        {
+            var operatorName = CurrentIsKeyword("UNION")
+                ? ConsumeKeyword("ALL") ? "UNION ALL" : "UNION"
+                : CurrentIsKeyword("INTERSECT") ? "INTERSECT" : "EXCEPT";
+            var clause = orderBy.Count != 0 ? "ORDER BY" : "LIMIT";
+            throw Error($"{clause} clause should come after {operatorName} not before");
+        }
 
         if (terms.Count == 1)
         {
@@ -3308,7 +3363,37 @@ internal sealed class SqlParser
             Expect(TokenKind.RightParen);
         }
 
+        // `x IN ((SELECT ...))` is subquery membership, the same as
+        // `x IN (SELECT ...)`: an empty subquery yields 0/1, never NULL. A list of
+        // two or more values, or a subquery embedded in a larger expression, stays a
+        // value list (mirrors is_bare_subquery/into_bare_subquery in parser.rs).
+        if (values.Count == 1 && TryUnwrapBareSubquery(values[0], out var subquery))
+            return new InSubqueryExpression(expression, subquery, negated);
+
         return new InExpression(expression, values, negated);
+    }
+
+    /// <summary>
+    /// True when <paramref name="expression"/> is a bare subquery, possibly wrapped in
+    /// one or more layers of single-element parentheses.
+    /// </summary>
+    private static bool TryUnwrapBareSubquery(Expression expression, out QueryStatement query)
+    {
+        while (true)
+        {
+            switch (expression)
+            {
+                case ScalarSubqueryExpression scalar:
+                    query = scalar.Query;
+                    return true;
+                case RowValueExpression row when row.Values.Count == 1:
+                    expression = row.Values[0];
+                    continue;
+                default:
+                    query = null!;
+                    return false;
+            }
+        }
     }
 
     private Expression ParseRelational()

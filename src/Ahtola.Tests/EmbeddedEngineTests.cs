@@ -1821,7 +1821,7 @@ public class EmbeddedEngineTests
         Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX t ON t(a);"))!
             .Message.Should().Be("there is already a table named t");
         Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX idx_missing ON nope(a);"))!
-            .Message.Should().Be("no such table: nope");
+            .Message.Should().Be("no such table: main.nope");
         Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX idx_missing ON t(b);"))!
             .Message.Should().Be("no such column: b");
     }

@@ -3,14 +3,196 @@
 # Regenerate with:
 #   dotnet test src/Ahtola.Tests/Ahtola.Tests.csproj \
 #     --filter FullyQualifiedName~RegenerateExpectedFailures -- NUnit.Explicit=true
+#
+# The corpus was refreshed 2026-09-05 to the pinned turso-src v0.8.0-pre.7
+# (277ddd050) content: 51 new files vendored, 30 files refreshed, and the
+# @var/matrix blocks now expand through the managed runner's SQLite-oracle
+# differential path (SqltestMatrixOracle). The entries below are the gaps that
+# refresh exposed; each names the concrete observed difference. Matrix expansions
+# are compared differentially against bundled SQLite at run time.
 
-# Phase 1 MVCC surface cleared the previous 11 MVCC-mode markers
-# (journal_mode=mvcc + BEGIN CONCURRENT + sequential DML under MvStore).
-# Remaining MVCC depth (row-version chains, durable logical log, checkpoint SM)
-# is tracked in docs/mvcc-port-contract.md — not as silent expected failures.
+# Intentional SQLite-compatible extensions beyond the pinned Turso baseline:
+# Ahtola supports DELETE/UPDATE ... ORDER BY/LIMIT (the SQLite
+# SQLITE_ENABLE_UPDATE_DELETE_LIMIT build option) as a deliberate extension, so
+# the upstream corpus's default-build rejections in delete-update-limit-rejected
+# are recorded here rather than changing the engine.
+# Similarly, STORED generated columns are supported where the pinned corpus
+# expects rejection (see the two gencol markers below).
 
-# Intentional SQLite-compatible extensions beyond the pinned Turso baseline.
-gencol.sqltest::gencol_stored_rejected | STORED generated columns are supported instead of returning Turso's expected rejection
-gencol.sqltest::gencol_stored_generated_always_rejected | GENERATED ALWAYS AS ... STORED is supported instead of returning Turso's expected rejection
-
-# Engine gaps exposed by the now-managed deterministic :default: fixtures.
+agg_sum_overflow.sqltest::sum-overflow-forgiven-by-later-float | database variant 1/1 (:memory:): expected success but got error: integer overflow
+aggregate-of-outer-column.sqltest::count-of-outer-column-is-an-aggregate-of-the-outer-query | database variant 1/1 (:memory:): expected 1 row(s), got 3 row(s); row 0 expected '3' but was '1'
+aggregate-of-outer-column.sqltest::count-of-outer-column-wins-over-the-subquerys-own-from | database variant 1/1 (:memory:): expected 1 row(s), got 3 row(s); row 0 expected '3' but was '2'
+aggregate-of-outer-column.sqltest::outer-where-filters-before-the-outer-aggregate | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s); row 0 expected '2' but was '1'
+alter-add-column-default-negate-overflow.sqltest::alter-add-column-default-negate-min-int | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/9.22337203685478e+18/real' but was '1/-9223372036854775808/integer'
+alter-add-column-default-negate-overflow.sqltest::alter-add-column-default-negate-min-int-parenthesized | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/9.22337203685478e+18/real' but was '1/-9223372036854775808/integer'
+alter-add-column-default-negate-overflow.sqltest::alter-add-column-default-negate-min-int-insert | database variant 1/1 (:memory:): expected an error but the statement succeeded
+alter-add-column-default-negate-overflow.sqltest::select-negate-min-int-hex-literal | database variant 1/1 (:memory:): expected an error but the statement succeeded
+compound-select-orderby.sqltest::union-all-order-by-function-expression | database variant 1/1 (:memory:): expected success but got error: 1st ORDER BY term does not match any column in the result set
+compound-select-orderby.sqltest::union-all-order-by-qualified-with-alias | database variant 1/1 (:memory:): expected success but got error: 1st ORDER BY term does not match any column in the result set
+cte.sqltest::cte-referenced-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'cte1' is not supported: no module registration, planner, or execution contract is available. At SQL offset 46.' does not match patt
+cte.sqltest::table-referenced-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'not_a_function' is not supported: no module registration, planner, or execution contract is available. At SQL offset 28.' does not 
+delete-trigger-resets-conflict-policy.sqltest::delete-trigger-does-not-inherit-outer-or-replace | database variant 1/1 (:memory:): expected an error but the statement succeeded
+delete-update-limit-rejected.sqltest::delete-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+delete-update-limit-rejected.sqltest::delete-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+delete-update-limit-rejected.sqltest::delete-where-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+delete-update-limit-rejected.sqltest::delete-order-by-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+delete-update-limit-rejected.sqltest::update-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+delete-update-limit-rejected.sqltest::update-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+delete-update-limit-rejected.sqltest::update-where-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+delete-update-limit-rejected.sqltest::update-order-by-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+exists-drops-order-by-distinct.sqltest::exists-order-by-term-is-not-evaluated | database variant 1/1 (:memory:): expected success but got error: integer overflow
+exists-drops-order-by-distinct.sqltest::exists-order-by-term-not-evaluated-with-limit | database variant 1/1 (:memory:): expected success but got error: integer overflow
+exists-drops-order-by-distinct.sqltest::exists-distinct-offset-counts-plain-rows | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
+from-subquery-affinity.sqltest::derived-table-compound-select-real-blob-leading-arm-not-skipped | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '' but was '3'
+gencol.sqltest::gencol_stored_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+gencol.sqltest::gencol_stored_generated_always_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+join/outer_hash_join.sqltest::full-outer-with-not-exists-subquery | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
+json/json-valid-strict.sqltest::json_valid_json5_marking_survives_later_standard_escape | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '0/0/0/695C7834315C6E' but was '0/0/0/885C75303034315C6E'
+json/json-valid-strict.sqltest::json_valid_infinite_float_argument_is_invalid | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '0/0' but was '1/1'
+json/json-valid-strict.sqltest::json5_numbers_need_a_mantissa_digit | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json5_numbers_reject_repeated_dots_and_exponents | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag2_accepts_json5_text | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_blob_flags_match_jsonb_blobs_only | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag4_is_shallow_flag8_is_deep | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag8_checks_numeric_payloads | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flags_classify_blob_before_whitespace | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flags_ambiguous_small_blob_is_text | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_text_never_matches_blob_flags | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flags_combine_as_bitmask | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_two_arg_numbers_render_as_text | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_two_arg_null_x_is_null | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flags_coerce_numerically | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_text_flags_use_integer_prefix | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flags_zero_is_an_error | database variant 1/1 (:memory:): error 'wrong number of arguments to function json_valid()' does not match pattern '^FLAGS parameter to json_valid\(\) must be between 1 and 15$'
+json/json-valid-strict.sqltest::json_valid_flags_sixteen_is_an_error | database variant 1/1 (:memory:): error 'wrong number of arguments to function json_valid()' does not match pattern '^FLAGS parameter to json_valid\(\) must be between 1 and 15$'
+json/json-valid-strict.sqltest::json_valid_flags_null_is_an_error_even_for_null_x | database variant 1/1 (:memory:): error 'wrong number of arguments to function json_valid()' does not match pattern '^FLAGS parameter to json_valid\(\) must be between 1 and 15$'
+json/json-valid-strict.sqltest::json_valid_flag8_checks_string_escapes | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag8_rejects_extended_headers_on_primitives | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag8_accepts_non_utf8_text_payloads | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag8_accepts_backslash_nul_like_sqlite | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag8_bounds_escape_lookahead_to_the_payload | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag8_skips_hex_checks_for_u_after_continuation | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flags_accept_nine_byte_size_headers | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag8_rejects_nine_byte_headers_on_primitives | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_valid_flag8_depth_limit | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json5_line_continuation_u2028_u2029 | database variant 1/1 (:memory:): expected success but got error: malformed JSON
+json/json-valid-strict.sqltest::json5_vertical_tab_escape_decodes_to_0x0b | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '780B7A/{"a":"x\u0009z"}' but was '780B7A/{"a":"x\u000bz"}'
+json/json-valid-strict.sqltest::json5_unquoted_key_charset | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json5_unquoted_key_rejects_illegal_characters | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json5_unquoted_key_accepts_unicode_escapes | database variant 1/1 (:memory:): expected success but got error: malformed JSON
+json/json-valid-strict.sqltest::json5_unquoted_key_rejects_other_escapes | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json5_unquoted_key_ends_at_comment | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_append_across_array_header_size_boundary | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
+json/json-valid-strict.sqltest::json_bad_path_message_doubles_apostrophes | database variant 1/1 (:memory:): error 'bad JSON path: 'x'y'z'' does not match pattern '^(Parse error: )?bad JSON path: 'x''y''z'$'
+json/json-valid-strict.sqltest::json_bad_path_message_stops_at_nul | database variant 1/1 (:memory:): error 'bad JSON path: 'x\0y'' does not match pattern '^(Parse error: )?bad JSON path: 'x'$'
+json/json-valid-strict.sqltest::subtype_reports_json_text_only | database variant 1/1 (:memory:): expected success but got error: no such function: SUBTYPE
+json/json-valid-strict.sqltest::double_arrow_result_never_carries_subtype | database variant 1/1 (:memory:): expected success but got error: no such function: SUBTYPE
+json/json-valid-strict.sqltest::patch_and_error_position_accept_blobs | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"a":1,"b":2}/{"a":1,"b":2}/{}/0/0/1' but was '{"a":1,"b":2}/{"a":1,"b":2}/{}/1/0/1'
+json/json-valid-strict.sqltest::subtype_marks_json_values_not_metadata | database variant 1/1 (:memory:): expected success but got error: no such function: SUBTYPE
+json/json-valid-strict.sqltest::patch_json_null_result_stays_json | database variant 1/1 (:memory:): expected success but got error: no such function: SUBTYPE
+json/json-valid-strict.sqltest::json_error_position_reports_jsonb_offsets | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '4/2/2/0/0/1' but was '1/1/1/0/0/1'
+json/json-valid-strict.sqltest::json_text_stops_at_first_nul | database variant 1/1 (:memory:): expected success but got error: malformed JSON
+multi_index_or_compound.sqltest::compound-or-analyzed-benchmark-shape-eqp | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH e USING INDEX idx_edge_label (label=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+partial_idx.sqltest::plan-partial-index-equality-predicate | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH products USING COVERING INDEX idx_active_sku (sku=?)' but was '1/0/0/SEARCH products USING INDEX idx_acti
+partial_idx.sqltest::plan-partial-index-range-predicate | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH products USING COVERING INDEX idx_expensive (sku=?)' but was '1/0/0/SEARCH products USING INDEX idx_expen
+partial_idx.sqltest::partial-index-qualified-where-upsert-with-aliased-target | database variant 1/1 (:memory:): expected success but got error: Expected VALUES, DEFAULT VALUES, or a SELECT query after the INSERT target. At SQL offset 14.
+partial_idx.sqltest::eqp-use-partial-idx-predicate-for-covering-index-scan | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN t USING COVERING INDEX idx' but was '1/0/0/SCAN t USING INDEX idx'
+partial_idx.sqltest::eqp-use-partial-idx-predicate-with-residual-predicate-for-covering-index-scan | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH t USING COVERING INDEX idx (a=?)' but was '1/0/0/SEARCH t USING INDEX idx (a=?)'
+recursive-cte.sqltest::recursive-cte-union-recursive-collation | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s)
+recursive-cte.sqltest::recursive-cte-limit | database variant 1/1 (:memory:): expected success but got error: recursive query for seq exceeded the maximum of 1000000 rows
+recursive-cte.sqltest::recursive-cte-limit-offset | database variant 1/1 (:memory:): expected success but got error: recursive query for seq exceeded the maximum of 1000000 rows
+recursive-cte.sqltest::recursive-cte-zero-limit-does-not-recurse | database variant 1/1 (:memory:): expected success but got error: recursive query for seq exceeded the maximum of 1000000 rows
+recursive-cte.sqltest::recursive-cte-zero-limit-skips-initial-query | database variant 1/1 (:memory:): expected success but got error: malformed JSON
+recursive-cte.sqltest::recursive-cte-fuzz-120717-outer-order-after-priority-queue | database variant 1/1 (:memory:): expected 6 row(s), got 8 row(s); row 0 expected '3' but was '2'
+recursive-cte.sqltest::recursive-cte-expression-limit-and-offset | database variant 1/1 (:memory:): expected 5 row(s), got 20 row(s); row 0 expected '3' but was '1'
+recursive-cte.sqltest::recursive-cte-create-table-as-select | database variant 1/1 (:memory:): expected success but got error: no such table: c
+recursive-cte.sqltest::recursive-cte-graph-depth-first | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 2 expected '4/2' but was '3/1'
+recursive-cte.sqltest::recursive-cte-order-inherits-recursive-collation | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected 'A' but was 'b'
+recursive-cte.sqltest::recursive-cte-order-qualified-non-result-column-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
+recursive-cte.sqltest::recursive-cte-forward-dependency | database variant 1/1 (:memory:): expected success but got error: no such table: seq
+recursive-cte.sqltest::recursive-cte-forward-insert-select | database variant 1/1 (:memory:): expected success but got error: no such table: seq
+recursive-cte.sqltest::recursive-cte-left-join-on-clause-reading-left-table | database variant 1/1 (:memory:): expected success but got error: recursive query for path exceeded the maximum of 1000000 rows
+recursive-cte.sqltest::recursive-cte-full-join-recursive-on-left-not-supported | database variant 1/1 (:memory:): expected an error but the statement succeeded
+recursive-cte.sqltest::recursive-cte-full-join-recursive-on-right-not-supported | database variant 1/1 (:memory:): error 'recursive query for path exceeded the maximum of 1000000 rows' does not match pattern 'FULL OUTER JOIN with a recursive reference is not yet supported'
+recursive-cte.sqltest::recursive-cte-left-join-on-clause-subquery-reading-left-table | database variant 1/1 (:memory:): expected success but got error: recursive query for path exceeded the maximum of 1000000 rows
+recursive-cte.sqltest::recursive-cte-distinct-in-recursive-step | database variant 1/1 (:memory:): expected 6 row(s), got 4 row(s); row 3 expected '2' but was '3'
+recursive-cte.sqltest::recursive-cte-nested-with-in-body | database variant 1/1 (:memory:): expected success but got error: circular reference: outer_seq
+recursive-cte.sqltest::recursive-cte-order-by-ordinals | database variant 1/1 (:memory:): expected 8 row(s), got 8 row(s); row 0 expected '2/0' but was '1/3'
+recursive-cte.sqltest::recursive-cte-order-is-priority-queue-not-final-sort | database variant 1/1 (:memory:): expected 10 row(s), got 10 row(s); row 1 expected '6' but was '1'
+recursive-cte.sqltest::recursive-cte-order-multi-arm-depth-first | database variant 1/1 (:memory:): expected 15 row(s), got 15 row(s); row 2 expected '4/2' but was '3/1'
+recursive-cte.sqltest::recursive-cte-order-with-limit-stops-infinite | database variant 1/1 (:memory:): expected success but got error: recursive query for seq exceeded the maximum of 1000000 rows
+recursive-cte.sqltest::recursive-cte-multiple-nested-references | database variant 1/1 (:memory:): error 'circular reference: seq' does not match pattern 'multiple recursive references: seq'
+recursive-cte.sqltest::recursive-cte-arm-column-count-rejected | database variant 1/1 (:memory:): error 'SELECTs to the left and right of a compound operator do not have the same number of result columns' does not match pattern 'SELECTs to the left and right of UNI
+recursive-cte.sqltest::recursive-cte-order-expression-must-match-output | database variant 1/1 (:memory:): expected an error but the statement succeeded
+recursive-cte.sqltest::recursive-cte-mutual-cycle-rejected | database variant 1/1 (:memory:): error 'no such table: b' does not match pattern 'circular reference: a'
+recursive-cte.sqltest::recursive-cte-correlated-resets-limit-and-offset-per-invocation | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '3/2,3' but was '3/1,2,3'
+recursive-cte.sqltest::recursive-cte-correlated-order-by-desc-with-limit | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '5/1,2,3' but was '5/1,2,3,4,5'
+recursive-cte.sqltest::recursive-cte-correlated-limit-zero-and-offset-past-end | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '3/0/0' but was '3/5/5'
+recursive-cte.sqltest::recursive-cte-unused-nested-cte-self-ref-is-not-a-recursive-ref | database variant 1/1 (:memory:): expected success but got error: circular reference: c
+recursive-cte.sqltest::recursive-cte-unused-nested-cte-self-ref-keeps-cte-non-recursive | database variant 1/1 (:memory:): expected success but got error: circular reference: c
+recursive-cte.sqltest::recursive-cte-used-nested-cte-self-ref-rejected | database variant 1/1 (:memory:): error 'circular reference: c' does not match pattern 'multiple recursive references: c'
+recursive-cte.sqltest::recursive-cte-visited-set-via-nested-cte-rejected | database variant 1/1 (:memory:): error 'circular reference: reach' does not match pattern 'multiple recursive references: reach'
+recursive-cte.sqltest::recursive-cte-window-clause-self-ref-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
+recursive-cte.sqltest::recursive-cte-self-ref-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'cte1' is not supported: no module registration, planner, or execution contract is available. At SQL offset 129.' does not match pat
+returning.sqltest::update-returning-after-trigger-same-row-direct | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected '20' but was '120'
+returning.sqltest::update-returning-after-trigger-same-row-subquery | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected '20/20' but was '120/120'
+temp-trigger-fires-before-main.sqltest::temp-triggers-fire-first-in-creation-order | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 0 expected '1/temp1' but was '1/temp2'
+temp-view.sqltest::create-temp-view-lives-in-temp-schema-not-main | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
+temp-view.sqltest::create-temporary-view-lives-in-temp-schema-not-main | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
+timediff-negative-month-roundtrip.sqltest::timediff-negative-month-overflow | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-0000-01-02 00:00:00.000' but was '-0000-01-00 00:00:00.000'
+timediff-negative-month-roundtrip.sqltest::timediff-negative-month-overflow-roundtrip | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '2000-01-31 00:00:00' but was '2000-02-02 00:00:00'
+timediff-negative-month-roundtrip.sqltest::timediff-negative-month-overflow-across-years | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-0001-01-02 00:00:00.000' but was '-0001-01-00 00:00:00.000'
+timediff-negative-month-roundtrip.sqltest::timediff-negative-month-overflow-across-years-roundtrip | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1999-01-31 00:00:00' but was '1999-02-02 00:00:00'
+timediff-negative-month-roundtrip.sqltest::timediff-negative-short-february | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-0000-01-30 00:00:00.000' but was '-0000-01-28 00:00:00.000'
+timediff-negative-month-roundtrip.sqltest::timediff-negative-short-february-roundtrip | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '2000-01-02 00:00:00' but was '2000-01-04 00:00:00'
+timediff-negative-month-roundtrip.sqltest::timediff-negative-two-months-back | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-0000-02-01 00:00:00.000' but was '-0000-02--01 00:00:00.000'
+timediff-negative-month-roundtrip.sqltest::timediff-negative-two-months-back-roundtrip | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1999-12-31 00:00:00' but was ''
+views.sqltest::drop-view-finds-temp-view-with-unqualified-name | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][none] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-no-others] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-current-row] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-group] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-ties] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][none] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-no-others] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-current-row] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-group] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-ties] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix_edge.sqltest::integer-extreme-keys[range][asc][100-preceding-and-2-preceding] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix_edge.sqltest::integer-extreme-keys[range][desc][100-preceding-and-2-preceding] | database variant 1/1 (:memory:): SQLite errored ('SQLite Error 1: 'integer overflow'.') but managed returned 5 row(s)
+window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][0-5][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][0-5][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][1e308][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][1e308][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][0-5][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][0-5][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][1e308][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][1e308][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
+window/frame_sum_overflow.sqltest::window-sum-inverse-transient-overflow-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
+window/frame_sum_overflow.sqltest::window-frame-membership-at-integer-extremes | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected '9223372036854775807/0//' but was '9223372036854775807/1/9223372036854775807/9223372036854775807'
+window/frame_sum_overflow.sqltest::window-sum-step-overflow-forgiven-by-float | database variant 1/1 (:memory:): expected success but got error: integer overflow
+window/memory.sqltest::named-window-chain-missing-base-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
+window/moving_concat_json.sqltest::moving-group-concat-empty-prefix | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 2 expected '3/'x'/'x'' but was '3/'/x'/'/x''
+window/moving_min_max.sqltest::moving-min-max-argument-collation | database variant 1/1 (:memory:): expected 6 row(s), got 6 row(s); row 2 expected '3/a/b' but was '3/A/b'
+window/rows_frame.sqltest::rows-mixed-int-float-approx-transition | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 2 expected '3/300.0' but was '3/300'
+unnest-correlated.sqltest::one-value-group-concat-does-not-build-unused-groups | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN outer_rows AS o.*CORRELATED SCALAR SUBQUERY'
+unnest-correlated.sqltest::one-value-group-concat-joins-before-grouping | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN inner_rows AS i.*SCAN outer_rows AS o.*USE SORTER FOR GROUP BY'
+unnest-correlated.sqltest::correlated-in-null-results-do-not-match | database variant 1/1 (:memory:): expected 1 row(s), got 4 row(s); row 0 expected '3' but was '1'
+unnest-correlated.sqltest::exists-after-full-join | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
+unnest-correlated.sqltest::exists-linked-past-full-join | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
+unnest-correlated.sqltest::not-exists-linked-past-full-join | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
+unnest-correlated.sqltest::one-value-sum-joins-before-grouping | database variant 1/1 (:memory:): output does not match pattern '(?s)HASH JOIN sum_join_inner AS i.*SCAN sum_join_outer AS o.*USE SORTER FOR GROUP BY'
+unnest-correlated.sqltest::one-value-sum-compared-with-subquery-stays-correlated | database variant 1/1 (:memory:): output does not match pattern '(?s)CORRELATED SCALAR SUBQUERY.*CORRELATED SCALAR SUBQUERY'
+unnest-correlated.sqltest::one-value-sum-with-nondeterministic-where-term-stays-correlated | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN nondet_outer AS o.*CORRELATED SCALAR SUBQUERY'
+unnest-correlated.sqltest::one-value-sum-with-correlated-subquery-term-stays-correlated | database variant 1/1 (:memory:): output does not match pattern '(?s)CORRELATED SCALAR SUBQUERY.*CORRELATED SCALAR SUBQUERY'
+unnest-correlated.sqltest::one-value-sum-join-allows-uncorrelated-subquery-term | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN in_term_inner AS i.*USE SORTER FOR GROUP BY'
+unnest-correlated.sqltest::one-value-sum-join-subquery-on-left-side | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN left_side_inner AS i.*USE SORTER FOR GROUP BY'
+unnest-correlated.sqltest::one-value-json-sum-uses-joined-form | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN json_sum_plan_inner AS i.*SCAN json_sum_plan_outer AS o.*USE SORTER FOR GROUP BY'
+unnest-correlated.sqltest::limit-one-keeps-correlated-in | database variant 1/1 (:memory:): expected 8 row(s), got 3 row(s); row 0 expected '1/0/0/SCAN limit_outer AS o' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+unnest-correlated.sqltest::two-exists-use-two-semi-joins | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN two_exists_outer AS o' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+unnest-correlated.sqltest::outer-filter-keeps-exists-semi-join | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN filtered_exists_outer AS o' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+unnest-correlated.sqltest::indexed-average-uses-outer-row-count | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN one_indexed_avg_outer AS o.*CORRELATED SCALAR SUBQUERY.*SEARCH i USING INDEX indexed_avg_inner_k.*SCAN many_indexed_avg_outer A
+unnest-correlated.sqltest::two-identical-averages-use-one-grouped-table | database variant 1/1 (:memory:): output does not match pattern '^1\n[0-9]+\/0\/0\/SCAN two_avg_outer AS o\n[0-9]+\/0\/0\/SEARCH scalar_subquery_[^\n]*\n[0-9]+\/[0-9]+\/0\/SCAN two_avg_inner AS i\n[0-9
+unnest-correlated.sqltest::grouped-seek-does-not-copy-unused-columns | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
+unnest-correlated.sqltest::unnested-in-reuses-unused-cursor | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
+unnest-correlated.sqltest::grouped-aggregate-reuses-unused-result-register | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.

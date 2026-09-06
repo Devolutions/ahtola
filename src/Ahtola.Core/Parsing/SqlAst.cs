@@ -24,7 +24,10 @@ internal sealed record CreateTableStatement(
     // loop, and a non-null (possibly empty) list is also what marks the statement as a CTAS, which stores
     // its schema SQL in compact form.
     IReadOnlyList<SqlValue[]>? InitialRows = null,
-    string? Sql = null) : ParsedStatement;
+    string? Sql = null,
+    // The name exactly as the user wrote it (quotes included when quoted); SQLite echoes
+    // this spelling in "already exists" collision errors.
+    string? WrittenName = null) : ParsedStatement;
 
 /// <summary>
 /// A module-backed catalog table. Module arguments deliberately retain SQL text rather than
@@ -80,7 +83,10 @@ internal sealed record CreateViewStatement(
     QueryStatement Query,
     string Sql,
     bool IfNotExists,
-    bool Temporary = false) : ParsedStatement;
+    bool Temporary = false,
+    // The name exactly as the user wrote it (quotes included when quoted); SQLite echoes
+    // this spelling in "already exists" collision errors.
+    string? WrittenName = null) : ParsedStatement;
 
 internal sealed record DropViewStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -111,7 +117,10 @@ internal sealed record CreateTriggerStatement(
     bool Temporary = false,
     // Set when the trigger lives in a different schema than the table it watches, which
     // SQLite only allows for temp triggers. The owning connection validates the target.
-    string? TargetSchema = null) : ParsedStatement;
+    string? TargetSchema = null,
+    // The name exactly as the user wrote it (quotes included when quoted); SQLite echoes
+    // this spelling in "already exists" collision errors.
+    string? WrittenName = null) : ParsedStatement;
 
 internal sealed record DropTriggerStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -313,6 +322,13 @@ internal sealed record PragmaEncodingStatement(string? Schema = null) : ParsedSt
 
 internal sealed record PragmaQueryOnlyStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
 
+/// <summary>
+/// <c>PRAGMA count_changes</c>: when enabled, each INSERT/UPDATE/DELETE returns one row
+/// carrying the number of rows it changed, the way SQLite's deprecated-but-supported
+/// count_changes pragma does.
+/// </summary>
+internal sealed record PragmaCountChangesStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
+
 internal sealed record PragmaForeignKeysStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
 
 internal sealed record PragmaDeferForeignKeysStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
@@ -434,7 +450,25 @@ internal sealed record DetachDatabaseStatement(string Alias) : ParsedStatement;
 
 internal sealed record ExplainStatement(ParsedStatement Inner) : ParsedStatement;
 
-internal sealed record ExplainQueryPlanStatement(ParsedStatement Inner) : ParsedStatement;
+/// <summary>The output format of <c>EXPLAIN QUERY PLAN</c>.</summary>
+internal enum ExplainQueryPlanFormat
+{
+    /// <summary>The classic four-column text rows.</summary>
+    Text,
+
+    /// <summary>
+    /// One <c>plan_json</c> TEXT row carrying the machine-readable plan envelope documented in
+    /// <c>turso-src/docs/eqp-json.md</c>.
+    /// </summary>
+    Json,
+}
+
+internal sealed record ExplainQueryPlanStatement(
+    ParsedStatement Inner,
+    ExplainQueryPlanFormat Format = ExplainQueryPlanFormat.Text,
+    // The original statement text (without the EXPLAIN QUERY PLAN prefix), captured for
+    // FORMAT=JSON's envelope "sql" field.
+    string? InnerSql = null) : ParsedStatement;
 
 internal sealed record SelectStatement(
     bool Distinct,

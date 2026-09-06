@@ -116,9 +116,11 @@ public sealed class ManagedScalarFunctionParityTests
         ReadValue(connection, sql).Should().Be(SqlValue.Integer(expected));
     }
 
-    [TestCase("SELECT char('not a code point');", "")]
-    [TestCase("SELECT char(65, 1.5, 'ignored', X'42', 66);", "AB")]
-    public void ManagedEngineIgnoresNonIntegerCharArguments(string sql, string expected)
+    [TestCase("SELECT char('not a code point');", "\0")]
+    [TestCase("SELECT char('');", "\0")]
+    [TestCase("SELECT char('65');", "A")]
+    [TestCase("SELECT char(65, 1.5, '66', X'43', 67);", "A\u0001B\0C")]
+    public void ManagedEngineCoercesCharArgumentsToIntegerCodePoints(string sql, string expected)
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();

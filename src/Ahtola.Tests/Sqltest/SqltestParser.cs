@@ -30,6 +30,12 @@ internal enum SqltestExpectationKind
     Pattern,
     Unordered,
     Error,
+
+    /// <summary>
+    /// Matrix expansion: the expectation is produced at run time by the bundled SQLite
+    /// oracle — the managed engine must return the same rows, or both must reject.
+    /// </summary>
+    Oracle,
 }
 
 internal sealed record SqltestExpectation(
@@ -50,13 +56,145 @@ internal sealed record SqltestCase(
     IReadOnlyList<string> Requires,
     bool CrossCheckIntegrity);
 
+/// <summary>A <c>@var</c> decorator: a substitution name and the values it expands over.</summary>
+internal sealed record SqltestMatrixVar(string Name, IReadOnlyList<string> Values);
+
+/// <summary>
+/// A <c>matrix</c> block: one SQL template expanded over the cross-product of its
+/// <c>@var</c> decorators. Each expansion becomes an individual case named
+/// <c>&lt;matrix&gt;[slug]...</c> and is verified at run time against the bundled
+/// SQLite oracle, mirroring <c>ast.rs::MatrixCase</c>.
+/// </summary>
+internal sealed record SqltestMatrixCase(
+    string Name,
+    string SqlTemplate,
+    IReadOnlyList<SqltestMatrixVar> Vars,
+    IReadOnlyList<string> Setups,
+    IReadOnlyList<SqltestSkip> Skips,
+    string? Backend,
+    IReadOnlyList<string> Requires,
+    bool CrossCheckIntegrity)
+{
+    /// <summary>
+    /// Expands the cross-product of all variables into concrete cases. Substitution
+    /// replaces longer variable names first so <c>$start</c> is never clobbered by a
+    /// variable named <c>$s</c> (mirrors <c>MatrixCase::expand</c>). When two values of the
+    /// same variable slug identically (e.g. the operators <c>=</c> and <c>&lt;=</c>), the
+    /// later expansion is suffixed <c>~N</c> so every case name stays unique for the
+    /// name-keyed conformance lookup.
+    /// </summary>
+    public IReadOnlyList<(string Name, string Sql)> Expand()
+    {
+        var order = Enumerable.Range(0, Vars.Count)
+            .OrderByDescending(index => Vars[index].Name.Length)
+            .ToList();
+        var expansions = new List<(string Name, string Sql)>();
+        var seenNames = new HashSet<string>(StringComparer.Ordinal);
+        var indices = new int[Vars.Count];
+        while (true)
+        {
+            var sql = SqlTemplate;
+            foreach (var variableIndex in order)
+            {
+                var variable = Vars[variableIndex];
+                sql = sql.Replace($"${variable.Name}", variable.Values[indices[variableIndex]]);
+            }
+
+            var name = new StringBuilder(Name);
+            for (var variableIndex = 0; variableIndex < Vars.Count; variableIndex++)
+            {
+                name.Append('[').Append(Slug(Vars[variableIndex].Values[indices[variableIndex]])).Append(']');
+            }
+
+            var uniqueName = name.ToString();
+            if (!seenNames.Add(uniqueName))
+            {
+                var suffix = 2;
+                while (!seenNames.Add($"{uniqueName}~{suffix}"))
+                    suffix++;
+                uniqueName = $"{uniqueName}~{suffix}";
+            }
+
+            expansions.Add((uniqueName, sql));
+
+            // Advance the odometer.
+            var position = Vars.Count;
+            while (position > 0)
+            {
+                position--;
+                indices[position]++;
+                if (indices[position] < Vars[position].Values.Count)
+                    break;
+                indices[position] = 0;
+            }
+
+            if (position == 0 && indices[0] == 0)
+                return expansions;
+        }
+    }
+
+    /// <summary>Turns a variable value into a stable, readable name fragment (mirrors <c>slug</c>).</summary>
+    private static string Slug(string value)
+    {
+        var slug = new StringBuilder(value.Length);
+        var lastWasSeparator = true;
+        foreach (var character in value.ToLowerInvariant())
+        {
+            if (char.IsAsciiLetterOrDigit(character))
+            {
+                slug.Append(character);
+                lastWasSeparator = false;
+            }
+            else if (!lastWasSeparator)
+            {
+                slug.Append('-');
+                lastWasSeparator = true;
+            }
+        }
+
+        while (slug.Length > 0 && slug[^1] == '-')
+            slug.Length--;
+
+        return slug.Length == 0 ? "none" : slug.ToString();
+    }
+}
+
 internal sealed record SqltestFile(
     string RelativePath,
     IReadOnlyList<SqltestDatabase> Databases,
     IReadOnlyDictionary<string, string> Setups,
     IReadOnlyList<SqltestCase> Tests,
     IReadOnlyList<SqltestSkip> GlobalSkips,
-    IReadOnlyList<string> GlobalRequires);
+    IReadOnlyList<string> GlobalRequires)
+{
+    public IReadOnlyList<SqltestMatrixCase> Matrices { get; init; } = [];
+
+    /// <summary>
+    /// Expands every matrix into concrete <c>Oracle</c>-expectation cases so discovery,
+    /// classification, and expected-failure tracking observe them like ordinary tests.
+    /// </summary>
+    public IReadOnlyList<SqltestCase> ExpandedMatrixTests()
+    {
+        var cases = new List<SqltestCase>();
+        foreach (var matrix in Matrices)
+        {
+            foreach (var (expansionName, sql) in matrix.Expand())
+            {
+                cases.Add(new SqltestCase(
+                    expansionName,
+                    sql,
+                    new SqltestExpectation(SqltestExpectationKind.Oracle, [], null),
+                    matrix.Setups,
+                    matrix.Skips,
+                    matrix.Backend,
+                    matrix.Requires,
+                    matrix.CrossCheckIntegrity));
+            }
+        }
+
+        return cases;
+    }
+}
 
 internal sealed class SqltestParseException(string message) : Exception(message);
 
@@ -295,6 +433,7 @@ internal static class SqltestParser
     private sealed class Reader(string relativePath, List<Token> tokens)
     {
         private int _position;
+        private readonly List<SqltestMatrixCase> _matrixCases = [];
 
         public SqltestFile ParseFile()
         {
@@ -341,7 +480,10 @@ internal static class SqltestParser
                 }
             }
 
-            return new SqltestFile(relativePath, databases, setups, tests, globalSkips, globalRequires);
+            return new SqltestFile(relativePath, databases, setups, tests, globalSkips, globalRequires)
+            {
+                Matrices = _matrixCases,
+            };
         }
 
         private SqltestDatabase ParseDatabase()
@@ -381,6 +523,7 @@ internal static class SqltestParser
             var requires = new List<string>();
             string? backend = null;
             var crossCheckIntegrity = false;
+            var matrixVars = new List<SqltestMatrixVar>();
 
             while (Peek() is { Kind: TokenKind.Directive } directive)
             {
@@ -407,6 +550,15 @@ internal static class SqltestParser
                     case "@cross-check-integrity":
                         crossCheckIntegrity = true;
                         break;
+                    case "@var":
+                        var variableName = ExpectWord();
+                        if (matrixVars.Any(variable => variable.Name == variableName))
+                            throw new SqltestParseException($"duplicate @var name: {variableName}");
+                        var valueBlock = ExpectBlock();
+                        matrixVars.Add(new SqltestMatrixVar(
+                            variableName,
+                            valueBlock.Split('|').Select(static value => value.Trim()).ToArray()));
+                        break;
                     default:
                         throw new SqltestParseException($"Unexpected directive '{directive.Value}' in {relativePath}.");
                 }
@@ -424,6 +576,32 @@ internal static class SqltestParser
                 _ = ExpectBlock();
                 return null;
             }
+
+            if (keyword is { Kind: TokenKind.Word, Value: "matrix" })
+            {
+                Advance();
+                var matrixName = ExpectWord();
+                if (matrixVars.Count == 0)
+                    throw new SqltestParseException($"Matrix '{matrixName}' in {relativePath} requires at least one @var.");
+                var sqlTemplate = ExpectBlock().Trim();
+                SkipNewlines();
+                if (Peek() is { Kind: TokenKind.Word, Value: "expect" })
+                    throw new SqltestParseException(
+                        $"Matrix '{matrixName}' in {relativePath} takes no expect blocks; every expansion is verified against the SQLite oracle at run time.");
+                _matrixCases.Add(new SqltestMatrixCase(
+                    matrixName,
+                    sqlTemplate,
+                    matrixVars,
+                    setups,
+                    skips,
+                    backend,
+                    requires,
+                    crossCheckIntegrity));
+                return null;
+            }
+
+            if (matrixVars.Count != 0)
+                throw new SqltestParseException($"@var decorators are only valid before a matrix in {relativePath}.");
 
             if (keyword is not { Kind: TokenKind.Word, Value: "test" })
                 throw new SqltestParseException($"Expected 'test' in {relativePath}, got '{keyword.Value}'.");

@@ -126,7 +126,7 @@ public sealed class SchemaObjectStatementCompilerTests
         Compile("CREATE VIEW existing_view AS SELECT a FROM t;", catalog)
             .Should().Throw<EmbeddedSqlException>().WithMessage("view existing_view already exists");
         Compile("CREATE VIEW t AS SELECT a FROM t;", catalog)
-            .Should().Throw<EmbeddedSqlException>().WithMessage("there is already a table named t");
+            .Should().Throw<EmbeddedSqlException>().WithMessage("table t already exists");
         Compile("CREATE VIEW existing_trigger AS SELECT a FROM t;", catalog)
             .Should().Throw<EmbeddedSqlException>().WithMessage("there is already a trigger named existing_trigger");
         Compile("CREATE VIEW existing_index AS SELECT a FROM t;", catalog)

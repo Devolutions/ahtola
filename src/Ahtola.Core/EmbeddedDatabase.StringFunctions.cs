@@ -512,20 +512,19 @@ public sealed partial class EmbeddedDatabase
         var builder = new StringBuilder(arguments.Count);
         foreach (var argument in arguments)
         {
-            // Turso only converts INTEGER arguments to code points. NULL remains a NUL character,
-            // while REAL, TEXT, and BLOB arguments do not contribute a character.
-            long codePoint;
-            switch (argument.Kind)
+            // char() coerces every argument to an integer codepoint, the same way
+            // sqlite3_value_int64 / CAST(... AS INTEGER) does: text and blobs by their
+            // numeric prefix (0 if none), floats by truncation, NULL as 0
+            // (turso-src/core/vdbe/value.rs exec_char).
+            long codePoint = argument.Kind switch
             {
-                case SqlValueKind.Integer:
-                    codePoint = argument.AsInteger();
-                    break;
-                case SqlValueKind.Null:
-                    codePoint = 0;
-                    break;
-                default:
-                    continue;
-            }
+                SqlValueKind.Integer => argument.AsInteger(),
+                SqlValueKind.Real => RealToInteger(argument.AsReal()),
+                SqlValueKind.Text => CoerceTextPrefixToInteger(argument.AsText()),
+                SqlValueKind.Blob => CoerceTextPrefixToInteger(
+                    Encoding.UTF8.GetString(argument.AsBlob().Span)),
+                _ => 0,
+            };
 
             // SQLite substitutes U+FFFD for values outside the Unicode range and
             // for surrogate code points, which cannot stand alone.
@@ -541,6 +540,52 @@ public sealed partial class EmbeddedDatabase
         return SqlValue.Text(builder.ToString());
     }
 
+    /// <summary>
+    /// Coerces a text value's numeric prefix to an integer the way SQLite's
+    /// <c>sqlite3_value_int64</c> does for text: the longest leading numeric run,
+    /// or 0 when there is none.
+    /// </summary>
+    private static long CoerceTextPrefixToInteger(string text)
+    {
+        var end = 0;
+        var seenDigit = false;
+        while (end < text.Length)
+        {
+            var character = text[end];
+            if (char.IsDigit(character))
+            {
+                seenDigit = true;
+                end++;
+            }
+            else if ((character is '+' or '-') && end == 0)
+            {
+                end++;
+            }
+            else if (character == '.' && seenDigit)
+            {
+                end++;
+            }
+            else if ((character is 'e' or 'E') && seenDigit)
+            {
+                end++;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        return seenDigit && long.TryParse(text[..end], out var value)
+            ? value
+            : 0;
+    }
+
+    /// <summary>Truncates a REAL toward zero into an i64, saturating at the i64 bounds.</summary>
+    private static long RealToInteger(double value)
+        => value >= long.MaxValue ? long.MaxValue
+            : value <= long.MinValue ? long.MinValue
+            : (long)value;
+
     private static SqlValue EvaluateUnicode(IReadOnlyList<SqlValue> arguments)
     {
         RequireArgumentCount("unicode", arguments, 1);
@@ -552,6 +597,71 @@ public sealed partial class EmbeddedDatabase
             return SqlValue.Null;
 
         return SqlValue.Integer(char.ConvertToUtf32(text, 0));
+    }
+
+    /// <summary>
+    /// <c>get_byte(data, offset)</c>: PostgreSQL-compatible byte access on blobs. Text input
+    /// is read as its UTF-8 bytes; NULL in either argument yields NULL; an out-of-range
+    /// offset raises <c>index N out of valid range, 0..LEN-1</c> exactly like PG
+    /// (turso-sqltests/get-set-byte.sqltest).
+    /// </summary>
+    private static SqlValue EvaluateGetByte(IReadOnlyList<SqlValue> arguments)
+    {
+        RequireArgumentCount("get_byte", arguments, 2);
+        if (HasNullArgument(arguments))
+            return SqlValue.Null;
+
+        var data = ToByteString(arguments[0]);
+        var offset = ToByteOffset(arguments[1]);
+        ValidateByteOffset(offset, data.Length);
+        return SqlValue.Integer(data[offset]);
+    }
+
+    /// <summary>
+    /// <c>set_byte(data, offset, value)</c>: PostgreSQL-compatible byte replacement. The value
+    /// wraps to its low 8 bits, the result is always a blob (even for text input), NULL in any
+    /// argument yields NULL, and out-of-range offsets raise the PG-style range error.
+    /// </summary>
+    private static SqlValue EvaluateSetByte(IReadOnlyList<SqlValue> arguments)
+    {
+        RequireArgumentCount("set_byte", arguments, 3);
+        if (HasNullArgument(arguments))
+            return SqlValue.Null;
+
+        var data = ToByteString(arguments[0]);
+        var offset = ToByteOffset(arguments[1]);
+        ValidateByteOffset(offset, data.Length);
+
+        var value = ToByteOffset(arguments[2]);
+        var replaced = new byte[data.Length];
+        data.CopyTo(replaced);
+        replaced[offset] = (byte)(value & 0xff);
+        return SqlValue.BlobOwned(replaced);
+    }
+
+    private static byte[] ToByteString(SqlValue value)
+        => value.Kind switch
+        {
+            SqlValueKind.Blob => value.AsBlob().ToArray(),
+            SqlValueKind.Text => Encoding.UTF8.GetBytes(value.AsText()),
+            SqlValueKind.Integer => [(byte)(value.AsInteger() & 0xff)],
+            SqlValueKind.Real => [(byte)((long)value.AsReal() & 0xff)],
+            _ => [],
+        };
+
+    private static long ToByteOffset(SqlValue value)
+        => value.Kind switch
+        {
+            SqlValueKind.Integer => value.AsInteger(),
+            SqlValueKind.Text => CoerceTextPrefixToInteger(value.AsText()),
+            SqlValueKind.Real => RealToInteger(value.AsReal()),
+            _ => 0,
+        };
+
+    private static void ValidateByteOffset(long offset, int length)
+    {
+        if (offset < 0 || offset >= length)
+            throw new EmbeddedSqlException($"index {offset} out of valid range, 0..{length - 1}");
     }
 
     private static SqlValue EvaluateUnhex(IReadOnlyList<SqlValue> arguments)

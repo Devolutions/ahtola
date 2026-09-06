@@ -91,13 +91,50 @@ internal static class SqltestManagedRunner
             }
 
             var error = TryExecute(connection, test.Sql, timeout.Token, out var rows);
-            var outcome = Compare(test.Expectation, rows, error);
+
+            SqltestOutcome outcome;
+            if (test.Expectation.Kind == SqltestExpectationKind.Oracle)
+            {
+                // Matrix expansion: the expectation is produced at run time by the
+                // bundled SQLite oracle (mirrors runner/mod.rs::MatrixRunCase).
+                var setups = new List<string>();
+                foreach (var setupName in test.Setups)
+                {
+                    if (!file.Setups.TryGetValue(setupName, out var setupSql))
+                        return new SqltestOutcome(false, $"undefined setup '{setupName}'");
+                    setups.Add(setupSql);
+                }
+
+                var oracle = SqltestMatrixOracle.Run(setups, test.Sql);
+                outcome = (error, oracle.Error) switch
+                {
+                    (null, null) => rows.SequenceEqual(oracle.Rows, StringComparer.Ordinal)
+                        ? new SqltestOutcome(true, string.Empty)
+                        : new SqltestOutcome(
+                            false,
+                            "managed and SQLite rows differ" +
+                            $"{Environment.NewLine}--- managed{Environment.NewLine}{string.Join(Environment.NewLine, rows)}" +
+                            $"{Environment.NewLine}+++ SQLite{Environment.NewLine}{string.Join(Environment.NewLine, oracle.Rows)}"),
+                    (not null, not null) => new SqltestOutcome(true, string.Empty),
+                    (not null, null) => new SqltestOutcome(
+                        false,
+                        $"managed errored ('{error}') but SQLite returned {oracle.Rows.Count} row(s)"),
+                    (null, not null) => new SqltestOutcome(
+                        false,
+                        $"SQLite errored ('{oracle.Error}') but managed returned {rows.Count} row(s)"),
+                };
+            }
+            else
+            {
+                outcome = Compare(test.Expectation, rows, error);
+            }
+
             // Match Turso's runner: integrity cross-checks apply only to passing,
             // writable cases that did not intentionally expect an error.
             if (!outcome.Matched
                 || !test.CrossCheckIntegrity
                 || database.ReadOnly
-                || test.Expectation.Kind == SqltestExpectationKind.Error)
+                || test.Expectation.Kind is SqltestExpectationKind.Error or SqltestExpectationKind.Oracle)
                 return outcome;
 
             var integrity = integrityCheck(connection, timeout.Token);
@@ -219,15 +256,7 @@ internal static class SqltestManagedRunner
     }
 
     private static string FormatError(Exception exception)
-    {
-        var message = exception.Message;
-        return exception is EmbeddedSqlException
-               && (message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal)
-                   || message.StartsWith("CHECK constraint failed:", StringComparison.Ordinal)
-                   || message.StartsWith("NOT NULL constraint failed:", StringComparison.Ordinal))
-            ? $"{message} (19)"
-            : message;
-    }
+        => exception.Message;
 
     private static SqltestOutcome Compare(SqltestExpectation expectation, List<string> rows, string? error)
     {

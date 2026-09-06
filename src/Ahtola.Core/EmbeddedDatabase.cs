@@ -5511,7 +5511,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ReindexStatement reindex => ExecuteReindex(reindex, catalog),
                 OptimizeIndexStatement optimize => ExecuteOptimizeIndex(optimize, catalog),
                 ExplainStatement explain => ExecuteExplain(explain, parameters, context),
-                ExplainQueryPlanStatement explainQueryPlan => ExecuteExplainQueryPlan(explainQueryPlan, parameters, context),
+                ExplainQueryPlanStatement explainQueryPlan => ExecuteExplainQueryPlan(
+                    explainQueryPlan,
+                    parameters,
+                    context),
                 BeginStatement => ExecutionResult.Empty,
                 CommitStatement => ExecutionResult.Empty,
                 RollbackStatement => ExecutionResult.Empty,
@@ -15369,10 +15372,54 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (value.Kind != SqlValueKind.Null && !IsTrue(value))
             {
                 throw new EmbeddedSqlException(
-                    $"CHECK constraint failed: {check.Name ?? check.Sql}",
+                    $"CHECK constraint failed: {check.Name ?? DequoteConstraintMessageSource(check.Sql)}",
                     InsertConflictAlgorithm.Abort);
             }
         }
+    }
+
+    /// <summary>
+    /// SQLite dequotes the leading token of a CHECK constraint's source text when it
+    /// reports a failure: <c>CHECK("xy" &lt; +5)</c> reports
+    /// <c>CHECK constraint failed: xy</c> — only the first quoted token survives, with its
+    /// quotes stripped, when the message source starts with a quote character.
+    /// </summary>
+    private static string DequoteConstraintMessageSource(string sql)
+    {
+        var trimmed = sql.TrimStart();
+        if (trimmed.Length == 0 || trimmed[0] is not ('"' or '`' or '['))
+            return sql;
+
+        var closing = trimmed[0] switch
+        {
+            '"' => '"',
+            '`' => '`',
+            _ => ']',
+        };
+
+        var end = 1;
+        var result = new System.Text.StringBuilder();
+        while (end < trimmed.Length)
+        {
+            if (trimmed[end] == closing)
+            {
+                if (end + 1 < trimmed.Length && trimmed[end + 1] == closing)
+                {
+                    result.Append(closing);
+                    end += 2;
+                    continue;
+                }
+
+                end++;
+                break;
+            }
+
+            result.Append(trimmed[end]);
+            end++;
+        }
+
+        // Only the first quoted token survives; the rest of the expression is dropped.
+        return result.ToString();
     }
 
     // Mirrors Turso's columns_affected_by_update + ROWID_STRS expansion in the update
@@ -24824,7 +24871,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             spec = (frame is { Mode: Ahtola.Core.Parsing.WindowFrameMode.Groups }
                 ? WindowFrameSpec.GroupsRunning
-                : WindowFrameSpec.RangeRunning) with { Exclusion = exclusion };
+                : WindowFrameSpec.RangeRunning) with
+            { Exclusion = exclusion };
             return true;
         }
 
@@ -24837,7 +24885,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             spec = (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
                 ? WindowFrameSpec.GroupsCurrentPeer
-                : WindowFrameSpec.RangeCurrentPeer) with { Exclusion = exclusion };
+                : WindowFrameSpec.RangeCurrentPeer) with
+            { Exclusion = exclusion };
             return true;
         }
 
@@ -25333,7 +25382,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             ((NthValueAccumulator)contextObject!).Remove();
                         return contextObject;
                     }
-                    : null,
+                : null,
                 Finalize = static contextObject => contextObject switch
                 {
                     LagAccumulator lag => lag.Finalize(),
@@ -27636,6 +27685,90 @@ out bool hasReturning)
     internal static string[] ExplainColumns() => ["addr", "opcode", "p1", "p2", "p3", "p4", "comment"];
 
     private ExecutionResult ExecuteExplainQueryPlan(
+        ExplainQueryPlanStatement statement,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var result = ExecuteExplainQueryPlanText(statement, parameters, context);
+        if (statement.Format != ExplainQueryPlanFormat.Json)
+            return result;
+
+        // EXPLAIN QUERY PLAN FORMAT=JSON emits one plan_json TEXT row carrying the
+        // machine-readable envelope documented in turso-src/docs/eqp-json.md. The
+        // managed engine's plan rows become node entries; the structured `op` objects
+        // of the upstream format are not yet modeled, so each node carries the plan
+        // detail text with the node id/parent linkage from the text rows.
+        var sql = statement.InnerSql ?? string.Empty;
+        // The query's result columns come from the same auto-increment statement state the
+        // text path binds; when the inner statement is not a plain query, fall back to
+        // the plan row columns.
+        string[] resultColumns;
+        try
+        {
+            resultColumns = statement.Inner is QueryStatement innerQuery
+                ? DescribeQuery(innerQuery, EnsureAutoIncrementStatementState(context))
+                : result.Columns;
+        }
+        catch (EmbeddedSqlException)
+        {
+            resultColumns = result.Columns;
+        }
+        var json = new System.Text.StringBuilder()
+            .Append("{\"version\":1,\"sql\":")
+            .Append(JsonEscape("EXPLAIN QUERY PLAN " + sql))
+            .Append(",\"result_columns\":[")
+            .Append(string.Join(",", resultColumns.Select(static column => JsonEscape(column))))
+            .Append("],\"nodes\":[")
+            .Append(string.Join(",", result.Rows.Select((row, index) =>
+            {
+                var detail = row.Length >= 4 ? row[3] : SqlValue.Null;
+                var nodeId = row.Length >= 1 && row[0].Kind == SqlValueKind.Integer
+                    ? row[0].AsInteger().ToString(CultureInfo.InvariantCulture)
+                    : (index + 1).ToString(CultureInfo.InvariantCulture);
+                var parent = row.Length >= 2 && row[1].Kind == SqlValueKind.Integer
+                    ? row[1].AsInteger().ToString(CultureInfo.InvariantCulture)
+                    : "null";
+                return $"{{\"id\":{nodeId},\"parent\":{parent},\"detail\":{JsonEscape(detail.Kind == SqlValueKind.Text ? detail.AsText() : string.Empty)}}}";
+            })))
+            .Append("]}");
+        return new ExecutionResult(["plan_json"], [[SqlValue.Text(json.ToString())]], 0);
+    }
+
+    private static string JsonEscape(string value)
+    {
+        var escaped = new System.Text.StringBuilder(value.Length + 2);
+        foreach (var character in value)
+        {
+            switch (character)
+            {
+                case '"':
+                    escaped.Append("\\\"");
+                    break;
+                case '\\':
+                    escaped.Append("\\\\");
+                    break;
+                case '\n':
+                    escaped.Append("\\n");
+                    break;
+                case '\r':
+                    escaped.Append("\\r");
+                    break;
+                case '\t':
+                    escaped.Append("\\t");
+                    break;
+                default:
+                    if (char.IsControl(character))
+                        escaped.Append("\\u").Append(((int)character).ToString("X4", CultureInfo.InvariantCulture));
+                    else
+                        escaped.Append(character);
+                    break;
+            }
+        }
+
+        return $"\"{escaped}\"";
+    }
+
+    private ExecutionResult ExecuteExplainQueryPlanText(
         ExplainQueryPlanStatement statement,
         SqlValue[] parameters,
         QueryContext context)
@@ -32971,13 +33104,20 @@ out bool hasReturning)
         var expression = orderBy.Expression;
         if (orderBy.Ordinal is { } ordinal)
         {
-            if (ordinal >= 1 && ordinal <= columns.Count)
-                return (int)ordinal - 1;
+            // Only an integer that fits a 32-bit int is a column reference, mirroring
+            // resolve_compound_order_by_expr (select.rs): an i32-fitting literal below 1 or
+            // past the column count errors, while a literal beyond i32 falls through to
+            // constant-expression handling below.
+            if (ordinal is >= int.MinValue and <= int.MaxValue)
+            {
+                if (ordinal >= 1 && ordinal <= columns.Count)
+                    return (int)ordinal - 1;
 
-            // Turso reports the literal's own value as the prefix for compound range
-            // errors (resolve_compound_order_by_expr in select.rs).
-            throw new EmbeddedSqlException(
-                $"{ordinal} ORDER BY term out of range - should be between 1 and {columns.Count}");
+                // Turso reports the literal's own value as the prefix for compound range
+                // errors (resolve_compound_order_by_expr in select.rs).
+                throw new EmbeddedSqlException(
+                    $"{ordinal} ORDER BY term out of range - should be between 1 and {columns.Count}");
+            }
         }
 
         var reference = UnwrapCollation(expression);
@@ -41953,6 +42093,26 @@ out bool hasReturning)
         return foundNull ? SqlValue.Null : SqlValue.Integer(1);
     }
 
+    /// <summary>
+    /// Expands <c>json_object(*)</c>'s star into alternating column-name/column-value
+    /// arguments drawn from the current FROM row, mirroring the Turso extension pinned by
+    /// turso-sqltests/json_object_star.sqltest.
+    /// </summary>
+    private static SqlValue[] ExpandJsonObjectStarArguments(SourceRow? row)
+    {
+        if (row is null || row.Columns.Length == 0)
+            throw new EmbeddedSqlException("json_object(*) requires a FROM clause");
+
+        var expanded = new SqlValue[row.Columns.Length * 2];
+        for (var index = 0; index < row.Columns.Length; index++)
+        {
+            expanded[index * 2] = SqlValue.Text(row.Columns[index]);
+            expanded[(index * 2) + 1] = row.Values[index];
+        }
+
+        return expanded;
+    }
+
     private SqlValue EvaluateScalarFunction(
         FunctionExpression function,
         SqlValue[] parameters,
@@ -41977,6 +42137,19 @@ out bool hasReturning)
             ValidateLikelihood(function);
         if (!builtinIsShadowed && normalizedName == "MATCH")
             return EvaluateFtsMatchOperator(function, parameters, row, context);
+
+        // json_object(*) (and jsonb_object(*)) expands to one label/value pair per visible
+        // column of the current FROM row, matching the Turso extension pinned by
+        // turso-sqltests/json_object_star.sqltest. A bare star without a FROM row errors.
+        if (function.CountStar
+            && normalizedName is "JSON_OBJECT" or "JSONB_OBJECT"
+            && !builtinIsShadowed)
+        {
+            var expanded = ExpandJsonObjectStarArguments(row);
+            return normalizedName == "JSON_OBJECT"
+                ? SqliteJson.JsonObject(expanded)
+                : SqliteJson.JsonbObject(expanded);
+        }
 
         var arguments = function.Arguments.Select(argument => Evaluate(argument, parameters, row, context)).ToArray();
         if (!context.IndexExpression
@@ -42036,6 +42209,8 @@ out bool hasReturning)
             "CHAR" or "CHR" => EvaluateChar(arguments),
             "UNICODE" => EvaluateUnicode(arguments),
             "UNHEX" => EvaluateUnhex(arguments),
+            "GET_BYTE" => EvaluateGetByte(arguments),
+            "SET_BYTE" => EvaluateSetByte(arguments),
             "ZEROBLOB" => EvaluateZeroBlob(arguments),
             "RANDOMBLOB" => EvaluateRandomBlob(arguments),
             "RANDOM" => EvaluateRandom(arguments),
@@ -42395,9 +42570,11 @@ out bool hasReturning)
     }
 
     // Keep this bounded independently of SQLite's process-wide SQLITE_LIMIT_LENGTH. The managed
-    // evaluator must not let a SQL format string allocate an unbounded managed string.
+    // evaluator must not let a SQL format string allocate an unbounded managed string. The
+    // precision cap matches upstream printf.rs (MAX_WIDTH), which the overflow-payload corpus
+    // fixtures rely on (printf('%.*c', 5000, 'y')).
     private const int MaximumPrintfWidth = 1_000_000;
-    private const int MaximumPrintfPrecision = 1_000;
+    private const int MaximumPrintfPrecision = 1_000_000;
     private const int MaximumPrintfOutputLength = 1_000_000;
 
     // SQLite format() is an alias for printf(). Keep the parser independent of the platform
@@ -47061,20 +47238,25 @@ out bool hasReturning)
             // returns before the alias fallback below, so a resolved expression is never
             // re-matched against result aliases (SELECT x AS y, y AS x FROM t ORDER BY 1
             // sorts by x, not by the alias sharing a later output column's name).
-            if (value is >= 1 and <= int.MaxValue && value <= projections.Count)
-                return projections[(int)value - 1].Expression;
-
-            // A star projection expands to more result columns than projections.Count
-            // reflects; the expanded range is validated where the star is expanded
-            // (ResolveOrderByBindings). Pass the literal through so star queries keep their
-            // pre-rewrite behavior instead of erroring on the unexpanded count.
-            if (!projections.Any(projection =>
-                    projection.Expression is StarExpression or QualifiedStarExpression))
+            // Only an integer that fits a 32-bit int is a column reference, mirroring
+            // SQLite's sqlite3ExprIsInteger (select.rs); a literal beyond i32 is a constant.
+            if (value is >= int.MinValue and <= int.MaxValue)
             {
-                // Turso hard-codes the "1st" prefix for simple-select range errors
-                // regardless of which term carries the ordinal (select.rs:1124).
-                throw new EmbeddedSqlException(
-                    $"1st ORDER BY term out of range - should be between 1 and {projections.Count}");
+                if (value >= 1 && value <= projections.Count)
+                    return projections[(int)value - 1].Expression;
+
+                // A star projection expands to more result columns than projections.Count
+                // reflects; the expanded range is validated where the star is expanded
+                // (ResolveOrderByBindings). Pass the literal through so star queries keep their
+                // pre-rewrite behavior instead of erroring on the unexpanded count.
+                if (!projections.Any(projection =>
+                        projection.Expression is StarExpression or QualifiedStarExpression))
+                {
+                    // Turso hard-codes the "1st" prefix for simple-select range errors
+                    // regardless of which term carries the ordinal (select.rs:1124).
+                    throw new EmbeddedSqlException(
+                        $"1st ORDER BY term out of range - should be between 1 and {projections.Count}");
+                }
             }
         }
 
@@ -51064,6 +51246,13 @@ public sealed partial class EmbeddedConnection : IDisposable
     /// </summary>
     private readonly ManagedSequenceSession _sequenceSession = new();
     private bool _queryOnly;
+
+    /// <summary>
+    /// <c>PRAGMA count_changes</c>: when enabled, each INSERT/UPDATE/DELETE returns one row
+    /// carrying the number of changed rows (SQLite's deprecated count_changes behavior,
+    /// pinned by pragma-count-changes.sqltest).
+    /// </summary>
+    private bool _countChanges;
     private bool _foreignKeys;
     private bool _deferForeignKeys;
     private bool _recursiveTriggers;
@@ -53027,6 +53216,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 return ExecutePragmaFreelistCount(freelistCount);
             case PragmaQueryOnlyStatement queryOnly:
                 return ExecutePragmaQueryOnly(queryOnly);
+            case PragmaCountChangesStatement countChanges:
+                return ExecutePragmaCountChanges(countChanges);
             case PragmaForeignKeysStatement foreignKeys:
                 return ExecutePragmaForeignKeys(foreignKeys);
             case PragmaDeferForeignKeysStatement deferForeignKeys:
@@ -53340,6 +53531,12 @@ public sealed partial class EmbeddedConnection : IDisposable
                         concurrentTxId,
                         mvccStatementSavepoint);
                     tempTriggerSession?.Commit();
+
+                    // PRAGMA count_changes: each INSERT/UPDATE/DELETE returns one row with
+                    // the number of rows it changed (SQLite's deprecated count_changes).
+                    if (_countChanges && result.Changed && statement is InsertStatement or UpdateStatement or DeleteStatement)
+                        return new ExecutionResult(["changes"], [[SqlValue.Integer(result.RowsAffected)]], 0, result.Changed);
+
                     return result;
                 }
                 catch (EmbeddedConflictRollbackException exception)
@@ -54098,7 +54295,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                             rewritten => new ExplainStatement(rewritten)),
             ExplainQueryPlanStatement explainQueryPlan => RouteExplain(
                 explainQueryPlan.Inner,
-                rewritten => new ExplainQueryPlanStatement(rewritten)),
+                rewritten => new ExplainQueryPlanStatement(
+                    rewritten,
+                    explainQueryPlan.Format,
+                    explainQueryPlan.InnerSql)),
             _ when ContainsSchemaQualification(statement)
                 => throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH."),
             _ => new RoutedStatement(_database, statement, IsAttached: false),
@@ -54159,6 +54359,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                 statement with { Target = "main" },
                 IsAttached: true);
         }
+
+        // `ANALYZE sqlite_schema` re-analyzes the main schema (the schema-table name is
+        // not an ordinary table target).
+        if (EmbeddedDatabase.IsSchemaTable(statement.Target))
+            return new RoutedStatement(_database, statement with { Target = null }, IsAttached: false);
 
         return new RoutedStatement(_database, statement, IsAttached: false);
     }
@@ -54452,10 +54657,43 @@ Func<string, ParsedStatement> rewrite)
         Func<string, ParsedStatement> rewrite)
     {
         if (ManagedSchemaName.TrySplit(objectName, out var schema, out var localName))
+        {
+            // SQLite reports a missing qualified object at resolve time with the
+            // qualifier kept, so validate before the routing rewrite strips it.
+            if (kind == ManagedSchemaObjectKind.Table
+                && !SchemaExists(schema, localName))
+                throw NoSuchTableError(objectName);
             return RouteSchema(schema, localName, rewrite);
+        }
 
         schema = ResolveExistingObjectSchema(objectName, kind);
         return RouteSchema(schema, objectName, rewrite);
+    }
+
+    private bool SchemaExists(string schema, string localName)
+    {
+        // The schema-table pseudo-tables (sqlite_schema/sqlite_master/sqlite_temp_schema)
+        // resolve through their own read paths, not the ordinary catalog.
+        if (EmbeddedDatabase.IsSchemaTable(localName)
+            || string.Equals(localName, "sqlite_temp_schema", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(localName, "sqlite_temp_master", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+            return DatabaseContains(_tempDatabase, localName);
+        if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
+            return DatabaseContains(_database, localName);
+        return _attachedDatabases.TryGetValue(schema, out var attachment)
+               && DatabaseContains(attachment.Database, localName);
+
+        bool DatabaseContains(EmbeddedDatabase database, string name)
+            => GetTransactionState(database) is { } state
+                ? state.Catalog.Tables.ContainsKey(name)
+                    || state.Catalog.Views.ContainsKey(name)
+                    || state.Catalog.VirtualTables.ContainsKey(name)
+                    || database.ContainsSchemaObject(name, ManagedSchemaObjectKind.Table)
+                : database.ContainsSchemaObject(name, ManagedSchemaObjectKind.Table)
+                    || database.ContainsTableOrView(name);
     }
 
     private RoutedStatement RoutePragmaTableMetadataStatement(
@@ -54540,6 +54778,10 @@ Func<string, ParsedStatement> rewrite)
                 ManagedSchemaObjectKind.Table)
                 ? "temp"
                 : "main";
+            // An index always lives in its table's database, so SQLite reports a missing
+            // target with that database qualifier even when the user wrote it bare.
+            if (!SchemaExists(schema, statement.TableName))
+                throw NoSuchTableError(ManagedSchemaName.Create(schema, statement.TableName));
             return RouteSchema(schema, statement.TableName, localTableName => statement with
             {
                 TableName = localTableName,
@@ -54549,6 +54791,12 @@ Func<string, ParsedStatement> rewrite)
         {
             if (hasTableSchema && !string.Equals(indexSchema, tableSchema, StringComparison.OrdinalIgnoreCase))
                 throw new EmbeddedSqlException("CREATE INDEX cannot span managed database schemas.");
+
+            // The index lives in the index name's database, so a missing target reports
+            // that database's qualifier even when the table name was written bare.
+            var unqualifiedTableName = hasTableSchema ? tableName : statement.TableName;
+            if (!SchemaExists(indexSchema, unqualifiedTableName))
+                throw NoSuchTableError(ManagedSchemaName.Create(indexSchema, unqualifiedTableName));
 
             return RouteSchema(
                 indexSchema,
@@ -54565,6 +54813,9 @@ Func<string, ParsedStatement> rewrite)
             throw new EmbeddedSqlException(
                 "CREATE INDEX on an attached table must qualify the index name with the attached schema.");
         }
+
+        if (!SchemaExists(tableSchema, tableName))
+            throw NoSuchTableError(ManagedSchemaName.Create(tableSchema, tableName));
 
         return RouteSchema(
             tableSchema,
@@ -54621,6 +54872,17 @@ Func<string, ParsedStatement> rewrite)
         {
             throw new EmbeddedSqlException(
                 "Managed persistent trigger bodies cannot reference another database schema.");
+        }
+
+        // SQLite reports a missing trigger target with the trigger's database qualifier when
+        // the trigger is persistent (its target lives in the same database), and with the
+        // plain user-written name when the trigger is temporary (its target is searched in
+        // every database).
+        if (!SchemaExists(resolvedTargetSchema, localTargetName))
+        {
+            throw temporary
+                ? NoSuchTableError(localTargetName)
+                : NoSuchTableError(ManagedSchemaName.Create(homeSchema, localTargetName));
         }
 
         return RouteSchema(
@@ -54980,6 +55242,7 @@ Func<string, ParsedStatement> rewrite)
         }
 
         var schema = resolvedSchemas.Single();
+        ValidateQualifiedDmlTargetsExist(statement, schema);
         var rewritten = RewriteStatementSchema(statement, schema);
         if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
             return new RoutedStatement(_database, rewritten, IsAttached: false);
@@ -54989,6 +55252,94 @@ Func<string, ParsedStatement> rewrite)
             throw new EmbeddedSqlException($"no such database: {schema}");
 
         return new RoutedStatement(attachment.Database, rewritten, IsAttached: true);
+    }
+
+    /// <summary>
+    /// Validates that every schema-qualified DML target or read source exists before the
+    /// routing rewrite strips its qualifier, so a missing table reports the name the user
+    /// wrote with the qualifier kept (<c>no such table: main.nosuch</c>), exactly like SQLite.
+    /// </summary>
+    private void ValidateQualifiedDmlTargetsExist(ParsedStatement statement, string schema)
+    {
+        switch (statement)
+        {
+            case InsertStatement insert:
+                ValidateQualifiedTarget(insert.TableName);
+                ValidateQualifiedSources(insert.Source, schema);
+                break;
+            case UpdateStatement update:
+                ValidateQualifiedTarget(update.TableName);
+                ValidateQualifiedSource(update.From, schema);
+                break;
+            case DeleteStatement delete:
+                ValidateQualifiedTarget(delete.TableName);
+                break;
+            case QueryStatement query:
+                ValidateQualifiedSources(query, schema);
+                break;
+            case WithDmlStatement with:
+                ValidateQualifiedDmlTargetsExist(with.Dml, schema);
+                break;
+        }
+
+        return;
+
+        void ValidateQualifiedTarget(string tableName)
+        {
+            if (!ManagedSchemaName.TrySplit(tableName, out var targetSchema, out var targetName))
+                return;
+            if (targetSchema.Equals(schema, StringComparison.OrdinalIgnoreCase)
+                && !SchemaExists(targetSchema, targetName))
+                throw NoSuchTableError(tableName);
+        }
+    }
+
+    private void ValidateQualifiedSources(QueryStatement? query, string schema)
+    {
+        if (query is null)
+            return;
+        if (query is SelectStatement select)
+        {
+            ValidateQualifiedSource(select.Source, schema);
+            return;
+        }
+
+        // Compound arms carry their own sources.
+        if (query is CompoundSelectStatement compound)
+        {
+            foreach (var arm in compound.Terms)
+                ValidateQualifiedSources(arm, schema);
+        }
+    }
+
+    private void ValidateQualifiedSource(TableSource? source, string schema)
+    {
+        // Only the main and temp schemas are pre-validated here: an attached or unknown
+        // schema qualifier keeps its existing error paths (e.g. "no such database: aux"),
+        // which fire when the statement routes.
+        if (!schema.Equals("main", StringComparison.OrdinalIgnoreCase)
+            && !schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        switch (source)
+        {
+            case NamedTableSource named when named.IsSchemaQualified
+                && ManagedSchemaName.TrySplit(named.Name, out var qualifiedSchema, out var qualifiedName):
+                if (qualifiedSchema.Equals(schema, StringComparison.OrdinalIgnoreCase)
+                    && !EmbeddedDatabase.IsSchemaTable(qualifiedName)
+                    && !SchemaExists(qualifiedSchema, qualifiedName))
+                    throw NoSuchTableError(named.Name);
+                break;
+            case JoinTableSource join:
+                ValidateQualifiedSource(join.Left, schema);
+                ValidateQualifiedSource(join.Right, schema);
+                break;
+            case DerivedTableSource derived:
+                ValidateQualifiedSources(derived.Query, schema);
+                break;
+        }
     }
 
     // Temp is connection-private, so a read-only catalog can safely combine its current snapshot with main.
@@ -56095,6 +56446,15 @@ Func<string, ParsedStatement> rewrite)
         return new RoutedStatement(attachment.Database, rewrite(localName), IsAttached: true);
     }
 
+    /// <summary>
+    /// Reports a missing table using the name the user wrote, with quotes stripped but any
+    /// database qualifier kept: <c>SELECT * FROM main."t1"</c> fails with
+    /// <c>no such table: main.t1</c>, exactly like SQLite (mirrors the qualified-name
+    /// reporting the upstream corpus pins in no-such-table-error-message.sqltest).
+    /// </summary>
+    private static EmbeddedSqlException NoSuchTableError(string userWrittenName)
+        => new($"no such table: {ManagedSchemaName.Display(userWrittenName)}");
+
     private EmbeddedDatabase ResolveBlobDatabase(string databaseName)
     {
         if (databaseName.Equals("temp", StringComparison.OrdinalIgnoreCase))
@@ -57189,6 +57549,18 @@ Func<string, ParsedStatement> rewrite)
         return new ExecutionResult(["query_only"], [[SqlValue.Integer(_queryOnly ? 1 : 0)]], 0);
     }
 
+    private ExecutionResult ExecutePragmaCountChanges(PragmaCountChangesStatement statement)
+    {
+        ValidatePragmaSchema(statement.Schema);
+        if (statement.Enabled is { } enabled)
+        {
+            _countChanges = enabled;
+            return ExecutionResult.Empty;
+        }
+
+        return new ExecutionResult(["count_changes"], [[SqlValue.Integer(_countChanges ? 1 : 0)]], 0);
+    }
+
     private ExecutionResult ExecutePragmaForeignKeys(PragmaForeignKeysStatement statement)
     {
         ValidatePragmaSchema(statement.Schema);
@@ -57943,6 +58315,8 @@ Func<string, ParsedStatement> rewrite)
             return ["freelist_count"];
         if (statement is PragmaQueryOnlyStatement { Enabled: null })
             return ["query_only"];
+        if (statement is PragmaCountChangesStatement { Enabled: null })
+            return ["count_changes"];
         if (statement is PragmaForeignKeysStatement { Enabled: null })
             return ["foreign_keys"];
         if (statement is PragmaDeferForeignKeysStatement { Enabled: null })

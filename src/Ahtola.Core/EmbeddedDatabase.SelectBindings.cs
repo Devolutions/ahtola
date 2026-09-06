@@ -98,6 +98,13 @@ public sealed partial class EmbeddedDatabase
             if (!TryGetOrdinalLiteral(inner, out _))
                 continue;
 
+            // Only an integer that fits a 32-bit int is a column reference, mirroring
+            // SQLite's sqlite3ExprIsInteger (select.rs). A literal that fits i32 but
+            // is out of the result range errors; a literal beyond i32 (e.g.
+            // 6641019685895816357) is a constant expression.
+            if (ordinal is < int.MinValue or > int.MaxValue)
+                continue;
+
             if (ordinal < 1 || ordinal > resultColumns.Count)
             {
                 // Turso hard-codes the "1st" prefix for simple-select range errors
@@ -235,17 +242,23 @@ public sealed partial class EmbeddedDatabase
 
             if (TryGetOrdinalLiteral(ordinalExpression, out var ordinal))
             {
-                if (ordinal < 1 || ordinal > resultColumns.Count)
+                // Only an integer that fits a 32-bit int is a column reference, mirroring
+                // SQLite's sqlite3ExprIsInteger; a literal beyond i32 is a constant, while
+                // an i32-fitting literal below 1 or past the result count errors.
+                if (ordinal is >= int.MinValue and <= int.MaxValue)
                 {
-                    throw new EmbeddedSqlException(
-                        $"{OrdinalSuffix(index)} GROUP BY term out of range - should be between 1 and {resultColumns.Count}");
-                }
+                    if (ordinal < 1 || ordinal > resultColumns.Count)
+                    {
+                        throw new EmbeddedSqlException(
+                            $"{OrdinalSuffix(index)} GROUP BY term out of range - should be between 1 and {resultColumns.Count}");
+                    }
 
-                resolved = resultColumns[(int)ordinal - 1].Expression;
-                if (collationWrappers is not null)
-                {
-                    for (var wrapperIndex = collationWrappers.Count - 1; wrapperIndex >= 0; wrapperIndex--)
-                        resolved = collationWrappers[wrapperIndex] with { Expression = resolved };
+                    resolved = resultColumns[(int)ordinal - 1].Expression;
+                    if (collationWrappers is not null)
+                    {
+                        for (var wrapperIndex = collationWrappers.Count - 1; wrapperIndex >= 0; wrapperIndex--)
+                            resolved = collationWrappers[wrapperIndex] with { Expression = resolved };
+                    }
                 }
             }
             else if (collationWrappers is null
