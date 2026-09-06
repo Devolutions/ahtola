@@ -204,7 +204,8 @@ internal sealed record InsertStatement(
     QueryStatement? Source = null,
     IReadOnlyList<Projection>? Returning = null,
     UpsertClause? Upsert = null,
-    InsertConflictAlgorithm? ConflictAlgorithm = null) : ParsedStatement;
+    InsertConflictAlgorithm? ConflictAlgorithm = null,
+    string? TargetAlias = null) : ParsedStatement;
 
 internal enum InsertConflictAlgorithm
 {

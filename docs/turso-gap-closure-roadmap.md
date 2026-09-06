@@ -571,3 +571,18 @@ and keep the shipped closure pure managed, trim-safe, and NativeAOT-safe.
     The ALTER TABLE ADD COLUMN backfill still promotes the negation to the
     REAL 2^63 (upstream eval_constant_default_value), while INSERT
     code-generation and direct SELECT hit the error (upstream issue #4621).
+
+- 2026-09-06 (continued): **partial-index covering wave** (5 vendored cases
+  closed, 141 expected-failures remain):
+  - A partial index covers a query whose WHERE contains the partial predicate
+    verbatim: the implied term is dropped from the key-only check (SQLite's
+    whereLoopAddBtree pPartIdxWhere handling), so `EXPLAIN QUERY PLAN` reports
+    USING COVERING INDEX for both SEARCH and SCAN shapes.
+  - A reference to the table's rowid-alias column under its declared name (e.g.
+    `id` for `id INTEGER PRIMARY KEY`) is always satisfiable from an index
+    entry, closing the plain covering gap that also affected non-partial
+    indexes.
+  - `INSERT INTO t AS z ...` parses SQLite's target alias (used to qualify
+    UPSERT DO UPDATE references); the plain statement accepts and ignores it.
+  - Two EQP tests that pinned the pre-fix non-covering wording were updated to
+    the SQLite-verified COVERING plans.

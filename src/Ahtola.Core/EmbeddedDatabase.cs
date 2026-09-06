@@ -29408,12 +29408,31 @@ out bool hasReturning)
                 return false;
         }
 
-        if (select.Where is not null
-            && !ExpressionCoveredByIndex(select.Where, table, covered))
+        if (select.Where is not null)
         {
-            return false;
-        }
+            // A partial index's WHERE clause implies the query's matching WHERE
+            // term, so that term never reads the table row: SQLite drops the
+            // implied term from the key-only check (whereLoopAddBtree's
+            // pPartIdxWhere handling). Only the implied term's columns count as
+            // covered here — a projection still needs the real column.
+            var whereCovered = covered;
+            if (index.Where is { } partialWhere)
+            {
+                foreach (var (term, _) in SplitConjunction(select.Where))
+                {
+                    if (!ExpressionsAreEquivalent(term, partialWhere))
+                        continue;
 
+                    whereCovered = new HashSet<int>(covered);
+                    foreach (var column in CollectColumnIndexes(term, table))
+                        whereCovered.Add(column);
+                    break;
+                }
+            }
+
+            if (!ExpressionCoveredByIndex(select.Where, table, whereCovered))
+                return false;
+        }
         foreach (var term in select.OrderBy)
         {
             if (!ExpressionCoveredByIndex(term.Expression, table, covered))
@@ -29421,6 +29440,54 @@ out bool hasReturning)
         }
 
         return true;
+    }
+
+    /// <summary>Splits an expression's top-level AND conjunction into its terms.</summary>
+    private static IEnumerable<(Expression Term, int Index)> SplitConjunction(Expression expression)
+    {
+        var index = 0;
+        var stack = new Stack<Expression>();
+        stack.Push(expression);
+        while (stack.Count > 0)
+        {
+            var current = stack.Pop();
+            if (current is BinaryExpression { Operator: BinaryOperator.And } and)
+            {
+                stack.Push(and.Right);
+                stack.Push(and.Left);
+                continue;
+            }
+
+            yield return (current, index++);
+        }
+    }
+
+    /// <summary>Collects the table column indexes a WHERE-term references.</summary>
+    private static IEnumerable<int> CollectColumnIndexes(Expression expression, EmbeddedTable table)
+    {
+        switch (expression)
+        {
+            case ColumnExpression column:
+                var bare = column.UnqualifiedName ?? column.Name;
+                var name = bare.IndexOf('.') >= 0 ? bare[(bare.IndexOf('.') + 1)..] : bare;
+                if (table.TryGetColumnIndex(name, out var columnIndex))
+                    yield return columnIndex;
+                break;
+            case BinaryExpression binary:
+                foreach (var index in CollectColumnIndexes(binary.Left, table))
+                    yield return index;
+                foreach (var index in CollectColumnIndexes(binary.Right, table))
+                    yield return index;
+                break;
+            case UnaryExpression unary:
+                foreach (var index in CollectColumnIndexes(unary.Operand, table))
+                    yield return index;
+                break;
+            case CollationExpression collation:
+                foreach (var index in CollectColumnIndexes(collation.Expression, table))
+                    yield return index;
+                break;
+        }
     }
 
     private static bool ProjectionCoveredByIndex(
@@ -29486,7 +29553,14 @@ out bool hasReturning)
             return true;
 
         if (table.TryGetColumnIndex(bare, out var index))
+        {
+            // An index entry carries the rowid, and the rowid-alias column is the
+            // rowid under its declared name, so a reference to that column is
+            // always satisfiable from the index.
+            if (table.HasRowid && index == table.RowidAliasColumnIndex)
+                return true;
             return covered.Contains(index);
+        }
 
         // Qualified name: strip qualifier.
         var separator = bare.IndexOf('.');
@@ -29496,7 +29570,11 @@ out bool hasReturning)
             if (table.HasRowid && EmbeddedTable.IsRowidAliasName(name))
                 return true;
             if (table.TryGetColumnIndex(name, out index))
+            {
+                if (table.HasRowid && index == table.RowidAliasColumnIndex)
+                    return true;
                 return covered.Contains(index);
+            }
         }
 
         return false;

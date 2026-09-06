@@ -1949,6 +1949,10 @@ internal sealed class SqlParser
         ExpectKeyword("INTO");
         var tableName = ParseSchemaQualifiedName(out var insertTableToken);
         RejectQualifiedTriggerDmlTarget(tableName);
+        // SQLite's insert-stmt grammar allows an AS alias on the target so an
+        // UPSERT DO UPDATE body can qualify its references (INSERT INTO v AS z ...
+        // ON CONFLICT DO UPDATE SET d = z.d); the plain statement ignores it.
+        var targetAlias = ParseDmlTargetAlias();
         string[]? columns = null;
         IReadOnlyList<SqlToken>? columnTokens = null;
         if (Consume(TokenKind.LeftParen))
@@ -2001,7 +2005,8 @@ internal sealed class SqlParser
             source,
             ParseReturning(),
             upsert,
-            conflictAlgorithm);
+            conflictAlgorithm,
+            targetAlias);
         _spans?.RecordName(insert, insertTableToken);
         if (_spans is not null && columnTokens is not null)
             _spans.RecordList(insert, columnTokens);
