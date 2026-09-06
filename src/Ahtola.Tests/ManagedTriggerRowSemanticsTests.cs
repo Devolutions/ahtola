@@ -226,10 +226,12 @@ public sealed class ManagedTriggerRowSemanticsTests
         foreach (var sql in setup)
             Execute(managed, sql);
 
+        // SQLite's RETURNING sees the row after the write but before the AFTER
+        // trigger fires (returning.sqltest update-returning-after-trigger cases).
         ReadRows(managed, "UPDATE data SET value = 20 WHERE id = 1 RETURNING id, value")
             .Should()
             .ContainSingle()
-            .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(120));
+            .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(20));
         ReadRows(managed, "SELECT id, value FROM data")
             .Should()
             .ContainSingle()

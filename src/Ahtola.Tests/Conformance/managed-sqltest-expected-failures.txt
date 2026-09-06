@@ -37,9 +37,7 @@ alter-add-column-default-negate-overflow.sqltest::alter-add-column-default-negat
 alter-add-column-default-negate-overflow.sqltest::select-negate-min-int-hex-literal | database variant 1/1 (:memory:): expected an error but the statement succeeded
 compound-select-orderby.sqltest::union-all-order-by-function-expression | database variant 1/1 (:memory:): expected success but got error: 1st ORDER BY term does not match any column in the result set
 compound-select-orderby.sqltest::union-all-order-by-qualified-with-alias | database variant 1/1 (:memory:): expected success but got error: 1st ORDER BY term does not match any column in the result set
-cte.sqltest::cte-referenced-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'cte1' is not supported: no module registration, planner, or execution contract is available. At SQL offset 46.' does not match patt
 cte.sqltest::table-referenced-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'not_a_function' is not supported: no module registration, planner, or execution contract is available. At SQL offset 28.' does not 
-delete-trigger-resets-conflict-policy.sqltest::delete-trigger-does-not-inherit-outer-or-replace | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-where-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
@@ -48,9 +46,6 @@ delete-update-limit-rejected.sqltest::update-limit-rejected | database variant 1
 delete-update-limit-rejected.sqltest::update-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::update-where-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::update-order-by-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
-exists-drops-order-by-distinct.sqltest::exists-order-by-term-is-not-evaluated | database variant 1/1 (:memory:): expected success but got error: integer overflow
-exists-drops-order-by-distinct.sqltest::exists-order-by-term-not-evaluated-with-limit | database variant 1/1 (:memory:): expected success but got error: integer overflow
-exists-drops-order-by-distinct.sqltest::exists-distinct-offset-counts-plain-rows | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
 from-subquery-affinity.sqltest::derived-table-compound-select-real-blob-leading-arm-not-skipped | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '' but was '3'
 gencol.sqltest::gencol_stored_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 gencol.sqltest::gencol_stored_generated_always_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
@@ -142,19 +137,8 @@ recursive-cte.sqltest::recursive-cte-used-nested-cte-self-ref-rejected | databas
 recursive-cte.sqltest::recursive-cte-visited-set-via-nested-cte-rejected | database variant 1/1 (:memory:): error 'circular reference: reach' does not match pattern 'multiple recursive references: reach'
 recursive-cte.sqltest::recursive-cte-window-clause-self-ref-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 recursive-cte.sqltest::recursive-cte-self-ref-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'cte1' is not supported: no module registration, planner, or execution contract is available. At SQL offset 129.' does not match pat
-returning.sqltest::update-returning-after-trigger-same-row-direct | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected '20' but was '120'
-returning.sqltest::update-returning-after-trigger-same-row-subquery | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected '20/20' but was '120/120'
-temp-trigger-fires-before-main.sqltest::temp-triggers-fire-first-in-creation-order | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 0 expected '1/temp1' but was '1/temp2'
 temp-view.sqltest::create-temp-view-lives-in-temp-schema-not-main | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
 temp-view.sqltest::create-temporary-view-lives-in-temp-schema-not-main | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
-timediff-negative-month-roundtrip.sqltest::timediff-negative-month-overflow | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-0000-01-02 00:00:00.000' but was '-0000-01-00 00:00:00.000'
-timediff-negative-month-roundtrip.sqltest::timediff-negative-month-overflow-roundtrip | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '2000-01-31 00:00:00' but was '2000-02-02 00:00:00'
-timediff-negative-month-roundtrip.sqltest::timediff-negative-month-overflow-across-years | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-0001-01-02 00:00:00.000' but was '-0001-01-00 00:00:00.000'
-timediff-negative-month-roundtrip.sqltest::timediff-negative-month-overflow-across-years-roundtrip | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1999-01-31 00:00:00' but was '1999-02-02 00:00:00'
-timediff-negative-month-roundtrip.sqltest::timediff-negative-short-february | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-0000-01-30 00:00:00.000' but was '-0000-01-28 00:00:00.000'
-timediff-negative-month-roundtrip.sqltest::timediff-negative-short-february-roundtrip | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '2000-01-02 00:00:00' but was '2000-01-04 00:00:00'
-timediff-negative-month-roundtrip.sqltest::timediff-negative-two-months-back | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-0000-02-01 00:00:00.000' but was '-0000-02--01 00:00:00.000'
-timediff-negative-month-roundtrip.sqltest::timediff-negative-two-months-back-roundtrip | database variant 1/1 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1999-12-31 00:00:00' but was ''
 views.sqltest::drop-view-finds-temp-view-with-unqualified-name | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
 window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][none] | database variant 1/1 (:memory:): managed and SQLite rows differ
 window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-no-others] | database variant 1/1 (:memory:): managed and SQLite rows differ
@@ -179,7 +163,6 @@ window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][1e308][desc] | data
 window/frame_sum_overflow.sqltest::window-sum-inverse-transient-overflow-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
 window/frame_sum_overflow.sqltest::window-frame-membership-at-integer-extremes | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected '9223372036854775807/0//' but was '9223372036854775807/1/9223372036854775807/9223372036854775807'
 window/frame_sum_overflow.sqltest::window-sum-step-overflow-forgiven-by-float | database variant 1/1 (:memory:): expected success but got error: integer overflow
-window/memory.sqltest::named-window-chain-missing-base-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
 window/moving_concat_json.sqltest::moving-group-concat-empty-prefix | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 2 expected '3/'x'/'x'' but was '3/'/x'/'/x''
 window/moving_min_max.sqltest::moving-min-max-argument-collation | database variant 1/1 (:memory:): expected 6 row(s), got 6 row(s); row 2 expected '3/a/b' but was '3/A/b'
 window/rows_frame.sqltest::rows-mixed-int-float-approx-transition | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 2 expected '3/300.0' but was '3/300'

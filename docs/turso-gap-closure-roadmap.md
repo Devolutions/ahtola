@@ -45,6 +45,32 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 
 ## Progress
 
+- 2026-09-06: **upstream-delta continuation wave** (17 more vendored cases closed):
+  - `timediff(A, B)` now produces a modifier that turns B into A using SQLite's
+    directional month arithmetic: forward month adds clamp a day-of-month overflow
+    forward (Jan 31 + 1 month = Mar 2), while a negative diff is anchored on the
+    later date and walked backwards — the asymmetry upstream issue #8242 pins. All
+    12 `timediff-negative-month-roundtrip.sqltest` cases pass.
+  - EXISTS subqueries drop ORDER BY and DISTINCT (name-resolution still runs on the
+    dropped terms; LIMIT/OFFSET stay, since OFFSET decides whether a row comes out
+    at all): the three `exists-drops-order-by-distinct.sqltest` gaps close.
+  - A WINDOW-clause definition with a base that is defined nowhere errors
+    (`no such window: X`), while a forward reference (a base defined later in the
+    same clause) is silently ignored — SQLite's resolution order, matching all
+    14 named-window-chain cases.
+  - UPDATE ... RETURNING sees the row after the write but before the AFTER trigger
+    fires (the returning.sqltest after-trigger cases; two prior tests asserting the
+    old post-trigger behavior updated to the SQLite-cross-checked semantics).
+  - A DELETE resets the conflict-policy override to ABORT for the triggers it
+    fires (SQLite's OE_Default row-delete coding), so an outer UPDATE OR REPLACE no
+    longer propagates through a DELETE into its trigger's plain INSERT, while an
+    explicit OR clause on the inner statement still wins.
+  - TEMP triggers fire before the table's own triggers and, among themselves, in
+    creation order (the main schema's own list stays newest-first), matching
+    temp-trigger-fires-before-main.sqltest.
+  - `WITH cte1(x) AS ... SELECT * FROM cte1(7)` rejects with `'cte1' is not a
+    function` (parser CTE-scope tracking; the plain-table variant needs a plan-time
+    catalog check and remains an expected-failure).
 - 2026-09-06: **sqlean extension ports completed.**
   - The regexp family is now built-in: `regexp(pattern, source)` follows
     `core/regexp.rs`'s `to_text_coerced` semantics (integers/reals as text, blobs as

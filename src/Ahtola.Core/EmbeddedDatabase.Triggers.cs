@@ -276,7 +276,13 @@ public sealed partial class EmbeddedDatabase
                     || updatedColumns is not null
                     && trigger.UpdateOfColumns.Any(updatedColumns.Contains)))
             .OrderByDescending(trigger => trigger.Temporary)
-            .ThenByDescending(trigger => trigger.DeclarationOrder)
+            .ThenBy(trigger => trigger.Temporary
+                // SQLite prepends the temp schema's triggers (walked newest first)
+                // onto the main list, so temp triggers fire in creation order while
+                // the main schema's own list is prepended at CREATE TRIGGER time and
+                // fires newest first (temp-trigger-fires-before-main.sqltest).
+                ? trigger.DeclarationOrder
+                : int.MaxValue - trigger.DeclarationOrder)
             .ThenByDescending(trigger => trigger.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
@@ -366,9 +372,17 @@ public sealed partial class EmbeddedDatabase
         QueryContext context)
         => ExecuteRowTriggerStatement(
             context,
-            triggerContext => triggerContext.Views?.ContainsKey(statement.TableName) == true
-                ? PerformInsteadOfDelete(statement, parameters, triggerContext)
-                : PerformRowTriggeredDelete(statement, parameters, triggerContext));
+            triggerContext =>
+            {
+                // SQLite codes row-delete triggers with the default OE_Default
+                // policy (delete.c), so a DELETE never propagates an inherited OR
+                // REPLACE into the triggers it fires: the inner statements run with
+                // their own OR clauses only (delete-trigger-resets-conflict-policy).
+                triggerContext = triggerContext with { ConflictAlgorithmOverride = null };
+                return triggerContext.Views?.ContainsKey(statement.TableName) == true
+                    ? PerformInsteadOfDelete(statement, parameters, triggerContext)
+                    : PerformRowTriggeredDelete(statement, parameters, triggerContext);
+            });
 
     private ExecutionResult ExecuteRowTriggerStatement(
         QueryContext context,
@@ -950,22 +964,24 @@ public sealed partial class EmbeddedDatabase
             }
             rowsAffected++;
             context.TriggerState!.Changed = true;
+            // RETURNING sees the row after the write but before the AFTER trigger
+            // fires (returning.sqltest update-returning-after-trigger cases), so
+            // evaluate the projections before the trigger's own writes land.
+            if (statement.Returning is not null)
+            {
+                AppendReturningRow(
+                    statement.Returning,
+                    statement.TableName,
+                    table,
+                    updated,
+                    newRowId,
+                    parameters,
+                    context,
+                    returningRows,
+                    ref returningColumns);
+            }
+
             _ = FireRowTriggers(afterTriggers, frame, context);
-            position = FindTriggerRowPosition(table, identity);
-            var returningRow = position >= 0 ? table.Rows[position] : updated;
-            var returningRowId = position >= 0 && table.HasRowid
-                ? table.RowIds[position]
-                : newRowId;
-            AppendReturningRow(
-                statement.Returning,
-                statement.TableName,
-                table,
-                returningRow,
-                returningRowId,
-                parameters,
-                context,
-                returningRows,
-                ref returningColumns);
         }
 
         if (statement.Returning is not null && returningColumns is null)

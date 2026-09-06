@@ -14,6 +14,8 @@ internal sealed class SqlParser
     private int _maximumParameterIndex;
     private bool _inTriggerBody;
     private IReadOnlyList<SqlToken>? _pendingUpdateOfTokens;
+    /// <summary>CTE names in scope for the statement body being parsed (WITH clause).</summary>
+    private HashSet<string>? _activeCteNames;
 
     private SqlParser(string sql, SqlParameterMap parameterMap, SqlSourceSpans? spans = null)
     {
@@ -2335,27 +2337,52 @@ internal sealed class SqlParser
         var commonTableExpressions = ParseCommonTableExpressions();
         if (!IsQueryStart())
             throw Error("Expected a SELECT query after the common table expression.");
-        return new WithSelectStatement(commonTableExpressions, ParseQuery());
+
+        // CTE names stay in scope for the query body, so a call like cte1(7) can be
+        // rejected as "'cte1' is not a function" at parse time (upstream planner.rs).
+        var previous = _activeCteNames;
+        _activeCteNames = new HashSet<string>(
+            commonTableExpressions.Select(static expression => expression.Name),
+            StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            return new WithSelectStatement(commonTableExpressions, ParseQuery());
+        }
+        finally
+        {
+            _activeCteNames = previous;
+        }
     }
 
     private ParsedStatement ParseWithStatement()
     {
         var commonTableExpressions = ParseCommonTableExpressions();
-        if (ConsumeKeyword("INSERT"))
-            return new WithDmlStatement(commonTableExpressions, ParseInsert());
-        if (ConsumeKeyword("REPLACE"))
-            return new WithDmlStatement(
-                commonTableExpressions,
-                ParseInsert(InsertConflictAlgorithm.Replace));
-        if (ConsumeKeyword("UPDATE"))
-            return new WithDmlStatement(commonTableExpressions, ParseUpdate());
-        if (ConsumeKeyword("DELETE"))
-            return new WithDmlStatement(commonTableExpressions, ParseDelete());
-        if (IsQueryStart())
-            return new WithSelectStatement(commonTableExpressions, ParseQuery());
+        var previous = _activeCteNames;
+        _activeCteNames = new HashSet<string>(
+            commonTableExpressions.Select(static expression => expression.Name),
+            StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (ConsumeKeyword("INSERT"))
+                return new WithDmlStatement(commonTableExpressions, ParseInsert());
+            if (ConsumeKeyword("REPLACE"))
+                return new WithDmlStatement(
+                    commonTableExpressions,
+                    ParseInsert(InsertConflictAlgorithm.Replace));
+            if (ConsumeKeyword("UPDATE"))
+                return new WithDmlStatement(commonTableExpressions, ParseUpdate());
+            if (ConsumeKeyword("DELETE"))
+                return new WithDmlStatement(commonTableExpressions, ParseDelete());
+            if (IsQueryStart())
+                return new WithSelectStatement(commonTableExpressions, ParseQuery());
 
-        throw Error(
-            "Expected a SELECT, INSERT, REPLACE, UPDATE, or DELETE statement after the common table expression.");
+            throw Error(
+                "Expected a SELECT, INSERT, REPLACE, UPDATE, or DELETE statement after the common table expression.");
+        }
+        finally
+        {
+            _activeCteNames = previous;
+        }
     }
 
     private IReadOnlyList<CommonTableExpression> ParseCommonTableExpressions()
@@ -3101,6 +3128,10 @@ internal sealed class SqlParser
         {
             if (functionName.StartsWith("pragma_", StringComparison.OrdinalIgnoreCase))
                 throw Error($"no such table: {ManagedSchemaName.Display(name)}");
+            // A CTE referenced with call arguments is a known non-function (upstream
+            // planner.rs: "'cte1' is not a function").
+            if (_activeCteNames is not null && _activeCteNames.Contains(functionName))
+                throw Error($"'{functionName}' is not a function");
             throw Error(TableValuedFunctionRegistry.UnsupportedMessage(ManagedSchemaName.Display(name)));
         }
 

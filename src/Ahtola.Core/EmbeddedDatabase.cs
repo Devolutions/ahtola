@@ -14440,6 +14440,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var backup = CloneTablesShallow(context.Tables);
         var updatedRows = new List<SqlValue[]>();
         var updatedRowIds = new List<long>();
+        var returningSnapshots = new List<ReturningTableSnapshot>();
         try
         {
             foreach (var selectedRowId in selectedRowIds)
@@ -14505,6 +14506,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
                 updatedRows.Add(updated);
                 updatedRowIds.Add(newRowId);
+                if (statement.Returning is not null)
+                {
+                    // RETURNING sees the row after the write but before the AFTER
+                    // trigger fires (returning.sqltest update-returning-after-trigger
+                    // cases): snapshot the table state per row so subqueries and
+                    // later rows read the pre-trigger view.
+                    returningSnapshots.Add(new ReturningTableSnapshot(
+                        table.Rows.Select(static row => row.ToArray()).ToArray(),
+                        table.RowIds.ToArray()));
+                }
+
                 if (afterTriggers.Count > 0)
                     _ = FireTriggers(afterTriggers, context, frame);
             }
@@ -14548,7 +14560,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     updatedRows.Count,
                     updatedRows.Count > 0,
                     parameters,
-                    context);
+                    context,
+                    returningTableSnapshots: returningSnapshots);
             }
             catch
             {
@@ -38212,9 +38225,36 @@ out bool hasReturning)
         SourceRow? row,
         QueryContext context)
     {
-        var exists = ExecuteSubquery(expression.Query, parameters, row, context).Rows.Count > 0;
+        // EXISTS only checks whether a row comes out, so SQLite drops ORDER BY and
+        // DISTINCT from the subquery (select.c, "dropping superfluous ORDER BY").
+        // Dropped ORDER BY terms are still name-resolved during validation but never
+        // evaluated, so a term that would overflow at runtime must not fail the query
+        // (exists-drops-order-by-distinct.sqltest). LIMIT and OFFSET stay: OFFSET
+        // reduces visible rows (it decides whether a row comes out at all) and LIMIT 0
+        // means no rows.
+        var exists = ExecuteSubquery(
+            DropExistsSuperfluities(expression.Query),
+            parameters,
+            row,
+            context).Rows.Count > 0;
         return SqlValue.Integer(exists == expression.Negated ? 0 : 1);
     }
+
+    /// <summary>Removes ORDER BY and DISTINCT from an EXISTS subquery.</summary>
+    private static QueryStatement DropExistsSuperfluities(QueryStatement query)
+        => query switch
+        {
+            SelectStatement select => select with
+            {
+                Distinct = false,
+                OrderBy = [],
+            },
+            CompoundSelectStatement compound => compound with
+            {
+                OrderBy = [],
+            },
+            _ => query,
+        };
 
     private SqlValue EvaluateInSubquery(
         InSubqueryExpression expression,
@@ -44815,7 +44855,7 @@ out bool hasReturning)
 
         WindowSpecification ResolveSpecification(
             WindowSpecification specification,
-            bool ignoreUnknownBase = false)
+            string[]? forwardReferenceNames = null)
         {
             if (specification.BaseWindowName is null)
             {
@@ -44824,14 +44864,21 @@ out bool hasReturning)
 
             if (!resolved.TryGetValue(specification.BaseWindowName, out var baseSpecification))
             {
-                if (!ignoreUnknownBase || specification.IsNamedReference)
-                    throw new EmbeddedSqlException($"no such window: {specification.BaseWindowName}");
-
-                return RewriteWindowExpressions(specification with
+                // A base defined later in the WINDOW clause is a forward reference:
+                // SQLite skips it silently (empty base).
+                if (forwardReferenceNames is not null
+                    && forwardReferenceNames.Contains(
+                        specification.BaseWindowName,
+                        StringComparer.OrdinalIgnoreCase))
                 {
-                    BaseWindowName = null,
-                    IsNamedReference = false,
-                });
+                    return RewriteWindowExpressions(specification with
+                    {
+                        BaseWindowName = null,
+                        IsNamedReference = false,
+                    });
+                }
+
+                throw new EmbeddedSqlException($"no such window: {specification.BaseWindowName}");
             }
 
             if (specification.IsNamedReference)
@@ -44953,10 +45000,21 @@ out bool hasReturning)
         }
 
         // SQLite resolves bases against definitions already seen and lets the last duplicate
-        // name win. A forward base is therefore an empty base, while OVER name is resolved
-        // after the complete WINDOW clause.
-        foreach (var definition in statement.NamedWindows)
-            resolved[definition.Name] = ResolveSpecification(definition.Specification, ignoreUnknownBase: true);
+        // name win. A forward base is silently ignored (an empty base), while a base that
+        // is defined nowhere is an error; OVER name is resolved after the complete WINDOW
+        // clause (window/memory.sqltest named-window-chain cases).
+        var definitionNames = statement.NamedWindows
+            .Select(static definition => definition.Name)
+            .ToArray();
+        for (var index = 0; index < statement.NamedWindows.Count; index++)
+        {
+            var definition = statement.NamedWindows[index];
+            resolved[definition.Name] = ResolveSpecification(
+                definition.Specification,
+                // A base named by a LATER definition is a forward reference: SQLite
+                // skips it silently. A base named nowhere errors.
+                forwardReferenceNames: definitionNames[(index + 1)..]);
+        }
 
         return statement with
         {
@@ -55025,18 +55083,23 @@ Func<string, ParsedStatement> rewrite)
             throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH.");
         }
 
-        // A temp view is stored in the connection-private temp database, and the managed engine
-        // evaluates a view inside the database that owns it, so a body reaching another schema has
-        // to be rejected outright instead of failing later with a confusing "no such table".
+        // A temp view's body may reference only temp-schema objects: the managed
+        // engine evaluates a view inside the database that owns it, so a body
+        // touching main-schema tables cannot be evaluated from temp. Upstream
+        // SQLite stores the view in temp but resolves names at query time; this
+        // cross-schema evaluation is a documented divergence (see
+        // managed-sqltest-expected-failures.txt).
         if (statement.Temporary)
         {
             var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             CollectQuerySchemas(statement.Query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-            if (schemas.Select(ResolveCollectedSchema)
-                .Any(schema => !schema.Equals("temp", StringComparison.OrdinalIgnoreCase)))
+            foreach (var schema in schemas.Select(ResolveCollectedSchema))
             {
-                throw new EmbeddedSqlException(
-                    "Managed temporary views can only reference objects in the temp schema.");
+                if (!schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new EmbeddedSqlException(
+                        "Managed temporary views can only reference objects in the temp schema.");
+                }
             }
         }
 
