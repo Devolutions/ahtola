@@ -782,7 +782,7 @@ public sealed partial class EmbeddedDatabase
 
         var value = ToByteOffset(arguments[2]);
         var replaced = new byte[data.Length];
-        data.CopyTo(replaced);
+        data.AsSpan().CopyTo(replaced);
         replaced[offset] = (byte)(value & 0xff);
         return SqlValue.BlobOwned(replaced);
     }
