@@ -32124,6 +32124,43 @@ out bool hasReturning)
             recursiveTerms.Add(term);
         }
 
+        // The compound's own LIMIT/OFFSET bounds the recursion the way SQLite's
+        // co-routine does (recursive_cte.rs init_limit/emit_offset): a literal
+        // LIMIT 0 skips everything — the anchor is never evaluated — a negative
+        // limit is unlimited, OFFSET drops rows from the output while still
+        // feeding them to the recursive step, and the limit counter stops the
+        // whole expansion the moment enough rows have been emitted.
+        long? emitLimit = null;
+        if (compound.Limit is not null)
+        {
+            var limitValue = RequireLimitInteger(
+                Evaluate(compound.Limit, parameters, outerRow, cteContext));
+            if (limitValue == 0)
+            {
+                // The declared column list names the output without running the
+                // anchor, so an empty body still has the right shape.
+                var emptyColumns = ResolveCommonTableExpressionColumns(
+                    commonTableExpression,
+                    DescribeQuery(compound.Terms[0], cteContext));
+                var emptyDefinitions = DescribeRuntimeSourceColumnDefinitions(
+                    compound.Terms[0], emptyColumns, cteContext);
+                return new SourceData(
+                    emptyColumns,
+                    [],
+                    GetQueryOutputCollations(commonTableExpression.Query, cteContext),
+                    emptyDefinitions);
+            }
+
+            if (limitValue > 0)
+                emitLimit = limitValue;
+        }
+
+        var emitOffset = compound.Offset is null
+            ? 0
+            : Math.Max(
+                0,
+                RequireLimitInteger(Evaluate(compound.Offset, parameters, outerRow, cteContext)));
+
         var anchor = MaterializeQueryResult(
             EvaluateRecursiveAnchor(compound, firstRecursiveIndex, parameters, cteContext, outerRow));
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, anchor.Columns);
@@ -32170,6 +32207,16 @@ out bool hasReturning)
         var result = new List<SourceRow>();
         var seen = deduplicate ? new List<SqlValue[]>() : null;
         var workingSet = new List<SourceRow>();
+        // The budget caps how many EMITTED rows the expansion may produce: the
+        // compound's own LIMIT (the OFFSET is consumed inside this loop), or the
+        // outer query's row budget when the compound is unlimited. With both, the
+        // smaller wins.
+        var compoundBudget = emitLimit is long compoundLimitValue
+            ? compoundLimitValue > int.MaxValue ? int.MaxValue : (int)compoundLimitValue
+            : (int?)null;
+        var budget = outerRowBudget is int outerBudgetValue && compoundBudget is int innerBudgetValue
+            ? Math.Min(outerBudgetValue, innerBudgetValue)
+            : outerRowBudget ?? compoundBudget;
         foreach (var row in anchor.Rows)
         {
             var values = row.ToArray();
@@ -32177,12 +32224,21 @@ out bool hasReturning)
                 continue;
 
             var sourceRow = new SourceRow(columns, values);
-            result.Add(sourceRow);
             workingSet.Add(sourceRow);
-            // The outer consumer can never observe more than its budget, so stop expanding as soon
-            // as the budget is filled rather than materializing (or overflowing on) the whole set.
-            if (outerRowBudget is int anchorBudget && result.Count >= anchorBudget)
-                return new SourceData(columns, result, collations, columnDefinitions);
+            if (emitOffset > 0)
+            {
+                // An OFFSET row is dropped from the output but still feeds the
+                // recursive step, like SQLite's emit_offset jumping past the emit.
+                emitOffset--;
+            }
+            else
+            {
+                result.Add(sourceRow);
+                // The consumer can never observe more than its budget, so stop
+                // expanding as soon as the budget is filled.
+                if (budget is int anchorBudget && result.Count >= anchorBudget)
+                    return new SourceData(columns, result, collations, columnDefinitions);
+            }
         }
 
         while (workingSet.Count > 0)
@@ -32212,13 +32268,20 @@ out bool hasReturning)
                         continue;
 
                     var sourceRow = new SourceRow(columns, values);
-                    result.Add(sourceRow);
                     produced.Add(sourceRow);
-                    if (outerRowBudget is int budget && result.Count >= budget)
-                        return new SourceData(columns, result, collations, columnDefinitions);
-                    if (result.Count > RecursiveCteRowLimit)
-                        throw new EmbeddedSqlException(
-                            $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
+                    if (emitOffset > 0)
+                    {
+                        emitOffset--;
+                    }
+                    else
+                    {
+                        result.Add(sourceRow);
+                        if (budget is int budgetValue && result.Count >= budgetValue)
+                            return new SourceData(columns, result, collations, columnDefinitions);
+                        if (result.Count > RecursiveCteRowLimit)
+                            throw new EmbeddedSqlException(
+                                $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
+                    }
                 }
             }
 

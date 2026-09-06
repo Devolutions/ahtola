@@ -586,3 +586,19 @@ and keep the shipped closure pure managed, trim-safe, and NativeAOT-safe.
     UPSERT DO UPDATE references); the plain statement accepts and ignores it.
   - Two EQP tests that pinned the pre-fix non-covering wording were updated to
     the SQLite-verified COVERING plans.
+
+- 2026-09-06 (continued): **recursive-CTE LIMIT/OFFSET wave** (12 vendored
+  cases closed, 129 expected-failures remain):
+  - A recursive CTE's own LIMIT/OFFSET now bounds the recursion the way
+    SQLite's co-routine does (recursive_cte.rs init_limit/emit_offset): a
+    literal LIMIT 0 skips everything (the anchor is never evaluated, so its
+    errors never surface), a negative limit is unlimited, expressions evaluate
+    once up front, OFFSET rows are dropped from the output while still feeding
+    the recursive step, and the limit counter stops the expansion the moment
+    enough rows have been emitted. The emit budget combines with (and caps at)
+    the outer query's row budget.
+  - Closed: limit, limit-offset, zero-limit x2, expression-limit-and-offset,
+    fuzz-120717, left-join-on-clause x2, order-with-limit-stops-infinite, and
+    the correlated limit/offset family.
+  - Remaining in the cluster: ORDER BY priority-queue semantics (7), nested-CTE
+    self-reference rules (7), and scattered singles (10).

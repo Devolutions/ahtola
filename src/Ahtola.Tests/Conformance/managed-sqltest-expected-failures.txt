@@ -46,35 +46,23 @@ gencol.sqltest::gencol_stored_generated_always_rejected | database variant 1/1 (
 join/outer_hash_join.sqltest::full-outer-with-not-exists-subquery | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
 multi_index_or_compound.sqltest::compound-or-analyzed-benchmark-shape-eqp | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH e USING INDEX idx_edge_label (label=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 recursive-cte.sqltest::recursive-cte-union-recursive-collation | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s)
-recursive-cte.sqltest::recursive-cte-limit | database variant 1/1 (:memory:): expected success but got error: recursive query for seq exceeded the maximum of 1000000 rows
-recursive-cte.sqltest::recursive-cte-limit-offset | database variant 1/1 (:memory:): expected success but got error: recursive query for seq exceeded the maximum of 1000000 rows
-recursive-cte.sqltest::recursive-cte-zero-limit-does-not-recurse | database variant 1/1 (:memory:): expected success but got error: recursive query for seq exceeded the maximum of 1000000 rows
-recursive-cte.sqltest::recursive-cte-zero-limit-skips-initial-query | database variant 1/1 (:memory:): expected success but got error: malformed JSON
-recursive-cte.sqltest::recursive-cte-fuzz-120717-outer-order-after-priority-queue | database variant 1/1 (:memory:): expected 6 row(s), got 8 row(s); row 0 expected '3' but was '2'
-recursive-cte.sqltest::recursive-cte-expression-limit-and-offset | database variant 1/1 (:memory:): expected 5 row(s), got 20 row(s); row 0 expected '3' but was '1'
 recursive-cte.sqltest::recursive-cte-create-table-as-select | database variant 1/1 (:memory:): expected success but got error: no such table: c
 recursive-cte.sqltest::recursive-cte-graph-depth-first | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 2 expected '4/2' but was '3/1'
 recursive-cte.sqltest::recursive-cte-order-inherits-recursive-collation | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected 'A' but was 'b'
 recursive-cte.sqltest::recursive-cte-order-qualified-non-result-column-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
 recursive-cte.sqltest::recursive-cte-forward-dependency | database variant 1/1 (:memory:): expected success but got error: no such table: seq
 recursive-cte.sqltest::recursive-cte-forward-insert-select | database variant 1/1 (:memory:): expected success but got error: no such table: seq
-recursive-cte.sqltest::recursive-cte-left-join-on-clause-reading-left-table | database variant 1/1 (:memory:): expected success but got error: recursive query for path exceeded the maximum of 1000000 rows
 recursive-cte.sqltest::recursive-cte-full-join-recursive-on-left-not-supported | database variant 1/1 (:memory:): expected an error but the statement succeeded
 recursive-cte.sqltest::recursive-cte-full-join-recursive-on-right-not-supported | database variant 1/1 (:memory:): error 'recursive query for path exceeded the maximum of 1000000 rows' does not match pattern 'FULL OUTER JOIN with a recursive reference is not yet supported'
-recursive-cte.sqltest::recursive-cte-left-join-on-clause-subquery-reading-left-table | database variant 1/1 (:memory:): expected success but got error: recursive query for path exceeded the maximum of 1000000 rows
 recursive-cte.sqltest::recursive-cte-distinct-in-recursive-step | database variant 1/1 (:memory:): expected 6 row(s), got 4 row(s); row 3 expected '2' but was '3'
 recursive-cte.sqltest::recursive-cte-nested-with-in-body | database variant 1/1 (:memory:): expected success but got error: circular reference: outer_seq
 recursive-cte.sqltest::recursive-cte-order-by-ordinals | database variant 1/1 (:memory:): expected 8 row(s), got 8 row(s); row 0 expected '2/0' but was '1/3'
 recursive-cte.sqltest::recursive-cte-order-is-priority-queue-not-final-sort | database variant 1/1 (:memory:): expected 10 row(s), got 10 row(s); row 1 expected '6' but was '1'
 recursive-cte.sqltest::recursive-cte-order-multi-arm-depth-first | database variant 1/1 (:memory:): expected 15 row(s), got 15 row(s); row 2 expected '4/2' but was '3/1'
-recursive-cte.sqltest::recursive-cte-order-with-limit-stops-infinite | database variant 1/1 (:memory:): expected success but got error: recursive query for seq exceeded the maximum of 1000000 rows
 recursive-cte.sqltest::recursive-cte-multiple-nested-references | database variant 1/1 (:memory:): error 'circular reference: seq' does not match pattern 'multiple recursive references: seq'
 recursive-cte.sqltest::recursive-cte-arm-column-count-rejected | database variant 1/1 (:memory:): error 'SELECTs to the left and right of a compound operator do not have the same number of result columns' does not match pattern 'SELECTs to the left and right of UNI
 recursive-cte.sqltest::recursive-cte-order-expression-must-match-output | database variant 1/1 (:memory:): expected an error but the statement succeeded
 recursive-cte.sqltest::recursive-cte-mutual-cycle-rejected | database variant 1/1 (:memory:): error 'no such table: b' does not match pattern 'circular reference: a'
-recursive-cte.sqltest::recursive-cte-correlated-resets-limit-and-offset-per-invocation | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '3/2,3' but was '3/1,2,3'
-recursive-cte.sqltest::recursive-cte-correlated-order-by-desc-with-limit | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '5/1,2,3' but was '5/1,2,3,4,5'
-recursive-cte.sqltest::recursive-cte-correlated-limit-zero-and-offset-past-end | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '3/0/0' but was '3/5/5'
 recursive-cte.sqltest::recursive-cte-unused-nested-cte-self-ref-is-not-a-recursive-ref | database variant 1/1 (:memory:): expected success but got error: circular reference: c
 recursive-cte.sqltest::recursive-cte-unused-nested-cte-self-ref-keeps-cte-non-recursive | database variant 1/1 (:memory:): expected success but got error: circular reference: c
 recursive-cte.sqltest::recursive-cte-used-nested-cte-self-ref-rejected | database variant 1/1 (:memory:): error 'circular reference: c' does not match pattern 'multiple recursive references: c'
