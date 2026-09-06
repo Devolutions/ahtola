@@ -614,9 +614,14 @@ public sealed class ExpressionOperatorParityTests
         managedRows.Should().BeEquivalentTo(sqliteRows, options => options.WithStrictOrdering());
 
         using var unregistered = new EmbeddedDatabase().Connect();
+        // regexp is now a built-in (turso-src/core/regexp.rs registers it upstream too),
+        // so CHECK (value REGEXP '^a') validates against the built-in: matching rows
+        // insert and non-matching rows fail the CHECK constraint.
+        ExecuteManaged(unregistered, "CREATE TABLE accepted(value CHECK (value REGEXP '^a'));");
+        ExecuteManaged(unregistered, "INSERT INTO accepted VALUES ('alpha');");
         Assert.Throws<EmbeddedSqlException>(
-                () => ExecuteManaged(unregistered, "CREATE TABLE rejected(value CHECK (value REGEXP 'a'));"))
-            !.Message.Should().Be("no such function: REGEXP");
+                () => ExecuteManaged(unregistered, "INSERT INTO accepted VALUES ('beta');"))
+            !.Message.Should().Contain("CHECK constraint failed");
     }
 
     [Test]

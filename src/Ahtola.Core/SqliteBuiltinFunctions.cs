@@ -27,6 +27,19 @@ internal static class SqliteBuiltinFunctions
         "SUBSTR", "SUBSTRING", "REPLACE", "STRING_REVERSE", "REVERSE", "SOUNDEX", "REPEAT", "LPAD", "RPAD", "TRIM", "BTRIM", "LTRIM", "RTRIM", "QUOTE",
         "CHAR", "CHR", "UNICODE", "UNISTR", "UNISTR_QUOTE", "UNHEX", "ZEROBLOB", "RANDOMBLOB", "RANDOM", "CONCAT", "CONCAT_WS",
         "GET_BYTE", "SET_BYTE",
+        "REGEXP", "REGEXP_LIKE", "REGEXP_SUBSTR", "REGEXP_REPLACE", "REGEXP_CAPTURE",
+        "TIME_NOW", "MAKE_DATE", "MAKE_TIMESTAMP", "TIME_GET",
+        "TIME_GET_YEAR", "TIME_GET_MONTH", "TIME_GET_DAY", "TIME_GET_HOUR", "TIME_GET_MINUTE",
+        "TIME_GET_SECOND", "TIME_GET_NANO", "TIME_GET_WEEKDAY", "TIME_GET_YEARDAY",
+        "TIME_GET_ISOYEAR", "TIME_GET_ISOWEEK",
+        "TIME_UNIX", "TO_TIMESTAMP", "TIME_MILLI", "TIME_MICRO", "TIME_NANO",
+        "TIME_TO_UNIX", "TIME_TO_MILLI", "TIME_TO_MICRO", "TIME_TO_NANO",
+        "TIME_AFTER", "TIME_BEFORE", "TIME_COMPARE", "TIME_EQUAL",
+        "DUR_NS", "DUR_US", "DUR_MS", "DUR_S", "DUR_M", "DUR_H",
+        "TIME_ADD", "TIME_ADD_DATE", "TIME_SUB", "TIME_SINCE", "TIME_UNTIL",
+        "TIME_TRUNC", "TIME_ROUND",
+        "TIME_FMT_ISO", "TIME_FMT_DATETIME", "TIME_FMT_DATE", "TIME_FMT_TIME",
+        "TIME_PARSE",
         "IF", "IIF", "LIKELY", "UNLIKELY", "LIKELIHOOD",
         "SQLITE_VERSION", "TURSO_VERSION", "SQLITE_SOURCE_ID", "CHANGES", "TOTAL_CHANGES", "TIMEDIFF",
         "TIME_DATE",
@@ -183,6 +196,32 @@ internal static class SqliteBuiltinFunctions
             return [2, 3];
         if (normalized is "GET_BYTE" or "SET_BYTE")
             return normalized == "GET_BYTE" ? [2] : [3];
+        if (normalized is "REGEXP" or "REGEXP_LIKE" or "REGEXP_SUBSTR")
+            return [2];
+        if (normalized is "REGEXP_REPLACE" or "REGEXP_CAPTURE")
+            return [2, 3];
+        if (normalized is "TIME_NOW" or "DUR_NS" or "DUR_US" or "DUR_MS" or "DUR_S" or "DUR_M" or "DUR_H")
+            return [0];
+        if (normalized is "TIME_GET_YEAR" or "TIME_GET_MONTH" or "TIME_GET_DAY" or "TIME_GET_HOUR"
+            or "TIME_GET_MINUTE" or "TIME_GET_SECOND" or "TIME_GET_NANO" or "TIME_GET_WEEKDAY"
+            or "TIME_GET_YEARDAY" or "TIME_GET_ISOYEAR" or "TIME_GET_ISOWEEK"
+            or "TIME_TO_UNIX" or "TIME_TO_MILLI" or "TIME_TO_MICRO" or "TIME_TO_NANO"
+            or "TIME_SINCE" or "TIME_UNTIL" or "TIME_MILLI" or "TIME_MICRO" or "TIME_NANO"
+            or "TO_TIMESTAMP" or "TIME_PARSE")
+            return [1];
+        if (normalized is "TIME_FMT_ISO" or "TIME_FMT_DATETIME" or "TIME_FMT_DATE" or "TIME_FMT_TIME")
+            return [1, 2];
+        if (normalized is "TIME_GET" or "TIME_ADD" or "TIME_TRUNC" or "TIME_ROUND" or "TIME_AFTER"
+            or "TIME_BEFORE" or "TIME_COMPARE" or "TIME_EQUAL" or "TIME_SUB")
+            return [2];
+        if (normalized is "TIME_ADD_DATE")
+            return [2, 3, 4];
+        if (normalized is "MAKE_DATE")
+            return [3];
+        if (normalized is "MAKE_TIMESTAMP")
+            return [6];
+        if (normalized is "TIME_UNIX")
+            return [1, 2];
         if (normalized == "SETVAL")
             return [2, 3];
         if (normalized is "NEXTVAL" or "CURRVAL")

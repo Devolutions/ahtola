@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Ahtola.Core;
 
@@ -598,6 +599,153 @@ public sealed partial class EmbeddedDatabase
 
         return SqlValue.Integer(char.ConvertToUtf32(text, 0));
     }
+
+    /// <summary>
+    /// <c>regexp(pattern, source)</c>: 1 when the pattern matches, 0 when it does not,
+    /// NULL when either operand is NULL or the pattern is invalid (not an error). Every
+    /// operand coerces to text the way <c>to_text_coerced</c> does in
+    /// <c>turso-src/core/regexp.rs</c>: integers/reals by their decimal text, blobs by their
+    /// UTF-8 bytes. Wrong arity raises the dedicated error because the upstream varargs
+    /// shim used to panic on it.
+    /// </summary>
+    private static SqlValue EvaluateRegexp(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count != 2)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp()");
+
+        return RegexpMatch(RegexpText(arguments[0]), RegexpText(arguments[1]));
+    }
+
+    /// <summary>
+    /// <c>regexp_like(source, pattern)</c>: the same match test with swapped operands,
+    /// mirroring <c>extensions/regexp</c>; NULL for non-text operands (the extension is
+    /// stricter than the core <c>regexp</c> path).
+    /// </summary>
+    private static SqlValue EvaluateRegexpLike(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count != 2)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp_like()");
+
+        var source = arguments[0].Kind == SqlValueKind.Text ? arguments[0].AsText() : null;
+        var pattern = arguments[1].Kind == SqlValueKind.Text ? arguments[1].AsText() : null;
+        return RegexpMatch(pattern, source);
+    }
+
+    /// <summary>
+    /// <c>regexp_substr(source, pattern)</c>: the first matching substring, or NULL when
+    /// there is no match, an operand is non-text/NULL, or the pattern is invalid.
+    /// </summary>
+    private static SqlValue EvaluateRegexpSubstr(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count != 2)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp_substr()");
+
+        if (arguments[0].Kind != SqlValueKind.Text || arguments[1].Kind != SqlValueKind.Text)
+            return SqlValue.Null;
+
+        var regex = TryCompileRegexp(arguments[1].AsText());
+        if (regex is null)
+            return SqlValue.Null;
+
+        var match = regex.Match(arguments[0].AsText());
+        return match.Success ? SqlValue.Text(match.Value) : SqlValue.Null;
+    }
+
+    /// <summary>
+    /// <c>regexp_replace(source, pattern, replacement)</c>: replaces the first match (the
+    /// Rust <c>Regex::replace</c> default) with the replacement text, where <c>$1</c>-style
+    /// capture references expand. A missing third argument is an empty replacement.
+    /// </summary>
+    private static SqlValue EvaluateRegexpReplace(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count < 2 || arguments.Count > 3)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp_replace()");
+
+        var source = arguments[0].Kind == SqlValueKind.Text ? arguments[0].AsText() : null;
+        var pattern = arguments[1].Kind == SqlValueKind.Text ? arguments[1].AsText() : null;
+        var replacement = arguments.Count == 3 && arguments[2].Kind == SqlValueKind.Text
+            ? arguments[2].AsText()
+            : string.Empty;
+        if (source is null || pattern is null)
+            return SqlValue.Text(string.Empty);
+
+        var regex = TryCompileRegexp(pattern);
+        if (regex is null)
+            return SqlValue.Text(string.Empty);
+
+        return SqlValue.Text(regex.Replace(source, replacement, count: 1));
+    }
+
+    /// <summary>
+    /// <c>regexp_capture(source, pattern[, group])</c>: the first capture group (default 1)
+    /// of the first match, or NULL when there is no match, the group is missing, an operand
+    /// is NULL, or the pattern is invalid.
+    /// </summary>
+    private static SqlValue EvaluateRegexpCapture(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count < 2 || arguments.Count > 3)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp_capture()");
+
+        if (arguments[0].Kind != SqlValueKind.Text || arguments[1].Kind != SqlValueKind.Text)
+            return SqlValue.Null;
+
+        var group = 1;
+        if (arguments.Count == 3)
+        {
+            if (arguments[2].Kind == SqlValueKind.Null)
+                return SqlValue.Null;
+            group = arguments[2].Kind == SqlValueKind.Integer ? (int)arguments[2].AsInteger() : 1;
+        }
+
+        var regex = TryCompileRegexp(arguments[1].AsText());
+        if (regex is null)
+            return SqlValue.Null;
+
+        var match = regex.Match(arguments[0].AsText());
+        if (!match.Success || group >= match.Groups.Count || !match.Groups[group].Success)
+            return SqlValue.Null;
+
+        return SqlValue.Text(match.Groups[group].Value);
+    }
+
+    private static SqlValue RegexpMatch(string? pattern, string? source)
+    {
+        if (pattern is null || source is null)
+            return SqlValue.Null;
+
+        var regex = TryCompileRegexp(pattern);
+        if (regex is null)
+            return SqlValue.Null;
+
+        return SqlValue.Integer(regex.IsMatch(source) ? 1 : 0);
+    }
+
+    private static Regex? TryCompileRegexp(string pattern)
+    {
+        try
+        {
+            return new Regex(pattern, RegexOptions.CultureInvariant);
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Coerces a regexp operand to text the way <c>to_text_coerced</c> does
+    /// (extensions/core/src/types.rs): text verbatim, integers/reals by their
+    /// invariant-culture text, blobs by their UTF-8 bytes, NULL stays null.
+    /// </summary>
+    private static string? RegexpText(SqlValue value) => value.Kind switch
+    {
+        SqlValueKind.Null => null,
+        SqlValueKind.Text => value.AsText(),
+        SqlValueKind.Integer => value.AsInteger().ToString(CultureInfo.InvariantCulture),
+        SqlValueKind.Real => value.AsReal().ToString(CultureInfo.InvariantCulture),
+        SqlValueKind.Blob => Encoding.UTF8.GetString(value.AsBlob().Span),
+        _ => null,
+    };
 
     /// <summary>
     /// <c>get_byte(data, offset)</c>: PostgreSQL-compatible byte access on blobs. Text input

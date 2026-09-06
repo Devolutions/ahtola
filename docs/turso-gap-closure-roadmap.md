@@ -35,13 +35,48 @@ scope decision; it does not mean Ahtola implements every newer Turso feature.
 | 12 | `upstream-delta-correctness` | ~180 newly vendored cases closed by engine fixes | `core/vdbe/value.rs`, `sqlite/parser/src/parser.rs`, `core/translate/select.rs` | Done |
 | 13 | `eqp-format-json` | Parser clause + plan_json envelope | `core/translate/eqp.rs`, `docs/eqp-json.md` | Done |
 | 14 | `get-set-byte-json-object-star` | Built-in `get_byte`/`set_byte` + `json_object(*)` | `turso-sqltests/get-set-byte.sqltest`, `json_object_star.sqltest` | Done |
-| 15 | `time-family`, `regexp-family`, `turso-sqltests-adoption` | Not started | `core/time/`, sqlean regexp, `turso-sqltests/` | Open |
+| 15 | `regexp-family` | Built-in regexp + operator without registration; corpus 19/19 | `core/regexp.rs`, `extensions/regexp`, `turso-sqltests/regexp.sqltest` | Done |
+| 16 | `time-family` | Full sqlean time_*/dur_* family; corpus 34/34 | `core/time/`, `turso-sqltests/time.sqltest` | Done |
+| 17 | `turso-sqltests-adoption` | regexp/sequence/time/vector/without_rowid vendored into turso/ | `turso-sqltests/` | Done |
+| 18 | `eqp-json-op-objects` | Structured per-node op objects not yet modeled | `core/translate/eqp.rs` | Open |
 
 The sqltest counts overlap by subsystem only in implementation, not in this
 classification: ranks 1-7 account for 133 distinct expected-failure entries.
 
 ## Progress
 
+- 2026-09-06: **sqlean extension ports completed.**
+  - The regexp family is now built-in: `regexp(pattern, source)` follows
+    `core/regexp.rs`'s `to_text_coerced` semantics (integers/reals as text, blobs as
+    UTF-8 bytes, NULL as NULL, invalid patterns as NULL, wrong arity as an error),
+    the `X REGEXP Y` operator works without user registration, and the
+    `extensions/regexp` family (`regexp_like`, `regexp_substr`, `regexp_replace`
+    first-match with `$N` group expansion, `regexp_capture` with an optional group
+    index) is registered. The vendored `turso/regexp.sqltest` passes 19/19.
+  - The full sqlean time family (~45 functions) is ported in
+    `EmbeddedDatabase.TimeFunctions.cs`: a `SqleanTime` value with the documented
+    13-byte blob layout (version, 8 big-endian seconds since 0001-01-01, 4 big-endian
+    nanoseconds) and civil-calendar arithmetic (Howard Hinnant's
+    days_from_civil/civil_from_days) so the corpus's BCE years round-trip;
+    time_now/make_date/make_timestamp; the time_get family (named getters return
+    INTEGER whole seconds per `get_second()`, the two-argument `time_get(t,
+    'second')` carries the nanosecond fraction as REAL); time_unix/to_timestamp/
+    time_milli/micro/nano and time_to_*; comparisons; the `dur_*` constants;
+    time_add/time_add_date (chrono-style whole-month moves with day clamping)/
+    time_sub/since/until; time_trunc (field form incl. the corpus's ISO-week
+    Jan-1+(week-1)*7 semantics, duration form) and time_round (nearest-multiple,
+    ties away from zero, via decimal to avoid seconds*1e9 overflow); time_fmt_* with
+    optional UTC offsets; time_parse (RFC 3339, naive datetime, date, time forms).
+    The vendored `turso/time.sqltest` passes 34/34.
+  - The supported `turso-sqltests` subset is vendored under
+    `conformance/sqlite-sqltests/turso/`: regexp (19/19), sequence (23/23), time
+    (34/34), vector (21/22 — the one difference is Turso's CLI "Parse error:"
+    display prefix, recorded as an expected-failure), without_rowid (3/11 — the
+    failing cases pin Turso's insert-only WITHOUT ROWID restrictions that Ahtola
+    deliberately exceeds: secondary UNIQUE/INDEX, UPDATE, DELETE, INSERT OR
+    REPLACE, UPSERT, and FOREIGN KEY are all supported extensions, recorded as
+    intentional expected-failures). The AUTOINCREMENT-on-WITHOUT-ROWID message was
+    aligned to upstream ("is not allowed").
 - 2026-09-05: **corpus refresh to the v0.8.0-pre.7 pin.** The vendored
   `conformance/sqlite-sqltests/` corpus was stale at the v0.7.2 vintage while
   `turso-src/` had moved to v0.8.0-pre.7 (`277ddd050`). Vendored the 51

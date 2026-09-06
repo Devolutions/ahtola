@@ -241,7 +241,7 @@ public sealed class ManagedAutoIncrementTests
         "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")]
     [TestCase(
         "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID",
-        "AUTOINCREMENT not allowed on WITHOUT ROWID tables")]
+        "AUTOINCREMENT is not allowed on WITHOUT ROWID tables")]
     [TestCase(
         "CREATE TABLE t(id INTEGER, other INTEGER, PRIMARY KEY(id AUTOINCREMENT, other))",
         "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")]

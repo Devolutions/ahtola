@@ -10,6 +10,14 @@
 # differential path (SqltestMatrixOracle). The entries below are the gaps that
 # refresh exposed; each names the concrete observed difference. Matrix expansions
 # are compared differentially against bundled SQLite at run time.
+#
+# conformance/sqlite-sqltests/turso/ vendors the supported subset of the
+# upstream turso-sqltests suite (regexp, sequence, time, vector, without_rowid)
+# for features Ahtola claims: the built-in regexp family and the sqlean time_*/
+# dur_* family both pass their corpus files entirely. The vendored without_rowid
+# file pins Turso's insert-only WITHOUT ROWID restrictions, which Ahtola
+# deliberately exceeds (secondary UNIQUE/INDEX, UPDATE, DELETE, UPSERT, FK) —
+# those rejections are recorded below as intentional extensions.
 
 # Intentional SQLite-compatible extensions beyond the pinned Turso baseline:
 # Ahtola supports DELETE/UPDATE ... ORDER BY/LIMIT (the SQLite
@@ -196,3 +204,11 @@ unnest-correlated.sqltest::two-identical-averages-use-one-grouped-table | databa
 unnest-correlated.sqltest::grouped-seek-does-not-copy-unused-columns | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
 unnest-correlated.sqltest::unnested-in-reuses-unused-cursor | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
 unnest-correlated.sqltest::grouped-aggregate-reuses-unused-result-register | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
+turso/vector.sqltest::vector-insert-no-quotes | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is otherwise identical)
+turso/without_rowid.sqltest::without-rowid-secondary-unique-rejected | intentional extension: Ahtola supports secondary UNIQUE constraints on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
+turso/without_rowid.sqltest::without-rowid-create-index-rejected | intentional extension: Ahtola supports secondary CREATE INDEX on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
+turso/without_rowid.sqltest::without-rowid-update-rejected | intentional extension: Ahtola supports UPDATE on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
+turso/without_rowid.sqltest::without-rowid-delete-rejected | intentional extension: Ahtola supports DELETE on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
+turso/without_rowid.sqltest::without-rowid-insert-or-replace-rejected | intentional extension: Ahtola supports INSERT OR REPLACE on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
+turso/without_rowid.sqltest::without-rowid-upsert-rejected | intentional extension: Ahtola supports UPSERT on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
+turso/without_rowid.sqltest::without-rowid-foreign-keys-rejected | intentional extension: Ahtola supports FOREIGN KEY on WITHOUT ROWID tables where the pinned Turso corpus expects rejection

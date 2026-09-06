@@ -429,14 +429,17 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   raw pages explicitly and reject zstd responses because no approved
   pure-managed, trim-safe zstd implementation is shipped.
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
-  is null), zstd-compressed replica page sets, typed-value extensions, the
-  sqlean-compatible `time_*`/`dur_*` function family, and the sqlean
-  `regexp_*` extension functions (the `X REGEXP Y` operator works through a
-  registered `regexp` function, matching SQLite). `CREATE SEQUENCE` /
-  `DROP SEQUENCE` and the `nextval` / `currval` / `setval` functions are
-  supported as a Turso-compatible extension: sequences persist a backing table
-  whose watermark row is ordinary transactional state (a rolled-back
+  is null), zstd-compressed replica page sets, and typed-value extensions.
+  `CREATE SEQUENCE` / `DROP SEQUENCE` and the `nextval` / `currval` / `setval`
+  functions are supported as a Turso-compatible extension: sequences persist a
+  backing table whose watermark row is ordinary transactional state (a rolled-back
   allocation can be re-emitted), and `currval` is per-connection session state.
+  The sqlean-compatible `time_*` / `dur_*` family (13-byte time blob, nanosecond
+  precision, `time_date`/`time_get*`/`time_unix`/`time_add`/`time_trunc`/
+  `time_round`/`time_fmt_*`/`time_parse`) and the built-in regexp family
+  (`regexp`, `regexp_like`, `regexp_substr`, `regexp_replace`, `regexp_capture`,
+  plus the `X REGEXP Y` operator without user registration) match the pinned
+  Turso corpus.
   `DELETE`/`UPDATE ... ORDER BY`/`LIMIT`/`OFFSET` are supported as a
   deliberate extension (the SQLite `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` build
   option); the upstream conformance corpus pins the default-build rejection,

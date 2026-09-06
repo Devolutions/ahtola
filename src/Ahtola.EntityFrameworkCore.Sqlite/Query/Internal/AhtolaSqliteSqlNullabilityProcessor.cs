@@ -16,10 +16,11 @@ public sealed class AhtolaSqliteSqlNullabilityProcessor(
         bool allowOptimizedExpansion,
         out bool nullable)
     {
-        // Regex.IsMatch(...) translates to a RegexpExpression ("X REGEXP Y"), which requires a
-        // client-registered 'regexp' SQL function that direct remote Hrana and embedded-replica
-        // connections cannot register. Fail here, during translation, rather than emitting SQL
-        // the endpoint will reject at execution time.
+        // Regex.IsMatch(...) translates to a RegexpExpression ("X REGEXP Y"). The embedded
+        // engine ships a built-in regexp, but direct remote Hrana and embedded-replica
+        // connections cannot register one client-side and the endpoint may not provide it,
+        // so fail here, during translation, rather than emitting SQL the endpoint may
+        // reject at execution time.
         if (!supportsProviderExtensionFunctions && sqlExpression is RegexpExpression)
             throw AhtolaRemoteSqlRestrictions.ForRegexp();
 
