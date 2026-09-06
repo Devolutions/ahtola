@@ -42349,6 +42349,7 @@ out bool hasReturning)
             "JSONB_SET" => SqliteJson.JsonbSet(arguments),
             "JSON_TYPE" => SqliteJson.JsonType(arguments),
             "JSON_VALID" => SqliteJson.JsonValid(arguments),
+            "SUBTYPE" => EvaluateSubtype(arguments),
             "JULIANDAY" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.JulianDay),
             "LAST_INSERT_ROWID" => EvaluateLastInsertRowId(arguments, context),
             "IS_AUTOCOMMIT" => EvaluateIsAutocommit(arguments, context),
@@ -42405,6 +42406,18 @@ out bool hasReturning)
             "SETVAL" => EvaluateSetVal(arguments, context),
             _ => throw new EmbeddedSqlException($"no such function: {function.Name}"),
         };
+    }
+
+    // subtype() reports the ephemeral subtype of a value: 74 ('J') for text a
+    // JSON function produced as a JSON value, and 0 for everything else —
+    // including JSONB blobs, whose acceptance as JSON arguments is purely
+    // structural.
+    private static SqlValue EvaluateSubtype(IReadOnlyList<SqlValue> arguments)
+    {
+        RequireArgumentCount("subtype", arguments, 1);
+        var value = arguments[0];
+        return SqlValue.Integer(
+            value.Kind == SqlValueKind.Text && value.IsJson ? 74 : 0);
     }
 
     private static SqlValue EvaluateRTreeCheck(
@@ -49090,6 +49103,7 @@ out bool hasReturning)
         private sealed class JMember
         {
             public string RawKey = string.Empty;
+            public string? RawKey5;
             public string Key = string.Empty;
             public JNode Value = null!;
         }
@@ -49098,6 +49112,7 @@ out bool hasReturning)
         {
             public JKind Kind;
             public string Raw = string.Empty; // Verbatim token for numbers and quoted strings.
+            public string? Raw5; // Verbatim JSON5 payload for strings with JSON5-only escapes (TEXT5 elements).
             public string Str = string.Empty; // Decoded text for Text nodes.
             public List<JNode>? Items;
             public List<JMember>? Members;
@@ -49147,18 +49162,662 @@ out bool hasReturning)
 
         internal static SqlValue JsonValid(IReadOnlyList<SqlValue> args)
         {
-            RequireArgumentCount("json_valid", args, 1);
+            if (args.Count is < 1 or > 2)
+                throw new EmbeddedSqlException("wrong number of arguments to function json_valid()");
+
+            // json_valid(X) is json_valid(X, 1): strict RFC 8259 text only. The two
+            // argument form takes a bitmask picking which representations count:
+            // 1 = strict text, 2 = JSON5 text, 4 = blob that superficially looks
+            // like JSONB, 8 = blob that is fully valid JSONB (SQLite's json_valid).
+            long flags = 1;
+            if (args.Count == 2)
+            {
+                flags = FlagsArgument(args[1]);
+                if (flags is < 1 or > 15)
+                    throw new EmbeddedSqlException("FLAGS parameter to json_valid() must be between 1 and 15");
+            }
+
             var value = args[0];
             switch (value.Kind)
             {
                 case SqlValueKind.Null:
                     return SqlValue.Null;
                 case SqlValueKind.Integer:
+                    return SqlValue.Integer((flags & (TextStrict | TextJson5)) != 0 ? 1 : 0);
                 case SqlValueKind.Real:
-                    return SqlValue.Integer(1);
+                    // SQLite renders a REAL argument as text; an infinite one is
+                    // only reachable through the JSON5 Infinity literal (9e999),
+                    // so only the JSON5 text flag accepts it.
+                    return SqlValue.Integer(
+                        double.IsInfinity(value.AsReal())
+                            ? (flags & TextJson5) != 0 ? 1 : 0
+                            : (flags & (TextStrict | TextJson5)) != 0 ? 1 : 0);
                 default:
-                    return SqlValue.Integer(TryParse(InputText(value)) is null ? 0 : 1);
+                    return SqlValue.Integer(IsValidForFlags(value, flags) ? 1 : 0);
             }
+        }
+
+        private const long TextStrict = 1;
+        private const long TextJson5 = 2;
+
+        /// <summary>
+        /// Coerces the FLAGS argument like sqlite3_value_int: numbers convert,
+        /// text and blobs take their leading integer prefix, and NULL is 0 (which
+        /// the caller rejects with the range error).
+        /// </summary>
+        private static long FlagsArgument(SqlValue value)
+            => value.Kind switch
+            {
+                SqlValueKind.Integer => value.AsInteger(),
+                SqlValueKind.Real => (long)value.AsReal(),
+                SqlValueKind.Text => IntegerPrefix(value.AsText()),
+                SqlValueKind.Blob => IntegerPrefix(Encoding.UTF8.GetString(value.AsBlob().Span)),
+                _ => 0,
+            };
+
+        private static long IntegerPrefix(string text)
+        {
+            var span = text.AsSpan().TrimStart();
+            int end = 0;
+            if (end < span.Length && (span[end] is '+' or '-'))
+                end++;
+            int digits = end;
+            while (end < span.Length && char.IsAsciiDigit(span[end]))
+                end++;
+            if (end == digits)
+                return 0;
+            return long.TryParse(span[..end], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var v) ? v : 0;
+        }
+
+        private static bool IsValidForFlags(SqlValue value, long flags)
+        {
+            if (value.Kind == SqlValueKind.Blob)
+            {
+                var blob = value.AsBlob().Span;
+                // SQLite classifies the raw blob first: a blob that superficially
+                // looks like JSONB can only match the blob flags, while any other
+                // blob validates as text.
+                if (LooksLikeJsonbBlob(blob))
+                {
+                    if ((flags & 4) != 0)
+                        return true;
+                    return (flags & 8) != 0 && JsonbErrorPosition(blob) == 0;
+                }
+
+                return TextCheck(blob, flags);
+            }
+
+            return TextCheck(Encoding.UTF8.GetBytes(value.AsText()), flags);
+        }
+
+        private static bool TextCheck(ReadOnlySpan<byte> bytes, long flags)
+        {
+            // With neither text flag selected the answer is already 0; SQLite does
+            // not parse at all in that case, so a huge input must not error either.
+            if ((flags & (TextStrict | TextJson5)) == 0)
+                return false;
+
+            var (parsed, hasJson5) = TryParseTracking(bytes);
+            if (parsed is null)
+                return false;
+            if (hasJson5)
+                return (flags & TextJson5) != 0;
+            return (flags & (TextStrict | TextJson5)) != 0;
+        }
+
+        /// <summary>
+        /// SQLite's shallow "superficially looks like JSONB" test
+        /// (jsonFuncArgMightBeBinary): the outer header must parse, claim exactly
+        /// the whole blob, and a NULL/TRUE/FALSE element must have no payload. The
+        /// payload bytes themselves are never examined, except that RFC 8259 text
+        /// can only masquerade as JSONB when it starts with '{', '[' or a digit,
+        /// and in every such coincidence the claimed payload is at most 7 bytes —
+        /// those are resolved by full strict validation, falling back to text.
+        /// </summary>
+        private static bool LooksLikeJsonbBlob(ReadOnlySpan<byte> slice)
+        {
+            if (slice.IsEmpty)
+                return false;
+
+            // SQLite reads the 8-byte size encoding (header nibble 15) with a
+            // 32-bit size, so the header only parses when the first four size
+            // bytes are zero.
+            if (slice[0] >> 4 == 15 && (slice.Length < 9 || (slice[1] != 0 || slice[2] != 0 || slice[3] != 0 || slice[4] != 0)))
+                return false;
+
+            if (!TryReadJsonbHeaderAt(slice, 0, out var type, out var headerSize, out var payloadSize))
+                return false;
+
+            if (headerSize + payloadSize != slice.Length)
+                return false;
+
+            if (payloadSize > 0 && type is 0 or 1 or 2)
+                return false;
+
+            if (payloadSize <= 7 && (slice[0] is (byte)'{' or (byte)'[' or >= (byte)'0' and <= (byte)'9'))
+                return JsonbErrorPosition(slice) == 0;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Reads the JSONB header at <paramref name="start"/> without any
+        /// structural assumptions. Returns false when the header itself cannot
+        /// parse (unknown type, truncated size bytes, or an oversized payload).
+        /// </summary>
+        private static bool TryReadJsonbHeaderAt(ReadOnlySpan<byte> data, int start, out int type, out int headerSize, out int payloadSize)
+        {
+            type = 0;
+            headerSize = 0;
+            payloadSize = 0;
+            if (start >= data.Length)
+                return false;
+
+            var header = data[start];
+            headerSize = 1;
+            type = header & 0x0F;
+            if (type > 12)
+                return false;
+
+            var sizeMarker = header >> 4;
+            if (sizeMarker <= 11)
+            {
+                payloadSize = sizeMarker;
+                return true;
+            }
+
+            var sizeBytes = sizeMarker switch
+            {
+                12 => 1,
+                13 => 2,
+                14 => 4,
+                15 => 8,
+                _ => 0,
+            };
+            if (sizeBytes == 0 || start + 1 + sizeBytes > data.Length)
+            {
+                headerSize = 0;
+                return false;
+            }
+
+            ulong length = 0;
+            for (int i = 0; i < sizeBytes; i++)
+                length = (length << 8) | data[start + 1 + i];
+
+            if (length > int.MaxValue)
+            {
+                headerSize = 0;
+                return false;
+            }
+
+            headerSize = 1 + sizeBytes;
+            payloadSize = (int)length;
+            return true;
+        }
+
+        /// <summary>
+        /// SQLite's jsonbValidityCheck: 0 when the data is fully valid JSONB
+        /// including numeric payload contents, otherwise the 1-based byte offset
+        /// of the first malformed byte or element. json_valid(X, 8) and
+        /// json_error_position report this strict check.
+        /// </summary>
+        internal static int JsonbErrorPosition(ReadOnlySpan<byte> data)
+        {
+            // SQLite starts jsonbValidityCheck at depth 1, so exactly
+            // MaxJsonbDepth nested containers pass and one more fails.
+            return ValidateJsonbElement(data, 0, data.Length, 1, strict: true) is int error ? error : 0;
+        }
+
+        private const int MaxJsonbDepth = 1000;
+
+        /// <summary>
+        /// Validates one JSONB element. Returns null for a valid element or the
+        /// 1-based byte offset of the first problem, following
+        /// jsonbValidityCheck: a malformed header or payload shape reports the
+        /// element's own start, and a bad byte inside a numeric payload reports
+        /// that byte. Strict turns on the numeric payload checks and the
+        /// bare-header requirement for NULL/TRUE/FALSE.
+        /// </summary>
+        private static int? ValidateJsonbElement(ReadOnlySpan<byte> data, int start, int end, int depth, bool strict)
+        {
+            if (depth > MaxJsonbDepth)
+                return start + 1;
+
+            if (start >= end)
+                return start + 1;
+
+            // SQLite reads the 8-byte size encoding (header nibble 15) with a
+            // 32-bit size, so jsonbPayloadSize accepts the header only when the
+            // first four size bytes are zero.
+            if (strict
+                && data[start] >> 4 == 15
+                && (start + 9 > data.Length || data[start + 1] != 0 || data[start + 2] != 0 || data[start + 3] != 0 || data[start + 4] != 0))
+            {
+                return start + 1;
+            }
+
+            if (!TryReadJsonbHeaderAt(data, start, out var type, out var headerSize, out var payloadSize))
+                return start + 1;
+
+            var payloadStart = start + headerSize;
+            if (payloadStart + payloadSize != end || payloadStart + payloadSize > data.Length)
+                return start + 1;
+
+            var payloadEnd = payloadStart + payloadSize;
+            switch (type)
+            {
+                case 0 or 1 or 2:
+                    if (payloadSize != 0)
+                        return start + 1;
+                    // SQLite accepts these only as their bare one-byte headers
+                    // (jsonbValidityCheck requires n+sz==1), so an extended-size
+                    // encoding of the empty payload is malformed.
+                    if (strict && headerSize != 1)
+                        return start + 1;
+                    return null;
+                case 3: // INT: payload is all ASCII digits, with an optional leading '-'.
+                    if (payloadSize == 0)
+                        return start + 1;
+                    if (!strict)
+                        return null;
+                    var pos = payloadStart;
+                    if (data[pos] == (byte)'-')
+                    {
+                        pos++;
+                        if (payloadSize < 2)
+                            return start + 1;
+                    }
+                    for (var offset = 0; pos + offset < payloadEnd; offset++)
+                    {
+                        if (!char.IsAsciiDigit((char)data[pos + offset]))
+                            return pos + offset + 1;
+                    }
+                    return null;
+                case 4: // INT5: payload is a hexadecimal literal [-]0x<hex digits>.
+                    if (payloadSize == 0)
+                        return start + 1;
+                    if (!strict)
+                        return null;
+                    if (payloadSize < 3)
+                        return start + 1;
+                    pos = payloadStart;
+                    if (data[pos] == (byte)'-')
+                    {
+                        if (payloadSize < 4)
+                            return start + 1;
+                        pos++;
+                    }
+                    if (data[pos] != (byte)'0')
+                        return start + 1;
+                    if (data[pos + 1] is not ((byte)'x' or (byte)'X'))
+                        return pos + 2;
+                    pos += 2;
+                    for (var offset = 0; pos + offset < payloadEnd; offset++)
+                    {
+                        if (!char.IsAsciiHexDigit((char)data[pos + offset]))
+                            return pos + offset + 1;
+                    }
+                    return null;
+                case 5 or 6: // FLOAT / FLOAT5
+                    if (payloadSize == 0)
+                        return start + 1;
+                    if (!strict)
+                        return null;
+                    return ValidateFloatPayload(data, start, payloadStart, payloadEnd, float5: type == 6);
+                case 7 or 8 or 9 or 10: // TEXT / TEXTJ / TEXT5 / TEXTRAW
+                    if (!strict)
+                    {
+                        // The lenient document check decodes text payloads as
+                        // strings, so the payload must be valid UTF-8.
+                        try
+                        {
+                            JsonbUtf8.GetString(data[payloadStart..payloadEnd]);
+                        }
+                        catch (DecoderFallbackException)
+                        {
+                            return payloadStart + 1;
+                        }
+                        return null;
+                    }
+                    return ValidateTextPayload(data, payloadStart, payloadEnd, type);
+                case 11: // ARRAY
+                    pos = payloadStart;
+                    while (pos < payloadEnd)
+                    {
+                        if (ChildElementEnd(data, pos, payloadEnd) is not int childEnd)
+                            return pos + 1;
+                        if (ValidateJsonbElement(data, pos, childEnd, depth + 1, strict) is int inner)
+                            return inner;
+                        pos = childEnd;
+                    }
+                    return null;
+                case 12: // OBJECT
+                    pos = payloadStart;
+                    var count = 0;
+                    while (pos < payloadEnd)
+                    {
+                        if (ChildElementEnd(data, pos, payloadEnd) is not int elemEnd)
+                            return pos + 1;
+                        if (count % 2 == 0)
+                        {
+                            // Keys must be text elements.
+                            if (!TryReadJsonbHeaderAt(data, pos, out var keyType, out _, out _)
+                                || keyType is < 7 or > 10)
+                            {
+                                return pos + 1;
+                            }
+                        }
+                        if (ValidateJsonbElement(data, pos, elemEnd, depth + 1, strict) is int inner)
+                            return inner;
+                        pos = elemEnd;
+                        count++;
+                    }
+                    if (count % 2 != 0)
+                        return payloadEnd + 1;
+                    return null;
+                default:
+                    return start + 1;
+            }
+        }
+
+        /// <summary>
+        /// Reads the header of the child element at <paramref name="pos"/> and
+        /// returns where the child ends, or the 1-based offset of pos when the
+        /// header is malformed or the child would run past payloadEnd.
+        /// </summary>
+        private static int? ChildElementEnd(ReadOnlySpan<byte> data, int pos, int payloadEnd)
+        {
+            if (!TryReadJsonbHeaderAt(data, pos, out _, out var headerSize, out var payloadSize))
+                return pos + 1;
+            var end = pos + headerSize + payloadSize;
+            if (end > payloadEnd)
+                return pos + 1;
+            return end;
+        }
+
+        /// <summary>
+        /// Validates a text payload the way jsonbValidityCheck does. TEXTRAW
+        /// accepts anything, TEXT allows no escapes and no raw control bytes or
+        /// double quotes, TEXTJ adds the RFC 8259 escapes, and TEXT5
+        /// additionally allows raw control bytes, raw double quotes and the
+        /// JSON5 escapes. A bad JSON5 escape is reported at its initial
+        /// backslash, even when line continuations sit between that backslash
+        /// and the offending bytes, because SQLite decodes the whole run as one
+        /// escape.
+        /// </summary>
+        private static int? ValidateTextPayload(ReadOnlySpan<byte> data, int payloadStart, int payloadEnd, int type)
+        {
+            if (type == 10) // TEXTRAW
+                return null;
+
+            var pos = payloadStart;
+            while (pos < payloadEnd)
+            {
+                var b = data[pos];
+                if (b > 0x1f && b != (byte)'"' && b != (byte)'\\')
+                {
+                    pos++;
+                    continue;
+                }
+
+                if (type == 7) // TEXT: no escapes at all
+                    return pos + 1;
+
+                if (b != (byte)'\\')
+                {
+                    // A raw control byte or double quote is a JSON5 literal.
+                    if (type == 8) // TEXTJ
+                        return pos + 1;
+                    pos++;
+                    continue;
+                }
+
+                if (pos + 1 >= payloadEnd)
+                    return pos + 1;
+
+                var escaped = data[pos + 1];
+                switch (escaped)
+                {
+                    // The 0 arm is SQLite bug-compatibility: its standard-escape
+                    // test is strchr("\"\\/bfnrt", z[j+1]), and strchr with a
+                    // NUL needle matches the string's own terminator, so a
+                    // backslash-NUL sequence passes in TEXTJ and TEXT5 payloads.
+                    case 0 or (byte)'"' or (byte)'\\' or (byte)'/' or (byte)'b' or (byte)'f' or (byte)'n' or (byte)'r' or (byte)'t':
+                        pos += 2;
+                        continue;
+                    case (byte)'u':
+                        if (pos + 5 >= payloadEnd
+                            || !char.IsAsciiHexDigit((char)data[pos + 2])
+                            || !char.IsAsciiHexDigit((char)data[pos + 3])
+                            || !char.IsAsciiHexDigit((char)data[pos + 4])
+                            || !char.IsAsciiHexDigit((char)data[pos + 5]))
+                        {
+                            return pos + 1;
+                        }
+                        pos += 6;
+                        continue;
+                }
+
+                if (type != 9) // TEXT5
+                    return pos + 1;
+
+                // A JSON5 escape: consume it exactly the way SQLite's
+                // jsonUnescapeOneChar does, without inspecting bytes past the
+                // payload end (the lookahead stops at payloadEnd).
+                var (consumed, valid) = UnescapeOneChar(data[pos..payloadEnd]);
+                if (!valid)
+                    return pos + 1;
+                pos += consumed;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Walks over the run of JSON5 line continuations at the start of
+        /// <paramref name="z"/> and returns how many bytes they span: \&lt;LF&gt;,
+        /// \&lt;CR&gt;, \&lt;CRLF&gt;, and \ before U+2028 or U+2029 each continue
+        /// the string without contributing a character.
+        /// </summary>
+        private static int BytesToBypass(ReadOnlySpan<byte> z)
+        {
+            var n = z.Length;
+            var i = 0;
+            while (i + 1 < n)
+            {
+                if (z[i] != (byte)'\\')
+                    return i;
+                if (z[i + 1] == (byte)'\n')
+                {
+                    i += 2;
+                    continue;
+                }
+                if (z[i + 1] == (byte)'\r')
+                {
+                    if (i + 2 < n && z[i + 2] == (byte)'\n')
+                        i += 3;
+                    else
+                        i += 2;
+                    continue;
+                }
+                if (z[i + 1] == 0xe2 && i + 3 < n && z[i + 2] == 0x80 && (z[i + 3] is 0xa8 or 0xa9))
+                {
+                    i += 4;
+                    continue;
+                }
+                break;
+            }
+            return i;
+        }
+
+        /// <summary>
+        /// SQLite's jsonHexToInt: converts a byte to its hex digit value without
+        /// validating it first, so garbage bytes map to arbitrary but
+        /// deterministic values. The surrogate-pair detection below needs the
+        /// exact same garbage mapping to consume the same number of bytes as
+        /// SQLite does.
+        /// </summary>
+        private static uint JsonHexToInt(byte h)
+            => (uint)((h + 9 * (1 & (h >> 6))) & 0xf);
+
+        private static uint JsonHexToInt4(ReadOnlySpan<byte> z)
+            => (JsonHexToInt(z[0]) << 12) + (JsonHexToInt(z[1]) << 8) + (JsonHexToInt(z[2]) << 4) + JsonHexToInt(z[3]);
+
+        /// <summary>
+        /// SQLite's sqlite3Utf8ReadLimited consumption rule: one lead byte, and
+        /// for leads at or above 0xC0 also up to three following continuation
+        /// bytes. The payload may not be UTF-8, and a malformed sequence must
+        /// consume exactly the bytes SQLite consumes or later escapes would be
+        /// scanned from a different offset.
+        /// </summary>
+        private static int Utf8ReadLimitedLen(ReadOnlySpan<byte> z)
+        {
+            var i = 1;
+            if (z[0] >= 0xC0)
+            {
+                var n = Math.Min(z.Length, 4);
+                while (i < n && (z[i] & 0xC0) == 0x80)
+                    i++;
+            }
+            return i;
+        }
+
+        /// <summary>
+        /// Consumes one JSON5 escape at the start of <paramref name="z"/>
+        /// (which begins with a backslash) and reports whether it was valid. A
+        /// line continuation swallows the whole run of continuations and then
+        /// the character or escape that follows, which is why a \u reached
+        /// through a continuation is consumed without checking its hex digits:
+        /// jsonUnescapeOneChar converts them blindly, so SQLite accepts it.
+        /// </summary>
+        private static (int Consumed, bool Valid) UnescapeOneChar(ReadOnlySpan<byte> z)
+        {
+            var n = z.Length;
+            if (n < 2)
+                return (n, false);
+            switch (z[1])
+            {
+                case (byte)'u':
+                    if (n < 6)
+                        return (n, false);
+                    var v = JsonHexToInt4(z[2..6]);
+                    if ((v & 0xfc00) == 0xd800
+                        && n >= 12
+                        && z[6] == (byte)'\\'
+                        && z[7] == (byte)'u'
+                        && (JsonHexToInt4(z[8..12]) & 0xfc00) == 0xdc00)
+                    {
+                        return (12, true);
+                    }
+                    return (6, true);
+                case (byte)'b' or (byte)'f' or (byte)'n' or (byte)'r' or (byte)'t' or (byte)'v'
+                    or (byte)'\'' or (byte)'"' or (byte)'/' or (byte)'\\':
+                    return (2, true);
+                case (byte)'0':
+                    // JSON5 forbids a digit right after \0.
+                    return (2, !(n > 2 && char.IsAsciiDigit((char)z[2])));
+                case (byte)'x':
+                    // Like SQLite, the two bytes after \x are consumed without
+                    // being checked as hex digits.
+                    if (n < 4)
+                        return (n, false);
+                    return (4, true);
+                case 0xe2 or (byte)'\r' or (byte)'\n':
+                    var skip = BytesToBypass(z);
+                    if (skip == 0)
+                        return (n, false);
+                    if (skip == n)
+                        return (n, true);
+                    if (z[skip] == (byte)'\\')
+                    {
+                        var (consumed, valid) = UnescapeOneChar(z[skip..]);
+                        return (skip + consumed, valid);
+                    }
+                    return (skip + Utf8ReadLimitedLen(z[skip..]), true);
+                default:
+                    return (2, false);
+            }
+        }
+
+        /// <summary>
+        /// Validates a FLOAT or FLOAT5 payload the way jsonbValidityCheck does:
+        /// FLOAT must be a canonical RFC 8259 number with a '.' or exponent,
+        /// FLOAT5 additionally allows the JSON5 forms '.5' and '5.'.
+        /// </summary>
+        private static int? ValidateFloatPayload(ReadOnlySpan<byte> data, int start, int payloadStart, int payloadEnd, bool float5)
+        {
+            const byte SeenDot = 1;
+            const byte SeenExp = 2;
+            if (payloadEnd - payloadStart < 2)
+                return start + 1;
+
+            var pos = payloadStart;
+            byte seen = 0;
+            if (data[pos] == (byte)'-')
+            {
+                pos++;
+                if (payloadEnd - payloadStart < 3)
+                    return start + 1;
+            }
+
+            if (data[pos] == (byte)'.')
+            {
+                if (!float5 || pos + 1 >= payloadEnd || !char.IsAsciiDigit((char)data[pos + 1]))
+                    return pos + 1;
+                pos += 2;
+                seen = SeenDot;
+            }
+            else if (data[pos] == (byte)'0' && !float5)
+            {
+                // A strict leading zero must be the whole integer part.
+                if (pos + 3 > payloadEnd)
+                    return pos + 1;
+                if (data[pos + 1] is not ((byte)'.' or (byte)'e' or (byte)'E'))
+                    return pos + 1;
+                pos += 1;
+            }
+
+            while (pos < payloadEnd)
+            {
+                var b = data[pos];
+                if (char.IsAsciiDigit((char)b))
+                {
+                    pos++;
+                    continue;
+                }
+
+                if (b == (byte)'.')
+                {
+                    if (seen != 0)
+                        return pos + 1;
+                    if (!float5 && (pos == payloadEnd - 1 || pos + 1 >= payloadEnd || !char.IsAsciiDigit((char)data[pos + 1])))
+                        return pos + 1;
+                    seen = SeenDot;
+                    pos++;
+                    continue;
+                }
+
+                if (b is (byte)'e' or (byte)'E')
+                {
+                    if (seen == SeenExp || pos == payloadEnd - 1)
+                        return pos + 1;
+                    if (pos + 1 < payloadEnd && data[pos + 1] is ((byte)'+' or (byte)'-'))
+                    {
+                        pos++;
+                        if (pos == payloadEnd - 1)
+                            return pos + 1;
+                    }
+                    seen = SeenExp;
+                    pos++;
+                    continue;
+                }
+
+                return pos + 1;
+            }
+
+            if (seen == 0)
+                return start + 1;
+            return null;
         }
 
         internal static SqlValue JsonType(IReadOnlyList<SqlValue> args)
@@ -49389,6 +50048,12 @@ out bool hasReturning)
             RequireArgumentCount("json_error_position", args, 1);
             if (args[0].Kind == SqlValueKind.Null)
                 return SqlValue.Null;
+
+            // A blob that superficially looks like JSONB reports the byte offset
+            // of its first malformed element instead of being re-read as text;
+            // any other blob validates as text.
+            if (args[0].Kind == SqlValueKind.Blob && LooksLikeJsonbBlob(args[0].AsBlob().Span))
+                return SqlValue.Integer(JsonbErrorPosition(args[0].AsBlob().Span));
 
             string input = args[0].Kind switch
             {
@@ -50026,9 +50691,12 @@ out bool hasReturning)
         }
 
         private static string InputText(SqlValue value)
-            => value.Kind == SqlValueKind.Blob
-                ? SqliteTextPrefix(Encoding.UTF8.GetString(value.AsBlob().Span))
-                : value.AsText();
+            // SQLite treats text as a NUL-terminated C string when parsing a JSON
+            // document, so parsing stops at the first embedded NUL. A text value
+            // converted to a JSON string literal keeps the NUL as an escape.
+            => SqliteTextPrefix(value.Kind == SqlValueKind.Blob
+                ? Encoding.UTF8.GetString(value.AsBlob().Span)
+                : value.AsText());
 
         private static string RequirePathText(SqlValue value)
             => value.Kind switch
@@ -50153,7 +50821,7 @@ out bool hasReturning)
                     payload.AddRange(JsonbUtf8.GetBytes(node.Raw));
                     break;
                 case JKind.Text:
-                    AppendJsonbText(payload, node.Raw, node.Str, out type);
+                    AppendJsonbText(payload, node.Raw, node.Raw5, node.Str, out type);
                     break;
                 case JKind.Array:
                     type = 11;
@@ -50164,7 +50832,7 @@ out bool hasReturning)
                     type = 12;
                     foreach (var member in node.Members!)
                     {
-                        AppendJsonbTextNode(payload, member.RawKey, member.Key);
+                        AppendJsonbTextNode(payload, member.RawKey, member.RawKey5, member.Key);
                         AppendJsonbNode(payload, member.Value);
                     }
                     break;
@@ -50178,14 +50846,33 @@ out bool hasReturning)
 
         private static void AppendJsonbTextNode(List<byte> destination, string raw, string text)
         {
+            AppendJsonbTextNode(destination, raw, raw5: null, text);
+        }
+
+        private static void AppendJsonbTextNode(List<byte> destination, string raw, string? raw5, string text)
+        {
             var payload = new List<byte>();
-            AppendJsonbText(payload, raw, text, out var type);
+            AppendJsonbText(payload, raw, raw5, text, out var type);
             WriteJsonbHeader(destination, type, payload.Count);
             destination.AddRange(payload);
         }
 
         private static void AppendJsonbText(List<byte> destination, string raw, string text, out int type)
         {
+            AppendJsonbText(destination, raw, raw5: null, text, out type);
+        }
+
+        private static void AppendJsonbText(List<byte> destination, string raw, string? raw5, string text, out int type)
+        {
+            // A JSON5 string (Raw5) stores its verbatim payload in a TEXT5
+            // element; a standard-escaped string is TEXTJ and a plain one TEXT.
+            if (raw5 is not null)
+            {
+                type = 9;
+                destination.AddRange(JsonbUtf8.GetBytes(raw5));
+                return;
+            }
+
             var payload = raw.Length >= 2 && raw[0] == '"' && raw[^1] == '"'
                 ? raw[1..^1]
                 : text;
@@ -50280,6 +50967,16 @@ out bool hasReturning)
                         return false;
                     }
                     node = escapedText;
+                    cursor = payloadEnd;
+                    return true;
+                case 9:
+                    // A TEXT5 payload holds verbatim JSON5 escapes (raw control
+                    // bytes, raw double quotes, \x, \v, line continuations), so it
+                    // decodes through the dedicated TEXT5 scanner and keeps the
+                    // verbatim payload for JSONB round-trips.
+                    if (!TryDecodeJsonbText(data[payloadStart..payloadEnd], out var json5))
+                        return false;
+                    node = DecodeText5Payload(json5);
                     cursor = payloadEnd;
                     return true;
                 case 11:
@@ -50380,6 +51077,201 @@ out bool hasReturning)
                 text = string.Empty;
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Decodes a TEXT5 payload: the verbatim JSON5 escapes and raw bytes it
+        /// stores (raw control bytes, raw double quotes, \x, \v, \0, line
+        /// continuations, \uXXXX) turn into their decoded string value while the
+        /// verbatim payload is kept for JSONB round-trips.
+        /// </summary>
+        private static JNode DecodeText5Payload(string payload)
+        {
+            var sb = new StringBuilder(payload.Length);
+            var raw = new StringBuilder(payload.Length + 2);
+            raw.Append('"');
+            for (var i = 0; i < payload.Length; i++)
+            {
+                var c = payload[i];
+                if (c != '\\')
+                {
+                    sb.Append(c);
+                    if (c == '"')
+                        raw.Append("\\\"");
+                    else
+                        raw.Append(c);
+                    continue;
+                }
+
+                // An escape at the very end is malformed, but the lenient read
+                // tolerates it as a literal backslash.
+                if (i + 1 >= payload.Length)
+                {
+                    sb.Append(c);
+                    raw.Append(c);
+                    continue;
+                }
+
+                var escaped = payload[i + 1];
+                switch (escaped)
+                {
+                    case '"': sb.Append('"'); raw.Append("\\\""); break;
+                    case '\\': sb.Append('\\'); raw.Append("\\\\"); break;
+                    case '/': sb.Append('/'); raw.Append("\\/"); break;
+                    case 'b': sb.Append('\b'); raw.Append("\\b"); break;
+                    case 'f': sb.Append('\f'); raw.Append("\\f"); break;
+                    case 'n': sb.Append('\n'); raw.Append("\\n"); break;
+                    case 'r': sb.Append('\r'); raw.Append("\\r"); break;
+                    case 't': sb.Append('\t'); raw.Append("\\t"); break;
+                    case '\'': sb.Append('\''); raw.Append("\\'"); break;
+                    case '0': sb.Append('\0'); raw.Append("\\0"); break;
+                    case 'v': sb.Append('\v'); raw.Append("\\v"); break;
+                    case 'x':
+                        if (i + 3 < payload.Length)
+                        {
+                            int hex = (HexDigit(payload[i + 2]) << 4) | HexDigit(payload[i + 3]);
+                            sb.Append((char)hex);
+                            raw.Append(payload, i, 4);
+                            i += 2;
+                        }
+                        else
+                        {
+                            sb.Append(escaped);
+                            raw.Append(payload, i, 2);
+                            i += 1;
+                        }
+                        break;
+                    case 'u':
+                        if (i + 5 < payload.Length)
+                        {
+                            int cp = 0;
+                            for (var k = 2; k <= 5; k++)
+                                cp = (cp * 16) + HexDigit(payload[i + k]);
+                            sb.Append((char)cp);
+                            raw.Append(payload, i, 6);
+                            i += 4;
+                        }
+                        else
+                        {
+                            sb.Append(escaped);
+                            raw.Append(payload, i, 2);
+                            i += 1;
+                        }
+                        break;
+                    case '\n':
+                        // Line continuations decode to nothing and render away.
+                        i += 1;
+                        break;
+                    case '\r':
+                        if (i + 2 < payload.Length && payload[i + 2] == '\n')
+                            i += 2;
+                        else
+                            i += 1;
+                        break;
+                    case '\u2028':
+                    case '\u2029':
+                        i += 1;
+                        break;
+                    default:
+                        sb.Append(escaped);
+                        raw.Append(payload, i, 2);
+                        i += 1;
+                        break;
+                }
+
+                i++;
+            }
+
+            raw.Append('"');
+            return new JNode
+            {
+                Kind = JKind.Text,
+                Str = sb.ToString(),
+                Raw = CanonicalizeHexEscapes(raw.ToString()),
+                Raw5 = payload,
+            };
+        }
+
+        private static int HexDigit(char c) => c switch
+        {
+            >= '0' and <= '9' => c - '0',
+            >= 'a' and <= 'f' => c - 'a' + 10,
+            >= 'A' and <= 'F' => c - 'A' + 10,
+            _ => 0,
+        };
+
+        /// <summary>
+        /// Re-renders a JSON5 string's verbatim source into canonical JSON text:
+        /// \x and \v escapes convert to \u00XX (SQLite renders \v as the
+        /// horizontal-tab escape through 3.51.1), line continuations drop, \0
+        /// becomes \u0000, and standard escapes pass through untouched.
+        /// </summary>
+        private static string CanonicalizeHexEscapes(string source)
+        {
+            var result = new StringBuilder(source.Length + 8);
+            result.Append('"');
+            for (var index = 1; index < source.Length - 1; index++)
+            {
+                var character = source[index];
+                if (character != '\\' || index + 1 >= source.Length - 1)
+                {
+                    if (character < 0x20)
+                    {
+                        result.Append("\\u");
+                        result.Append(((int)character).ToString("x4", CultureInfo.InvariantCulture));
+                    }
+                    else
+                    {
+                        result.Append(character);
+                    }
+                    continue;
+                }
+
+                var escaped = source[++index];
+                if (escaped == 'x' && index + 2 < source.Length - 1)
+                {
+                    result.Append("\\u00");
+                    result.Append(source[index + 1]);
+                    result.Append(source[index + 2]);
+                    index += 2;
+                    continue;
+                }
+
+                if (escaped == '0')
+                {
+                    result.Append("\\u0000");
+                    continue;
+                }
+                if (escaped == 'v')
+                {
+                    // SQLite (through 3.51.1) renders the JSON5 vertical-tab
+                    // escape with the horizontal-tab escape, and we are
+                    // bug-compatible with that; extraction decodes the stored
+                    // \v directly and still yields the real 0x0B byte.
+                    result.Append("\\u0009");
+                    continue;
+                }
+                if (escaped == '\u2028' || escaped == '\u2029')
+                    continue;
+                if (escaped == '\n')
+                    continue;
+                if (escaped == '\r')
+                {
+                    if (index + 1 < source.Length - 1 && source[index + 1] == '\n')
+                        index++;
+                    continue;
+                }
+                if (escaped == '\'')
+                {
+                    result.Append('\'');
+                    continue;
+                }
+
+                result.Append('\\').Append(escaped);
+            }
+
+            result.Append('"');
+            return result.ToString();
         }
 
         private static void Serialize(JNode node, StringBuilder sb)
@@ -50550,7 +51442,15 @@ out bool hasReturning)
         }
 
         private static EmbeddedSqlException BadPath(string path)
-            => new($"bad JSON path: '{path}'");
+        {
+            // SQLite formats the path with %Q, which wraps in single quotes,
+            // doubles embedded apostrophes, and reads a C string — so the
+            // message stops at an embedded NUL.
+            var nul = path.IndexOf('\0');
+            var cstring = nul >= 0 ? path[..nul] : path;
+            return new EmbeddedSqlException(
+                $"bad JSON path: '{cstring.Replace("'", "''", StringComparison.Ordinal)}'");
+        }
 
         private static string FormatJsonReal(double d)
         {
@@ -50616,6 +51516,38 @@ out bool hasReturning)
             return parser.AtEnd ? node : null;
         }
 
+        /// <summary>
+        /// Parses like <see cref="TryParseJson5"/> but also reports whether the
+        /// text used any JSON5-only syntax, which json_valid needs to tell
+        /// strict RFC 8259 documents apart from merely parseable ones. Text
+        /// stops at the first NUL like SQLite.
+        /// </summary>
+        private static (JNode? Node, bool HasJson5) TryParseTracking(ReadOnlySpan<byte> bytes)
+        {
+            // SQLite parses the text up to the first NUL byte.
+            var zero = bytes.IndexOf((byte)0);
+            var slice = zero >= 0 ? bytes[..zero] : bytes;
+            string text;
+            try
+            {
+                text = JsonbUtf8.GetString(slice);
+            }
+            catch (DecoderFallbackException)
+            {
+                return (null, false);
+            }
+
+            var parser = new Parser(text, 0, json5: true);
+            parser.SkipWs();
+            var node = parser.ParseValue();
+            if (node is null)
+                return (null, false);
+            parser.SkipWs();
+            if (!parser.AtEnd)
+                return (null, false);
+            return (node, parser.Json5Seen);
+        }
+
         private static JNode? TryParseJson5(string s)
         {
             var parser = new Parser(s, 0, json5: true);
@@ -50633,6 +51565,7 @@ out bool hasReturning)
             private readonly bool _json5;
             private int _i;
             private int _errorPosition = -1;
+            private bool _json5Seen;
 
             public Parser(string s, int start)
                 : this(s, start, json5: false)
@@ -50652,6 +51585,11 @@ out bool hasReturning)
 
             public int ErrorPosition => _errorPosition;
 
+            /// <summary>Whether any JSON5-only syntax was consumed, which keeps a TEXT5 string element from demoting to TEXTJ when a standard escape follows it.</summary>
+            public bool Json5Seen => _json5Seen;
+
+            private void MarkJson5() => _json5Seen = true;
+
             public void SkipWs()
             {
                 while (_i < _s.Length)
@@ -50670,6 +51608,7 @@ out bool hasReturning)
                             _i += 2;
                             while (_i < _s.Length && _s[_i] != '\n')
                                 _i++;
+                            MarkJson5();
                             continue;
                         }
 
@@ -50679,6 +51618,7 @@ out bool hasReturning)
                             while (_i + 1 < _s.Length && !(_s[_i] == '*' && _s[_i + 1] == '/'))
                                 _i++;
                             _i = _i + 1 < _s.Length ? _i + 2 : _s.Length;
+                            MarkJson5();
                             continue;
                         }
                     }
@@ -50711,6 +51651,7 @@ out bool hasReturning)
                     case '"':
                         return ParseString();
                     case '\'' when _json5:
+                        MarkJson5();
                         return ParseString();
                     case 't':
                         return ParseLiteral("true", JKind.True);
@@ -50721,6 +51662,7 @@ out bool hasReturning)
                         if (_json5 && MatchesIgnoreCase("nan"))
                         {
                             _i += 3;
+                            MarkJson5();
                             return new JNode { Kind = JKind.Null };
                         }
 
@@ -50729,7 +51671,10 @@ out bool hasReturning)
                         if (c == '-' || char.IsAsciiDigit(c))
                             return ParseNumber();
                         if (_json5 && (c == '+' || c == '.' || c is 'I' or 'i'))
+                        {
+                            MarkJson5();
                             return ParseNumber();
+                        }
                         RecordFailure();
                         return null;
                 }
@@ -50758,6 +51703,7 @@ out bool hasReturning)
 
             private JNode? ParseNumber()
             {
+                int numberStart = _i;
                 int start = _i;
                 bool negative = false;
                 if (_i < _s.Length && _s[_i] == '-')
@@ -50769,19 +51715,23 @@ out bool hasReturning)
                 {
                     // (2) JSON5 explicit-plus numbers: the sign is consumed and dropped so the
                     // canonical form matches the unsigned spelling.
+                    MarkJson5();
                     _i++;
                     start = _i;
                 }
 
                 if (_i >= _s.Length)
                 {
-                    RecordFailure();
+                    // A bare sign has no mantissa at all: SQLite reports at the
+                    // start of the number (the sign itself).
+                    RecordFailure(numberStart);
                     return null;
                 }
 
                 if (_json5 && (_s[_i] is 'I' or 'i'))
                 {
                     // (5) JSON5 Infinity: canonicalized to SQLite's 9e999 spelling.
+                    MarkJson5();
                     if (!MatchesIgnoreCase("infinity"))
                     {
                         RecordFailure();
@@ -50808,6 +51758,7 @@ out bool hasReturning)
                 if (_json5 && _s[_i] == '0' && _i + 1 < _s.Length && (_s[_i + 1] is 'x' or 'X'))
                 {
                     // (1) JSON5 hexadecimal numbers: canonicalized to a decimal integer.
+                    MarkJson5();
                     _i += 2;
                     int hexStart = _i;
                     while (_i < _s.Length && HexValue(_s[_i]) >= 0)
@@ -50844,11 +51795,13 @@ out bool hasReturning)
                 else if (_json5 && _s[_i] == '.')
                 {
                     // (3) JSON5 leading-dot numbers: ".5" canonicalizes to "0.5".
+                    // The dot itself is consumed by the fraction block below.
+                    MarkJson5();
                     leadingDot = true;
                 }
                 else
                 {
-                    RecordFailure();
+                    RecordFailure(numberStart);
                     return null;
                 }
 
@@ -50857,26 +51810,33 @@ out bool hasReturning)
                 if (_i < _s.Length && _s[_i] == '.')
                 {
                     isReal = true;
+                    int dot = _i;
                     _i++;
                     if (_i >= _s.Length || !char.IsAsciiDigit(_s[_i]))
                     {
-                        // (4) JSON5 trailing-dot numbers: "42." canonicalizes to "42.0".
-                        if (!_json5 || leadingDot)
+                        if (leadingDot)
                         {
-                            RecordFailure();
+                            // A leading dot needs a digit after it: SQLite reports
+                            // an unsigned bare dot at the dot and a signed one
+                            // just after it.
+                            RecordFailure(negative || numberStart != start ? dot + 1 : dot);
                             return null;
                         }
 
+                        // (4) JSON5 trailing-dot numbers: "42." canonicalizes to "42.0",
+                        // and "5.e2" keeps the exponent.
+                        if (!_json5)
+                        {
+                            RecordFailure(dot);
+                            return null;
+                        }
+
+                        MarkJson5();
                         trailingDot = true;
                     }
 
                     while (_i < _s.Length && char.IsAsciiDigit(_s[_i]))
                         _i++;
-                }
-                else if (leadingDot)
-                {
-                    RecordFailure();
-                    return null;
                 }
 
                 if (_i < _s.Length && (_s[_i] == 'e' || _s[_i] == 'E'))
@@ -50892,6 +51852,15 @@ out bool hasReturning)
                     }
                     while (_i < _s.Length && char.IsAsciiDigit(_s[_i]))
                         _i++;
+                }
+
+                // A number holds at most one dot and one exponent: any leftover
+                // dot or exponent letter at this point is reported at the
+                // offending character (json5_numbers_reject_repeated_dots_and_exponents).
+                if (_i < _s.Length && (_s[_i] == '.' || _s[_i] == 'e' || _s[_i] == 'E'))
+                {
+                    RecordFailure(_i);
+                    return null;
                 }
 
                 string raw = _s.Substring(start, _i - start);
@@ -50988,6 +51957,11 @@ out bool hasReturning)
                                     _i++;
                                 json5Only = true;
                                 break;
+                            case '\u2028' when _json5:
+                            case '\u2029' when _json5:
+                                // JSON5 line continuation over the Unicode line separators.
+                                json5Only = true;
+                                break;
                             case 'x' when _json5:
                                 if (_i + 2 >= _s.Length)
                                 {
@@ -50995,6 +51969,7 @@ out bool hasReturning)
                                     return null;
                                 }
 
+                                MarkJson5();
                                 int hex = 0;
                                 for (int k = 1; k <= 2; k++)
                                 {
@@ -51056,88 +52031,82 @@ out bool hasReturning)
 
                 string text = sb.ToString();
                 var source = _s.Substring(start, _i - start);
-                string raw = quote == '"' && !json5Only
-                    ? source
-                    : quote == '"' && source.Contains("\\x", StringComparison.Ordinal)
-                        ? CanonicalizeHexEscapes(source)
-                        : QuoteString(text);
-                return new JNode { Kind = JKind.Text, Raw = raw, Str = text };
-            }
-
-            private static string CanonicalizeHexEscapes(string source)
-            {
-                var result = new StringBuilder(source.Length + 8);
-                result.Append('"');
-                for (var index = 1; index < source.Length - 1; index++)
+                // A strict double-quoted string keeps its verbatim source. A JSON5
+                // string keeps its verbatim payload for the JSONB TEXT5 element
+                // (upstream stores the raw escapes) and canonicalizes for the
+                // rendered text: \x and \v re-render through \u (SQLite renders
+                // \v as the horizontal-tab escape, through 3.51.1), line
+                // continuations are dropped, and standard escapes pass through.
+                string raw;
+                string? raw5 = null;
+                if (quote == '"')
                 {
-                    var character = source[index];
-                    if (character != '\\' || index + 1 >= source.Length - 1)
+                    if (!json5Only)
                     {
-                        if (character < 0x20)
-                        {
-                            result.Append("\\u");
-                            result.Append(((int)character).ToString("x4", CultureInfo.InvariantCulture));
-                        }
-                        else
-                        {
-                            result.Append(character);
-                        }
-                        continue;
+                        raw = source;
                     }
-
-                    var escaped = source[++index];
-                    if (escaped == 'x' && index + 2 < source.Length - 1)
+                    else
                     {
-                        result.Append("\\u00");
-                        result.Append(source[index + 1]);
-                        result.Append(source[index + 2]);
-                        index += 2;
-                        continue;
+                        raw5 = source[1..^1];
+                        raw = CanonicalizeHexEscapes(source);
                     }
-
-                    if (escaped == '0')
-                    {
-                        result.Append("\\u0000");
-                        continue;
-                    }
-                    if (escaped == 'v')
-                    {
-                        result.Append("\\u000b");
-                        continue;
-                    }
-                    if (escaped == '\n')
-                        continue;
-                    if (escaped == '\r')
-                    {
-                        if (index + 1 < source.Length - 1 && source[index + 1] == '\n')
-                            index++;
-                        continue;
-                    }
-                    if (escaped == '\'')
-                    {
-                        result.Append('\'');
-                        continue;
-                    }
-
-                    result.Append('\\').Append(escaped);
+                }
+                else
+                {
+                    // (6) Single-quoted strings store their content verbatim in a
+                    // TEXT5 element; the rendered text re-quotes with '"'.
+                    raw5 = source[1..^1];
+                    raw = QuoteString(text);
                 }
 
-                result.Append('"');
-                return result.ToString();
+                if (json5Only)
+                    MarkJson5();
+                return new JNode { Kind = JKind.Text, Raw = raw, Raw5 = raw5, Str = text };
             }
 
-            // (7) JSON5 unquoted object keys: a bare ECMAScript-style identifier is accepted as a
-            // key and re-emitted in canonical double-quoted form.
+            // (7) JSON5 unquoted object keys: a bare ECMAScript-style identifier is
+            // accepted as a key and re-emitted in canonical double-quoted form.
+            // SQLite's identifier rules: ASCII letters, '_' and '$' may start one,
+            // digits only continue one, non-ASCII characters are accepted, and a
+            // \uXXXX escape may appear anywhere (whatever it decodes to; kept
+            // verbatim for rendering while path matching decodes it). No other
+            // escape is allowed. A comment directly after the key acts as
+            // whitespace, ending the key.
             private JNode? ParseUnquotedKey()
             {
                 int start = _i;
+                var key = new StringBuilder();
                 while (_i < _s.Length)
                 {
                     char c = _s[_i];
-                    if (char.IsLetterOrDigit(c) || c == '_' || c == '$')
+                    if (char.IsAsciiLetter(c) || c == '_' || c == '$'
+                        || (c >= 0x7f && !char.IsSurrogate(c))
+                        || (key.Length > 0 && char.IsAsciiDigit(c)))
+                    {
+                        key.Append(c);
                         _i++;
-                    else
-                        break;
+                        continue;
+                    }
+
+                    if (c == '\\' && _i + 1 < _s.Length && _s[_i + 1] == 'u')
+                    {
+                        // \uXXXX escapes are accepted without being validated as
+                        // identifiers; the escape is kept verbatim in the rendered
+                        // key while the decoded value is used for matching.
+                        if (_i + 5 >= _s.Length
+                            || HexValue(_s[_i + 2]) < 0 || HexValue(_s[_i + 3]) < 0
+                            || HexValue(_s[_i + 4]) < 0 || HexValue(_s[_i + 5]) < 0)
+                        {
+                            RecordFailure(_i);
+                            return null;
+                        }
+
+                        key.Append(_s, _i, 6);
+                        _i += 6;
+                        continue;
+                    }
+
+                    break;
                 }
 
                 if (_i == start)
@@ -51148,12 +52117,44 @@ out bool hasReturning)
 
                 if (char.IsAsciiDigit(_s[start]))
                 {
+                    // A digit cannot start an identifier.
                     RecordFailure(start);
                     return null;
                 }
 
-                string text = _s.Substring(start, _i - start);
-                return new JNode { Kind = JKind.Text, Raw = QuoteString(text), Str = text };
+                MarkJson5();
+                string text = key.ToString();
+                // The key text is identifier characters and \uXXXX escapes only,
+                // so it is already safe inside quotes; the escape stays verbatim
+                // in the rendered key while matching decodes it.
+                return new JNode
+                {
+                    Kind = JKind.Text,
+                    Raw = "\"" + text + "\"",
+                    Str = DecodeKeyEscapes(text),
+                };
+            }
+
+            private static string DecodeKeyEscapes(string text)
+            {
+                if (!text.Contains('\\', StringComparison.Ordinal))
+                    return text;
+                var result = new StringBuilder(text.Length);
+                for (var index = 0; index < text.Length; index++)
+                {
+                    if (text[index] == '\\' && index + 5 < text.Length && text[index + 1] == 'u')
+                    {
+                        int cp = 0;
+                        for (int k = 2; k <= 5; k++)
+                            cp = (cp * 16) + HexValue(text[index + k]);
+                        result.Append((char)cp);
+                        index += 5;
+                        continue;
+                    }
+
+                    result.Append(text[index]);
+                }
+                return result.ToString();
             }
 
             private JNode? ParseArray()
@@ -51190,6 +52191,7 @@ out bool hasReturning)
                             SkipWs();
                             if (_i < _s.Length && _s[_i] == ']')
                             {
+                                MarkJson5();
                                 _i++;
                                 break;
                             }
@@ -51259,7 +52261,7 @@ out bool hasReturning)
                     var v = ParseValue();
                     if (v is null)
                         return null;
-                    members.Add(new JMember { RawKey = key.Raw, Key = key.Str, Value = v });
+                    members.Add(new JMember { RawKey = key.Raw, RawKey5 = key.Raw5, Key = key.Str, Value = v });
                     SkipWs();
                     if (_i >= _s.Length)
                     {
@@ -51276,6 +52278,7 @@ out bool hasReturning)
                             SkipWs();
                             if (_i < _s.Length && _s[_i] == '}')
                             {
+                                MarkJson5();
                                 _i++;
                                 break;
                             }

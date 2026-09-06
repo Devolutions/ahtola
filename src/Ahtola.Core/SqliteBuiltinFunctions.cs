@@ -52,6 +52,7 @@ internal static class SqliteBuiltinFunctions
         "LAST_INSERT_ROWID", "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "LIKE", "LOWER", "NULLIF", "OCTET_LENGTH", "FORMAT", "PRINTF",
         "STRPOS",
         "STRFTIME", "TIME", "TYPEOF", "UNIXEPOCH", "UPPER",
+        "SUBTYPE",
         "UUID4_STR", "GEN_RANDOM_UUID", "UUID4", "UUID7_STR", "UUID7", "UUID7_TIMESTAMP_MS",
         "UUID_STR", "UUID_BLOB",
         "BOOLEAN_TO_INT", "INT_TO_BOOLEAN", "VALIDATE_IPADDR",
@@ -227,7 +228,8 @@ internal static class SqliteBuiltinFunctions
         if (normalized is "NEXTVAL" or "CURRVAL")
             return [1];
         if (normalized is "TRIM" or "BTRIM" or "LTRIM" or "RTRIM" or "ROUND" or "LOG"
-            or "UNHEX" or "JSON_ARRAY_LENGTH" or "JSON_TYPE" or "JSON_PRETTY" or "RTREECHECK")
+            or "UNHEX" or "JSON_ARRAY_LENGTH" or "JSON_TYPE" or "JSON_PRETTY" or "RTREECHECK"
+            or "JSON_VALID")
         {
             return [1, 2];
         }

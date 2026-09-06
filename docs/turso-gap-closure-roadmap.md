@@ -517,3 +517,42 @@ Each workstream must cite the matching Turso source, add focused tests, run the
 smallest affected managed suite through `Invoke-ManagedTestSuite.ps1`, run the
 full affected sqltest file(s), remove newly passing expected-failure entries,
 and keep the shipped closure pure managed, trim-safe, and NativeAOT-safe.
+
+- 2026-09-06: **json conformance wave** (the 45-case json-valid-strict cluster
+  closed, 152 expected-failures remain):
+  - Two-argument `json_valid(X, Y)`: Y is a bitmask (1 = strict RFC 8259 text,
+    2 = JSON5 text, 4 = blob that superficially looks like JSONB, 8 = blob that
+    is fully valid JSONB) and X is valid when any selected check passes. The
+    FLAGS argument coerces like sqlite3_value_int (numeric conversion, text and
+    blobs take their leading integer prefix), and out-of-range flags error with
+    SQLite's exact message. The parser now tracks which constructs were JSON5
+    (unquoted keys, single quotes, trailing commas, comments, hex numbers,
+    leading `+`/`.` and trailing `.`, Infinity/NaN, `\x`/`\v`/`\0` escapes, raw
+    control bytes, line continuations), and the marking survives later standard
+    escapes exactly like upstream's TEXT5/TEXTJ element-type promotion.
+  - A byte-faithful port of SQLite's jsonbValidityCheck drives flags 4/8 and
+    json_error_position on JSONB blobs: shallow outer-header classification with
+    the ambiguous small `{`/`[`/digit-blob fallback to strict validation,
+    32-bit nine-byte header reads, bare-header requirements for NULL/TRUE/FALSE,
+    digit/hex/canonical-float payload checks, TEXTJ/TEXT5 escape validation
+    including the strchr backslash-NUL bug-compatibility, line continuations,
+    the blind \u conversion after a continuation, and the 1000-deep nesting
+    limit. Non-JSONB blobs and text validate as before, and document parsing
+    now stops at the first embedded NUL like SQLite.
+  - JSON5 leniencies: numbers need a mantissa digit with SQLite's error
+    positions (bare dot at the dot, signed just after the dot, exponent-less
+    forms at the number start, repeated dots/exponents at the offending
+    character); `\` + U+2028/U+2029 line continuations; unquoted keys follow
+    SQLite's identifier rules (letters/`_`/`$` start, digits continue,
+    non-ASCII accepted) with `\uXXXX` escapes kept verbatim in the rendered key
+    while matching decodes them and every other escape rejected; comments after
+    a key act as whitespace; the vertical-tab escape renders through
+    `\u0009` (SQLite through 3.51.1 bug-compatibility) while extraction still
+    yields 0x0B.
+  - JSONB TEXT5 payloads store verbatim JSON5 escapes (hex(jsonb('"\x41\n"'))
+    is a TEXT5 element with the raw source), and TEXT5 payloads re-read through
+    a dedicated decoder so json(jsonb(...)) round-trips.
+  - `subtype(X)` builtin: 74 for text carrying the JSON subtype, 0 for
+    everything else including JSONB blobs.
+  - Bad-path messages use SQLite's %Q: apostrophes doubled, embedded NUL ends
+    the message.

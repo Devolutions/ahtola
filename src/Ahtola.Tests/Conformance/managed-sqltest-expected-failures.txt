@@ -50,51 +50,6 @@ from-subquery-affinity.sqltest::derived-table-compound-select-real-blob-leading-
 gencol.sqltest::gencol_stored_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 gencol.sqltest::gencol_stored_generated_always_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 join/outer_hash_join.sqltest::full-outer-with-not-exists-subquery | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
-json/json-valid-strict.sqltest::json_valid_json5_marking_survives_later_standard_escape | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '0/0/0/695C7834315C6E' but was '0/0/0/885C75303034315C6E'
-json/json-valid-strict.sqltest::json_valid_infinite_float_argument_is_invalid | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '0/0' but was '1/1'
-json/json-valid-strict.sqltest::json5_numbers_need_a_mantissa_digit | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json5_numbers_reject_repeated_dots_and_exponents | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag2_accepts_json5_text | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_blob_flags_match_jsonb_blobs_only | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag4_is_shallow_flag8_is_deep | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag8_checks_numeric_payloads | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flags_classify_blob_before_whitespace | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flags_ambiguous_small_blob_is_text | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_text_never_matches_blob_flags | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flags_combine_as_bitmask | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_two_arg_numbers_render_as_text | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_two_arg_null_x_is_null | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flags_coerce_numerically | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_text_flags_use_integer_prefix | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flags_zero_is_an_error | database variant 1/1 (:memory:): error 'wrong number of arguments to function json_valid()' does not match pattern '^FLAGS parameter to json_valid\(\) must be between 1 and 15$'
-json/json-valid-strict.sqltest::json_valid_flags_sixteen_is_an_error | database variant 1/1 (:memory:): error 'wrong number of arguments to function json_valid()' does not match pattern '^FLAGS parameter to json_valid\(\) must be between 1 and 15$'
-json/json-valid-strict.sqltest::json_valid_flags_null_is_an_error_even_for_null_x | database variant 1/1 (:memory:): error 'wrong number of arguments to function json_valid()' does not match pattern '^FLAGS parameter to json_valid\(\) must be between 1 and 15$'
-json/json-valid-strict.sqltest::json_valid_flag8_checks_string_escapes | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag8_rejects_extended_headers_on_primitives | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag8_accepts_non_utf8_text_payloads | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag8_accepts_backslash_nul_like_sqlite | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag8_bounds_escape_lookahead_to_the_payload | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag8_skips_hex_checks_for_u_after_continuation | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flags_accept_nine_byte_size_headers | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag8_rejects_nine_byte_headers_on_primitives | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_valid_flag8_depth_limit | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json5_line_continuation_u2028_u2029 | database variant 1/1 (:memory:): expected success but got error: malformed JSON
-json/json-valid-strict.sqltest::json5_vertical_tab_escape_decodes_to_0x0b | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '780B7A/{"a":"x\u0009z"}' but was '780B7A/{"a":"x\u000bz"}'
-json/json-valid-strict.sqltest::json5_unquoted_key_charset | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json5_unquoted_key_rejects_illegal_characters | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json5_unquoted_key_accepts_unicode_escapes | database variant 1/1 (:memory:): expected success but got error: malformed JSON
-json/json-valid-strict.sqltest::json5_unquoted_key_rejects_other_escapes | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json5_unquoted_key_ends_at_comment | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_append_across_array_header_size_boundary | database variant 1/1 (:memory:): expected success but got error: wrong number of arguments to function json_valid()
-json/json-valid-strict.sqltest::json_bad_path_message_doubles_apostrophes | database variant 1/1 (:memory:): error 'bad JSON path: 'x'y'z'' does not match pattern '^(Parse error: )?bad JSON path: 'x''y''z'$'
-json/json-valid-strict.sqltest::json_bad_path_message_stops_at_nul | database variant 1/1 (:memory:): error 'bad JSON path: 'x\0y'' does not match pattern '^(Parse error: )?bad JSON path: 'x'$'
-json/json-valid-strict.sqltest::subtype_reports_json_text_only | database variant 1/1 (:memory:): expected success but got error: no such function: SUBTYPE
-json/json-valid-strict.sqltest::double_arrow_result_never_carries_subtype | database variant 1/1 (:memory:): expected success but got error: no such function: SUBTYPE
-json/json-valid-strict.sqltest::patch_and_error_position_accept_blobs | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"a":1,"b":2}/{"a":1,"b":2}/{}/0/0/1' but was '{"a":1,"b":2}/{"a":1,"b":2}/{}/1/0/1'
-json/json-valid-strict.sqltest::subtype_marks_json_values_not_metadata | database variant 1/1 (:memory:): expected success but got error: no such function: SUBTYPE
-json/json-valid-strict.sqltest::patch_json_null_result_stays_json | database variant 1/1 (:memory:): expected success but got error: no such function: SUBTYPE
-json/json-valid-strict.sqltest::json_error_position_reports_jsonb_offsets | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '4/2/2/0/0/1' but was '1/1/1/0/0/1'
-json/json-valid-strict.sqltest::json_text_stops_at_first_nul | database variant 1/1 (:memory:): expected success but got error: malformed JSON
 multi_index_or_compound.sqltest::compound-or-analyzed-benchmark-shape-eqp | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH e USING INDEX idx_edge_label (label=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 partial_idx.sqltest::plan-partial-index-equality-predicate | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH products USING COVERING INDEX idx_active_sku (sku=?)' but was '1/0/0/SEARCH products USING INDEX idx_acti
 partial_idx.sqltest::plan-partial-index-range-predicate | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH products USING COVERING INDEX idx_expensive (sku=?)' but was '1/0/0/SEARCH products USING INDEX idx_expen
