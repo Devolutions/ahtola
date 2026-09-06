@@ -556,3 +556,18 @@ and keep the shipped closure pure managed, trim-safe, and NativeAOT-safe.
     everything else including JSONB blobs.
   - Bad-path messages use SQLite's %Q: apostrophes doubled, embedded NUL ends
     the message.
+
+- 2026-09-06 (continued): **compound ORDER BY + hex-negation overflow wave**
+  (6 more vendored cases closed, 146 expected-failures remain):
+  - A compound SELECT's ORDER BY term now matches an arm's projection
+    structurally (function calls like `upper(b)`, arithmetic, and qualified
+    references against an aliased output), porting Turso's
+    resolve_compound_order_by_expr + exprs_are_equivalent (select.rs/util.rs):
+    identifiers compare case-insensitively and commutative binary operators
+    match with sides swapped.
+  - A negated hex literal folds at parse time like SQLite's codeInteger:
+    `-0xNNNN` becomes the negated integer while the magnitude fits, and
+    `-0x8000000000000000` is the prepare-time "hex literal too big" error.
+    The ALTER TABLE ADD COLUMN backfill still promotes the negation to the
+    REAL 2^63 (upstream eval_constant_default_value), while INSERT
+    code-generation and direct SELECT hit the error (upstream issue #4621).

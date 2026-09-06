@@ -3521,12 +3521,47 @@ internal sealed class SqlParser
                 return new LiteralExpression(SqlValue.Integer(long.MinValue));
             }
 
+            var hexNegation = TryParseHexNegation();
+            if (hexNegation is not null)
+                return hexNegation;
+
             return new UnaryExpression(UnaryOperator.Negate, ParseUnary());
         }
         if (Consume(TokenKind.BitwiseNot))
             return new UnaryExpression(UnaryOperator.BitwiseNot, ParseUnary());
 
         return ParsePrimary();
+    }
+
+    /// <summary>
+    /// Folds a negated hex literal the way SQLite's codeInteger does: the value
+    /// negates directly while the magnitude fits, and negating
+    /// 0x8000000000000000 becomes the prepare-time "hex literal too big" error
+    /// (kept as a marker so the ALTER TABLE default backfill can still promote
+    /// it to the REAL 2^63). Must be called right after a Minus token.
+    /// </summary>
+    private Expression? TryParseHexNegation()
+    {
+        if (_lexer.Current is not { Kind: TokenKind.Integer } hexToken
+            || !hexToken.Text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (!ulong.TryParse(
+                hexToken.Text.AsSpan(2),
+                NumberStyles.AllowHexSpecifier,
+                CultureInfo.InvariantCulture,
+                out var hex))
+        {
+            return null;
+        }
+
+        _lexer.Next();
+        if (hex == 0x8000000000000000UL)
+            return new HexNegationOverflowExpression("-" + hexToken.Text);
+
+        return new LiteralExpression(SqlValue.Integer(-unchecked((long)hex)));
     }
 
     private Expression ParseSignedPrimary()
@@ -3540,6 +3575,10 @@ internal sealed class SqlParser
                 _lexer.Next();
                 return new LiteralExpression(SqlValue.Integer(long.MinValue));
             }
+
+            var hexNegation = TryParseHexNegation();
+            if (hexNegation is not null)
+                return hexNegation;
 
             return new UnaryExpression(UnaryOperator.Negate, ParseSignedPrimary());
         }
@@ -4329,6 +4368,15 @@ internal sealed class SqlParser
             return true;
         }
 
+        // The overflowing hex negation stays an expression: the ALTER backfill
+        // promotes it to the REAL 2^63, while INSERT code generation hits the
+        // prepare-time "hex literal too big" error like upstream.
+        if (expression is HexNegationOverflowExpression)
+        {
+            value = default;
+            return false;
+        }
+
         // DEFAULT expressions are resolved with no columns in scope, so a bare TRUE/FALSE
         // keyword is always the integer literal 1/0 and stays a constant default.
         if (expression is ColumnExpression { BooleanKeyword: { } keyword })
@@ -4343,9 +4391,14 @@ internal sealed class SqlParser
                 Operand: LiteralExpression right,
             })
         {
+            // Negating i64::MIN overflows: match SQLite's valueFromExpr, which
+            // promotes -(i64::MIN) to the REAL value 2^63 (upstream
+            // eval_constant_default_value, translate/alter.rs).
             value = right.Value.Kind switch
             {
-                SqlValueKind.Integer => SqlValue.Integer(-right.Value.AsInteger()),
+                SqlValueKind.Integer => right.Value.AsInteger() == long.MinValue
+                    ? SqlValue.Real(-(double)long.MinValue)
+                    : SqlValue.Integer(-right.Value.AsInteger()),
                 SqlValueKind.Real => SqlValue.Real(-right.Value.AsReal()),
                 _ => default,
             };

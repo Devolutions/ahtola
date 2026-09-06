@@ -31,12 +31,6 @@ agg_sum_overflow.sqltest::sum-overflow-forgiven-by-later-float | database varian
 aggregate-of-outer-column.sqltest::count-of-outer-column-is-an-aggregate-of-the-outer-query | database variant 1/1 (:memory:): expected 1 row(s), got 3 row(s); row 0 expected '3' but was '1'
 aggregate-of-outer-column.sqltest::count-of-outer-column-wins-over-the-subquerys-own-from | database variant 1/1 (:memory:): expected 1 row(s), got 3 row(s); row 0 expected '3' but was '2'
 aggregate-of-outer-column.sqltest::outer-where-filters-before-the-outer-aggregate | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s); row 0 expected '2' but was '1'
-alter-add-column-default-negate-overflow.sqltest::alter-add-column-default-negate-min-int | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/9.22337203685478e+18/real' but was '1/-9223372036854775808/integer'
-alter-add-column-default-negate-overflow.sqltest::alter-add-column-default-negate-min-int-parenthesized | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/9.22337203685478e+18/real' but was '1/-9223372036854775808/integer'
-alter-add-column-default-negate-overflow.sqltest::alter-add-column-default-negate-min-int-insert | database variant 1/1 (:memory:): expected an error but the statement succeeded
-alter-add-column-default-negate-overflow.sqltest::select-negate-min-int-hex-literal | database variant 1/1 (:memory:): expected an error but the statement succeeded
-compound-select-orderby.sqltest::union-all-order-by-function-expression | database variant 1/1 (:memory:): expected success but got error: 1st ORDER BY term does not match any column in the result set
-compound-select-orderby.sqltest::union-all-order-by-qualified-with-alias | database variant 1/1 (:memory:): expected success but got error: 1st ORDER BY term does not match any column in the result set
 cte.sqltest::table-referenced-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'not_a_function' is not supported: no module registration, planner, or execution contract is available. At SQL offset 28.' does not 
 delete-update-limit-rejected.sqltest::delete-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded

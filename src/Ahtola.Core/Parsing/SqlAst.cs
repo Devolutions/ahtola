@@ -953,6 +953,14 @@ internal sealed record ExistsExpression(QueryStatement Query, bool Negated) : Ex
 
 internal sealed record CollationExpression(Expression Expression, string Name) : Expression;
 
+/// <summary>
+/// A negated hex literal whose magnitude overflows i64 (<c>-0x8000000000000000</c>):
+/// SQLite's codeInteger rejects it at prepare time with "hex literal too big", while an
+/// ALTER TABLE ADD COLUMN backfill promotes the negation to the REAL value 2^63
+/// (valueFromExpr). The parser keeps the exact source text for the error message.
+/// </summary>
+internal sealed record HexNegationOverflowExpression(string Text) : Expression;
+
 internal sealed record CastExpression(Expression Expression, string TypeName) : Expression;
 
 internal sealed record CaseExpression(Expression? Operand, IReadOnlyList<CaseClause> Clauses, Expression? Else) : Expression;

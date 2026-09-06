@@ -10125,7 +10125,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         cancellationToken.ThrowIfCancellationRequested();
         switch (expression)
         {
-            case LiteralExpression or CurrentTimeExpression or ParameterExpression
+            case LiteralExpression or HexNegationOverflowExpression or CurrentTimeExpression or ParameterExpression
                 or StarExpression or QualifiedStarExpression:
                 return;
             case RowValueExpression rowValue:
@@ -27226,6 +27226,9 @@ out bool hasReturning)
         return expression switch
         {
             LiteralExpression => true,
+            // The overflowing hex negation folds to the prepare-time error, so it
+            // is constant-shaped for the compiler (the fold raises like upstream).
+            HexNegationOverflowExpression => true,
             BinaryExpression binary when TryMapArithmeticOperator(binary.Operator, out _)
                 => IsConstantScalarExpression(binary.Left) && IsConstantScalarExpression(binary.Right),
             UnaryExpression unary when TryMapArithmeticOperator(unary.Operator, out _)
@@ -28590,7 +28593,7 @@ out bool hasReturning)
     {
         switch (expression)
         {
-            case null or LiteralExpression or CurrentTimeExpression or ParameterExpression or RaiseExpression
+            case null or LiteralExpression or HexNegationOverflowExpression or CurrentTimeExpression or ParameterExpression or RaiseExpression
                 or ColumnExpression or StarExpression or QualifiedStarExpression:
                 return;
             case RowValueExpression row:
@@ -31223,7 +31226,7 @@ out bool hasReturning)
                 ValidateColumnReferences(binary.Left, row);
                 ValidateColumnReferences(binary.Right, row);
                 return;
-            case LiteralExpression or ParameterExpression or StarExpression or QualifiedStarExpression or ScalarSubqueryExpression or ExistsExpression:
+            case LiteralExpression or HexNegationOverflowExpression or ParameterExpression or StarExpression or QualifiedStarExpression or ScalarSubqueryExpression or ExistsExpression:
                 return;
             default:
                 throw new EmbeddedSqlException($"Unsupported expression type {expression.GetType().Name}.");
@@ -33151,14 +33154,43 @@ out bool hasReturning)
                         return index;
                 }
             }
+
+            // A qualified reference (t1.b) matches the arm's own projection of the
+            // same column even when that arm renamed it with an alias: binding the
+            // term against the arm's tables yields the same column the projection
+            // reads, whatever the output name is (select.rs binds before comparing).
+            if (column.Qualifier is not null)
+            {
+                foreach (var term in selectTerms)
+                {
+                    if (!TermReferencesSource(term, column.Qualifier))
+                        continue;
+
+                    for (var index = 0; index < term.Projections.Count; index++)
+                    {
+                        var projection = term.Projections[index].Expression;
+                        if (projection is ColumnExpression projectionColumn
+                            && string.Equals(
+                                projectionColumn.UnqualifiedName ?? projectionColumn.Name,
+                                column.UnqualifiedName ?? column.Name,
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            return index;
+                        }
+                    }
+                }
+            }
         }
 
+        // A general expression matches the arm's projection with the same shape,
+        // the way exprs_are_equivalent compares the bound ORDER BY term with each
+        // result column (select.rs): upper(b) matches an upper(b) projection.
         foreach (var term in selectTerms)
         {
             for (var index = 0; index < term.Projections.Count; index++)
             {
-                if (term.Projections[index].Expression.Equals(expression)
-                    || term.Projections[index].Expression.Equals(reference))
+                if (ExpressionsAreEquivalent(term.Projections[index].Expression, reference)
+                    || ExpressionsAreEquivalent(term.Projections[index].Expression, expression))
                     return index;
             }
         }
@@ -33168,6 +33200,139 @@ out bool hasReturning)
         throw new EmbeddedSqlException(
             $"{OrdinalSuffix(termNumber - 1)} ORDER BY term does not match any column in the result set");
     }
+
+    /// <summary>
+    /// Whether a compound-select arm reads from a table source whose effective
+    /// name (alias, or table name) matches <paramref name="qualifier"/>.
+    /// </summary>
+    private static bool TermReferencesSource(SelectStatement term, string qualifier)
+    {
+        if (term.Source is null)
+            return false;
+
+        bool Visit(TableSource source)
+            => source switch
+            {
+                NamedTableSource named => string.Equals(named.Alias ?? named.Name, qualifier, StringComparison.OrdinalIgnoreCase),
+                TableValuedFunctionSource tableFunction => string.Equals(tableFunction.Alias, qualifier, StringComparison.OrdinalIgnoreCase),
+                DerivedTableSource derived => string.Equals(derived.Alias, qualifier, StringComparison.OrdinalIgnoreCase),
+                JoinTableSource join => Visit(join.Left) || Visit(join.Right),
+                _ => false,
+            };
+
+        return Visit(term.Source);
+    }
+
+    /// <summary>
+    /// Structural expression equivalence mirroring Turso's exprs_are_equivalent
+    /// (util.rs): identifiers and function names compare case-insensitively, and
+    /// commutative binary operators also match with their sides swapped.
+    /// </summary>
+    private static bool ExpressionsAreEquivalent(Expression? left, Expression? right)
+    {
+        if (left is null || right is null)
+            return ReferenceEquals(left, right);
+
+        if (left is ColumnExpression leftColumn && right is ColumnExpression rightColumn)
+        {
+            // A qualified reference is equivalent to the same column spelled with
+            // its qualifier when both name the same column.
+            return string.Equals(leftColumn.Name, rightColumn.Name, StringComparison.OrdinalIgnoreCase)
+                && Equals(leftColumn.Qualifier, rightColumn.Qualifier);
+        }
+
+        if (left is BinaryExpression leftBinary && right is BinaryExpression rightBinary)
+        {
+            if (leftBinary.Operator != rightBinary.Operator)
+                return false;
+
+            if ((ExpressionsAreEquivalent(leftBinary.Left, rightBinary.Left)
+                    && ExpressionsAreEquivalent(leftBinary.Right, rightBinary.Right))
+                || (IsCommutative(leftBinary.Operator)
+                    && ExpressionsAreEquivalent(leftBinary.Left, rightBinary.Right)
+                    && ExpressionsAreEquivalent(leftBinary.Right, rightBinary.Left)))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        if (left is UnaryExpression leftUnary && right is UnaryExpression rightUnary)
+            return leftUnary.Operator == rightUnary.Operator
+                && ExpressionsAreEquivalent(leftUnary.Operand, rightUnary.Operand);
+
+        if (left is FunctionExpression leftFunction && right is FunctionExpression rightFunction)
+        {
+            if (!string.Equals(leftFunction.Name, rightFunction.Name, StringComparison.OrdinalIgnoreCase)
+                || leftFunction.CountStar != rightFunction.CountStar
+                || leftFunction.Distinct != rightFunction.Distinct
+                || leftFunction.Arguments.Count != rightFunction.Arguments.Count)
+            {
+                return false;
+            }
+
+            for (var index = 0; index < leftFunction.Arguments.Count; index++)
+            {
+                if (!ExpressionsAreEquivalent(leftFunction.Arguments[index], rightFunction.Arguments[index]))
+                    return false;
+            }
+
+            return true;
+        }
+
+        if (left is CollationExpression leftCollation && right is CollationExpression rightCollation)
+        {
+            return string.Equals(leftCollation.Name, rightCollation.Name, StringComparison.OrdinalIgnoreCase)
+                && ExpressionsAreEquivalent(leftCollation.Expression, rightCollation.Expression);
+        }
+
+        if (left is CastExpression leftCast && right is CastExpression rightCast)
+        {
+            return string.Equals(leftCast.TypeName, rightCast.TypeName, StringComparison.OrdinalIgnoreCase)
+                && ExpressionsAreEquivalent(leftCast.Expression, rightCast.Expression);
+        }
+
+        if (left is LiteralExpression leftLiteral && right is LiteralExpression rightLiteral)
+            return leftLiteral.Value.Equals(rightLiteral.Value);
+
+        if (left is BetweenExpression leftBetween && right is BetweenExpression rightBetween)
+        {
+            return leftBetween.Negated == rightBetween.Negated
+                && ExpressionsAreEquivalent(leftBetween.Value, rightBetween.Value)
+                && ExpressionsAreEquivalent(leftBetween.Lower, rightBetween.Lower)
+                && ExpressionsAreEquivalent(leftBetween.Upper, rightBetween.Upper);
+        }
+
+        if (left is InExpression leftIn && right is InExpression rightIn)
+        {
+            return leftIn.Negated == rightIn.Negated
+                && ExpressionsAreEquivalent(leftIn.Value, rightIn.Value)
+                && leftIn.Values.Count == rightIn.Values.Count
+                && leftIn.Values.Zip(rightIn.Values, ExpressionsAreEquivalent).All(static equivalent => equivalent);
+        }
+
+        if (left is CaseExpression leftCase && right is CaseExpression rightCase)
+        {
+            return ExpressionsAreEquivalent(leftCase.Operand, rightCase.Operand)
+                && leftCase.Clauses.Count == rightCase.Clauses.Count
+                && leftCase.Clauses.Zip(rightCase.Clauses, (leftClause, rightClause)
+                    => ExpressionsAreEquivalent(leftClause.When, rightClause.When)
+                        && ExpressionsAreEquivalent(leftClause.Then, rightClause.Then))
+                    .All(static equivalent => equivalent)
+                && ExpressionsAreEquivalent(leftCase.Else, rightCase.Else);
+        }
+
+        return left.Equals(right);
+    }
+
+    private static bool IsCommutative(BinaryOperator operatorKind)
+        => operatorKind is BinaryOperator.Equal
+            or BinaryOperator.NotEqual
+            or BinaryOperator.Multiply
+            or BinaryOperator.Add
+            or BinaryOperator.BitwiseAnd
+            or BinaryOperator.BitwiseOr;
 
     private SqlValue[][] ApplyDistinctLimit(
         IEnumerable<SqlValue[]> source,
@@ -37705,6 +37870,8 @@ out bool hasReturning)
         var result = expression switch
         {
             LiteralExpression literal => literal.Value,
+            HexNegationOverflowExpression hexNegation => throw new EmbeddedSqlException(
+                $"hex literal too big: {hexNegation.Text}"),
             CurrentTimeExpression current => current.Kind switch
             {
                 CurrentTimeKind.Date => SqliteDateTime.Execute([], SqliteDateTime.Func.Date),
@@ -57027,6 +57194,7 @@ Func<string, ParsedStatement> rewrite)
         {
             case null:
             case LiteralExpression:
+            case HexNegationOverflowExpression:
             case ParameterExpression:
             case ColumnExpression:
             case StarExpression:
@@ -60989,6 +61157,7 @@ internal sealed class EmbeddedTable
         {
             case LiteralExpression:
             case CurrentTimeExpression:
+            case HexNegationOverflowExpression:
                 return;
             case ColumnExpression column:
                 // A bare TRUE/FALSE keyword is the integer literal 1/0 unless a column of that
@@ -62137,8 +62306,12 @@ internal sealed class EmbeddedTable
             TableForeignKeys,
             Strict);
 
-        if (column.DefaultExpression is not null && Rows.Count > 0)
+        if (column.DefaultExpression is not null
+            && Rows.Count > 0
+            && !IsConstantDefaultExpression(column.DefaultExpression))
+        {
             throw new EmbeddedSqlException("Cannot add a column with non-constant default.");
+        }
 
         // Turso (translate/alter.rs strict_default_type_mismatch): the added column's constant
         // DEFAULT gets PLAIN affinity conversion without a strict storage-class throw. A STRICT
@@ -62146,7 +62319,7 @@ internal sealed class EmbeddedTable
         // rows, because upstream emits the validation as a table scan; an empty table defers the
         // failure to the first INSERT that stores the default (which hits the normal strict
         // storage-class check).
-        var defaultValue = CoerceColumnAffinity(column, column.DefaultValue ?? SqlValue.Null);
+        var defaultValue = CoerceColumnAffinity(column, EvaluateConstantDefault(column) ?? SqlValue.Null);
         if (Strict
             && Rows.Count > 0
             && defaultValue.Kind != SqlValueKind.Null
@@ -62180,6 +62353,77 @@ internal sealed class EmbeddedTable
             if (column.IsGenerated)
                 EmbeddedDatabase.ComputeGeneratedColumnsAfterAddColumn(this, Name, row);
         }
+    }
+
+    /// <summary>
+    /// Whether a DEFAULT expression is a constant one — literals (with the bare-identifier
+    /// string form already folded by the parser), unary +/- over a literal, and a single
+    /// parenthesized constant — mirroring Turso's is_strict_constant_default
+    /// (translate/alter.rs).
+    /// </summary>
+    private static bool IsConstantDefaultExpression(Expression expression)
+        => expression switch
+        {
+            LiteralExpression => true,
+            HexNegationOverflowExpression => true,
+            ColumnExpression { BooleanKeyword: not null } => true,
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Plus or UnaryOperator.Negate,
+                Operand: LiteralExpression or HexNegationOverflowExpression,
+            } => true,
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Plus or UnaryOperator.Negate,
+                Operand: ColumnExpression { BooleanKeyword: not null },
+            } => true,
+            _ => false,
+        };
+
+    /// <summary>
+    /// The backfill value an ALTER TABLE ADD COLUMN writes into pre-existing rows,
+    /// mirroring Turso's eval_constant_default_value (translate/alter.rs): the stored
+    /// constant default, with a negation that overflows i64 promoted to the REAL
+    /// magnitude (SQLite's valueFromExpr) instead of the prepare-time error the
+    /// expression paths raise.
+    /// </summary>
+    private static SqlValue? EvaluateConstantDefault(EmbeddedColumn column)
+    {
+        if (column.DefaultValue is { } value)
+            return value;
+
+        if (column.DefaultExpression is not { } expression)
+            return null;
+
+        return expression switch
+        {
+            HexNegationOverflowExpression => SqlValue.Real(-(double)long.MinValue),
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Negate,
+                Operand: LiteralExpression negated,
+            } => negated.Value.Kind switch
+            {
+                SqlValueKind.Integer => negated.Value.AsInteger() == long.MinValue
+                    ? SqlValue.Real(-(double)long.MinValue)
+                    : SqlValue.Integer(-negated.Value.AsInteger()),
+                SqlValueKind.Real => SqlValue.Real(-negated.Value.AsReal()),
+                _ => negated.Value,
+            },
+            UnaryExpression { Operator: UnaryOperator.Plus, Operand: LiteralExpression positive }
+                => positive.Value,
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Negate,
+                Operand: HexNegationOverflowExpression,
+            } => SqlValue.Real(-(double)long.MinValue),
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Plus,
+                Operand: HexNegationOverflowExpression,
+            } => SqlValue.Real(-(double)long.MinValue),
+            _ => null,
+        };
     }
 
     /// <summary>
