@@ -23,6 +23,9 @@ public sealed class LocaleCollationTests
     [TestCase("en-u-kf-sideways")]
     [TestCase("en-u-kn-maybe")]
     [TestCase("-leading-hyphen")]
+    [TestCase("zzz")] // syntactically valid but fictional: not distinguished from a real
+                      // unimplemented language, so it fails closed too (see below).
+    [TestCase("zzz-u-kn-true")]
     public void MalformedOrOutOfEnumerationLocaleTagFailsClosed(string tag)
     {
         var fileSystem = new InMemoryFileSystem();
@@ -35,19 +38,62 @@ public sealed class LocaleCollationTests
     }
 
     [Test]
-    public void SyntacticallyValidButUnknownLanguageFallsBackToRootOrdering()
+    [TestCase("sv")] // Swedish: å/ä/ö sort as distinct primary letters after 'z', not as accented a/o.
+    [TestCase("sv-SE")]
+    [TestCase("tr")] // Turkish: dotted/dotless I forms are distinct base letters, not a case pair.
+    [TestCase("tr-TR")]
+    [TestCase("de-u-co-phonebk")] // German phonebook: expands ö/ü/ä into two collation elements.
+    [TestCase("de")] // Bare German is also rejected: not a profile this port has verified end-to-end,
+                     // even though a spot check suggested default umlaut handling might coincide
+                     // with the generic Latin table for some inputs -- that is not the same as a
+                     // proven profile, so it stays out of the accepted allowlist.
+    [TestCase("fr-CA")] // French Canadian: a real, distinct BCP-47 region this port has not verified;
+                       // only fr-FR is an accepted profile.
+    [TestCase("fr-BE")]
+    [TestCase("fr")] // Bare French (no region) is also rejected: only the exact fr-FR profile
+                     // used by the pinned upstream test was verified.
+    [TestCase("es-MX")] // Other Spanish regions besides bare "es" are not verified.
+    [TestCase("en-US")] // Other English regions besides bare "en" are not verified.
+    [TestCase("es-u-co-phonebk")] // Any co value besides "trad" is rejected, even for Spanish.
+    [TestCase("en-u-co-trad")] // "trad" itself is only valid paired with Spanish.
+    public void KnownUnsupportedOrUnverifiedLocaleProfileFailsClosed(string tag)
     {
+        // These are all REAL, well-formed BCP-47 profiles with known or plausible collation
+        // behavior this port has not implemented/verified -- they must be rejected outright,
+        // never silently approximated with the generic Latin/root comparator (see
+        // LocaleCollationTag's accepted-profile allowlist and its remarks).
         var fileSystem = new InMemoryFileSystem();
-        using var database = EmbeddedDatabase.OpenFile("locale-unknown-language.db", fileSystem);
+        using var database = EmbeddedDatabase.OpenFile($"locale-unsupported-profile-{Math.Abs(tag.GetHashCode())}.db", fileSystem);
         using var connection = database.Connect();
 
-        // "zzz" is not a registered BCP-47 language, but it is syntactically valid, so it must
-        // resolve (root-equivalent ordering) rather than fail closed — mirroring Turso's own
-        // fallback to the CLDR root collation for an unrecognized language.
-        Query(connection, "SELECT 'a' < 'b' COLLATE 'zzz';")[0][0].AsInteger().Should().Be(1);
+        Action select = () => Query(connection, $"SELECT 'a' = 'b' COLLATE '{tag}';");
+        select.Should().Throw<EmbeddedSqlException>()
+            .WithMessage($"*no such collation sequence*{tag}*");
+    }
 
-        // The "kn" keyword must still take effect under an unknown language.
-        Query(connection, "SELECT '10' > '2' COLLATE 'zzz-u-kn-true';")[0][0].AsInteger().Should().Be(1);
+    [Test]
+    [TestCase("en")]
+    [TestCase("es")]
+    [TestCase("es-u-co-trad")]
+    [TestCase("fr-FR")]
+    [TestCase("en-u-kf-upper")]
+    [TestCase("en-u-kn-true")]
+    [TestCase("en-u-ks-level2")]
+    public void AcceptedProfileParsesAndResolvesSuccessfully(string tag)
+    {
+        // Completeness check for the allowlist itself: every profile this port claims to
+        // support must actually parse and resolve to a working comparator, not just avoid
+        // throwing for the rejected cases above.
+        LocaleCollationTag.TryParse(tag, out var parsed).Should().BeTrue($"'{tag}' is an accepted profile");
+        parsed.Should().NotBeNull();
+        LocaleCollationRegistry.TryResolve(tag, out var compare).Should().BeTrue();
+        compare.Should().NotBeNull();
+        compare!("a", "a").Should().Be(0);
+
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile($"locale-accepted-profile-{Math.Abs(tag.GetHashCode())}.db", fileSystem);
+        using var connection = database.Connect();
+        Query(connection, $"SELECT 'a' = 'a' COLLATE '{tag}';")[0][0].AsInteger().Should().Be(1);
     }
 
     [Test]

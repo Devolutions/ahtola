@@ -40,9 +40,47 @@ public enum LocaleCaseFirst
 /// singleton extension (e.g. <c>-t-</c>, <c>-a-</c>) is skipped structurally rather
 /// than interpreted.
 /// </para>
+/// <para>
+/// <b>Accepted profiles are an explicit, conservative allowlist — not full ICU
+/// parity.</b> Only the base locale/region combinations this port has actually
+/// implemented and verified against the pinned reference collator are accepted:
+/// bare <c>en</c>, bare <c>es</c> (with or without <c>co=trad</c>), and
+/// <c>fr-FR</c> exactly. A script subtag, a variant subtag, any other region
+/// (including <c>fr-CA</c> — real BCP-47, but not a profile this port has
+/// verified), and any other base language (including <c>sv</c> Swedish, whose
+/// å/ä/ö sort as distinct primary letters after 'z' rather than as accented
+/// a/o; <c>tr</c> Turkish, whose dotted/dotless I forms are distinct base
+/// letters rather than a case pair; and <c>de</c> German, whose <c>co=phonebk</c>
+/// tailoring expands ö/ü/ä into two collation elements) are all REJECTED by
+/// <see cref="TryParse"/> rather than silently falling back to a generic Latin
+/// comparator that would produce a plausible-looking but factually wrong order
+/// for those locales. Likewise, <c>co</c> is accepted only as the literal value
+/// <c>trad</c> and only paired with language <c>es</c>; every other <c>co</c>
+/// value (including real CLDR types this port has not implemented, such as
+/// <c>phonebk</c>, <c>pinyin</c>, <c>stroke</c>, <c>search</c>) is rejected. A
+/// syntactically well-formed but entirely fictional language subtag (e.g.
+/// <c>"zzz"</c>) is likewise rejected: this port does not attempt to
+/// distinguish "real language we have not implemented" from "not a real
+/// language at all" and fails closed for both, rather than risk silently
+/// approximating a real locale's ordering with generic Latin rules.
+/// </para>
 /// </remarks>
 public sealed record LocaleCollationTag
 {
+    /// <summary>
+    /// The base language/region combinations this port has implemented and
+    /// verified end-to-end against the pinned reference collator. Anything
+    /// outside this set is rejected by <see cref="TryParse"/> — see the type
+    /// remarks for why (known divergent tailoring for languages like Swedish/
+    /// Turkish, and unverified regional variants like French Canadian).
+    /// </summary>
+    private static readonly HashSet<(string Language, string? Region)> AcceptedProfiles = new()
+    {
+        ("en", null),
+        ("es", null),
+        ("fr", "fr"),
+    };
+
     private LocaleCollationTag(
         string canonicalName,
         string language,
@@ -70,12 +108,12 @@ public sealed record LocaleCollationTag
 
     /// <summary>
     /// The <c>co</c> (collation type) keyword value, lowercased, or <see langword="null"/>
-    /// when absent. Only <c>"trad"</c> (CLDR traditional Spanish tailoring — the
-    /// <c>ll</c>/<c>ch</c> digraph ordering) changes comparison behavior here; any
-    /// other value is accepted syntactically and falls back to the untailored
-    /// (root-equivalent) ordering, matching CLDR's own type-fallback rule that an
-    /// unrecognized/unavailable collation type falls back to the default tailoring
-    /// rather than failing.
+    /// when absent. The only value <see cref="TryParse"/> accepts is
+    /// <c>"trad"</c> paired with language <c>es</c> (CLDR traditional Spanish
+    /// tailoring — the <c>ll</c>/<c>ch</c> digraph ordering); any other value,
+    /// or <c>"trad"</c> paired with a different language, is REJECTED by
+    /// <see cref="TryParse"/> rather than silently falling back to untailored
+    /// ordering — see the type remarks.
     /// </summary>
     public string? CollationType { get; }
 
@@ -92,16 +130,19 @@ public sealed record LocaleCollationTag
     /// <summary>
     /// Attempts to parse <paramref name="tag"/> as a BCP-47 locale identifier
     /// carrying the Unicode locale extension keywords this port understands.
-    /// Returns <see langword="false"/> for structurally malformed tags or a
-    /// recognized keyword carrying an out-of-enumeration value — mirroring
-    /// <c>icu_locale::Locale::from_str</c>/<c>icu_collator::Collator::try_new</c>
-    /// failing closed for the same inputs (empirically verified: a bad <c>ks</c>
-    /// value is rejected by <c>Locale::from_str</c> itself with
-    /// <c>InvalidExtension</c>, and space/punctuation-bearing garbage is rejected
-    /// with <c>InvalidLanguage</c>). A syntactically valid but otherwise unknown
-    /// language subtag (e.g. <c>"not-a-real-locale-zzz"</c>) is accepted and
-    /// falls back to root-equivalent ordering, exactly as Turso's collator falls
-    /// back to the CLDR root collation for an unrecognized language.
+    /// Returns <see langword="false"/> for structurally malformed tags, a
+    /// recognized keyword carrying an out-of-enumeration value, OR a
+    /// syntactically well-formed tag that does not match one of
+    /// <see cref="AcceptedProfiles"/> (see the type remarks: this includes
+    /// known-different-tailoring languages like Swedish/Turkish/German
+    /// phonebook, unverified regional variants like <c>fr-CA</c>, and any
+    /// fictional language). Mirrors <c>icu_locale::Locale::from_str</c>/
+    /// <c>icu_collator::Collator::try_new</c> failing closed for malformed
+    /// input (empirically verified: a bad <c>ks</c> value is rejected by
+    /// <c>Locale::from_str</c> itself with <c>InvalidExtension</c>, and
+    /// space/punctuation-bearing garbage is rejected with
+    /// <c>InvalidLanguage</c>) — the accepted-profile allowlist is this port's
+    /// own additional, more conservative restriction on top of that.
     /// </summary>
     public static bool TryParse(string? tag, out LocaleCollationTag? result)
     {
@@ -117,21 +158,33 @@ public sealed record LocaleCollationTag
         var language = subtags[0].ToLowerInvariant();
         index++;
 
-        // Optional script subtag (4 alpha).
+        // Optional script subtag (4 alpha). No accepted profile carries a script
+        // subtag, so its mere presence disqualifies the tag below.
+        var hadScript = false;
         if (index < subtags.Length && subtags[index].Length == 4 && IsAlpha(subtags[index]))
+        {
+            hadScript = true;
             index++;
+        }
 
         // Optional region subtag (2 alpha or 3 digit).
+        string? region = null;
         if (index < subtags.Length
             && ((subtags[index].Length == 2 && IsAlpha(subtags[index]))
                 || (subtags[index].Length == 3 && IsDigits(subtags[index]))))
         {
+            region = subtags[index].ToLowerInvariant();
             index++;
         }
 
-        // Variant subtags: 5-8 alphanumeric, or 4 characters starting with a digit.
+        // Variant subtags: 5-8 alphanumeric, or 4 characters starting with a
+        // digit. No accepted profile carries a variant subtag either.
+        var hadVariant = false;
         while (index < subtags.Length && IsVariant(subtags[index]))
+        {
+            hadVariant = true;
             index++;
+        }
 
         var collationType = (string?)null;
         var caseFirst = LocaleCaseFirst.Off;
@@ -250,6 +303,22 @@ public sealed record LocaleCollationTag
             index++;
             while (index < subtags.Length && subtags[index].Length != 1)
                 index++;
+        }
+
+        // Accepted-profile allowlist: reject anything outside the base
+        // locale/region combinations this port has implemented and verified
+        // against the pinned reference collator, and any co value other than
+        // "trad" paired with "es" — see type remarks for why this is
+        // deliberately conservative rather than a best-effort fallback.
+        if (hadScript || hadVariant)
+            return false;
+        if (!AcceptedProfiles.Contains((language, region)))
+            return false;
+        if (collationType is not null
+            && !(string.Equals(collationType, "trad", StringComparison.Ordinal)
+                && string.Equals(language, "es", StringComparison.Ordinal)))
+        {
+            return false;
         }
 
         result = new LocaleCollationTag(
