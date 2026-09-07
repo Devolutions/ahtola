@@ -587,6 +587,97 @@ public sealed class BufferedWindowVdbeRoutingTests
         AssertMatchesSqlite(setup, query);
     }
 
+    // ---- WIN workstream: numeric lifecycle, moving MIN/MAX, moving GROUP_CONCAT -------------
+
+    [Test]
+    public void MovingSumStaysApproximateAfterTheFloatThatCausedItLeavesTheFrame()
+    {
+        // Once a float enters the sliding accumulator it stays approximate even after it is
+        // inverted back out and only integers remain, mirroring sumStep/sumInverse's sticky
+        // approx flag (never cleared by xInverse, only by a later forward float step).
+        string[] setup =
+        [
+            "CREATE TABLE tm(id INTEGER PRIMARY KEY, v);",
+            "INSERT INTO tm VALUES (1, 1.25), (2, 100), (3, 200), (4, 300);",
+        ];
+        const string query =
+            "SELECT id, typeof(sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) FROM tm ORDER BY id;";
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void MovingMinMaxPrefersTheNewestArgumentCollationTieAsRowsSlideThroughTheFrame()
+    {
+        // The moving MIN/MAX index is keyed on (collated value, sequence): among argument-
+        // collation ties the most recently added row represents the extremum, not the oldest.
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, txt TEXT COLLATE NOCASE);",
+            "INSERT INTO t VALUES (1,'b'),(2,'A'),(3,'a'),(4,'C'),(5,'c'),(6,'B');",
+        ];
+        const string query =
+            """
+            SELECT id,
+                   min(txt COLLATE NOCASE) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
+                   max(txt COLLATE NOCASE) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+            FROM t ORDER BY id;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void MovingSumPermanentlyLocksToNullAfterAnInfiniteCancellation()
+    {
+        // Once Inf and -Inf cancel to NaN in the running total (removing -Inf while it is still
+        // the sole accumulated value), sum() is permanently NULL for the rest of the partition,
+        // even once later rows swap the frame over to entirely finite or entirely +Inf values —
+        // mirrors sumStep's own "acc is Null and already approximate" early return, which never
+        // re-seeds from a later value once approximate.
+        string[] setup =
+        [
+            "CREATE TABLE ti(k REAL);",
+            "INSERT INTO ti VALUES (-9e999),(-1.0),(0.0),(2.5),(9e999),(9e999);",
+        ];
+        const string query =
+            """
+            SELECT k, quote(count(*) OVER w), quote(sum(k) OVER w)
+            FROM ti
+            WINDOW w AS (ORDER BY k ASC RANGE BETWEEN 1e308 PRECEDING AND 1e308 FOLLOWING)
+            ORDER BY k ASC;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void MovingGroupConcatEmptyPrefixNeverLeavesAStaleLeadingSeparator()
+    {
+        // Removing a head value whose own rendered text is empty must also strip the separator
+        // that preceded the *next* remaining value, so it never renders with a stale leading
+        // separator once it becomes the new head (mirrors groupConcatInverse's separator-queue
+        // bookkeeping in execute.rs).
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, sep TEXT);",
+            "INSERT INTO t VALUES (1,'','|'),(2,'','|'),(3,'x','|'),(4,'y','--');",
+        ];
+        const string query =
+            """
+            SELECT id,
+                   quote(group_concat(v, sep) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)),
+                   quote(string_agg(v, sep) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW))
+            FROM t ORDER BY id;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
     // ---- Helpers ---------------------------------------------------------------------------
 
     private static void AssertRoutesThroughWindowBuffer(IReadOnlyList<string> setup, string query)

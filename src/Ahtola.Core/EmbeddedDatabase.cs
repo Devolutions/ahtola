@@ -25480,10 +25480,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (function.Name is "MIN" or "MAX" && function.Arguments.Count == 1)
         {
             var maximum = function.Name == "MAX";
+            var minMaxCollation = GetEffectiveCollation(function.Arguments[0], context);
             return new VdbeAggregate
             {
                 Name = function.Name.ToLowerInvariant(),
-                CreateContext = () => new ExtremumAggregateAccumulator(maximum, Compare),
+                CreateContext = () => new ExtremumAggregateAccumulator(maximum, Compare, minMaxCollation),
                 Accumulate = (contextObject, arguments) =>
                 {
                     ((ExtremumAggregateAccumulator)contextObject!).Add(ValueOf(function.Arguments[0], arguments));
@@ -25495,6 +25496,33 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     return contextObject;
                 },
                 Finalize = static contextObject => ((ExtremumAggregateAccumulator)contextObject!).Finalize(),
+            };
+        }
+
+        if (function.Name is "GROUP_CONCAT" or "STRING_AGG"
+            && function.Arguments.Count is 1 or 2
+            && !function.Distinct
+            && function.AggregateOrderBy is not { Count: > 0 })
+        {
+            return new VdbeAggregate
+            {
+                Name = function.Name.ToLowerInvariant(),
+                CreateContext = static () => new GroupConcatAggregateAccumulator(),
+                Accumulate = (contextObject, arguments) =>
+                {
+                    var value = ValueOf(function.Arguments[0], arguments);
+                    var separator = function.Arguments.Count == 2
+                        ? ValueOf(function.Arguments[1], arguments)
+                        : SqlValue.Text(",");
+                    ((GroupConcatAggregateAccumulator)contextObject!).Add(value, separator);
+                    return contextObject;
+                },
+                Inverse = (contextObject, arguments) =>
+                {
+                    ((GroupConcatAggregateAccumulator)contextObject!).Remove(ValueOf(function.Arguments[0], arguments));
+                    return contextObject;
+                },
+                Finalize = static contextObject => ((GroupConcatAggregateAccumulator)contextObject!).Finalize(),
             };
         }
 
@@ -41582,12 +41610,17 @@ out bool hasReturning)
     {
         private readonly bool _maximum;
         private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private readonly string? _collation;
         private readonly List<SqlValue> _values = [];
 
-        internal ExtremumAggregateAccumulator(bool maximum, Func<SqlValue, SqlValue, string?, int> compare)
+        internal ExtremumAggregateAccumulator(
+            bool maximum,
+            Func<SqlValue, SqlValue, string?, int> compare,
+            string? collation = null)
         {
             _maximum = maximum;
             _compare = compare;
+            _collation = collation;
         }
 
         internal void Add(SqlValue value)
@@ -41620,16 +41653,96 @@ out bool hasReturning)
             if (_values.Count == 0)
                 return SqlValue.Null;
 
+            // Mirrors Turso's collated(value, sequence) ephemeral index: among argument-collation
+            // ties, the most recently added (highest sequence) member represents the extremum, so
+            // the scan uses a non-strict comparison and lets later members win on ties.
             var extremum = _values[0];
             for (var index = 1; index < _values.Count; index++)
             {
-                var comparison = _compare(_values[index], extremum, null);
-                if (_maximum ? comparison > 0 : comparison < 0)
+                var comparison = _compare(_values[index], extremum, _collation);
+                if (_maximum ? comparison >= 0 : comparison <= 0)
                     extremum = _values[index];
             }
 
             return extremum;
         }
+    }
+
+    /// <summary>
+    /// Incremental GROUP_CONCAT/STRING_AGG accumulator mirroring Turso's
+    /// GroupConcat/StringAgg step/inverse (execute.rs): tracks the rendered
+    /// buffer, a running count, the length of the separator that would be
+    /// used for the first value (recorded lazily, only while the buffer is
+    /// still empty), and a FIFO queue of the actual separator lengths used
+    /// for every subsequent value. Removing the head value strips that
+    /// value's own text plus the separator that preceded the *next*
+    /// remaining value (which becomes the new, separator-less head); if
+    /// that empties the rendered buffer, the accumulator resets to its
+    /// initial "no value yet" state exactly like Turso's Null sentinel, so
+    /// a following Add never prepends a stale separator.
+    /// </summary>
+    private sealed class GroupConcatAggregateAccumulator
+    {
+        private System.Text.StringBuilder? _buffer;
+        private long _count;
+        private int _firstSeparatorLength;
+        private readonly Queue<int> _separatorLengths = new();
+
+        internal void Add(SqlValue value, SqlValue separator)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+
+            var firstTerm = _buffer is null;
+            if (firstTerm)
+            {
+                _buffer = new System.Text.StringBuilder();
+                _firstSeparatorLength = separator.Kind == SqlValueKind.Null ? 0 : ToSqlText(separator).Length;
+            }
+            else
+            {
+                var before = _buffer!.Length;
+                if (separator.Kind != SqlValueKind.Null)
+                    _buffer.Append(ToSqlText(separator));
+                var separatorLength = _buffer.Length - before;
+                if (separatorLength != _firstSeparatorLength || _separatorLengths.Count > 0)
+                    _separatorLengths.Enqueue(separatorLength);
+            }
+
+            _buffer!.Append(ToSqlText(value));
+            _count++;
+        }
+
+        internal void Remove(SqlValue value)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+            if (_buffer is null || _count == 0)
+                throw new InvalidOperationException("Aggregate inverse removed a row from an empty group_concat.");
+
+            var valueLength = ToSqlText(value).Length;
+            _count--;
+            int separatorLength;
+            if (_separatorLengths.Count > 0 && _count > 0)
+                separatorLength = _separatorLengths.Dequeue();
+            else if (_separatorLengths.Count == 0)
+                separatorLength = _firstSeparatorLength;
+            else
+                separatorLength = 0;
+
+            var removeLength = valueLength + separatorLength;
+            if (removeLength >= _buffer.Length)
+            {
+                _buffer = null;
+                _separatorLengths.Clear();
+            }
+            else
+            {
+                _buffer.Remove(0, removeLength);
+            }
+        }
+
+        internal SqlValue Finalize() => _buffer is null ? SqlValue.Null : SqlValue.Text(_buffer.ToString());
     }
 
     private sealed class CountAggregateAccumulator
@@ -42059,6 +42172,19 @@ out bool hasReturning)
         private double _realTotal;
         private double _realError;
         private bool _approximate;
+        // Sticky per Turso's sumStep/sumInverse (execute.rs): set the first time an all-integer
+        // add/subtract overflows i64. A later float step, while the accumulator is *already*
+        // approximate, clears it (the result is a float approximation regardless, so nothing to
+        // report). Removal (xInverse) never clears it — only a forward float step can. sum()
+        // reports the still-set flag as an error at Finalize, never at step/inverse time, so a
+        // frame that later shrinks back into range is still an error (SQLite still reports it).
+        // total()/avg() never surface it.
+        private bool _overflowed;
+        // Sticky per apply_kbn_step: Inf + (-Inf) produces NaN, which SQLite/Turso treats as a
+        // permanent NULL accumulator (every further step/inverse is skipped) until a *new* value
+        // arrives to re-seed it fresh — mirroring the `acc==Null` step arms, which assign the new
+        // value directly rather than folding it into the (nonsensical) running total.
+        private bool _nanLocked;
         private long _count;
 
         internal NumericAggregateAccumulator(bool forceReal, bool average)
@@ -42077,13 +42203,29 @@ out bool hasReturning)
             // its separate text conversion path instead.
             var exact = ApplyComparisonNumericAffinity(value);
             _count++;
+
+            // Once the running total has collapsed to NaN (Inf + -Inf) while already
+            // approximate, every further step is skipped outright — mirrors sumStep's own
+            // `if acc==Null && approx { return }` guard. This is permanent for the rest of the
+            // accumulator's life (a NULL accumulator only ever gets a fresh direct assignment
+            // *before* it first turns approximate), unlike the sticky overflow flag, which a
+            // later float step can still clear.
+            if (_nanLocked)
+                return;
+
             if (exact.Kind != SqlValueKind.Integer)
             {
                 var real = exact.Kind == SqlValueKind.Real
                     ? AsReal(exact)
                     : AsReal(ApplyNumericAffinity(value));
+
+                // A float arriving while the accumulator is already approximate clears any
+                // earlier sticky overflow: the result is a float approximation regardless.
+                if (_approximate)
+                    _overflowed = false;
                 PromoteToReal();
-                KahanBabuskaNeumaierStep(real, ref _realTotal, ref _realError);
+                if (KahanBabuskaNeumaierStep(real, ref _realTotal, ref _realError))
+                    _nanLocked = true;
                 return;
             }
 
@@ -42097,13 +42239,15 @@ out bool hasReturning)
                     return;
                 }
 
-                if (value.Kind == SqlValueKind.Integer && !_forceReal && !_average)
-                    throw new EmbeddedSqlException("integer overflow");
-
+                // The exact integer total overflowed: switch to the floating-point total and
+                // remember the overflow. sum() reports it at Finalize unless a later float
+                // clears it; total()/avg() never report it (mirrors sumStep, func.c:1838-1846).
+                _overflowed = true;
                 PromoteToReal();
             }
 
-            KahanBabuskaNeumaierStepInt64(addend, ref _realTotal, ref _realError);
+            if (KahanBabuskaNeumaierStepInt64(addend, ref _realTotal, ref _realError))
+                _nanLocked = true;
         }
 
         internal void Remove(SqlValue value)
@@ -42113,23 +42257,23 @@ out bool hasReturning)
             if (_count == 0)
                 throw new InvalidOperationException("Aggregate inverse removed a row from an empty numeric aggregate.");
 
-            // If the departing value is the aggregate's only non-NULL input, reset exactly. This also
-            // avoids manufacturing NaN when an infinite value leaves a one-row SUM/AVG frame.
-            if (_count == 1)
+            _count--;
+            if (_nanLocked)
             {
-                Reset();
+                // Mirrors apply_kbn_step's own "acc is already Null" early return: xInverse never
+                // recovers a NaN-collapsed accumulator, only a forward step re-seeds it.
                 return;
             }
 
             var exact = ApplyComparisonNumericAffinity(value);
-            _count--;
             if (exact.Kind != SqlValueKind.Integer)
             {
                 var real = exact.Kind == SqlValueKind.Real
                     ? AsReal(exact)
                     : AsReal(ApplyNumericAffinity(value));
                 PromoteToReal();
-                KahanBabuskaNeumaierStep(-real, ref _realTotal, ref _realError);
+                if (KahanBabuskaNeumaierStep(-real, ref _realTotal, ref _realError))
+                    _nanLocked = true;
                 return;
             }
 
@@ -42143,20 +42287,32 @@ out bool hasReturning)
                     return;
                 }
 
-                if (value.Kind == SqlValueKind.Integer && !_forceReal && !_average)
-                    throw new EmbeddedSqlException("integer overflow");
-
+                // Mirrors the step path: the exact subtract overflowed, switch to float and
+                // remember it (sumInverse, func.c). Inverse never *clears* the flag, only a
+                // later forward float step can.
+                _overflowed = true;
                 PromoteToReal();
             }
 
-            if (subtrahend == long.MinValue)
-                KahanBabuskaNeumaierStep(9223372036854775808d, ref _realTotal, ref _realError);
-            else
-                KahanBabuskaNeumaierStepInt64(-subtrahend, ref _realTotal, ref _realError);
+            var subtractNanned = subtrahend == long.MinValue
+                ? KahanBabuskaNeumaierStep(9223372036854775808d, ref _realTotal, ref _realError)
+                : KahanBabuskaNeumaierStepInt64(-subtrahend, ref _realTotal, ref _realError);
+            if (subtractNanned)
+                _nanLocked = true;
         }
 
         internal SqlValue Finalize()
         {
+            // An all-integer sum that overflowed and was never cleared by a later float is
+            // reported here, at the end, not when it happened — the frame may have shrunk back
+            // into range since, but SQLite still reports it (sumFinalize). total()/avg() never
+            // surface this even though they track the same sticky state.
+            if (_overflowed && !_forceReal && !_average)
+                throw new EmbeddedSqlException("integer overflow");
+
+            if (_nanLocked)
+                return SqlValue.Null;
+
             var accumulated = _approximate
                 ? (double.IsNaN(_realError) ? _realTotal : _realTotal + _realError)
                 : _integerTotal;
@@ -42169,15 +42325,6 @@ out bool hasReturning)
                 return SqlValue.Null;
 
             return _approximate ? SqlValue.Real(accumulated) : SqlValue.Integer(_integerTotal);
-        }
-
-        private void Reset()
-        {
-            _integerTotal = 0;
-            _realTotal = 0;
-            _realError = 0;
-            _approximate = false;
-            _count = 0;
         }
 
         private void PromoteToReal()
@@ -42210,28 +42357,40 @@ out bool hasReturning)
         }
     }
 
-    /// <summary>Adds one term to the Kahan-Babuska-Neumaier compensated sum.</summary>
-    private static void KahanBabuskaNeumaierStep(double term, ref double sum, ref double error)
+    /// <summary>
+    /// Adds one term to the Kahan-Babuska-Neumaier compensated sum. Returns true when the
+    /// running sum itself collapses to NaN (e.g. Inf + -Inf) — mirrors apply_kbn_step, which
+    /// treats that as a permanent NULL accumulator rather than a poisoned-but-still-numeric
+    /// value.
+    /// </summary>
+    private static bool KahanBabuskaNeumaierStep(double term, ref double sum, ref double error)
     {
         var running = sum;
         var next = running + term;
+        if (double.IsNaN(next))
+        {
+            sum = next;
+            return true;
+        }
+
         error += Math.Abs(running) > Math.Abs(term)
             ? (running - next) + term
             : (term - next) + running;
         sum = next;
+        return false;
     }
 
-    private static void KahanBabuskaNeumaierStepInt64(long value, ref double sum, ref double error)
+    private static bool KahanBabuskaNeumaierStepInt64(long value, ref double sum, ref double error)
     {
         if (value is <= -4503599627370496L or >= 4503599627370496L)
         {
             var low = value % 16384;
-            KahanBabuskaNeumaierStep(value - low, ref sum, ref error);
-            KahanBabuskaNeumaierStep(low, ref sum, ref error);
-            return;
+            if (KahanBabuskaNeumaierStep(value - low, ref sum, ref error))
+                return true;
+            return KahanBabuskaNeumaierStep(low, ref sum, ref error);
         }
 
-        KahanBabuskaNeumaierStep(value, ref sum, ref error);
+        return KahanBabuskaNeumaierStep(value, ref sum, ref error);
     }
 
     private SqlValue EvaluateMinMax(
@@ -46803,6 +46962,193 @@ out bool hasReturning)
         }
     }
 
+    private enum SlidingWindowAggregateKind
+    {
+        Count,
+        Sum,
+        Total,
+        Average,
+        Minimum,
+        Maximum,
+        GroupConcat,
+    }
+
+    /// <summary>
+    /// A window aggregate accumulator that tracks state across an entire partition scan rather
+    /// than being rebuilt from each row's frame membership. Unlike <see cref="CumulativeWindowAggregate"/>
+    /// (growing-only, used for the default RANGE frame that every peer shares), this also supports
+    /// <see cref="Remove"/> so it can follow an arbitrary sliding ROWS/GROUPS/RANGE frame as its
+    /// start and end boundaries both advance. Carrying the same accumulator across positions
+    /// (rather than recomputing fresh from the current frame's members) is what lets transient
+    /// integer-overflow and float-approximation history survive a frame that later shrinks back
+    /// into range, mirroring Turso's per-row AggStep/AggInverse (execute.rs).
+    /// </summary>
+    private sealed class SlidingWindowAggregate
+    {
+        private readonly EmbeddedDatabase _database;
+        private readonly SlidingWindowAggregateKind _kind;
+        private readonly string? _collation;
+        private NumericAggregateAccumulator? _numeric;
+        private ExtremumAggregateAccumulator? _extremum;
+        private GroupConcatAggregateAccumulator? _concat;
+        private long _count;
+
+        internal SlidingWindowAggregate(
+            EmbeddedDatabase database,
+            SlidingWindowAggregateKind kind,
+            string? collation)
+        {
+            _database = database;
+            _kind = kind;
+            _collation = collation;
+            CreateAccumulators();
+        }
+
+        // Rebuilds fresh, empty inner accumulators; used both by the constructor and by the
+        // defensive full-replay fallback when a frame transition turns out non-monotonic.
+        internal void Reset()
+        {
+            _count = 0;
+            CreateAccumulators();
+        }
+
+        private void CreateAccumulators()
+        {
+            _numeric = _kind switch
+            {
+                SlidingWindowAggregateKind.Sum => new NumericAggregateAccumulator(
+                    forceReal: false,
+                    average: false),
+                SlidingWindowAggregateKind.Total => new NumericAggregateAccumulator(
+                    forceReal: true,
+                    average: false),
+                SlidingWindowAggregateKind.Average => new NumericAggregateAccumulator(
+                    forceReal: true,
+                    average: true),
+                _ => null,
+            };
+            _extremum = _kind is SlidingWindowAggregateKind.Minimum or SlidingWindowAggregateKind.Maximum
+                ? new ExtremumAggregateAccumulator(_kind == SlidingWindowAggregateKind.Maximum, _database.Compare, _collation)
+                : null;
+            _concat = _kind == SlidingWindowAggregateKind.GroupConcat
+                ? new GroupConcatAggregateAccumulator()
+                : null;
+        }
+
+        internal void Accumulate(WindowFunctionInput input)
+        {
+            if (!input.Included)
+                return;
+
+            switch (_kind)
+            {
+                case SlidingWindowAggregateKind.Count:
+                    if (input.Arguments.Length == 0 || input.Arguments[0].Kind != SqlValueKind.Null)
+                        _count++;
+                    return;
+                case SlidingWindowAggregateKind.Sum:
+                case SlidingWindowAggregateKind.Total:
+                case SlidingWindowAggregateKind.Average:
+                    _numeric!.Accumulate(input.Arguments[0]);
+                    return;
+                case SlidingWindowAggregateKind.Minimum:
+                case SlidingWindowAggregateKind.Maximum:
+                    _extremum!.Add(input.Arguments[0]);
+                    return;
+                case SlidingWindowAggregateKind.GroupConcat:
+                    var separator = input.Arguments.Length > 1 ? input.Arguments[1] : SqlValue.Text(",");
+                    _concat!.Add(input.Arguments[0], separator);
+                    return;
+                default:
+                    throw new InvalidOperationException($"Unsupported sliding window aggregate {_kind}.");
+            }
+        }
+
+        internal void Remove(WindowFunctionInput input)
+        {
+            if (!input.Included)
+                return;
+
+            switch (_kind)
+            {
+                case SlidingWindowAggregateKind.Count:
+                    if (input.Arguments.Length == 0 || input.Arguments[0].Kind != SqlValueKind.Null)
+                        _count--;
+                    return;
+                case SlidingWindowAggregateKind.Sum:
+                case SlidingWindowAggregateKind.Total:
+                case SlidingWindowAggregateKind.Average:
+                    _numeric!.Remove(input.Arguments[0]);
+                    return;
+                case SlidingWindowAggregateKind.Minimum:
+                case SlidingWindowAggregateKind.Maximum:
+                    _extremum!.Remove(input.Arguments[0]);
+                    return;
+                case SlidingWindowAggregateKind.GroupConcat:
+                    _concat!.Remove(input.Arguments[0]);
+                    return;
+                default:
+                    throw new InvalidOperationException($"Unsupported sliding window aggregate {_kind}.");
+            }
+        }
+
+        internal SqlValue GetValue()
+        {
+            return _kind switch
+            {
+                SlidingWindowAggregateKind.Count => SqlValue.Integer(_count),
+                SlidingWindowAggregateKind.Sum
+                    or SlidingWindowAggregateKind.Total
+                    or SlidingWindowAggregateKind.Average => _numeric!.Finalize(),
+                SlidingWindowAggregateKind.Minimum
+                    or SlidingWindowAggregateKind.Maximum => _extremum!.Finalize(),
+                SlidingWindowAggregateKind.GroupConcat => _concat!.Finalize(),
+                _ => throw new InvalidOperationException(
+                    $"Unsupported sliding window aggregate {_kind}."),
+            };
+        }
+    }
+
+    // Eligible for true incremental (step/inverse) sliding accumulation: intrinsic aggregates
+    // whose contribution from a single row can be added and later removed without replaying the
+    // whole frame. DISTINCT/ordered-set/aggregate-ORDER BY forms and any other function fall back
+    // to the existing per-position recompute path.
+    private static bool TryGetSlidingWindowAggregateKind(
+        FunctionExpression function,
+        out SlidingWindowAggregateKind kind)
+    {
+        kind = default;
+        if (function.Distinct || function.OrderedSet || function.AggregateOrderBy is { Count: > 0 })
+            return false;
+
+        switch (function.Name.ToUpperInvariant())
+        {
+            case "COUNT" when function.CountStar || function.Arguments.Count is 0 or 1:
+                kind = SlidingWindowAggregateKind.Count;
+                return true;
+            case "SUM" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Sum;
+                return true;
+            case "TOTAL" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Total;
+                return true;
+            case "AVG" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Average;
+                return true;
+            case "MIN" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Minimum;
+                return true;
+            case "MAX" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Maximum;
+                return true;
+            case "GROUP_CONCAT" or "STRING_AGG" when function.Arguments.Count is 1 or 2:
+                kind = SlidingWindowAggregateKind.GroupConcat;
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private sealed record WindowPeerInfo(
         int[] Starts,
         int[] Ends,
@@ -46879,6 +47225,24 @@ out bool hasReturning)
         var frameRuntime = needsFrame
             ? PrepareWindowFrame(spec, parameters, context)
             : default;
+
+        // Functions eligible for true incremental (step/inverse) sliding accumulation, resolved
+        // once since eligibility does not depend on the partition. EXCLUDE support is left to the
+        // existing per-position recompute path below (a temporary inverse/step around the
+        // excluded rows would risk reordering equal-key tie representatives for MIN/MAX/GROUP_CONCAT).
+        var slidingEligible = (spec.Frame is null || spec.Frame.Exclusion == FrameExclusion.NoOthers)
+            ? functions
+                .Select(function => (Function: function, Eligible: TryGetSlidingWindowAggregateKind(function, out var kind), Kind: kind))
+                .Where(candidate => candidate.Eligible)
+                .ToDictionary(candidate => candidate.Function, candidate => candidate.Kind)
+            : new Dictionary<FunctionExpression, SlidingWindowAggregateKind>();
+        var slidingCollations = slidingEligible.Count == 0
+            ? null
+            : slidingEligible.Keys
+                .Where(function => slidingEligible[function]
+                    is SlidingWindowAggregateKind.Minimum or SlidingWindowAggregateKind.Maximum)
+                .ToDictionary(function => function, function => GetEffectiveCollation(function.Arguments[0], context));
+
         foreach (var partition in partitions)
         {
             context.CheckInterrupt();
@@ -46950,17 +47314,87 @@ out bool hasReturning)
                 CreateCumulativeWindowAggregates(functions, context, sharePeerAggregateFrames);
             var directEvaluationNeedsFrame = functions.Any(function =>
                 !cumulativeAggregates.ContainsKey(function)
+                && !slidingEligible.ContainsKey(function)
                 && WindowFunctionUsesFrame(function));
             var cumulativeThrough = cumulativeAggregates.Keys.ToDictionary(
                 function => function,
                 _ => -1);
             var cumulativeValues = new Dictionary<FunctionExpression, SqlValue>();
+
+            // All sliding-eligible functions in this batch share one window spec, so a single
+            // pair of pointers tracks the currently-accumulated frame range [slidingStart,
+            // slidingEnd] for every one of them (start > end represents "nothing added yet").
+            var slidingAggregates = new Dictionary<FunctionExpression, SlidingWindowAggregate>();
+            foreach (var (function, kind) in slidingEligible)
+                slidingAggregates[function] = new SlidingWindowAggregate(
+                    this,
+                    kind,
+                    slidingCollations is not null && slidingCollations.TryGetValue(function, out var collation)
+                        ? collation
+                        : null);
+            var slidingStart = 0;
+            var slidingEnd = -1;
+
             IReadOnlyList<int>? sharedFramePositions = null;
             Dictionary<FunctionExpression, SqlValue>? sharedAggregateValues = null;
             var sharedPeerGroupStart = -1;
             for (var position = 0; position < entries.Count; position++)
             {
                 context.CheckInterrupt();
+
+                if (slidingAggregates.Count > 0)
+                {
+                    var (newStart, newEnd) = ResolveWindowFrameBoundsOnly(
+                        spec,
+                        entries,
+                        peers,
+                        position,
+                        frameRuntime);
+                    if (newStart < slidingStart || newEnd < slidingEnd)
+                    {
+                        // Defensive: a non-monotonic frame transition (should not happen for a
+                        // well-ordered partition) — reset and replay the new range fresh rather
+                        // than risk removing a row that was never added.
+                        foreach (var aggregate in slidingAggregates.Values)
+                            aggregate.Reset();
+                        for (var candidate = newStart; candidate <= newEnd; candidate++)
+                        {
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Accumulate(inputs[function][sourceIndex]);
+                        }
+                    }
+                    else
+                    {
+                        // Rows leaving the frame are inverted before rows entering are stepped
+                        // (windowCodeOp's per-row AGGINVERSE-then-AGGSTEP): a departing row that
+                        // briefly shares an accumulator with an about-to-enter row must not see it
+                        // added first, or GROUP_CONCAT's separator bookkeeping surfaces at the
+                        // wrong moment and a numeric accumulator can transiently (and wrongly)
+                        // overflow against a value that was about to leave anyway. The permanent
+                        // NaN-lock above is what makes this also correct for RANGE frames that
+                        // swap an entire peer group of Inf/-Inf values in one transition.
+                        for (var candidate = slidingStart; candidate <= Math.Min(slidingEnd, newStart - 1); candidate++)
+                        {
+                            context.CheckInterrupt();
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Remove(inputs[function][sourceIndex]);
+                        }
+
+                        for (var candidate = Math.Max(slidingEnd + 1, newStart); candidate <= newEnd; candidate++)
+                        {
+                            context.CheckInterrupt();
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Accumulate(inputs[function][sourceIndex]);
+                        }
+                    }
+
+                    slidingStart = newStart;
+                    slidingEnd = newEnd;
+                }
+
                 if (evaluationSourceIndexes is not null
                     && !evaluationSourceIndexes.Contains(entries[position].SourceIndex))
                 {
@@ -47015,6 +47449,12 @@ out bool hasReturning)
 
                         results[function][entries[position].SourceIndex] =
                             cumulativeValues[function];
+                        continue;
+                    }
+
+                    if (slidingAggregates.TryGetValue(function, out var sliding))
+                    {
+                        results[function][entries[position].SourceIndex] = sliding.GetValue();
                         continue;
                     }
 
@@ -47280,7 +47720,7 @@ out bool hasReturning)
         };
     }
 
-    private IReadOnlyList<int> ResolveWindowFramePositions(
+    private (int Start, int End) ResolveWindowFrameBoundsOnly(
         WindowSpecification spec,
         IReadOnlyList<WindowOrderEntry> entries,
         WindowPeerInfo peers,
@@ -47311,6 +47751,21 @@ out bool hasReturning)
             spec.OrderBy);
         var start = (int)Math.Clamp(startRaw, 0L, entries.Count);
         var end = (int)Math.Clamp(endRaw, -1L, entries.Count - 1L);
+        return (start, end);
+    }
+
+    private IReadOnlyList<int> ResolveWindowFramePositions(
+        WindowSpecification spec,
+        IReadOnlyList<WindowOrderEntry> entries,
+        WindowPeerInfo peers,
+        int position,
+        WindowFrameRuntime runtime)
+    {
+        var frame = spec.Frame ?? new WindowFrame(
+            Ahtola.Core.Parsing.WindowFrameMode.Range,
+            new FrameBound(FrameBoundKind.UnboundedPreceding, null),
+            new FrameBound(FrameBoundKind.CurrentRow, null));
+        var (start, end) = ResolveWindowFrameBoundsOnly(spec, entries, peers, position, runtime);
         if (start > end)
             return [];
 
@@ -47403,6 +47858,79 @@ out bool hasReturning)
         return isStart ? group.Start : group.End;
     }
 
+    // A RANGE bound's coordinate: an exact 64-bit integer when the underlying key/arithmetic
+    // never left that range, or a double when negation or the offset arithmetic overflowed and
+    // (mirroring SQLite's silent int-to-float promotion on scalar overflow) had to fall back to
+    // floating point. Keeping the exact/inexact distinction lets comparisons stay precise for the
+    // common case while still reproducing SQLite's own precision loss where *it* would incur one
+    // (e.g. negating i64::MIN for a DESC coordinate), rather than inventing new, more "correct"
+    // arithmetic that would silently diverge from the oracle at the i64 extremes.
+    private readonly record struct WindowCoordinate(long? Exact, double Value)
+    {
+        internal static WindowCoordinate FromLong(long value) => new(value, value);
+        internal static WindowCoordinate FromDouble(double value) => new(null, value);
+    }
+
+    private static WindowCoordinate ComputeWindowKeyCoordinate(SqlValue key, bool descending, double fallbackNumber)
+    {
+        if (key.Kind == SqlValueKind.Integer)
+        {
+            var raw = key.AsInteger();
+            if (!descending)
+                return WindowCoordinate.FromLong(raw);
+            if (raw == long.MinValue)
+                return WindowCoordinate.FromDouble(-(double)raw);
+            return WindowCoordinate.FromLong(-raw);
+        }
+
+        return WindowCoordinate.FromDouble(descending ? -fallbackNumber : fallbackNumber);
+    }
+
+    private static WindowCoordinate ComputeWindowTargetCoordinate(
+        WindowCoordinate coordinate,
+        SqlValue offset,
+        bool subtract)
+    {
+        // RANGE-mode offsets are always pre-converted to SqlValueKind.Real by
+        // EvaluateWindowFrameOffset (it accepts any non-negative number, not just integer
+        // literals), so an exact-integer offset like "2 PRECEDING" no longer carries an Integer
+        // kind by the time it reaches here. Recover it from the whole-number REAL instead of
+        // giving up on exact arithmetic for every RANGE frame.
+        if (coordinate.Exact is { } exact && TryGetExactOffsetInteger(offset, out var offsetLong))
+        {
+            var overflowed = subtract
+                ? SubtractOverflows(exact, offsetLong, out var result)
+                : AddOverflows(exact, offsetLong, out result);
+            if (!overflowed)
+                return WindowCoordinate.FromLong(result);
+
+            return WindowCoordinate.FromDouble(subtract ? (double)exact - offsetLong : (double)exact + offsetLong);
+        }
+
+        var distance = offset.AsReal();
+        return WindowCoordinate.FromDouble(subtract ? coordinate.Value - distance : coordinate.Value + distance);
+    }
+
+    // Decimal precision-safely bridges the ~2^11 gap between representable doubles near +/-2^63
+    // (SQLite's own int/float comparison is precision-safe the same way), but decimal cannot
+    // represent infinities or magnitudes past roughly 7.9e28: those fall back to plain double
+    // comparison, which is exactly what the existing (and still correct) handling for genuinely
+    // huge/infinite REAL keys already relied on.
+    private static int CompareWindowCoordinates(WindowCoordinate left, WindowCoordinate right)
+    {
+        if (left.Exact is { } exactLeft && right.Exact is { } exactRight)
+            return exactLeft.CompareTo(exactRight);
+        if (!double.IsFinite(left.Value) || !double.IsFinite(right.Value)
+            || Math.Abs(left.Value) >= 7.9e28 || Math.Abs(right.Value) >= 7.9e28)
+        {
+            return left.Value.CompareTo(right.Value);
+        }
+
+        var decimalLeft = left.Exact is { } el ? (decimal)el : (decimal)left.Value;
+        var decimalRight = right.Exact is { } er ? (decimal)er : (decimal)right.Value;
+        return decimalLeft.CompareTo(decimalRight);
+    }
+
     private long ResolveRangeFrameBound(
         FrameBound bound,
         bool isStart,
@@ -47423,23 +47951,61 @@ out bool hasReturning)
         if (!TryGetStoredWindowNumber(current, out var currentNumber))
             return isStart ? peers.Starts[position] : peers.Ends[position];
 
-        var direction = orderBy[0].Descending ? -1d : 1d;
-        // Negating descending keys maps both directions onto one ascending coordinate space.
-        var currentCoordinate = direction * currentNumber;
-        var distance = offset!.Value.AsReal();
-        var target = bound.Kind == FrameBoundKind.Preceding
-            ? currentCoordinate - distance
-            : currentCoordinate + distance;
+        var descending = orderBy[0].Descending;
+
+        // NULL's raw-value sense (smallest vs "biggest") depends on where it actually sorts:
+        // by default it is the smallest value regardless of ASC/DESC, but an explicit NULLS
+        // FIRST under DESC (or NULLS LAST under ASC) makes it sort as the biggest value instead
+        // — mirrors emit_window_range_test's "big_null" flag (window.rs). TEXT/BLOB keys have no
+        // such placement option: SQLite's type-affinity ordering (NULL < INTEGER/REAL < TEXT <
+        // BLOB) always sorts them *after* every numeric value, so they are unconditionally "big"
+        // relative to a numeric current-row target, unlike NULL.
+        var nullsFirst = orderBy[0].NullPlacement switch
+        {
+            NullPlacement.Default => !descending,
+            NullPlacement.First => true,
+            NullPlacement.Last => false,
+            _ => throw new InvalidOperationException(
+                $"Unsupported NULL placement {orderBy[0].NullPlacement}."),
+        };
+        var nullIsBig = (!descending && !nullsFirst) || (descending && nullsFirst);
+
+        // The *comparison sense* actually applied to a non-numeric candidate is "<=" exactly
+        // when isStart and DESC disagree (start bound under DESC, or end bound under ASC) —
+        // mirrors emit_window_range_test's raw null_eq comparison, which never negates the
+        // non-numeric operand itself. A "small" candidate is trivially "<=" any real threshold
+        // and a "big" one is trivially ">="; under the matching op sense the candidate always
+        // satisfies membership, and under the opposite sense it can never satisfy a finite
+        // threshold and is skipped.
+        var rawOpIsLe = isStart ? descending : !descending;
+
+        bool NonNumericSatisfies(SqlValue key)
+        {
+            var isBig = key.Kind == SqlValueKind.Null ? nullIsBig : true;
+            return rawOpIsLe == !isBig;
+        }
+
+        var currentCoordinate = ComputeWindowKeyCoordinate(current, descending, currentNumber);
+        var target = ComputeWindowTargetCoordinate(
+            currentCoordinate,
+            offset!.Value,
+            subtract: bound.Kind == FrameBoundKind.Preceding);
 
         if (isStart)
         {
             for (var candidate = 0; candidate < entries.Count; candidate++)
             {
-                if (TryGetStoredWindowNumber(entries[candidate].OrderKeys[0], out var value)
-                    && direction * value >= target)
+                var key = entries[candidate].OrderKeys[0];
+                if (!TryGetStoredWindowNumber(key, out var candidateNumber))
                 {
-                    return candidate;
+                    if (NonNumericSatisfies(key))
+                        return candidate;
+                    continue;
                 }
+
+                var coordinate = ComputeWindowKeyCoordinate(key, descending, candidateNumber);
+                if (CompareWindowCoordinates(coordinate, target) >= 0)
+                    return candidate;
             }
 
             return entries.Count;
@@ -47447,14 +48013,57 @@ out bool hasReturning)
 
         for (var candidate = entries.Count - 1; candidate >= 0; candidate--)
         {
-            if (TryGetStoredWindowNumber(entries[candidate].OrderKeys[0], out var value)
-                && direction * value <= target)
+            var key = entries[candidate].OrderKeys[0];
+            if (!TryGetStoredWindowNumber(key, out var candidateNumber))
             {
-                return candidate;
+                if (NonNumericSatisfies(key))
+                    return candidate;
+                continue;
             }
+
+            var coordinate = ComputeWindowKeyCoordinate(key, descending, candidateNumber);
+            if (CompareWindowCoordinates(coordinate, target) <= 0)
+                return candidate;
         }
 
         return -1;
+    }
+
+    private static bool AddOverflows(long left, long right, out long result)
+    {
+        result = unchecked(left + right);
+        return ((left ^ result) & (right ^ result)) < 0;
+    }
+
+    private static bool SubtractOverflows(long left, long right, out long result)
+    {
+        result = unchecked(left - right);
+        return ((left ^ right) & (left ^ result)) < 0;
+    }
+
+    private static bool TryGetExactOffsetInteger(SqlValue offset, out long value)
+    {
+        if (offset.Kind == SqlValueKind.Integer)
+        {
+            value = offset.AsInteger();
+            return true;
+        }
+
+        if (offset.Kind == SqlValueKind.Real)
+        {
+            var real = offset.AsReal();
+            if (double.IsFinite(real)
+                && real == Math.Floor(real)
+                && real >= -9223372036854775000d
+                && real < 9223372036854775000d)
+            {
+                value = (long)real;
+                return true;
+            }
+        }
+
+        value = 0;
+        return false;
     }
 
     private SqlValue EvaluateWindowFunctionAtPosition(

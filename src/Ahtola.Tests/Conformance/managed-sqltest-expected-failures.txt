@@ -39,7 +39,6 @@
 # Similarly, STORED generated columns are supported where the pinned corpus
 # expects rejection (see the two gencol markers below).
 
-agg_sum_overflow.sqltest::sum-overflow-forgiven-by-later-float | database variant 1/1 (:memory:): expected success but got error: integer overflow
 delete-update-limit-rejected.sqltest::delete-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-where-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
@@ -77,32 +76,8 @@ recursive-cte.sqltest::recursive-cte-used-nested-cte-self-ref-rejected | databas
 recursive-cte.sqltest::recursive-cte-visited-set-via-nested-cte-rejected | database variant 1/1 (:memory:): error 'circular reference: reach' does not match pattern 'multiple recursive references: reach'
 recursive-cte.sqltest::recursive-cte-window-clause-self-ref-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 recursive-cte.sqltest::recursive-cte-self-ref-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'cte1' is not supported: no module registration, planner, or execution contract is available. At SQL offset 129.' does not match pat
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][none] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-no-others] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-current-row] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-group] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-ties] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][none] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-no-others] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-current-row] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-group] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-ties] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::integer-extreme-keys[range][asc][100-preceding-and-2-preceding] | database variant 1/1 (:memory:): managed and SQLite rows differ
 window/frame_matrix_edge.sqltest::integer-extreme-keys[range][desc][100-preceding-and-2-preceding] | database variant 1/1 (:memory:): SQLite errored ('SQLite Error 1: 'integer overflow'.') but managed returned 5 row(s)
-window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][0-5][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][0-5][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][1e308][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][1e308][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][0-5][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][0-5][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][1e308][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][1e308][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
 window/frame_sum_overflow.sqltest::window-sum-inverse-transient-overflow-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
-window/frame_sum_overflow.sqltest::window-frame-membership-at-integer-extremes | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected '9223372036854775807/0//' but was '9223372036854775807/1/9223372036854775807/9223372036854775807'
-window/frame_sum_overflow.sqltest::window-sum-step-overflow-forgiven-by-float | database variant 1/1 (:memory:): expected success but got error: integer overflow
-window/moving_concat_json.sqltest::moving-group-concat-empty-prefix | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 2 expected '3/'x'/'x'' but was '3/'/x'/'/x''
-window/moving_min_max.sqltest::moving-min-max-argument-collation | database variant 1/1 (:memory:): expected 6 row(s), got 6 row(s); row 2 expected '3/a/b' but was '3/A/b'
-window/rows_frame.sqltest::rows-mixed-int-float-approx-transition | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 2 expected '3/300.0' but was '3/300'
 unnest-correlated.sqltest::one-value-group-concat-does-not-build-unused-groups | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN outer_rows AS o.*CORRELATED SCALAR SUBQUERY'
 unnest-correlated.sqltest::one-value-group-concat-joins-before-grouping | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN inner_rows AS i.*SCAN outer_rows AS o.*USE SORTER FOR GROUP BY'
 unnest-correlated.sqltest::one-value-sum-joins-before-grouping | database variant 1/1 (:memory:): output does not match pattern '(?s)HASH JOIN sum_join_inner AS i.*SCAN sum_join_outer AS o.*USE SORTER FOR GROUP BY'
