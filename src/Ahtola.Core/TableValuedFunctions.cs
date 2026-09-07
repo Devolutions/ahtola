@@ -357,6 +357,7 @@ internal static class TableValuedFunctionRegistry
                 static argument => new PragmaForeignKeyListStatement(argument)),
             new PragmaTableListModule(),
             new PragmaCacheSizeModule(),
+            new PragmaJournalModeModule(),
             new PragmaFunctionListModule(),
             new PragmaModuleListModule(),
         })

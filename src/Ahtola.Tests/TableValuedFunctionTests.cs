@@ -446,6 +446,43 @@ public class TableValuedFunctionTests
     }
 
     /// <summary>
+    /// pragma_journal_mode() is connection-aware, not a hardcoded/cached constant: an
+    /// unqualified call reports main's own actual mode (never "wal" just because that
+    /// happens to be a common default elsewhere), temp always reports "wal" regardless of
+    /// main's mode, an explicit schema argument routes to that schema even when it is not
+    /// main (an in-memory ATTACHed database here), and a real PRAGMA journal_mode change is
+    /// reflected immediately rather than a value captured once.
+    /// </summary>
+    [Test]
+    public void PragmaJournalModeIsConnectionAware()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        // An in-memory main database only ever reports "memory" or "mvcc" - never "wal" -
+        // matching upstream SQLite exactly (this is a deliberate divergence from Turso's own
+        // "always wal for :memory:" rust-backend quirk; see pragma/memory.sqltest).
+        Rows(connection, "SELECT journal_mode FROM pragma_journal_mode();").Should().Equal(["memory"]);
+        Rows(connection, "SELECT journal_mode FROM pragma_journal_mode('main');").Should().Equal(["memory"]);
+
+        // temp always reports wal, regardless of main's own mode.
+        Rows(connection, "SELECT journal_mode FROM pragma_journal_mode('temp');").Should().Equal(["wal"]);
+
+        // An attached schema resolves through the connection, not through whichever database
+        // this statement's own routing happened to pick.
+        Execute(connection, "ATTACH DATABASE ':memory:' AS aux;");
+        Rows(connection, "SELECT journal_mode FROM pragma_journal_mode('aux');").Should().Equal(["memory"]);
+        Execute(connection, "PRAGMA aux.journal_mode='MVCC';");
+        Rows(connection, "SELECT journal_mode FROM pragma_journal_mode('aux');").Should().Equal(["mvcc"]);
+        // main is unaffected by the attached schema's mode change.
+        Rows(connection, "SELECT journal_mode FROM pragma_journal_mode('main');").Should().Equal(["memory"]);
+
+        // CTAS reads the same connection-aware value, not a value captured at prepare time.
+        Execute(connection, "CREATE TABLE modes AS SELECT journal_mode FROM pragma_journal_mode('aux');");
+        Rows(connection, "SELECT journal_mode FROM modes;").Should().Equal(["mvcc"]);
+    }
+
+    /// <summary>
     /// A real table always wins over a module registration, so registering a module can
     /// never shadow user data.
     /// </summary>

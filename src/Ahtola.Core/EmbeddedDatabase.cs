@@ -852,7 +852,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         EmbeddedFileReadSnapshot? TransactionPinnedSnapshot = null,
         Action<string, long>? TransactionBlobMutation = null,
         ManagedSchemaRowSet? StagedSchemaRows = null,
-        ManagedSequenceSession? SequenceSession = null)
+        ManagedSequenceSession? SequenceSession = null,
+        // Resolves the journal_mode string for a schema name (null = the routed database
+        // itself), set once per EmbeddedDatabase instance by its owning EmbeddedConnection
+        // (EmbeddedDatabase.SetDescribeJournalMode) so pragma_journal_mode() can report the
+        // connection-aware value (including temp's special "always wal") instead of
+        // conflating it with the single routed instance context.Database alone exposes.
+        Func<string?, string>? DescribeJournalMode = null)
     {
         /// <summary>
         /// Per-statement cache of opened managed index-method scan state. Derived contexts created
@@ -1684,6 +1690,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     public EmbeddedConnection Connect() => new(this);
+
+    // Set once by the owning EmbeddedConnection (mirroring
+    // CopyFunctionAndCollationRegistriesTo) so a table-valued function whose result depends
+    // on connection-level state spanning multiple physical databases - pragma_journal_mode,
+    // which must report "wal" for temp regardless of this instance's own pager state - can
+    // resolve any schema name through the connection instead of being limited to
+    // context.Database, which is only ever this one routed instance.
+    private Func<string?, string>? _describeJournalMode;
+
+    internal void SetDescribeJournalMode(Func<string?, string> describeJournalMode)
+        => _describeJournalMode = describeJournalMode;
 
     internal void CopyFunctionAndCollationRegistriesTo(EmbeddedDatabase target)
     {
@@ -3367,7 +3384,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ExecuteTableList: executeTableList,
             VirtualTables: catalog.VirtualTables,
             VdbeExecutionOptions: vdbeExecutionOptions,
-            Database: this);
+            Database: this,
+            DescribeJournalMode: _describeJournalMode);
         var result = MaterializeQueryResult(ExecuteQuery(statement, parameters, context, outerRow: null));
         var affinities = DescribeQueryAffinities(
             statement,
@@ -5425,6 +5443,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ? new CteMutationState()
                 : null,
             Database: this,
+            DescribeJournalMode: _describeJournalMode,
             TransactionOverlay: transactionOverlay,
             TransactionPinnedSnapshot: transactionPinnedSnapshot,
             TransactionBlobMutation: transactionBlobMutation,
@@ -54006,6 +54025,8 @@ public sealed partial class EmbeddedConnection : IDisposable
         _database = database;
         _tempDatabase = new EmbeddedDatabase();
         _database.CopyFunctionAndCollationRegistriesTo(_tempDatabase);
+        _database.SetDescribeJournalMode(DescribeJournalModeForSchema);
+        _tempDatabase.SetDescribeJournalMode(DescribeJournalModeForSchema);
     }
 
     internal bool HasActiveTransaction => _transactionDatabases is not null;
@@ -54794,6 +54815,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         _tempDatabase.Dispose();
         _tempDatabase = new EmbeddedDatabase();
         _database.CopyFunctionAndCollationRegistriesTo(_tempDatabase);
+        _tempDatabase.SetDescribeJournalMode(DescribeJournalModeForSchema);
     }
 
     internal ExecutionResult Execute(
@@ -55453,6 +55475,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                 // Fresh in-memory attach inherits main page size (and MVCC when enabled).
                 inMemoryAttached._inMemoryPageSize = _database.GetPageSize();
                 _database.CopyFunctionAndCollationRegistriesTo(inMemoryAttached);
+                inMemoryAttached.SetDescribeJournalMode(DescribeJournalModeForSchema);
                 inMemoryAttached.BusyTimeout = BusyTimeout;
                 if (_database.IsMvccEnabled)
                     _ = inMemoryAttached.EnableMvccMode();
@@ -55536,6 +55559,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                 readOnly,
                 initialPageSize: isFreshAttach ? _database.GetPageSize() : null);
             _database.CopyFunctionAndCollationRegistriesTo(attached);
+            attached.SetDescribeJournalMode(DescribeJournalModeForSchema);
             attached.BusyTimeout = BusyTimeout;
 
             if (isFreshAttach)
@@ -59618,6 +59642,18 @@ Func<string, ParsedStatement> rewrite)
         if (!database.IsFileBacked)
             return "memory";
         return database.GetJournalMode().ToString().ToLowerInvariant();
+    }
+
+    // The pragma_journal_mode() table-valued function's connection-aware resolver: a null
+    // schema (the TVF called with no argument) reports main's mode, matching PRAGMA
+    // journal_mode's own unqualified default. Reused by every EmbeddedDatabase instance this
+    // connection owns (SetDescribeJournalMode), since a routed statement's context.Database
+    // is only ever the single instance that statement targets and cannot see its sibling
+    // schemas (temp, an attached database) on its own.
+    private string DescribeJournalModeForSchema(string? schema)
+    {
+        var database = ResolvePragmaDatabase(schema);
+        return DescribeJournalMode(database, isTempDatabase: ReferenceEquals(database, _tempDatabase));
     }
 
     private static bool TryParseJournalMode(string mode, out SqliteJournalMode journalMode)
