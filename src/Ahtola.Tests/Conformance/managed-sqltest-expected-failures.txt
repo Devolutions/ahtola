@@ -87,22 +87,21 @@ turso/without_rowid.sqltest::without-rowid-insert-or-replace-rejected | intentio
 turso/without_rowid.sqltest::without-rowid-upsert-rejected | intentional extension: Ahtola supports UPSERT on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-foreign-keys-rejected | intentional extension: Ahtola supports FOREIGN KEY on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 
-# COVER workstream (2026-09-06): these 10 files' fixtures are byte-faithful (the corruption
+# COVER workstream (2026-09-06): these 9 files' fixtures are byte-faithful (the corruption
 # generator reproduces Turso's own turso-src/testing/sqltest/src/generator/mod.rs patches
 # exactly, and the legacy-view static fixture is vendored unmodified) and execute normally
 # through the managed harness -- SqltestManagedRunner.RunVariant converts the resulting
 # open-time EmbeddedSqlException/InvalidDataException into a plain SqltestOutcome instead of
 # letting it escape as an unhandled test exception, so each case is compared and recorded like
-# any other. All 21 cases below are real observed engine behavior, assigned to the coordinator:
+# any other. All 18 cases below are real observed engine behavior:
 # EmbeddedFileStore.Load() validates b-tree/index/allocation-map/generated-column structural
 # integrity eagerly at file-open time, where Turso/SQLite open the file unconditionally and
 # defer to PRAGMA integrity_check/quick_check to report the same defect as row output (the
 # same class of pre-existing divergence already exercised by
 # ManagedIntegrityCheckPragmaTests.AStoredNonUniqueIndexEntryFailsToOpenInsteadOfBeingReported).
-# turso/legacy-unquoted-view-columns.sqltest is a distinct, narrower schema-loader gap:
-# ManagedSchemaRowParser.ParseView rethrows the parser's "Expected RightParen" error instead of
-# tolerating an unquoted multi-word view-column alias the way Turso does, so the whole database
-# fails to open rather than degrading to just the one broken view being unavailable. The other
+# The separate legacy-view loader gap is closed: malformed stored views no longer prevent
+# unrelated operations, and resolving a broken view for queries or trigger DML fails closed.
+# The other
 # 3 files this generator builds (parity_check_constraint, parity_quick_check_constraint,
 # parity_not_null_violation) are NOT listed here: ordinary column CHECK/NOT NULL values are not
 # re-validated on load, only generated-column values are recomputed (and their NOT NULL
@@ -132,43 +131,33 @@ integrity_check/parity_overflow_list_length_mismatch.sqltest::quick-check-overfl
 # turso/mvcc_feature_compat.sqltest, turso/mvcc_sequence.sqltest, turso/mvcc_sequence_adversarial.sqltest,
 # turso/sequence_adversarial.sqltest — see
 # docs/cover-turso-sqltests-audit.md for the full adoption list and disposition). Notable
-# concentrations for the coordinator to consider assigning as follow-up workstreams:
-#   - turso/alter_column.sqltest (32 cases): ALTER TABLE ... ALTER COLUMN's schema-text
-#     rewrite for FOREIGN KEY references consistently drops the space before "(" that Turso's
-#     corpus expects (e.g. "REFERENCES parent(id)" vs "REFERENCES parent (id)"), and
-#     "ALTER COLUMN ... TO ... AS (...)" (converting a column to/from a generated column) is not
-#     implemented at all ("ALTER COLUMN to a generated column is not supported").
-#   - turso/attach/writes.sqltest (21 cases) + turso/attach/cross_db_views_rejection.sqltest
-#     (9 cases): Ahtola's managed ATTACH deliberately rejects cross-database JOINs, INSERT
-#     SELECTs, subqueries, multi-database transactions, and schema-qualified CREATE VIEW/DROP
-#     VIEW ("Cross-database statements are not supported by managed ATTACH", "Managed ATTACH
-#     transactions cannot modify more than one database..."), where Turso supports all of
-#     these; turso_cdc (change-data-capture) is also not implemented.
-#   - turso/attach/sequence.sqltest (4 cases) + turso/mvcc_sequence*.sqltest (8 cases):
-#     schema-qualified/attached-database SEQUENCE state does not appear to be scoped per
-#     schema the way the pinned corpus expects (values interleave across what should be two
-#     independent sequences).
-# These are genuine, precise, per-case differences (not harness limitations) recorded below for
-# the coordinator's ownership; COVER does not implement engine fixes.
-turso/alter_column.sqltest::alter-column-all-to-generated-error | database variant 1/1 (:memory:): error 'ALTER COLUMN to a generated column is not supported' does not match pattern 'Parse error: must have at least one non-generated column'
-turso/alter_column.sqltest::alter-column-only-to-generated-error | database variant 1/1 (:memory:): error 'ALTER COLUMN to a generated column is not supported' does not match pattern 'Parse error: must have at least one non-generated column'
-turso/alter_column.sqltest::alter-table-add-column-with-fk-updates-schema | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a))' but was 'CREATE TABLE s(a, b REFERENCES t(a))'
-turso/alter_column.sqltest::alter-table-add-self-ref-fk-updates-schema | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))' but was 'CREATE TABLE s(a, b REFERENCES s(a))'
-turso/alter_column.sqltest::alter-table-rename-complex-constraints | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (x INTEGER, y TEXT, c REAL, PRIMARY KEY (x, y), UNIQUE (y, c), FOREIGN KEY (x) REFERENCES t (x))' but was 'CREATE TABLE t (
-turso/alter_column.sqltest::alter-table-rename-composite-fk-parent | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 1 expected 'CREATE TABLE inventory (id INTEGER PRIMARY KEY, cat TEXT, code TEXT, FOREIGN KEY (cat, code) REFERENCES products (cat, sku))' but was 'CREATE TABLE inventory (id INTEGER PRIMARY KEY, cat TEXT, sku TEXT, FOREIGN KEY (cat, sku) REFERENCES products(cat, sku))'
-turso/alter_column.sqltest::alter-table-rename-fk-actions | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent (parent_id) ON DELETE CASCADE ON UPDATE RESTRICT)' but was 'CREATE TABLE child (cid INTEGER PRIMARY KEY, parent_id INTEGER,
-turso/alter_column.sqltest::alter-table-rename-fk-chain | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected 'CREATE TABLE t2 (b_new INTEGER PRIMARY KEY, a_ref INTEGER, FOREIGN KEY (a_ref) REFERENCES t1 (a_new))' but was 'CREATE TABLE t2 (b_new INTEGER PRIMARY KEY, a_ref INTEGER, FOREIGN KEY (a_ref) REFERENCES t1(a_new))'
-turso/alter_column.sqltest::alter-table-rename-fk-child | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE child (cid INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent (id))' but was 'CREATE TABLE child (cid INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent(id))'
-turso/alter_column.sqltest::alter-table-rename-fk-deferrable | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent (parent_id) DEFERRABLE INITIALLY DEFERRED)' but was 'CREATE TABLE child (parent_id INTEGER PRIMARY KEY, pid INTEGER,
-turso/alter_column.sqltest::alter-table-rename-fk-parent | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 1 expected 'CREATE TABLE items (item_id INTEGER PRIMARY KEY, oid INTEGER, FOREIGN KEY (oid) REFERENCES orders (ord_id))' but was 'CREATE TABLE items (item_id INTEGER PRIMARY KEY, oid INTEGER, FOREIGN KEY (oid) REFERENCES orders(ord_id))'
-turso/alter_column.sqltest::alter-table-rename-fk-quoted | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES "parent table" ("new id"))' but was 'CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER,
-turso/alter_column.sqltest::alter-table-rename-multiple-fks | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE messages (mid INTEGER PRIMARY KEY, sender INTEGER, receiver INTEGER, FOREIGN KEY (sender) REFERENCES users (user_id), FOREIGN KEY (receiver) REFERENCES users (user_id))' but was 'CREATE TABLE messages (mid INTEGER PRIMARY KEY, sender INTEGER, receiver INTEGER,
-turso/alter_column.sqltest::alter-table-rename-pk-and-fk | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE child (id INTEGER PRIMARY KEY, parent_ref INTEGER, FOREIGN KEY (id) REFERENCES parent (pid), FOREIGN KEY (parent_ref) REFERENCES parent (pid))' but was 'CREATE TABLE child (
-turso/alter_column.sqltest::alter-table-rename-self-ref-fk | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE employees (employee_id INTEGER PRIMARY KEY, manager_id INTEGER, FOREIGN KEY (manager_id) REFERENCES employees (employee_id))' but was 'CREATE TABLE employees (employee_id INTEGER PRIMARY KEY, manager_id INTEGER,
-turso/alter_column.sqltest::rename-parent-2-inline | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p2_new (id))' but was 'CREATE TABLE c2(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES "p2_new"(id))'
-turso/alter_column.sqltest::rename-parent-3-composite | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))' but was 'CREATE TABLE c3(x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER,
-turso/alter_column.sqltest::rename-self-1 | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 's1_new|s1_new|1' but was 's1_new|s1_new|0'
-turso/alter_column.sqltest::rename-self-2-composite | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE sc_new (id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER, PRIMARY KEY (id, vr), FOREIGN KEY (parent_id, parent_vr) REFERENCES sc_new (id, vr))' but was 'CREATE TABLE "sc_new"(id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER,
+# These counts describe discovery, not the current remaining workload. Generated-column
+# conversion, dependent-FK rename corruption, ordinary cross-schema routing, and committed
+# sequence watermarks have since been fixed. Remaining ALTER entries preserve SQLite-style
+# token-spliced schema text or differ in CLI error decoration. FK replay/reopen and generated
+# column value-preservation tests guard the semantic fixes independently of text formatting.
+# Cross-database atomic publication and CDC remain separately owned implementation gaps.
+# The final MVCC entries retain intentional DDL/allocation/storage-mode contracts, pinned by
+# ManagedIntentionalMvccParityTests, not unsupported-harness exclusions.
+turso/alter_column.sqltest::alter-column-all-to-generated-error | diagnostic decoration: the engine rejects losing the last ordinary column with "must have at least one non-generated column"; the fixture requires Turso's CLI "Parse error:" prefix instead of the managed ALTER context
+turso/alter_column.sqltest::alter-column-only-to-generated-error | diagnostic decoration: same semantic rejection and CLI-prefix difference as alter-column-all-to-generated-error
+turso/alter_column.sqltest::alter-table-add-column-with-fk-updates-schema | schema rendering: SQLite-style ADD COLUMN preserves the inline REFERENCES clause; Turso reserializes it as a table-level FOREIGN KEY clause
+turso/alter_column.sqltest::alter-table-add-self-ref-fk-updates-schema | schema rendering: inline self-REFERENCES is preserved instead of being reserialized as a table-level FOREIGN KEY clause
+turso/alter_column.sqltest::alter-table-rename-complex-constraints | schema rendering: token-spliced CREATE TABLE retains source whitespace/newlines instead of Turso's single-line canonical form
+turso/alter_column.sqltest::alter-table-rename-composite-fk-parent | schema rendering: dependent child column names and FK child lists are now preserved correctly; token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-fk-actions | schema rendering: dependent child column names and FK actions are preserved correctly; token-spliced REFERENCES spacing differs
+turso/alter_column.sqltest::alter-table-rename-fk-chain | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-fk-child | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-fk-deferrable | schema rendering: dependent child column names and FK deferrability are preserved correctly; token-spliced REFERENCES spacing differs
+turso/alter_column.sqltest::alter-table-rename-fk-parent | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-fk-quoted | schema rendering: quoted identifiers remain valid; token-spliced REFERENCES spacing differs
+turso/alter_column.sqltest::alter-table-rename-multiple-fks | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-pk-and-fk | schema rendering: dependent child PK/FK column names are preserved correctly; source whitespace/newlines differ from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-self-ref-fk | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::rename-parent-2-inline | schema rendering: SQLite-style RENAME TO quotes the replacement table name and preserves inline REFERENCES spacing; Turso omits unnecessary quotes
+turso/alter_column.sqltest::rename-parent-3-composite | schema rendering: replacement table-name quoting and retained source whitespace differ from Turso's canonical form
+turso/alter_column.sqltest::rename-self-1 | schema rendering: valid REFERENCES "s1_new" does not match the fixture's sql LIKE '%REFERENCES s1_new%' check for an unquoted table name
+turso/alter_column.sqltest::rename-self-2-composite | schema rendering: replacement table-name quoting and retained source whitespace differ from Turso's canonical form
 turso/attach/writes.sqltest::attach-begin-exclusive-multiple-attached | database variant 1/1 (:memory:): expected success but got error: Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.
 turso/attach/writes.sqltest::attach-write-cdc-delete | database variant 1/1 (:memory:): expected success but got error: no such table: turso_cdc
 turso/attach/writes.sqltest::attach-write-cdc-insert | database variant 1/1 (:memory:): expected success but got error: no such table: turso_cdc
@@ -186,14 +175,14 @@ turso/gencol-index-order.sqltest::eqp-order-by-desc-virtual-column-uses-index | 
 turso/gencol-index-order.sqltest::eqp-order-by-virtual-column-and-unindexed-column-still-sorts | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t' but was '0|0|0|MANAGED EVALUATOR FALLBACK'
 turso/gencol-index-order.sqltest::eqp-order-by-virtual-column-uses-desc-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tvd' but was '1|0|0|SCAN t USING COVERING INDEX tvd'
 turso/gencol-index-order.sqltest::eqp-order-by-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '1|0|0|SCAN t USING COVERING INDEX tv'
-turso/mvcc_feature_compat.sqltest::mvcc-alter-table-in-begin-concurrent | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/mvcc_feature_compat.sqltest::mvcc-create-index-in-begin-concurrent | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/mvcc_feature_compat.sqltest::mvcc-create-table-in-begin-concurrent | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/mvcc_feature_compat.sqltest::mvcc-drop-table-in-begin-concurrent | database variant 1/1 (:memory:): expected an error but the statement succeeded
+turso/mvcc_feature_compat.sqltest::mvcc-alter-table-in-begin-concurrent | intentional extension: managed concurrent transactions permit conflict-free ALTER TABLE; the pinned Turso case rejects it unconditionally
+turso/mvcc_feature_compat.sqltest::mvcc-create-index-in-begin-concurrent | intentional extension: managed concurrent transactions permit conflict-free CREATE INDEX; the pinned Turso case rejects it unconditionally
+turso/mvcc_feature_compat.sqltest::mvcc-create-table-in-begin-concurrent | intentional extension: managed concurrent transactions permit conflict-free CREATE TABLE; the pinned Turso case rejects it unconditionally
+turso/mvcc_feature_compat.sqltest::mvcc-drop-table-in-begin-concurrent | intentional extension: managed concurrent transactions permit conflict-free DROP TABLE; the pinned Turso case rejects it unconditionally
 turso/mvcc_sequence_adversarial.sqltest::mvcc-concurrent-tx-non-cycle-backing-table-accumulates | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 4 expected '3|3' but was '1|3' -- intentional representation difference: Ahtola compacts the sequence backing table to one row per commit (matching its non-concurrent semantics) where Turso's BEGIN CONCURRENT leaves one row per nextval for a later checkpoint compactor to reclaim; the persisted watermark VALUE itself (3) is correct and durable across commit, only the row count differs.
-turso/mvcc_sequence_adversarial.sqltest::mvcc-concurrent-tx-rollback-burns-nextval | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 2 expected '2' but was '1'
-turso/mvcc_sequence_adversarial.sqltest::mvcc-concurrent-tx-rollback-burns-rowid | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 1 expected '2|b' but was '1|b'
-turso/mvcc_sequence_adversarial.sqltest::mvcc-user-sequence-survives-concurrent-tx-rollback | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 2 expected '102' but was '100'
-turso/mvcc_sequence.sqltest::mvcc-to-wal-autoincrement-continues | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 1 expected 'wal' but was 'mvcc'
-turso/mvcc_sequence.sqltest::mvcc-to-wal-user-sequence-continues | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 4 expected 'wal' but was 'mvcc'
-turso/mvcc_sequence.sqltest::mvcc-wal-mvcc-roundtrip-autoincrement | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 1 expected 'wal' but was 'mvcc'
+turso/mvcc_sequence_adversarial.sqltest::mvcc-concurrent-tx-rollback-burns-nextval | intentional allocation policy: rollback restores managed sequence watermarks, so the rolled-back allocation is reused (1 instead of Turso's 2)
+turso/mvcc_sequence_adversarial.sqltest::mvcc-concurrent-tx-rollback-burns-rowid | intentional allocation policy: rollback restores managed AUTOINCREMENT state, so the rolled-back rowid is reused (1 instead of Turso's 2)
+turso/mvcc_sequence_adversarial.sqltest::mvcc-user-sequence-survives-concurrent-tx-rollback | intentional allocation policy: rollback restores the user sequence watermark to 100 rather than burning allocations through 101
+turso/mvcc_sequence.sqltest::mvcc-to-wal-autoincrement-continues | intentional storage-mode policy: a :memory: WAL request retains mvcc mode; committed AUTOINCREMENT values still advance correctly
+turso/mvcc_sequence.sqltest::mvcc-to-wal-user-sequence-continues | intentional storage-mode policy: a :memory: WAL request retains mvcc mode; committed user-sequence values still advance correctly
+turso/mvcc_sequence.sqltest::mvcc-wal-mvcc-roundtrip-autoincrement | intentional storage-mode policy: a :memory: WAL request retains mvcc mode without losing allocation watermarks
