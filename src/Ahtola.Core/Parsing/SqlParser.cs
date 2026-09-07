@@ -1591,7 +1591,7 @@ internal sealed class SqlParser
         }
     }
 
-    // allowNulls gates Turso's CREATE-INDEX-only NULLS FIRST/LAST extension (turso-src
+    // allowNulls gates Turso's index/table-constraint NULLS FIRST/LAST extension (turso-src
     // core/schema.rs:5744 IndexColumn.nulls_order). It stays false for the UPSERT conflict-target
     // call site: SQLite/Turso reject an explicit NULLS clause there (sqlite3HasExplicitNulls /
     // core/translate/index.rs reject_explicit_nulls), independent of the CREATE INDEX grammar.

@@ -1,11 +1,10 @@
 namespace Ahtola.Core.Collation;
 
 /// <summary>
-/// Process-wide cache of parsed locale collation tags, mirroring Turso's
-/// <c>LocaleCollationRegistry</c> (<c>turso-src/core/translate/collate.rs</c>):
-/// resolving a BCP-47 tag string to a comparator is attempted lazily, once, and
-/// the result is cached by the case-folded tag text so repeated <c>COLLATE
-/// 'locale-tag'</c> usages do not re-parse or re-build the weight lookup.
+/// Resolves the supported managed locale profiles and caches their comparators,
+/// corresponding to Turso's <c>LocaleCollationRegistry</c>
+/// (<c>turso-src/core/translate/collate.rs</c>). Each lookup parses the supplied tag;
+/// equivalent accepted spellings reuse a comparator through its canonical semantic key.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -23,47 +22,13 @@ namespace Ahtola.Core.Collation;
 /// matching Turso's own single point of dispatch through <c>CollationSeq::new</c>.
 /// </para>
 /// <para>
-/// <b>Only successfully-resolved (accepted-profile) results are cached.</b> A
-/// review (2026-09-07) correctly flagged that the original implementation
-/// cached EVERY distinct name ever queried, including ones that failed to
-/// parse or were rejected by <see cref="LocaleCollationTag"/>'s accepted-
-/// profile allowlist. Since <c>COLLATE '&lt;arbitrary text&gt;'</c> can appear
-/// in ordinary SQL text and this cache is process-wide and never evicted, that
-/// let an attacker (or a buggy application generating novel collation names
-/// per query) grow the dictionary without bound simply by supplying a stream
-/// of distinct garbage strings — an unbounded-memory-growth vector. The set of
-/// names that can ever resolve successfully is intrinsically bounded (it must
-/// pass <see cref="LocaleCollationTag.TryParse"/>'s finite accepted-profile
-/// allowlist), so only positive resolutions are cached; a failed parse/
-/// rejection is recomputed on every call instead of being remembered. Parsing
-/// is a single cheap linear pass over the tag string with no allocation beyond
-/// the (rejected, therefore discarded) <see cref="LocaleCollationTag"/> record,
-/// so this trades an unbounded memory leak for a bounded amount of repeated,
-/// inexpensive work on the (rare, already-erroring) rejection path.
-/// </para>
-/// <para>
-/// <b>The cache key is the tag's canonical SEMANTIC identity, never the raw
-/// input text.</b> A follow-up review (2026-09-07) found that the first fix
-/// above was incomplete: even restricting caching to successfully-ACCEPTED
-/// tags left the cache unbounded, because <see cref="LocaleCollationTag.TryParse"/>
-/// (at the time) still tolerated arbitrary ignored BCP-47 attributes,
-/// unrecognized keywords, and a private-use suffix on an otherwise-accepted
-/// profile — so a caller could still vary the raw input text without bound
-/// (e.g. <c>en-u-zzzzzzzz-kf-upper</c>, <c>en-x-aaaaaaaa</c>,
-/// <c>en-u-zz-abcdefgh</c>) while every variant still "resolved". Two things
-/// closed this completely: <see cref="LocaleCollationTag.TryParse"/> now
-/// rejects that previously-tolerated content outright (see its remarks), and —
-/// belt-and-suspenders, since BCP-47 keyword ORDER is legitimately
-/// unconstrained and can't simply be "rejected" — this cache is keyed by
-/// <see cref="LocaleCollationTag.CanonicalName"/>, which is rebuilt from only
-/// the tag's parsed semantic fields (language, region, collation type,
-/// case-first, numeric) in a FIXED keyword order, excluding the raw input's
-/// casing, keyword order, and the parsed-but-inert <c>ks</c> value entirely.
-/// Because <see cref="LocaleCollationTag.CanonicalName"/> only depends on a small, enumerable set
-/// of semantic field combinations (24 across the three profiles this port
-/// currently accepts), the cache is now provably bounded regardless of how a
-/// caller spells, orders, or (within the accepted grammar) pads an equivalent
-/// input tag — not merely "bounded because we hope no one tries too hard".
+/// Only successful resolutions are cached, keyed by
+/// <see cref="LocaleCollationTag.CanonicalName"/> rather than raw input text.
+/// The supported profile, collation-type, case-first, and numeric combinations
+/// produce at most 24 keys. Raw casing, keyword order, and the parsed-but-inert
+/// <c>ks</c> value do not create extra entries. Neither rejected names nor
+/// caller-provided spellings are retained. This deliberately restricted subset
+/// does not provide general ICU/CLDR locale coverage.
 /// </para>
 /// </remarks>
 public static class LocaleCollationRegistry

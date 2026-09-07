@@ -1,10 +1,11 @@
 # `CREATE INDEX ... NULLS FIRST/LAST`
 
 Ahtola supports Turso's `NULLS FIRST`/`NULLS LAST` extension on `CREATE INDEX`
-indexed-column terms:
+terms and table-level `PRIMARY KEY`/`UNIQUE` constraint terms:
 
 ```sql
 CREATE INDEX idx ON t (a, b DESC NULLS FIRST, c COLLATE NOCASE NULLS LAST);
+CREATE TABLE keyed(a INT, b, PRIMARY KEY(a NULLS LAST), UNIQUE(b DESC NULLS FIRST));
 ```
 
 This mirrors `turso-src/sqlite/parser/src/ast.rs` (`NullsOrder`),
@@ -27,22 +28,23 @@ An explicit clause changes physical key ordering (and therefore the on-disk
 byte layout of the index b-tree) whenever it disagrees with the implicit
 default for that term's direction — e.g. `a ASC NULLS LAST` or
 `a DESC NULLS FIRST`. `ASC NULLS FIRST` / `DESC NULLS LAST` are equivalent to
-omitting the clause and produce byte-identical output to a plain index.
+omitting the clause for key comparison. Explicit schema text can still differ.
 
 This is honored end-to-end: parsed metadata (`IndexedColumnDefinition`/
 `EmbeddedIndexColumn.NullPlacement`), the persisted comparator
 (`SqliteIndexComparisonTerm.NullsOrder`/`SqliteIndexRecordComparer`), schema
-round-trip/reopen validation, `ORDER BY` index-satisfaction, forward/reverse
+round-trip/reopen validation, forward/reverse
 scans, uniqueness/UPSERT comparisons, and MVCC overlay merge ordering all
 resolve the same effective placement.
 
+Some reverse-scan ORDER BY elision, range-plan descriptions, and MIN/MAX index
+optimizations remain tracked in the gap inventory; supported key ordering does
+not imply those planner gaps are closed.
+
 ## Scope and exclusions
 
-Only `CREATE INDEX` indexed-column terms accept this clause. It stays
-rejected, matching SQLite/Turso, in:
+The clause remains rejected, matching SQLite/Turso, in:
 
-- Table constraints (`PRIMARY KEY (...)`, `UNIQUE (...)`, column-level
-  `PRIMARY KEY`) — `"NULLS FIRST/LAST is not supported in table constraints."`
 - `INSERT ... ON CONFLICT (...)` conflict targets — SQLite rejects an explicit
   NULLS clause there (`sqlite3HasExplicitNulls`; Turso's
   `reject_explicit_nulls`, `turso-src/core/translate/upsert.rs`).
@@ -57,16 +59,44 @@ already supported and is unaffected.
 Standard SQLite's `CREATE INDEX` grammar has **no** `NULLS FIRST`/`NULLS LAST`
 clause (unlike its `ORDER BY` grammar, which has supported it since 3.30.0).
 An index created with an explicit NULLS clause is therefore a Turso/Ahtola
-extension to the on-disk schema text: a real `sqlite3`-based reader (or any
-engine without this extension) parses the whole `sqlite_master`/schema table
-eagerly at open time and will fail to parse that one `CREATE INDEX` statement,
-making the database unusable with that reader. This is a hard, documented
-fail-closed boundary, not a silent-corruption risk: the foreign reader gets a
-schema parse error up front rather than reading the index with the wrong
-implicit comparator.
+extension to the on-disk schema text. A reader without this extension can fail
+when it parses the schema, even if that happens after opening the file rather
+than during open itself. Table constraints carrying the extension have the
+same interoperability limitation.
 
-To keep ordinary indexes fully interoperable, Ahtola never emits an explicit
-`NULLS FIRST`/`NULLS LAST` clause for a term whose placement already matches
-the implicit ASC/DESC default — the clause appears in persisted/round-tripped
-SQL text only when the user actually wrote a placement that diverges from
-that default.
+User-supplied schema text retains explicitly written clauses, including ones
+that happen to match the implicit ordering. To keep the schema compatible
+with standard SQLite, omit explicit NULLS clauses from index and constraint
+definitions; use ordinary ASC/DESC semantics instead.
+
+## Locale collations on ordinary indexes
+
+Ordinary expressions and b-tree keys also support a restricted, pure-managed
+locale profile through `COLLATE`. This is separate from `USING <method>`
+indexes, which still reject column-level COLLATE.
+
+```sql
+SELECT name FROM people ORDER BY name COLLATE 'en-u-kn-true';
+CREATE INDEX names ON people(name COLLATE 'fr-FR' NULLS LAST);
+```
+
+The accepted base profiles are bare `en`, bare `es`, and `fr-FR`, not arbitrary
+BCP-47 locales. Supported options include numeric ordering (`kn`), case-first
+ordering (`kf`), and traditional Spanish `es-u-co-trad`. Other languages,
+unverified region/variant forms, private-use extensions, Unicode attributes,
+and unknown keywords fail explicitly instead of falling back to approximate
+root ordering.
+
+The character repertoire is also restricted: ASCII letters/digits, the defined
+ASCII punctuation/whitespace weights, and the implemented Latin accented
+letters and their corresponding decomposed forms. Unsupported characters or
+combining sequences throw rather than silently installing an incompatible
+index order. This is not general ICU/CLDR coverage. The `ks` keyword is
+validated but does not change comparison strength in this pinned-binding
+profile; it must not be used to request accent-insensitive comparison.
+
+Application-registered collations take precedence over these profiles. The
+process-wide comparator cache uses at most 24 canonical semantic identities,
+not arbitrary caller-supplied tag strings. A foreign reader needs a matching
+collation implementation for operations using these keys; accepting a locale
+name alone does not establish compatible persisted ordering.
