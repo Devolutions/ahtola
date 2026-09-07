@@ -6,10 +6,10 @@ namespace Ahtola.Tests;
 public sealed class TursoAggregateStepParityTests
 {
     [Test]
-    public void SumIntegerOverflowStopsTheCompiledAggregateAtTheOverflowingRow()
+    public void SumIntegerOverflowIsReportedAfterTheCompiledAggregateConsumesItsInput()
     {
         var observed = new List<long>();
-        var database = new EmbeddedDatabase();
+        using var database = new EmbeddedDatabase();
         database.RegisterScalarFunction("observe", 1, arguments =>
         {
             var value = arguments[0].AsInteger();
@@ -24,7 +24,9 @@ public sealed class TursoAggregateStepParityTests
         using var statement = connection.Prepare("SELECT sum(observe(x)) FROM values_table;");
         Assert.Throws<EmbeddedSqlException>(() => statement.Step())
             .Message.Should().Be("integer overflow");
-        observed.Should().Equal(9223372036854775807, 1);
+        // The pinned SumAggState defers overflow until finalization: a later REAL could
+        // still clear the flag, so intervening input callbacks must not be skipped.
+        observed.Should().Equal(9223372036854775807, 1, 2);
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)
