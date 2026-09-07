@@ -26,11 +26,17 @@ public sealed partial class EmbeddedDatabase
     {
         var outputColumns = GetOutputColumns(statement.Source, context);
         var rawOutputColumns = GetRawOutputColumns(statement.Source, context);
-        var resultColumns = GetSelectBindingColumns(statement.Projections, outputColumns, rawOutputColumns);
+        // json_object(*)/jsonb_object(*) must be expanded into explicit column references
+        // before RewriteSelectSubqueries's FROM-subquery flattening runs, so a flattened
+        // derived table's computed columns and a table-valued function's hidden columns are
+        // resolved the same way an ordinary `SELECT *` resolves them (see
+        // ExpandJsonObjectStarProjections for why the ordering matters).
+        var projections = ExpandJsonObjectStarProjections(statement.Projections, statement.Source, context);
+        var resultColumns = GetSelectBindingColumns(projections, outputColumns, rawOutputColumns);
 
         var groupBy = ResolveGroupByBindings(
             statement.GroupBy,
-            statement.Projections,
+            projections,
             resultColumns,
             outputColumns,
             rawOutputColumns,
@@ -40,18 +46,19 @@ public sealed partial class EmbeddedDatabase
             ? null
             : RewriteColumnReferences(
                 statement.Having,
-                column => ResolveHavingAlias(column, statement.Projections, outputColumns, rawOutputColumns, outerRow));
+                column => ResolveHavingAlias(column, projections, outputColumns, rawOutputColumns, outerRow));
 
         var where = statement.Where is null
             ? null
             : RewriteColumnReferences(
                 statement.Where,
-                column => ResolveWhereAliasFallback(column, statement.Projections, outputColumns, rawOutputColumns, outerRow));
+                column => ResolveWhereAliasFallback(column, projections, outputColumns, rawOutputColumns, outerRow));
 
         var orderBy = ResolveOrderByBindings(statement.OrderBy, resultColumns);
 
         return statement with
         {
+            Projections = projections,
             GroupBy = groupBy,
             Having = having,
             Where = where,
@@ -162,6 +169,68 @@ public sealed partial class EmbeddedDatabase
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Expands a <c>json_object(*)</c>/<c>jsonb_object(*)</c> projection into an explicit
+    /// argument list (alternating column-name literal, column-value reference) built from the
+    /// enclosing SELECT's resolved, subquery-aware, hidden-column-excluding output columns —
+    /// the same <see cref="GetOutputColumns"/>/<see cref="BuildStarColumnReference"/> mechanism
+    /// an ordinary <c>SELECT *</c> uses (see <see cref="GetSelectBindingColumns"/>).
+    /// <para>
+    /// Doing this once, up front — before <c>RewriteSelectSubqueries</c>'s FROM-subquery
+    /// flattening runs — matters: flattening substitutes derived-table column *references*
+    /// (e.g. rewriting a projected <c>double_price</c> back to <c>price * 2</c>) by walking the
+    /// projection expression tree, but a bare <c>json_object(*)</c> has no such references for
+    /// it to find. Expanding the star into real <see cref="ColumnExpression"/> arguments here
+    /// gives the flattener something to substitute, so a derived-table's computed columns and a
+    /// table-valued function's hidden columns are both already correct by the time
+    /// <c>EvaluateScalarFunction</c>'s runtime <c>CountStar</c> branch would otherwise have to
+    /// read them straight off the (possibly-flattened) physical row.
+    /// </para>
+    /// A bare <c>json_object(*)</c> with no FROM clause is left unexpanded so the existing
+    /// runtime check still reports "json_object(*) requires a FROM clause".
+    /// </summary>
+    private static IReadOnlyList<Projection> ExpandJsonObjectStarProjections(
+        IReadOnlyList<Projection> projections,
+        TableSource? source,
+        QueryContext context)
+    {
+        List<Projection>? result = null;
+        for (var index = 0; index < projections.Count; index++)
+        {
+            var projection = projections[index];
+            if (projection.Expression is not FunctionExpression
+                {
+                    CountStar: true,
+                } function
+                || function.Name.ToUpperInvariant() is not ("JSON_OBJECT" or "JSONB_OBJECT"))
+            {
+                result?.Add(projection);
+                continue;
+            }
+
+            var outputColumns = GetOutputColumns(source, context);
+            if (outputColumns.Count == 0)
+            {
+                // No FROM clause: leave CountStar set so the scalar-function evaluator's
+                // existing "json_object(*) requires a FROM clause" check still fires.
+                result?.Add(projection);
+                continue;
+            }
+
+            var arguments = new List<Expression>(outputColumns.Count * 2);
+            foreach (var column in outputColumns)
+            {
+                arguments.Add(new LiteralExpression(SqlValue.Text(column.Name)));
+                arguments.Add(BuildStarColumnReference(column));
+            }
+
+            result ??= [.. projections.Take(index)];
+            result.Add(projection with { Expression = function with { Arguments = arguments, CountStar = false } });
+        }
+
+        return result ?? projections;
     }
 
     private static ColumnExpression BuildStarColumnReference(OutputColumn column)

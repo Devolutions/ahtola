@@ -3784,6 +3784,9 @@ internal sealed class SqlParser
                     && string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
                     return new LiteralExpression(SqlValue.Null);
                 if (!token.IsQuoted
+                    && string.Equals(token.Text, "DEFAULT", StringComparison.OrdinalIgnoreCase))
+                    return new DefaultValueExpression();
+                if (!token.IsQuoted
                     && string.Equals(token.Text, "CURRENT_DATE", StringComparison.OrdinalIgnoreCase))
                     return new CurrentTimeExpression(CurrentTimeKind.Date);
                 if (!token.IsQuoted
@@ -3964,10 +3967,13 @@ internal sealed class SqlParser
 
     private Expression ParseRaiseExpression()
     {
-        if (!_inTriggerBody)
-            throw Error("RAISE() may only be used within a trigger program.");
         if (ConsumeKeyword("IGNORE"))
         {
+            // Unlike ABORT, IGNORE has no meaning outside a trigger: there is no triggering
+            // statement to skip, so Turso rejects it here (translator.rs: ResolveType::Ignore).
+            if (!_inTriggerBody)
+                throw Error("RAISE() may only be used within a trigger program.");
+
             Expect(TokenKind.RightParen);
             return new RaiseExpression(RaiseAction.Ignore, null);
         }
@@ -3991,6 +3997,13 @@ internal sealed class SqlParser
                         ? RaiseAction.Fail
                         : throw Error("Expected ROLLBACK, ABORT, FAIL, or IGNORE in RAISE().");
         }
+
+        // Turso extension: RAISE(ABORT, msg)/RAISE('msg') is also usable outside a trigger
+        // program to fail a query directly (translator.rs: ResolveType::Fail | Abort | Rollback
+        // only requires a trigger when the action isn't Abort). ROLLBACK and FAIL still require
+        // one, since there is no enclosing trigger transaction/statement to roll back or fail.
+        if (!_inTriggerBody && action != RaiseAction.Abort)
+            throw Error("RAISE() may only be used within a trigger program.");
 
         if (!shorthand)
             Expect(TokenKind.Comma);

@@ -939,6 +939,16 @@ internal enum CurrentTimeKind
 
 internal sealed record CurrentTimeExpression(CurrentTimeKind Kind) : Expression;
 
+/// <summary>
+/// A bare <c>DEFAULT</c> token in value position, e.g.
+/// <c>INSERT INTO t VALUES (1, DEFAULT)</c>. Valid only inside an INSERT statement's
+/// VALUES row list, where <c>EmbeddedDatabase.BuildInsertRow</c> resolves it to
+/// the target column's declared default (schema <c>DEFAULT</c> clause, or NULL); evaluating
+/// it in any other expression context (SELECT list, WHERE, etc.) is a compile-time error,
+/// matching SQLite/Turso, which reject <c>DEFAULT</c> outside a VALUES row.
+/// </summary>
+internal sealed record DefaultValueExpression : Expression;
+
 internal sealed record ParameterExpression(int Index) : Expression;
 
 internal enum RaiseAction

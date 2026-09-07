@@ -181,15 +181,20 @@ public class ManagedPercentileAggregateRuntimeSliceTests
         AssertError(connection, "SELECT percentile(value) FROM valueset;", "wrong number of arguments to function percentile()");
         AssertError(connection, "SELECT percentile_cont(value) FROM valueset;", "wrong number of arguments to function percentile_cont()");
         AssertError(connection, "SELECT percentile_disc(value) FROM valueset;", "wrong number of arguments to function percentile_disc()");
-        AssertError(connection, "SELECT percentile(value, 101) FROM valueset;", "Invalid percentile value");
-        AssertError(
-            connection,
-            "SELECT percentile_cont(value, 1.01) FROM valueset;",
-            "Percentile value must be between 0.0 and 1.0 inclusive");
-        AssertError(
-            connection,
-            "SELECT percentile_disc(value, -0.01) FROM valueset;",
-            "Percentile value must be between 0.0 and 1.0 inclusive");
+
+        // A fraction/percentage that is out of range for every row never gets pushed into the
+        // running value set (mirrors Turso's percentile.rs step(), which returns before
+        // recording the row), so the aggregate sees an empty set and quietly finalizes as
+        // NULL — finalize() checks for an empty value set before it ever looks at the
+        // accumulated error. The error only surfaces once at least one row *did* get recorded
+        // (see the "Inconsistent percentile values" case below, where row 1's value is
+        // recorded before row 2's fraction is found to disagree).
+        ReadRows(connection, "SELECT percentile(value, 101) FROM valueset;")[0]
+            .Should().Equal(SqlValue.Null);
+        ReadRows(connection, "SELECT percentile_cont(value, 1.01) FROM valueset;")[0]
+            .Should().Equal(SqlValue.Null);
+        ReadRows(connection, "SELECT percentile_disc(value, -0.01) FROM valueset;")[0]
+            .Should().Equal(SqlValue.Null);
 
         Execute(connection, "UPDATE valueset SET percentile = 0.75 WHERE value = 2;");
         AssertError(

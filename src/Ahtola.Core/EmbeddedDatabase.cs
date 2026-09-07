@@ -14131,8 +14131,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferRowidTracking = false)
     {
         var values = new SqlValue[valueExpressions.Length];
+        bool[]? defaultedPositions = null;
         for (var index = 0; index < valueExpressions.Length; index++)
-            values[index] = Evaluate(valueExpressions[index], parameters, null, context);
+        {
+            if (valueExpressions[index] is DefaultValueExpression)
+            {
+                // A bare DEFAULT in a VALUES row means "use this column's declared default",
+                // not a value to evaluate. Leave a placeholder here; BuildInsertRow(values, ...)
+                // excludes this position's target column from assignedTargetIndices so
+                // CreateRowWithDefaults fills it from the schema DEFAULT clause (or NULL).
+                defaultedPositions ??= new bool[valueExpressions.Length];
+                defaultedPositions[index] = true;
+                values[index] = SqlValue.Null;
+            }
+            else
+            {
+                values[index] = Evaluate(valueExpressions[index], parameters, null, context);
+            }
+        }
 
         return BuildInsertRow(
             statement,
@@ -14144,7 +14160,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             allowExistingRowid,
             validateCheckConstraints,
             resolveNotNullReplace,
-            deferRowidTracking);
+            deferRowidTracking,
+            defaultedPositions);
     }
 
     private (SqlValue[] Row, long RowId) BuildInsertRow(
@@ -14157,7 +14174,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool allowExistingRowid = false,
         bool validateCheckConstraints = true,
         bool resolveNotNullReplace = true,
-        bool deferRowidTracking = false)
+        bool deferRowidTracking = false,
+        bool[]? defaultedPositions = null)
     {
         if (values.Count != plan.TargetIndices.Length)
             throw new EmbeddedSqlException(
@@ -14170,6 +14188,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 assignedTargetIndices.Add(targetIndex);
         }
 
+        if (defaultedPositions is not null)
+        {
+            // A position marked DEFAULT is not actually being assigned a value: exclude its
+            // target column from assignedTargetIndices so CreateRowWithDefaults fills it from
+            // the schema DEFAULT clause (or NULL) below instead of leaving it a placeholder.
+            for (var index = 0; index < defaultedPositions.Length; index++)
+            {
+                if (defaultedPositions[index] && plan.TargetIndices[index] >= 0)
+                    assignedTargetIndices.Remove(plan.TargetIndices[index]);
+            }
+        }
+
         var row = table.CreateRowWithDefaults(
             expression => Evaluate(expression, EmptyParameters, row: null, context),
             assignedTargetIndices);
@@ -14177,6 +14207,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue explicitRowidValue = SqlValue.Null;
         for (var index = 0; index < values.Count; index++)
         {
+            if (defaultedPositions is not null && defaultedPositions[index])
+                continue; // CreateRowWithDefaults already filled this column's default above.
+
             var value = values[index];
             if (plan.TargetIndices[index] < 0)
                 explicitRowidValue = value; // rowid pseudo-column: last write wins.
@@ -18294,7 +18327,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 context.VdbeExecutionOptions);
         }
 
-        return ExecuteSelect(select, parameters, context, outerRow);
+        return ExecuteSelect(select, parameters, context, outerRow, bindingsAlreadyResolved: true);
     }
 
     // Ordinary callback-capable scans stay on the evaluator's deferred projection path. Direct managed
@@ -25689,7 +25722,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 foreach (var tuple in tuples)
                     rows.Add(new SourceRow(argumentNames, tuple, Parent: outerRow));
 
-                return EvaluateAggregateFunction(function, rows, parameters, context);
+                return EvaluateAggregateFunction(function, rows, parameters, context, outerRow);
             },
         };
     }
@@ -30534,14 +30567,22 @@ out bool hasReturning)
         SelectStatement statement,
         SqlValue[] parameters,
         QueryContext context,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        bool bindingsAlreadyResolved = false)
     {
         context.CheckInterrupt();
         statement = BindTableValuedFunctionSources(statement, context);
         ValidateSelectIndexDirectives(statement, context);
         statement = StripUnusableForcedIndexForCountStar(statement, context);
         statement = ResolveNamedWindows(statement);
-        statement = ResolveSelectBindings(statement, context, outerRow);
+        // GROUP BY ordinal resolution is not idempotent: an ordinal like "GROUP BY 1" is
+        // rewritten to the referenced result-column expression, and when that expression is
+        // itself an integer literal (e.g. `SELECT 42 GROUP BY 1`), re-running the resolver
+        // would misread the already-resolved literal as a brand-new ordinal position. Callers
+        // that already resolved bindings (the compiled-route caller falling back to this
+        // evaluator) must skip this step instead of re-applying it.
+        if (!bindingsAlreadyResolved)
+            statement = ResolveSelectBindings(statement, context, outerRow);
         context = EnterCollationSource(context, statement.Source);
         ValidateGroupByCollations(statement.GroupBy);
         var resolvedOrderBy = ResolveOrderBy(statement.OrderBy, statement.Projections);
@@ -38924,6 +38965,11 @@ out bool hasReturning)
             },
             ParameterExpression parameter => ReadParameter(parameters, parameter.Index),
             RowValueExpression => throw new EmbeddedSqlException("row value misused"),
+            // Only meaningful in an INSERT statement's VALUES row list, where BuildInsertRow
+            // intercepts it before evaluation. Reaching Evaluate means it appeared somewhere
+            // else (SELECT list, WHERE, a non-INSERT VALUES term, …), which SQLite/Turso reject.
+            DefaultValueExpression => throw new EmbeddedSqlException(
+                "near \"DEFAULT\": syntax error"),
             ColumnExpression column => EvaluateColumn(column, row, context),
             RaiseExpression raise => EvaluateRaise(raise, parameters, row, context),
             FunctionExpression function => EvaluateFunctionRespectingOuterAggregateScope(function, parameters, row, context),
@@ -41733,7 +41779,8 @@ out bool hasReturning)
         FunctionExpression function,
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        SourceRow? representative = null)
     {
         var effectiveRows = ApplyAggregateModifiers(function, rows, parameters, context);
         if (string.Equals(function.Name, "COUNT", StringComparison.Ordinal))
@@ -41741,7 +41788,7 @@ out bool hasReturning)
         if (IsBuiltInAggregate(function))
             return EvaluateBuiltInAggregate(function, effectiveRows, parameters, context);
         if (IsManagedPercentileAggregate(function.Name))
-            return EvaluatePercentileAggregate(function, effectiveRows, parameters, context);
+            return EvaluatePercentileAggregate(function, effectiveRows, parameters, context, representative);
         if (TryGetAggregateFunction(function.Name, function.Arguments.Count, out var aggregate))
             return EvaluateManagedAggregate(aggregate, function, effectiveRows, parameters, context);
 
@@ -42021,7 +42068,7 @@ out bool hasReturning)
                 return EvaluateAggregateFunction(function, scope.Rows, parameters, scope.Context);
             }
         }
-        return EvaluateAggregateFunction(function, rows, parameters, context);
+        return EvaluateAggregateFunction(function, rows, parameters, context, representative);
     }
 
     // Decides whether every column an aggregate call references (arguments plus FILTER)
@@ -42110,6 +42157,36 @@ out bool hasReturning)
 
     private static bool TryResolveColumnLocally(SourceRow row, ColumnExpression column)
         => (row.Parent is null ? row : row with { Parent = null }).TryGetValue(column, out _);
+
+    /// <summary>
+    /// True when an ordered-set aggregate's direct (fraction) argument is not a valid constant
+    /// with respect to its own input rows: it references a column that resolves against
+    /// <paramref name="localRow"/> (ignoring any Parent chain, so an outer correlation is not
+    /// mistaken for a local reference), or it contains a subquery anywhere — conservatively
+    /// rejected because a nested query's own scope is not visible from here. Mirrors
+    /// PostgreSQL's rejection of <c>percentile_cont(x) WITHIN GROUP (ORDER BY x)</c> and the
+    /// pinned corpus's <c>ordered-set-*-fraction-rejected</c> family.
+    /// </summary>
+    private static bool OrderedSetFractionReferencesLocalInput(Expression fraction, SourceRow? localRow)
+    {
+        var rejected = false;
+        ForEachExpression(fraction, candidate =>
+        {
+            switch (candidate)
+            {
+                case ScalarSubqueryExpression or ExistsExpression or InSubqueryExpression:
+                    rejected = true;
+                    return false;
+                case ColumnExpression column when localRow is not null && TryResolveColumnLocally(localRow, column):
+                    rejected = true;
+                    return false;
+                default:
+                    return true;
+            }
+        });
+
+        return rejected;
+    }
 
     // ContainsAggregate/ContainsAggregateAcrossWindows never look inside a subquery
     // boundary (a scalar/EXISTS/IN subquery has its own scope), so they cannot see an
@@ -43315,13 +43392,14 @@ out bool hasReturning)
         FunctionExpression function,
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        SourceRow? representative = null)
     {
         var name = function.Name.ToUpperInvariant();
         if (name == "MODE")
             return EvaluateModeAggregate(function, rows, parameters, context);
         if (function.OrderedSet)
-            return EvaluateOrderedSetPercentileAggregate(function, rows, parameters, context);
+            return EvaluateOrderedSetPercentileAggregate(function, rows, parameters, context, representative);
 
         var isMedian = name == "MEDIAN";
         var isPercentile = name == "PERCENTILE";
@@ -43377,10 +43455,18 @@ out bool hasReturning)
             values.Add(value);
         }
 
-        if (error is not null)
-            throw new EmbeddedSqlException(error);
+        // Mirrors Turso's percentile.rs finalize(): an empty result set returns NULL even
+        // when every row's candidate was invalid — step() never pushes a value for an
+        // out-of-range or inconsistent fraction, so "every row was invalid" and "no rows
+        // matched" are the same empty-values state, and both quietly finalize as NULL. The
+        // accumulated error only surfaces when at least one row *did* get pushed (a valid
+        // fraction seen before a later invalid/inconsistent one), matching
+        // percentile_disc(x, 100)'s NULL result and percentile_cont(value, percentile)'s
+        // "Inconsistent percentile values across rows" error against the same code path.
         if (values.Count == 0)
             return SqlValue.Null;
+        if (error is not null)
+            throw new EmbeddedSqlException(error);
 
         values.Sort(ComparePercentileValues);
         if (isMedian)
@@ -43401,7 +43487,11 @@ out bool hasReturning)
                 return SqlValue.Real(values[lower]);
 
             var weight = rank - lower;
-            return SqlValue.Real(values[lower] * (1d - weight) + values[upper] * weight);
+            // lower + (upper - lower) * weight, not lower * (1 - weight) + upper * weight:
+            // the two are mathematically equivalent but not bit-identical in floating point,
+            // and only this ordering matches PostgreSQL's percentile_cont (and the pinned
+            // corpus's exact expected text, e.g. 2.4 rather than 2.4000000000000004).
+            return SqlValue.Real(values[lower] + ((values[upper] - values[lower]) * weight));
         }
 
         return SqlValue.Real(values[(int)Math.Floor(rank)]);
@@ -43411,13 +43501,30 @@ out bool hasReturning)
         FunctionExpression function,
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        SourceRow? representative = null)
     {
         RequireAggregateArgumentCount(function.Name.ToLowerInvariant(), function.Arguments, 2);
+        // The direct (fraction) argument must be a constant with respect to this aggregate's
+        // own input rows — PostgreSQL rejects a fraction that reads a column of the ordered
+        // set it is computed over (and, conservatively, a fraction containing any subquery,
+        // since a nested query's own scope is not visible here). It may, however, be a
+        // correlated reference to an *enclosing* query
+        // (`percentile_cont(outer.frac) WITHIN GROUP (ORDER BY inner.x)`), evaluated once per
+        // invocation rather than once per row. The local-row probe below distinguishes the
+        // two: a column that resolves against this aggregate's own rows is rejected, while one
+        // that only resolves through an enclosing row's Parent chain is a legal correlation.
+        var localProbeRow = rows.Count > 0 ? rows[0] : null;
+        if (OrderedSetFractionReferencesLocalInput(function.Arguments[1], localProbeRow))
+        {
+            throw new EmbeddedSqlException(
+                $"the fraction argument of {function.Name.ToLowerInvariant()}() must be constant with respect to its input rows");
+        }
+
         var fractionValue = Evaluate(
             function.Arguments[1],
             parameters,
-            new SourceRow([], []),
+            representative ?? localProbeRow,
             context);
         if (fractionValue.Kind == SqlValueKind.Null)
             return SqlValue.Null;
@@ -43454,7 +43561,9 @@ out bool hasReturning)
                 return SqlValue.Real(values[lower]);
 
             var weight = rank - lower;
-            return SqlValue.Real(values[lower] * (1d - weight) + values[upper] * weight);
+            // See the matching comment on the legacy two-argument form above: this exact
+            // operand order is required for bit-identical output with the pinned corpus.
+            return SqlValue.Real(values[lower] + ((values[upper] - values[lower]) * weight));
         }
 
         var discreteValues = new List<SqlValue>();
@@ -43471,8 +43580,18 @@ out bool hasReturning)
 
         var orderBy = function.OrderedSetOrderBy
             ?? new OrderByTerm(function.Arguments[0], Descending: false);
-        var collation = GetCollation(orderBy.Expression);
-        discreteValues.Sort((left, right) => CompareForOrdering(left, right, orderBy, collation));
+        // A column's declared collation (e.g. TEXT COLLATE NOCASE) governs ordering here even
+        // without an explicit COLLATE in the ORDER BY clause, exactly like a real ORDER BY —
+        // GetCollation only looks at an explicit COLLATE wrapper and misses that fallback.
+        var collation = GetEffectiveCollation(orderBy.Expression, context);
+        // A stable sort matters here: values the chosen collation considers equal (e.g. 'apple'
+        // and 'Apple' under NOCASE) keep their original row order, so which one percentile_disc
+        // picks as, say, the minimum is deterministic instead of depending on an unstable sort's
+        // internal pivoting. List<T>.Sort is not guaranteed stable; Enumerable.OrderBy is.
+        discreteValues = discreteValues
+            .OrderBy(static value => value, Comparer<SqlValue>.Create(
+                (left, right) => CompareForOrdering(left, right, orderBy, collation)))
+            .ToList();
         var index = fraction <= 0d
             ? 0
             : Math.Max(0, (int)Math.Ceiling(fraction * discreteValues.Count) - 1);
@@ -43500,8 +43619,13 @@ out bool hasReturning)
 
         var orderBy = function.OrderedSetOrderBy
             ?? new OrderByTerm(function.Arguments[0], Descending: false);
-        var collation = GetCollation(orderBy.Expression);
-        values.Sort((left, right) => CompareForOrdering(left, right, orderBy, collation));
+        // See the matching comment in EvaluateOrderedSetPercentileAggregate: the column's
+        // declared collation must be honored, and the sort must be stable.
+        var collation = GetEffectiveCollation(orderBy.Expression, context);
+        values = values
+            .OrderBy(static value => value, Comparer<SqlValue>.Create(
+                (left, right) => CompareForOrdering(left, right, orderBy, collation)))
+            .ToList();
         var bestIndex = 0;
         var bestCount = 0;
         for (var index = 0; index < values.Count;)
@@ -57488,14 +57612,12 @@ public sealed partial class EmbeddedConnection : IDisposable
         if (ManagedSchemaName.TrySplit(statement.Target, out var schema, out var localName))
             return RouteSchema(schema, localName, target => statement with { Target = target });
 
-        if (statement.Target.Equals("temp", StringComparison.OrdinalIgnoreCase))
-        {
-            return new RoutedStatement(
-                _tempDatabase,
-                statement with { Target = "main" },
-                IsAttached: false);
-        }
-
+        // Unlike DROP/REINDEX, a bare (unqualified) ANALYZE target is never treated as the
+        // "temp" schema name — Turso's resolve_analyze_targets (core/translate/analyze.rs)
+        // only special-cases "main" and attached-database aliases here; anything else,
+        // including the literal word "temp", is looked up as a table/index name in the main
+        // schema. A table that happens to be named "temp" must resolve to itself, matching
+        // turso-sqltests/analyze.sqltest's `CREATE TABLE temp (...); ANALYZE temp;`.
         if (_attachedDatabases.TryGetValue(statement.Target, out var attachment))
         {
             return new RoutedStatement(
@@ -59240,6 +59362,7 @@ Func<string, ParsedStatement> rewrite)
             case QualifiedStarExpression:
             case CurrentTimeExpression:
             case RaiseExpression:
+            case DefaultValueExpression:
                 return;
             case ScalarSubqueryExpression scalarSubquery:
                 CollectQuerySchemas(scalarSubquery.Query, schemas, commonTableExpressions);
@@ -61397,9 +61520,23 @@ Func<string, ParsedStatement> rewrite)
     private ExecutionResult ExecutePragmaAutoVacuum(PragmaAutoVacuumStatement statement)
     {
         ValidatePragmaSchema(statement.Schema);
-        return statement.Value is null
-            ? new ExecutionResult(["auto_vacuum"], [[SqlValue.Integer(0)]], 0)
-            : ExecutionResult.Empty;
+        if (statement.Value is null)
+            return new ExecutionResult(["auto_vacuum"], [[SqlValue.Integer(0)]], 0);
+
+        // Auto-vacuum is always off: Ahtola has no `--experimental-autovacuum` flag/engine
+        // support to turn it on. SQLite spells the mode either by name or by number (0/NONE,
+        // 1/FULL, 2/INCREMENTAL); requesting NONE only restates the state the database is
+        // already in, so it is always accepted, while requesting FULL/INCREMENTAL (or any
+        // unrecognized value) fails the same way it would if the flag existed but was unset.
+        var isNone = string.Equals(statement.Value, "none", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(statement.Value, "0", StringComparison.Ordinal);
+        if (!isNone)
+        {
+            throw new EmbeddedSqlException(
+                "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.");
+        }
+
+        return ExecutionResult.Empty;
     }
 
     private ExecutionResult ExecutePragmaDataSyncRetry(PragmaDataSyncRetryStatement statement)

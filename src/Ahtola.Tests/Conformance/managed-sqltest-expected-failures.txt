@@ -79,6 +79,7 @@ turso/create-index-nulls-first-last.sqltest::eqp-range-seek-on-nulls-last-index 
 turso/create-index-nulls-first-last.sqltest::eqp-upper-range-seek-on-nulls-last-index | same separately owned EQP operator-symbol gap as eqp-range-seek-on-nulls-last-index, for the upper-bound "(a<?)" case
 turso/create-index-nulls-first-last.sqltest::eqp-min-fast-path-on-nulls-last-index | separately owned gap: the VDBE compiler's MIN()-via-covering-index fast path does not yet recognize a NULLS-FIRST/LAST-carrying index as eligible, falling back to MANAGED COMPILED VDBE (a full aggregate scan); the returned value is still correct (see min-max-with-nulls-last-index, which passes), only the EXPLAIN QUERY PLAN fast-path optimization is unapplied
 turso/create-index-nulls-first-last.sqltest::eqp-max-fast-path-on-desc-nulls-first-index | same separately owned MAX()-via-covering-index fast-path gap as eqp-min-fast-path-on-nulls-last-index, for a DESC NULLS FIRST index
+turso/analyze.sqltest::analyze-table-without-rowid-fails | policy candidate: intentional extension — Ahtola supports ANALYZE on WITHOUT ROWID tables (consistent with the without_rowid.sqltest extensions above) where the pinned Turso corpus expects "Parse error: ANALYZE on tables without rowid is not supported"
 turso/vector.sqltest::vector-insert-no-quotes | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is otherwise identical)
 turso/without_rowid.sqltest::without-rowid-secondary-unique-rejected | intentional extension: Ahtola supports secondary UNIQUE constraints on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-create-index-rejected | intentional extension: Ahtola supports secondary CREATE INDEX on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
@@ -132,11 +133,9 @@ turso/legacy-unquoted-view-columns.sqltest::legacy-broken-view-is-unavailable | 
 turso/legacy-unquoted-view-columns.sqltest::legacy-broken-view-row-still-listed-in-schema | database variant 1/1 (database/testing_legacy_unquoted_view_columns.db): database failed to open: Expected RightParen. At SQL offset 19.
 
 # COVER workstream (2026-09-06): 116 cases exposed by adopting 25 more turso-sqltests files
-# (turso/alter_column.sqltest, turso/analyze.sqltest, turso/attach/*, turso/gencol-index-order.sqltest,
-# turso/group-by-having-infinite-loop.sqltest, turso/insert-default.sqltest,
-# turso/invalid-argument-error-message.sqltest, turso/json_object_star.sqltest,
+# (turso/alter_column.sqltest, turso/attach/*, turso/gencol-index-order.sqltest,
 # turso/mvcc_feature_compat.sqltest, turso/mvcc_sequence.sqltest, turso/mvcc_sequence_adversarial.sqltest,
-# turso/raise.sqltest, turso/sequence_adversarial.sqltest, turso/within-group.sqltest — see
+# turso/sequence_adversarial.sqltest — see
 # docs/cover-turso-sqltests-audit.md for the full adoption list and disposition). Notable
 # concentrations for the coordinator to consider assigning as follow-up workstreams:
 #   - turso/alter_column.sqltest (32 cases): ALTER TABLE ... ALTER COLUMN's schema-text
@@ -150,9 +149,6 @@ turso/legacy-unquoted-view-columns.sqltest::legacy-broken-view-row-still-listed-
 #     VIEW ("Cross-database statements are not supported by managed ATTACH", "Managed ATTACH
 #     transactions cannot modify more than one database..."), where Turso supports all of
 #     these; turso_cdc (change-data-capture) is also not implemented.
-#   - turso/analyze.sqltest (5 cases): ANALYZE does not create/populate sqlite_stat1 for
-#     :memory: databases ("no such table: sqlite_stat1"), and analyzing a WITHOUT ROWID table
-#     does not reject as the pinned corpus expects.
 #   - turso/attach/sequence.sqltest (4 cases) + turso/mvcc_sequence*.sqltest (8 cases):
 #     schema-qualified/attached-database SEQUENCE state does not appear to be scoped per
 #     schema the way the pinned corpus expects (values interleave across what should be two
@@ -191,11 +187,6 @@ turso/alter_column.sqltest::rename-parent-2-inline | database variant 1/1 (:memo
 turso/alter_column.sqltest::rename-parent-3-composite | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))' but was 'CREATE TABLE c3(x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER,
 turso/alter_column.sqltest::rename-self-1 | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 's1_new|s1_new|1' but was 's1_new|s1_new|0'
 turso/alter_column.sqltest::rename-self-2-composite | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE sc_new (id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER, PRIMARY KEY (id, vr), FOREIGN KEY (parent_id, parent_vr) REFERENCES sc_new (id, vr))' but was 'CREATE TABLE "sc_new"(id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER,
-turso/analyze.sqltest::analyze-overwrites | database variant 1/1 (:memory:): expected success but got error: no such table: sqlite_stat1
-turso/analyze.sqltest::analyze-table-with-pk | database variant 1/1 (:memory:): expected success but got error: no such table: sqlite_stat1
-turso/analyze.sqltest::analyze-table-without-rowid-fails | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/analyze.sqltest::empty-table | database variant 1/1 (:memory:): expected success but got error: no such table: sqlite_stat1
-turso/analyze.sqltest::one-row-table | database variant 1/1 (:memory:): expected success but got error: no such table: sqlite_stat1
 turso/attach/cross_db_views_rejection.sqltest::cross-db-view-rejected-attached-referencing-main | database variant 1/1 (:memory:): error 'This schema-qualified statement is not supported by managed ATTACH.' does not match pattern 'view cannot reference table in attached database: main.main_data'
 turso/attach/cross_db_views_rejection.sqltest::cross-db-view-rejected-exists | database variant 1/1 (:memory:): error 'A view in the main schema cannot reference objects in an attached database.' does not match pattern 'view cannot reference table in attached database: aux.refs'
 turso/attach/cross_db_views_rejection.sqltest::cross-db-view-rejected-join | database variant 1/1 (:memory:): error 'A view in the main schema cannot reference objects in an attached database.' does not match pattern 'view cannot reference table in attached database: aux.other_table'
@@ -242,16 +233,6 @@ turso/gencol-index-order.sqltest::eqp-order-by-desc-virtual-column-uses-index | 
 turso/gencol-index-order.sqltest::eqp-order-by-virtual-column-and-unindexed-column-still-sorts | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t' but was '0|0|0|MANAGED EVALUATOR FALLBACK'
 turso/gencol-index-order.sqltest::eqp-order-by-virtual-column-uses-desc-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tvd' but was '1|0|0|SCAN t USING COVERING INDEX tvd'
 turso/gencol-index-order.sqltest::eqp-order-by-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '1|0|0|SCAN t USING COVERING INDEX tv'
-turso/group-by-having-infinite-loop.sqltest::group-by-literal-having-value | database variant 1/1 (:memory:): expected success but got error: 1st GROUP BY term out of range - should be between 1 and 1
-turso/insert-default.sqltest::default-with-returning | database variant 1/1 (:memory:): expected success but got error: no such column: DEFAULT
-turso/insert-default.sqltest::default-without-column-list | database variant 1/1 (:memory:): expected success but got error: no such column: DEFAULT
-turso/insert-default.sqltest::multi-row-different-defaults | database variant 1/1 (:memory:): expected success but got error: no such column: DEFAULT
-turso/insert-default.sqltest::no-default-resolves-to-null | database variant 1/1 (:memory:): expected success but got error: no such column: DEFAULT
-turso/insert-default.sqltest::single-row-all-default | database variant 1/1 (:memory:): expected success but got error: no such column: DEFAULT
-turso/insert-default.sqltest::single-row-mixed-default-and-values | database variant 1/1 (:memory:): expected success but got error: no such column: DEFAULT
-turso/invalid-argument-error-message.sqltest::invalid-argument-error-has-no-prefix | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/json_object_star.sqltest::json_object_star_derived_columns | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"id":1,"name":"Widget","double_price":19.98}' but was '{"id":1,"name":"Widget","price":9.99}'
-turso/json_object_star.sqltest::json_object_star_hidden_columns_generate_series | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '{"value":1}' but was '{"value":1,"start":1,"stop":3,"step":1}'
 turso/mvcc_feature_compat.sqltest::mvcc-alter-table-in-begin-concurrent | database variant 1/1 (:memory:): expected an error but the statement succeeded
 turso/mvcc_feature_compat.sqltest::mvcc-create-index-in-begin-concurrent | database variant 1/1 (:memory:): expected an error but the statement succeeded
 turso/mvcc_feature_compat.sqltest::mvcc-create-table-in-begin-concurrent | database variant 1/1 (:memory:): expected an error but the statement succeeded
@@ -264,14 +245,4 @@ turso/mvcc_sequence_adversarial.sqltest::mvcc-user-sequence-survives-concurrent-
 turso/mvcc_sequence.sqltest::mvcc-to-wal-autoincrement-continues | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 1 expected 'wal' but was 'mvcc'
 turso/mvcc_sequence.sqltest::mvcc-to-wal-user-sequence-continues | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 4 expected 'wal' but was 'mvcc'
 turso/mvcc_sequence.sqltest::mvcc-wal-mvcc-roundtrip-autoincrement | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 1 expected 'wal' but was 'mvcc'
-turso/raise.sqltest::raise-abort-conditional-pass | database variant 1/1 (:memory:): expected success but got error: RAISE() may only be used within a trigger program. At SQL offset 35.
-turso/raise.sqltest::raise-abort-in-case | database variant 1/1 (:memory:): error 'RAISE() may only be used within a trigger program. At SQL offset 34.' does not match pattern 'too large'
-turso/raise.sqltest::raise-abort-outside-trigger | database variant 1/1 (:memory:): error 'RAISE() may only be used within a trigger program. At SQL offset 13.' does not match pattern 'query failed'
-turso/raise.sqltest::raise-shorthand | database variant 1/1 (:memory:): error 'RAISE() may only be used within a trigger program. At SQL offset 13.' does not match pattern 'shorthand error'
-turso/raise.sqltest::raise-shorthand-in-case | database variant 1/1 (:memory:): error 'RAISE() may only be used within a trigger program. At SQL offset 34.' does not match pattern 'conditional error'
 turso/sequence_adversarial.sqltest::alter-rename-rejects-internal-prefix-target | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/within-group.sqltest::ordered-set-correlated-outer-fraction | database variant 1/1 (:memory:): expected success but got error: no such column: oc.frac
-turso/within-group.sqltest::percentile_disc_rejects_percentage | database variant 1/1 (:memory:): expected success but got error: Percentile value must be between 0.0 and 1.0 inclusive
-turso/within-group.sqltest::percentile-cont-floats-30 | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '2.4' but was '2.4000000000000004'
-turso/within-group.sqltest::percentile-correlated-null-fraction-is-null | database variant 1/1 (:memory:): expected success but got error: no such column: outer_t.frac
-turso/within-group.sqltest::within-group-column-collation | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'apple' but was 'Apple'
