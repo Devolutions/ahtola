@@ -47,6 +47,12 @@ public sealed class AhtolaBrowserBoundedScanTests
         labels.Should().HaveCount(50);
         labels[0].Should().Be("row-0");
         labels[49].Should().Be("row-49");
+        var readAfterCompletion = () => reader.GetValue(0);
+        readAfterCompletion.Should().Throw<InvalidOperationException>()
+            .WithMessage("*ReadAsync*true result*");
+
+        await reader.DisposeAsync();
+        await reader.DisposeAsync();
     }
 
     [Test]
@@ -160,6 +166,7 @@ public sealed class AhtolaBrowserBoundedScanTests
             DatabasePath,
             pageBudget: 16,
             CancellationToken.None);
+        await boundedConnection.DisposeAsync();
         await boundedConnection.DisposeAsync();
 
         // The borrowed file system must still work: disposing a connection that does not own
