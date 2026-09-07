@@ -3036,6 +3036,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 var snapshot = CloneTransactionSnapshotLocked();
                 try
                 {
+                    // Still holding _fileCatalogWriteLock, so this is exactly the same
+                    // generation RefreshTransactionSnapshotCatalogUnderWriteLockLocked just
+                    // settled and CloneTransactionSnapshotLocked just cloned — no peer commit
+                    // can have happened in between. A classic transaction's isolation promise
+                    // (a consistent view for its whole lifetime, matching the pinned pager
+                    // snapshot opened right below) can only hold if every table this snapshot's
+                    // catalog might later touch reads that same, already-fixed generation. A
+                    // page-backed table still lazily pending at this point (see
+                    // EmbeddedTable.HasPendingRowLoad) would otherwise materialize on first
+                    // touch — mid-transaction — from whatever the store's live pager then holds,
+                    // which can be a peer's commit made *after* this transaction began but
+                    // before this specific table was ever touched: the same class of gap already
+                    // closed for MVCC in PublishCatalog (see EstablishHeapBaselineForMvccLocked).
+                    foreach (var table in snapshot.Catalog.Tables.Values)
+                        _ = table.Rows;
                     BeforePinningTransactionSnapshotForTesting?.Invoke();
                     EmbeddedFileReadSnapshot? pinnedSnapshot = null;
                     if (_fileStore.TryOpenReadSnapshot(out var opened))

@@ -283,6 +283,49 @@ public sealed class PageBackedLazyRowLoadTests
         ReadInteger(writer, "SELECT COUNT(*) FROM t WHERE v = 91;").Should().Be(1);
     }
 
+    [Test]
+    public void BeginningAClassicTransactionHydratesAStillPendingReopenedTableSoTheReaderStaysIsolated()
+    {
+        // Regression coverage for the fix in EmbeddedDatabase.CreateTransactionSnapshotWithPin:
+        // a classic (non-MVCC) transaction pins a real pager read snapshot and clones the
+        // catalog for its own exclusive use at BEGIN time, so its isolation promise (a
+        // consistent view for the transaction's whole lifetime) can only hold if every table
+        // its own clone might later touch is hydrated from that exact same, already-fixed
+        // generation — not lazily, mid-transaction, from whatever the store's live pager holds
+        // by then (which could already include a peer's later commit). Only the transaction's
+        // own working-copy clone is force-hydrated; the shared, published catalog stays lazy
+        // for a table nothing has ever touched (see the assertion on 'catalog' below).
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "lazy-classic-tx-isolation.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(v INTEGER);");
+            Execute(connection, "INSERT INTO t VALUES (1);");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        var catalog = reopened.LiveCatalog;
+        catalog.Tables["t"].HasPendingRowLoad.Should().BeTrue(
+            "a reopened, indexless table must still be lazy immediately after physical open");
+
+        using var reader = reopened.Connect();
+        using var writer = reopened.Connect();
+
+        Execute(reader, "BEGIN;");
+        Execute(writer, "INSERT INTO t VALUES (91);");
+
+        ReadInteger(reader, "SELECT COUNT(*) FROM t WHERE v = 91;").Should().Be(
+            0,
+            "the classic reader's pinned snapshot predates the writer's autocommit insert");
+        Execute(reader, "COMMIT;");
+
+        ReadInteger(reader, "SELECT COUNT(*) FROM t WHERE v = 91;").Should().Be(
+            1,
+            "once the reader's own transaction ends, a fresh read observes the committed insert");
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         foreach (var statement in connection.PrepareScript(sql))
