@@ -22,6 +22,16 @@ internal sealed class SqlParser
     // diagnostic SQLite/Turso give a CTE called with arguments, instead of the generic
     // "is not supported" message (cte.sqltest::table-referenced-with-call-arguments-rejected).
     private readonly Func<string, bool>? _isKnownNonFunctionName;
+    /// <summary>
+    /// The name of the common table expression whose own body is currently being parsed, or
+    /// <see langword="null"/> outside any CTE body. Unlike <see cref="_activeCteNames"/> (which
+    /// only becomes visible once the whole WITH clause is parsed), this lets a CTE's own body
+    /// recognize a self-reference used with call-argument syntax (<c>cte1(x)</c>) while still
+    /// inside that CTE's definition, so it can be rejected as an arity error against the
+    /// recursive input's implicit zero-parameter shape rather than the generic
+    /// "is not a function" diagnostic used for a CTE called from outside its own body.
+    /// </summary>
+    private string? _currentCteSelfName;
 
     private SqlParser(
         string sql,
@@ -2439,7 +2449,18 @@ internal sealed class SqlParser
             }
 
             Expect(TokenKind.LeftParen);
-            var body = ParseCommonTableExpressionBody();
+            var previousCteSelfName = _currentCteSelfName;
+            _currentCteSelfName = name;
+            ParsedStatement body;
+            try
+            {
+                body = ParseCommonTableExpressionBody();
+            }
+            finally
+            {
+                _currentCteSelfName = previousCteSelfName;
+            }
+
             Expect(TokenKind.RightParen);
             commonTableExpressions.Add(body is QueryStatement query
                 ? new CommonTableExpression(name, columns, query, materializationHint)
@@ -3143,7 +3164,16 @@ internal sealed class SqlParser
         }
 
         var qualified = ManagedSchemaName.TrySplit(name, out var schema, out var functionName);
-        if (!TableValuedFunctionRegistry.TryResolve(functionName, out var module))
+        // A recursive CTE's own name, used with call-argument syntax inside its own body, is a
+        // self-reference to a real table (the recursive input) that structurally accepts no
+        // call parameters -- an arity error, not "is not a function" (which stays reserved for
+        // a CTE called from outside its own definition, where it truly is not a table-valued
+        // function). Matches upstream's zero-parameter recursive-input rejection.
+        var isRecursiveSelfReference = !qualified
+            && _currentCteSelfName is not null
+            && string.Equals(_currentCteSelfName, functionName, StringComparison.OrdinalIgnoreCase);
+        TableValuedFunctionModule? module = null;
+        if (!isRecursiveSelfReference && !TableValuedFunctionRegistry.TryResolve(functionName, out module))
         {
             if (functionName.StartsWith("pragma_", StringComparison.OrdinalIgnoreCase))
                 throw Error($"no such table: {ManagedSchemaName.Display(name)}");
@@ -3171,12 +3201,21 @@ internal sealed class SqlParser
             Expect(TokenKind.RightParen);
         }
 
-        if (arguments.Count > module.MaximumArgumentCount)
+        var maximumArgumentCount = isRecursiveSelfReference ? 0 : module!.MaximumArgumentCount;
+        if (arguments.Count > maximumArgumentCount)
         {
             throw Error(
-                $"too many arguments on {functionName}() - max {module.MaximumArgumentCount}");
+                $"too many arguments on {functionName}() - max {maximumArgumentCount}");
         }
-        if (arguments.Count < module.MinimumArgumentCount)
+
+        if (isRecursiveSelfReference)
+        {
+            // Zero call arguments: treat exactly like a plain self-reference table.
+            var selfAlias = ParseTableAlias();
+            return new NamedTableSource(functionName, selfAlias, ParseTableIndexDirective(), false);
+        }
+
+        if (arguments.Count < module!.MinimumArgumentCount)
         {
             throw Error(
                 $"too few arguments on {functionName}() - min {module.MinimumArgumentCount}");

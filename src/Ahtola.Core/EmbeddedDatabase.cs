@@ -32026,29 +32026,74 @@ out bool hasReturning)
                 throw new EmbeddedSqlException($"duplicate WITH table name: {commonTableExpression.Name}");
         }
 
+        var expressionsByName = new Dictionary<string, CommonTableExpression>(StringComparer.OrdinalIgnoreCase);
+        foreach (var commonTableExpression in expressions)
+            expressionsByName[commonTableExpression.Name] = commonTableExpression;
+
+        var materialized = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var inProgress = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Materializes one sibling CTE on demand, resolving whichever of its own sibling
+        // dependencies (declared earlier or later in the same WITH clause) it needs first --
+        // SQLite's planner resolves a CTE's dependencies by name, not by declaration order,
+        // so `WITH a AS (SELECT * FROM b), b AS (...)` must plan `b` before `a` even though
+        // `a` is declared first. A name that re-enters while still being resolved is a
+        // genuine cycle, mirroring Turso's program.push_cte_being_defined check.
+        void Materialize(string requestedName)
+        {
+            if (materialized.Contains(requestedName)
+                || !expressionsByName.TryGetValue(requestedName, out var commonTableExpression))
+            {
+                return;
+            }
+
+            if (!inProgress.Add(requestedName))
+                throw new EmbeddedSqlException($"circular reference: {requestedName}");
+
+            try
+            {
+                foreach (var candidateName in expressionsByName.Keys)
+                {
+                    if (materialized.Contains(candidateName)
+                        || string.Equals(candidateName, requestedName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (CountStatementReferences(commonTableExpression.Body, candidateName) > 0)
+                        Materialize(candidateName);
+                }
+
+                var cteContext = context with { CommonTableExpressions = resolvedExpressions };
+                var resolved = CommonTableExpressionReferencesItself(commonTableExpression.Body, commonTableExpression.Name)
+                    ? EvaluateRecursiveCte(
+                        commonTableExpression,
+                        parameters,
+                        cteContext,
+                        outerRow,
+                        outerRowBudgets is not null
+                            && outerRowBudgets.TryGetValue(commonTableExpression.Name, out var budget)
+                                ? budget
+                                : null)
+                    : EvaluateNonRecursiveCte(commonTableExpression, parameters, cteContext, outerRow);
+                resolvedExpressions[commonTableExpression.Name] = resolved;
+                materialized.Add(requestedName);
+            }
+            finally
+            {
+                inProgress.Remove(requestedName);
+            }
+        }
+
         foreach (var commonTableExpression in expressions)
         {
-            if (!requiredCteNames.Contains(commonTableExpression.Name))
-                continue;
-
-            var cteContext = context with { CommonTableExpressions = resolvedExpressions };
-            var resolved = commonTableExpression.Body is QueryStatement query
-                && CountAllReferences(query, commonTableExpression.Name) > 0
-                ? EvaluateRecursiveCte(
-                    commonTableExpression,
-                    parameters,
-                    cteContext,
-                    outerRow,
-                    outerRowBudgets is not null
-                        && outerRowBudgets.TryGetValue(commonTableExpression.Name, out var budget)
-                            ? budget
-                            : null)
-                : EvaluateNonRecursiveCte(commonTableExpression, parameters, cteContext, outerRow);
-            resolvedExpressions[commonTableExpression.Name] = resolved;
+            if (requiredCteNames.Contains(commonTableExpression.Name))
+                Materialize(commonTableExpression.Name);
         }
 
         return context with { CommonTableExpressions = resolvedExpressions };
     }
+
 
     private QueryContext RematerializeReturningCommonTableExpressions(
         SqlValue[] parameters,
@@ -32080,6 +32125,8 @@ out bool hasReturning)
             var collations = GetCommonTableExpressionBodyCollations(writableBody, cteContext);
             var affinities = DescribeCommonTableExpressionBodyAffinities(
                 writableBody,
+                commonTableExpression.Name,
+                commonTableExpression.Columns,
                 cteContext,
                 BuildAffinityMapFromRuntimeCtes(cteContext.CommonTableExpressions));
             return new SourceData(
@@ -32135,10 +32182,70 @@ out bool hasReturning)
     // (see TryGetRecursiveCteOuterRowBudget) without ever approaching this ceiling.
     private const int RecursiveCteRowLimit = 1_000_000;
 
-    // Evaluates a recursive common table expression using semi-naive (working-set)
-    // iteration: run the anchor once, then repeatedly run the recursive term(s) over only
-    // the rows produced by the previous step until no new rows appear. UNION deduplicates
-    // (which also terminates cycles); UNION ALL keeps every row.
+    // Falls back through a recursive CTE's anchor arms, then its recursive arms, in
+    // declaration order to find the first arm that declares an explicit collation for a
+    // given result column -- unlike an ordinary compound SELECT, whose result-column
+    // collation only ever looks at its leftmost arm (GetQueryOutputCollations). Mirrors
+    // Turso's recursive_cte_result_column_collation / recursive_cte_query_result_column_collation
+    // (core/translate/recursive_cte.rs), which checks the initial query first and only
+    // consults the recursive query when the anchor declares nothing. A recursive arm may
+    // itself reference the CTE, so describing its own output collation needs a placeholder
+    // self-reference binding -- seeded with whatever the anchor already established --
+    // mirroring how Turso's RecursiveCteInput schema carries the anchor's own column
+    // metadata before the recursive query is ever analyzed.
+    private static IReadOnlyList<string?> GetRecursiveCteResultColumnCollations(
+        string cteName,
+        string[] columns,
+        IReadOnlyList<QueryStatement> anchorTerms,
+        IReadOnlyList<QueryStatement> recursiveTerms,
+        QueryContext context)
+    {
+        var result = new string?[columns.Length];
+        for (var index = 0; index < columns.Length; index++)
+            result[index] = FirstNonNullTermCollation(anchorTerms, index, context);
+
+        if (recursiveTerms.Count > 0 && result.Any(collation => collation is null))
+        {
+            var selfBoundContext = context with
+            {
+                CommonTableExpressions = new Dictionary<string, SourceData>(
+                    context.CommonTableExpressions, StringComparer.OrdinalIgnoreCase)
+                {
+                    [cteName] = new SourceData(columns, [], result),
+                },
+            };
+            for (var index = 0; index < columns.Length; index++)
+            {
+                if (result[index] is null)
+                    result[index] = FirstNonNullTermCollation(recursiveTerms, index, selfBoundContext);
+            }
+        }
+
+        return result;
+    }
+
+    private static string? FirstNonNullTermCollation(
+        IReadOnlyList<QueryStatement> terms,
+        int columnIndex,
+        QueryContext context)
+    {
+        foreach (var term in terms)
+        {
+            var collation = GetQueryOutputCollations(term, context).ElementAtOrDefault(columnIndex);
+            if (collation is not null)
+                return collation;
+        }
+
+        return null;
+    }
+
+    // Evaluates a recursive common table expression using a priority queue of pending rows,
+    // exactly as Turso lowers WITH RECURSIVE (core/translate/recursive_cte.rs): every
+    // anchor row is admitted first, then rows are dequeued one at a time -- in the order an
+    // explicit queue ORDER BY selects, or FIFO otherwise, with a sequence number breaking
+    // ties -- emitted, and used to re-seed every recursive arm as the single current row
+    // before its own children are admitted. UNION deduplicates on admission (which also
+    // terminates cycles); UNION ALL admits every row.
     private SourceData EvaluateRecursiveCte(
         CommonTableExpression commonTableExpression,
         SqlValue[] parameters,
@@ -32147,13 +32254,33 @@ out bool hasReturning)
         int? outerRowBudget = null)
     {
         var name = commonTableExpression.Name;
-        if (commonTableExpression.Query is not CompoundSelectStatement compound)
+        var scope = new List<(string Name, int Weight)>();
+        var query = commonTableExpression.Query;
+
+        // A body-level WITH (`cte AS (WITH inner AS (...) SELECT ... UNION ALL ...)`) sits
+        // above the whole compound in SQLite's grammar, so its nested CTEs are visible to
+        // every arm -- anchor and recursive alike. Bring their names into the
+        // reference-counting scope now (so shadowing/weighting matches name resolution) but
+        // defer actually materializing them until after the recursive shape below has been
+        // validated: a nested CTE that itself reads the recursive self-reference (the
+        // rejected "multiple recursive references" shape) cannot be evaluated yet -- the
+        // self-reference has no binding until the per-row loop establishes one -- and must
+        // never be attempted for a shape validation is about to reject anyway.
+        var pendingNestedWith = new List<(IReadOnlyList<CommonTableExpression> Ctes, QueryStatement DownstreamQuery)>();
+        while (query is WithSelectStatement nestedWith)
+        {
+            PushNestedRecursiveCteScope(nestedWith.CommonTableExpressions, scope, name);
+            pendingNestedWith.Add((nestedWith.CommonTableExpressions, nestedWith.Query));
+            query = nestedWith.Query;
+        }
+
+        if (query is not CompoundSelectStatement compound)
             throw new EmbeddedSqlException($"circular reference: {name}");
 
         var firstRecursiveIndex = -1;
         for (var index = 0; index < compound.Terms.Count; index++)
         {
-            if (CountAllReferences(compound.Terms[index], name) > 0)
+            if (CountRecursiveReferencesInArm(compound.Terms[index], scope, name).TotalCount > 0)
             {
                 firstRecursiveIndex = index;
                 break;
@@ -32179,8 +32306,22 @@ out bool hasReturning)
         var recursiveTerms = new List<SelectStatement>();
         for (var index = firstRecursiveIndex; index < compound.Terms.Count; index++)
         {
-            var term = ValidateRecursiveTerm(compound.Terms[index], name);
+            var term = ValidateRecursiveTerm(compound.Terms[index], name, scope);
             recursiveTerms.Add(term);
+        }
+
+        // Validation passed, so the recursive shape is legal: now materialize any
+        // body-level nested WITH clauses for real. A nested CTE that references the
+        // recursive self-reference would already have failed validation above (as
+        // "multiple recursive references"), so every nested CTE reaching this point is
+        // either independent of the recursion (like an ordinary sibling CTE) or unused.
+        foreach (var (nestedCtes, downstreamQuery) in pendingNestedWith)
+        {
+            var nestedRequired = GetRequiredCommonTableExpressionNames(
+                nestedCtes,
+                candidateName => CountAllReferences(downstreamQuery, candidateName));
+            cteContext = MaterializeCommonTableExpressions(
+                nestedCtes, parameters, cteContext, outerRow, nestedRequired);
         }
 
         // The compound's own LIMIT/OFFSET bounds the recursion the way SQLite's
@@ -32225,7 +32366,12 @@ out bool hasReturning)
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, anchor.Columns);
         // A recursive CTE's result-column affinities come from its anchor (base case), matching SQLite.
         var columnDefinitions = DescribeRuntimeSourceColumnDefinitions(compound.Terms[0], columns, cteContext);
-        var collations = GetQueryOutputCollations(commonTableExpression.Query, cteContext);
+        var anchorTerms = compound.Terms.Take(firstRecursiveIndex).ToArray();
+        // A recursive CTE's per-column collation falls back from the anchor to the
+        // recursive term(s) when the anchor itself declares none -- unlike an ordinary
+        // compound SELECT, which only ever looks at its leftmost arm. Mirrors Turso's
+        // recursive_cte_result_column_collation (core/translate/recursive_cte.rs).
+        var collations = GetRecursiveCteResultColumnCollations(name, columns, anchorTerms, recursiveTerms, cteContext);
         var deduplicate = recursiveOperator == CompoundOperator.Union;
         var anchorsRoutable = AreRecursiveAnchorsRoutable(
             compound,
@@ -32263,9 +32409,36 @@ out bool hasReturning)
                 outerRowBudget);
         }
 
+        // The queue's own priority order: an ORDER BY on the whole recursive CTE decides
+        // which pending row is dequeued (and hence expanded) next -- it does not sort the
+        // final output. Resolved against every anchor and recursive arm's own result
+        // columns/aliases/expressions, exactly like an ordinary compound SELECT's ORDER BY
+        // (ResolveCompoundOrderByIndex), but falling back to the recursive-aware collation
+        // above rather than the anchor-only one. Mirrors resolve_recursive_cte_queue_order.
+        // The alias/name fast-path matches each arm's own natural output name -- the
+        // anchor's, before any `WITH cte(renamed)` column list is applied -- never the
+        // CTE's externally declared column names, so an ORDER BY naming the CTE's own
+        // declared column (rather than the arm's own alias/expression) is correctly
+        // rejected instead of accidentally resolving through the rename.
+        IReadOnlyList<(int ColumnIndex, OrderByTerm Term, string? Collation)>? queueOrder = null;
+        if (compound.OrderBy.Count > 0)
+        {
+            var allTerms = anchorTerms.Concat(recursiveTerms).ToArray();
+            var anchorNaturalColumns = DescribeQuery(compound.Terms[0], cteContext);
+            var resolvedOrder = new (int ColumnIndex, OrderByTerm Term, string? Collation)[compound.OrderBy.Count];
+            for (var orderIndex = 0; orderIndex < compound.OrderBy.Count; orderIndex++)
+            {
+                var orderTerm = compound.OrderBy[orderIndex];
+                var columnIndex = ResolveCompoundOrderByIndex(orderTerm, orderIndex + 1, allTerms, anchorNaturalColumns);
+                var collation = GetCollation(orderTerm.Expression) ?? collations.ElementAtOrDefault(columnIndex);
+                resolvedOrder[orderIndex] = (columnIndex, orderTerm, collation);
+            }
+
+            queueOrder = resolvedOrder;
+        }
+
         var result = new List<SourceRow>();
         var seen = deduplicate ? new List<SqlValue[]>() : null;
-        var workingSet = new List<SourceRow>();
         // The budget caps how many EMITTED rows the expansion may produce: the
         // compound's own LIMIT (the OFFSET is consumed inside this loop), or the
         // outer query's row budget when the compound is unlimited. With both, the
@@ -32276,14 +32449,80 @@ out bool hasReturning)
         var budget = outerRowBudget is int outerBudgetValue && compoundBudget is int innerBudgetValue
             ? Math.Min(outerBudgetValue, innerBudgetValue)
             : outerRowBudget ?? compoundBudget;
+
+        // The work queue itself: a plain FIFO when there is no ORDER BY (the common case,
+        // and the shape every already-verified breadth-first/graph test depends on), or a
+        // priority queue keyed by the resolved queue order with a sequence number as the
+        // stable tie-breaker -- mirroring Turso's ephemeral B-Tree index keyed on
+        // (priority columns, sequence, result columns) in emit_recursive_cte.
+        var fifoQueue = queueOrder is null ? new Queue<SqlValue[]>() : null;
+        var priorityQueue = queueOrder is null
+            ? null
+            : new PriorityQueue<SqlValue[], (SqlValue[] Keys, long Sequence)>(
+                Comparer<(SqlValue[] Keys, long Sequence)>.Create((left, right) =>
+                {
+                    for (var index = 0; index < queueOrder!.Count; index++)
+                    {
+                        var comparison = CompareForOrdering(
+                            left.Keys[index], right.Keys[index], queueOrder[index].Term, queueOrder[index].Collation);
+                        if (comparison != 0)
+                            return comparison;
+                    }
+
+                    return left.Sequence.CompareTo(right.Sequence);
+                }));
+        var nextSequence = 0L;
+
+        void EnqueueRow(SqlValue[] row)
+        {
+            if (priorityQueue is not null)
+            {
+                var keys = new SqlValue[queueOrder!.Count];
+                for (var index = 0; index < queueOrder.Count; index++)
+                    keys[index] = row[queueOrder[index].ColumnIndex];
+                priorityQueue.Enqueue(row, (keys, nextSequence++));
+            }
+            else
+            {
+                fifoQueue!.Enqueue(row);
+            }
+        }
+
+        bool TryDequeueRow(out SqlValue[] row)
+        {
+            if (priorityQueue is not null)
+                return priorityQueue.TryDequeue(out row!, out _);
+            if (fifoQueue!.Count > 0)
+            {
+                row = fifoQueue.Dequeue();
+                return true;
+            }
+
+            row = null!;
+            return false;
+        }
+
         foreach (var row in anchor.Rows)
         {
             var values = row.ToArray();
             if (seen is not null && !TryAddRecursiveDistinctRow(seen, values, collations))
                 continue;
 
-            var sourceRow = new SourceRow(columns, values);
-            workingSet.Add(sourceRow);
+            EnqueueRow(values);
+        }
+
+        var recursiveOperatorDisplay = recursiveOperator == CompoundOperator.UnionAll ? "UNION ALL" : "UNION";
+
+        // Drain the queue one row at a time: dequeue the next row in priority (or FIFO)
+        // order, emit it, and run every recursive arm against exactly that one row before
+        // moving on -- SQLite/Turso's per-current-row recursion (recursive_cte.rs), not a
+        // whole-frontier batch. This is what makes DISTINCT inside the recursive projection,
+        // a multi-arm ORDER BY, and depth-first graph traversal all observably correct: each
+        // arm invocation only ever sees one input row, exactly like every non-recursive
+        // consumer of this CTE would.
+        while (TryDequeueRow(out var currentValues))
+        {
+            var currentRow = new SourceRow(columns, currentValues);
             if (emitOffset > 0)
             {
                 // An OFFSET row is dropped from the output but still feeds the
@@ -32292,59 +32531,48 @@ out bool hasReturning)
             }
             else
             {
-                result.Add(sourceRow);
+                result.Add(currentRow);
                 // The consumer can never observe more than its budget, so stop
-                // expanding as soon as the budget is filled.
-                if (budget is int anchorBudget && result.Count >= anchorBudget)
+                // expanding as soon as the budget is filled -- matching Turso's
+                // DecrJumpZero jumping past the recursive step once the limit hits zero.
+                if (budget is int budgetValue && result.Count >= budgetValue)
                     return new SourceData(columns, result, collations, columnDefinitions);
+                if (result.Count > RecursiveCteRowLimit)
+                {
+                    throw new EmbeddedSqlException(
+                        $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
+                }
             }
-        }
 
-        while (workingSet.Count > 0)
-        {
             var iterationContext = cteContext with
             {
                 CommonTableExpressions = new Dictionary<string, SourceData>(
                     cteContext.CommonTableExpressions,
                     StringComparer.OrdinalIgnoreCase)
                 {
-                    [name] = new SourceData(columns, workingSet, collations),
+                    [name] = new SourceData(columns, [currentRow], collations),
                 },
             };
 
-            var produced = new List<SourceRow>();
             foreach (var term in recursiveTerms)
             {
                 var termResult = MaterializeQueryResult(
                     ExecuteSelect(term, parameters, iterationContext, outerRow));
                 if (termResult.Columns.Length != columns.Length)
-                    throw new EmbeddedSqlException("SELECTs to the left and right of a compound operator do not have the same number of result columns");
-
-                foreach (var row in termResult.Rows)
                 {
-                    var values = row.ToArray();
+                    throw new EmbeddedSqlException(
+                        $"SELECTs to the left and right of {recursiveOperatorDisplay} do not have the same number of result columns");
+                }
+
+                foreach (var producedRow in termResult.Rows)
+                {
+                    var values = producedRow.ToArray();
                     if (seen is not null && !TryAddRecursiveDistinctRow(seen, values, collations))
                         continue;
 
-                    var sourceRow = new SourceRow(columns, values);
-                    produced.Add(sourceRow);
-                    if (emitOffset > 0)
-                    {
-                        emitOffset--;
-                    }
-                    else
-                    {
-                        result.Add(sourceRow);
-                        if (budget is int budgetValue && result.Count >= budgetValue)
-                            return new SourceData(columns, result, collations, columnDefinitions);
-                        if (result.Count > RecursiveCteRowLimit)
-                            throw new EmbeddedSqlException(
-                                $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
-                    }
+                    EnqueueRow(values);
                 }
             }
-
-            workingSet = produced;
         }
 
         return new SourceData(columns, result, collations, columnDefinitions);
@@ -32355,7 +32583,12 @@ out bool hasReturning)
         string name,
         QueryContext context)
     {
-        if (term.OrderBy.Count != 0
+        // A DISTINCT recursive projection must be evaluated once per current row (a
+        // single-row DISTINCT never removes anything, preserving duplicates the
+        // per-generation worktable transform would otherwise collapse), so it stays on the
+        // evaluator's own per-row queue rather than the whole-frontier worktable route.
+        if (term.Distinct
+            || term.OrderBy.Count != 0
             || !IsRoutableRecursiveSource(term.Source, name, context)
             || !AreRoutableRecursiveJoinConditions(term.Source)
             || term.Projections.Any(projection => !IsRoutableRecursiveExpression(projection.Expression))
@@ -32527,7 +32760,7 @@ out bool hasReturning)
             if (termResult.Columns.Length != width)
             {
                 throw new EmbeddedSqlException(
-                    "SELECTs to the left and right of a compound operator do not have the same number of result columns");
+                    $"SELECTs to the left and right of {(deduplicate ? "UNION" : "UNION ALL")} do not have the same number of result columns");
             }
 
             var children = new SqlValue[termResult.Rows.Count][];
@@ -32942,22 +33175,332 @@ out bool hasReturning)
         return ExecuteCompoundSelect(anchor, parameters, cteContext, outerRow);
     }
 
+    // (topLevelFromCount, totalCount) for one arm/term of a recursive CTE body: direct
+    // references to the recursive table in the arm's own top-level FROM clause (which decide
+    // multi-arm-join detection), and every reference reachable from the arm (which detects a
+    // reference hidden inside a subquery, WHERE clause, WINDOW clause, or a used nested CTE).
+    // Mirrors Turso's RecursiveRefCounter::count_arm (core/translate/planner.rs).
+    private readonly record struct RecursiveCteReferenceCount(int TopLevelFromCount, int TotalCount);
+
+    // Scope-aware reference counting for a recursive CTE's own name, mirroring Turso's
+    // RecursiveRefCounter: a nested WITH that redefines the CTE's name shadows it for that
+    // subtree, and a reference reachable only through a nested CTE's body counts only when
+    // that nested CTE is itself used, weighted by how many references its own body contains.
+    // The scope is a stack of (name, weight) pairs, innermost last; weight is the number of
+    // recursive references using that name implies (0 for a shadowing redefinition, or the
+    // nested CTE's own total reference count for any other nested CTE).
+    private static int RecursiveCteScopeWeight(
+        string name,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        for (var index = scope.Count - 1; index >= 0; index--)
+        {
+            if (string.Equals(scope[index].Name, name, StringComparison.OrdinalIgnoreCase))
+                return scope[index].Weight;
+        }
+
+        return string.Equals(name, cteName, StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+    }
+
+    private static bool RecursiveCteNameIsShadowed(
+        string name,
+        List<(string Name, int Weight)> scope)
+        => scope.Any(entry => string.Equals(entry.Name, name, StringComparison.OrdinalIgnoreCase));
+
+    // Brings a nested WITH clause's own CTEs into scope with their reference weights,
+    // mirroring RecursiveRefCounter::push_nested_ctes. The caller is responsible for
+    // truncating the scope afterwards (or, for a body-level WITH shared by every arm of a
+    // recursive CTE, leaving the entries for the whole evaluation).
+    private static void PushNestedRecursiveCteScope(
+        IReadOnlyList<CommonTableExpression>? nested,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        if (nested is null)
+            return;
+
+        foreach (var cte in nested)
+        {
+            scope.Add((cte.Name, 0));
+            var weight = cte.Query is QueryStatement nestedQuery
+                ? CountRecursiveReferencesInQuery(nestedQuery, scope, cteName)
+                : 0;
+            scope[^1] = (cte.Name, weight);
+        }
+    }
+
+    // Total (weighted) reference count reachable from an entire query statement, including
+    // its own ORDER BY/LIMIT/OFFSET and any nested WITH it introduces. Mirrors
+    // RecursiveRefCounter::count_select. Used to decide whether a CTE's whole body
+    // references itself at all (Turso's `references_itself`).
+    private static int CountRecursiveReferencesInQuery(
+        QueryStatement query,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        var baseDepth = scope.Count;
+        try
+        {
+            switch (query)
+            {
+                case WithSelectStatement with:
+                    PushNestedRecursiveCteScope(with.CommonTableExpressions, scope, cteName);
+                    return CountRecursiveReferencesInQuery(with.Query, scope, cteName);
+                case SelectStatement select:
+                    return CountRecursiveReferencesInSelectCore(select, scope, cteName)
+                        + select.OrderBy.Sum(term => CountRecursiveReferencesInExpression(term.Expression, scope, cteName))
+                        + (select.Limit is null ? 0 : CountRecursiveReferencesInExpression(select.Limit, scope, cteName))
+                        + (select.Offset is null ? 0 : CountRecursiveReferencesInExpression(select.Offset, scope, cteName));
+                case CompoundSelectStatement compound:
+                    return compound.Terms.Sum(term => CountRecursiveReferencesInQuery(term, scope, cteName))
+                        + compound.OrderBy.Sum(term => CountRecursiveReferencesInExpression(term.Expression, scope, cteName))
+                        + (compound.Limit is null ? 0 : CountRecursiveReferencesInExpression(compound.Limit, scope, cteName))
+                        + (compound.Offset is null ? 0 : CountRecursiveReferencesInExpression(compound.Offset, scope, cteName));
+                case ValuesClause values:
+                    return values.Rows.Sum(row => row.Sum(expression => CountRecursiveReferencesInExpression(expression, scope, cteName)));
+                default:
+                    return 0;
+            }
+        }
+        finally
+        {
+            scope.RemoveRange(baseDepth, scope.Count - baseDepth);
+        }
+    }
+
+    // Whether a common table expression's body references its own name anywhere, honoring
+    // nested-WITH shadowing and weighting an unused nested CTE to zero. A writable
+    // (INSERT/UPDATE/DELETE) body can never be recursive. Mirrors Turso's
+    // `references_itself` (RecursiveRefCounter::count_select on the CTE's own select).
+    private static bool CommonTableExpressionReferencesItself(ParsedStatement body, string name)
+        => body is QueryStatement query
+            && CountRecursiveReferencesInQuery(query, [], name) > 0;
+
+    // (topLevelFromCount, totalCount) for one arm (term) of a recursive CTE's compound body.
+    // A VALUES arm cannot reference a table directly, so its top-level count is always 0;
+    // its expressions are still walked for a reference hidden in a subquery.
+    private static RecursiveCteReferenceCount CountRecursiveReferencesInArm(
+        QueryStatement arm,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        if (arm is ValuesClause values)
+        {
+            var valuesTotal = values.Rows.Sum(row => row.Sum(expression => CountRecursiveReferencesInExpression(expression, scope, cteName)));
+            return new RecursiveCteReferenceCount(0, valuesTotal);
+        }
+
+        if (arm is not SelectStatement select)
+            return new RecursiveCteReferenceCount(0, 0);
+
+        var topLevelFrom = CountDirectRecursiveFromReferences(select.Source, scope, cteName);
+        var total = CountRecursiveReferencesInSelectCore(select, scope, cteName);
+        return new RecursiveCteReferenceCount(topLevelFrom, total);
+    }
+
+    // Direct references to the recursive table in the top level of a FROM clause (walking
+    // only the join tree, never descending into derived tables/subqueries), honoring
+    // shadowing by a nested WITH the way name resolution does. A table-valued call's own
+    // arguments are not counted here (they belong to the total walk below). Mirrors
+    // count_direct_in_from_table.
+    private static int CountDirectRecursiveFromReferences(
+        TableSource? source,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        return source switch
+        {
+            null => 0,
+            NamedTableSource named when !named.IsSchemaQualified
+                => string.Equals(named.Name, cteName, StringComparison.OrdinalIgnoreCase)
+                    && !RecursiveCteNameIsShadowed(named.Name, scope)
+                    ? 1 : 0,
+            TableValuedFunctionSource function when function.Schema is null
+                => string.Equals(function.Name, cteName, StringComparison.OrdinalIgnoreCase)
+                    && !RecursiveCteNameIsShadowed(function.Name, scope)
+                    ? 1 : 0,
+            JoinTableSource join => CountDirectRecursiveFromReferences(join.Left, scope, cteName)
+                + CountDirectRecursiveFromReferences(join.Right, scope, cteName),
+            _ => 0,
+        };
+    }
+
+    // Total (weighted) reference count reachable from a FROM-clause source, honoring nested
+    // CTE shadowing/weighting for a plain table reference and fully re-entering a derived
+    // table's own query. Mirrors count_from_table.
+    private static int CountRecursiveReferencesInFromSource(
+        TableSource? source,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        return source switch
+        {
+            null => 0,
+            NamedTableSource named => named.IsSchemaQualified ? 0 : RecursiveCteScopeWeight(named.Name, scope, cteName),
+            TableValuedFunctionSource function => (function.Schema is null ? RecursiveCteScopeWeight(function.Name, scope, cteName) : 0)
+                + function.Arguments.Sum(argument => CountRecursiveReferencesInExpression(argument, scope, cteName)),
+            DerivedTableSource derived => CountRecursiveReferencesInQuery(derived.Query, scope, cteName),
+            JoinTableSource join => CountRecursiveReferencesInFromSource(join.Left, scope, cteName)
+                + CountRecursiveReferencesInFromSource(join.Right, scope, cteName)
+                + (join.Condition is null ? 0 : CountRecursiveReferencesInExpression(join.Condition, scope, cteName)),
+            _ => 0,
+        };
+    }
+
+    // Total (weighted) reference count reachable from one SELECT arm's own clauses (FROM,
+    // projections, WHERE, GROUP BY/HAVING, and named WINDOW definitions), excluding the
+    // arm's own ORDER BY/LIMIT/OFFSET -- those belong to the enclosing compound, not to an
+    // individual recursive-CTE arm. Mirrors count_one_select(OneSelect::Select).
+    private static int CountRecursiveReferencesInSelectCore(
+        SelectStatement select,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        var count = CountRecursiveReferencesInFromSource(select.Source, scope, cteName);
+        count += select.Projections.Sum(projection => CountRecursiveReferencesInExpression(projection.Expression, scope, cteName));
+        if (select.Where is not null)
+            count += CountRecursiveReferencesInExpression(select.Where, scope, cteName);
+        count += select.GroupBy.Sum(expression => CountRecursiveReferencesInExpression(expression, scope, cteName));
+        if (select.Having is not null)
+            count += CountRecursiveReferencesInExpression(select.Having, scope, cteName);
+        foreach (var namedWindow in select.NamedWindows)
+            count += CountRecursiveReferencesInWindow(namedWindow.Specification, scope, cteName);
+
+        return count;
+    }
+
+    private static int CountRecursiveReferencesInWindow(
+        WindowSpecification window,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        var count = window.PartitionBy.Sum(expression => CountRecursiveReferencesInExpression(expression, scope, cteName));
+        count += window.OrderBy.Sum(term => CountRecursiveReferencesInExpression(term.Expression, scope, cteName));
+        if (window.Frame is { } frame)
+        {
+            if (frame.Start.Offset is not null)
+                count += CountRecursiveReferencesInExpression(frame.Start.Offset, scope, cteName);
+            if (frame.End.Offset is not null)
+                count += CountRecursiveReferencesInExpression(frame.End.Offset, scope, cteName);
+        }
+
+        return count;
+    }
+
+    // Total (weighted) reference count reachable from an expression tree, including every
+    // subquery form (scalar, EXISTS, IN) and a function call's FILTER/OVER/aggregate-ORDER-BY
+    // clauses. Mirrors count_expr (walk_expr with Exists/Subquery/InSelect special-cased).
+    private static int CountRecursiveReferencesInExpression(
+        Expression expression,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        switch (expression)
+        {
+            case ScalarSubqueryExpression subquery:
+                return CountRecursiveReferencesInQuery(subquery.Query, scope, cteName);
+            case ExistsExpression exists:
+                return CountRecursiveReferencesInQuery(exists.Query, scope, cteName);
+            case InSubqueryExpression inSubquery:
+                return CountRecursiveReferencesInExpression(inSubquery.Value, scope, cteName)
+                    + CountRecursiveReferencesInQuery(inSubquery.Query, scope, cteName);
+            case FunctionExpression function:
+                {
+                    var count = function.Arguments.Sum(argument => CountRecursiveReferencesInExpression(argument, scope, cteName));
+                    if (function.Filter is not null)
+                        count += CountRecursiveReferencesInExpression(function.Filter, scope, cteName);
+                    if (function.Window is not null)
+                        count += CountRecursiveReferencesInWindow(function.Window, scope, cteName);
+                    if (function.AggregateOrderBy is not null)
+                        count += function.AggregateOrderBy.Sum(term => CountRecursiveReferencesInExpression(term.Expression, scope, cteName));
+                    if (function.OrderedSetOrderBy is not null)
+                        count += CountRecursiveReferencesInExpression(function.OrderedSetOrderBy.Expression, scope, cteName);
+                    return count;
+                }
+            case RowValueExpression rowValue:
+                return rowValue.Values.Sum(value => CountRecursiveReferencesInExpression(value, scope, cteName));
+            case BinaryExpression binary:
+                return CountRecursiveReferencesInExpression(binary.Left, scope, cteName)
+                    + CountRecursiveReferencesInExpression(binary.Right, scope, cteName);
+            case UnaryExpression unary:
+                return CountRecursiveReferencesInExpression(unary.Operand, scope, cteName);
+            case CollationExpression collation:
+                return CountRecursiveReferencesInExpression(collation.Expression, scope, cteName);
+            case CastExpression cast:
+                return CountRecursiveReferencesInExpression(cast.Expression, scope, cteName);
+            case CaseExpression @case:
+                {
+                    var count = @case.Operand is null ? 0 : CountRecursiveReferencesInExpression(@case.Operand, scope, cteName);
+                    count += @case.Clauses.Sum(clause => CountRecursiveReferencesInExpression(clause.When, scope, cteName)
+                        + CountRecursiveReferencesInExpression(clause.Then, scope, cteName));
+                    if (@case.Else is not null)
+                        count += CountRecursiveReferencesInExpression(@case.Else, scope, cteName);
+                    return count;
+                }
+            case LikeExpression like:
+                return CountRecursiveReferencesInExpression(like.Value, scope, cteName)
+                    + CountRecursiveReferencesInExpression(like.Pattern, scope, cteName)
+                    + (like.Escape is null ? 0 : CountRecursiveReferencesInExpression(like.Escape, scope, cteName));
+            case GlobExpression glob:
+                return CountRecursiveReferencesInExpression(glob.Value, scope, cteName)
+                    + CountRecursiveReferencesInExpression(glob.Pattern, scope, cteName);
+            case InExpression @in:
+                return CountRecursiveReferencesInExpression(@in.Value, scope, cteName)
+                    + @in.Values.Sum(value => CountRecursiveReferencesInExpression(value, scope, cteName));
+            case BetweenExpression between:
+                return CountRecursiveReferencesInExpression(between.Value, scope, cteName)
+                    + CountRecursiveReferencesInExpression(between.Lower, scope, cteName)
+                    + CountRecursiveReferencesInExpression(between.Upper, scope, cteName);
+            case RaiseExpression raise:
+                return raise.Message is null ? 0 : CountRecursiveReferencesInExpression(raise.Message, scope, cteName);
+            default:
+                return 0;
+        }
+    }
+
+    // Whether a table source anywhere in the FROM tree is joined with FULL JOIN. A recursive
+    // CTE's own input can never be the build side the FULL OUTER hash join requires, so any
+    // FULL JOIN sharing a FROM clause with the recursive self-reference is rejected up front
+    // instead of being attempted and (for a UNION ALL term) looping until the row guard
+    // fires. Mirrors the has_recursive_input/is_full_outer diagnosis in
+    // core/translate/optimizer/join.rs.
+    private static bool ContainsFullJoin(TableSource? source)
+    {
+        return source switch
+        {
+            JoinTableSource { Kind: JoinKind.Full } => true,
+            JoinTableSource join => ContainsFullJoin(join.Left) || ContainsFullJoin(join.Right),
+            _ => false,
+        };
+    }
+
     // Validates a single recursive term and returns it as a SELECT. Rejects constructs
     // SQLite forbids in a recursive term with the same messages it produces.
-    private SelectStatement ValidateRecursiveTerm(QueryStatement term, string name)
+    private SelectStatement ValidateRecursiveTerm(
+        QueryStatement term,
+        string name,
+        List<(string Name, int Weight)> scope)
     {
         if (term is not SelectStatement select)
             throw new EmbeddedSqlException($"circular reference: {name}");
 
-        var directReferences = CountDirectFromReferences(select.Source, name);
-        var allReferences = CountAllReferences(select, name);
-        if (directReferences > 1)
-            throw new EmbeddedSqlException($"multiple references to recursive table: {name}");
-
-        // Any reference that is not a single top-level FROM entry (e.g. inside a subquery,
-        // a derived table, or joined to itself) is not a supported linear recursion.
-        if (directReferences != 1 || allReferences != 1)
+        // Mirrors prepare_recursive_cte_plan's per-arm validation order exactly: a missing
+        // top-level reference (including one hidden behind a subquery/join-to-itself) is
+        // "circular reference"; more than one top-level FROM reference is "multiple
+        // references to recursive table"; any further reference reachable only through a
+        // subquery, WHERE clause, WINDOW clause, or a used nested CTE is "multiple recursive
+        // references".
+        var (topLevelFromCount, totalCount) = CountRecursiveReferencesInArm(select, scope, name);
+        if (topLevelFromCount == 0)
             throw new EmbeddedSqlException($"circular reference: {name}");
+        if (topLevelFromCount > 1)
+            throw new EmbeddedSqlException($"multiple references to recursive table: {name}");
+        if (totalCount > topLevelFromCount)
+            throw new EmbeddedSqlException($"multiple recursive references: {name}");
+
+        if (ContainsFullJoin(select.Source))
+            throw new EmbeddedSqlException("FULL OUTER JOIN with a recursive reference is not yet supported");
 
         if (select.GroupBy.Count > 0
             || select.Having is not null
@@ -37349,11 +37892,13 @@ out bool hasReturning)
 
     private static IReadOnlyList<QueryAffinityColumn> DescribeCommonTableExpressionBodyAffinities(
         ParsedStatement body,
+        string cteName,
+        IReadOnlyList<string>? declaredColumns,
         QueryContext context,
         Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
     {
         if (body is QueryStatement query)
-            return DescribeQueryAffinities(query, context, commonTableExpressions);
+            return DescribeRecursiveAwareQueryAffinities(query, cteName, declaredColumns, context, commonTableExpressions);
         if (!TryGetReturning(body, out var tableName, out var returning))
             return [];
 
@@ -37369,6 +37914,64 @@ out bool hasReturning)
             Limit: null,
             Offset: null);
         return DescribeSelectAffinities(select, context, commonTableExpressions);
+    }
+
+    // Describes a CTE body's affinities, pre-seeding the CTE's own affinity metadata from
+    // just its anchor arm(s) before describing a self-referencing recursive arm. Without
+    // this, describing (without executing, as CREATE TABLE AS SELECT's own describer does)
+    // a recursive CTE's compound body would need the CTE's own metadata to describe the very
+    // arm that produces it. Mirrors Turso's planner deriving a recursive CTE's input
+    // metadata from its initial query before its recursive query is planned
+    // (core/translate/planner.rs prepare_recursive_cte_plan / plan.rs). The anchor's own
+    // column names are renamed to the CTE's declared names (when given and matching in
+    // count) before seeding, so a recursive arm that refers to the CTE by its declared
+    // column names (rather than the anchor's own projection names) still resolves.
+    private static IReadOnlyList<QueryAffinityColumn> DescribeRecursiveAwareQueryAffinities(
+        QueryStatement query,
+        string cteName,
+        IReadOnlyList<string>? declaredColumns,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        if (query is not CompoundSelectStatement compound)
+            return DescribeQueryAffinities(query, context, commonTableExpressions);
+
+        var scope = new List<(string Name, int Weight)>();
+        var firstRecursiveIndex = -1;
+        for (var index = 0; index < compound.Terms.Count; index++)
+        {
+            if (CountRecursiveReferencesInArm(compound.Terms[index], scope, cteName).TotalCount > 0)
+            {
+                firstRecursiveIndex = index;
+                break;
+            }
+        }
+
+        if (firstRecursiveIndex <= 0)
+            return DescribeQueryAffinities(query, context, commonTableExpressions);
+
+        QueryStatement anchorOnly = firstRecursiveIndex == 1
+            ? compound.Terms[0]
+            : new CompoundSelectStatement(
+                compound.Terms.Take(firstRecursiveIndex).ToArray(),
+                compound.Operators.Take(firstRecursiveIndex - 1).ToArray(),
+                [],
+                null,
+                null);
+        var anchorColumns = DescribeQueryAffinities(anchorOnly, context, commonTableExpressions);
+        if (declaredColumns is not null && declaredColumns.Count == anchorColumns.Count)
+        {
+            anchorColumns = anchorColumns
+                .Select((column, index) => column with { Name = declaredColumns[index] })
+                .ToArray();
+        }
+
+        var seededCommonTableExpressions = new Dictionary<string, IReadOnlyList<QueryAffinityColumn>>(
+            commonTableExpressions, StringComparer.OrdinalIgnoreCase)
+        {
+            [cteName] = anchorColumns,
+        };
+        return DescribeCompoundAffinities(compound, context, seededCommonTableExpressions);
     }
 
     private sealed record QueryAffinityColumn(
@@ -37791,6 +38394,8 @@ out bool hasReturning)
 
             var columns = DescribeCommonTableExpressionBodyAffinities(
                 cte.Body,
+                cte.Name,
+                cte.Columns,
                 context with { CommonTableExpressions = runtimeCtes },
                 ctes).ToArray();
             if (cte.Columns is { } declared)

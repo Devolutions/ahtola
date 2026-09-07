@@ -215,10 +215,15 @@ public class RecursiveCteSqlRoutingTests
     }
 
     [Test]
-    public void DistinctRecursiveTermRoutesThroughGenerationExpansion()
+    public void DistinctRecursiveTermFallsBackToEvaluator()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
+        // A DISTINCT recursive projection must run once per current row -- a single-row
+        // DISTINCT never removes anything, preserving duplicates the whole-generation
+        // worktable transform would otherwise collapse (recursive-cte-distinct-in-recursive-step).
+        // So this shape stays on the evaluator's own per-row priority queue instead of routing
+        // through generation expansion, and EXPLAIN cannot describe a program for it either.
         Column0(ReadRows(connection, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT DISTINCT x + 1 FROM c WHERE x < 4) SELECT * FROM c;"))
             .Should().Equal(
                 SqlValue.Integer(1),
@@ -226,8 +231,8 @@ public class RecursiveCteSqlRoutingTests
                 SqlValue.Integer(3),
                 SqlValue.Integer(4));
 
-        Opcodes(ReadRows(connection, "EXPLAIN WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT DISTINCT x + 1 FROM c WHERE x < 4) SELECT * FROM c;"))
-            .Should().Contain("WorkTableExpandGeneration");
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "EXPLAIN WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT DISTINCT x + 1 FROM c WHERE x < 4) SELECT * FROM c;"));
     }
 
     [Test]

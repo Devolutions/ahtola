@@ -52,30 +52,6 @@ gencol.sqltest::gencol_stored_generated_always_rejected | database variant 1/1 (
 multi_index_or_compound.sqltest::compound-or-analyzed-benchmark-shape-eqp | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH e USING INDEX idx_edge_label (label=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 pragma/memory.sqltest::pragma-function-update-journal-mode | intentional storage-mode divergence: pragma_journal_mode() reports the same SQLite-correct memory mode as the statement form for :memory:, while the pinned Turso case expects wal
 pragma/memory.sqltest::pragma-update-journal-mode-wal | intentional storage-mode divergence: Ahtola reports journal_mode='memory' (SQLite-correct) for a :memory: database; Turso's Rust engine always reports wal/mvcc even in-memory
-recursive-cte.sqltest::recursive-cte-union-recursive-collation | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s)
-recursive-cte.sqltest::recursive-cte-create-table-as-select | database variant 1/1 (:memory:): expected success but got error: no such table: c
-recursive-cte.sqltest::recursive-cte-graph-depth-first | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 2 expected '4/2' but was '3/1'
-recursive-cte.sqltest::recursive-cte-order-inherits-recursive-collation | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected 'A' but was 'b'
-recursive-cte.sqltest::recursive-cte-order-qualified-non-result-column-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
-recursive-cte.sqltest::recursive-cte-forward-dependency | database variant 1/1 (:memory:): expected success but got error: no such table: seq
-recursive-cte.sqltest::recursive-cte-forward-insert-select | database variant 1/1 (:memory:): expected success but got error: no such table: seq
-recursive-cte.sqltest::recursive-cte-full-join-recursive-on-left-not-supported | database variant 1/1 (:memory:): expected an error but the statement succeeded
-recursive-cte.sqltest::recursive-cte-full-join-recursive-on-right-not-supported | database variant 1/1 (:memory:): error 'recursive query for path exceeded the maximum of 1000000 rows' does not match pattern 'FULL OUTER JOIN with a recursive reference is not yet supported'
-recursive-cte.sqltest::recursive-cte-distinct-in-recursive-step | database variant 1/1 (:memory:): expected 6 row(s), got 4 row(s); row 3 expected '2' but was '3'
-recursive-cte.sqltest::recursive-cte-nested-with-in-body | database variant 1/1 (:memory:): expected success but got error: circular reference: outer_seq
-recursive-cte.sqltest::recursive-cte-order-by-ordinals | database variant 1/1 (:memory:): expected 8 row(s), got 8 row(s); row 0 expected '2/0' but was '1/3'
-recursive-cte.sqltest::recursive-cte-order-is-priority-queue-not-final-sort | database variant 1/1 (:memory:): expected 10 row(s), got 10 row(s); row 1 expected '6' but was '1'
-recursive-cte.sqltest::recursive-cte-order-multi-arm-depth-first | database variant 1/1 (:memory:): expected 15 row(s), got 15 row(s); row 2 expected '4/2' but was '3/1'
-recursive-cte.sqltest::recursive-cte-multiple-nested-references | database variant 1/1 (:memory:): error 'circular reference: seq' does not match pattern 'multiple recursive references: seq'
-recursive-cte.sqltest::recursive-cte-arm-column-count-rejected | database variant 1/1 (:memory:): error 'SELECTs to the left and right of a compound operator do not have the same number of result columns' does not match pattern 'SELECTs to the left and right of UNI
-recursive-cte.sqltest::recursive-cte-order-expression-must-match-output | database variant 1/1 (:memory:): expected an error but the statement succeeded
-recursive-cte.sqltest::recursive-cte-mutual-cycle-rejected | database variant 1/1 (:memory:): error 'no such table: b' does not match pattern 'circular reference: a'
-recursive-cte.sqltest::recursive-cte-unused-nested-cte-self-ref-is-not-a-recursive-ref | database variant 1/1 (:memory:): expected success but got error: circular reference: c
-recursive-cte.sqltest::recursive-cte-unused-nested-cte-self-ref-keeps-cte-non-recursive | database variant 1/1 (:memory:): expected success but got error: circular reference: c
-recursive-cte.sqltest::recursive-cte-used-nested-cte-self-ref-rejected | database variant 1/1 (:memory:): error 'circular reference: c' does not match pattern 'multiple recursive references: c'
-recursive-cte.sqltest::recursive-cte-visited-set-via-nested-cte-rejected | database variant 1/1 (:memory:): error 'circular reference: reach' does not match pattern 'multiple recursive references: reach'
-recursive-cte.sqltest::recursive-cte-window-clause-self-ref-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
-recursive-cte.sqltest::recursive-cte-self-ref-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'cte1' is not supported: no module registration, planner, or execution contract is available. At SQL offset 129.' does not match pat
 window/frame_matrix_edge.sqltest::integer-extreme-keys[range][desc][100-preceding-and-2-preceding] | database variant 1/1 (:memory:): SQLite errored ('SQLite Error 1: 'integer overflow'.') but managed returned 5 row(s)
 window/frame_sum_overflow.sqltest::window-sum-inverse-transient-overflow-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
 unnest-correlated.sqltest::one-value-group-concat-does-not-build-unused-groups | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN outer_rows AS o.*CORRELATED SCALAR SUBQUERY'
