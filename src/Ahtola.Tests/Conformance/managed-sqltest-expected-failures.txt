@@ -182,7 +182,6 @@ turso/attach/default.sqltest::attach-reserved-main | database variant 1/2 (:defa
 turso/attach/default.sqltest::attach-reserved-temp | database variant 1/2 (:default:): error 'cannot attach database as temp' does not match pattern 'in use'
 turso/attach/memory.sqltest::attach-cross-database-join | database variant 1/1 (:memory:): expected success but got error: Cross-database statements are not supported by managed ATTACH; every persistent table reference must resolve to one database.
 turso/attach/memory.sqltest::attach-from-memory-db | database variant 1/1 (:memory:): expected success but got error: Cross-database statements are not supported by managed ATTACH; every persistent table reference must resolve to one database.
-turso/attach/memory.sqltest::database-list-with-arg | database variant 1/1 (:memory:): expected success but got error: PRAGMA database_list does not accept a value. At SQL offset 20.
 turso/attach/sequence.sqltest::sequence-nonexistent-schema-errors | database variant 1/1 (:memory:): error 'sequence "bogus.my_seq" does not exist' does not match pattern 'no such database: bogus'
 turso/attach/sequence.sqltest::sequence-schema-qualified-currval | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 1 expected '1' but was '2'
 turso/attach/sequence.sqltest::sequence-schema-qualified-nextval | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 1 expected '1' but was '2'

@@ -303,7 +303,10 @@ internal sealed class SqlParser
         }
         if (name.Equals("database_list", StringComparison.OrdinalIgnoreCase))
         {
-            RequireReadOnlyPragma(name);
+            // Turso accepts (and ignores) an optional argument here - "fix: handle PRAGMA
+            // database_list with argument without panicking". The pragma always lists every
+            // database regardless of what is passed, so the value is parsed and discarded.
+            _ = ParseOptionalPragmaObjectName(name, schema);
             return new PragmaDatabaseListStatement(schema);
         }
         if (name.Equals("encoding", StringComparison.OrdinalIgnoreCase))
