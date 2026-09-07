@@ -12,15 +12,17 @@ historical analysis.
 **Companion artifact.** [`turso-gap-inventory.json`](./turso-gap-inventory.json) —
 the machine-readable inventory, with stable IDs for status tracking
 (`open → closed`). This report is the human-readable analysis **as of analysis
-time (171 entries)**; the JSON is the live tracking source of truth. Closure
+time (171 entries)**; the JSON preserves the historical dispositions. Closure
 progress since analysis (waves F1–F2.18) is recorded in
-[section 11](#11-closure-progress-since-analysis), and current counts are:
-**216 entries, 216 closed, 0 open**; expected-failures file down from
-**606 → 2** lines. The two live markers record intentional SQLite-compatible
-STORED-generated-column support beyond the pinned Turso baseline, not missing
-managed behavior. Remaining MVCC depth (row-version cursors, durable logical
-log, checkpoint SM) is tracked in
-[`mvcc-port-contract.md`](mvcc-port-contract.md).
+[section 11](#11-closure-progress-since-analysis). The inventory now contains
+**217 historically closed entries**, including intentional scope decisions.
+At Ahtola `83bb892`, the refreshed v0.8.0-pre.7 corpus records **100 differences**:
+82 engine/planner/diagnostic parity candidates, 17 deliberate extensions, and
+one CLI-only error-prefix difference. Follow the
+[remaining-gap execution plan](turso-remaining-gap-plan.md) for current work,
+rather than treating the historical closed count as full parity. MVCC version
+cursors, durable logical logging, and checkpointing are implemented; remaining
+page-backed execution and working-set depth are described in the current plan.
 
 **Ground truth.** `src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt`
 (606 failure lines at analysis time). Every line was cross-referenced to at least

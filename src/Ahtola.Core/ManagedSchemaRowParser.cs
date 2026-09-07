@@ -178,6 +178,17 @@ internal static class ManagedSchemaRowParser
     }
 
     /// <summary>Rebuilds and validates the view a <c>view</c> row declares.</summary>
+    /// <remarks>
+    /// A row loaded from storage (<see cref="ManagedSchemaAdoptionMode.Load"/>) tolerates its
+    /// stored SQL failing to parse at all: an older Turso/Ahtola build could write a CREATE VIEW
+    /// column list without identifier quoting (<c>CREATE VIEW v (col one) AS ...</c>), which this
+    /// parser rejects as a multi-word alias. Real SQLite refuses to open such a database
+    /// ("malformed database schema"), but Turso keeps it usable -- the row is malformed SQL text,
+    /// not b-tree/page corruption, so only that one view becomes unavailable (see
+    /// <see cref="ViewDefinition.BrokenReason"/> and <c>EmbeddedDatabase.TryGetView</c>). A row a
+    /// running DDL statement just staged (<see cref="ManagedSchemaAdoptionMode.Reparse"/>) never
+    /// takes this path: the statement that produced it already parsed successfully.
+    /// </remarks>
     public static ViewDefinition ParseView(
         ManagedSchemaRow row,
         ManagedSchemaAdoptionMode mode = ManagedSchemaAdoptionMode.Load)
@@ -185,14 +196,34 @@ internal static class ManagedSchemaRowParser
         ArgumentNullException.ThrowIfNull(row);
         RequireType(row, ManagedSchemaRow.ViewType);
         var sql = RequireSql(row);
-        if (SqlParser.Parse(sql, SqlParameterMap.Parse(sql)) is not CreateViewStatement view)
+
+        ParsedStatement statement;
+        try
+        {
+            statement = SqlParser.Parse(sql, SqlParameterMap.Parse(sql));
+        }
+        catch (EmbeddedSqlException exception) when (mode == ManagedSchemaAdoptionMode.Load)
+        {
+            return new ViewDefinition(row.Name, null, BrokenViewPlaceholderQuery, sql, exception.Message);
+        }
+
+        if (statement is not CreateViewStatement view)
             throw new EmbeddedSqlException($"Stored schema entry '{row.Name}' is not a CREATE VIEW statement.");
 
         ValidateView(row, view, mode);
         return new ViewDefinition(view.Name, view.Columns, view.Query, view.Sql);
     }
 
+    /// <summary>
+    /// A never-executed placeholder for a broken <see cref="ViewDefinition.Query"/>: every path
+    /// that resolves a view as a query source checks <see cref="ViewDefinition.BrokenReason"/>
+    /// and fails closed before it would ever run this.
+    /// </summary>
+    private static readonly QueryStatement BrokenViewPlaceholderQuery =
+        (QueryStatement)SqlParser.Parse("SELECT 1 WHERE 0", SqlParameterMap.Parse("SELECT 1 WHERE 0"));
+
     /// <summary>Rebuilds and validates the trigger a <c>trigger</c> row declares.</summary>
+
     /// <param name="row">The <c>trigger</c> row to rebuild.</param>
     /// <param name="tables">The tables the trigger's target is resolved against.</param>
     /// <param name="views">The views an <c>INSTEAD OF</c> trigger's target is resolved against.</param>

@@ -44,9 +44,11 @@ namespace Ahtola.Core;
 /// The stage runs inside <c>ExecuteSelectStatement</c>, after <c>ValidateQuerySchema</c>, so
 /// name-resolution diagnostics are always produced from the <em>original</em> statement and a
 /// rewrite can never mask a "no such column" error or invent scope. For the same reason it is
-/// skipped inside trigger bodies, where that validation does not run. <c>EXPLAIN</c> and
-/// <c>EXPLAIN QUERY PLAN</c> use their own routes and therefore describe the un-rewritten
-/// statement.
+/// skipped inside trigger bodies, where that validation does not run. <c>EXPLAIN</c> uses its own
+/// route and describes the un-rewritten statement. <c>EXPLAIN QUERY PLAN</c> runs this same
+/// rewrite (see <c>EmbeddedDatabase.ExplainQueryPlanDescriber.cs</c>) for the correlated-
+/// aggregate-subquery shapes it can already describe, so the reported plan matches what actually
+/// executes instead of the statement as written.
 /// </para>
 /// </summary>
 public sealed partial class EmbeddedDatabase
@@ -842,6 +844,23 @@ public sealed partial class EmbeddedDatabase
                 return false;
             }
 
+            // inValue is bound in the OUTER query's scope, before the inner subquery's table
+            // is in scope, so an unqualified column within it always names an outer column -
+            // even when the inner table happens to declare a column of the same name (e.g.
+            // `amount IN (SELECT i.amount FROM inner_rows i …)` where inner_rows also has an
+            // `amount` column). The merged row the synthesized equality is evaluated against
+            // resolves unqualified names against the inner row first (probe = innerRow with
+            // Parent = outerRow; see GetSemiOrAntiJoinRows), so leaving the reference
+            // unqualified would let the inner table silently capture it, turning the equality
+            // into a tautology like `i.amount = i.amount`. Turso never has this ambiguity
+            // because it binds columns by cursor/register instead of by name
+            // (unnest.rs:269-325). Qualify every unqualified reference with the outer alias
+            // that owns it here, and decline the rewrite (fail closed) when a name cannot be
+            // resolved to exactly one outer column.
+            if (!TryQualifyOuterValueColumns(inValue, outerSource, context, out var qualifiedInValue))
+                return false;
+            inValue = qualifiedInValue;
+
             // `x IN (SELECT y …)` is exactly `EXISTS (SELECT 1 … WHERE x = y)` in a WHERE
             // context: the operator's three-valued NULL result and its false result are both
             // filtered out there, so a plain equality reproduces it.
@@ -922,6 +941,54 @@ public sealed partial class EmbeddedDatabase
         else
             Interlocked.Increment(ref _antiJoinRewrites);
 
+        return true;
+    }
+
+    /// <summary>
+    /// Qualifies every unqualified column reference in <paramref name="value"/> with the
+    /// outer alias that owns it, using <paramref name="outerSource"/>'s current output
+    /// columns. Declines (returns false) unless every unqualified reference resolves to
+    /// exactly one outer column - an ambiguous or unresolved name is left for evaluation to
+    /// raise its ordinary diagnostic against the un-rewritten statement instead of being
+    /// silently mishandled here.
+    /// </summary>
+    private bool TryQualifyOuterValueColumns(
+        Expression value,
+        TableSource outerSource,
+        QueryContext context,
+        out Expression qualified)
+    {
+        var outerColumns = GetOutputColumns(outerSource, context);
+        var failed = false;
+        var result = RewriteColumnReferences(value, column =>
+        {
+            if (column.Qualifier is not null)
+                return null;
+
+            var matches = outerColumns
+                .Where(candidate => string.Equals(candidate.Name, column.Name, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (matches.Length != 1 || matches[0].Qualifier is not { } qualifier)
+            {
+                failed = true;
+                return null;
+            }
+
+            return column with
+            {
+                Name = qualifier + "." + column.Name,
+                Qualifier = qualifier,
+                UnqualifiedName = column.Name,
+            };
+        });
+
+        if (failed)
+        {
+            qualified = null!;
+            return false;
+        }
+
+        qualified = result;
         return true;
     }
 

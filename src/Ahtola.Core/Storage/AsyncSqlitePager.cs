@@ -76,6 +76,19 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
         }
     }
 
+    /// <summary>The portion of each page usable by SQLite (page size minus reserved space).</summary>
+    public int UsableSpace
+    {
+        get
+        {
+            lock (_stateGate)
+            {
+                ThrowIfDisposed();
+                return _pageStore.Header.UsableSpace;
+            }
+        }
+    }
+
     /// <summary>The durable transaction format used by this pager.</summary>
     public SqliteJournalMode JournalMode { get; }
 

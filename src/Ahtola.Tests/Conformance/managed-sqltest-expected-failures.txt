@@ -18,6 +18,18 @@
 # file pins Turso's insert-only WITHOUT ROWID restrictions, which Ahtola
 # deliberately exceeds (secondary UNIQUE/INDEX, UPDATE, DELETE, UPSERT, FK) —
 # those rejections are recorded below as intentional extensions.
+#
+# COVER workstream (2026-09-06): @backend rust now routes to Runnable instead of
+# being unconditionally skipped (SqltestCorpus.RunnableBackends). @backend rust
+# pins the Rust-native engine's own behavior, and Ahtola is that engine's managed
+# analog, so these are ordinary SQL/PRAGMA cases, not CLI/API-only contracts.
+# @backend cli remains skipped (sqlite3 CLI dot-commands only). This newly ran
+# correlated-subquery-aggregate-groupby.sqltest (4 cases) and
+# trigger-before-insert-affinity.sqltest (3 cases) fully passing. It also exposed
+# a missing pragma_journal_mode() function and two VACUUM INTO diagnostics.
+# The VACUUM INTO diagnostics and table-valued function are implemented. Both
+# upstream journal-mode cases expect wal for :memory:, whereas Ahtola preserves
+# SQLite's memory mode in both the statement and table-valued forms.
 
 # Intentional SQLite-compatible extensions beyond the pinned Turso baseline:
 # Ahtola supports DELETE/UPDATE ... ORDER BY/LIMIT (the SQLite
@@ -27,11 +39,6 @@
 # Similarly, STORED generated columns are supported where the pinned corpus
 # expects rejection (see the two gencol markers below).
 
-agg_sum_overflow.sqltest::sum-overflow-forgiven-by-later-float | database variant 1/1 (:memory:): expected success but got error: integer overflow
-aggregate-of-outer-column.sqltest::count-of-outer-column-is-an-aggregate-of-the-outer-query | database variant 1/1 (:memory:): expected 1 row(s), got 3 row(s); row 0 expected '3' but was '1'
-aggregate-of-outer-column.sqltest::count-of-outer-column-wins-over-the-subquerys-own-from | database variant 1/1 (:memory:): expected 1 row(s), got 3 row(s); row 0 expected '3' but was '2'
-aggregate-of-outer-column.sqltest::outer-where-filters-before-the-outer-aggregate | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s); row 0 expected '2' but was '1'
-cte.sqltest::table-referenced-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'not_a_function' is not supported: no module registration, planner, or execution contract is available. At SQL offset 28.' does not 
 delete-update-limit-rejected.sqltest::delete-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-where-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
@@ -40,77 +47,12 @@ delete-update-limit-rejected.sqltest::update-limit-rejected | database variant 1
 delete-update-limit-rejected.sqltest::update-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::update-where-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::update-order-by-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
-from-subquery-affinity.sqltest::derived-table-compound-select-real-blob-leading-arm-not-skipped | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '' but was '3'
 gencol.sqltest::gencol_stored_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 gencol.sqltest::gencol_stored_generated_always_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
-join/outer_hash_join.sqltest::full-outer-with-not-exists-subquery | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
 multi_index_or_compound.sqltest::compound-or-analyzed-benchmark-shape-eqp | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH e USING INDEX idx_edge_label (label=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
-recursive-cte.sqltest::recursive-cte-union-recursive-collation | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s)
-recursive-cte.sqltest::recursive-cte-create-table-as-select | database variant 1/1 (:memory:): expected success but got error: no such table: c
-recursive-cte.sqltest::recursive-cte-graph-depth-first | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 2 expected '4/2' but was '3/1'
-recursive-cte.sqltest::recursive-cte-order-inherits-recursive-collation | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected 'A' but was 'b'
-recursive-cte.sqltest::recursive-cte-order-qualified-non-result-column-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
-recursive-cte.sqltest::recursive-cte-forward-dependency | database variant 1/1 (:memory:): expected success but got error: no such table: seq
-recursive-cte.sqltest::recursive-cte-forward-insert-select | database variant 1/1 (:memory:): expected success but got error: no such table: seq
-recursive-cte.sqltest::recursive-cte-full-join-recursive-on-left-not-supported | database variant 1/1 (:memory:): expected an error but the statement succeeded
-recursive-cte.sqltest::recursive-cte-full-join-recursive-on-right-not-supported | database variant 1/1 (:memory:): error 'recursive query for path exceeded the maximum of 1000000 rows' does not match pattern 'FULL OUTER JOIN with a recursive reference is not yet supported'
-recursive-cte.sqltest::recursive-cte-distinct-in-recursive-step | database variant 1/1 (:memory:): expected 6 row(s), got 4 row(s); row 3 expected '2' but was '3'
-recursive-cte.sqltest::recursive-cte-nested-with-in-body | database variant 1/1 (:memory:): expected success but got error: circular reference: outer_seq
-recursive-cte.sqltest::recursive-cte-order-by-ordinals | database variant 1/1 (:memory:): expected 8 row(s), got 8 row(s); row 0 expected '2/0' but was '1/3'
-recursive-cte.sqltest::recursive-cte-order-is-priority-queue-not-final-sort | database variant 1/1 (:memory:): expected 10 row(s), got 10 row(s); row 1 expected '6' but was '1'
-recursive-cte.sqltest::recursive-cte-order-multi-arm-depth-first | database variant 1/1 (:memory:): expected 15 row(s), got 15 row(s); row 2 expected '4/2' but was '3/1'
-recursive-cte.sqltest::recursive-cte-multiple-nested-references | database variant 1/1 (:memory:): error 'circular reference: seq' does not match pattern 'multiple recursive references: seq'
-recursive-cte.sqltest::recursive-cte-arm-column-count-rejected | database variant 1/1 (:memory:): error 'SELECTs to the left and right of a compound operator do not have the same number of result columns' does not match pattern 'SELECTs to the left and right of UNI
-recursive-cte.sqltest::recursive-cte-order-expression-must-match-output | database variant 1/1 (:memory:): expected an error but the statement succeeded
-recursive-cte.sqltest::recursive-cte-mutual-cycle-rejected | database variant 1/1 (:memory:): error 'no such table: b' does not match pattern 'circular reference: a'
-recursive-cte.sqltest::recursive-cte-unused-nested-cte-self-ref-is-not-a-recursive-ref | database variant 1/1 (:memory:): expected success but got error: circular reference: c
-recursive-cte.sqltest::recursive-cte-unused-nested-cte-self-ref-keeps-cte-non-recursive | database variant 1/1 (:memory:): expected success but got error: circular reference: c
-recursive-cte.sqltest::recursive-cte-used-nested-cte-self-ref-rejected | database variant 1/1 (:memory:): error 'circular reference: c' does not match pattern 'multiple recursive references: c'
-recursive-cte.sqltest::recursive-cte-visited-set-via-nested-cte-rejected | database variant 1/1 (:memory:): error 'circular reference: reach' does not match pattern 'multiple recursive references: reach'
-recursive-cte.sqltest::recursive-cte-window-clause-self-ref-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
-recursive-cte.sqltest::recursive-cte-self-ref-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'cte1' is not supported: no module registration, planner, or execution contract is available. At SQL offset 129.' does not match pat
-temp-view.sqltest::create-temp-view-lives-in-temp-schema-not-main | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
-temp-view.sqltest::create-temporary-view-lives-in-temp-schema-not-main | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
-views.sqltest::drop-view-finds-temp-view-with-unqualified-name | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][none] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-no-others] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-current-row] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-group] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-ties] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][none] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-no-others] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-current-row] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-group] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][1-preceding][exclude-ties] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::integer-extreme-keys[range][asc][100-preceding-and-2-preceding] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::integer-extreme-keys[range][desc][100-preceding-and-2-preceding] | database variant 1/1 (:memory:): SQLite errored ('SQLite Error 1: 'integer overflow'.') but managed returned 5 row(s)
-window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][0-5][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][0-5][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][1e308][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[0-5][1e308][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][0-5][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][0-5][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][1e308][asc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_matrix_edge.sqltest::infinite-range-keys[1e308][1e308][desc] | database variant 1/1 (:memory:): managed and SQLite rows differ
-window/frame_sum_overflow.sqltest::window-sum-inverse-transient-overflow-errors | database variant 1/1 (:memory:): expected an error but the statement succeeded
-window/frame_sum_overflow.sqltest::window-frame-membership-at-integer-extremes | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected '9223372036854775807/0//' but was '9223372036854775807/1/9223372036854775807/9223372036854775807'
-window/frame_sum_overflow.sqltest::window-sum-step-overflow-forgiven-by-float | database variant 1/1 (:memory:): expected success but got error: integer overflow
-window/moving_concat_json.sqltest::moving-group-concat-empty-prefix | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 2 expected '3/'x'/'x'' but was '3/'/x'/'/x''
-window/moving_min_max.sqltest::moving-min-max-argument-collation | database variant 1/1 (:memory:): expected 6 row(s), got 6 row(s); row 2 expected '3/a/b' but was '3/A/b'
-window/rows_frame.sqltest::rows-mixed-int-float-approx-transition | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 2 expected '3/300.0' but was '3/300'
-unnest-correlated.sqltest::one-value-group-concat-does-not-build-unused-groups | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN outer_rows AS o.*CORRELATED SCALAR SUBQUERY'
-unnest-correlated.sqltest::one-value-group-concat-joins-before-grouping | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN inner_rows AS i.*SCAN outer_rows AS o.*USE SORTER FOR GROUP BY'
-unnest-correlated.sqltest::correlated-in-null-results-do-not-match | database variant 1/1 (:memory:): expected 1 row(s), got 4 row(s); row 0 expected '3' but was '1'
-unnest-correlated.sqltest::exists-after-full-join | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
-unnest-correlated.sqltest::exists-linked-past-full-join | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
-unnest-correlated.sqltest::not-exists-linked-past-full-join | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
-unnest-correlated.sqltest::one-value-sum-joins-before-grouping | database variant 1/1 (:memory:): output does not match pattern '(?s)HASH JOIN sum_join_inner AS i.*SCAN sum_join_outer AS o.*USE SORTER FOR GROUP BY'
-unnest-correlated.sqltest::one-value-sum-compared-with-subquery-stays-correlated | database variant 1/1 (:memory:): output does not match pattern '(?s)CORRELATED SCALAR SUBQUERY.*CORRELATED SCALAR SUBQUERY'
-unnest-correlated.sqltest::one-value-sum-with-nondeterministic-where-term-stays-correlated | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN nondet_outer AS o.*CORRELATED SCALAR SUBQUERY'
-unnest-correlated.sqltest::one-value-sum-with-correlated-subquery-term-stays-correlated | database variant 1/1 (:memory:): output does not match pattern '(?s)CORRELATED SCALAR SUBQUERY.*CORRELATED SCALAR SUBQUERY'
+pragma/memory.sqltest::pragma-function-update-journal-mode | intentional storage-mode divergence: pragma_journal_mode() reports the same SQLite-correct memory mode as the statement form for :memory:, while the pinned Turso case expects wal
+pragma/memory.sqltest::pragma-update-journal-mode-wal | intentional storage-mode divergence: Ahtola reports journal_mode='memory' (SQLite-correct) for a :memory: database; Turso's Rust engine always reports wal/mvcc even in-memory
 unnest-correlated.sqltest::one-value-sum-join-allows-uncorrelated-subquery-term | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN in_term_inner AS i.*USE SORTER FOR GROUP BY'
-unnest-correlated.sqltest::one-value-sum-join-subquery-on-left-side | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN left_side_inner AS i.*USE SORTER FOR GROUP BY'
-unnest-correlated.sqltest::one-value-json-sum-uses-joined-form | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN json_sum_plan_inner AS i.*SCAN json_sum_plan_outer AS o.*USE SORTER FOR GROUP BY'
 unnest-correlated.sqltest::limit-one-keeps-correlated-in | database variant 1/1 (:memory:): expected 8 row(s), got 3 row(s); row 0 expected '1/0/0/SCAN limit_outer AS o' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 unnest-correlated.sqltest::two-exists-use-two-semi-joins | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN two_exists_outer AS o' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 unnest-correlated.sqltest::outer-filter-keeps-exists-semi-join | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN filtered_exists_outer AS o' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
@@ -119,6 +61,30 @@ unnest-correlated.sqltest::two-identical-averages-use-one-grouped-table | databa
 unnest-correlated.sqltest::grouped-seek-does-not-copy-unused-columns | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
 unnest-correlated.sqltest::unnested-in-reuses-unused-cursor | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
 unnest-correlated.sqltest::grouped-aggregate-reuses-unused-result-register | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
+turso/create-index-nulls-first-last.sqltest::schema-roundtrip-all-variants | pre-existing, NULLS-unrelated gap: Ahtola persists CREATE INDEX SQL text verbatim as typed (matching real SQLite's sqlite_master behavior), while this Turso fixture expects a canonicalized re-print with a space before the column-list parenthesis (e.g. "ON t (a NULLS LAST)" vs the typed "ON t(a NULLS LAST)"); the NULLS clause itself round-trips correctly
+turso/create-index-nulls-first-last.sqltest::pk-schema-roundtrip | same pre-existing verbatim-vs-canonicalized CREATE TABLE text gap as schema-roundtrip-all-variants, applied to a table-level PRIMARY KEY(...) constraint
+turso/create-index-nulls-first-last.sqltest::unique-constraint-schema-roundtrip | same pre-existing verbatim-vs-canonicalized CREATE TABLE text gap as schema-roundtrip-all-variants, applied to a table-level UNIQUE(...) constraint
+turso/create-index-nulls-first-last.sqltest::eqp-elide-reverse-scan-of-asc-nulls-last-index | separately owned gap: the VDBE bytecode compiler's (SelectStatementCompiler) cost-based ORDER BY elision does not yet recognize that reversing a NULLS-FIRST/LAST-carrying index's scan direction also reverses its effective null placement, so it falls back to MANAGED EVALUATOR FALLBACK (a full sort) instead of a reverse covering-index scan; query results are correct (see reverse-scan-of-asc-nulls-last-index, which passes), only the EXPLAIN QUERY PLAN elision optimization is unapplied
+turso/create-index-nulls-first-last.sqltest::eqp-range-seek-on-nulls-last-index | separately owned gap: the VDBE compiler's SEARCH EQP description reports an equality probe "(a=?)" instead of a range probe "(a>?)" once the index carries an explicit NULLS clause; row-level query results are correct (see range-seek-rows-ordered-nulls-last, which passes), only the EXPLAIN QUERY PLAN operator-symbol text is wrong
+turso/create-index-nulls-first-last.sqltest::eqp-upper-range-seek-on-nulls-last-index | same separately owned EQP operator-symbol gap as eqp-range-seek-on-nulls-last-index, for the upper-bound "(a<?)" case
+turso/create-index-nulls-first-last.sqltest::eqp-min-fast-path-on-nulls-last-index | separately owned gap: the VDBE compiler's MIN()-via-covering-index fast path does not yet recognize a NULLS-FIRST/LAST-carrying index as eligible, falling back to MANAGED COMPILED VDBE (a full aggregate scan); the returned value is still correct (see min-max-with-nulls-last-index, which passes), only the EXPLAIN QUERY PLAN fast-path optimization is unapplied
+turso/create-index-nulls-first-last.sqltest::eqp-max-fast-path-on-desc-nulls-first-index | same separately owned MAX()-via-covering-index fast-path gap as eqp-min-fast-path-on-nulls-last-index, for a DESC NULLS FIRST index
+turso/analyze.sqltest::analyze-table-without-rowid-fails | policy candidate: intentional extension — Ahtola supports ANALYZE on WITHOUT ROWID tables (consistent with the without_rowid.sqltest extensions above) where the pinned Turso corpus expects "Parse error: ANALYZE on tables without rowid is not supported"
+# JSON EQP adoption: retain actual contract differences. Original SQL echo currently loses
+# its statement terminator; some operations/topology remain incomplete. Native-layout IDs
+# are not a reason to fabricate operations or hide a missing materialization relationship.
+turso/explain-query-plan-json.sqltest::search-nodes-name-the-index-the-constraints-and-the-join | JSON SQL echo omits the trailing semicolon; join search/sorter operation metadata and node identifiers differ
+turso/explain-query-plan-json.sqltest::exists-is-reported-as-a-semi-join | execution-plan gap: Ahtola's evaluator probes an automatic transient hash lookup for the semi-join; the pinned plan uses the declared idx_orders_user index
+turso/explain-query-plan-json.sqltest::not-exists-is-reported-as-an-anti-join | execution-plan gap: Ahtola's evaluator probes an automatic transient hash lookup for the anti-join; the pinned plan uses the declared idx_orders_user index
+turso/explain-query-plan-json.sqltest::both-readers-of-a-shared-cte-point-at-one-materialization | JSON SQL echo, shared CTE materialization metadata and reader relationships are incomplete
+turso/explain-query-plan-json.sqltest::a-from-clause-subquery-nests-its-body-under-its-own-scan | JSON SQL echo and nested FROM-subquery parent/child topology differ
+turso/explain-query-plan-json.sqltest::a-compound-select-lists-its-arms | JSON SQL echo and compound/compound-arm operation topology differ
+turso/explain-query-plan-json.sqltest::list-and-scalar-subqueries-report-whether-they-are-correlated | JSON SQL echo and list/scalar subquery correlation metadata differ
+turso/explain-query-plan-json.sqltest::an-or-over-two-indexes-lists-both-branches | JSON SQL echo, multi-index branch metadata and rowid PRIMARY KEY naming differ
+turso/explain-query-plan-json.sqltest::a-recursive-cte-reports-its-setup-and-step-phases | JSON SQL echo and recursive setup/step topology differ
+turso/explain-query-plan-json.sqltest::the-json-tree-matches-the-text-rows | List-subquery/sorter text and JSON topology differ from the pinned snapshot
+turso/explain-query-plan-json.sqltest::leaving-out-the-format-clause-means-text | Remaining execution-route gap: the managed harness supplies a cancellation token, so CanUseCompiledSelectRoute keeps this non-aggregate LEFT JOIN on the evaluator; the compiled index-search suffix fix alone does not provide the fixture's two SEARCH rows
+turso/explain-query-plan-json.sqltest::quotes-in-the-statement-are-escaped-in-the-echo | Original SQL echo loses its terminator; index access text uses the alias instead of table AS alias
 turso/vector.sqltest::vector-insert-no-quotes | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is otherwise identical)
 turso/without_rowid.sqltest::without-rowid-secondary-unique-rejected | intentional extension: Ahtola supports secondary UNIQUE constraints on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-create-index-rejected | intentional extension: Ahtola supports secondary CREATE INDEX on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
@@ -127,3 +93,95 @@ turso/without_rowid.sqltest::without-rowid-delete-rejected | intentional extensi
 turso/without_rowid.sqltest::without-rowid-insert-or-replace-rejected | intentional extension: Ahtola supports INSERT OR REPLACE on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-upsert-rejected | intentional extension: Ahtola supports UPSERT on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-foreign-keys-rejected | intentional extension: Ahtola supports FOREIGN KEY on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
+
+# COVER workstream (2026-09-06): these 9 files' fixtures are byte-faithful (the corruption
+# generator reproduces Turso's own turso-src/testing/sqltest/src/generator/mod.rs patches
+# exactly, and the legacy-view static fixture is vendored unmodified) and execute normally
+# through the managed harness -- SqltestManagedRunner.RunVariant converts the resulting
+# open-time EmbeddedSqlException/InvalidDataException into a plain SqltestOutcome instead of
+# letting it escape as an unhandled test exception, so each case is compared and recorded like
+# any other. All 18 cases below are real observed engine behavior:
+# EmbeddedFileStore.Load() validates b-tree/index/allocation-map/generated-column structural
+# integrity eagerly at file-open time, where Turso/SQLite open the file unconditionally and
+# defer to PRAGMA integrity_check/quick_check to report the same defect as row output (the
+# same class of pre-existing divergence already exercised by
+# ManagedIntegrityCheckPragmaTests.AStoredNonUniqueIndexEntryFailsToOpenInsteadOfBeingReported).
+# The separate legacy-view loader gap is closed: malformed stored views no longer prevent
+# unrelated operations, and resolving a broken view for queries or trigger DML fails closed.
+# The other
+# 3 files this generator builds (parity_check_constraint, parity_quick_check_constraint,
+# parity_not_null_violation) are NOT listed here: ordinary column CHECK/NOT NULL values are not
+# re-validated on load, only generated-column values are recomputed (and their NOT NULL
+# rechecked), so those 3 open successfully and PRAGMA integrity_check/quick_check see the
+# corruption exactly as the pinned corpus expects.
+integrity_check/parity_corrupt_index.sqltest::integrity-check-corrupt-missing-index-entry | database variant 1/1 (database/integrity_missing_index_entry.db): database failed to open: Stored index 'idx_b' is not a valid supported SQLite index b-tree.
+integrity_check/parity_corrupt_index.sqltest::quick-check-corrupt-missing-index-entry | database variant 1/1 (database/integrity_missing_index_entry.db): database failed to open: Stored index 'idx_b' is not a valid supported SQLite index b-tree.
+integrity_check/parity_corrupt_expression_index.sqltest::integrity-check-corrupt-missing-expression-index-entry | database variant 1/1 (database/integrity_missing_expression_index_entry.db): database failed to open: Stored index 'idx_expr' is not a valid supported SQLite index b-tree.
+integrity_check/parity_corrupt_expression_index.sqltest::quick-check-corrupt-missing-expression-index-entry | database variant 1/1 (database/integrity_missing_expression_index_entry.db): database failed to open: Stored index 'idx_expr' is not a valid supported SQLite index b-tree.
+integrity_check/parity_corrupt_partial_index.sqltest::integrity-check-corrupt-missing-partial-index-entry | database variant 1/1 (database/integrity_missing_partial_index_entry.db): database failed to open: Stored index 'idx_partial' is not a valid supported SQLite index b-tree.
+integrity_check/parity_corrupt_partial_index.sqltest::quick-check-corrupt-missing-partial-index-entry | database variant 1/1 (database/integrity_missing_partial_index_entry.db): database failed to open: Stored index 'idx_partial' is not a valid supported SQLite index b-tree.
+integrity_check/parity_freelist_count_mismatch.sqltest::integrity-check-freelist-count-mismatch | open-time validation: SQLite freelist header declares 202 pages but its trunks contain 201.
+integrity_check/parity_freelist_count_mismatch.sqltest::quick-check-freelist-count-mismatch | open-time validation: SQLite freelist header declares 202 pages but its trunks contain 201.
+integrity_check/parity_freelist_trunk_corrupt.sqltest::integrity-check-freelist-trunk-corrupt | open-time validation: SQLite freelist trunk page 2 declares 1023 leaves, exceeding capacity 1022.
+integrity_check/parity_freelist_trunk_corrupt.sqltest::quick-check-freelist-trunk-corrupt | open-time validation: SQLite freelist trunk page 2 declares 1023 leaves, exceeding capacity 1022.
+integrity_check/parity_gencol_not_null_violation.sqltest::integrity-check-gencol-not-null-violation | database variant 1/1 (database/integrity_gencol_not_null_violation.db): database failed to open: NOT NULL constraint failed: t.b
+integrity_check/parity_gencol_not_null_violation.sqltest::quick-check-gencol-not-null-violation | database variant 1/1 (database/integrity_gencol_not_null_violation.db): database failed to open: NOT NULL constraint failed: t.b
+integrity_check/parity_missing_unique_index.sqltest::integrity-check-missing-unique-index-entry | database variant 1/1 (database/integrity_missing_unique_index_entry.db): database failed to open: Stored index 'idx_u_missing' does not match table 't' at record 1.
+integrity_check/parity_missing_unique_index.sqltest::quick-check-missing-unique-index-entry | database variant 1/1 (database/integrity_missing_unique_index_entry.db): database failed to open: Stored index 'idx_u_missing' does not match table 't' at record 1.
+integrity_check/parity_non_unique_index.sqltest::integrity-check-non-unique-index-entry | database variant 1/1 (database/integrity_non_unique_index_entry.db): database failed to open: Stored unique index 'idx_u' on table 't' contains duplicate non-NULL keys.
+integrity_check/parity_non_unique_index.sqltest::quick-check-non-unique-index-entry | database variant 1/1 (database/integrity_non_unique_index_entry.db): database failed to open: Stored unique index 'idx_u' on table 't' contains duplicate non-NULL keys.
+integrity_check/parity_overflow_list_length_mismatch.sqltest::integrity-check-overflow-list-length-mismatch | database variant 1/1 (database/integrity_overflow_list_length_mismatch.db): database failed to open: SQLite overflow chain ends before its logical payload length.
+integrity_check/parity_overflow_list_length_mismatch.sqltest::quick-check-overflow-list-length-mismatch | database variant 1/1 (database/integrity_overflow_list_length_mismatch.db): database failed to open: SQLite overflow chain ends before its logical payload length.
+
+# COVER workstream (2026-09-06): 116 cases exposed by adopting 25 more turso-sqltests files
+# (turso/alter_column.sqltest, turso/attach/*, turso/gencol-index-order.sqltest,
+# turso/mvcc_feature_compat.sqltest, turso/mvcc_sequence.sqltest, turso/mvcc_sequence_adversarial.sqltest,
+# turso/sequence_adversarial.sqltest — see
+# docs/cover-turso-sqltests-audit.md for the full adoption list and disposition). Notable
+# These counts describe discovery, not the current remaining workload. Generated-column
+# conversion, dependent-FK rename corruption, ordinary cross-schema routing, and committed
+# sequence watermarks have since been fixed. Remaining ALTER entries preserve SQLite-style
+# token-spliced schema text or differ in CLI error decoration. FK replay/reopen and generated
+# column value-preservation tests guard the semantic fixes independently of text formatting.
+# Cross-database atomic publication is supported for multiple connection-private memory databases;
+# a transaction that writes a physical database must touch no other database and fails before
+# mutation otherwise. Attached-database CDC routing (connection-wide capture routed to whichever
+# attached database owns turso_cdc) has also been fixed, leaving only one intentional
+# SQL-source canonicalization difference in turso/attach/writes.sqltest. The final MVCC entries
+# retain intentional DDL/allocation/storage-mode contracts, pinned by
+# ManagedIntentionalMvccParityTests, not unsupported-harness exclusions.
+turso/alter_column.sqltest::alter-column-all-to-generated-error | diagnostic decoration: the engine rejects losing the last ordinary column with "must have at least one non-generated column"; the fixture requires Turso's CLI "Parse error:" prefix instead of the managed ALTER context
+turso/alter_column.sqltest::alter-column-only-to-generated-error | diagnostic decoration: same semantic rejection and CLI-prefix difference as alter-column-all-to-generated-error
+turso/alter_column.sqltest::alter-table-add-column-with-fk-updates-schema | schema rendering: SQLite-style ADD COLUMN preserves the inline REFERENCES clause; Turso reserializes it as a table-level FOREIGN KEY clause
+turso/alter_column.sqltest::alter-table-add-self-ref-fk-updates-schema | schema rendering: inline self-REFERENCES is preserved instead of being reserialized as a table-level FOREIGN KEY clause
+turso/alter_column.sqltest::alter-table-rename-complex-constraints | schema rendering: token-spliced CREATE TABLE retains source whitespace/newlines instead of Turso's single-line canonical form
+turso/alter_column.sqltest::alter-table-rename-composite-fk-parent | schema rendering: dependent child column names and FK child lists are now preserved correctly; token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-fk-actions | schema rendering: dependent child column names and FK actions are preserved correctly; token-spliced REFERENCES spacing differs
+turso/alter_column.sqltest::alter-table-rename-fk-chain | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-fk-child | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-fk-deferrable | schema rendering: dependent child column names and FK deferrability are preserved correctly; token-spliced REFERENCES spacing differs
+turso/alter_column.sqltest::alter-table-rename-fk-parent | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-fk-quoted | schema rendering: quoted identifiers remain valid; token-spliced REFERENCES spacing differs
+turso/alter_column.sqltest::alter-table-rename-multiple-fks | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-pk-and-fk | schema rendering: dependent child PK/FK column names are preserved correctly; source whitespace/newlines differ from Turso's canonical form
+turso/alter_column.sqltest::alter-table-rename-self-ref-fk | schema rendering: token-spliced REFERENCES spacing differs from Turso's canonical form
+turso/alter_column.sqltest::rename-parent-2-inline | schema rendering: SQLite-style RENAME TO quotes the replacement table name and preserves inline REFERENCES spacing; Turso omits unnecessary quotes
+turso/alter_column.sqltest::rename-parent-3-composite | schema rendering: replacement table-name quoting and retained source whitespace differ from Turso's canonical form
+turso/alter_column.sqltest::rename-self-1 | schema rendering: valid REFERENCES "s1_new" does not match the fixture's sql LIKE '%REFERENCES s1_new%' check for an unquoted table name
+turso/alter_column.sqltest::rename-self-2-composite | schema rendering: replacement table-name quoting and retained source whitespace differ from Turso's canonical form
+turso/attach/writes.sqltest::attach-write-schema-with-index-sql-canonical | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE INDEX idx1 ON t1 (name)' but was 'CREATE INDEX idx1 ON t1(name)'
+turso/gencol-index-order.sqltest::eqp-group-by-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '0|0|0|MANAGED COMPILED VDBE'
+turso/gencol-index-order.sqltest::eqp-max-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '0|0|0|MANAGED COMPILED VDBE'
+turso/gencol-index-order.sqltest::eqp-order-by-desc-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '0|0|0|MANAGED EVALUATOR FALLBACK'
+turso/gencol-index-order.sqltest::eqp-order-by-virtual-column-and-unindexed-column-still-sorts | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t' but was '0|0|0|MANAGED EVALUATOR FALLBACK'
+turso/mvcc_feature_compat.sqltest::mvcc-alter-table-in-begin-concurrent | intentional extension: managed concurrent transactions permit conflict-free ALTER TABLE; the pinned Turso case rejects it unconditionally
+turso/mvcc_feature_compat.sqltest::mvcc-create-index-in-begin-concurrent | intentional extension: managed concurrent transactions permit conflict-free CREATE INDEX; the pinned Turso case rejects it unconditionally
+turso/mvcc_feature_compat.sqltest::mvcc-create-table-in-begin-concurrent | intentional extension: managed concurrent transactions permit conflict-free CREATE TABLE; the pinned Turso case rejects it unconditionally
+turso/mvcc_feature_compat.sqltest::mvcc-drop-table-in-begin-concurrent | intentional extension: managed concurrent transactions permit conflict-free DROP TABLE; the pinned Turso case rejects it unconditionally
+turso/mvcc_sequence_adversarial.sqltest::mvcc-concurrent-tx-non-cycle-backing-table-accumulates | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 4 expected '3|3' but was '1|3' -- intentional representation difference: Ahtola compacts the sequence backing table to one row per commit (matching its non-concurrent semantics) where Turso's BEGIN CONCURRENT leaves one row per nextval for a later checkpoint compactor to reclaim; the persisted watermark VALUE itself (3) is correct and durable across commit, only the row count differs.
+turso/mvcc_sequence_adversarial.sqltest::mvcc-concurrent-tx-rollback-burns-nextval | intentional allocation policy: rollback restores managed sequence watermarks, so the rolled-back allocation is reused (1 instead of Turso's 2)
+turso/mvcc_sequence_adversarial.sqltest::mvcc-concurrent-tx-rollback-burns-rowid | intentional allocation policy: rollback restores managed AUTOINCREMENT state, so the rolled-back rowid is reused (1 instead of Turso's 2)
+turso/mvcc_sequence_adversarial.sqltest::mvcc-user-sequence-survives-concurrent-tx-rollback | intentional allocation policy: rollback restores the user sequence watermark to 100 rather than burning allocations through 101
+turso/mvcc_sequence.sqltest::mvcc-to-wal-autoincrement-continues | intentional storage-mode policy: a :memory: WAL request retains mvcc mode; committed AUTOINCREMENT values still advance correctly
+turso/mvcc_sequence.sqltest::mvcc-to-wal-user-sequence-continues | intentional storage-mode policy: a :memory: WAL request retains mvcc mode; committed user-sequence values still advance correctly
+turso/mvcc_sequence.sqltest::mvcc-wal-mvcc-roundtrip-autoincrement | intentional storage-mode policy: a :memory: WAL request retains mvcc mode without losing allocation watermarks

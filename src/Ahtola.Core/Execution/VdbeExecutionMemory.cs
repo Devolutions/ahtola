@@ -49,6 +49,25 @@ public sealed class VdbeExecutionMetrics
 
     public long HashPartitionFallbackScans { get; private set; }
 
+    /// <summary>Times a probe found its target partition already resident from a prior probe (no reload).</summary>
+    public long HashPartitionResidencyReuses { get; private set; }
+
+    /// <summary>Times a resident partition was evicted (least-recently-used) to make room for another.</summary>
+    public long HashPartitionEvictions { get; private set; }
+
+    /// <summary>Times an oversized partition was lazily split into finer sub-partitions.</summary>
+    public long HashPartitionSplits { get; private set; }
+
+    /// <summary>Times a lightweight key-&gt;offset index was built for a partition too large to fully load.</summary>
+    public long HashPartitionIndexBuilds { get; private set; }
+
+    /// <summary>Times a probe was answered via a resident lightweight partition index instead of a full scan.</summary>
+    public long HashPartitionIndexSeeks { get; private set; }
+
+    /// <summary>Times a group of buffered probe rows was processed together (partition-major scheduling);
+    /// see VdbeHashJoinRuntime.FlushProbeBatch. Includes single-probe fallback calls (batch of size 1).</summary>
+    public long HashProbeBatchesFlushed { get; private set; }
+
     public long KeyedRowSetsSpilled { get; private set; }
 
     public long WindowBuffersSpilled { get; private set; }
@@ -102,6 +121,24 @@ public sealed class VdbeExecutionMetrics
 
     internal void HashPartitionFallbackScan() =>
         HashPartitionFallbackScans = checked(HashPartitionFallbackScans + 1);
+
+    internal void HashPartitionResidencyReuse() =>
+        HashPartitionResidencyReuses = checked(HashPartitionResidencyReuses + 1);
+
+    internal void HashPartitionEviction() =>
+        HashPartitionEvictions = checked(HashPartitionEvictions + 1);
+
+    internal void HashPartitionSplit() =>
+        HashPartitionSplits = checked(HashPartitionSplits + 1);
+
+    internal void HashPartitionIndexBuild() =>
+        HashPartitionIndexBuilds = checked(HashPartitionIndexBuilds + 1);
+
+    internal void HashPartitionIndexSeek() =>
+        HashPartitionIndexSeeks = checked(HashPartitionIndexSeeks + 1);
+
+    internal void HashProbeBatchFlushed() =>
+        HashProbeBatchesFlushed = checked(HashProbeBatchesFlushed + 1);
 
     internal void KeyedRowSetSpilled() =>
         KeyedRowSetsSpilled = checked(KeyedRowSetsSpilled + 1);
@@ -329,6 +366,13 @@ internal static class VdbeManagedFootprint
     public static long EstimateInt32ListStorage(int capacity) =>
         capacity == 0 ? 0 : EstimateArray(sizeof(int), capacity);
 
+    public static long EstimateInt64ListStorage(int capacity) =>
+        capacity == 0 ? 0 : EstimateArray(sizeof(long), capacity);
+
+    /// <summary>Public wrapper over the internal string-retention estimate, used by callers
+    /// that retain a bare string (e.g. an index key) outside of a SqlValue payload.</summary>
+    public static long EstimateStringStorage(int characterCount) => EstimateString(characterCount);
+
     public static long EstimateRunDescriptorListStorage(int capacity) =>
         capacity == 0 ? 0 : EstimateArray(RunDescriptorSlotBytes, capacity);
 
@@ -392,6 +436,31 @@ internal static class VdbeManagedFootprint
                     "hash-matches".Length));
         }
         return total;
+    }
+
+    private const long HashPartitionSplitObjectBytes = 96;
+
+    /// <summary>
+    /// Estimates the retained-memory infrastructure cost of lazily splitting one oversized
+    /// hash-join partition into <paramref name="subPartitionCount"/> finer sub-partitions
+    /// (see <c>VdbeHashJoinRuntime.HashSpill.TrySplitPartition</c>): the sub-partition file
+    /// array plus one temporary file per sub-partition. Does not include the row/key
+    /// payloads themselves, which are accounted for separately as entries are rewritten.
+    /// </summary>
+    public static long EstimateHashPartitionSplitInfrastructure(
+        string temporaryDirectory,
+        int subPartitionCount)
+    {
+        ArgumentNullException.ThrowIfNull(temporaryDirectory);
+        ArgumentOutOfRangeException.ThrowIfNegative(subPartitionCount);
+
+        var subPartitionFileBytes = EstimateTemporaryFileInfrastructure(
+            temporaryDirectory.Length,
+            "hash-p000-s000".Length);
+        return checked(
+            HashPartitionSplitObjectBytes
+            + EstimateReferenceListStorage(subPartitionCount)
+            + (subPartitionCount * (HashPartitionObjectBytes + subPartitionFileBytes)));
     }
 
     public static long EstimateSorterSpillInfrastructure(string temporaryDirectory)

@@ -2068,6 +2068,468 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public async Task ProtocolTwoIncrementalPagesReplaysPendingLocalRowAndAddColumnChanges()
+    {
+        // An incremental page patch has no per-row replay of its own, unlike a logical apply's
+        // precollect/reapply and unlike ReplaceBase's full statement replay onto a pristine
+        // snapshot. EnsurePagesApplyIsSafe allows this shape (CREATE/ADD COLUMN pending schema,
+        // any pending row changes) and ApplyIncrementalPagesAsync's precollect/patch/reassert
+        // path must recover the still-unpushed rows while retaining the acknowledged column
+        // already present in the authoritative remote page image.
+        var path = NewReplicaPath("managed-replica-incremental-pending-local");
+        var sourcePath = path + ".source";
+        byte[] initialImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            initialImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var incrementedSource = path + ".incremented";
+        byte[] incrementedImage;
+        try
+        {
+            using (var incremented = new AhtolaConnection($"Data Source={incrementedSource};Local Provider=Managed"))
+            {
+                incremented.Open();
+                incremented.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                incremented.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (84);");
+                incremented.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT, extra TEXT);");
+            }
+
+            incrementedImage = File.ReadAllBytes(incrementedSource);
+        }
+        finally
+        {
+            DeleteReplicaFiles(incrementedSource);
+        }
+
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+            ReadBootstrapMarker(connection).Should().Be(42);
+
+            // The additive ADD COLUMN executes first so it is the oldest journal entry: with
+            // PushOperationsThreshold=1, the sync below pushes and acknowledges exactly that one
+            // entry before pulling, leaving only the two row INSERTs pending -- so this exercises
+            // pending-row precollect/reassert without replaying the acknowledged ADD COLUMN
+            // onto a remote base that already includes it.
+            connection.ExecuteNonQuery("ALTER TABLE local_items ADD COLUMN extra TEXT;");
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x, extra) VALUES (1, 'first', 'extra-1');");
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (2, 'second');");
+
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().HaveCount(3);
+
+            var result = await connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+            handler.PushCallCount.Should().Be(1, "the ADD COLUMN was pushed; the two INSERTs remain pending");
+
+            ReadBootstrapMarker(connection).Should().Be(84);
+
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT id, x, extra FROM local_items ORDER BY id;";
+            using var reader = command.ExecuteReader();
+            reader.Read().Should().BeTrue();
+            reader.GetInt64(0).Should().Be(1);
+            reader.GetString(1).Should().Be("first");
+            reader.GetString(2).Should().Be("extra-1");
+            reader.Read().Should().BeTrue();
+            reader.GetInt64(0).Should().Be(2);
+            reader.GetString(1).Should().Be("second");
+            reader.IsDBNull(2).Should().BeTrue();
+            reader.Read().Should().BeFalse();
+
+            // Only the two still-unpushed row INSERTs remain pending; the ADD COLUMN was already
+            // pushed and acknowledged above.
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should()
+                .HaveCount(2).And.OnlyContain(change => change.Kind == ReplicaLocalChangeKind.Row);
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+
+    [Test]
+    public async Task IncrementalPendingLiveWalCheckpointIsCrashSafeAndConvergesOnRetry()
+    {
+        // The Incremental+pending branch's live-WAL checkpoint (added alongside the
+        // precollect/patch/reassert reconciliation) is a newly introduced durability boundary: an
+        // interruption right after it must not corrupt the replica or lose the still-unpushed
+        // local change, and a plain retry (a fresh sync call, no special recovery API) must
+        // converge to the correct end state. The checkpoint is durable and lossless by
+        // construction (it only relocates already-committed bytes from the WAL into the main
+        // file), and the change journal -- not the WAL -- remains the sole source of truth for
+        // what is still pending, so re-running the whole apply from scratch is safe.
+        var path = NewReplicaPath("managed-replica-incremental-pending-checkpoint-crash");
+        var sourcePath = path + ".source";
+        byte[] initialImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            initialImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var incrementedSource = path + ".incremented";
+        byte[] incrementedImage;
+        try
+        {
+            using (var incremented = new AhtolaConnection($"Data Source={incrementedSource};Local Provider=Managed"))
+            {
+                incremented.Open();
+                incremented.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                incremented.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (84);");
+                incremented.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            incrementedImage = File.ReadAllBytes(incrementedSource);
+        }
+        finally
+        {
+            DeleteReplicaFiles(incrementedSource);
+        }
+
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+
+                // The ADD COLUMN executes first so it is the oldest journal entry: with
+                // PushOperationsThreshold=1, the first sync below pushes and acknowledges exactly
+                // that one entry, leaving only the row INSERT pending when the injected fault
+                // fires during the Incremental+pending apply.
+                connection.ExecuteNonQuery("ALTER TABLE local_items ADD COLUMN extra TEXT;");
+                connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');");
+
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == ManagedReplicaDurableBoundary.IncrementalPendingLiveWalCheckpointed)
+                               throw new InvalidOperationException("Injected incremental pending checkpoint interruption.");
+                       }))
+                {
+                    Assert.ThrowsAsync<InvalidOperationException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                }
+            }
+
+            // The interrupted checkpoint must not have advanced the revision or lost the still-
+            // unpushed row change: the WAL-to-main-file installation is durable and idempotent by
+            // construction, but nothing downstream of it (staging, patch, reassert, publish) ever
+            // ran.
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
+                .Should().ContainSingle(change => change.Kind == ReplicaLocalChangeKind.Row);
+
+            using (var reopened = AhtolaConnection.CreateReplica(options))
+            {
+                reopened.Open();
+                ReadBootstrapMarker(reopened).Should().Be(42, "the checkpoint only relocates already-committed bytes");
+
+                using var command = reopened.CreateCommand();
+                command.CommandText = "SELECT x FROM local_items WHERE id = 1;";
+                command.ExecuteScalar().Should().Be("first", "the pending row survives the checkpoint uncorrupted");
+
+                // A plain retry -- no special recovery API, just another ordinary sync call --
+                // must converge without throwing: it pushes the one remaining pending change and
+                // successfully applies the (freshly queued) second revision-43 response. Whether
+                // the row's own value survives this specific retry depends on the acknowledged-
+                // write reconciliation on the remote-base/page-apply path, which is a separate
+                // concern from the live-WAL checkpoint boundary this test targets; only the
+                // absence of a crash/exception and a fully-drained journal are asserted here.
+                var result = await reopened.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+
+                ReadBootstrapMarker(reopened).Should().Be(84);
+                ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().BeEmpty();
+                ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+            }
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [TestCase(RevertWalStagedBoundary)]
+    [TestCase(RevertWalPublishedBoundary)]
+    public async Task IncrementalPendingProtectedSnapshotCaptureWithFingerprintHintsIsCrashSafeAtEveryPublicationBoundary(
+        int boundaryValue)
+    {
+        // PublishProtectedSnapshots/StageFileCapture's own publication boundaries (RevertWalStaged,
+        // RevertWalPublished) are pre-existing, but the code path that reaches them via the new
+        // knownOriginalFingerprint/knownCommittedFingerprint hints (see faf4dad) had not previously
+        // been exercised by a dedicated crash-recovery test at these exact boundaries: the only
+        // existing coverage for them (ReplaceBaseCheckpointRevertCaptureIsCrashSafeAtEveryPublicationBoundary)
+        // goes through CaptureAndCheckpoint/StageCapture, a completely different, unmodified
+        // capture routine. This proves the hinted capture path is equally crash-safe at both
+        // boundaries that fire strictly before any durable metadata references the captured
+        // RevertState: the revert-WAL sidecar StageFileCapture produced with hints is byte-for-byte
+        // identical to what the unhinted path would have produced, so an interruption here must
+        // leave metadata exactly as untouched as it always did, and a plain retry must converge.
+        // (RevertRemoteApplyIntentPublished, fired after WritePhaseMetadata durably records the
+        // captured RevertState, exercises the pre-existing, unmodified "ambiguous push outcome"
+        // CommittedReady state machine -- unrelated to this specific optimization and already
+        // covered in spirit by the existing CaptureAndCheckpoint-based boundary tests below.)
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var path = NewReplicaPath($"managed-replica-protected-hinted-capture-{boundary}");
+        var sourcePath = path + ".source";
+        byte[] initialImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            initialImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var incrementedSource = path + ".incremented";
+        byte[] incrementedImage;
+        try
+        {
+            using (var incremented = new AhtolaConnection($"Data Source={incrementedSource};Local Provider=Managed"))
+            {
+                incremented.Open();
+                incremented.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                incremented.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (84);");
+                incremented.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            incrementedImage = File.ReadAllBytes(incrementedSource);
+        }
+        finally
+        {
+            DeleteReplicaFiles(incrementedSource);
+        }
+
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+
+                // ADD COLUMN is oldest so PushOperationsThreshold=1 pushes/acknowledges it first,
+                // leaving the row INSERT pending -- reaching the Incremental+pending branch, whose
+                // remote-base reconstruction and protected-snapshot capture both use the new
+                // fingerprint hints.
+                connection.ExecuteNonQuery("ALTER TABLE local_items ADD COLUMN extra TEXT;");
+                connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');");
+
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == boundary)
+                               throw new InvalidOperationException("Injected protected-snapshot capture interruption.");
+                       }))
+                {
+                    Assert.ThrowsAsync<InvalidOperationException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                }
+            }
+
+            // Both boundaries fire strictly before WritePhaseMetadata durably records the captured
+            // RevertState, so metadata must be completely untouched by the interrupted attempt.
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            metadata.Revision.Should().Be("revision-42");
+            metadata.RevertState.Should().BeNull();
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
+                .Should().ContainSingle(change => change.Kind == ReplicaLocalChangeKind.Row);
+
+            using (var reopened = AhtolaConnection.CreateReplica(options))
+            {
+                reopened.Open();
+
+                var result = await reopened.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+
+                ReadBootstrapMarker(reopened).Should().Be(84);
+                ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().BeEmpty();
+                ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+            }
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
+    public void PublishProtectedSnapshotsStillDetectsAMismatchedKnownFingerprintHint()
+    {
+        // StageFileCapture's caller-supplied fingerprint parameters are a pure I/O-saving hint
+        // (skip a redundant standalone pre-hash when the caller already knows the value from
+        // having just computed it over the same unmodified bytes) -- they must never let a
+        // genuinely wrong value slip through unverified. The page-by-page capture loop
+        // independently recomputes and cross-checks a fingerprint against whichever value is in
+        // force, so passing a deliberately incorrect hint here must still fail closed exactly as
+        // it would with no hint at all.
+        var path = NewReplicaPath("managed-replica-protected-snapshot-mismatched-hint");
+        var originalPath = path + ".original";
+        var committedPath = path + ".committed";
+        try
+        {
+            var originalImage = CreateDatabaseImageWithMarker(originalPath, 42);
+            var committedImage = CreateDatabaseImageWithMarker(committedPath, 84);
+            File.WriteAllBytes(originalPath, originalImage);
+            File.WriteAllBytes(committedPath, committedImage);
+
+            var handler = new ReplicaPushHandler(
+                [CreatePullResponse("revision-42", originalImage, protocol: 2), CreateLogicalPullResponse("revision-42", body: [])],
+                _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+            var options = CreateOptions(path, handler);
+            using (var connection = AhtolaConnection.CreateReplica(options))
+                connection.Open();
+
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            var wrongFingerprint = new string('0', 64);
+
+            Assert.Throws<InvalidDataException>(() =>
+                ManagedReplicaRevertWal.PublishProtectedSnapshots(
+                    path,
+                    metadata,
+                    originalPath,
+                    committedPath,
+                    CancellationToken.None,
+                    knownOriginalFingerprint: wrongFingerprint));
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+            DeleteReplicaFiles(originalPath);
+            DeleteReplicaFiles(committedPath);
+        }
+    }
+
+    [Test]
+    public async Task ProtocolTwoIncrementalPagesRejectsAPendingLocalTableRename()
+    {
+        // Unlike CREATE/ADD COLUMN, a RENAME cannot be idempotently reasserted after an
+        // incremental page patch (or safely replayed onto a ReplaceBase snapshot either): the
+        // patch has no way to expose what the remote independently did to the same object, so
+        // EnsurePagesApplyIsSafe must still reject it via
+        // RejectIfLocalSchemaChangesConflictWithRemoteChanges rather than silently losing or
+        // misapplying it.
+        var path = NewReplicaPath("managed-replica-incremental-pending-rename");
+        var sourcePath = path + ".source";
+        byte[] initialImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            initialImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var incrementedImage = CreateDatabaseImageWithMarker(path + ".incremented", 84);
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using var connection = AhtolaConnection.CreateReplica(options);
+            connection.Open();
+
+            // The INSERT executes first so it is the oldest journal entry: with
+            // PushOperationsThreshold=1, the sync below pushes and acknowledges exactly that one
+            // entry before attempting the pull, leaving only the RENAME pending -- exactly
+            // mirroring PendingLocalDropTableStillRejectsALogicalPull's setup for the page
+            // protocol instead of the logical one.
+            connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');");
+            connection.ExecuteNonQuery("ALTER TABLE bootstrap_marker RENAME TO renamed_marker;");
+            var beforeMetadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+
+            Func<Task> sync = () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+            await sync.Should().ThrowAsync<NotSupportedException>()
+                .WithMessage("*local schema change pending push*");
+
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be(beforeMetadata.Revision);
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
+                .Should().ContainSingle(change => change.Kind == ReplicaLocalChangeKind.Schema);
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
+    [Test]
     public async Task ProtocolTwoPagesReplaceBaseAfterAFullyPushedWalWriteSucceedsAndRetainsLogicalProtocol()
     {
         var path = NewReplicaPath("managed-replica-replace-base-pushed-wal");

@@ -27,7 +27,17 @@ internal static class SqlScript
                 }
                 else
                 {
-                    AddStatement(sql, start, token.Offset, statements);
+                    // Include the terminating ';' itself in the returned statement text (once
+                    // AddStatement has confirmed the segment before it is a real, non-empty
+                    // statement -- never for the empty segment between two adjacent
+                    // semicolons, which must keep producing no entry at all). SqlParser.Parse
+                    // already tolerates exactly one trailing semicolon
+                    // (Consume(TokenKind.Semicolon) before Expect(TokenKind.End)), so every
+                    // downstream Prepare/PrepareScript caller keeps parsing identically; this
+                    // only lets EXPLAIN QUERY PLAN FORMAT=JSON's "sql" field echo the statement
+                    // byte-for-byte, terminator included, matching the pinned upstream
+                    // eqp-json fixtures.
+                    AddStatement(sql, start, token.Offset, statements, includeTerminator: true);
                     start = token.Offset + 1;
                     firstTokenInStatement = true;
                     header = TriggerHeader.None;
@@ -145,11 +155,24 @@ internal static class SqlScript
         SeekBegin,
     }
 
-    private static void AddStatement(string sql, int start, int end, List<string> statements)
+    private static void AddStatement(
+        string sql,
+        int start,
+        int end,
+        List<string> statements,
+        bool includeTerminator = false)
     {
         var statement = sql[start..end].Trim();
-        if (statement.Length != 0 && new SqlLexer(statement).Current.Kind != TokenKind.End)
-            statements.Add(statement);
+        if (statement.Length == 0 || new SqlLexer(statement).Current.Kind == TokenKind.End)
+            return;
+
+        // Only re-slice through the terminating ';' once the segment before it is confirmed to
+        // be a real statement, so a stray ";;"/"; ;" run never turns the empty gap between two
+        // adjacent semicolons into a phantom lone-";" entry.
+        if (includeTerminator)
+            statement = sql[start..(end + 1)].Trim();
+
+        statements.Add(statement);
     }
 }
 

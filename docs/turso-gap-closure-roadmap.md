@@ -1,5 +1,10 @@
 # Turso gap closure roadmap
 
+> Current execution plan: [Remaining Turso gap closure plan](turso-remaining-gap-plan.md).
+> The 2026-09-06 baseline at `83bb892` has 100 expected-failure entries:
+> 82 parity candidates, 17 deliberate extensions, and one CLI-only diagnostic.
+> Counts and completed waves below are historical, not a current zero-gap claim.
+
 ## Baseline
 
 This roadmap was reconciled on 2026-08-28 against the read-only Turso

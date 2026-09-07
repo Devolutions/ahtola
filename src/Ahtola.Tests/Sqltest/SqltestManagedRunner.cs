@@ -73,8 +73,35 @@ internal static class SqltestManagedRunner
                     temporaryPath!);
             }
 
-            using var embedded = OpenDatabase(database, temporaryPath, writableDefault);
-            embedded.RegisterScalarFunction(
+            var physicalFixturePath = database.Kind == SqltestDatabaseKind.Path
+                && database.Path is { } fixturePath
+                    ? SqltestPhysicalFixtures.Materialize(fixturePath)
+                    : null;
+            EmbeddedDatabase? embedded;
+            SqltestOutcome? openFailure;
+            try
+            {
+                embedded = OpenDatabase(database, temporaryPath, writableDefault, physicalFixturePath);
+                openFailure = null;
+            }
+            catch (Exception exception) when (database.Kind == SqltestDatabaseKind.Path
+                && IsFixtureOpenValidationException(exception))
+            {
+                // Materialization is outside this boundary: fixture-construction bugs must
+                // fail the run, not masquerade as expected rejection of a corrupt image.
+                embedded = null;
+                var detail = exception.Message;
+                var cause = exception.GetBaseException().Message;
+                if (!string.Equals(detail, cause, StringComparison.Ordinal))
+                    detail += $" ({cause})";
+                openFailure = new SqltestOutcome(false, $"database failed to open: {detail}");
+            }
+
+            using var scopedDatabase = embedded;
+            if (openFailure is not null)
+                return openFailure;
+
+            embedded!.RegisterScalarFunction(
                 "test_nondet_counter",
                 0,
                 static _ => SqlValue.Integer(Interlocked.Increment(ref _testNondeterministicCounter) - 1));
@@ -162,7 +189,8 @@ internal static class SqltestManagedRunner
     private static EmbeddedDatabase OpenDatabase(
         SqltestDatabase database,
         string? temporaryPath,
-        bool writableDefault)
+        bool writableDefault,
+        string? physicalFixturePath)
         => database.Kind switch
         {
             SqltestDatabaseKind.Memory => new EmbeddedDatabase(),
@@ -177,9 +205,28 @@ internal static class SqltestManagedRunner
                     ? temporaryPath!
                     : SqltestDefaultDatabaseGenerator.GetDefaultPath(noRowidAlias: true),
                 readOnly: !writableDefault),
+            SqltestDatabaseKind.Path when physicalFixturePath is not null =>
+                EmbeddedDatabase.OpenFile(physicalFixturePath, readOnly: database.ReadOnly),
             _ => throw new NotSupportedException(
                 $"The managed sqltest harness cannot construct database fixture '{database.DisplayName}'."),
         };
+
+    /// <summary>
+    /// Whether <paramref name="exception"/> represents a legitimate engine/data validation
+    /// rejection of a physical fixture (a real observed behavior worth recording as a
+    /// comparable outcome), as opposed to a harness/test-infrastructure bug that should
+    /// propagate and fail loudly. <see cref="EmbeddedSqlException"/> is the engine's own SQL
+    /// error type; <see cref="InvalidDataException"/> is thrown directly by the storage layer
+    /// for malformed on-disk structures (e.g. <c>SqliteFreelist.Read</c>,
+    /// <c>SqliteOverflowChainReader</c>) when it is not wrapped in an
+    /// <see cref="EmbeddedSqlException"/>. A case whose database kind is genuinely
+    /// unsupported still throws <see cref="NotSupportedException"/> from
+    /// <see cref="OpenDatabase"/> above and is intentionally not caught here — that is a
+    /// harness/classification bug (the case should not have been discovered as Runnable),
+    /// not an engine behavior to record.
+    /// </summary>
+    private static bool IsFixtureOpenValidationException(Exception exception)
+        => exception is EmbeddedSqlException or InvalidDataException;
 
     private static bool RequiresWritableDefaultFixture(string sql)
         => Regex.IsMatch(

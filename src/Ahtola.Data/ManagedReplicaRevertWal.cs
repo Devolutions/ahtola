@@ -56,12 +56,24 @@ internal static class ManagedReplicaRevertWal
         }
     }
 
+    /// <summary>
+    /// Durably captures the protected checkpoint-recovery pair (<paramref name="originalDatabasePath"/>
+    /// and <paramref name="committedDatabasePath"/>) into a revert-WAL sidecar and publishes the
+    /// resulting recovery bundle. <paramref name="knownOriginalFingerprint"/> and
+    /// <paramref name="knownCommittedFingerprint"/> are an optional, purely I/O-saving hint: pass a
+    /// value only when the caller computed it, synchronously and in this same operation, over the
+    /// exact unmodified bytes at that path (see <see cref="StageFileCapture"/> for the exact
+    /// safety argument); omit them (the default) to preserve the original always-hash-from-scratch
+    /// behavior.
+    /// </summary>
     internal static ManagedReplicaBootstrapper.ManagedReplicaMetadata PublishProtectedSnapshots(
         string databasePath,
         ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
         string originalDatabasePath,
         string committedDatabasePath,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? knownOriginalFingerprint = null,
+        string? knownCommittedFingerprint = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(databasePath);
         ArgumentException.ThrowIfNullOrEmpty(originalDatabasePath);
@@ -71,7 +83,12 @@ internal static class ManagedReplicaRevertWal
         var stagingPath = CreateStagingPath(databasePath, "capture");
         try
         {
-            var state = StageFileCapture(stagingPath, originalDatabasePath, committedDatabasePath);
+            var state = StageFileCapture(
+                stagingPath,
+                originalDatabasePath,
+                committedDatabasePath,
+                knownOriginalFingerprint,
+                knownCommittedFingerprint);
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertWalStaged);
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -515,10 +532,31 @@ internal static class ManagedReplicaRevertWal
         }
     }
 
+    /// <summary>
+    /// Captures both protected snapshots into one revert-WAL sidecar. When the caller already
+    /// knows a snapshot's fingerprint -- because it was just computed, synchronously, over the
+    /// exact same unmodified file a few lines earlier in the same operation (e.g. immediately
+    /// after <see cref="ManagedReplicaBootstrapper.PublishRemoteBaseSnapshot"/> or an equivalent
+    /// <c>ComputeDatabaseFingerprint</c> call) -- it may pass that value via
+    /// <paramref name="knownOriginalFingerprint"/>/<paramref name="knownCommittedFingerprint"/> to
+    /// skip one of the two full-file read passes this method would otherwise perform per side (one
+    /// standalone whole-file hash, plus one page-by-page read while building the revert-WAL, which
+    /// independently re-derives and cross-checks the same fingerprint). This does not weaken
+    /// verification: the page-by-page capture below still recomputes and cross-checks a fingerprint
+    /// against whichever value is in force (caller-supplied or freshly computed) exactly as before,
+    /// so a file that changed between the caller's own computation and this call is still caught --
+    /// only the now-redundant standalone pre-hash pass is elided. Passing null (the default)
+    /// preserves the original, always-hash-both-sides behavior exactly, which remains required for
+    /// callers (the MVCC logical protocol's protected-pending path) whose "original" image is built
+    /// by replaying local statements after the point where any pre-existing fingerprint was known,
+    /// and so has no reusable prior value.
+    /// </summary>
     private static ManagedReplicaBootstrapper.ManagedReplicaRevertState StageFileCapture(
         string stagingPath,
         string originalDatabasePath,
-        string committedDatabasePath)
+        string committedDatabasePath,
+        string? knownOriginalFingerprint = null,
+        string? knownCommittedFingerprint = null)
     {
         var originalHeader = ReadDatabaseHeader(originalDatabasePath);
         var committedHeader = ReadDatabaseHeader(committedDatabasePath);
@@ -531,8 +569,13 @@ internal static class ManagedReplicaRevertWal
         var pageSize = originalHeader.PageSize;
         var originalPageCount = GetDatabasePageCount(originalDatabasePath, pageSize);
         var committedPageCount = GetDatabasePageCount(committedDatabasePath, pageSize);
-        var originalFingerprint = ComputeSha256(originalDatabasePath);
-        var committedFingerprint = ComputeSha256(committedDatabasePath);
+        // Skip the standalone whole-file hash when the caller already knows it (see the summary
+        // above): the page-by-page capture loop below still independently recomputes and
+        // cross-checks a fingerprint against this value either way, so nothing here bypasses
+        // verification -- it only avoids reading the file a second time purely to precompute a
+        // value the capture loop is about to re-derive from the same bytes regardless.
+        var originalFingerprint = knownOriginalFingerprint ?? ComputeSha256(originalDatabasePath);
+        var committedFingerprint = knownCommittedFingerprint ?? ComputeSha256(committedDatabasePath);
         Span<byte> saltBytes = stackalloc byte[8];
         RandomNumberGenerator.Fill(saltBytes);
         var revertHeader = SqliteWalHeader.Create(

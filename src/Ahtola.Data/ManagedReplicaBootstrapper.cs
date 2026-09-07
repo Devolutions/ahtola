@@ -1069,32 +1069,46 @@ internal static class ManagedReplicaBootstrapper
         }
 
         // Pages stream (Incremental or ReplaceBase for a page-protocol remote, or a protocol-2
-        // remote using Pages+ReplaceBase for a validated full atomic replacement).
-        var pages = new List<PullPage>();
-        while (await reader.ReadAsync(MaxPageMessageLength, effectiveToken).ConfigureAwait(false) is { } page)
+        // remote using Pages+ReplaceBase for a validated full atomic replacement). Pages are
+        // written straight to a bounded, file-backed staging area as they arrive instead of being
+        // accumulated in an in-memory list -- see ManagedReplicaPullPageStaging.
+        ManagedReplicaPullPageStaging? pageStaging = ManagedReplicaPullPageStaging.Create(options.Path);
+        try
         {
-            pages.Add(ParsePage(page));
-        }
-        if (pages.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
-        {
-            return ManagedReplicaStagedChanges.ForNoOp(
+            while (await reader.ReadAsync(MaxPageMessageLength, effectiveToken).ConfigureAwait(false) is { } page)
+            {
+                var parsed = ParsePage(page);
+                await pageStaging.AppendAsync(parsed.PageId, parsed.Data, effectiveToken).ConfigureAwait(false);
+            }
+
+            if (pageStaging.Count == 0 && string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
+            {
+                return ManagedReplicaStagedChanges.ForNoOp(
+                    options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges, requestLogical,
+                    payload.Length, reader.BytesRead);
+            }
+
+            if (pageStaging.Count == 0)
+                throw new InvalidDataException("The pull-updates response changed revision without returning page data.");
+            if (string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
+                throw new InvalidDataException("The pull-updates response returned page data without changing revision.");
+            if (header.ApplyMode == PullApplyMode.ReplaceBase && (ulong)pageStaging.Count != header.DatabasePages)
+            {
+                throw new InvalidDataException(
+                    "The pull-updates response used replace_base apply mode without returning every database page exactly once.");
+            }
+
+            await pageStaging.CompleteAsync(effectiveToken).ConfigureAwait(false);
+            var staged = ManagedReplicaStagedChanges.ForPages(
                 options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges, requestLogical,
-                payload.Length, reader.BytesRead);
+                payload.Length, reader.BytesRead, header, pageStaging);
+            pageStaging = null;
+            return staged;
         }
-
-        if (pages.Count == 0)
-            throw new InvalidDataException("The pull-updates response changed revision without returning page data.");
-        if (string.Equals(header.Revision, metadata.Revision, StringComparison.Ordinal))
-            throw new InvalidDataException("The pull-updates response returned page data without changing revision.");
-        if (header.ApplyMode == PullApplyMode.ReplaceBase && (ulong)pages.Count != header.DatabasePages)
+        finally
         {
-            throw new InvalidDataException(
-                "The pull-updates response used replace_base apply mode without returning every database page exactly once.");
+            pageStaging?.Dispose();
         }
-
-        return ManagedReplicaStagedChanges.ForPages(
-            options.Path, metadata, pendingLocalChanges, acknowledgedLocalChanges, requestLogical,
-            payload.Length, reader.BytesRead, header, pages);
     }
 
     /// <summary>
@@ -1413,7 +1427,7 @@ internal static class ManagedReplicaBootstrapper
             StagedKind kind,
             PullHeader header,
             byte[]? logicalBody,
-            IReadOnlyList<PullPage>? pages)
+            ManagedReplicaPullPageStaging? pages)
         {
             _databasePath = databasePath;
             RequestBaseMetadata = requestBaseMetadata;
@@ -1437,7 +1451,7 @@ internal static class ManagedReplicaBootstrapper
         internal StagedKind Kind { get; }
         internal PullHeader Header { get; }
         internal byte[]? LogicalBody { get; }
-        internal IReadOnlyList<PullPage>? Pages { get; }
+        internal ManagedReplicaPullPageStaging? Pages { get; }
 
         /// <summary>The response carried no changes and the revision did not move.</summary>
         internal bool IsEmpty => Kind == StagedKind.NoOp;
@@ -1477,7 +1491,7 @@ internal static class ManagedReplicaBootstrapper
             int requestPayloadLength,
             long responseBytesRead,
             PullHeader header,
-            IReadOnlyList<PullPage> pages)
+            ManagedReplicaPullPageStaging pages)
             => new(databasePath, requestBaseMetadata, requestBasePendingLocalChanges,
                 requestBaseAcknowledgedLocalChanges, requestedLogical, requestPayloadLength, responseBytesRead,
                 StagedKind.Pages, header, null, pages);
@@ -1509,10 +1523,16 @@ internal static class ManagedReplicaBootstrapper
 
         /// <summary>
         /// Discards the staged response without applying it. Safe to call whether or not it was
-        /// ever applied: nothing durable or shared was touched while staged, so this only ever
-        /// marks the instance consumed (idempotent) to enforce the one-shot contract.
+        /// ever applied, and safe to call more than once: nothing durable or shared was touched
+        /// while staged (beyond the private page-staging temp file below, which this always
+        /// cleans up), so this only ever marks the instance consumed (idempotent) to enforce the
+        /// one-shot contract.
         /// </summary>
-        public void Dispose() => Volatile.Write(ref _consumed, 1);
+        public void Dispose()
+        {
+            Volatile.Write(ref _consumed, 1);
+            Pages?.Dispose();
+        }
     }
 
     /// <summary>
@@ -2020,7 +2040,8 @@ internal static class ManagedReplicaBootstrapper
                 protectedMetadata,
                 originalPath,
                 committedPath,
-                cancellationToken);
+                cancellationToken,
+                knownCommittedFingerprint: protectedMetadata.DatabaseSha256);
             CompleteRemoteBaseSnapshotPublication(options.Path);
         }
         finally
@@ -2425,10 +2446,46 @@ internal static class ManagedReplicaBootstrapper
         }
     }
 
+    /// <summary>
+    /// Patches <paramref name="targetPath"/> in place from a bounded, file-backed page set: sizes
+    /// the file to the declared database size, then writes each page at its byte offset. Shared by
+    /// the unconditional live-file staging copy and, for an incremental apply with pending local
+    /// changes, the previous-remote-base advance -- both patch the exact same page set onto a
+    /// different starting file.
+    /// </summary>
+    private static async Task ApplyPagePatchAsync(
+        string targetPath,
+        ManagedReplicaPullPageStaging pages,
+        ulong databasePages,
+        CancellationToken cancellationToken)
+    {
+        var pageIds = new HashSet<ulong>();
+        await using var staging = new FileStream(
+            targetPath,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.None,
+            bufferSize: PageSize,
+            FileOptions.Asynchronous | FileOptions.WriteThrough);
+        staging.SetLength(checked((long)databasePages * PageSize));
+        foreach (var page in pages.ReadPages())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (page.PageId >= databasePages || !pageIds.Add(page.PageId))
+                throw new InvalidDataException("The pull-updates response contains an invalid incremental page set.");
+
+            staging.Position = checked((long)page.PageId * PageSize);
+            await staging.WriteAsync(page.Data, cancellationToken).ConfigureAwait(false);
+        }
+
+        await staging.FlushAsync(cancellationToken).ConfigureAwait(false);
+        staging.Flush(flushToDisk: true);
+    }
+
     private static async Task ApplyIncrementalPagesAsync(
         AhtolaReplicaOptions options,
         PullHeader header,
-        IReadOnlyList<PullPage> pages,
+        ManagedReplicaPullPageStaging pages,
         ManagedReplicaMetadata metadata,
         IReadOnlyList<ReplicaLocalChange> pendingLocalChanges,
         IReadOnlyList<ReplicaLocalChange> acknowledgedLocalChanges,
@@ -2451,29 +2508,8 @@ internal static class ManagedReplicaBootstrapper
         try
         {
             File.Copy(options.Path, stagingPath, overwrite: false);
-            var pageIds = new HashSet<ulong>();
-            await using (var staging = new FileStream(
-                stagingPath,
-                FileMode.Open,
-                FileAccess.ReadWrite,
-                FileShare.None,
-                bufferSize: PageSize,
-                FileOptions.Asynchronous | FileOptions.WriteThrough))
-            {
-                staging.SetLength(checked((long)header.DatabasePages * PageSize));
-                foreach (var page in pages)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (page.PageId >= header.DatabasePages || !pageIds.Add(page.PageId))
-                        throw new InvalidDataException("The pull-updates response contains an invalid incremental page set.");
-
-                    staging.Position = checked((long)page.PageId * PageSize);
-                    await staging.WriteAsync(page.Data, cancellationToken).ConfigureAwait(false);
-                }
-
-                await staging.FlushAsync(cancellationToken).ConfigureAwait(false);
-                staging.Flush(flushToDisk: true);
-            }
+            await ApplyPagePatchAsync(stagingPath, pages, header.DatabasePages, cancellationToken)
+                .ConfigureAwait(false);
 
             ValidateStagedDatabase(stagingPath, options.RemoteEncryption);
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalApplyStagedDatabase);
@@ -2523,7 +2559,112 @@ internal static class ManagedReplicaBootstrapper
                     protectedMetadata,
                     stagingPath,
                     protectedStagingPath,
-                    cancellationToken);
+                    cancellationToken,
+                    knownOriginalFingerprint: publishedRemoteBase,
+                    knownCommittedFingerprint: protectedMetadata.DatabaseSha256);
+                CompleteRemoteBaseSnapshotPublication(options.Path);
+                return;
+            }
+            if (header.ApplyMode == PullApplyMode.Incremental && pendingLocalChanges.Count > 0)
+            {
+                // A partial page patch has no per-row replay of its own, unlike a logical apply's
+                // precollect/reapply (ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges):
+                // precollect the current value of every row a still-unpushed local change touches
+                // BEFORE anything above patched a single byte, so it can be idempotently
+                // reasserted afterward regardless of which physical page the incoming patch
+                // happened to touch. EnsurePagesApplyIsSafe already rejected any pending schema
+                // change beyond CREATE/additive ADD COLUMN, so nothing here can lose a DROP/RENAME
+                // silently -- see ManagedReplicaLogicalReplayer.ReplayPendingLocalSchemaChanges.
+                IReadOnlyList<ManagedReplicaCapturedLocalRowChange> capturedLocalChanges;
+                using (var database = ManagedDatabaseAdapter.Open(options.Path))
+                {
+                    capturedLocalChanges = ManagedReplicaLogicalReplayer.CapturePendingLocalRowChanges(
+                        database.Connect(),
+                        pendingLocalChanges);
+                }
+
+                // The remote base this pull publishes must never contain the still-pending rows:
+                // it is reconstructed by advancing the PREVIOUS remote base (not the live file,
+                // which may already carry unpushed writes on pages this patch never touches) by
+                // this pull's authoritative page patch. Physical pages already include any
+                // acknowledged changes; logical client-echo filtering does not apply here.
+                // Publishing anything else would make a later push believe the server already
+                // has rows it has never seen, silently dropping them from the next push.
+                var previousRemoteBasePath = ResolveRemoteBaseSnapshot(options.Path, metadata);
+                File.Copy(previousRemoteBasePath, protectedStagingPath, overwrite: false);
+                await ApplyPagePatchAsync(protectedStagingPath, pages, header.DatabasePages, cancellationToken)
+                    .ConfigureAwait(false);
+                ValidateStagedDatabase(protectedStagingPath, options.RemoteEncryption);
+
+                // The installed file: stagingPath already carries the live file's own committed-
+                // but-unpushed writes, patched by this pull's incoming pages above -- wherever the
+                // patch happened to overwrite the same physical page, that write is gone.
+                // Idempotently reassert every still-pending schema/row change on top: a no-op
+                // wherever the patch left it untouched, a genuine repair wherever the patch
+                // clobbered it. Unlike ReplayPendingLocalStatements (used by the
+                // ReplaceBase+pending branch), this cannot double-apply: it upserts by captured
+                // rowid/value and idempotent DDL rather than re-executing the original
+                // INSERT/UPDATE/DELETE text, which would violate uniqueness on a base that
+                // (unlike a ReplaceBase snapshot) already has the pending write's first
+                // application baked in. The already-acknowledged schema changes are reasserted
+                // here too (defense in depth alongside EnsurePagesApplyIsSafe's own checkpoint):
+                // reasserting a schema change already present is a no-op (CREATE becomes IF NOT
+                // EXISTS; ADD COLUMN checks for the column first), so this is safe even if it
+                // turns out to be redundant. Acknowledged ROW changes are deliberately never
+                // replayed here -- unlike schema DDL, re-executing their original statement text
+                // is not idempotent.
+                using (var opened = ManagedReplicaEncryption.OpenDatabase(stagingPath, options.RemoteEncryption))
+                {
+                    var connection = opened.Database.Connect();
+                    ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
+                    try
+                    {
+                        ManagedReplicaLogicalReplayer.ReplayPendingLocalSchemaChanges(
+                            connection,
+                            acknowledgedLocalChanges,
+                            cancellationToken);
+                        ManagedReplicaLogicalReplayer.ReplayPendingLocalSchemaChanges(
+                            connection,
+                            pendingLocalChanges,
+                            cancellationToken);
+                        ManagedReplicaLogicalReplayer.ReplayPendingLocalRowChanges(
+                            connection,
+                            capturedLocalChanges,
+                            cancellationToken);
+                        ExecuteNonQuery(connection, "COMMIT");
+                    }
+                    catch
+                    {
+                        TryExecuteNonQuery(connection, "ROLLBACK");
+                        throw;
+                    }
+
+                    ExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+                }
+                ValidateStagedDatabase(stagingPath, options.RemoteEncryption);
+
+                var protectedMetadata = metadata with
+                {
+                    Revision = header.Revision,
+                    DatabaseSha256 = ComputeDatabaseFingerprint(stagingPath),
+                    Protocol = header.Protocol,
+                    TableNamesByStableId = RebuildTableMapFromSchema(stagingPath, options.RemoteEncryption),
+                    RevertState = null,
+                    JournalBaseWatermark = AdvanceJournalBaseWatermark(metadata, acknowledgedLocalChanges),
+                };
+                var publishedIncrementalRemoteBase = PublishRemoteBaseSnapshot(
+                    options.Path,
+                    metadata,
+                    protectedStagingPath);
+                protectedMetadata = protectedMetadata with { RemoteBaseSha256 = publishedIncrementalRemoteBase };
+                _ = ManagedReplicaRevertWal.PublishProtectedSnapshots(
+                    options.Path,
+                    protectedMetadata,
+                    protectedStagingPath,
+                    stagingPath,
+                    cancellationToken,
+                    knownOriginalFingerprint: publishedIncrementalRemoteBase,
+                    knownCommittedFingerprint: protectedMetadata.DatabaseSha256);
                 CompleteRemoteBaseSnapshotPublication(options.Path);
                 return;
             }
@@ -3905,15 +4046,19 @@ internal static class ManagedReplicaBootstrapper
     /// Guards a PAGES-stream apply (Incremental or ReplaceBase). This stream kind may be returned
     /// even when the remembered protocol is MvccLogical: a protocol-2 remote can still answer any
     /// given pull with raw pages (e.g. after its logical log has been garbage-collected, or for a
-    /// ReplaceBase). A raw page-based apply has no mechanism to reconcile local writes the way the
-    /// logical path's precollect/reapply does, so both modes reject outright when local changes are
-    /// still pending push. Incremental still rejects those entries because a partial page patch
-    /// cannot rebase journaled SQL. ReplaceBase installs a complete snapshot, so pending statements
-    /// are replayed onto the new image before metadata publication. After that their remaining
-    /// safety requirements differ: ReplaceBase may checkpoint and discard fully-pushed local WAL
-    /// state before replacement; Incremental patches only selected pages, so any non-empty WAL
-    /// already proves that its main-file base is stale and must be rejected without
-    /// checkpointing/mutating that base.
+    /// ReplaceBase). Both modes support a still-unpushed local change, but neither can honor a
+    /// pending schema change beyond CREATE/additive ALTER TABLE ... ADD COLUMN the same way a
+    /// logical apply can (see <see cref="RejectIfLocalSchemaChangesConflictWithRemoteChanges"/>):
+    /// ReplaceBase replays every pending statement's original text onto the freshly installed
+    /// snapshot (see <see cref="ManagedReplicaLogicalReplayer.ReplayPendingLocalStatements"/>),
+    /// which cannot honor DROP/RENAME either, since it has no way to tell whether the remote
+    /// object it would touch is one the server has already seen. Incremental instead precollects
+    /// pending row values before the patch and idempotently reasserts them (and any pending
+    /// additive schema change) afterward, independent of which physical pages the patch touched
+    /// (see the Incremental+pending branch of <see cref="ApplyIncrementalPagesAsync"/>) -- the
+    /// same reason it, too, is limited to CREATE/ADD COLUMN for schema changes: reasserting a
+    /// DROP/RENAME would need to know what the remote independently did to that same object,
+    /// which a raw page patch does not expose.
     /// </summary>
     private static ManagedReplicaMetadata EnsurePagesApplyIsSafe(
         string databasePath,
@@ -3922,17 +4067,63 @@ internal static class ManagedReplicaBootstrapper
         PullApplyMode applyMode,
         CancellationToken cancellationToken)
     {
-        if (pendingLocalChanges.Count > 0 && applyMode == PullApplyMode.Incremental)
-        {
-            throw new NotSupportedException(
-                "Managed embedded replica has local changes pending push; an incremental page-based update "
-                + "has no way to reconcile them and was rejected. Push the pending local changes, then retry.");
-        }
-
         if (applyMode == PullApplyMode.Incremental)
         {
-            CheckFileDivergence(databasePath, metadata);
-            DeleteStagingSidecars(databasePath);
+            if (pendingLocalChanges.Count == 0)
+            {
+                CheckFileDivergence(databasePath, metadata);
+                DeleteStagingSidecars(databasePath);
+                return metadata;
+            }
+
+            // The file-divergence check does not apply here: a pending write is expected to have
+            // advanced the WAL past the last recorded fingerprint, exactly like the logical
+            // protocol's own steady state (see EnsureNoLocalDivergence).
+            RejectIfLocalSchemaChangesConflictWithRemoteChanges(pendingLocalChanges);
+
+            // ApplyIncrementalPagesAsync builds its live-file staging copy with a plain
+            // File.Copy of the main database file (not the WAL): checkpoint here first so that
+            // copy reliably reflects every locally committed schema/row change, including one
+            // still sitting only in the WAL because it was never checkpointed out of it. Unlike
+            // the no-pending branch above, the WAL is not deleted afterward -- TRUNCATE leaves it
+            // at its empty 32-byte header, and CheckFileDivergence's own tolerance for that exact
+            // size means nothing here depends on removing the file.
+            using (var database = ManagedDatabaseAdapter.Open(databasePath))
+            {
+                ExecuteNonQuery(database.Connect(), "PRAGMA wal_checkpoint(TRUNCATE)");
+            }
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalPendingLiveWalCheckpointed);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Republish the fingerprint to match the bytes the checkpoint above just made
+            // durable, mirroring ApplyLogicalUpdatesAsync's own checkpoint+refingerprint pairing
+            // (the MvccLogical apply path always keeps metadata.DatabaseSha256 in step with the
+            // file after any checkpoint that folds in a local write). Without this, metadata would
+            // still name the PRE-checkpoint fingerprint until this pull's own apply completes; if
+            // instead a later, unrelated pull attempt lands in the zero-pending branch above (e.g.
+            // after a subsequent push cycle drains every remaining pending change before the next
+            // pull), CheckFileDivergence's strict, protocol-independent comparison would then
+            // spuriously reject the very bytes this checkpoint already made durable.
+            var checkpointedFingerprint = ComputeDatabaseFingerprint(databasePath);
+            if (!string.Equals(checkpointedFingerprint, metadata.DatabaseSha256, StringComparison.Ordinal))
+            {
+                var metadataPath = databasePath + MetadataSuffix;
+                var metadataStagingPath = Path.Combine(
+                    Path.GetDirectoryName(Path.GetFullPath(databasePath))!,
+                    $".{Path.GetFileName(metadataPath)}.incremental-pending-checkpoint-{Guid.NewGuid():N}.tmp");
+                metadata = metadata with { DatabaseSha256 = checkpointedFingerprint };
+                try
+                {
+                    WriteMetadata(metadataStagingPath, metadataPath, metadata);
+                }
+                finally
+                {
+                    DeleteIfExists(metadataStagingPath);
+                }
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.IncrementalPendingLiveWalCheckpointFingerprintPublished);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
             return metadata;
         }
         if (pendingLocalChanges.Count != 0)
@@ -4086,10 +4277,11 @@ internal static class ManagedReplicaBootstrapper
     }
 
     /// <summary>
-    /// Rejects a non-empty logical apply while a pending local schema change cannot be rebased.
-    /// Additive <c>ALTER TABLE ... ADD COLUMN</c> is always allowed: extra local columns are
-    /// ignored during remote table refresh and reapplied afterward. <c>CREATE</c> remains
-    /// allowed because it introduces an object the server cannot yet know.
+    /// Rejects a non-empty apply (logical, or an incremental page patch reconciling pending
+    /// changes) while a pending local schema change cannot be rebased. Additive
+    /// <c>ALTER TABLE ... ADD COLUMN</c> is always allowed: extra local columns are ignored
+    /// during remote table refresh and reapplied afterward. <c>CREATE</c> remains allowed because
+    /// it introduces an object the server cannot yet know.
     /// </summary>
     private static void RejectIfLocalSchemaChangesConflictWithRemoteChanges(
         IReadOnlyList<ReplicaLocalChange> pendingLocalChanges)

@@ -16,12 +16,33 @@ internal sealed class SqlParser
     private IReadOnlyList<SqlToken>? _pendingUpdateOfTokens;
     /// <summary>CTE names in scope for the statement body being parsed (WITH clause).</summary>
     private HashSet<string>? _activeCteNames;
+    // The parser has no schema access of its own; a caller that does (EmbeddedConnection.Prepare)
+    // may supply this so a bare `name(args)` call that matches a real table or view - not a
+    // registered table-valued function, not a CTE - gets the same "'name' is not a function"
+    // diagnostic SQLite/Turso give a CTE called with arguments, instead of the generic
+    // "is not supported" message (cte.sqltest::table-referenced-with-call-arguments-rejected).
+    private readonly Func<string, bool>? _isKnownNonFunctionName;
+    /// <summary>
+    /// The name of the common table expression whose own body is currently being parsed, or
+    /// <see langword="null"/> outside any CTE body. Unlike <see cref="_activeCteNames"/> (which
+    /// only becomes visible once the whole WITH clause is parsed), this lets a CTE's own body
+    /// recognize a self-reference used with call-argument syntax (<c>cte1(x)</c>) while still
+    /// inside that CTE's definition, so it can be rejected as an arity error against the
+    /// recursive input's implicit zero-parameter shape rather than the generic
+    /// "is not a function" diagnostic used for a CTE called from outside its own body.
+    /// </summary>
+    private string? _currentCteSelfName;
 
-    private SqlParser(string sql, SqlParameterMap parameterMap, SqlSourceSpans? spans = null)
+    private SqlParser(
+        string sql,
+        SqlParameterMap parameterMap,
+        SqlSourceSpans? spans = null,
+        Func<string, bool>? isKnownNonFunctionName = null)
     {
         _lexer = new SqlLexer(sql);
         _sql = sql;
         _spans = spans;
+        _isKnownNonFunctionName = isKnownNonFunctionName;
         for (var index = 1; index <= parameterMap.Count; index++)
         {
             var name = parameterMap.GetName(index);
@@ -30,9 +51,12 @@ internal sealed class SqlParser
         }
     }
 
-    public static ParsedStatement Parse(string sql, SqlParameterMap parameterMap)
+    public static ParsedStatement Parse(
+        string sql,
+        SqlParameterMap parameterMap,
+        Func<string, bool>? isKnownNonFunctionName = null)
     {
-        var parser = new SqlParser(sql, parameterMap);
+        var parser = new SqlParser(sql, parameterMap, isKnownNonFunctionName: isKnownNonFunctionName);
         var statement = parser.ParseStatement();
         parser.Consume(TokenKind.Semicolon);
         parser.Expect(TokenKind.End);
@@ -101,10 +125,10 @@ internal sealed class SqlParser
             if (ConsumeKeyword("QUERY"))
             {
                 ExpectKeyword("PLAN");
-                var format = ParseExplainQueryPlanFormat();
                 var innerStart = _lexer.Current.Offset;
+                var format = ParseExplainQueryPlanFormat();
                 var inner = ParseStatement();
-                var innerSql = _sql[innerStart..].Trim();
+                var innerSql = _sql[innerStart..].TrimEnd();
                 return new ExplainQueryPlanStatement(inner, format, InnerSql: innerSql);
             }
 
@@ -279,7 +303,10 @@ internal sealed class SqlParser
         }
         if (name.Equals("database_list", StringComparison.OrdinalIgnoreCase))
         {
-            RequireReadOnlyPragma(name);
+            // Turso accepts (and ignores) an optional argument here - "fix: handle PRAGMA
+            // database_list with argument without panicking". The pragma always lists every
+            // database regardless of what is passed, so the value is parsed and discarded.
+            _ = ParseOptionalPragmaObjectName(name, schema);
             return new PragmaDatabaseListStatement(schema);
         }
         if (name.Equals("encoding", StringComparison.OrdinalIgnoreCase))
@@ -1239,22 +1266,28 @@ internal sealed class SqlParser
             var columnName = nameToken.Text;
             string? collation = null;
             if (ConsumeKeyword("COLLATE"))
-                collation = ExpectIdentifier();
+                collation = ExpectIdentifierOrString();
 
             var descending = false;
             if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
                 descending = true;
 
+            // Turso-only extension (turso-src core/schema.rs:5938/5992): table-level
+            // PRIMARY KEY(...)/UNIQUE(...) constraint columns accept the same NULLS
+            // FIRST/LAST clause as CREATE INDEX indexed-column terms.
+            var nullPlacement = NullPlacement.Default;
             if (ConsumeKeyword("NULLS"))
             {
-                if (!ConsumeKeyword("FIRST") && !ConsumeKeyword("LAST"))
+                if (ConsumeKeyword("FIRST"))
+                    nullPlacement = NullPlacement.First;
+                else if (ConsumeKeyword("LAST"))
+                    nullPlacement = NullPlacement.Last;
+                else
                     throw Error("Expected FIRST or LAST after NULLS.");
-
-                throw Error("NULLS FIRST/LAST is not supported in table constraints.");
             }
 
             var autoIncrement = allowAutoIncrement && ConsumeKeyword("AUTOINCREMENT");
-            var column = new TablePrimaryKeyColumn(columnName, descending, collation, autoIncrement);
+            var column = new TablePrimaryKeyColumn(columnName, descending, collation, autoIncrement, nullPlacement);
             _spans?.RecordName(column, nameToken);
             columns.Add(column);
         }
@@ -1427,7 +1460,7 @@ internal sealed class SqlParser
         var columns = new List<IndexedColumnDefinition>();
         do
         {
-            columns.Add(ParseIndexedColumn(allowMethodParameters: method is not null));
+            columns.Add(ParseIndexedColumn(allowMethodParameters: method is not null, allowNulls: true));
         }
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
@@ -1558,7 +1591,11 @@ internal sealed class SqlParser
         }
     }
 
-    private IndexedColumnDefinition ParseIndexedColumn(bool allowMethodParameters = false)
+    // allowNulls gates Turso's index/table-constraint NULLS FIRST/LAST extension (turso-src
+    // core/schema.rs:5744 IndexColumn.nulls_order). It stays false for the UPSERT conflict-target
+    // call site: SQLite/Turso reject an explicit NULLS clause there (sqlite3HasExplicitNulls /
+    // core/translate/index.rs reject_explicit_nulls), independent of the CREATE INDEX grammar.
+    private IndexedColumnDefinition ParseIndexedColumn(bool allowMethodParameters = false, bool allowNulls = false)
     {
         var startOffset = _lexer.Current.Offset;
         var expression = ParseExpression();
@@ -1574,12 +1611,27 @@ internal sealed class SqlParser
         if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
             descending = true;
 
+        var nullPlacement = NullPlacement.Default;
         if (ConsumeKeyword("NULLS"))
         {
-            if (!ConsumeKeyword("FIRST") && !ConsumeKeyword("LAST"))
+            NullPlacement parsed;
+            if (ConsumeKeyword("FIRST"))
+                parsed = NullPlacement.First;
+            else if (ConsumeKeyword("LAST"))
+                parsed = NullPlacement.Last;
+            else
                 throw Error("Expected FIRST or LAST after NULLS.");
 
-            throw Error("NULLS FIRST/LAST is not supported in index expressions.");
+            if (!allowNulls)
+            {
+                // Matches SQLite's sqlite3HasExplicitNulls / Turso's reject_explicit_nulls
+                // (turso-src/core/translate/upsert.rs): only an UPSERT conflict target reaches
+                // this branch, since the CREATE INDEX call site always passes allowNulls: true.
+                throw Error(
+                    "NULLS FIRST/LAST is not supported in an ON CONFLICT target.");
+            }
+
+            nullPlacement = parsed;
         }
 
         if (_lexer.Current.Kind is not TokenKind.Comma and not TokenKind.RightParen)
@@ -1600,7 +1652,8 @@ internal sealed class SqlParser
                 column.Name,
                 collation,
                 descending,
-                MethodParameters: methodParameters);
+                MethodParameters: methodParameters,
+                NullPlacement: nullPlacement);
             var columnSpan = _spans?.GetName(column);
             if (columnSpan is not null)
                 _spans!.RecordName(definition, columnSpan.Value);
@@ -1614,7 +1667,8 @@ internal sealed class SqlParser
             descending,
             expression,
             expressionSql,
-            methodParameters);
+            methodParameters,
+            nullPlacement);
     }
 
     private IReadOnlyList<Indexing.ManagedIndexMethodParameter> ParseIndexMethodColumnParameters()
@@ -2425,7 +2479,18 @@ internal sealed class SqlParser
             }
 
             Expect(TokenKind.LeftParen);
-            var body = ParseCommonTableExpressionBody();
+            var previousCteSelfName = _currentCteSelfName;
+            _currentCteSelfName = name;
+            ParsedStatement body;
+            try
+            {
+                body = ParseCommonTableExpressionBody();
+            }
+            finally
+            {
+                _currentCteSelfName = previousCteSelfName;
+            }
+
             Expect(TokenKind.RightParen);
             commonTableExpressions.Add(body is QueryStatement query
                 ? new CommonTableExpression(name, columns, query, materializationHint)
@@ -3129,13 +3194,27 @@ internal sealed class SqlParser
         }
 
         var qualified = ManagedSchemaName.TrySplit(name, out var schema, out var functionName);
-        if (!TableValuedFunctionRegistry.TryResolve(functionName, out var module))
+        // A recursive CTE's own name, used with call-argument syntax inside its own body, is a
+        // self-reference to a real table (the recursive input) that structurally accepts no
+        // call parameters -- an arity error, not "is not a function" (which stays reserved for
+        // a CTE called from outside its own definition, where it truly is not a table-valued
+        // function). Matches upstream's zero-parameter recursive-input rejection.
+        var isRecursiveSelfReference = !qualified
+            && _currentCteSelfName is not null
+            && string.Equals(_currentCteSelfName, functionName, StringComparison.OrdinalIgnoreCase);
+        TableValuedFunctionModule? module = null;
+        if (!isRecursiveSelfReference && !TableValuedFunctionRegistry.TryResolve(functionName, out module))
         {
             if (functionName.StartsWith("pragma_", StringComparison.OrdinalIgnoreCase))
                 throw Error($"no such table: {ManagedSchemaName.Display(name)}");
             // A CTE referenced with call arguments is a known non-function (upstream
             // planner.rs: "'cte1' is not a function").
             if (_activeCteNames is not null && _activeCteNames.Contains(functionName))
+                throw Error($"'{functionName}' is not a function");
+            // Same diagnostic for a real table or view: the parser has no schema access of
+            // its own, so the connection preparing the statement hands in a lookup for the
+            // one case this matters (cte.sqltest::table-referenced-with-call-arguments-rejected).
+            if (_isKnownNonFunctionName?.Invoke(functionName) == true)
                 throw Error($"'{functionName}' is not a function");
             throw Error(TableValuedFunctionRegistry.UnsupportedMessage(ManagedSchemaName.Display(name)));
         }
@@ -3152,12 +3231,21 @@ internal sealed class SqlParser
             Expect(TokenKind.RightParen);
         }
 
-        if (arguments.Count > module.MaximumArgumentCount)
+        var maximumArgumentCount = isRecursiveSelfReference ? 0 : module!.MaximumArgumentCount;
+        if (arguments.Count > maximumArgumentCount)
         {
             throw Error(
-                $"too many arguments on {functionName}() - max {module.MaximumArgumentCount}");
+                $"too many arguments on {functionName}() - max {maximumArgumentCount}");
         }
-        if (arguments.Count < module.MinimumArgumentCount)
+
+        if (isRecursiveSelfReference)
+        {
+            // Zero call arguments: treat exactly like a plain self-reference table.
+            var selfAlias = ParseTableAlias();
+            return new NamedTableSource(functionName, selfAlias, ParseTableIndexDirective(), false);
+        }
+
+        if (arguments.Count < module!.MinimumArgumentCount)
         {
             throw Error(
                 $"too few arguments on {functionName}() - min {module.MinimumArgumentCount}");
@@ -3509,7 +3597,7 @@ internal sealed class SqlParser
     {
         var expression = ParseUnary();
         while (ConsumeKeyword("COLLATE"))
-            expression = new CollationExpression(expression, ExpectIdentifier());
+            expression = new CollationExpression(expression, ExpectIdentifierOrString());
 
         return expression;
     }
@@ -3699,6 +3787,9 @@ internal sealed class SqlParser
                     && string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
                     return new LiteralExpression(SqlValue.Null);
                 if (!token.IsQuoted
+                    && string.Equals(token.Text, "DEFAULT", StringComparison.OrdinalIgnoreCase))
+                    return new DefaultValueExpression();
+                if (!token.IsQuoted
                     && string.Equals(token.Text, "CURRENT_DATE", StringComparison.OrdinalIgnoreCase))
                     return new CurrentTimeExpression(CurrentTimeKind.Date);
                 if (!token.IsQuoted
@@ -3879,10 +3970,13 @@ internal sealed class SqlParser
 
     private Expression ParseRaiseExpression()
     {
-        if (!_inTriggerBody)
-            throw Error("RAISE() may only be used within a trigger program.");
         if (ConsumeKeyword("IGNORE"))
         {
+            // Unlike ABORT, IGNORE has no meaning outside a trigger: there is no triggering
+            // statement to skip, so Turso rejects it here (translator.rs: ResolveType::Ignore).
+            if (!_inTriggerBody)
+                throw Error("RAISE() may only be used within a trigger program.");
+
             Expect(TokenKind.RightParen);
             return new RaiseExpression(RaiseAction.Ignore, null);
         }
@@ -3906,6 +4000,13 @@ internal sealed class SqlParser
                         ? RaiseAction.Fail
                         : throw Error("Expected ROLLBACK, ABORT, FAIL, or IGNORE in RAISE().");
         }
+
+        // Turso extension: RAISE(ABORT, msg)/RAISE('msg') is also usable outside a trigger
+        // program to fail a query directly (translator.rs: ResolveType::Fail | Abort | Rollback
+        // only requires a trigger when the action isn't Abort). ROLLBACK and FAIL still require
+        // one, since there is no enclosing trigger transaction/statement to roll back or fail.
+        if (!_inTriggerBody && action != RaiseAction.Abort)
+            throw Error("RAISE() may only be used within a trigger program.");
 
         if (!shorthand)
             Expect(TokenKind.Comma);
@@ -4128,7 +4229,7 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("COLLATE"))
             {
-                collation = ExpectIdentifier();
+                collation = ExpectIdentifierOrString();
                 collationConstraintName = pendingConstraintName;
                 pendingConstraintName = null;
                 continue;

@@ -238,6 +238,35 @@ internal sealed class PragmaCacheSizeModule : TableValuedFunctionModule
         => [[SqlValue.Integer(DefaultCacheSize), call.Arguments[0]]];
 }
 
+/// <summary>
+/// <c>pragma_journal_mode</c>. Reports the current journal mode for the given schema (main
+/// when the argument is omitted, matching PRAGMA journal_mode's own unqualified default) -
+/// evaluated through the calling connection so bound schema arguments, attached databases,
+/// and the connection's temporary schema use the same resolution as the statement form.
+/// </summary>
+internal sealed class PragmaJournalModeModule : TableValuedFunctionModule
+{
+    public override string Name => "pragma_journal_mode";
+
+    public override TableValuedFunctionSchema Schema { get; } = new(
+        ["journal_mode"],
+        ["schema"],
+        [ColumnAffinity.Text, ColumnAffinity.Blob]);
+
+    public override int? SchemaNameArgumentIndex => 0;
+
+    public override IReadOnlyList<SqlValue[]> Enumerate(TableValuedFunctionCall call)
+    {
+        var schema = call.HasArgument(0) && call.Arguments[0].Kind != SqlValueKind.Null
+            ? TableValuedFunctionRows.CoerceToText(call.Arguments[0])
+            : null;
+        var describe = call.Context.DescribeJournalMode
+            ?? throw new InvalidOperationException("A connection-scoped journal-mode resolver is required.");
+        var mode = describe(schema);
+        return [[SqlValue.Text(mode), call.Arguments[0]]];
+    }
+}
+
 internal sealed class PragmaFunctionListModule : TableValuedFunctionModule
 {
     public override string Name => "pragma_function_list";

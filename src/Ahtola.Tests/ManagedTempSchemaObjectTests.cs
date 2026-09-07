@@ -559,18 +559,25 @@ public sealed class ManagedTempSchemaObjectTests
     }
 
     [Test]
-    public void TempViewBodyOutsideTheTempSchemaIsRejectedUpFront()
+    public void TempViewCanReadMainWhileItsDefinitionRemainsConnectionLocal()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE data(id INTEGER PRIMARY KEY)");
+        Execute(connection, "INSERT INTO data VALUES (7)");
+        Execute(connection, "CREATE TEMP VIEW over_main AS SELECT id FROM data");
 
-        // The managed engine evaluates a view inside the database that owns it, so a temp view
-        // reaching main is refused instead of half-working.
-        Assert.Throws<EmbeddedSqlException>(
-            () => Execute(connection, "CREATE TEMP VIEW over_main AS SELECT id FROM data"))!
-            .Message.Should().Be("Managed temporary views can only reference objects in the temp schema.");
-        ReadRows(connection, "SELECT name FROM sqlite_temp_schema").Should().BeEmpty();
+        ReadRows(connection, "SELECT id FROM over_main")
+            .Select(row => row[0].AsInteger()).Should().Equal(7);
+        ReadRows(connection, "SELECT name FROM sqlite_temp_schema WHERE type='view'")
+            .Select(row => row[0].AsText()).Should().Equal("over_main");
+        ReadRows(connection, "SELECT name FROM sqlite_schema WHERE type='view'")
+            .Should().BeEmpty();
+
+        using var other = database.Connect();
+        ReadRows(other, "SELECT name FROM sqlite_temp_schema").Should().BeEmpty();
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(other, "SELECT id FROM over_main"))!
+            .Message.Should().Contain("no such table: over_main");
     }
 
     [Test]

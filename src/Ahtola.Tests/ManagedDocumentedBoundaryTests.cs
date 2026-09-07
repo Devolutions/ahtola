@@ -36,14 +36,15 @@ public sealed class ManagedDocumentedBoundaryTests
     }
 
     /// <summary>
-    /// P5-D: auto_vacuum / incremental_vacuum stay silent no-ops (Turso v0.7.2 also rejects
-    /// Incremental auto-vacuum). Must not throw and must not claim ptrmap reclaim.
+    /// P5-D: auto_vacuum stays a silent no-op only for NONE (0), which merely restates the
+    /// mode the database is already in — matching Turso's translate/pragma.rs (v0.8.0-pre.7):
+    /// requesting NONE never needs the (unimplemented) --experimental-autovacuum flag.
+    /// incremental_vacuum stays a silent no-op unconditionally: it never enables autovacuum
+    /// itself, it only reclaims free pages under a mode that already is one.
     /// </summary>
     [Test]
     [TestCase("PRAGMA auto_vacuum")]
     [TestCase("PRAGMA auto_vacuum=NONE")]
-    [TestCase("PRAGMA auto_vacuum=FULL")]
-    [TestCase("PRAGMA auto_vacuum=INCREMENTAL")]
     [TestCase("PRAGMA incremental_vacuum")]
     [TestCase("PRAGMA incremental_vacuum(10)")]
     public void AutoVacuumFamilyIsAcceptedNoOp(string sql)
@@ -52,6 +53,25 @@ public sealed class ManagedDocumentedBoundaryTests
         Execute(connection, "INSERT INTO t VALUES (1, 'a');");
         Execute(connection, sql);
         ExecuteScalarLong(connection, "SELECT COUNT(*) FROM t;").Should().Be(1L);
+    }
+
+    /// <summary>
+    /// P5-D: requesting FULL/INCREMENTAL autovacuum fails closed with Turso's own diagnostic
+    /// (translate/pragma.rs) since Ahtola has no <c>--experimental-autovacuum</c> flag/engine
+    /// support to turn it on — matches turso-sqltests/invalid-argument-error-message.sqltest,
+    /// which pins this exact message with no CLI-style prefix.
+    /// </summary>
+    [Test]
+    [TestCase("PRAGMA auto_vacuum=FULL")]
+    [TestCase("PRAGMA auto_vacuum=INCREMENTAL")]
+    [TestCase("PRAGMA auto_vacuum=1")]
+    [TestCase("PRAGMA auto_vacuum=2")]
+    public void AutoVacuumNonNoneModeFailsClosedWithoutExperimentalFlag(string sql)
+    {
+        using var connection = Open();
+        var error = Assert.Throws<SqliteException>(() => Execute(connection, sql));
+        error!.Message.Should().Contain(
+            "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.");
     }
 
     /// <summary>

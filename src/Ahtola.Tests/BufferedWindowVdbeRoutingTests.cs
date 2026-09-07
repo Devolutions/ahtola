@@ -587,6 +587,198 @@ public sealed class BufferedWindowVdbeRoutingTests
         AssertMatchesSqlite(setup, query);
     }
 
+    // ---- WIN workstream: numeric lifecycle, moving MIN/MAX, moving GROUP_CONCAT -------------
+
+    [Test]
+    public void MovingSumStaysApproximateAfterTheFloatThatCausedItLeavesTheFrame()
+    {
+        // Once a float enters the sliding accumulator it stays approximate even after it is
+        // inverted back out and only integers remain, mirroring sumStep/sumInverse's sticky
+        // approx flag (never cleared by xInverse, only by a later forward float step).
+        string[] setup =
+        [
+            "CREATE TABLE tm(id INTEGER PRIMARY KEY, v);",
+            "INSERT INTO tm VALUES (1, 1.25), (2, 100), (3, 200), (4, 300);",
+        ];
+        const string query =
+            "SELECT id, typeof(sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) FROM tm ORDER BY id;";
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void MovingMinMaxPrefersTheNewestArgumentCollationTieAsRowsSlideThroughTheFrame()
+    {
+        // The moving MIN/MAX index is keyed on (collated value, sequence): among argument-
+        // collation ties the most recently added row represents the extremum, not the oldest.
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, txt TEXT COLLATE NOCASE);",
+            "INSERT INTO t VALUES (1,'b'),(2,'A'),(3,'a'),(4,'C'),(5,'c'),(6,'B');",
+        ];
+        const string query =
+            """
+            SELECT id,
+                   min(txt COLLATE NOCASE) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
+                   max(txt COLLATE NOCASE) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+            FROM t ORDER BY id;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void MovingSumPermanentlyLocksToNullAfterAnInfiniteCancellation()
+    {
+        // Once Inf and -Inf cancel to NaN in the running total (removing -Inf while it is still
+        // the sole accumulated value), sum() is permanently NULL for the rest of the partition,
+        // even once later rows swap the frame over to entirely finite or entirely +Inf values —
+        // mirrors sumStep's own "acc is Null and already approximate" early return, which never
+        // re-seeds from a later value once approximate.
+        string[] setup =
+        [
+            "CREATE TABLE ti(k REAL);",
+            "INSERT INTO ti VALUES (-9e999),(-1.0),(0.0),(2.5),(9e999),(9e999);",
+        ];
+        const string query =
+            """
+            SELECT k, quote(count(*) OVER w), quote(sum(k) OVER w)
+            FROM ti
+            WINDOW w AS (ORDER BY k ASC RANGE BETWEEN 1e308 PRECEDING AND 1e308 FOLLOWING)
+            ORDER BY k ASC;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void MovingSumOverIntegerExtremesRaisesTheSameTransientOverflowAsSqliteUnderDescendingBothPrecedingRange()
+    {
+        // A RANGE frame with BOTH bounds PRECEDING (unlike an end bound of CURRENT ROW) steps
+        // its end cursor fully forward before its start cursor steps fully forward, so a row can
+        // be transiently added by the end-cursor catch-up and then immediately inverted back out
+        // by the start-cursor catch-up within the very same row transition — even though that
+        // row never appears in either the old or the new frame's own final membership. Here the
+        // transient add of k=-5 followed by k=i64::MIN, then the transient removal of k=5,
+        // underflows i64 and sets the sticky overflow flag permanently (mirrors sumStep/
+        // sumInverse's ovrfl bookkeeping, window.rs's Pattern-B end-then-start cursor order).
+        string[] setup =
+        [
+            "CREATE TABLE t(k INT);",
+            "INSERT INTO t VALUES (-9223372036854775808),(-5),(0),(5),(9223372036854775807);",
+        ];
+        const string query =
+            "SELECT k, sum(k) OVER (ORDER BY k DESC RANGE BETWEEN 100 PRECEDING AND 2 PRECEDING) FROM t;";
+
+        using var connection = OpenManaged(setup);
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query))!
+            .Message.Should().Contain("integer overflow");
+        var sqlite = () => RunSqlite(setup, query);
+        sqlite.Should().Throw<MsData.SqliteException>();
+    }
+
+    [Test]
+    public void MovingMinMaxFrameMembershipAtIntegerExtremesStaysCorrectDespiteTheTransientSumOverflow()
+    {
+        // The same both-PRECEDING RANGE frame shape whose transient cursor catch-up overflows
+        // sum() must still report correct frame *membership* for order-insensitive aggregates
+        // that don't accumulate exact arithmetic the same way — count/group_concat/min are
+        // unaffected by the transient add-then-remove of a row that ultimately nets out.
+        string[] setup =
+        [
+            "CREATE TABLE t(k INT);",
+            "INSERT INTO t VALUES (-9223372036854775808),(-5),(0),(5),(9223372036854775807);",
+        ];
+        const string query =
+            """
+            SELECT k, count(*) OVER w, group_concat(k,',') OVER w, min(k) OVER w
+            FROM t WINDOW w AS (ORDER BY k DESC RANGE BETWEEN 100 PRECEDING AND 2 PRECEDING)
+            ORDER BY k DESC;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void MovingGroupConcatEmptyPrefixNeverLeavesAStaleLeadingSeparator()
+    {
+        // Removing a head value whose own rendered text is empty must also strip the separator
+        // that preceded the *next* remaining value, so it never renders with a stale leading
+        // separator once it becomes the new head (mirrors groupConcatInverse's separator-queue
+        // bookkeeping in execute.rs).
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, sep TEXT);",
+            "INSERT INTO t VALUES (1,'','|'),(2,'','|'),(3,'x','|'),(4,'y','--');",
+        ];
+        const string query =
+            """
+            SELECT id,
+                   quote(group_concat(v, sep) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)),
+                   quote(string_agg(v, sep) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW))
+            FROM t ORDER BY id;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void MovingGroupConcatBackfillsUniformSeparatorHistoryOnFirstDivergence()
+    {
+        // The first time a variable separator's length diverges from first_separator_len, every
+        // separator used so far (there are count-1 of them, all implicitly first_separator_len)
+        // must be backfilled into the queue before the divergent length is enqueued. Otherwise a
+        // later xInverse dequeues the wrong (divergent) length for a gap that was actually
+        // uniform, corrupting both the retained text and the queue's own alignment for every
+        // subsequent removal. Mirrors Turso's prior_separator_count backfill
+        // (execute.rs::update_agg_payload).
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, sep TEXT);",
+            "INSERT INTO t VALUES (1,'A',','),(2,'B',','),(3,'C',','),(4,'D','||'),(5,'E',',');",
+        ];
+        const string query =
+            """
+            SELECT id,
+                   quote(group_concat(v, sep) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)),
+                   quote(string_agg(v, sep) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW))
+            FROM t ORDER BY id;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void GrowingMinMaxKeepsTheFirstArgumentCollationTieButMovingMinPrefersTheNewest()
+    {
+        // A growing (UNBOUNDED PRECEDING start, no eviction) frame must keep the ordinary,
+        // first-seen-wins tie behavior every non-window aggregate MIN/MAX uses; only a genuinely
+        // moving frame — where Inverse actually retires rows — uses the collated(value, sequence)
+        // newest-wins representative. Both share the exact same NOCASE data and partition so the
+        // only variable is the frame shape.
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, txt TEXT COLLATE NOCASE);",
+            "INSERT INTO t VALUES (1,'abc'),(2,'ABC'),(3,'aaa');",
+        ];
+        const string query =
+            """
+            SELECT id,
+                   min(txt) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                   min(txt) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+            FROM t ORDER BY id;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
     // ---- Helpers ---------------------------------------------------------------------------
 
     private static void AssertRoutesThroughWindowBuffer(IReadOnlyList<string> setup, string query)

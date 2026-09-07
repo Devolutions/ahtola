@@ -38,6 +38,14 @@ internal static class SqltestCorpus
     private static readonly HashSet<string> ManagedCapabilities =
         new(StringComparer.Ordinal) { "trigger", "strict" };
 
+    /// <summary>
+    /// The pinned <c>@backend rust</c> cases contain ordinary SQL, not native API calls.
+    /// Execute them and classify behavioral differences rather than hiding them as skips.
+    /// CLI and other backend contracts remain excluded.
+    /// </summary>
+    private static readonly HashSet<string> RunnableBackends =
+        new(StringComparer.Ordinal) { "rust" };
+
     private static readonly Lazy<IReadOnlyList<SqltestDiscoveredCase>> LazyCases = new(Discover);
 
     private static readonly Lazy<IReadOnlyDictionary<string, string>> LazyExpectedFailures =
@@ -117,7 +125,9 @@ internal static class SqltestCorpus
 
         foreach (var database in file.Databases)
         {
-            if (database.Kind == SqltestDatabaseKind.Path)
+            if (database.Kind == SqltestDatabaseKind.Path
+                && database.Path is { } path
+                && !SqltestPhysicalFixtures.IsKnown(path))
             {
                 return
                     $"path fixture '{database.Path}' has no equivalent managed generator; " +
@@ -155,7 +165,7 @@ internal static class SqltestCorpus
                 return (SqltestCaseStatus.SkippedByCorpus, $"@requires {capability}");
         }
 
-        if (test.Backend is { } backend)
+        if (test.Backend is { } backend && !RunnableBackends.Contains(backend))
             return (SqltestCaseStatus.SkippedByCorpus, $"@backend {backend}");
 
         return (SqltestCaseStatus.Runnable, null);

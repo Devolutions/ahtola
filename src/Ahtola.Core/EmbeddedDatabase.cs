@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
+using Ahtola.Core.Collation;
 using Ahtola.Core.Compilation;
 using Ahtola.Core.Execution;
 using Ahtola.Core.Mvcc;
@@ -92,16 +93,30 @@ internal readonly record struct FileCatalogVersion(
     int PageSize,
     SqliteTextEncoding TextEncoding)
 {
-    public static FileCatalogVersion FromHeader(SqliteDatabaseHeader header)
-        => new(
+    /// <summary>
+    /// Builds a <see cref="FileCatalogVersion"/> from a parsed header, substituting
+    /// <paramref name="trustedPageCount"/> (the pager's actual committed page count) for
+    /// <see cref="SqliteDatabaseHeader.DatabaseSizeInPages"/> whenever the header's own count is
+    /// untrusted: zero, or reported when <see cref="SqliteDatabaseHeader.VersionValidFor"/>
+    /// does not match <see cref="SqliteDatabaseHeader.ChangeCounter"/> (file format spec 1.3.7
+    /// "Database Size"). Returning the raw untrusted value here would leak a stale or absent
+    /// page count into every caller of <c>CommittedCatalogVersion</c> (PRAGMA page_count and
+    /// friends), even though the pager itself already computed the real count from the file.
+    /// </summary>
+    public static FileCatalogVersion FromHeader(SqliteDatabaseHeader header, uint trustedPageCount)
+    {
+        var headerSizeIsAuthoritative = header.DatabaseSizeInPages != 0
+            && header.VersionValidFor == header.ChangeCounter;
+        return new FileCatalogVersion(
             header.ChangeCounter,
             header.SchemaCookie,
-            header.DatabaseSizeInPages,
+            headerSizeIsAuthoritative ? header.DatabaseSizeInPages : trustedPageCount,
             header.FreelistPageCount,
             header.UserVersion,
             header.ApplicationId,
             header.PageSize,
             header.TextEncoding);
+    }
 }
 
 internal sealed class EmbeddedConflictRollbackException : EmbeddedSqlException
@@ -255,6 +270,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
     internal const string SqliteStat4TableName = "sqlite_stat4";
     private const string TursoSequenceBackingTablePrefix = "__turso_internal_seq_";
     private const string TursoAutoIncrementSequencePrefix = "__turso_internal_autoincrement_";
+    // Mirrors Turso's RESERVED_TABLE_PREFIXES (core/schema.rs): the whole "__turso_internal_"
+    // namespace is reserved for internal objects (sequence backing tables, the autoincrement
+    // namespace, DBSP materialized-view state, ...), not just the two specific sub-prefixes
+    // above. ALTER TABLE RENAME TO checks this directly (core/translate/alter.rs::validate);
+    // object creation goes through IsReservedObjectName instead.
+    private const string TursoInternalReservedPrefix = "__turso_internal_";
     private static readonly ConditionalWeakTable<IFileSystem, FileCatalogWriteLockScope> FileCatalogWriteLocks = new();
     private static readonly ConditionalWeakTable<IFileSystem, FileCatalogWriterRegistry> FileCatalogWriterRegistries = new();
     private readonly object _gate = new();
@@ -852,7 +873,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         EmbeddedFileReadSnapshot? TransactionPinnedSnapshot = null,
         Action<string, long>? TransactionBlobMutation = null,
         ManagedSchemaRowSet? StagedSchemaRows = null,
-        ManagedSequenceSession? SequenceSession = null)
+        ManagedSequenceSession? SequenceSession = null,
+        // Connection-scoped: several connections may share the same EmbeddedDatabase.
+        Func<string?, string>? DescribeJournalMode = null)
     {
         /// <summary>
         /// Per-statement cache of opened managed index-method scan state. Derived contexts created
@@ -2144,7 +2167,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
-        ManagedSequenceSession? sequenceSession = null)
+        ManagedSequenceSession? sequenceSession = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         var result = ExecuteCore(
             statement,
@@ -2165,7 +2189,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             vdbeExecutionOptions,
             synchronousMode,
             virtualTableTransaction,
-            sequenceSession);
+            sequenceSession,
+            describeJournalMode);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -2208,7 +2233,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
-        ManagedSequenceSession? sequenceSession = null)
+        ManagedSequenceSession? sequenceSession = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         synchronousMode.Validate(nameof(synchronousMode));
         ThrowIfRecursiveTriggerCallbackReentry();
@@ -2237,7 +2263,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 vdbeExecutionOptions,
                 synchronousMode,
                 virtualTableTransaction,
-                sequenceSession));
+                sequenceSession,
+                describeJournalMode));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -2298,7 +2325,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                     changeDataCapture: changeDataCapture,
                                     vdbeExecutionOptions: vdbeExecutionOptions,
                                     virtualTableTransaction: statementVirtualTableTransaction,
-                                    sequenceSession: sequenceSession);
+                                    sequenceSession: sequenceSession,
+                                    describeJournalMode: describeJournalMode);
                             }
                             catch (EmbeddedConflictFailException)
                             {
@@ -2399,7 +2427,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 externalTables,
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
-                                sequenceSession: sequenceSession);
+                                sequenceSession: sequenceSession,
+                                describeJournalMode: describeJournalMode);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -2447,7 +2476,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             externalTables,
                             changeDataCapture: changeDataCapture,
                             vdbeExecutionOptions: vdbeExecutionOptions,
-                            sequenceSession: sequenceSession);
+                            sequenceSession: sequenceSession,
+                            describeJournalMode: describeJournalMode);
 
                     var working = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
                     try
@@ -2474,7 +2504,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
                                 virtualTableTransaction: virtualTableTransaction,
-                                sequenceSession: sequenceSession);
+                                sequenceSession: sequenceSession,
+                                describeJournalMode: describeJournalMode);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -2580,7 +2611,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 MvccTextEncoding: outer.MvccTextEncoding,
                 VirtualTables: catalog.VirtualTables,
                 VirtualTableTransaction: outer.VirtualTableTransaction,
-                ChangeDataCapture: outer.ChangeDataCapture);
+                ChangeDataCapture: outer.ChangeDataCapture,
+                DescribeJournalMode: outer.DescribeJournalMode);
             return statement switch
             {
                 InsertStatement insert => ExecuteDmlWithAutoIncrementState(
@@ -2607,6 +2639,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
             lock (_gate)
                 return new SchemaCatalog(_tables, _views, _triggers, _virtualTables);
         }
+    }
+
+    /// <summary>
+    /// Reverts an in-memory database's already-published catalog back to a snapshot captured
+    /// before the publish, when a LATER database in the same multi-database commit failed after
+    /// this one already succeeded. <see cref="PublishCatalog"/> is otherwise an irreversible
+    /// reference swap that <c>EmbeddedConnection.ResetTransactionState</c> cannot undo (that
+    /// method only discards the transaction's own staged clones, not an already-published live
+    /// catalog). Only valid for a <c>:memory:</c> database: a file-backed commit is durable the
+    /// instant <c>PersistFileCatalog</c> returns and must never be reverted here - see the
+    /// physical-database-first ordering in <c>EmbeddedConnection.CommitTransaction</c>, which
+    /// exists precisely so a physical commit is never the one this revert needs to undo.
+    /// </summary>
+    internal void RevertPublishedMemoryCatalog(SchemaCatalog previous)
+    {
+        if (IsFileBacked)
+        {
+            throw new InvalidOperationException(
+                "A durable physical commit cannot be reverted after PersistFileCatalog returns.");
+        }
+
+        lock (_gate)
+            PublishCatalog(previous);
     }
 
     internal SchemaCatalog SnapshotCatalog()
@@ -3025,6 +3080,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 var snapshot = CloneTransactionSnapshotLocked();
                 try
                 {
+                    // Still holding _fileCatalogWriteLock, so this is exactly the same
+                    // generation RefreshTransactionSnapshotCatalogUnderWriteLockLocked just
+                    // settled and CloneTransactionSnapshotLocked just cloned — no peer commit
+                    // can have happened in between. A classic transaction's isolation promise
+                    // (a consistent view for its whole lifetime, matching the pinned pager
+                    // snapshot opened right below) can only hold if every table this snapshot's
+                    // catalog might later touch reads that same, already-fixed generation. A
+                    // page-backed table still lazily pending at this point (see
+                    // EmbeddedTable.HasPendingRowLoad) would otherwise materialize on first
+                    // touch — mid-transaction — from whatever the store's live pager then holds,
+                    // which can be a peer's commit made *after* this transaction began but
+                    // before this specific table was ever touched: the same class of gap already
+                    // closed for MVCC in PublishCatalog (see EstablishHeapBaselineForMvccLocked).
+                    foreach (var table in snapshot.Catalog.Tables.Values)
+                        _ = table.Rows;
                     BeforePinningTransactionSnapshotForTesting?.Invoke();
                     EmbeddedFileReadSnapshot? pinnedSnapshot = null;
                     if (_fileStore.TryOpenReadSnapshot(out var opened))
@@ -3106,6 +3176,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     internal bool IsTransactionSnapshotGateHeldForTesting => Monitor.IsEntered(_gate);
+
+    /// <summary>
+    /// The file-backed store, or null for an in-memory-only database. Used both by production
+    /// code that needs to open a durable page-native accessor (see
+    /// <see cref="GetNamedTableRows"/>'s concurrent-MVCC base-row scan) and directly by
+    /// storage-layer tests.
+    /// </summary>
+    internal EmbeddedFileStore? FileStore => _fileStore;
 
     /// <summary>
     /// Fires inside <see cref="CreateTransactionSnapshotWithPin"/> and
@@ -3324,7 +3402,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CancellationToken cancellationToken,
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
-        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null)
+        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         lock (_gate)
         {
@@ -3338,7 +3417,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 cancellationToken,
                 vdbeExecutionOptions,
                 executeTableList,
-                externalTables);
+                externalTables,
+                describeJournalMode);
         }
     }
 
@@ -3352,7 +3432,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CancellationToken cancellationToken,
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
-        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null)
+        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         var tables = CreateExecutionTables(catalog.Tables, externalTables);
         var context = new QueryContext(
@@ -3367,7 +3448,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ExecuteTableList: executeTableList,
             VirtualTables: catalog.VirtualTables,
             VdbeExecutionOptions: vdbeExecutionOptions,
-            Database: this);
+            Database: this,
+            DescribeJournalMode: describeJournalMode);
         var result = MaterializeQueryResult(ExecuteQuery(statement, parameters, context, outerRow: null));
         var affinities = DescribeQueryAffinities(
             statement,
@@ -3999,6 +4081,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             if (_mvStore is not null || _fileSystem is null || string.IsNullOrEmpty(_databasePath))
                 return;
+            EstablishHeapBaselineForMvccLocked();
             _mvStore = CreateOrGetSharedMvStore(
                 _fileSystem,
                 _databasePath,
@@ -4023,6 +4106,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (EmbeddedMvStoreRegistry.TryGet(_fileSystem, _databasePath, out var shared)
                 && shared is not null)
             {
+                EstablishHeapBaselineForMvccLocked();
                 _mvStore = shared;
                 return;
             }
@@ -4034,11 +4118,38 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (_fileStore.JournalMode != SqliteJournalMode.Mvcc)
                 return;
 
+            EstablishHeapBaselineForMvccLocked();
             _mvStore = CreateOrGetSharedMvStore(
                 _fileSystem,
                 _databasePath,
                 _fileCatalogVersion.SchemaCookie);
         }
+    }
+
+    /// <summary>
+    /// Forces every still-lazy table in the live catalog to load its committed rows before this
+    /// connection's MVCC store attaches (see <c>EnableMvccModeLocked</c>,
+    /// <c>AttachMvStoreFromDurableLog</c>, <c>EnsureMvccAttachedIfDurable</c>).
+    /// </summary>
+    /// <remarks>
+    /// MVCC's per-transaction view (<c>MergeConcurrentCatalogFromStoreLocked</c>) reconstructs
+    /// what a transaction should see by merging the heap catalog (<c>EmbeddedTable.Rows</c>)
+    /// with the store's version-chain overlay, on the assumption that the heap already reflects
+    /// a single, stable, already-known baseline that the overlay's rowIds are tracked relative
+    /// to. A page-backed table that is still lazily pending would otherwise materialize on first
+    /// touch from whatever happens to be currently committed at that later moment — which, for a
+    /// table an active BEGIN CONCURRENT reader has not yet touched, can be *after* a peer's
+    /// concurrent commit — silently promoting the reader's view past its own pinned snapshot.
+    /// Establishing the baseline once here, before any concurrent transaction can begin relying
+    /// on it, is far cheaper than making every page-backed table ineligible for lazy
+    /// materialization, and MVCC-mode connections are the only ones that need it: an ordinary
+    /// (non-MVCC) reader's isolation is a separate, already-tracked gap — see the "NOTE ON A
+    /// REJECTED DESIGN" comment in EmbeddedFileStore.
+    /// </remarks>
+    private void EstablishHeapBaselineForMvccLocked()
+    {
+        foreach (var table in _tables.Values)
+            _ = table.Rows;
     }
 
     private static MvStore CreateOrGetSharedMvStore(
@@ -4282,13 +4393,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         if (_fileStore is not null && _fileSystem is not null && !string.IsNullOrEmpty(_databasePath))
+        {
+            EstablishHeapBaselineForMvccLocked();
             _mvStore = CreateOrGetSharedMvStore(
                 _fileSystem,
                 _databasePath,
                 _fileCatalogVersion.SchemaCookie,
                 synchronousMode);
+        }
         else
+        {
             _mvStore = new MvStore();
+        }
 
         _version++;
         return SqliteJournalMode.Mvcc;
@@ -4373,6 +4489,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
                 EnsureFileCatalogVersionCurrent(busyTimeout);
                 using var writeRegistration = RegisterCatalogWrite(_databasePath);
+                // A full-catalog rewrite (Compact()/page-size migration) reassigns root pages,
+                // and AdoptCommittedTables below proves _tables unchanged by comparing row
+                // content against the freshly-reloaded, post-rewrite catalog. Force every
+                // still-lazy table in _tables to load its rows now, while its original root
+                // pages are still valid, so that comparison never has to resolve a pending row
+                // load against root pages the rewrite has already reassigned or reclaimed.
+                foreach (var table in _tables.Values)
+                    _ = table.Rows;
                 if (pageSize == _fileCatalogVersion.PageSize)
                     _fileStore.Compact();
                 else
@@ -4992,6 +5116,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private void PublishCatalog(SchemaCatalog catalog, FileCatalogVersion? fileCatalogVersion = null)
     {
+        // MVCC's per-transaction view (MergeConcurrentCatalogFromStoreLocked) reconstructs what
+        // a transaction should see by merging the heap catalog (EmbeddedTable.Rows) with the
+        // store's version-chain overlay, on the assumption that the heap already reflects a
+        // single, stable, already-known baseline the overlay's rowIds are tracked relative to.
+        // Every catalog this connection ever publishes flows through here — including a fresh
+        // reload (see TryReloadFileCatalogIfChanged), whose tables come straight out of
+        // EmbeddedFileStore.Load() and can be lazily pending again (see
+        // EmbeddedTable.HasPendingRowLoad) even though an earlier publish already hydrated the
+        // catalog being replaced. A page-backed table that is still lazily pending when this
+        // connection has MVCC active would otherwise materialize on first touch from whatever
+        // happens to be currently committed at that later moment — which, for a table an active
+        // BEGIN CONCURRENT reader has not yet touched, can be after a peer's concurrent commit —
+        // silently promoting the reader's view past its own pinned snapshot. Establishing the
+        // baseline here, on every publish, for as long as this connection has MVCC active, is
+        // the single chokepoint that catches every one of those reload paths; an ordinary
+        // (non-MVCC) reader's isolation remains a separate, already-tracked gap — see the "NOTE
+        // ON A REJECTED DESIGN" comment in EmbeddedFileStore.
+        if (_mvStore is not null)
+        {
+            foreach (var table in catalog.Tables.Values)
+                _ = table.Rows;
+        }
+
         var previousVirtualTables = _virtualTables;
         _tables = catalog.Tables;
         _views = catalog.Views;
@@ -5077,8 +5224,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
             readOnly: true,
             foreignReadOnly: foreignReadOnly);
         var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
-        if (header.VersionValidFor != header.ChangeCounter
-            || header.DatabaseSizeInPages != pager.CommittedPageCount)
+        // The in-header database size is only authoritative when it is non-zero AND the change
+        // counter exactly matches the version-valid-for number (file format spec 1.3.7
+        // "Database Size"); a zero size is untrusted even when the counters agree (the spec's
+        // "non-zero" clause), and any other mismatch means the header's declared size is merely
+        // untrusted, not evidence of corruption (see the matching comment on
+        // SqlitePager.InitializeCleanWalView). Either way the untrusted size must never be
+        // reported as this file's page count -- pager.CommittedPageCount (computed from the
+        // actual file) is the only trustworthy value to hand back in that case.
+        var headerSizeIsAuthoritative = header.DatabaseSizeInPages != 0
+            && header.VersionValidFor == header.ChangeCounter;
+        if (headerSizeIsAuthoritative && header.DatabaseSizeInPages != pager.CommittedPageCount)
         {
             throw new InvalidDataException(
                 "The managed file catalog does not have an authoritative committed SQLite header.");
@@ -5087,7 +5243,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return new FileCatalogVersion(
             header.ChangeCounter,
             header.SchemaCookie,
-            header.DatabaseSizeInPages,
+            headerSizeIsAuthoritative ? header.DatabaseSizeInPages : pager.CommittedPageCount,
             header.FreelistPageCount,
             header.UserVersion,
             header.ApplicationId,
@@ -5344,7 +5500,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         TransactionMutationOverlay? transactionOverlay = null,
         EmbeddedFileReadSnapshot? transactionPinnedSnapshot = null,
         Action<string, long>? transactionBlobMutation = null,
-        ManagedSequenceSession? sequenceSession = null)
+        ManagedSequenceSession? sequenceSession = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -5377,7 +5534,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 transactionOverlay,
                 transactionPinnedSnapshot,
                 transactionBlobMutation,
-                sequenceSession));
+                sequenceSession,
+                describeJournalMode));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -5425,6 +5583,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ? new CteMutationState()
                 : null,
             Database: this,
+            DescribeJournalMode: describeJournalMode,
             TransactionOverlay: transactionOverlay,
             TransactionPinnedSnapshot: transactionPinnedSnapshot,
             TransactionBlobMutation: transactionBlobMutation,
@@ -7124,7 +7283,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return name.Equals("BINARY", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("RTRIM", StringComparison.OrdinalIgnoreCase)
-                || _collations.ContainsKey(name);
+                || _collations.ContainsKey(name)
+                || LocaleCollationRegistry.TryResolve(name, out _);
         }
     }
 
@@ -7317,13 +7477,41 @@ public sealed partial class EmbeddedDatabase : IDisposable
         for (var position = 0; position < primaryKeySchema.Terms.Count; position++)
         {
             var term = primaryKeySchema.Terms[position];
-            var comparison = Compare(left[position], right[position], term.Collation.Name);
+            var leftValue = left[position];
+            var rightValue = right[position];
+            if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+            {
+                if (leftValue.Kind == rightValue.Kind)
+                    continue;
+
+                var nullsFirst = ResolvesToNullsFirst(term.NullsOrder, term.SortOrder);
+                return leftValue.Kind == SqlValueKind.Null
+                    ? (nullsFirst ? -1 : 1)
+                    : (nullsFirst ? 1 : -1);
+            }
+
+            var comparison = Compare(leftValue, rightValue, term.Collation.Name);
             if (comparison != 0)
                 return term.SortOrder == SqliteKeySortOrder.Descending ? -comparison : comparison;
         }
 
         return 0;
     }
+
+    /// <summary>
+    /// Whether NULLs sort before non-NULL values for a primary-key term, resolving an explicit
+    /// <see cref="SqlitePrimaryKeyTerm.NullsOrder"/> override or falling back to SQLite's implicit
+    /// ASC/DESC-derived default when unset. Mirrors
+    /// <see cref="SqliteIndexComparisonTerm.NullsSortFirst"/> for the primary-key-schema shape.
+    /// </summary>
+    private static bool ResolvesToNullsFirst(SqliteIndexNullsOrder? nullsOrder, SqliteKeySortOrder sortOrder)
+        => nullsOrder switch
+        {
+            SqliteIndexNullsOrder.First => true,
+            SqliteIndexNullsOrder.Last => false,
+            null => sortOrder == SqliteKeySortOrder.Ascending,
+            _ => throw new InvalidOperationException($"Unknown NULLS order {nullsOrder}."),
+        };
 
     private bool PrimaryKeyPrefixesEqual(
         SqlitePrimaryKeySchema primaryKeySchema,
@@ -13527,7 +13715,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             foreach (var row in rows)
             {
-                foreach (var (columnIndex, _) in primaryKey)
+                foreach (var (columnIndex, _, _) in primaryKey)
                 {
                     if (row[columnIndex].Kind == SqlValueKind.Null)
                         throw new EmbeddedSqlException(
@@ -13671,7 +13859,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             persistedComparer = new SqliteIndexRecordComparer(
                 SqliteTextEncoding.Utf8,
                 primaryKeySchema.Terms.Select(term =>
-                    new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+                    new SqliteIndexComparisonTerm(term.SortOrder, term.Collation) { NullsOrder = term.NullsOrder })
+                    .ToArray());
         }
         var keys = persistedComparer is null
             ? null
@@ -13684,13 +13873,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             for (var position = 0; position < primaryKey.Count; position++)
             {
-                var (columnIndex, descending) = primaryKey[position];
+                var (columnIndex, descending, nullPlacement) = primaryKey[position];
                 var collation = table.TableLevelPrimaryKey?[position].Collation
                     ?? table.ColumnDefinitions[columnIndex].Collation;
-                var comparison = Compare(
-                    table.Rows[left][columnIndex],
-                    table.Rows[right][columnIndex],
-                    collation);
+                var leftValue = table.Rows[left][columnIndex];
+                var rightValue = table.Rows[right][columnIndex];
+                if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+                {
+                    if (leftValue.Kind == rightValue.Kind)
+                        continue;
+
+                    var nullsFirst = nullPlacement.ResolvesToNullsFirst(descending);
+                    return leftValue.Kind == SqlValueKind.Null
+                        ? (nullsFirst ? -1 : 1)
+                        : (nullsFirst ? 1 : -1);
+                }
+
+                var comparison = Compare(leftValue, rightValue, collation);
                 if (comparison != 0)
                     return descending ? -comparison : comparison;
             }
@@ -13994,8 +14193,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferRowidTracking = false)
     {
         var values = new SqlValue[valueExpressions.Length];
+        bool[]? defaultedPositions = null;
         for (var index = 0; index < valueExpressions.Length; index++)
-            values[index] = Evaluate(valueExpressions[index], parameters, null, context);
+        {
+            if (valueExpressions[index] is DefaultValueExpression)
+            {
+                // A bare DEFAULT in a VALUES row means "use this column's declared default",
+                // not a value to evaluate. Leave a placeholder here; BuildInsertRow(values, ...)
+                // excludes this position's target column from assignedTargetIndices so
+                // CreateRowWithDefaults fills it from the schema DEFAULT clause (or NULL).
+                defaultedPositions ??= new bool[valueExpressions.Length];
+                defaultedPositions[index] = true;
+                values[index] = SqlValue.Null;
+            }
+            else
+            {
+                values[index] = Evaluate(valueExpressions[index], parameters, null, context);
+            }
+        }
 
         return BuildInsertRow(
             statement,
@@ -14007,7 +14222,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             allowExistingRowid,
             validateCheckConstraints,
             resolveNotNullReplace,
-            deferRowidTracking);
+            deferRowidTracking,
+            defaultedPositions);
     }
 
     private (SqlValue[] Row, long RowId) BuildInsertRow(
@@ -14020,7 +14236,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool allowExistingRowid = false,
         bool validateCheckConstraints = true,
         bool resolveNotNullReplace = true,
-        bool deferRowidTracking = false)
+        bool deferRowidTracking = false,
+        bool[]? defaultedPositions = null)
     {
         if (values.Count != plan.TargetIndices.Length)
             throw new EmbeddedSqlException(
@@ -14033,6 +14250,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 assignedTargetIndices.Add(targetIndex);
         }
 
+        if (defaultedPositions is not null)
+        {
+            // A position marked DEFAULT is not actually being assigned a value: exclude its
+            // target column from assignedTargetIndices so CreateRowWithDefaults fills it from
+            // the schema DEFAULT clause (or NULL) below instead of leaving it a placeholder.
+            for (var index = 0; index < defaultedPositions.Length; index++)
+            {
+                if (defaultedPositions[index] && plan.TargetIndices[index] >= 0)
+                    assignedTargetIndices.Remove(plan.TargetIndices[index]);
+            }
+        }
+
         var row = table.CreateRowWithDefaults(
             expression => Evaluate(expression, EmptyParameters, row: null, context),
             assignedTargetIndices);
@@ -14040,6 +14269,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue explicitRowidValue = SqlValue.Null;
         for (var index = 0; index < values.Count; index++)
         {
+            if (defaultedPositions is not null && defaultedPositions[index])
+                continue; // CreateRowWithDefaults already filled this column's default above.
+
             var value = values[index];
             if (plan.TargetIndices[index] < 0)
                 explicitRowidValue = value; // rowid pseudo-column: last write wins.
@@ -18157,7 +18389,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 context.VdbeExecutionOptions);
         }
 
-        return ExecuteSelect(select, parameters, context, outerRow);
+        return ExecuteSelect(select, parameters, context, outerRow, bindingsAlreadyResolved: true);
     }
 
     // Ordinary callback-capable scans stay on the evaluator's deferred projection path. Direct managed
@@ -18173,7 +18405,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 && TryGetVirtualTable(context, named, out _);
         return context.ConcurrentMvStore is null
             && (isVirtualTableScan || !context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
-            && (isVirtualTableScan || !CanStreamProjectionRows(select, context, outerRow));
+            && (isVirtualTableScan || !CanStreamProjectionRows(select, context, outerRow, IsAggregateSelect(select)));
     }
 
     // True when any node of the FROM tree is one of the internal semi/anti joins introduced by
@@ -22174,7 +22406,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 new SqliteIndexRecordComparer(
                     context.MvccTextEncoding,
                     primaryKey.Terms.Select(term =>
-                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray()));
+                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation) { NullsOrder = term.NullsOrder })
+                        .ToArray()));
         }
 
         var mergeComparer = index is not null
@@ -23146,11 +23379,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// <summary>
     /// True when <paramref name="collation"/> can be handed to <see cref="Compare"/> without it
     /// throwing "no such collation sequence": every built-in name always resolves (falling back
-    /// to its built-in behavior if not overridden), and a custom name resolves once it has a
-    /// registered <see cref="RegisterCollation"/> callback.
+    /// to its built-in behavior if not overridden), a custom name resolves once it has a
+    /// registered <see cref="RegisterCollation"/> callback, and a BCP-47 locale collation tag
+    /// (e.g. <c>es-u-co-trad</c>) resolves via <see cref="LocaleCollationRegistry"/>.
     /// </summary>
     private bool IsCollationResolvable(string? collation)
-        => IsBuiltInCollation(collation) || _collations.ContainsKey(collation!);
+        => IsBuiltInCollation(collation)
+            || _collations.ContainsKey(collation!)
+            || LocaleCollationRegistry.TryResolve(collation, out _);
 
     private static bool CollationsEquivalent(string? left, string? right) =>
         string.Equals(
@@ -24615,7 +24851,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var names = argumentNames.ToArray();
-        var aggregate = BuildAccumulatorAggregate(function, names, parameters, context, outerRow);
+        var aggregate = BuildAccumulatorAggregate(
+            function,
+            names,
+            parameters,
+            context,
+            outerRow,
+            growing: frame.Start == WindowBound.UnboundedPreceding);
         if (function.Filter is not null && !ranking)
             aggregate = ApplyWindowFilter(aggregate, function.Filter, names, parameters, context, outerRow);
         if (frame.RequiresInverse && aggregate.Inverse is null)
@@ -25243,7 +25485,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         string[] argumentNames,
         SqlValue[] parameters,
         QueryContext context,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        bool growing)
     {
         SqlValue ValueOf(Expression expression, SqlValue[] arguments) =>
             Evaluate(
@@ -25463,10 +25706,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (function.Name is "MIN" or "MAX" && function.Arguments.Count == 1)
         {
             var maximum = function.Name == "MAX";
+            var minMaxCollation = GetEffectiveCollation(function.Arguments[0], context);
+            // A growing (UNBOUNDED PRECEDING start) frame never evicts, so it must keep the
+            // ordinary, first-seen-wins tie behavior every non-window aggregate MIN/MAX uses.
+            // Only a genuinely moving frame — where Inverse actually retires rows — uses
+            // upstream's collated(value, sequence) newest-wins representative.
             return new VdbeAggregate
             {
                 Name = function.Name.ToLowerInvariant(),
-                CreateContext = () => new ExtremumAggregateAccumulator(maximum, Compare),
+                CreateContext = () => new ExtremumAggregateAccumulator(
+                    maximum,
+                    Compare,
+                    minMaxCollation,
+                    preferNewestOnTie: !growing),
                 Accumulate = (contextObject, arguments) =>
                 {
                     ((ExtremumAggregateAccumulator)contextObject!).Add(ValueOf(function.Arguments[0], arguments));
@@ -25478,6 +25730,33 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     return contextObject;
                 },
                 Finalize = static contextObject => ((ExtremumAggregateAccumulator)contextObject!).Finalize(),
+            };
+        }
+
+        if (function.Name is "GROUP_CONCAT" or "STRING_AGG"
+            && function.Arguments.Count is 1 or 2
+            && !function.Distinct
+            && function.AggregateOrderBy is not { Count: > 0 })
+        {
+            return new VdbeAggregate
+            {
+                Name = function.Name.ToLowerInvariant(),
+                CreateContext = static () => new GroupConcatAggregateAccumulator(),
+                Accumulate = (contextObject, arguments) =>
+                {
+                    var value = ValueOf(function.Arguments[0], arguments);
+                    var separator = function.Arguments.Count == 2
+                        ? ValueOf(function.Arguments[1], arguments)
+                        : SqlValue.Text(",");
+                    ((GroupConcatAggregateAccumulator)contextObject!).Add(value, separator);
+                    return contextObject;
+                },
+                Inverse = (contextObject, arguments) =>
+                {
+                    ((GroupConcatAggregateAccumulator)contextObject!).Remove(ValueOf(function.Arguments[0], arguments));
+                    return contextObject;
+                },
+                Finalize = static contextObject => ((GroupConcatAggregateAccumulator)contextObject!).Finalize(),
             };
         }
 
@@ -25508,7 +25787,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 foreach (var tuple in tuples)
                     rows.Add(new SourceRow(argumentNames, tuple, Parent: outerRow));
 
-                return EvaluateAggregateFunction(function, rows, parameters, context);
+                return EvaluateAggregateFunction(function, rows, parameters, context, outerRow);
             },
         };
     }
@@ -27316,6 +27595,11 @@ out bool hasReturning)
             throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
         if (IsSqliteSequenceTable(statement.NewName))
             throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
+        // The whole __turso_internal_ namespace is reserved (sequence backing tables, the
+        // autoincrement namespace, DBSP materialized-view state, ...), not just the specific
+        // sub-prefixes IsSqliteSequenceTable/IsAutoIncrementSequenceBackingTable already reject.
+        if (statement.NewName.StartsWith(TursoInternalReservedPrefix, StringComparison.OrdinalIgnoreCase))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {statement.NewName}");
         if (tables.ContainsKey(statement.NewName) || virtualTables?.ContainsKey(statement.NewName) == true)
             throw new EmbeddedSqlException($"table {statement.NewName} already exists");
         if (views?.ContainsKey(statement.NewName) == true)
@@ -27705,52 +27989,133 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context)
     {
-        var result = ExecuteExplainQueryPlanText(statement, parameters, context);
+        var result = ExecuteExplainQueryPlanText(statement, parameters, context, out var ops);
         if (statement.Format != ExplainQueryPlanFormat.Json)
             return result;
 
         // EXPLAIN QUERY PLAN FORMAT=JSON emits one plan_json TEXT row carrying the
-        // machine-readable envelope documented in turso-src/docs/eqp-json.md. The
-        // managed engine's plan rows become node entries; the structured `op` objects
-        // of the upstream format are not yet modeled, so each node carries the plan
-        // detail text with the node id/parent linkage from the text rows.
+        // machine-readable envelope documented in turso-src/docs/eqp-json.md. Every node in
+        // that contract carries a structured `op` object; ExecuteExplainQueryPlanText attaches
+        // one to every row its own describer branches can build directly from data they already
+        // computed (never fabricated/approximated -- see EqpJsonOp's doc comment). Any row
+        // without one reports an explicit "unmodeled" op carrying the plan detail text instead --
+        // never a real Turso op name, so it can never be silently mistaken for the genuine
+        // contract.
         var sql = statement.InnerSql ?? string.Empty;
+        var isWriteWithoutReturning = statement.Inner switch
+        {
+            InsertStatement { Returning: null } => true,
+            UpdateStatement { Returning: null } => true,
+            DeleteStatement { Returning: null } => true,
+            _ => false,
+        };
         // The query's result columns come from the same auto-increment statement state the
         // text path binds; when the inner statement is not a plain query, fall back to
-        // the plan row columns.
+        // the plan row columns. INSERT/UPDATE/DELETE without RETURNING produce no output rows
+        // at all, so their result_columns is always empty rather than the internal EQP columns.
         string[] resultColumns;
-        try
+        if (isWriteWithoutReturning)
         {
-            resultColumns = statement.Inner is QueryStatement innerQuery
-                ? DescribeQuery(innerQuery, EnsureAutoIncrementStatementState(context))
-                : result.Columns;
+            resultColumns = [];
         }
-        catch (EmbeddedSqlException)
+        else
         {
-            resultColumns = result.Columns;
+            try
+            {
+                resultColumns = statement.Inner is QueryStatement innerQuery
+                    ? DescribeQuery(innerQuery, EnsureAutoIncrementStatementState(context))
+                    : result.Columns;
+            }
+            catch (EmbeddedSqlException)
+            {
+                resultColumns = result.Columns;
+            }
         }
+
+        // A lone "MANAGED COMPILED VDBE"/"MANAGED EVALUATOR FALLBACK" row is the text path's
+        // placeholder for "no per-step plan is modeled for this statement yet", not a real scan
+        // or search step -- but for a plain SELECT the query still genuinely executes some real
+        // access path (a FROM-less constant row, or an ordinary full table scan), and the JSON
+        // envelope can describe that faithfully even while the TEXT convention keeps reporting
+        // the placeholder (ExplainQueryPlanTests.cs pins that TEXT routing marker independently
+        // of what FORMAT=JSON reports). A write statement with nothing to scan (a constant
+        // INSERT ... VALUES) has no equivalent real access path, so it still reports no nodes.
+        var isPlaceholderOnly = result.Rows.Count == 1
+            && result.Rows[0].Length >= 4
+            && result.Rows[0][3].Kind == SqlValueKind.Text
+            && result.Rows[0][3].AsText() is "MANAGED COMPILED VDBE" or "MANAGED EVALUATOR FALLBACK";
+        (string Detail, EqpJsonOp Op)? placeholderNode = isPlaceholderOnly && statement.Inner is SelectStatement placeholderSelect
+            ? TryDescribeGenuinePlaceholderAccessPath(placeholderSelect)
+            : null;
+
+        IReadOnlyList<(int Id, int Parent, string Detail, EqpJsonOp? Op)> nodes;
+        if (placeholderNode is { } genuine)
+        {
+            nodes = [(1, 0, genuine.Detail, genuine.Op)];
+        }
+        else if (isPlaceholderOnly)
+        {
+            nodes = [];
+        }
+        else
+        {
+            nodes = result.Rows.Select((row, index) =>
+            {
+                var detail = row.Length >= 4 ? row[3] : SqlValue.Null;
+                var detailText = detail.Kind == SqlValueKind.Text ? detail.AsText() : string.Empty;
+                var nodeId = row.Length >= 1 && row[0].Kind == SqlValueKind.Integer
+                    ? (int)row[0].AsInteger()
+                    : index + 1;
+                var parent = row.Length >= 2 && row[1].Kind == SqlValueKind.Integer && row[1].AsInteger() != 0
+                    // The TEXT rows use 0 as the "no parent" sentinel (matching Turso's own
+                    // parent=0 top-level convention); the JSON contract spells that null.
+                    ? (int)row[1].AsInteger()
+                    : 0;
+                var op = ops is not null && index < ops.Count ? ops[index] : null;
+                return (nodeId, parent, detailText, op);
+            }).ToArray();
+        }
+
         var json = new System.Text.StringBuilder()
             .Append("{\"version\":1,\"sql\":")
             .Append(JsonEscape("EXPLAIN QUERY PLAN " + sql))
             .Append(",\"result_columns\":[")
             .Append(string.Join(",", resultColumns.Select(static column => JsonEscape(column))))
             .Append("],\"nodes\":[")
-            .Append(string.Join(",", result.Rows.Select((row, index) =>
+            .Append(string.Join(",", nodes.Select(node =>
             {
-                var detail = row.Length >= 4 ? row[3] : SqlValue.Null;
-                var nodeId = row.Length >= 1 && row[0].Kind == SqlValueKind.Integer
-                    ? row[0].AsInteger().ToString(CultureInfo.InvariantCulture)
-                    : (index + 1).ToString(CultureInfo.InvariantCulture);
-                var parent = row.Length >= 2 && row[1].Kind == SqlValueKind.Integer
-                    ? row[1].AsInteger().ToString(CultureInfo.InvariantCulture)
-                    : "null";
-                return $"{{\"id\":{nodeId},\"parent\":{parent},\"detail\":{JsonEscape(detail.Kind == SqlValueKind.Text ? detail.AsText() : string.Empty)}}}";
+                var parentText = node.Parent == 0 ? "null" : node.Parent.ToString(CultureInfo.InvariantCulture);
+                var op = node.Op is not null
+                    ? node.Op.ToJson()
+                    : $"{{\"type\":\"unmodeled\",\"detail\":{JsonEscape(node.Detail)}}}";
+                return $"{{\"id\":{node.Id},\"parent\":{parentText},\"detail\":{JsonEscape(node.Detail)},\"op\":{op}}}";
             })))
             .Append("]}");
         return new ExecutionResult(["plan_json"], [[SqlValue.Text(json.ToString())]], 0);
     }
 
-    private static string JsonEscape(string value)
+    /// <summary>
+    /// When the TEXT path's per-step planners found no dedicated access-method description (the
+    /// generic "MANAGED COMPILED VDBE"/"MANAGED EVALUATOR FALLBACK" placeholder), the statement
+    /// still genuinely executes some real access path for these two narrow, unambiguous shapes:
+    /// a FROM-less SELECT (one synthesized row of literal/computed values) and a single plain
+    /// base table with no join, no index chosen (an ordinary full table scan). Both are
+    /// determined purely from the statement's own FROM clause -- no guessing about which access
+    /// method the compiled/evaluator route happened to pick. A multi-table join's real per-leg
+    /// access method (index seek vs. hash join vs. full scan) is not yet reconstructable this
+    /// way and stays unmodeled.
+    /// </summary>
+    private static (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(SelectStatement select)
+        => select.Source switch
+        {
+            null => ("SCAN CONSTANT ROW", new EqpJsonConstantRowOp()),
+            NamedTableSource { } source => (
+                $"SCAN {source.Name}" + (source.Alias is null ? string.Empty : $" AS {source.Alias}"),
+                new EqpJsonScanOp(source.Name, source.Alias, IndexName: null, Covering: false)),
+            _ => null,
+        };
+
+    internal static string JsonEscape(string value)
     {
         var escaped = new System.Text.StringBuilder(value.Length + 2);
         foreach (var character in value)
@@ -27787,8 +28152,10 @@ out bool hasReturning)
     private ExecutionResult ExecuteExplainQueryPlanText(
         ExplainQueryPlanStatement statement,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        out IReadOnlyList<EqpJsonOp?>? ops)
     {
+        ops = null;
         var compilationContext = EnsureAutoIncrementStatementState(context);
         if (statement.Inner is SelectStatement tableValuedSelect)
             statement = statement with { Inner = BindTableValuedFunctionSources(tableValuedSelect, compilationContext) };
@@ -27856,6 +28223,26 @@ out bool hasReturning)
         if (statement.Inner is SelectStatement plannedSelect
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
         {
+            var indexPlanCovering = IndexCoversSelect(plannedSelect, indexPlan.Table, indexPlan.Index);
+            // FormatManagedIndexExplainDetail only ever tests the leading index column for a
+            // plain equality (plan.Index.Columns[0].Name + "=?"); mirror that here directly
+            // instead of re-parsing the text it produced.
+            ops = indexPlan.Search && indexPlan.Index.Columns[0].Expression is null
+                ? [
+                    new EqpJsonSearchOp(
+                        indexPlan.Table.Name,
+                        indexPlan.Source.Alias,
+                        indexPlan.Index.Name,
+                        indexPlanCovering,
+                        [$"{indexPlan.Index.Columns[0].Name}=?"]),
+                ]
+                : [
+                    new EqpJsonScanOp(
+                        indexPlan.Table.Name,
+                        indexPlan.Source.Alias,
+                        indexPlan.Index.Name,
+                        indexPlanCovering),
+                ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [
@@ -27871,6 +28258,12 @@ out bool hasReturning)
         if (statement.Inner is SelectStatement orUnionSelect
             && TryPlanManagedOrIndexUnion(orUnionSelect, compilationContext) is { } orUnionPlan)
         {
+            ops =
+            [
+                new EqpJsonMultiIndexOp(
+                    orUnionPlan.Table.Name,
+                    orUnionPlan.Branches.Select(static branch => branch.Index.Name).ToArray()),
+            ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [
@@ -27919,6 +28312,17 @@ out bool hasReturning)
                     SqlValue.Text(detail),
                 }).ToArray(),
                 0);
+        }
+        if (statement.Inner is SelectStatement correlatedAggregateSelect
+            && TryDescribeCorrelatedAggregateSubqueryPlan(
+                correlatedAggregateSelect,
+                parameters,
+                compilationContext,
+                out var correlatedAggregatePlan,
+                out var correlatedAggregateOps))
+        {
+            ops = correlatedAggregateOps;
+            return correlatedAggregatePlan;
         }
 
         var usesCompiledProgram = statement.Inner switch
@@ -27978,23 +28382,27 @@ out bool hasReturning)
         foreach (var instruction in program.Instructions)
         {
             if (instruction is OpenJoinCursorInstruction open)
-                Collect(open.Plan.Root);
+                Collect(open.Plan.Root, suffix: null);
         }
 
         return searches;
 
-        void Collect(VdbeJoinPlanNode node)
+        void Collect(VdbeJoinPlanNode node, string? suffix)
         {
             if (node is IVdbeJoinSeekPlan index)
             {
-                searches.Add(index.SearchDescription);
+                searches.Add(suffix is null ? index.SearchDescription : index.SearchDescription + suffix);
                 return;
             }
 
             if (node is not VdbeJoinOperatorPlan join)
                 return;
-            Collect(join.Left);
-            Collect(join.Right);
+            Collect(join.Left, suffix);
+            // Turso tags the preserved (right) side of a LEFT JOIN's access-method line with
+            // " LEFT-JOIN" so EXPLAIN QUERY PLAN reads which side the outer join keeps NULL-padded
+            // rows for (core/translate/eqp.rs). RIGHT/FULL have no equivalent fixture evidence yet,
+            // so they are left exactly as before rather than guessed at.
+            Collect(join.Right, join.Kind == VdbeJoinKind.Left ? " LEFT-JOIN" : suffix);
         }
     }
 
@@ -28596,6 +29004,16 @@ out bool hasReturning)
             case null or LiteralExpression or HexNegationOverflowExpression or CurrentTimeExpression or ParameterExpression or RaiseExpression
                 or ColumnExpression or StarExpression or QualifiedStarExpression:
                 return;
+            // A bare DEFAULT is only meaningful inside an INSERT statement's VALUES row list
+            // (BuildInsertRow resolves it there without ever reaching this validator, which
+            // only walks SELECT-shaped expression trees — projections, WHERE, HAVING, GROUP
+            // BY, ORDER BY, LIMIT/OFFSET, join conditions, and INSERT ... SELECT sources).
+            // Reaching it here means DEFAULT was used somewhere else (`SELECT DEFAULT`,
+            // `WHERE a = DEFAULT`, …), which SQLite/Turso reject at prepare time — mirrors
+            // Turso's translator.rs/condition.rs: `bail_parse_error!("DEFAULT is only valid
+            // in INSERT VALUES")`.
+            case DefaultValueExpression:
+                throw new EmbeddedSqlException("DEFAULT is only valid in INSERT VALUES");
             case RowValueExpression row:
                 foreach (var value in row.Values)
                     ValidateExpressionIndexDirectives(value, context);
@@ -29392,6 +29810,19 @@ out bool hasReturning)
         if (index.Columns.Any(term => term.IsExpression))
             return false;
 
+        // An index over a VIRTUAL generated column has no physical row bytes of its own to
+        // index directly: the entry SQLite/Turso build is really an expression index over the
+        // column's defining expression, and neither engine treats an expression index as
+        // COVERING even when the expression's value is the only thing the query needs. Mirror
+        // that: a VIRTUAL generated column anywhere in the index keeps it a plain SCAN/SEARCH.
+        if (index.Columns.Any(term =>
+                term.ColumnIndex >= 0
+                && term.ColumnIndex < table.ColumnDefinitions.Length
+                && table.ColumnDefinitions[term.ColumnIndex] is { GenerationExpression: not null, GeneratedStored: false }))
+        {
+            return false;
+        }
+
         var covered = new HashSet<int>();
         foreach (var term in index.Columns)
         {
@@ -29633,7 +30064,7 @@ out bool hasReturning)
             var indexed = index.Columns[position];
             if (order.Ordinal is not null
                 || order.Descending != indexed.Descending
-                || !NullPlacementMatchesIndex(order)
+                || !NullPlacementMatchesIndex(order, indexed)
                 || !QueryExpressionMatchesIndexTerm(order.Expression, table, indexed))
             {
                 return false;
@@ -29643,15 +30074,18 @@ out bool hasReturning)
         return true;
     }
 
-    private static bool NullPlacementMatchesIndex(OrderByTerm order)
+    /// <summary>
+    /// Whether an ORDER BY term's NULL placement (explicit or SQLite's implicit ASC/DESC-derived
+    /// default) matches the index column's own effective placement, so the index's persisted
+    /// physical order actually satisfies this term without an extra sort step. Mirrors Turso's
+    /// <c>match_intrinsic_order</c> (turso-src/core/translate/optimizer/order.rs:565-566) comparing
+    /// <c>effective_nulls_order()</c> against the intrinsic column's placement.
+    /// </summary>
+    private static bool NullPlacementMatchesIndex(OrderByTerm order, EmbeddedIndexColumn indexed)
     {
-        return order.NullPlacement switch
-        {
-            NullPlacement.Default => true,
-            NullPlacement.First => !order.Descending,
-            NullPlacement.Last => order.Descending,
-            _ => throw new InvalidOperationException($"Unknown NULL placement {order.NullPlacement}."),
-        };
+        var requestedNullsFirst = order.NullPlacement.ResolvesToNullsFirst(order.Descending);
+        var indexedNullsFirst = indexed.NullPlacement.ResolvesToNullsFirst(indexed.Descending);
+        return requestedNullsFirst == indexedNullsFirst;
     }
 
     private bool IndexUsesRegisteredFunctions(EmbeddedIndex index)
@@ -29776,7 +30210,8 @@ out bool hasReturning)
                 new SqliteIndexRecordComparer(
                     context.MvccTextEncoding,
                     primaryKey.Terms.Select(term =>
-                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray()));
+                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation) { NullsOrder = term.NullsOrder })
+                        .ToArray()));
         }
 
         var indexComparer = Comparer<MvccDualCursor.IndexRow>.Create(
@@ -30239,7 +30674,23 @@ out bool hasReturning)
             if (!IsCollationResolvable(collationName))
                 continue;
 
-            var comparison = Compare(left.Key[position], right.Key[position], collationName);
+            var leftValue = left.Key[position];
+            var rightValue = right.Key[position];
+            if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+            {
+                if (leftValue.Kind == rightValue.Kind)
+                    continue;
+
+                // Explicit NULLS FIRST/LAST placement is independent of ASC/DESC value direction
+                // (turso-src/core/types.rs cmp_with_sort); resolve it directly instead of the
+                // generic Descending flip below, mirroring SqliteIndexRecordComparer.
+                var nullsFirst = term.NullPlacement.ResolvesToNullsFirst(term.Descending);
+                return leftValue.Kind == SqlValueKind.Null
+                    ? (nullsFirst ? -1 : 1)
+                    : (nullsFirst ? 1 : -1);
+            }
+
+            var comparison = Compare(leftValue, rightValue, collationName);
             if (comparison != 0)
                 return term.Descending ? -comparison : comparison;
         }
@@ -30308,7 +30759,20 @@ out bool hasReturning)
         for (var position = 0; position < primaryKeySchema.Terms.Count; position++)
         {
             var term = primaryKeySchema.Terms[position];
-            var comparison = Compare(left.Key[position], right.Key[position], term.Collation.Name);
+            var leftValue = left.Key[position];
+            var rightValue = right.Key[position];
+            if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+            {
+                if (leftValue.Kind == rightValue.Kind)
+                    continue;
+
+                var nullsFirst = ResolvesToNullsFirst(term.NullsOrder, term.SortOrder);
+                return leftValue.Kind == SqlValueKind.Null
+                    ? (nullsFirst ? -1 : 1)
+                    : (nullsFirst ? 1 : -1);
+            }
+
+            var comparison = Compare(leftValue, rightValue, term.Collation.Name);
             if (comparison != 0)
                 return term.SortOrder == SqliteKeySortOrder.Descending ? -comparison : comparison;
         }
@@ -30320,14 +30784,22 @@ out bool hasReturning)
         SelectStatement statement,
         SqlValue[] parameters,
         QueryContext context,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        bool bindingsAlreadyResolved = false)
     {
         context.CheckInterrupt();
         statement = BindTableValuedFunctionSources(statement, context);
         ValidateSelectIndexDirectives(statement, context);
         statement = StripUnusableForcedIndexForCountStar(statement, context);
         statement = ResolveNamedWindows(statement);
-        statement = ResolveSelectBindings(statement, context, outerRow);
+        // GROUP BY ordinal resolution is not idempotent: an ordinal like "GROUP BY 1" is
+        // rewritten to the referenced result-column expression, and when that expression is
+        // itself an integer literal (e.g. `SELECT 42 GROUP BY 1`), re-running the resolver
+        // would misread the already-resolved literal as a brand-new ordinal position. Callers
+        // that already resolved bindings (the compiled-route caller falling back to this
+        // evaluator) must skip this step instead of re-applying it.
+        if (!bindingsAlreadyResolved)
+            statement = ResolveSelectBindings(statement, context, outerRow);
         context = EnterCollationSource(context, statement.Source);
         ValidateGroupByCollations(statement.GroupBy);
         var resolvedOrderBy = ResolveOrderBy(statement.OrderBy, statement.Projections);
@@ -30351,7 +30823,14 @@ out bool hasReturning)
         var hasAggregate = statement.Projections.Any(projection =>
                 ContainsAggregateAcrossWindows(projection.Expression))
             || statement.Having is not null && ContainsAggregate(statement.Having)
-            || statement.OrderBy.Any(term => ContainsAggregateAcrossWindows(term.Expression));
+            || statement.OrderBy.Any(term => ContainsAggregateAcrossWindows(term.Expression))
+            // ContainsAggregate/ContainsAggregateAcrossWindows never look inside a subquery
+            // boundary, so an aggregate call nested in a scalar/EXISTS/IN subquery whose
+            // argument columns belong to THIS query's own FROM - an aggregate of the outer
+            // query, not of the subquery it is written in - would otherwise be missed here,
+            // leaving this block at its per-row cardinality instead of collapsing to one
+            // aggregate row (aggregate-of-outer-column.sqltest).
+            || ContainsOuterOwnedAggregate(statement, context);
         if (statement.Having is not null && !hasAggregate && statement.GroupBy.Count == 0)
             throw new EmbeddedSqlException("HAVING clause on a non-aggregate query");
         var hasWindow = windowFunctions.Count > 0;
@@ -30401,7 +30880,7 @@ out bool hasReturning)
         var orUnionPlan = intersectionPlan is null && indexPlan is null
             ? TryPlanManagedOrIndexUnion(statement, context)
             : null;
-        var streamProjectionRows = CanStreamProjectionRows(statement, context, outerRow)
+        var streamProjectionRows = CanStreamProjectionRows(statement, context, outerRow, hasAggregate)
             && !(context.ConcurrentMvStore is not null
                 && indexPlan is not null
                 && limit is >= 0);
@@ -30816,7 +31295,8 @@ out bool hasReturning)
     private bool CanStreamProjectionRows(
         SelectStatement statement,
         QueryContext context,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        bool hasAggregate)
     {
         if (outerRow is not null
             || statement.Source is not NamedTableSource named
@@ -30826,14 +31306,20 @@ out bool hasReturning)
             return false;
         }
 
+        // hasAggregate already covers ContainsAggregate(projection) plus the cases that check
+        // does not see on its own: an aggregate nested in a scalar/EXISTS/IN subquery whose
+        // columns belong to THIS query's own FROM (ContainsOuterOwnedAggregate). Streaming
+        // per-row output for such a query would bypass the aggregate collapse below and hand
+        // the aggregate branch an unfiltered row set (aggregate-of-outer-column.sqltest::
+        // outer-where-filters-before-the-outer-aggregate), since streaming also skips the
+        // ordinary WHERE-filter loop in favor of adding every scanned row unconditionally.
         return (statement.Where is null || IsScanPredicate(statement.Where))
             && statement.GroupBy.Count == 0
             && statement.Having is null
             && statement.OrderBy.Count == 0
             && !statement.Distinct
-            && !statement.Projections.Any(projection =>
-                ContainsAggregate(projection.Expression)
-                || ContainsWindowFunction(projection.Expression));
+            && !hasAggregate
+            && !statement.Projections.Any(projection => ContainsWindowFunction(projection.Expression));
     }
 
     private SqlValue[] EvaluateGroupedProjectionRow(
@@ -31967,29 +32453,74 @@ out bool hasReturning)
                 throw new EmbeddedSqlException($"duplicate WITH table name: {commonTableExpression.Name}");
         }
 
+        var expressionsByName = new Dictionary<string, CommonTableExpression>(StringComparer.OrdinalIgnoreCase);
+        foreach (var commonTableExpression in expressions)
+            expressionsByName[commonTableExpression.Name] = commonTableExpression;
+
+        var materialized = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var inProgress = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Materializes one sibling CTE on demand, resolving whichever of its own sibling
+        // dependencies (declared earlier or later in the same WITH clause) it needs first --
+        // SQLite's planner resolves a CTE's dependencies by name, not by declaration order,
+        // so `WITH a AS (SELECT * FROM b), b AS (...)` must plan `b` before `a` even though
+        // `a` is declared first. A name that re-enters while still being resolved is a
+        // genuine cycle, mirroring Turso's program.push_cte_being_defined check.
+        void Materialize(string requestedName)
+        {
+            if (materialized.Contains(requestedName)
+                || !expressionsByName.TryGetValue(requestedName, out var commonTableExpression))
+            {
+                return;
+            }
+
+            if (!inProgress.Add(requestedName))
+                throw new EmbeddedSqlException($"circular reference: {requestedName}");
+
+            try
+            {
+                foreach (var candidateName in expressionsByName.Keys)
+                {
+                    if (materialized.Contains(candidateName)
+                        || string.Equals(candidateName, requestedName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (CountStatementReferences(commonTableExpression.Body, candidateName) > 0)
+                        Materialize(candidateName);
+                }
+
+                var cteContext = context with { CommonTableExpressions = resolvedExpressions };
+                var resolved = CommonTableExpressionReferencesItself(commonTableExpression.Body, commonTableExpression.Name)
+                    ? EvaluateRecursiveCte(
+                        commonTableExpression,
+                        parameters,
+                        cteContext,
+                        outerRow,
+                        outerRowBudgets is not null
+                            && outerRowBudgets.TryGetValue(commonTableExpression.Name, out var budget)
+                                ? budget
+                                : null)
+                    : EvaluateNonRecursiveCte(commonTableExpression, parameters, cteContext, outerRow);
+                resolvedExpressions[commonTableExpression.Name] = resolved;
+                materialized.Add(requestedName);
+            }
+            finally
+            {
+                inProgress.Remove(requestedName);
+            }
+        }
+
         foreach (var commonTableExpression in expressions)
         {
-            if (!requiredCteNames.Contains(commonTableExpression.Name))
-                continue;
-
-            var cteContext = context with { CommonTableExpressions = resolvedExpressions };
-            var resolved = commonTableExpression.Body is QueryStatement query
-                && CountAllReferences(query, commonTableExpression.Name) > 0
-                ? EvaluateRecursiveCte(
-                    commonTableExpression,
-                    parameters,
-                    cteContext,
-                    outerRow,
-                    outerRowBudgets is not null
-                        && outerRowBudgets.TryGetValue(commonTableExpression.Name, out var budget)
-                            ? budget
-                            : null)
-                : EvaluateNonRecursiveCte(commonTableExpression, parameters, cteContext, outerRow);
-            resolvedExpressions[commonTableExpression.Name] = resolved;
+            if (requiredCteNames.Contains(commonTableExpression.Name))
+                Materialize(commonTableExpression.Name);
         }
 
         return context with { CommonTableExpressions = resolvedExpressions };
     }
+
 
     private QueryContext RematerializeReturningCommonTableExpressions(
         SqlValue[] parameters,
@@ -32021,6 +32552,8 @@ out bool hasReturning)
             var collations = GetCommonTableExpressionBodyCollations(writableBody, cteContext);
             var affinities = DescribeCommonTableExpressionBodyAffinities(
                 writableBody,
+                commonTableExpression.Name,
+                commonTableExpression.Columns,
                 cteContext,
                 BuildAffinityMapFromRuntimeCtes(cteContext.CommonTableExpressions));
             return new SourceData(
@@ -32076,10 +32609,70 @@ out bool hasReturning)
     // (see TryGetRecursiveCteOuterRowBudget) without ever approaching this ceiling.
     private const int RecursiveCteRowLimit = 1_000_000;
 
-    // Evaluates a recursive common table expression using semi-naive (working-set)
-    // iteration: run the anchor once, then repeatedly run the recursive term(s) over only
-    // the rows produced by the previous step until no new rows appear. UNION deduplicates
-    // (which also terminates cycles); UNION ALL keeps every row.
+    // Falls back through a recursive CTE's anchor arms, then its recursive arms, in
+    // declaration order to find the first arm that declares an explicit collation for a
+    // given result column -- unlike an ordinary compound SELECT, whose result-column
+    // collation only ever looks at its leftmost arm (GetQueryOutputCollations). Mirrors
+    // Turso's recursive_cte_result_column_collation / recursive_cte_query_result_column_collation
+    // (core/translate/recursive_cte.rs), which checks the initial query first and only
+    // consults the recursive query when the anchor declares nothing. A recursive arm may
+    // itself reference the CTE, so describing its own output collation needs a placeholder
+    // self-reference binding -- seeded with whatever the anchor already established --
+    // mirroring how Turso's RecursiveCteInput schema carries the anchor's own column
+    // metadata before the recursive query is ever analyzed.
+    private static IReadOnlyList<string?> GetRecursiveCteResultColumnCollations(
+        string cteName,
+        string[] columns,
+        IReadOnlyList<QueryStatement> anchorTerms,
+        IReadOnlyList<QueryStatement> recursiveTerms,
+        QueryContext context)
+    {
+        var result = new string?[columns.Length];
+        for (var index = 0; index < columns.Length; index++)
+            result[index] = FirstNonNullTermCollation(anchorTerms, index, context);
+
+        if (recursiveTerms.Count > 0 && result.Any(collation => collation is null))
+        {
+            var selfBoundContext = context with
+            {
+                CommonTableExpressions = new Dictionary<string, SourceData>(
+                    context.CommonTableExpressions, StringComparer.OrdinalIgnoreCase)
+                {
+                    [cteName] = new SourceData(columns, [], result),
+                },
+            };
+            for (var index = 0; index < columns.Length; index++)
+            {
+                if (result[index] is null)
+                    result[index] = FirstNonNullTermCollation(recursiveTerms, index, selfBoundContext);
+            }
+        }
+
+        return result;
+    }
+
+    private static string? FirstNonNullTermCollation(
+        IReadOnlyList<QueryStatement> terms,
+        int columnIndex,
+        QueryContext context)
+    {
+        foreach (var term in terms)
+        {
+            var collation = GetQueryOutputCollations(term, context).ElementAtOrDefault(columnIndex);
+            if (collation is not null)
+                return collation;
+        }
+
+        return null;
+    }
+
+    // Evaluates a recursive common table expression using a priority queue of pending rows,
+    // exactly as Turso lowers WITH RECURSIVE (core/translate/recursive_cte.rs): every
+    // anchor row is admitted first, then rows are dequeued one at a time -- in the order an
+    // explicit queue ORDER BY selects, or FIFO otherwise, with a sequence number breaking
+    // ties -- emitted, and used to re-seed every recursive arm as the single current row
+    // before its own children are admitted. UNION deduplicates on admission (which also
+    // terminates cycles); UNION ALL admits every row.
     private SourceData EvaluateRecursiveCte(
         CommonTableExpression commonTableExpression,
         SqlValue[] parameters,
@@ -32088,13 +32681,33 @@ out bool hasReturning)
         int? outerRowBudget = null)
     {
         var name = commonTableExpression.Name;
-        if (commonTableExpression.Query is not CompoundSelectStatement compound)
+        var scope = new List<(string Name, int Weight)>();
+        var query = commonTableExpression.Query;
+
+        // A body-level WITH (`cte AS (WITH inner AS (...) SELECT ... UNION ALL ...)`) sits
+        // above the whole compound in SQLite's grammar, so its nested CTEs are visible to
+        // every arm -- anchor and recursive alike. Bring their names into the
+        // reference-counting scope now (so shadowing/weighting matches name resolution) but
+        // defer actually materializing them until after the recursive shape below has been
+        // validated: a nested CTE that itself reads the recursive self-reference (the
+        // rejected "multiple recursive references" shape) cannot be evaluated yet -- the
+        // self-reference has no binding until the per-row loop establishes one -- and must
+        // never be attempted for a shape validation is about to reject anyway.
+        var pendingNestedWith = new List<(IReadOnlyList<CommonTableExpression> Ctes, QueryStatement DownstreamQuery)>();
+        while (query is WithSelectStatement nestedWith)
+        {
+            PushNestedRecursiveCteScope(nestedWith.CommonTableExpressions, scope, name);
+            pendingNestedWith.Add((nestedWith.CommonTableExpressions, nestedWith.Query));
+            query = nestedWith.Query;
+        }
+
+        if (query is not CompoundSelectStatement compound)
             throw new EmbeddedSqlException($"circular reference: {name}");
 
         var firstRecursiveIndex = -1;
         for (var index = 0; index < compound.Terms.Count; index++)
         {
-            if (CountAllReferences(compound.Terms[index], name) > 0)
+            if (CountRecursiveReferencesInArm(compound.Terms[index], scope, name).TotalCount > 0)
             {
                 firstRecursiveIndex = index;
                 break;
@@ -32120,8 +32733,22 @@ out bool hasReturning)
         var recursiveTerms = new List<SelectStatement>();
         for (var index = firstRecursiveIndex; index < compound.Terms.Count; index++)
         {
-            var term = ValidateRecursiveTerm(compound.Terms[index], name);
+            var term = ValidateRecursiveTerm(compound.Terms[index], name, scope);
             recursiveTerms.Add(term);
+        }
+
+        // Validation passed, so the recursive shape is legal: now materialize any
+        // body-level nested WITH clauses for real. A nested CTE that references the
+        // recursive self-reference would already have failed validation above (as
+        // "multiple recursive references"), so every nested CTE reaching this point is
+        // either independent of the recursion (like an ordinary sibling CTE) or unused.
+        foreach (var (nestedCtes, downstreamQuery) in pendingNestedWith)
+        {
+            var nestedRequired = GetRequiredCommonTableExpressionNames(
+                nestedCtes,
+                candidateName => CountAllReferences(downstreamQuery, candidateName));
+            cteContext = MaterializeCommonTableExpressions(
+                nestedCtes, parameters, cteContext, outerRow, nestedRequired);
         }
 
         // The compound's own LIMIT/OFFSET bounds the recursion the way SQLite's
@@ -32166,7 +32793,12 @@ out bool hasReturning)
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, anchor.Columns);
         // A recursive CTE's result-column affinities come from its anchor (base case), matching SQLite.
         var columnDefinitions = DescribeRuntimeSourceColumnDefinitions(compound.Terms[0], columns, cteContext);
-        var collations = GetQueryOutputCollations(commonTableExpression.Query, cteContext);
+        var anchorTerms = compound.Terms.Take(firstRecursiveIndex).ToArray();
+        // A recursive CTE's per-column collation falls back from the anchor to the
+        // recursive term(s) when the anchor itself declares none -- unlike an ordinary
+        // compound SELECT, which only ever looks at its leftmost arm. Mirrors Turso's
+        // recursive_cte_result_column_collation (core/translate/recursive_cte.rs).
+        var collations = GetRecursiveCteResultColumnCollations(name, columns, anchorTerms, recursiveTerms, cteContext);
         var deduplicate = recursiveOperator == CompoundOperator.Union;
         var anchorsRoutable = AreRecursiveAnchorsRoutable(
             compound,
@@ -32204,9 +32836,36 @@ out bool hasReturning)
                 outerRowBudget);
         }
 
+        // The queue's own priority order: an ORDER BY on the whole recursive CTE decides
+        // which pending row is dequeued (and hence expanded) next -- it does not sort the
+        // final output. Resolved against every anchor and recursive arm's own result
+        // columns/aliases/expressions, exactly like an ordinary compound SELECT's ORDER BY
+        // (ResolveCompoundOrderByIndex), but falling back to the recursive-aware collation
+        // above rather than the anchor-only one. Mirrors resolve_recursive_cte_queue_order.
+        // The alias/name fast-path matches each arm's own natural output name -- the
+        // anchor's, before any `WITH cte(renamed)` column list is applied -- never the
+        // CTE's externally declared column names, so an ORDER BY naming the CTE's own
+        // declared column (rather than the arm's own alias/expression) is correctly
+        // rejected instead of accidentally resolving through the rename.
+        IReadOnlyList<(int ColumnIndex, OrderByTerm Term, string? Collation)>? queueOrder = null;
+        if (compound.OrderBy.Count > 0)
+        {
+            var allTerms = anchorTerms.Concat(recursiveTerms).ToArray();
+            var anchorNaturalColumns = DescribeQuery(compound.Terms[0], cteContext);
+            var resolvedOrder = new (int ColumnIndex, OrderByTerm Term, string? Collation)[compound.OrderBy.Count];
+            for (var orderIndex = 0; orderIndex < compound.OrderBy.Count; orderIndex++)
+            {
+                var orderTerm = compound.OrderBy[orderIndex];
+                var columnIndex = ResolveCompoundOrderByIndex(orderTerm, orderIndex + 1, allTerms, anchorNaturalColumns);
+                var collation = GetCollation(orderTerm.Expression) ?? collations.ElementAtOrDefault(columnIndex);
+                resolvedOrder[orderIndex] = (columnIndex, orderTerm, collation);
+            }
+
+            queueOrder = resolvedOrder;
+        }
+
         var result = new List<SourceRow>();
         var seen = deduplicate ? new List<SqlValue[]>() : null;
-        var workingSet = new List<SourceRow>();
         // The budget caps how many EMITTED rows the expansion may produce: the
         // compound's own LIMIT (the OFFSET is consumed inside this loop), or the
         // outer query's row budget when the compound is unlimited. With both, the
@@ -32217,15 +32876,96 @@ out bool hasReturning)
         var budget = outerRowBudget is int outerBudgetValue && compoundBudget is int innerBudgetValue
             ? Math.Min(outerBudgetValue, innerBudgetValue)
             : outerRowBudget ?? compoundBudget;
-        foreach (var row in anchor.Rows)
-        {
-            var values = row.ToArray();
-            if (seen is not null && !TryAddRecursiveDistinctRow(seen, values, collations))
-                continue;
 
-            var sourceRow = new SourceRow(columns, values);
-            workingSet.Add(sourceRow);
-            if (emitOffset > 0)
+        // The work queue itself: a plain FIFO when there is no ORDER BY (the common case,
+        // and the shape every already-verified breadth-first/graph test depends on), or a
+        // priority queue keyed by the resolved queue order with a sequence number as the
+        // stable tie-breaker -- mirroring Turso's ephemeral B-Tree index keyed on
+        // (priority columns, sequence, result columns) in emit_recursive_cte.
+        var fifoQueue = queueOrder is null ? new Queue<SqlValue[]>() : null;
+        var priorityQueue = queueOrder is null
+            ? null
+            : new PriorityQueue<SqlValue[], (SqlValue[] Keys, long Sequence)>(
+                Comparer<(SqlValue[] Keys, long Sequence)>.Create((left, right) =>
+                {
+                    for (var index = 0; index < queueOrder!.Count; index++)
+                    {
+                        var comparison = CompareForOrdering(
+                            left.Keys[index], right.Keys[index], queueOrder[index].Term, queueOrder[index].Collation);
+                        if (comparison != 0)
+                            return comparison;
+                    }
+
+                    return left.Sequence.CompareTo(right.Sequence);
+                }));
+        var nextSequence = 0L;
+
+        void EnqueueRow(SqlValue[] row)
+        {
+            if (priorityQueue is not null)
+            {
+                var keys = new SqlValue[queueOrder!.Count];
+                for (var index = 0; index < queueOrder.Count; index++)
+                    keys[index] = row[queueOrder[index].ColumnIndex];
+                priorityQueue.Enqueue(row, (keys, nextSequence++));
+            }
+            else
+            {
+                fifoQueue!.Enqueue(row);
+            }
+        }
+
+        bool TryDequeueRow(out SqlValue[] row)
+        {
+            if (priorityQueue is not null)
+                return priorityQueue.TryDequeue(out row!, out _);
+            if (fifoQueue!.Count > 0)
+            {
+                row = fifoQueue.Dequeue();
+                return true;
+            }
+
+            row = null!;
+            return false;
+        }
+
+        // Bound emitted and pending rows during admission, including the current row while
+        // it seeds recursion. OFFSET rows release their charge after expansion: they are no
+        // longer retained, but must be consumed in dequeue order, not priority-insertion order.
+        var retainedRowCount = 0;
+
+        void AdmitRow(SqlValue[] values)
+        {
+            if (seen is not null && !TryAddRecursiveDistinctRow(seen, values, collations))
+                return;
+
+            retainedRowCount++;
+            if (retainedRowCount > RecursiveCteRowLimit)
+            {
+                throw new EmbeddedSqlException(
+                    $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
+            }
+
+            EnqueueRow(values);
+        }
+
+        foreach (var row in anchor.Rows)
+            AdmitRow(row.ToArray());
+
+        var recursiveOperatorDisplay = recursiveOperator == CompoundOperator.UnionAll ? "UNION ALL" : "UNION";
+
+        // Drain the queue one row at a time: dequeue the next row in priority (or FIFO)
+        // order, emit it, and run every recursive arm against exactly that one row before
+        // moving on -- SQLite/Turso's per-current-row recursion (recursive_cte.rs), not a
+        // whole-frontier batch. This is what makes DISTINCT inside the recursive projection,
+        // a multi-arm ORDER BY, and depth-first graph traversal all observably correct: each
+        // arm invocation only ever sees one input row, exactly like every non-recursive
+        // consumer of this CTE would.
+        while (TryDequeueRow(out var currentValues))
+        {
+            var currentRow = new SourceRow(columns, currentValues);
+            var skippedByOffset = emitOffset > 0;
+            if (skippedByOffset)
             {
                 // An OFFSET row is dropped from the output but still feeds the
                 // recursive step, like SQLite's emit_offset jumping past the emit.
@@ -32233,59 +32973,40 @@ out bool hasReturning)
             }
             else
             {
-                result.Add(sourceRow);
+                result.Add(currentRow);
                 // The consumer can never observe more than its budget, so stop
-                // expanding as soon as the budget is filled.
-                if (budget is int anchorBudget && result.Count >= anchorBudget)
+                // expanding as soon as the budget is filled -- matching Turso's
+                // DecrJumpZero jumping past the recursive step once the limit hits zero.
+                if (budget is int budgetValue && result.Count >= budgetValue)
                     return new SourceData(columns, result, collations, columnDefinitions);
             }
-        }
 
-        while (workingSet.Count > 0)
-        {
             var iterationContext = cteContext with
             {
                 CommonTableExpressions = new Dictionary<string, SourceData>(
                     cteContext.CommonTableExpressions,
                     StringComparer.OrdinalIgnoreCase)
                 {
-                    [name] = new SourceData(columns, workingSet, collations),
+                    [name] = new SourceData(columns, [currentRow], collations),
                 },
             };
 
-            var produced = new List<SourceRow>();
             foreach (var term in recursiveTerms)
             {
                 var termResult = MaterializeQueryResult(
                     ExecuteSelect(term, parameters, iterationContext, outerRow));
                 if (termResult.Columns.Length != columns.Length)
-                    throw new EmbeddedSqlException("SELECTs to the left and right of a compound operator do not have the same number of result columns");
-
-                foreach (var row in termResult.Rows)
                 {
-                    var values = row.ToArray();
-                    if (seen is not null && !TryAddRecursiveDistinctRow(seen, values, collations))
-                        continue;
-
-                    var sourceRow = new SourceRow(columns, values);
-                    produced.Add(sourceRow);
-                    if (emitOffset > 0)
-                    {
-                        emitOffset--;
-                    }
-                    else
-                    {
-                        result.Add(sourceRow);
-                        if (budget is int budgetValue && result.Count >= budgetValue)
-                            return new SourceData(columns, result, collations, columnDefinitions);
-                        if (result.Count > RecursiveCteRowLimit)
-                            throw new EmbeddedSqlException(
-                                $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
-                    }
+                    throw new EmbeddedSqlException(
+                        $"SELECTs to the left and right of {recursiveOperatorDisplay} do not have the same number of result columns");
                 }
+
+                foreach (var producedRow in termResult.Rows)
+                    AdmitRow(producedRow.ToArray());
             }
 
-            workingSet = produced;
+            if (skippedByOffset)
+                retainedRowCount--;
         }
 
         return new SourceData(columns, result, collations, columnDefinitions);
@@ -32296,7 +33017,12 @@ out bool hasReturning)
         string name,
         QueryContext context)
     {
-        if (term.OrderBy.Count != 0
+        // A DISTINCT recursive projection must be evaluated once per current row (a
+        // single-row DISTINCT never removes anything, preserving duplicates the
+        // per-generation worktable transform would otherwise collapse), so it stays on the
+        // evaluator's own per-row queue rather than the whole-frontier worktable route.
+        if (term.Distinct
+            || term.OrderBy.Count != 0
             || !IsRoutableRecursiveSource(term.Source, name, context)
             || !AreRoutableRecursiveJoinConditions(term.Source)
             || term.Projections.Any(projection => !IsRoutableRecursiveExpression(projection.Expression))
@@ -32468,7 +33194,7 @@ out bool hasReturning)
             if (termResult.Columns.Length != width)
             {
                 throw new EmbeddedSqlException(
-                    "SELECTs to the left and right of a compound operator do not have the same number of result columns");
+                    $"SELECTs to the left and right of {(deduplicate ? "UNION" : "UNION ALL")} do not have the same number of result columns");
             }
 
             var children = new SqlValue[termResult.Rows.Count][];
@@ -32883,22 +33609,332 @@ out bool hasReturning)
         return ExecuteCompoundSelect(anchor, parameters, cteContext, outerRow);
     }
 
+    // (topLevelFromCount, totalCount) for one arm/term of a recursive CTE body: direct
+    // references to the recursive table in the arm's own top-level FROM clause (which decide
+    // multi-arm-join detection), and every reference reachable from the arm (which detects a
+    // reference hidden inside a subquery, WHERE clause, WINDOW clause, or a used nested CTE).
+    // Mirrors Turso's RecursiveRefCounter::count_arm (core/translate/planner.rs).
+    private readonly record struct RecursiveCteReferenceCount(int TopLevelFromCount, int TotalCount);
+
+    // Scope-aware reference counting for a recursive CTE's own name, mirroring Turso's
+    // RecursiveRefCounter: a nested WITH that redefines the CTE's name shadows it for that
+    // subtree, and a reference reachable only through a nested CTE's body counts only when
+    // that nested CTE is itself used, weighted by how many references its own body contains.
+    // The scope is a stack of (name, weight) pairs, innermost last; weight is the number of
+    // recursive references using that name implies (0 for a shadowing redefinition, or the
+    // nested CTE's own total reference count for any other nested CTE).
+    private static int RecursiveCteScopeWeight(
+        string name,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        for (var index = scope.Count - 1; index >= 0; index--)
+        {
+            if (string.Equals(scope[index].Name, name, StringComparison.OrdinalIgnoreCase))
+                return scope[index].Weight;
+        }
+
+        return string.Equals(name, cteName, StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+    }
+
+    private static bool RecursiveCteNameIsShadowed(
+        string name,
+        List<(string Name, int Weight)> scope)
+        => scope.Any(entry => string.Equals(entry.Name, name, StringComparison.OrdinalIgnoreCase));
+
+    // Brings a nested WITH clause's own CTEs into scope with their reference weights,
+    // mirroring RecursiveRefCounter::push_nested_ctes. The caller is responsible for
+    // truncating the scope afterwards (or, for a body-level WITH shared by every arm of a
+    // recursive CTE, leaving the entries for the whole evaluation).
+    private static void PushNestedRecursiveCteScope(
+        IReadOnlyList<CommonTableExpression>? nested,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        if (nested is null)
+            return;
+
+        foreach (var cte in nested)
+        {
+            scope.Add((cte.Name, 0));
+            var weight = cte.Query is QueryStatement nestedQuery
+                ? CountRecursiveReferencesInQuery(nestedQuery, scope, cteName)
+                : 0;
+            scope[^1] = (cte.Name, weight);
+        }
+    }
+
+    // Total (weighted) reference count reachable from an entire query statement, including
+    // its own ORDER BY/LIMIT/OFFSET and any nested WITH it introduces. Mirrors
+    // RecursiveRefCounter::count_select. Used to decide whether a CTE's whole body
+    // references itself at all (Turso's `references_itself`).
+    private static int CountRecursiveReferencesInQuery(
+        QueryStatement query,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        var baseDepth = scope.Count;
+        try
+        {
+            switch (query)
+            {
+                case WithSelectStatement with:
+                    PushNestedRecursiveCteScope(with.CommonTableExpressions, scope, cteName);
+                    return CountRecursiveReferencesInQuery(with.Query, scope, cteName);
+                case SelectStatement select:
+                    return CountRecursiveReferencesInSelectCore(select, scope, cteName)
+                        + select.OrderBy.Sum(term => CountRecursiveReferencesInExpression(term.Expression, scope, cteName))
+                        + (select.Limit is null ? 0 : CountRecursiveReferencesInExpression(select.Limit, scope, cteName))
+                        + (select.Offset is null ? 0 : CountRecursiveReferencesInExpression(select.Offset, scope, cteName));
+                case CompoundSelectStatement compound:
+                    return compound.Terms.Sum(term => CountRecursiveReferencesInQuery(term, scope, cteName))
+                        + compound.OrderBy.Sum(term => CountRecursiveReferencesInExpression(term.Expression, scope, cteName))
+                        + (compound.Limit is null ? 0 : CountRecursiveReferencesInExpression(compound.Limit, scope, cteName))
+                        + (compound.Offset is null ? 0 : CountRecursiveReferencesInExpression(compound.Offset, scope, cteName));
+                case ValuesClause values:
+                    return values.Rows.Sum(row => row.Sum(expression => CountRecursiveReferencesInExpression(expression, scope, cteName)));
+                default:
+                    return 0;
+            }
+        }
+        finally
+        {
+            scope.RemoveRange(baseDepth, scope.Count - baseDepth);
+        }
+    }
+
+    // Whether a common table expression's body references its own name anywhere, honoring
+    // nested-WITH shadowing and weighting an unused nested CTE to zero. A writable
+    // (INSERT/UPDATE/DELETE) body can never be recursive. Mirrors Turso's
+    // `references_itself` (RecursiveRefCounter::count_select on the CTE's own select).
+    private static bool CommonTableExpressionReferencesItself(ParsedStatement body, string name)
+        => body is QueryStatement query
+            && CountRecursiveReferencesInQuery(query, [], name) > 0;
+
+    // (topLevelFromCount, totalCount) for one arm (term) of a recursive CTE's compound body.
+    // A VALUES arm cannot reference a table directly, so its top-level count is always 0;
+    // its expressions are still walked for a reference hidden in a subquery.
+    private static RecursiveCteReferenceCount CountRecursiveReferencesInArm(
+        QueryStatement arm,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        if (arm is ValuesClause values)
+        {
+            var valuesTotal = values.Rows.Sum(row => row.Sum(expression => CountRecursiveReferencesInExpression(expression, scope, cteName)));
+            return new RecursiveCteReferenceCount(0, valuesTotal);
+        }
+
+        if (arm is not SelectStatement select)
+            return new RecursiveCteReferenceCount(0, 0);
+
+        var topLevelFrom = CountDirectRecursiveFromReferences(select.Source, scope, cteName);
+        var total = CountRecursiveReferencesInSelectCore(select, scope, cteName);
+        return new RecursiveCteReferenceCount(topLevelFrom, total);
+    }
+
+    // Direct references to the recursive table in the top level of a FROM clause (walking
+    // only the join tree, never descending into derived tables/subqueries), honoring
+    // shadowing by a nested WITH the way name resolution does. A table-valued call's own
+    // arguments are not counted here (they belong to the total walk below). Mirrors
+    // count_direct_in_from_table.
+    private static int CountDirectRecursiveFromReferences(
+        TableSource? source,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        return source switch
+        {
+            null => 0,
+            NamedTableSource named when !named.IsSchemaQualified
+                => string.Equals(named.Name, cteName, StringComparison.OrdinalIgnoreCase)
+                    && !RecursiveCteNameIsShadowed(named.Name, scope)
+                    ? 1 : 0,
+            TableValuedFunctionSource function when function.Schema is null
+                => string.Equals(function.Name, cteName, StringComparison.OrdinalIgnoreCase)
+                    && !RecursiveCteNameIsShadowed(function.Name, scope)
+                    ? 1 : 0,
+            JoinTableSource join => CountDirectRecursiveFromReferences(join.Left, scope, cteName)
+                + CountDirectRecursiveFromReferences(join.Right, scope, cteName),
+            _ => 0,
+        };
+    }
+
+    // Total (weighted) reference count reachable from a FROM-clause source, honoring nested
+    // CTE shadowing/weighting for a plain table reference and fully re-entering a derived
+    // table's own query. Mirrors count_from_table.
+    private static int CountRecursiveReferencesInFromSource(
+        TableSource? source,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        return source switch
+        {
+            null => 0,
+            NamedTableSource named => named.IsSchemaQualified ? 0 : RecursiveCteScopeWeight(named.Name, scope, cteName),
+            TableValuedFunctionSource function => (function.Schema is null ? RecursiveCteScopeWeight(function.Name, scope, cteName) : 0)
+                + function.Arguments.Sum(argument => CountRecursiveReferencesInExpression(argument, scope, cteName)),
+            DerivedTableSource derived => CountRecursiveReferencesInQuery(derived.Query, scope, cteName),
+            JoinTableSource join => CountRecursiveReferencesInFromSource(join.Left, scope, cteName)
+                + CountRecursiveReferencesInFromSource(join.Right, scope, cteName)
+                + (join.Condition is null ? 0 : CountRecursiveReferencesInExpression(join.Condition, scope, cteName)),
+            _ => 0,
+        };
+    }
+
+    // Total (weighted) reference count reachable from one SELECT arm's own clauses (FROM,
+    // projections, WHERE, GROUP BY/HAVING, and named WINDOW definitions), excluding the
+    // arm's own ORDER BY/LIMIT/OFFSET -- those belong to the enclosing compound, not to an
+    // individual recursive-CTE arm. Mirrors count_one_select(OneSelect::Select).
+    private static int CountRecursiveReferencesInSelectCore(
+        SelectStatement select,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        var count = CountRecursiveReferencesInFromSource(select.Source, scope, cteName);
+        count += select.Projections.Sum(projection => CountRecursiveReferencesInExpression(projection.Expression, scope, cteName));
+        if (select.Where is not null)
+            count += CountRecursiveReferencesInExpression(select.Where, scope, cteName);
+        count += select.GroupBy.Sum(expression => CountRecursiveReferencesInExpression(expression, scope, cteName));
+        if (select.Having is not null)
+            count += CountRecursiveReferencesInExpression(select.Having, scope, cteName);
+        foreach (var namedWindow in select.NamedWindows)
+            count += CountRecursiveReferencesInWindow(namedWindow.Specification, scope, cteName);
+
+        return count;
+    }
+
+    private static int CountRecursiveReferencesInWindow(
+        WindowSpecification window,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        var count = window.PartitionBy.Sum(expression => CountRecursiveReferencesInExpression(expression, scope, cteName));
+        count += window.OrderBy.Sum(term => CountRecursiveReferencesInExpression(term.Expression, scope, cteName));
+        if (window.Frame is { } frame)
+        {
+            if (frame.Start.Offset is not null)
+                count += CountRecursiveReferencesInExpression(frame.Start.Offset, scope, cteName);
+            if (frame.End.Offset is not null)
+                count += CountRecursiveReferencesInExpression(frame.End.Offset, scope, cteName);
+        }
+
+        return count;
+    }
+
+    // Total (weighted) reference count reachable from an expression tree, including every
+    // subquery form (scalar, EXISTS, IN) and a function call's FILTER/OVER/aggregate-ORDER-BY
+    // clauses. Mirrors count_expr (walk_expr with Exists/Subquery/InSelect special-cased).
+    private static int CountRecursiveReferencesInExpression(
+        Expression expression,
+        List<(string Name, int Weight)> scope,
+        string cteName)
+    {
+        switch (expression)
+        {
+            case ScalarSubqueryExpression subquery:
+                return CountRecursiveReferencesInQuery(subquery.Query, scope, cteName);
+            case ExistsExpression exists:
+                return CountRecursiveReferencesInQuery(exists.Query, scope, cteName);
+            case InSubqueryExpression inSubquery:
+                return CountRecursiveReferencesInExpression(inSubquery.Value, scope, cteName)
+                    + CountRecursiveReferencesInQuery(inSubquery.Query, scope, cteName);
+            case FunctionExpression function:
+                {
+                    var count = function.Arguments.Sum(argument => CountRecursiveReferencesInExpression(argument, scope, cteName));
+                    if (function.Filter is not null)
+                        count += CountRecursiveReferencesInExpression(function.Filter, scope, cteName);
+                    if (function.Window is not null)
+                        count += CountRecursiveReferencesInWindow(function.Window, scope, cteName);
+                    if (function.AggregateOrderBy is not null)
+                        count += function.AggregateOrderBy.Sum(term => CountRecursiveReferencesInExpression(term.Expression, scope, cteName));
+                    if (function.OrderedSetOrderBy is not null)
+                        count += CountRecursiveReferencesInExpression(function.OrderedSetOrderBy.Expression, scope, cteName);
+                    return count;
+                }
+            case RowValueExpression rowValue:
+                return rowValue.Values.Sum(value => CountRecursiveReferencesInExpression(value, scope, cteName));
+            case BinaryExpression binary:
+                return CountRecursiveReferencesInExpression(binary.Left, scope, cteName)
+                    + CountRecursiveReferencesInExpression(binary.Right, scope, cteName);
+            case UnaryExpression unary:
+                return CountRecursiveReferencesInExpression(unary.Operand, scope, cteName);
+            case CollationExpression collation:
+                return CountRecursiveReferencesInExpression(collation.Expression, scope, cteName);
+            case CastExpression cast:
+                return CountRecursiveReferencesInExpression(cast.Expression, scope, cteName);
+            case CaseExpression @case:
+                {
+                    var count = @case.Operand is null ? 0 : CountRecursiveReferencesInExpression(@case.Operand, scope, cteName);
+                    count += @case.Clauses.Sum(clause => CountRecursiveReferencesInExpression(clause.When, scope, cteName)
+                        + CountRecursiveReferencesInExpression(clause.Then, scope, cteName));
+                    if (@case.Else is not null)
+                        count += CountRecursiveReferencesInExpression(@case.Else, scope, cteName);
+                    return count;
+                }
+            case LikeExpression like:
+                return CountRecursiveReferencesInExpression(like.Value, scope, cteName)
+                    + CountRecursiveReferencesInExpression(like.Pattern, scope, cteName)
+                    + (like.Escape is null ? 0 : CountRecursiveReferencesInExpression(like.Escape, scope, cteName));
+            case GlobExpression glob:
+                return CountRecursiveReferencesInExpression(glob.Value, scope, cteName)
+                    + CountRecursiveReferencesInExpression(glob.Pattern, scope, cteName);
+            case InExpression @in:
+                return CountRecursiveReferencesInExpression(@in.Value, scope, cteName)
+                    + @in.Values.Sum(value => CountRecursiveReferencesInExpression(value, scope, cteName));
+            case BetweenExpression between:
+                return CountRecursiveReferencesInExpression(between.Value, scope, cteName)
+                    + CountRecursiveReferencesInExpression(between.Lower, scope, cteName)
+                    + CountRecursiveReferencesInExpression(between.Upper, scope, cteName);
+            case RaiseExpression raise:
+                return raise.Message is null ? 0 : CountRecursiveReferencesInExpression(raise.Message, scope, cteName);
+            default:
+                return 0;
+        }
+    }
+
+    // Whether a table source anywhere in the FROM tree is joined with FULL JOIN. A recursive
+    // CTE's own input can never be the build side the FULL OUTER hash join requires, so any
+    // FULL JOIN sharing a FROM clause with the recursive self-reference is rejected up front
+    // instead of being attempted and (for a UNION ALL term) looping until the row guard
+    // fires. Mirrors the has_recursive_input/is_full_outer diagnosis in
+    // core/translate/optimizer/join.rs.
+    private static bool ContainsFullJoin(TableSource? source)
+    {
+        return source switch
+        {
+            JoinTableSource { Kind: JoinKind.Full } => true,
+            JoinTableSource join => ContainsFullJoin(join.Left) || ContainsFullJoin(join.Right),
+            _ => false,
+        };
+    }
+
     // Validates a single recursive term and returns it as a SELECT. Rejects constructs
     // SQLite forbids in a recursive term with the same messages it produces.
-    private SelectStatement ValidateRecursiveTerm(QueryStatement term, string name)
+    private SelectStatement ValidateRecursiveTerm(
+        QueryStatement term,
+        string name,
+        List<(string Name, int Weight)> scope)
     {
         if (term is not SelectStatement select)
             throw new EmbeddedSqlException($"circular reference: {name}");
 
-        var directReferences = CountDirectFromReferences(select.Source, name);
-        var allReferences = CountAllReferences(select, name);
-        if (directReferences > 1)
-            throw new EmbeddedSqlException($"multiple references to recursive table: {name}");
-
-        // Any reference that is not a single top-level FROM entry (e.g. inside a subquery,
-        // a derived table, or joined to itself) is not a supported linear recursion.
-        if (directReferences != 1 || allReferences != 1)
+        // Mirrors prepare_recursive_cte_plan's per-arm validation order exactly: a missing
+        // top-level reference (including one hidden behind a subquery/join-to-itself) is
+        // "circular reference"; more than one top-level FROM reference is "multiple
+        // references to recursive table"; any further reference reachable only through a
+        // subquery, WHERE clause, WINDOW clause, or a used nested CTE is "multiple recursive
+        // references".
+        var (topLevelFromCount, totalCount) = CountRecursiveReferencesInArm(select, scope, name);
+        if (topLevelFromCount == 0)
             throw new EmbeddedSqlException($"circular reference: {name}");
+        if (topLevelFromCount > 1)
+            throw new EmbeddedSqlException($"multiple references to recursive table: {name}");
+        if (totalCount > topLevelFromCount)
+            throw new EmbeddedSqlException($"multiple recursive references: {name}");
+
+        if (ContainsFullJoin(select.Source))
+            throw new EmbeddedSqlException("FULL OUTER JOIN with a recursive reference is not yet supported");
 
         if (select.GroupBy.Count > 0
             || select.Having is not null
@@ -35984,11 +37020,85 @@ out bool hasReturning)
                     new SqliteIndexRecordComparer(
                         context.MvccTextEncoding,
                         primaryKey.Terms.Select(term =>
-                            new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray()));
+                            new SqliteIndexComparisonTerm(term.SortOrder, term.Collation) { NullsOrder = term.NullsOrder })
+                            .ToArray()));
             }
 
             IEnumerable<MvccDualCursor.Row> EnumerateBaseRows()
             {
+                // Prefer the transaction's own pinned durable b-tree snapshot: an unconditional
+                // ascending scan of the committed base table (see
+                // EmbeddedFileStore.ScanCommittedRowidTableAscending for a rowid table, or its
+                // WITHOUT ROWID primary-key-index counterpart) whose physical key order already
+                // matches keyComparer (both derive from the same declared rowid/collation
+                // semantics), so no in-memory sort/materialization of the whole table is needed.
+                // requireCommittedTableIdentity: false matches the identical, already-shipped
+                // precedent in GetConcurrentMvccIndexRows.EnumerateBaseRows: a concurrent
+                // transaction's QueryContext.Tables entry is a working-copy Clone(), never
+                // reference-equal to the truly committed table even when nothing changed, and
+                // MVCC's own version-chain overlay (not this table object) is what carries this
+                // transaction's own uncommitted row mutations — the base scan only ever needs to
+                // reflect the last *committed* state, which the pinned snapshot already pins.
+                // Only when the file store is unavailable, the pinned snapshot could not be
+                // opened, or the table/index is otherwise ineligible (e.g. an in-memory table)
+                // does this fall back to the classic table.GetScanOrderIndices() full-heap
+                // materialization.
+                EmbeddedFileIndexFullScanAccessor? scanAccessor = null;
+                var opened = false;
+                if (context.Database?.FileStore is { } fileStore
+                    && context.TransactionPinnedSnapshot is { } pinnedSnapshot)
+                {
+                    opened = table.HasRowid
+                        ? fileStore.TryOpenBaseTableFullScanAccessor(
+                            table,
+                            pinnedSnapshot,
+                            out scanAccessor,
+                            requireCommittedTableIdentity: false)
+                        : fileStore.TryOpenIndexFullScanAccessor(
+                            table,
+                            index: null,
+                            covering: false,
+                            pinnedSnapshot,
+                            out scanAccessor,
+                            requireCommittedTableIdentity: false);
+                }
+
+                if (opened && scanAccessor is not null)
+                {
+                    // Same test-observable evidence GetConcurrentMvccIndexRows already records
+                    // for indexed durable cursors (see VdbeJoinIndexSeekMetrics /
+                    // MvccDirectIndexAccessTests): a caller can assert DurableCursorPlans
+                    // increased and IndexPagesRead/TableRowsFetched moved, proving this path
+                    // actually opened a bounded page-native cursor instead of silently falling
+                    // back to the full-heap materialization below.
+                    var metrics = context.Database?._joinIndexSeekMetrics;
+                    metrics?.DurableCursorPlanCreated();
+                    Action? pageRead = metrics is null ? null : metrics.IndexPageRead;
+                    Action? rowFetched = metrics is null ? null : metrics.TableRowFetched;
+                    scanAccessor.Open();
+                    try
+                    {
+                        foreach (var row in scanAccessor.Scan(pageRead, rowFetched))
+                        {
+                            context.CheckInterrupt();
+                            var rowId = row.RowId ?? 0L;
+                            var key = table.HasRowid
+                                ? MvccKey.FromInteger(rowId)
+                                : MvccKey.FromPrimaryKey(
+                                    table.PrimaryKeySchema!,
+                                    row.Values,
+                                    context.MvccTextEncoding);
+                            yield return new MvccDualCursor.Row(key, row.Values);
+                        }
+                    }
+                    finally
+                    {
+                        scanAccessor.Dispose();
+                    }
+
+                    yield break;
+                }
+
                 foreach (var index in table.GetScanOrderIndices())
                 {
                     var rowId = index < table.RowIds.Count ? table.RowIds[index] : index + 1;
@@ -36199,12 +37309,42 @@ out bool hasReturning)
     {
         if (context.Views is not null && context.Views.TryGetValue(name, out var found))
         {
+            // A view row whose stored SQL failed to (re)parse at schema load stays visible in
+            // sqlite_schema/sqlite_master (SQLite's own "malformed row, not corruption" contract
+            // for a legacy CREATE VIEW column list an older build wrote without identifier
+            // quoting), but resolving it as a query source fails closed here -- mirroring
+            // Turso's schema.broken_views check in translate/planner.rs -- rather than running a
+            // Query this class never actually parsed. DROP VIEW bypasses this helper (it reads
+            // catalog.Views directly in DdlStatementCompiler.CompileDropView), so the row can
+            // still be removed.
+            ThrowIfBroken(found, name);
             view = found;
             return true;
         }
 
         view = null!;
         return false;
+    }
+
+    /// <summary>
+    /// Fails closed the moment a broken view (see <see cref="ViewDefinition.BrokenReason"/>) is
+    /// about to be resolved as an actual query source, wherever that resolution happens to
+    /// enter -- <see cref="TryGetView"/>'s SELECT-side lookup, and the INSTEAD OF trigger DML
+    /// paths (PerformInsteadOfInsert/Update/Delete in EmbeddedDatabase.Triggers.cs) that look up
+    /// <c>context.Views</c> directly rather than through <see cref="TryGetView"/>. Centralized
+    /// here (rather than duplicated at every call site) and in <see cref="ResolveViewColumns"/>
+    /// and <see cref="GetViewRows"/>, the two primitives every one of those paths ultimately
+    /// calls, so a caller cannot accidentally reintroduce the gap by adding a new direct
+    /// <c>context.Views.TryGetValue</c> lookup that forgets the check.
+    /// </summary>
+    private static void ThrowIfBroken(ViewDefinition view, string name)
+    {
+        if (view.BrokenReason is { } reason)
+        {
+            throw new EmbeddedSqlException(
+                $"view '{name}' could not be loaded: its SQL in sqlite_schema does not parse ({reason}). "
+                    + "Use DROP VIEW to remove it, then recreate it.");
+        }
     }
 
     // Enters a view's resolution scope, guarding against direct or mutual recursion and
@@ -36233,9 +37373,12 @@ out bool hasReturning)
     }
 
     private static string[] ResolveViewColumns(ViewDefinition view, QueryContext viewContext)
-        => viewContext.SchemaValidation && view.Columns is not null
+    {
+        ThrowIfBroken(view, view.Name);
+        return viewContext.SchemaValidation && view.Columns is not null
             ? view.Columns.ToArray()
             : ApplyViewColumnNames(view, DescribeQuery(view.Query, viewContext));
+    }
 
     private static string[] ApplyViewColumnNames(ViewDefinition view, string[] queryColumns)
     {
@@ -36396,6 +37539,11 @@ out bool hasReturning)
                 SqlIdentifierFormatter.QuoteIfNeeded(keyColumn.Name)
                 + (keyColumn.Collation is { } collation ? " COLLATE " + collation : string.Empty)
                 + (keyColumn.Descending ? " DESC" : string.Empty)
+                + (keyColumn.NullPlacement == NullPlacement.First
+                    ? " NULLS FIRST"
+                    : keyColumn.NullPlacement == NullPlacement.Last
+                        ? " NULLS LAST"
+                        : string.Empty)
                 + (keyColumn.AutoIncrement ? " AUTOINCREMENT" : string.Empty));
             tableKeyConstraints.Add((
                 table.TablePrimaryKeyDeclarationOrder ?? -1,
@@ -36412,7 +37560,12 @@ out bool hasReturning)
             var keyColumns = unique.Columns.Select(keyColumn =>
                 SqlIdentifierFormatter.QuoteIfNeeded(keyColumn.Name)
                 + (keyColumn.Collation is { } collation ? " COLLATE " + collation : string.Empty)
-                + (keyColumn.Descending ? " DESC" : string.Empty));
+                + (keyColumn.Descending ? " DESC" : string.Empty)
+                + (keyColumn.NullPlacement == NullPlacement.First
+                    ? " NULLS FIRST"
+                    : keyColumn.NullPlacement == NullPlacement.Last
+                        ? " NULLS LAST"
+                        : string.Empty));
             tableKeyConstraints.Add((
                 unique.DeclarationOrder,
                 index + 1,
@@ -37290,11 +38443,13 @@ out bool hasReturning)
 
     private static IReadOnlyList<QueryAffinityColumn> DescribeCommonTableExpressionBodyAffinities(
         ParsedStatement body,
+        string cteName,
+        IReadOnlyList<string>? declaredColumns,
         QueryContext context,
         Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
     {
         if (body is QueryStatement query)
-            return DescribeQueryAffinities(query, context, commonTableExpressions);
+            return DescribeRecursiveAwareQueryAffinities(query, cteName, declaredColumns, context, commonTableExpressions);
         if (!TryGetReturning(body, out var tableName, out var returning))
             return [];
 
@@ -37312,11 +38467,76 @@ out bool hasReturning)
         return DescribeSelectAffinities(select, context, commonTableExpressions);
     }
 
+    // Describes a CTE body's affinities, pre-seeding the CTE's own affinity metadata from
+    // just its anchor arm(s) before describing a self-referencing recursive arm. Without
+    // this, describing (without executing, as CREATE TABLE AS SELECT's own describer does)
+    // a recursive CTE's compound body would need the CTE's own metadata to describe the very
+    // arm that produces it. Mirrors Turso's planner deriving a recursive CTE's input
+    // metadata from its initial query before its recursive query is planned
+    // (core/translate/planner.rs prepare_recursive_cte_plan / plan.rs). The anchor's own
+    // column names are renamed to the CTE's declared names (when given and matching in
+    // count) before seeding, so a recursive arm that refers to the CTE by its declared
+    // column names (rather than the anchor's own projection names) still resolves.
+    private static IReadOnlyList<QueryAffinityColumn> DescribeRecursiveAwareQueryAffinities(
+        QueryStatement query,
+        string cteName,
+        IReadOnlyList<string>? declaredColumns,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        if (query is not CompoundSelectStatement compound)
+            return DescribeQueryAffinities(query, context, commonTableExpressions);
+
+        var scope = new List<(string Name, int Weight)>();
+        var firstRecursiveIndex = -1;
+        for (var index = 0; index < compound.Terms.Count; index++)
+        {
+            if (CountRecursiveReferencesInArm(compound.Terms[index], scope, cteName).TotalCount > 0)
+            {
+                firstRecursiveIndex = index;
+                break;
+            }
+        }
+
+        if (firstRecursiveIndex <= 0)
+            return DescribeQueryAffinities(query, context, commonTableExpressions);
+
+        QueryStatement anchorOnly = firstRecursiveIndex == 1
+            ? compound.Terms[0]
+            : new CompoundSelectStatement(
+                compound.Terms.Take(firstRecursiveIndex).ToArray(),
+                compound.Operators.Take(firstRecursiveIndex - 1).ToArray(),
+                [],
+                null,
+                null);
+        var anchorColumns = DescribeQueryAffinities(anchorOnly, context, commonTableExpressions);
+        if (declaredColumns is not null && declaredColumns.Count == anchorColumns.Count)
+        {
+            anchorColumns = anchorColumns
+                .Select((column, index) => column with { Name = declaredColumns[index] })
+                .ToArray();
+        }
+
+        var seededCommonTableExpressions = new Dictionary<string, IReadOnlyList<QueryAffinityColumn>>(
+            commonTableExpressions, StringComparer.OrdinalIgnoreCase)
+        {
+            [cteName] = anchorColumns,
+        };
+        return DescribeCompoundAffinities(compound, context, seededCommonTableExpressions);
+    }
+
     private sealed record QueryAffinityColumn(
         string? Qualifier,
         string Name,
         ColumnAffinity Affinity,
-        string? DeclaredType = null);
+        string? DeclaredType = null,
+        // True when Affinity came from a real declared source (a column, CAST, or a
+        // recursively-derived subquery/compound result built from one) rather than from an
+        // expression with no affinity at all (a literal, function call, or arithmetic
+        // result) that merely defaults to Blob. Mirrors Turso's ExprAffinityInfo::has_affinity
+        // (core/translate/expr/affinity.rs): only a genuinely declared BLOB affinity blocks
+        // the datatype3 4.2 rule 2 TEXT-coercion an affinity-less operand still receives.
+        bool HasAffinity = true);
 
     private static IReadOnlyList<QueryAffinityColumn> DescribeQueryAffinities(
         QueryStatement statement,
@@ -37329,7 +38549,7 @@ out bool hasReturning)
             CompoundSelectStatement compound => DescribeCompoundAffinities(compound, context, commonTableExpressions),
             WithSelectStatement with => DescribeWithSelectAffinities(with, context, commonTableExpressions),
             ValuesClause values => Enumerable.Range(0, values.Rows[0].Count)
-                .Select(index => new QueryAffinityColumn(null, $"column{index + 1}", ColumnAffinity.Blob))
+                .Select(index => new QueryAffinityColumn(null, $"column{index + 1}", ColumnAffinity.Blob, HasAffinity: false))
                 .ToArray(),
             _ => throw new EmbeddedSqlException($"Unsupported query type {statement.GetType().Name}."),
         };
@@ -37344,7 +38564,8 @@ out bool hasReturning)
                 column.Qualifier,
                 column.Name,
                 column.Affinity,
-                column.DeclaredType))
+                column.DeclaredType,
+                column.HasAffinity))
             .ToArray();
 
     // One result column of a single SELECT arm, carrying both its comparison affinity and
@@ -37354,7 +38575,9 @@ out bool hasReturning)
         string Name,
         ColumnAffinity Affinity,
         StorageClassMask Data,
-        string? DeclaredType = null);
+        string? DeclaredType = null,
+        // See QueryAffinityColumn.HasAffinity.
+        bool HasAffinity = true);
 
     private static IReadOnlyList<ArmColumn> DescribeSelectArmColumns(
         SelectStatement statement,
@@ -37375,7 +38598,8 @@ out bool hasReturning)
                     column.Name,
                     column.Affinity,
                     StorageClassFromAffinity(column.Affinity),
-                    column.DeclaredType)));
+                    column.DeclaredType,
+                    column.HasAffinity)));
                 continue;
             }
 
@@ -37394,16 +38618,20 @@ out bool hasReturning)
                     column.Name,
                     column.Affinity,
                     StorageClassFromAffinity(column.Affinity),
-                    column.DeclaredType)));
+                    column.DeclaredType,
+                    column.HasAffinity)));
                 continue;
             }
 
+            var (projectionAffinity, projectionHasAffinity) = GetExpressionAffinity(
+                projection.Expression, output, context, commonTableExpressions);
             result.Add(new ArmColumn(
                 null,
                 GetProjectionName(projection),
-                GetExpressionAffinity(projection.Expression, output, context, commonTableExpressions),
+                projectionAffinity,
                 GetExpressionStorageClassMask(projection.Expression, output, context, commonTableExpressions),
-                GetExpressionDeclaredType(projection.Expression, output, context, commonTableExpressions)));
+                GetExpressionDeclaredType(projection.Expression, output, context, commonTableExpressions),
+                projectionHasAffinity));
         }
 
         return result;
@@ -37460,7 +38688,7 @@ out bool hasReturning)
             case ColumnExpression:
             case ScalarSubqueryExpression:
                 return StorageClassFromAffinity(
-                    GetExpressionAffinity(expression, sourceColumns, context, commonTableExpressions));
+                    GetExpressionAffinity(expression, sourceColumns, context, commonTableExpressions).Affinity);
             default:
                 return StorageClassMask.Numeric;
         }
@@ -37478,7 +38706,7 @@ out bool hasReturning)
         {
             SelectStatement select => DescribeSelectArmColumns(select, context, commonTableExpressions),
             ValuesClause values => Enumerable.Range(0, values.Rows[0].Count)
-                .Select(index => new ArmColumn(null, $"column{index + 1}", ColumnAffinity.Blob, StorageClassMask.All))
+                .Select(index => new ArmColumn(null, $"column{index + 1}", ColumnAffinity.Blob, StorageClassMask.All, HasAffinity: false))
                 .ToArray(),
             _ => DescribeQueryAffinities(statement, context, commonTableExpressions)
                 .Select(column => new ArmColumn(
@@ -37486,41 +38714,49 @@ out bool hasReturning)
                     column.Name,
                     column.Affinity,
                     StorageClassFromAffinity(column.Affinity),
-                    column.DeclaredType))
+                    column.DeclaredType,
+                    column.HasAffinity))
                 .ToArray(),
         };
     }
 
     // The combined affinity of one column across all arms of a compound SELECT, an exact
-    // port of Turso's compound_column_affinity (core/translate/plan.rs). A column keeps its
-    // first non-BLOB arm's affinity unless a later arm can produce a storage class that
-    // forces the result to BLOB (text arm with a numeric-producing arm, or vice versa).
-    private static ColumnAffinity CompoundColumnAffinity(
+    // port of Turso's compound_column_affinity (core/translate/plan.rs). Scanning arms
+    // left-to-right, the result keeps the first arm's affinity that actually HasAffinity -
+    // not merely the first arm whose *value* happens to be Blob, since a genuinely declared
+    // BLOB arm (a real column/CAST) stops the scan immediately just like any other declared
+    // affinity (from-subquery-affinity.sqltest::derived-table-compound-select-real-blob-
+    // leading-arm-not-skipped) - unless a later arm can produce a storage class that forces
+    // the result to BLOB (text arm with a numeric-producing arm, or vice versa). Only when
+    // every arm has no affinity at all does the column itself end up with no affinity.
+    private static (ColumnAffinity Affinity, bool HasAffinity) CompoundColumnAffinity(
         IReadOnlyList<IReadOnlyList<ArmColumn>> arms,
         int index)
     {
         var affinity = arms[0][index].Affinity;
+        var hasAffinity = arms[0][index].HasAffinity;
         var dataTypes = StorageClassMask.None;
         var armIndex = 0;
-        while (affinity == ColumnAffinity.Blob && armIndex + 1 < arms.Count)
+        while (!hasAffinity && armIndex + 1 < arms.Count)
         {
             dataTypes |= arms[armIndex][index].Data;
             armIndex++;
             affinity = arms[armIndex][index].Affinity;
+            hasAffinity = arms[armIndex][index].HasAffinity;
         }
 
-        if (affinity == ColumnAffinity.Blob)
-            return ColumnAffinity.Blob;
+        if (!hasAffinity)
+            return (ColumnAffinity.Blob, false);
 
         for (var other = armIndex + 1; other < arms.Count; other++)
             dataTypes |= arms[other][index].Data;
 
         if (affinity == ColumnAffinity.Text && dataTypes.HasFlag(StorageClassMask.Numeric))
-            return ColumnAffinity.Blob;
+            return (ColumnAffinity.Blob, true);
         if (IsNumericAffinity(affinity) && dataTypes.HasFlag(StorageClassMask.Text))
-            return ColumnAffinity.Blob;
+            return (ColumnAffinity.Blob, true);
 
-        return affinity;
+        return (affinity, true);
     }
 
     private static IReadOnlyList<QueryAffinityColumn> DescribeCompoundAffinities(
@@ -37544,7 +38780,7 @@ out bool hasReturning)
         var result = new List<QueryAffinityColumn>(width);
         for (var index = 0; index < width; index++)
         {
-            var affinity = CompoundColumnAffinity(arms, index);
+            var (affinity, hasAffinity) = CompoundColumnAffinity(arms, index);
             result.Add(new QueryAffinityColumn(
                 null,
                 arms[0][index].Name,
@@ -37552,7 +38788,8 @@ out bool hasReturning)
                 // The pragma/view column-type walk reports the first branch's declared type
                 // (its pre-existing behavior); the compound affinity above is what comparison
                 // threading consumes, and it re-derives the declared type independently.
-                arms[0][index].DeclaredType));
+                arms[0][index].DeclaredType,
+                hasAffinity));
         }
 
         return result;
@@ -37572,7 +38809,12 @@ out bool hasReturning)
 
     // Builds the static CTE affinity map consumed by DescribeQueryAffinities from the
     // runtime-materialized CTEs carried on a QueryContext, recovering each column's
-    // affinity from the threaded column definitions (BLOB when unavailable).
+    // affinity - and now its HasAffinity bit - from the threaded column definitions.
+    // BuildSourceColumnDefinitionsFromAffinities only omits a definition for a genuinely
+    // affinity-less column (HasAffinity false and no custom collation), so "has a
+    // definition" is exactly HasAffinity here; a missing definition reports Blob/false
+    // (no affinity), matching a bare literal (ManagedSqlBindingParityTests.
+    // DeclaredBlobAndAbsentAffinityRemainDistinct).
     private static Dictionary<string, IReadOnlyList<QueryAffinityColumn>> BuildAffinityMapFromRuntimeCtes(
         IReadOnlyDictionary<string, SourceData> runtimeCtes)
     {
@@ -37581,19 +38823,18 @@ out bool hasReturning)
         {
             var definitions = entry.Value.ColumnDefinitions;
             map[entry.Key] = entry.Value.Columns
-                .Select((column, index) => new QueryAffinityColumn(
-                    null,
-                    column,
-                    definitions is not null
-                        && index < definitions.Count
-                        && definitions[index] is { } definition
-                        ? EmbeddedTable.GetAffinity(definition.DeclaredType)
-                        : ColumnAffinity.Blob,
-                    definitions is not null
-                        && index < definitions.Count
-                        && definitions[index] is { } declaredDefinition
-                        ? declaredDefinition.DeclaredType
-                        : null))
+                .Select((column, index) =>
+                {
+                    var definition = definitions is not null && index < definitions.Count
+                        ? definitions[index]
+                        : null;
+                    return new QueryAffinityColumn(
+                        null,
+                        column,
+                        definition is not null ? EmbeddedTable.GetAffinity(definition.DeclaredType) : ColumnAffinity.Blob,
+                        definition?.DeclaredType,
+                        HasAffinity: definition is not null);
+                })
                 .ToArray();
         }
 
@@ -37602,9 +38843,15 @@ out bool hasReturning)
 
     // Materializes per-column definitions for a derived/CTE row source from a query's
     // described affinities so comparisons against its columns apply SQLite's affinity
-    // rules. BLOB-affinity columns carry no definition (no affinity), matching SQLite,
-    // unless the query output column carries a declared collation — then the definition
-    // exists only to expose that collation to comparisons.
+    // rules. A column with no declared affinity at all carries no definition (matching
+    // SQLite: a literal/computed-expression column has no affinity), unless the query
+    // output column carries a declared collation - then the definition exists only to
+    // expose that collation to comparisons. A genuinely declared BLOB column (a real
+    // column, CAST, or something derived from one - see QueryAffinityColumn.HasAffinity)
+    // still gets a real definition even though its DeclaredType is null: GetAffinity(null)
+    // resolves back to BLOB, keeping it distinct from "no affinity" for the datatype3 4.2
+    // rule 2 TEXT-coercion comparisons apply (ManagedSqlBindingParityTests.
+    // DeclaredBlobAndAbsentAffinityRemainDistinct).
     private static IReadOnlyList<EmbeddedColumn?> BuildSourceColumnDefinitionsFromAffinities(
         IReadOnlyList<QueryAffinityColumn> affinities,
         string[] outputColumns,
@@ -37618,7 +38865,7 @@ out bool hasReturning)
             var collation = collations is not null && index < collations.Count
                 ? NormalizeDeclaredCollation(collations[index])
                 : null;
-            if (affinity == ColumnAffinity.Blob
+            if (!affinities[index].HasAffinity
                 && (collation is null || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase)))
             {
                 definitions[index] = null;
@@ -37698,6 +38945,8 @@ out bool hasReturning)
 
             var columns = DescribeCommonTableExpressionBodyAffinities(
                 cte.Body,
+                cte.Name,
+                cte.Columns,
                 context with { CommonTableExpressions = runtimeCtes },
                 ctes).ToArray();
             if (cte.Columns is { } declared)
@@ -37814,7 +39063,13 @@ out bool hasReturning)
         string? qualifier)
         => columns.Select(column => column with { Qualifier = qualifier }).ToArray();
 
-    private static ColumnAffinity GetExpressionAffinity(
+    // Resolves an expression's comparison affinity together with whether that affinity is
+    // genuinely declared (a column, CAST, or something recursively derived from one) as
+    // opposed to an expression with no affinity at all (a literal, function call, or
+    // arithmetic result) that has nothing better to report than Blob. Mirrors Turso's
+    // get_expr_affinity_info (core/translate/expr/affinity.rs): only the former blocks the
+    // datatype3 4.2 rule 2 TEXT-coercion an affinity-less operand still receives.
+    private static (ColumnAffinity Affinity, bool HasAffinity) GetExpressionAffinity(
         Expression expression,
         IReadOnlyList<QueryAffinityColumn> sourceColumns,
         QueryContext context,
@@ -37829,7 +39084,7 @@ out bool hasReturning)
                 commonTableExpressions);
         }
         if (expression is CastExpression cast)
-            return EmbeddedTable.GetAffinity(cast.TypeName);
+            return (EmbeddedTable.GetAffinity(cast.TypeName), true);
         if (expression is ScalarSubqueryExpression { Query: SelectStatement { Source: null } select }
             && select.Projections.Count == 1)
         {
@@ -37845,10 +39100,12 @@ out bool hasReturning)
                 scalarSubquery.Query,
                 context,
                 commonTableExpressions);
-            return columns.Count == 1 ? columns[0].Affinity : ColumnAffinity.Blob;
+            return columns.Count == 1
+                ? (columns[0].Affinity, columns[0].HasAffinity)
+                : (ColumnAffinity.Blob, false);
         }
         if (expression is not ColumnExpression column)
-            return ColumnAffinity.Blob;
+            return (ColumnAffinity.Blob, false);
 
         var name = column.UnqualifiedName ?? column.Name[(column.Name.LastIndexOf('.') + 1)..];
         var matches = sourceColumns.Where(candidate =>
@@ -37856,7 +39113,9 @@ out bool hasReturning)
             && (column.Qualifier is null
                 || string.Equals(candidate.Qualifier, column.Qualifier, StringComparison.OrdinalIgnoreCase)))
             .ToArray();
-        return matches.Length == 1 ? matches[0].Affinity : ColumnAffinity.Blob;
+        return matches.Length == 1
+            ? (matches[0].Affinity, matches[0].HasAffinity)
+            : (ColumnAffinity.Blob, false);
     }
 
     // Derives the declared-type string SQLite's table-valued PRAGMA functions report
@@ -38022,6 +39281,13 @@ out bool hasReturning)
             },
             ParameterExpression parameter => ReadParameter(parameters, parameter.Index),
             RowValueExpression => throw new EmbeddedSqlException("row value misused"),
+            // Only meaningful in an INSERT statement's VALUES row list, where BuildInsertRow
+            // intercepts it before evaluation. ValidateExpressionIndexDirectives already
+            // rejects a SELECT-shaped DEFAULT at prepare time; this is a defense-in-depth
+            // backstop for any statement family that reaches evaluation without going through
+            // that validator. Mirrors Turso's translator.rs/condition.rs diagnostic text.
+            DefaultValueExpression => throw new EmbeddedSqlException(
+                "DEFAULT is only valid in INSERT VALUES"),
             ColumnExpression column => EvaluateColumn(column, row, context),
             RaiseExpression raise => EvaluateRaise(raise, parameters, row, context),
             FunctionExpression function => EvaluateFunctionRespectingOuterAggregateScope(function, parameters, row, context),
@@ -39743,7 +41009,7 @@ out bool hasReturning)
                 throw new EmbeddedSqlException("FULL OUTER JOIN chaining is not yet supported");
         }
 
-        if (ContainsCorrelatedSubqueryReferencingFromSources(statement))
+        if (ContainsCorrelatedSubqueryReferencingFullJoinNullSide(statement, fullOuterJoins))
         {
             throw new EmbeddedSqlException(
                 "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables");
@@ -39815,10 +41081,35 @@ out bool hasReturning)
                 || ContainsOuterJoin(join.Right));
     }
 
-    private static bool ContainsCorrelatedSubqueryReferencingFromSources(SelectStatement statement)
+    // A correlated subquery confined to a FULL JOIN's always-present side is evaluated as
+    // an ordinary per-row WHERE filter after the FULL JOIN materializes its null-padded
+    // rows: RewriteCorrelatedSubqueriesAsJoins already declines the semi/anti-join rewrite
+    // whenever any outer join is present (SourceContainsOuterJoin), so the correlated
+    // subquery keeps its normal three-valued evaluation against whatever row the FULL JOIN
+    // produced, including a null-padded one - the same answer a plain SQL WHERE clause
+    // gives. The chaining guard above (ContainsOuterJoin(fullOuterJoin.Left)) already
+    // proves that side holds no independent outer join of its own, so nothing there can be
+    // null-padded except by this same FULL JOIN, as a unit. Only a reference into a FULL
+    // JOIN's own right side - the side whose match-or-not decides the null padding, and
+    // whose planning Turso's join-order search cannot always complete
+    // (core/translate/optimizer/join.rs:1340-1365) - stays rejected.
+    private static bool ContainsCorrelatedSubqueryReferencingFullJoinNullSide(
+        SelectStatement statement,
+        IReadOnlyList<JoinTableSource> fullOuterJoins)
     {
-        var fromNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        CollectFromSourceNames(statement.Source, fromNames);
+        var unsafeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var fullOuterJoin in fullOuterJoins)
+            CollectFromSourceNames(fullOuterJoin.Right, unsafeNames);
+        if (unsafeNames.Count == 0)
+            return false;
+
+        return ContainsCorrelatedSubqueryReferencingFromSources(statement, unsafeNames);
+    }
+
+    private static bool ContainsCorrelatedSubqueryReferencingFromSources(
+        SelectStatement statement,
+        HashSet<string> fromNames)
+    {
         if (fromNames.Count == 0)
             return false;
 
@@ -40806,7 +42097,8 @@ out bool hasReturning)
         FunctionExpression function,
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        SourceRow? representative = null)
     {
         var effectiveRows = ApplyAggregateModifiers(function, rows, parameters, context);
         if (string.Equals(function.Name, "COUNT", StringComparison.Ordinal))
@@ -40814,7 +42106,7 @@ out bool hasReturning)
         if (IsBuiltInAggregate(function))
             return EvaluateBuiltInAggregate(function, effectiveRows, parameters, context);
         if (IsManagedPercentileAggregate(function.Name))
-            return EvaluatePercentileAggregate(function, effectiveRows, parameters, context);
+            return EvaluatePercentileAggregate(function, effectiveRows, parameters, context, representative);
         if (TryGetAggregateFunction(function.Name, function.Arguments.Count, out var aggregate))
             return EvaluateManagedAggregate(aggregate, function, effectiveRows, parameters, context);
 
@@ -41094,7 +42386,7 @@ out bool hasReturning)
                 return EvaluateAggregateFunction(function, scope.Rows, parameters, scope.Context);
             }
         }
-        return EvaluateAggregateFunction(function, rows, parameters, context);
+        return EvaluateAggregateFunction(function, rows, parameters, context, representative);
     }
 
     // Decides whether every column an aggregate call references (arguments plus FILTER)
@@ -41183,6 +42475,162 @@ out bool hasReturning)
 
     private static bool TryResolveColumnLocally(SourceRow row, ColumnExpression column)
         => (row.Parent is null ? row : row with { Parent = null }).TryGetValue(column, out _);
+
+    /// <summary>
+    /// True when an ordered-set aggregate's direct (fraction) argument is not a valid constant
+    /// with respect to its own input rows: it references a column that resolves against
+    /// <paramref name="localRow"/> (ignoring any Parent chain, so an outer correlation is not
+    /// mistaken for a local reference), or it contains a subquery anywhere — conservatively
+    /// rejected because a nested query's own scope is not visible from here. Mirrors
+    /// PostgreSQL's rejection of <c>percentile_cont(x) WITHIN GROUP (ORDER BY x)</c> and the
+    /// pinned corpus's <c>ordered-set-*-fraction-rejected</c> family.
+    /// </summary>
+    private static bool OrderedSetFractionReferencesLocalInput(Expression fraction, SourceRow? localRow)
+    {
+        var rejected = false;
+        ForEachExpression(fraction, candidate =>
+        {
+            switch (candidate)
+            {
+                case ScalarSubqueryExpression or ExistsExpression or InSubqueryExpression:
+                    rejected = true;
+                    return false;
+                case ColumnExpression column when localRow is not null && TryResolveColumnLocally(localRow, column):
+                    rejected = true;
+                    return false;
+                default:
+                    return true;
+            }
+        });
+
+        return rejected;
+    }
+
+    // ContainsAggregate/ContainsAggregateAcrossWindows never look inside a subquery
+    // boundary (a scalar/EXISTS/IN subquery has its own scope), so they cannot see an
+    // aggregate call written inside one whose argument columns actually belong to
+    // `statement`'s own FROM. SQLite's resolveExprStep walks outward through enclosing
+    // scopes and binds such a call to whichever one owns the column it references,
+    // marking that scope aggregate-bearing (NC_HasAgg) even though the call is written
+    // one level down (aggregate-of-outer-column.sqltest). This detects that shape so
+    // ExecuteSelect can fold it into `hasAggregate` before picking between the per-row
+    // and per-group/aggregate execution shapes; TryEvaluateOuterScopedAggregate performs
+    // the matching per-row redirect once this block's aggregate pass exposes its rows as
+    // an OuterAggregateScope.
+    private bool ContainsOuterOwnedAggregate(SelectStatement statement, QueryContext context)
+    {
+        if (statement.Source is null)
+            return false;
+
+        var outerProbe = CreateQuerySchemaValidationRow(
+            statement.Source,
+            context,
+            GetSourceColumns(statement.Source, context),
+            GetOutputColumns(statement.Source, context),
+            outerRow: null);
+
+        return statement.Projections.Any(projection =>
+                ExpressionHoldsOuterOwnedAggregate(projection.Expression, outerProbe, context))
+            || (statement.Having is not null
+                && ExpressionHoldsOuterOwnedAggregate(statement.Having, outerProbe, context))
+            || statement.OrderBy.Any(term =>
+                ExpressionHoldsOuterOwnedAggregate(term.Expression, outerProbe, context));
+    }
+
+    // Walks an expression tree looking for a nested scalar/EXISTS/IN subquery whose own
+    // aggregate calls resolve against `outerProbe` instead of the subquery's own FROM. A
+    // subquery nested more than one level down is left alone: TryEvaluateOuterScopedAggregate's
+    // per-row redirect already covers ownership further out, once an immediate ancestor is
+    // marked aggregate-bearing by this same detection at its own level. Does not itself count
+    // a direct aggregate call at this level - ContainsAggregate/ContainsAggregateAcrossWindows
+    // already do that - only its arguments are walked, in case they hold a further subquery.
+    private bool ExpressionHoldsOuterOwnedAggregate(Expression? expression, SourceRow outerProbe, QueryContext context)
+    {
+        switch (expression)
+        {
+            case null:
+                return false;
+            case ScalarSubqueryExpression { Query: SelectStatement innerScalar }:
+                return SelectHasAggregateOwnedByOuter(innerScalar, outerProbe, context);
+            case ExistsExpression { Query: SelectStatement innerExists }:
+                return SelectHasAggregateOwnedByOuter(innerExists, outerProbe, context);
+            case InSubqueryExpression inSubquery:
+                return ExpressionHoldsOuterOwnedAggregate(inSubquery.Value, outerProbe, context)
+                    || (inSubquery.Query is SelectStatement innerIn
+                        && SelectHasAggregateOwnedByOuter(innerIn, outerProbe, context));
+            case RowValueExpression rowValue:
+                return rowValue.Values.Any(value => ExpressionHoldsOuterOwnedAggregate(value, outerProbe, context));
+            case UnaryExpression unary:
+                return ExpressionHoldsOuterOwnedAggregate(unary.Operand, outerProbe, context);
+            case BinaryExpression binary:
+                return ExpressionHoldsOuterOwnedAggregate(binary.Left, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(binary.Right, outerProbe, context);
+            case CollationExpression collation:
+                return ExpressionHoldsOuterOwnedAggregate(collation.Expression, outerProbe, context);
+            case CastExpression cast:
+                return ExpressionHoldsOuterOwnedAggregate(cast.Expression, outerProbe, context);
+            case CaseExpression @case:
+                return (@case.Operand is not null && ExpressionHoldsOuterOwnedAggregate(@case.Operand, outerProbe, context))
+                    || @case.Clauses.Any(clause =>
+                        ExpressionHoldsOuterOwnedAggregate(clause.When, outerProbe, context)
+                        || ExpressionHoldsOuterOwnedAggregate(clause.Then, outerProbe, context))
+                    || (@case.Else is not null && ExpressionHoldsOuterOwnedAggregate(@case.Else, outerProbe, context));
+            case LikeExpression like:
+                return ExpressionHoldsOuterOwnedAggregate(like.Value, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(like.Pattern, outerProbe, context)
+                    || (like.Escape is not null && ExpressionHoldsOuterOwnedAggregate(like.Escape, outerProbe, context));
+            case GlobExpression glob:
+                return ExpressionHoldsOuterOwnedAggregate(glob.Value, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(glob.Pattern, outerProbe, context);
+            case InExpression @in:
+                return ExpressionHoldsOuterOwnedAggregate(@in.Value, outerProbe, context)
+                    || @in.Values.Any(value => ExpressionHoldsOuterOwnedAggregate(value, outerProbe, context));
+            case BetweenExpression between:
+                return ExpressionHoldsOuterOwnedAggregate(between.Value, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(between.Lower, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(between.Upper, outerProbe, context);
+            case FunctionExpression function:
+                return function.Arguments.Any(argument => ExpressionHoldsOuterOwnedAggregate(argument, outerProbe, context))
+                    || (function.Filter is not null && ExpressionHoldsOuterOwnedAggregate(function.Filter, outerProbe, context));
+            default:
+                return false;
+        }
+    }
+
+    // A subquery's own aggregate calls resolve against its own FROM first (SQL's shadowing
+    // rule keeps the nearest owner); only a call whose columns cannot resolve there but do
+    // resolve against `outerProbe` is an aggregate of the outer query.
+    private bool SelectHasAggregateOwnedByOuter(SelectStatement inner, SourceRow outerProbe, QueryContext context)
+    {
+        var aggregates = new List<FunctionExpression>();
+        foreach (var projection in inner.Projections)
+            CollectNonWindowAggregates(projection.Expression, aggregates);
+        if (inner.Having is not null)
+            CollectNonWindowAggregates(inner.Having, aggregates);
+        foreach (var term in inner.OrderBy)
+            CollectNonWindowAggregates(term.Expression, aggregates);
+        if (aggregates.Count == 0)
+            return false;
+
+        var innerProbe = inner.Source is null
+            ? null
+            : CreateQuerySchemaValidationRow(
+                inner.Source,
+                context,
+                GetSourceColumns(inner.Source, context),
+                GetOutputColumns(inner.Source, context),
+                outerRow: null);
+
+        foreach (var aggregate in aggregates)
+        {
+            if (AggregateColumnsResolveLocally(aggregate, innerProbe) is true)
+                continue;
+            if (AggregateColumnsResolveLocally(aggregate, outerProbe) is true)
+                return true;
+        }
+
+        return false;
+    }
 
     // True when every aggregate call this statement evaluates belongs to an enclosing
     // aggregate block. With selected rows, ownership is probed against the first row: a
@@ -41356,12 +42804,26 @@ out bool hasReturning)
     {
         private readonly bool _maximum;
         private readonly Func<SqlValue, SqlValue, string?, int> _compare;
+        private readonly string? _collation;
+        // Growing (UNBOUNDED PRECEDING start, no eviction) frames — and ordinary, non-window
+        // MIN/MAX — keep the first-seen representative on a tie, matching every plain aggregate.
+        // Only a genuinely moving frame (rows actually retired via Remove) uses Turso's
+        // collated(value, sequence) ephemeral index, whose newest-equal member represents the
+        // extremum. Defaults to false so any caller that doesn't pass this explicitly keeps the
+        // ordinary (first-wins) behavior.
+        private readonly bool _preferNewestOnTie;
         private readonly List<SqlValue> _values = [];
 
-        internal ExtremumAggregateAccumulator(bool maximum, Func<SqlValue, SqlValue, string?, int> compare)
+        internal ExtremumAggregateAccumulator(
+            bool maximum,
+            Func<SqlValue, SqlValue, string?, int> compare,
+            string? collation = null,
+            bool preferNewestOnTie = false)
         {
             _maximum = maximum;
             _compare = compare;
+            _collation = collation;
+            _preferNewestOnTie = preferNewestOnTie;
         }
 
         internal void Add(SqlValue value)
@@ -41394,16 +42856,115 @@ out bool hasReturning)
             if (_values.Count == 0)
                 return SqlValue.Null;
 
+            // Moving frames mirror Turso's collated(value, sequence) ephemeral index: among
+            // argument-collation ties, the most recently added (highest sequence) member
+            // represents the extremum, so the scan uses a non-strict comparison and lets later
+            // members win on ties. Growing frames and ordinary aggregates use a strict comparison
+            // so the first-seen member wins instead.
             var extremum = _values[0];
             for (var index = 1; index < _values.Count; index++)
             {
-                var comparison = _compare(_values[index], extremum, null);
-                if (_maximum ? comparison > 0 : comparison < 0)
+                var comparison = _compare(_values[index], extremum, _collation);
+                var replaces = _preferNewestOnTie
+                    ? (_maximum ? comparison >= 0 : comparison <= 0)
+                    : (_maximum ? comparison > 0 : comparison < 0);
+                if (replaces)
                     extremum = _values[index];
             }
 
             return extremum;
         }
+    }
+
+    /// <summary>
+    /// Incremental GROUP_CONCAT/STRING_AGG accumulator mirroring Turso's
+    /// GroupConcat/StringAgg step/inverse (execute.rs): tracks the rendered
+    /// buffer, a running count, the length of the separator that would be
+    /// used for the first value (recorded lazily, only while the buffer is
+    /// still empty), and a FIFO queue of the actual separator lengths used
+    /// for every subsequent value. Removing the head value strips that
+    /// value's own text plus the separator that preceded the *next*
+    /// remaining value (which becomes the new, separator-less head); if
+    /// that empties the rendered buffer, the accumulator resets to its
+    /// initial "no value yet" state exactly like Turso's Null sentinel, so
+    /// a following Add never prepends a stale separator.
+    /// </summary>
+    private sealed class GroupConcatAggregateAccumulator
+    {
+        private System.Text.StringBuilder? _buffer;
+        private long _count;
+        private int _firstSeparatorLength;
+        private readonly Queue<int> _separatorLengths = new();
+
+        internal void Add(SqlValue value, SqlValue separator)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+
+            var firstTerm = _buffer is null;
+            if (firstTerm)
+            {
+                _buffer = new System.Text.StringBuilder();
+                _firstSeparatorLength = separator.Kind == SqlValueKind.Null ? 0 : ToSqlText(separator).Length;
+            }
+            else
+            {
+                var before = _buffer!.Length;
+                if (separator.Kind != SqlValueKind.Null)
+                    _buffer.Append(ToSqlText(separator));
+                var separatorLength = _buffer.Length - before;
+                if (separatorLength != _firstSeparatorLength || _separatorLengths.Count > 0)
+                {
+                    if (_separatorLengths.Count == 0)
+                    {
+                        // First divergence from the uniform first_separator_len: every separator
+                        // used so far (there are _count - 1 of them, one before each of the
+                        // _count values already accumulated) was implicitly first_separator_len
+                        // and was never explicitly recorded. Backfill them now so a later Remove
+                        // dequeues the length that was *actually* used for that gap, mirroring
+                        // Turso's prior_separator_count backfill (execute.rs update_agg_payload).
+                        for (var index = 0; index < _count - 1; index++)
+                            _separatorLengths.Enqueue(_firstSeparatorLength);
+                    }
+
+                    _separatorLengths.Enqueue(separatorLength);
+                }
+            }
+
+            _buffer!.Append(ToSqlText(value));
+            _count++;
+        }
+
+        internal void Remove(SqlValue value)
+        {
+            if (value.Kind == SqlValueKind.Null)
+                return;
+            if (_buffer is null || _count == 0)
+                throw new InvalidOperationException("Aggregate inverse removed a row from an empty group_concat.");
+
+            var valueLength = ToSqlText(value).Length;
+            _count--;
+            int separatorLength;
+            if (_separatorLengths.Count > 0 && _count > 0)
+                separatorLength = _separatorLengths.Dequeue();
+            else if (_separatorLengths.Count == 0)
+                separatorLength = _firstSeparatorLength;
+            else
+                separatorLength = 0;
+
+            var removeLength = valueLength + separatorLength;
+            if (removeLength >= _buffer.Length)
+            {
+                _buffer = null;
+                _separatorLengths.Clear();
+            }
+            else
+            {
+                _buffer.Remove(0, removeLength);
+            }
+        }
+
+        internal SqlValue Finalize() => _buffer is null ? SqlValue.Null : SqlValue.Text(_buffer.ToString());
     }
 
     private sealed class CountAggregateAccumulator
@@ -41833,6 +43394,19 @@ out bool hasReturning)
         private double _realTotal;
         private double _realError;
         private bool _approximate;
+        // Sticky per Turso's sumStep/sumInverse (execute.rs): set the first time an all-integer
+        // add/subtract overflows i64. A later float step, while the accumulator is *already*
+        // approximate, clears it (the result is a float approximation regardless, so nothing to
+        // report). Removal (xInverse) never clears it — only a forward float step can. sum()
+        // reports the still-set flag as an error at Finalize, never at step/inverse time, so a
+        // frame that later shrinks back into range is still an error (SQLite still reports it).
+        // total()/avg() never surface it.
+        private bool _overflowed;
+        // Sticky per apply_kbn_step: Inf + (-Inf) produces NaN, which SQLite/Turso treats as a
+        // permanent NULL accumulator (every further step/inverse is skipped) until a *new* value
+        // arrives to re-seed it fresh — mirroring the `acc==Null` step arms, which assign the new
+        // value directly rather than folding it into the (nonsensical) running total.
+        private bool _nanLocked;
         private long _count;
 
         internal NumericAggregateAccumulator(bool forceReal, bool average)
@@ -41851,13 +43425,29 @@ out bool hasReturning)
             // its separate text conversion path instead.
             var exact = ApplyComparisonNumericAffinity(value);
             _count++;
+
+            // Once the running total has collapsed to NaN (Inf + -Inf) while already
+            // approximate, every further step is skipped outright — mirrors sumStep's own
+            // `if acc==Null && approx { return }` guard. This is permanent for the rest of the
+            // accumulator's life (a NULL accumulator only ever gets a fresh direct assignment
+            // *before* it first turns approximate), unlike the sticky overflow flag, which a
+            // later float step can still clear.
+            if (_nanLocked)
+                return;
+
             if (exact.Kind != SqlValueKind.Integer)
             {
                 var real = exact.Kind == SqlValueKind.Real
                     ? AsReal(exact)
                     : AsReal(ApplyNumericAffinity(value));
+
+                // A float arriving while the accumulator is already approximate clears any
+                // earlier sticky overflow: the result is a float approximation regardless.
+                if (_approximate)
+                    _overflowed = false;
                 PromoteToReal();
-                KahanBabuskaNeumaierStep(real, ref _realTotal, ref _realError);
+                if (KahanBabuskaNeumaierStep(real, ref _realTotal, ref _realError))
+                    _nanLocked = true;
                 return;
             }
 
@@ -41871,13 +43461,15 @@ out bool hasReturning)
                     return;
                 }
 
-                if (value.Kind == SqlValueKind.Integer && !_forceReal && !_average)
-                    throw new EmbeddedSqlException("integer overflow");
-
+                // The exact integer total overflowed: switch to the floating-point total and
+                // remember the overflow. sum() reports it at Finalize unless a later float
+                // clears it; total()/avg() never report it (mirrors sumStep, func.c:1838-1846).
+                _overflowed = true;
                 PromoteToReal();
             }
 
-            KahanBabuskaNeumaierStepInt64(addend, ref _realTotal, ref _realError);
+            if (KahanBabuskaNeumaierStepInt64(addend, ref _realTotal, ref _realError))
+                _nanLocked = true;
         }
 
         internal void Remove(SqlValue value)
@@ -41887,23 +43479,23 @@ out bool hasReturning)
             if (_count == 0)
                 throw new InvalidOperationException("Aggregate inverse removed a row from an empty numeric aggregate.");
 
-            // If the departing value is the aggregate's only non-NULL input, reset exactly. This also
-            // avoids manufacturing NaN when an infinite value leaves a one-row SUM/AVG frame.
-            if (_count == 1)
+            _count--;
+            if (_nanLocked)
             {
-                Reset();
+                // Mirrors apply_kbn_step's own "acc is already Null" early return: xInverse never
+                // recovers a NaN-collapsed accumulator, only a forward step re-seeds it.
                 return;
             }
 
             var exact = ApplyComparisonNumericAffinity(value);
-            _count--;
             if (exact.Kind != SqlValueKind.Integer)
             {
                 var real = exact.Kind == SqlValueKind.Real
                     ? AsReal(exact)
                     : AsReal(ApplyNumericAffinity(value));
                 PromoteToReal();
-                KahanBabuskaNeumaierStep(-real, ref _realTotal, ref _realError);
+                if (KahanBabuskaNeumaierStep(-real, ref _realTotal, ref _realError))
+                    _nanLocked = true;
                 return;
             }
 
@@ -41917,20 +43509,32 @@ out bool hasReturning)
                     return;
                 }
 
-                if (value.Kind == SqlValueKind.Integer && !_forceReal && !_average)
-                    throw new EmbeddedSqlException("integer overflow");
-
+                // Mirrors the step path: the exact subtract overflowed, switch to float and
+                // remember it (sumInverse, func.c). Inverse never *clears* the flag, only a
+                // later forward float step can.
+                _overflowed = true;
                 PromoteToReal();
             }
 
-            if (subtrahend == long.MinValue)
-                KahanBabuskaNeumaierStep(9223372036854775808d, ref _realTotal, ref _realError);
-            else
-                KahanBabuskaNeumaierStepInt64(-subtrahend, ref _realTotal, ref _realError);
+            var subtractNanned = subtrahend == long.MinValue
+                ? KahanBabuskaNeumaierStep(9223372036854775808d, ref _realTotal, ref _realError)
+                : KahanBabuskaNeumaierStepInt64(-subtrahend, ref _realTotal, ref _realError);
+            if (subtractNanned)
+                _nanLocked = true;
         }
 
         internal SqlValue Finalize()
         {
+            // An all-integer sum that overflowed and was never cleared by a later float is
+            // reported here, at the end, not when it happened — the frame may have shrunk back
+            // into range since, but SQLite still reports it (sumFinalize). total()/avg() never
+            // surface this even though they track the same sticky state.
+            if (_overflowed && !_forceReal && !_average)
+                throw new EmbeddedSqlException("integer overflow");
+
+            if (_nanLocked)
+                return SqlValue.Null;
+
             var accumulated = _approximate
                 ? (double.IsNaN(_realError) ? _realTotal : _realTotal + _realError)
                 : _integerTotal;
@@ -41943,15 +43547,6 @@ out bool hasReturning)
                 return SqlValue.Null;
 
             return _approximate ? SqlValue.Real(accumulated) : SqlValue.Integer(_integerTotal);
-        }
-
-        private void Reset()
-        {
-            _integerTotal = 0;
-            _realTotal = 0;
-            _realError = 0;
-            _approximate = false;
-            _count = 0;
         }
 
         private void PromoteToReal()
@@ -41984,28 +43579,40 @@ out bool hasReturning)
         }
     }
 
-    /// <summary>Adds one term to the Kahan-Babuska-Neumaier compensated sum.</summary>
-    private static void KahanBabuskaNeumaierStep(double term, ref double sum, ref double error)
+    /// <summary>
+    /// Adds one term to the Kahan-Babuska-Neumaier compensated sum. Returns true when the
+    /// running sum itself collapses to NaN (e.g. Inf + -Inf) — mirrors apply_kbn_step, which
+    /// treats that as a permanent NULL accumulator rather than a poisoned-but-still-numeric
+    /// value.
+    /// </summary>
+    private static bool KahanBabuskaNeumaierStep(double term, ref double sum, ref double error)
     {
         var running = sum;
         var next = running + term;
+        if (double.IsNaN(next))
+        {
+            sum = next;
+            return true;
+        }
+
         error += Math.Abs(running) > Math.Abs(term)
             ? (running - next) + term
             : (term - next) + running;
         sum = next;
+        return false;
     }
 
-    private static void KahanBabuskaNeumaierStepInt64(long value, ref double sum, ref double error)
+    private static bool KahanBabuskaNeumaierStepInt64(long value, ref double sum, ref double error)
     {
         if (value is <= -4503599627370496L or >= 4503599627370496L)
         {
             var low = value % 16384;
-            KahanBabuskaNeumaierStep(value - low, ref sum, ref error);
-            KahanBabuskaNeumaierStep(low, ref sum, ref error);
-            return;
+            if (KahanBabuskaNeumaierStep(value - low, ref sum, ref error))
+                return true;
+            return KahanBabuskaNeumaierStep(low, ref sum, ref error);
         }
 
-        KahanBabuskaNeumaierStep(value, ref sum, ref error);
+        return KahanBabuskaNeumaierStep(value, ref sum, ref error);
     }
 
     private SqlValue EvaluateMinMax(
@@ -42103,13 +43710,14 @@ out bool hasReturning)
         FunctionExpression function,
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        SourceRow? representative = null)
     {
         var name = function.Name.ToUpperInvariant();
         if (name == "MODE")
             return EvaluateModeAggregate(function, rows, parameters, context);
         if (function.OrderedSet)
-            return EvaluateOrderedSetPercentileAggregate(function, rows, parameters, context);
+            return EvaluateOrderedSetPercentileAggregate(function, rows, parameters, context, representative);
 
         var isMedian = name == "MEDIAN";
         var isPercentile = name == "PERCENTILE";
@@ -42165,17 +43773,25 @@ out bool hasReturning)
             values.Add(value);
         }
 
-        if (error is not null)
-            throw new EmbeddedSqlException(error);
+        // Mirrors Turso's percentile.rs finalize(): an empty result set returns NULL even
+        // when every row's candidate was invalid — step() never pushes a value for an
+        // out-of-range or inconsistent fraction, so "every row was invalid" and "no rows
+        // matched" are the same empty-values state, and both quietly finalize as NULL. The
+        // accumulated error only surfaces when at least one row *did* get pushed (a valid
+        // fraction seen before a later invalid/inconsistent one), matching
+        // percentile_disc(x, 100)'s NULL result and percentile_cont(value, percentile)'s
+        // "Inconsistent percentile values across rows" error against the same code path.
         if (values.Count == 0)
             return SqlValue.Null;
+        if (error is not null)
+            throw new EmbeddedSqlException(error);
 
         values.Sort(ComparePercentileValues);
         if (isMedian)
         {
             var middle = values.Count / 2;
             return SqlValue.Real(values.Count % 2 == 0
-                ? (values[middle - 1] + values[middle]) / 2d
+                ? SafeLerp(values[middle - 1], values[middle], 0.5d)
                 : values[middle]);
         }
 
@@ -42189,7 +43805,7 @@ out bool hasReturning)
                 return SqlValue.Real(values[lower]);
 
             var weight = rank - lower;
-            return SqlValue.Real(values[lower] * (1d - weight) + values[upper] * weight);
+            return SqlValue.Real(SafeLerp(values[lower], values[upper], weight));
         }
 
         return SqlValue.Real(values[(int)Math.Floor(rank)]);
@@ -42199,13 +43815,30 @@ out bool hasReturning)
         FunctionExpression function,
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        SourceRow? representative = null)
     {
         RequireAggregateArgumentCount(function.Name.ToLowerInvariant(), function.Arguments, 2);
+        // The direct (fraction) argument must be a constant with respect to this aggregate's
+        // own input rows — PostgreSQL rejects a fraction that reads a column of the ordered
+        // set it is computed over (and, conservatively, a fraction containing any subquery,
+        // since a nested query's own scope is not visible here). It may, however, be a
+        // correlated reference to an *enclosing* query
+        // (`percentile_cont(outer.frac) WITHIN GROUP (ORDER BY inner.x)`), evaluated once per
+        // invocation rather than once per row. The local-row probe below distinguishes the
+        // two: a column that resolves against this aggregate's own rows is rejected, while one
+        // that only resolves through an enclosing row's Parent chain is a legal correlation.
+        var localProbeRow = rows.Count > 0 ? rows[0] : null;
+        if (OrderedSetFractionReferencesLocalInput(function.Arguments[1], localProbeRow))
+        {
+            throw new EmbeddedSqlException(
+                $"the fraction argument of {function.Name.ToLowerInvariant()}() must be constant with respect to its input rows");
+        }
+
         var fractionValue = Evaluate(
             function.Arguments[1],
             parameters,
-            new SourceRow([], []),
+            representative ?? localProbeRow,
             context);
         if (fractionValue.Kind == SqlValueKind.Null)
             return SqlValue.Null;
@@ -42242,7 +43875,7 @@ out bool hasReturning)
                 return SqlValue.Real(values[lower]);
 
             var weight = rank - lower;
-            return SqlValue.Real(values[lower] * (1d - weight) + values[upper] * weight);
+            return SqlValue.Real(SafeLerp(values[lower], values[upper], weight));
         }
 
         var discreteValues = new List<SqlValue>();
@@ -42259,8 +43892,18 @@ out bool hasReturning)
 
         var orderBy = function.OrderedSetOrderBy
             ?? new OrderByTerm(function.Arguments[0], Descending: false);
-        var collation = GetCollation(orderBy.Expression);
-        discreteValues.Sort((left, right) => CompareForOrdering(left, right, orderBy, collation));
+        // A column's declared collation (e.g. TEXT COLLATE NOCASE) governs ordering here even
+        // without an explicit COLLATE in the ORDER BY clause, exactly like a real ORDER BY —
+        // GetCollation only looks at an explicit COLLATE wrapper and misses that fallback.
+        var collation = GetEffectiveCollation(orderBy.Expression, context);
+        // A stable sort matters here: values the chosen collation considers equal (e.g. 'apple'
+        // and 'Apple' under NOCASE) keep their original row order, so which one percentile_disc
+        // picks as, say, the minimum is deterministic instead of depending on an unstable sort's
+        // internal pivoting. List<T>.Sort is not guaranteed stable; Enumerable.OrderBy is.
+        discreteValues = discreteValues
+            .OrderBy(static value => value, Comparer<SqlValue>.Create(
+                (left, right) => CompareForOrdering(left, right, orderBy, collation)))
+            .ToList();
         var index = fraction <= 0d
             ? 0
             : Math.Max(0, (int)Math.Ceiling(fraction * discreteValues.Count) - 1);
@@ -42288,8 +43931,13 @@ out bool hasReturning)
 
         var orderBy = function.OrderedSetOrderBy
             ?? new OrderByTerm(function.Arguments[0], Descending: false);
-        var collation = GetCollation(orderBy.Expression);
-        values.Sort((left, right) => CompareForOrdering(left, right, orderBy, collation));
+        // See the matching comment in EvaluateOrderedSetPercentileAggregate: the column's
+        // declared collation must be honored, and the sort must be stable.
+        var collation = GetEffectiveCollation(orderBy.Expression, context);
+        values = values
+            .OrderBy(static value => value, Comparer<SqlValue>.Create(
+                (left, right) => CompareForOrdering(left, right, orderBy, collation)))
+            .ToList();
         var bestIndex = 0;
         var bestCount = 0;
         for (var index = 0; index < values.Count;)
@@ -42329,6 +43977,45 @@ out bool hasReturning)
                 numeric = default;
                 return false;
         }
+    }
+
+    /// <summary>
+    /// Numerically robust linear interpolation between two doubles for a weight in
+    /// <c>[0, 1]</c>, mirroring the reference algorithm behind C++20's <c>std::lerp</c>
+    /// (WG21 P0811) and matching PostgreSQL's own <c>percentile_cont</c> support function
+    /// (<c>orderedsetaggs.c</c>'s <c>float8_lerp</c>: <c>loval + (pct * (hival - loval))</c>).
+    /// <para>
+    /// For same-signed (or zero-adjacent) operands, the direct form <c>a + weight * (b - a)</c>
+    /// is used — this is what PostgreSQL computes, and it is both overflow-safe (<c>b - a</c>
+    /// cannot exceed the larger operand's own magnitude when the operands share a sign) and
+    /// the only form that reproduces PostgreSQL's exact rounding (e.g. the pinned corpus's
+    /// <c>2.4</c> rather than the algebraically-equivalent weighted form's
+    /// <c>2.4000000000000004</c>).
+    /// </para>
+    /// <para>
+    /// For operands that bracket zero (opposite signs, e.g. <c>-1.7e308</c> and
+    /// <c>1.7e308</c>), <c>b - a</c> can itself overflow to +/-Infinity even though both
+    /// inputs and the true interpolated result are finite, so the weighted convex-combination
+    /// form <c>weight * b + (1 - weight) * a</c> is used instead: each term is individually
+    /// bounded by one operand's own magnitude, so their sum cannot overflow.
+    /// </para>
+    /// </summary>
+    private static double SafeLerp(double a, double b, double weight)
+    {
+        if ((a <= 0d && b >= 0d) || (a >= 0d && b <= 0d))
+            return (weight * b) + ((1d - weight) * a);
+
+        if (weight == 1d)
+            return b;
+
+        var x = a + (weight * (b - a));
+        // Percentile interpolation only ever calls this with weight in [0, 1] (rank's
+        // fractional part), so extrapolation never happens in practice, but the guard is
+        // kept to match std::lerp's reference algorithm exactly rather than silently relying
+        // on a narrower, call-site-specific assumption.
+        return (weight > 1d) == (b > a)
+            ? (b < x ? x : b)
+            : (x < b ? x : b);
     }
 
     private static int ComparePercentileValues(double left, double right)
@@ -42813,14 +44500,23 @@ out bool hasReturning)
     /// <summary>
     /// Replaces the backing table's rows with the single watermark row an allocation or setval leaves
     /// behind (upstream compacts to one row at commit; the managed catalog is statement-atomic, so the
-    /// replacement is exact here).
+    /// replacement is exact here). Reports the swap to <paramref name="context"/> as a delete of the
+    /// prior watermark row (its rowid is the previous value, since <c>value</c> is the rowid-aliased
+    /// primary key) followed by an insert of the new one, so a concurrent (<c>BEGIN CONCURRENT</c>)
+    /// transaction's MVCC store sees the allocation the same way it sees any other row write. Without
+    /// this, nextval/setval's mutation was only ever a "classic" in-memory edit invisible to the MVCC
+    /// commit path, so the watermark reverted to its pre-transaction value once the surrounding
+    /// concurrent transaction committed.
     /// </summary>
     private static void WriteSequenceWatermark(
+        EmbeddedDatabase.QueryContext context,
+        string backingTableName,
         EmbeddedTable backing,
         long value,
         long isCalled,
         ManagedSequence sequence)
     {
+        var previousRowId = backing.RowIds.Count > 0 ? backing.RowIds[0] : (long?)null;
         backing.Rows.Clear();
         backing.RowIds.Clear();
         backing.Rows.Add(
@@ -42834,6 +44530,34 @@ out bool hasReturning)
             SqlValue.Integer(sequence.Cycle ? 1 : 0),
         ]);
         backing.RowIds.Add(value);
+
+        if (previousRowId is { } oldRowId
+            && oldRowId != value
+            && context.ConcurrentMvStore is { } deleteStore
+            && context.ConcurrentMvccTxId is { } deleteTxId)
+        {
+            deleteStore.DeleteOrTombstoneBase(
+                deleteTxId,
+                new MvccRowId(deleteStore.GetOrCreateTableId(deleteTxId, backingTableName), oldRowId));
+        }
+
+        // A direct MvStore.Insert (mirroring ChangeDataCaptureSession.Append), not
+        // QueryContext.ReportRowChange's generic INSERT path: that path promotes a rowid that
+        // collides with one the store has already seen to a fresh store-global id (correct for
+        // an ordinary AUTOINCREMENT insert racing a peer connection), but a sequence's watermark
+        // legitimately reuses a rowid a CYCLE sequence already emitted earlier in the same
+        // transaction - promoting it would silently move the stored value outside the
+        // sequence's own MINVALUE/MAXVALUE bounds.
+        if (context.ConcurrentMvStore is { } insertStore && context.ConcurrentMvccTxId is { } insertTxId)
+        {
+            var rowId = new MvccRowId(insertStore.GetOrCreateTableId(insertTxId, backingTableName), value);
+            // End the previous version even when only is_called changes. Otherwise moving
+            // off this key later can reveal a superseded watermark that was never deleted.
+            if (previousRowId == value)
+                insertStore.UpdateIncludingBase(insertTxId, rowId, backing.Rows[0]);
+            else
+                insertStore.Insert(insertTxId, rowId, backing.Rows[0]);
+        }
     }
 
     /// <summary>
@@ -42877,7 +44601,7 @@ out bool hasReturning)
         var descriptor = ReadSequenceDescriptor(sequenceName, backing);
         var (current, isCalled, wasEmpty, _) = ReadSequenceWatermark(backing, descriptor.Ascending);
         var next = descriptor.ComputeNext(current, isCalled, wasEmpty);
-        WriteSequenceWatermark(backing, next, 1, descriptor);
+        WriteSequenceWatermark(context, GetSequenceBackingTableName(sequenceName), backing, next, 1, descriptor);
         context.SequenceSession?.SetCurrval(rawName, next);
         // The watermark rewrite is a real catalog mutation even though this SELECT returns rows: flag it
         // so the statement's commit path publishes the clone (the writable-CTE state doubles as the
@@ -42932,7 +44656,7 @@ out bool hasReturning)
         }
 
         var isCalled = arguments.Count == 3 ? arguments[2].AsInteger() : 1;
-        WriteSequenceWatermark(backing, value, isCalled, descriptor);
+        WriteSequenceWatermark(context, GetSequenceBackingTableName(sequenceName), backing, value, isCalled, descriptor);
         context.SequenceSession?.SetCurrval(rawName, value);
         context.CteMutationState?.MarkChanged();
         return SqlValue.Integer(value);
@@ -44924,9 +46648,12 @@ out bool hasReturning)
     }
 
     // The affinity of a scalar-subquery comparison operand, resolved statically from the
-    // subquery's single result column. Returns null for BLOB affinity, a multi-column result,
-    // or any shape the affinity describer cannot model (so the comparison falls back to the
-    // other operand's affinity), mirroring SQLite.
+    // subquery's single result column. Returns the declared affinity as-is - including BLOB,
+    // which datatype3 4.2 rule 2 treats differently from "no affinity" (TEXT affinity is only
+    // pulled onto a truly affinity-less operand, never onto a genuinely BLOB-affinity one; see
+    // Turso's ExprAffinityInfo::has_affinity, core/translate/expr/affinity.rs) - or null for a
+    // multi-column result or any shape the affinity describer cannot model (so the comparison
+    // falls back to the other operand's affinity).
     private static ColumnAffinity? GetScalarSubqueryComparisonAffinity(
         ScalarSubqueryExpression subquery,
         QueryContext? context)
@@ -44943,8 +46670,7 @@ out bool hasReturning)
             if (affinities.Count != 1)
                 return null;
 
-            var affinity = affinities[0].Affinity;
-            return affinity == ColumnAffinity.Blob ? null : affinity;
+            return affinities[0].HasAffinity ? affinities[0].Affinity : null;
         }
         catch (EmbeddedSqlException)
         {
@@ -44953,8 +46679,12 @@ out bool hasReturning)
     }
 
     // The per-column candidate affinities of an IN-subquery's result set, so the membership
-    // comparison can apply affinity to each LHS element (SQLite datatype3 §4.1). BLOB-affinity
-    // columns yield null (no candidate affinity); an undescribable subquery yields null overall.
+    // comparison can apply affinity to each LHS element (SQLite datatype3 §4.1). A column's
+    // declared affinity is returned as-is - including BLOB, which is a real declared affinity
+    // distinct from "no affinity" for the TEXT-coercion rule (datatype3 4.2 rule 2; Turso's
+    // ExprAffinityInfo::has_affinity, core/translate/expr/affinity.rs) - a column that resolved
+    // with no declared affinity at all reports null, and an undescribable subquery yields null
+    // overall.
     private static IReadOnlyList<ColumnAffinity?>? DescribeSubqueryCandidateAffinities(
         QueryStatement query,
         QueryContext context)
@@ -44966,7 +46696,7 @@ out bool hasReturning)
                 context,
                 BuildAffinityMapFromRuntimeCtes(context.CommonTableExpressions));
             return affinities
-                .Select(column => column.Affinity == ColumnAffinity.Blob ? null : (ColumnAffinity?)column.Affinity)
+                .Select(column => column.HasAffinity ? (ColumnAffinity?)column.Affinity : null)
                 .ToArray();
         }
         catch (EmbeddedSqlException)
@@ -45081,6 +46811,14 @@ out bool hasReturning)
         if (_externalCollationResolver?.Invoke(collation) is not null)
             return;
 
+        // A locale/BCP-47 collation tag (e.g. "es-u-co-trad") is not registered
+        // per-connection like a custom callback; it resolves lazily against the
+        // process-wide LocaleCollationRegistry the same way Turso's
+        // CollationSeq::new falls back to LocaleCollationRegistry::get_or_register
+        // once a name isn't one of the three built-ins.
+        if (LocaleCollationRegistry.TryResolve(collation, out _))
+            return;
+
         throw new EmbeddedSqlException($"no such collation sequence: {collation}");
     }
 
@@ -45134,6 +46872,9 @@ out bool hasReturning)
                 return SqliteIndexRecordComparer.CompareNoCaseText(left.AsText(), right.AsText());
             if (string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase))
                 return SqliteIndexRecordComparer.CompareRTrimText(left.AsText(), right.AsText());
+
+            if (LocaleCollationRegistry.TryResolve(collation, out var localeCompare))
+                return InvokeManagedCallback(() => localeCompare!(left.AsText(), right.AsText()));
 
             throw new EmbeddedSqlException($"no such collation sequence: {collation}");
         }
@@ -46571,6 +48312,200 @@ out bool hasReturning)
         }
     }
 
+    private enum SlidingWindowAggregateKind
+    {
+        Count,
+        Sum,
+        Total,
+        Average,
+        Minimum,
+        Maximum,
+        GroupConcat,
+    }
+
+    /// <summary>
+    /// A window aggregate accumulator that tracks state across an entire partition scan rather
+    /// than being rebuilt from each row's frame membership. Unlike <see cref="CumulativeWindowAggregate"/>
+    /// (growing-only, used for the default RANGE frame that every peer shares), this also supports
+    /// <see cref="Remove"/> so it can follow an arbitrary sliding ROWS/GROUPS/RANGE frame as its
+    /// start and end boundaries both advance. Carrying the same accumulator across positions
+    /// (rather than recomputing fresh from the current frame's members) is what lets transient
+    /// integer-overflow and float-approximation history survive a frame that later shrinks back
+    /// into range, mirroring Turso's per-row AggStep/AggInverse (execute.rs).
+    /// </summary>
+    private sealed class SlidingWindowAggregate
+    {
+        private readonly EmbeddedDatabase _database;
+        private readonly SlidingWindowAggregateKind _kind;
+        private readonly string? _collation;
+        private readonly bool _preferNewestOnTie;
+        private NumericAggregateAccumulator? _numeric;
+        private ExtremumAggregateAccumulator? _extremum;
+        private GroupConcatAggregateAccumulator? _concat;
+        private long _count;
+
+        internal SlidingWindowAggregate(
+            EmbeddedDatabase database,
+            SlidingWindowAggregateKind kind,
+            string? collation,
+            bool preferNewestOnTie)
+        {
+            _database = database;
+            _kind = kind;
+            _collation = collation;
+            _preferNewestOnTie = preferNewestOnTie;
+            CreateAccumulators();
+        }
+
+        // Rebuilds fresh, empty inner accumulators; used both by the constructor and by the
+        // defensive full-replay fallback when a frame transition turns out non-monotonic.
+        internal void Reset()
+        {
+            _count = 0;
+            CreateAccumulators();
+        }
+
+        private void CreateAccumulators()
+        {
+            _numeric = _kind switch
+            {
+                SlidingWindowAggregateKind.Sum => new NumericAggregateAccumulator(
+                    forceReal: false,
+                    average: false),
+                SlidingWindowAggregateKind.Total => new NumericAggregateAccumulator(
+                    forceReal: true,
+                    average: false),
+                SlidingWindowAggregateKind.Average => new NumericAggregateAccumulator(
+                    forceReal: true,
+                    average: true),
+                _ => null,
+            };
+            _extremum = _kind is SlidingWindowAggregateKind.Minimum or SlidingWindowAggregateKind.Maximum
+                ? new ExtremumAggregateAccumulator(
+                    _kind == SlidingWindowAggregateKind.Maximum,
+                    _database.Compare,
+                    _collation,
+                    _preferNewestOnTie)
+                : null;
+            _concat = _kind == SlidingWindowAggregateKind.GroupConcat
+                ? new GroupConcatAggregateAccumulator()
+                : null;
+        }
+
+        internal void Accumulate(WindowFunctionInput input)
+        {
+            if (!input.Included)
+                return;
+
+            switch (_kind)
+            {
+                case SlidingWindowAggregateKind.Count:
+                    if (input.Arguments.Length == 0 || input.Arguments[0].Kind != SqlValueKind.Null)
+                        _count++;
+                    return;
+                case SlidingWindowAggregateKind.Sum:
+                case SlidingWindowAggregateKind.Total:
+                case SlidingWindowAggregateKind.Average:
+                    _numeric!.Accumulate(input.Arguments[0]);
+                    return;
+                case SlidingWindowAggregateKind.Minimum:
+                case SlidingWindowAggregateKind.Maximum:
+                    _extremum!.Add(input.Arguments[0]);
+                    return;
+                case SlidingWindowAggregateKind.GroupConcat:
+                    var separator = input.Arguments.Length > 1 ? input.Arguments[1] : SqlValue.Text(",");
+                    _concat!.Add(input.Arguments[0], separator);
+                    return;
+                default:
+                    throw new InvalidOperationException($"Unsupported sliding window aggregate {_kind}.");
+            }
+        }
+
+        internal void Remove(WindowFunctionInput input)
+        {
+            if (!input.Included)
+                return;
+
+            switch (_kind)
+            {
+                case SlidingWindowAggregateKind.Count:
+                    if (input.Arguments.Length == 0 || input.Arguments[0].Kind != SqlValueKind.Null)
+                        _count--;
+                    return;
+                case SlidingWindowAggregateKind.Sum:
+                case SlidingWindowAggregateKind.Total:
+                case SlidingWindowAggregateKind.Average:
+                    _numeric!.Remove(input.Arguments[0]);
+                    return;
+                case SlidingWindowAggregateKind.Minimum:
+                case SlidingWindowAggregateKind.Maximum:
+                    _extremum!.Remove(input.Arguments[0]);
+                    return;
+                case SlidingWindowAggregateKind.GroupConcat:
+                    _concat!.Remove(input.Arguments[0]);
+                    return;
+                default:
+                    throw new InvalidOperationException($"Unsupported sliding window aggregate {_kind}.");
+            }
+        }
+
+        internal SqlValue GetValue()
+        {
+            return _kind switch
+            {
+                SlidingWindowAggregateKind.Count => SqlValue.Integer(_count),
+                SlidingWindowAggregateKind.Sum
+                    or SlidingWindowAggregateKind.Total
+                    or SlidingWindowAggregateKind.Average => _numeric!.Finalize(),
+                SlidingWindowAggregateKind.Minimum
+                    or SlidingWindowAggregateKind.Maximum => _extremum!.Finalize(),
+                SlidingWindowAggregateKind.GroupConcat => _concat!.Finalize(),
+                _ => throw new InvalidOperationException(
+                    $"Unsupported sliding window aggregate {_kind}."),
+            };
+        }
+    }
+
+    // Eligible for true incremental (step/inverse) sliding accumulation: intrinsic aggregates
+    // whose contribution from a single row can be added and later removed without replaying the
+    // whole frame. DISTINCT/ordered-set/aggregate-ORDER BY forms and any other function fall back
+    // to the existing per-position recompute path.
+    private static bool TryGetSlidingWindowAggregateKind(
+        FunctionExpression function,
+        out SlidingWindowAggregateKind kind)
+    {
+        kind = default;
+        if (function.Distinct || function.OrderedSet || function.AggregateOrderBy is { Count: > 0 })
+            return false;
+
+        switch (function.Name.ToUpperInvariant())
+        {
+            case "COUNT" when function.CountStar || function.Arguments.Count is 0 or 1:
+                kind = SlidingWindowAggregateKind.Count;
+                return true;
+            case "SUM" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Sum;
+                return true;
+            case "TOTAL" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Total;
+                return true;
+            case "AVG" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Average;
+                return true;
+            case "MIN" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Minimum;
+                return true;
+            case "MAX" when function.Arguments.Count == 1:
+                kind = SlidingWindowAggregateKind.Maximum;
+                return true;
+            case "GROUP_CONCAT" or "STRING_AGG" when function.Arguments.Count is 1 or 2:
+                kind = SlidingWindowAggregateKind.GroupConcat;
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private sealed record WindowPeerInfo(
         int[] Starts,
         int[] Ends,
@@ -46647,6 +48582,24 @@ out bool hasReturning)
         var frameRuntime = needsFrame
             ? PrepareWindowFrame(spec, parameters, context)
             : default;
+
+        // Functions eligible for true incremental (step/inverse) sliding accumulation, resolved
+        // once since eligibility does not depend on the partition. EXCLUDE support is left to the
+        // existing per-position recompute path below (a temporary inverse/step around the
+        // excluded rows would risk reordering equal-key tie representatives for MIN/MAX/GROUP_CONCAT).
+        var slidingEligible = (spec.Frame is null || spec.Frame.Exclusion == FrameExclusion.NoOthers)
+            ? functions
+                .Select(function => (Function: function, Eligible: TryGetSlidingWindowAggregateKind(function, out var kind), Kind: kind))
+                .Where(candidate => candidate.Eligible)
+                .ToDictionary(candidate => candidate.Function, candidate => candidate.Kind)
+            : new Dictionary<FunctionExpression, SlidingWindowAggregateKind>();
+        var slidingCollations = slidingEligible.Count == 0
+            ? null
+            : slidingEligible.Keys
+                .Where(function => slidingEligible[function]
+                    is SlidingWindowAggregateKind.Minimum or SlidingWindowAggregateKind.Maximum)
+                .ToDictionary(function => function, function => GetEffectiveCollation(function.Arguments[0], context));
+
         foreach (var partition in partitions)
         {
             context.CheckInterrupt();
@@ -46718,17 +48671,153 @@ out bool hasReturning)
                 CreateCumulativeWindowAggregates(functions, context, sharePeerAggregateFrames);
             var directEvaluationNeedsFrame = functions.Any(function =>
                 !cumulativeAggregates.ContainsKey(function)
+                && !slidingEligible.ContainsKey(function)
                 && WindowFunctionUsesFrame(function));
             var cumulativeThrough = cumulativeAggregates.Keys.ToDictionary(
                 function => function,
                 _ => -1);
             var cumulativeValues = new Dictionary<FunctionExpression, SqlValue>();
+
+            // All sliding-eligible functions in this batch share one window spec, so a single
+            // pair of pointers tracks the currently-accumulated frame range [slidingStart,
+            // slidingEnd] for every one of them (start > end represents "nothing added yet").
+            // A growing (UNBOUNDED PRECEDING start, no eviction) frame keeps the ordinary,
+            // first-seen-wins MIN/MAX tie behavior; only a genuinely moving frame — where
+            // Remove actually retires rows — uses upstream's newest-wins representative.
+            var slidingFrameIsGrowing = spec.Frame is null
+                || spec.Frame.Start.Kind == FrameBoundKind.UnboundedPreceding;
+            // A RANGE frame with BOTH bounds Preceding (e.g. "100 PRECEDING AND 2 PRECEDING")
+            // uses a structurally different cursor order upstream (window.rs's Pattern B /
+            // `same_kind_bounded`): the end cursor steps fully forward first (AGGSTEP, possibly
+            // spanning several rows in one advance), then the start cursor steps fully forward
+            // (AGGINVERSE) — both unclamped against each other, so a row can be transiently
+            // stepped in by the end cursor and then immediately inverted back out by the start
+            // cursor within the same outer-row transition. This differs from every other frame
+            // shape (e.g. an end bound of CURRENT ROW), whose end cursor only ever advances by
+            // exactly the current row's own peer group per iteration and whose start/end ranges
+            // never need to "pass through" a row neither range's final membership retains.
+            // Reproducing this transient membership matters because a numeric accumulator's
+            // overflow can occur only during that transient state (mirrors sumStep/sumInverse
+            // reporting a sticky flag regardless of whether the frame later narrows again).
+            var bothBoundsPreceding = spec.Frame is { Mode: Ahtola.Core.Parsing.WindowFrameMode.Range }
+                && spec.Frame.Start.Kind == FrameBoundKind.Preceding
+                && spec.Frame.End.Kind == FrameBoundKind.Preceding;
+            var slidingAggregates = new Dictionary<FunctionExpression, SlidingWindowAggregate>();
+            foreach (var (function, kind) in slidingEligible)
+                slidingAggregates[function] = new SlidingWindowAggregate(
+                    this,
+                    kind,
+                    slidingCollations is not null && slidingCollations.TryGetValue(function, out var collation)
+                        ? collation
+                        : null,
+                    preferNewestOnTie: !slidingFrameIsGrowing);
+            var slidingStart = 0;
+            var slidingEnd = -1;
+            // Independent high-water marks for the bothBoundsPreceding branch: the last position
+            // ever passed to Accumulate, and the last position ever passed to Remove. These must
+            // be tracked separately from slidingStart/slidingEnd (which represent the *logical*
+            // frame boundary for the defensive non-monotonic check and the other branch): a run
+            // of empty-frame transitions can walk slidingStart/slidingEnd forward without every
+            // intervening position actually having been added, so capping a later Remove range by
+            // "whatever was last logically at slidingEnd" is not safe — it must be capped by what
+            // was actually, physically added.
+            var addedThrough = -1;
+            var removedThrough = -1;
+
             IReadOnlyList<int>? sharedFramePositions = null;
             Dictionary<FunctionExpression, SqlValue>? sharedAggregateValues = null;
             var sharedPeerGroupStart = -1;
             for (var position = 0; position < entries.Count; position++)
             {
                 context.CheckInterrupt();
+
+                if (slidingAggregates.Count > 0)
+                {
+                    var (newStart, newEnd) = ResolveWindowFrameBoundsOnly(
+                        spec,
+                        entries,
+                        peers,
+                        position,
+                        frameRuntime);
+                    if (newStart < slidingStart || newEnd < slidingEnd)
+                    {
+                        // Defensive: a non-monotonic frame transition (should not happen for a
+                        // well-ordered partition) — reset and replay the new range fresh rather
+                        // than risk removing a row that was never added.
+                        foreach (var aggregate in slidingAggregates.Values)
+                            aggregate.Reset();
+                        for (var candidate = newStart; candidate <= newEnd; candidate++)
+                        {
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Accumulate(inputs[function][sourceIndex]);
+                        }
+
+                        addedThrough = newEnd;
+                        removedThrough = newStart - 1;
+                    }
+                    else if (bothBoundsPreceding)
+                    {
+                        // Pattern B: end cursor steps fully forward (unclamped against the start
+                        // cursor) before the start cursor steps fully forward — a row between the
+                        // old added-through mark and the new end gets transiently added, then
+                        // (possibly in the very same transition) immediately removed again. The
+                        // remove range is capped by addedThrough, not by the logical slidingEnd:
+                        // a run of empty-frame transitions can advance slidingEnd past positions
+                        // that were only ever *logically* skipped, never physically added, and
+                        // trying to Remove those would fail (or worse, remove an unrelated row).
+                        for (var candidate = addedThrough + 1; candidate <= newEnd; candidate++)
+                        {
+                            context.CheckInterrupt();
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Accumulate(inputs[function][sourceIndex]);
+                        }
+
+                        addedThrough = Math.Max(addedThrough, newEnd);
+
+                        var removeThroughTarget = Math.Min(newStart - 1, addedThrough);
+                        for (var candidate = removedThrough + 1; candidate <= removeThroughTarget; candidate++)
+                        {
+                            context.CheckInterrupt();
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Remove(inputs[function][sourceIndex]);
+                        }
+
+                        removedThrough = Math.Max(removedThrough, removeThroughTarget);
+                    }
+                    else
+                    {
+                        // Rows leaving the frame are inverted before rows entering are stepped
+                        // (windowCodeOp's per-row AGGINVERSE-then-AGGSTEP): a departing row that
+                        // briefly shares an accumulator with an about-to-enter row must not see it
+                        // added first, or GROUP_CONCAT's separator bookkeeping surfaces at the
+                        // wrong moment and a numeric accumulator can transiently (and wrongly)
+                        // overflow against a value that was about to leave anyway. The permanent
+                        // NaN-lock above is what makes this also correct for RANGE frames that
+                        // swap an entire peer group of Inf/-Inf values in one transition.
+                        for (var candidate = slidingStart; candidate <= Math.Min(slidingEnd, newStart - 1); candidate++)
+                        {
+                            context.CheckInterrupt();
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Remove(inputs[function][sourceIndex]);
+                        }
+
+                        for (var candidate = Math.Max(slidingEnd + 1, newStart); candidate <= newEnd; candidate++)
+                        {
+                            context.CheckInterrupt();
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Accumulate(inputs[function][sourceIndex]);
+                        }
+                    }
+
+                    slidingStart = newStart;
+                    slidingEnd = newEnd;
+                }
+
                 if (evaluationSourceIndexes is not null
                     && !evaluationSourceIndexes.Contains(entries[position].SourceIndex))
                 {
@@ -46783,6 +48872,12 @@ out bool hasReturning)
 
                         results[function][entries[position].SourceIndex] =
                             cumulativeValues[function];
+                        continue;
+                    }
+
+                    if (slidingAggregates.TryGetValue(function, out var sliding))
+                    {
+                        results[function][entries[position].SourceIndex] = sliding.GetValue();
                         continue;
                     }
 
@@ -47048,7 +49143,7 @@ out bool hasReturning)
         };
     }
 
-    private IReadOnlyList<int> ResolveWindowFramePositions(
+    private (int Start, int End) ResolveWindowFrameBoundsOnly(
         WindowSpecification spec,
         IReadOnlyList<WindowOrderEntry> entries,
         WindowPeerInfo peers,
@@ -47079,6 +49174,21 @@ out bool hasReturning)
             spec.OrderBy);
         var start = (int)Math.Clamp(startRaw, 0L, entries.Count);
         var end = (int)Math.Clamp(endRaw, -1L, entries.Count - 1L);
+        return (start, end);
+    }
+
+    private IReadOnlyList<int> ResolveWindowFramePositions(
+        WindowSpecification spec,
+        IReadOnlyList<WindowOrderEntry> entries,
+        WindowPeerInfo peers,
+        int position,
+        WindowFrameRuntime runtime)
+    {
+        var frame = spec.Frame ?? new WindowFrame(
+            Ahtola.Core.Parsing.WindowFrameMode.Range,
+            new FrameBound(FrameBoundKind.UnboundedPreceding, null),
+            new FrameBound(FrameBoundKind.CurrentRow, null));
+        var (start, end) = ResolveWindowFrameBoundsOnly(spec, entries, peers, position, runtime);
         if (start > end)
             return [];
 
@@ -47171,6 +49281,79 @@ out bool hasReturning)
         return isStart ? group.Start : group.End;
     }
 
+    // A RANGE bound's coordinate: an exact 64-bit integer when the underlying key/arithmetic
+    // never left that range, or a double when negation or the offset arithmetic overflowed and
+    // (mirroring SQLite's silent int-to-float promotion on scalar overflow) had to fall back to
+    // floating point. Keeping the exact/inexact distinction lets comparisons stay precise for the
+    // common case while still reproducing SQLite's own precision loss where *it* would incur one
+    // (e.g. negating i64::MIN for a DESC coordinate), rather than inventing new, more "correct"
+    // arithmetic that would silently diverge from the oracle at the i64 extremes.
+    private readonly record struct WindowCoordinate(long? Exact, double Value)
+    {
+        internal static WindowCoordinate FromLong(long value) => new(value, value);
+        internal static WindowCoordinate FromDouble(double value) => new(null, value);
+    }
+
+    private static WindowCoordinate ComputeWindowKeyCoordinate(SqlValue key, bool descending, double fallbackNumber)
+    {
+        if (key.Kind == SqlValueKind.Integer)
+        {
+            var raw = key.AsInteger();
+            if (!descending)
+                return WindowCoordinate.FromLong(raw);
+            if (raw == long.MinValue)
+                return WindowCoordinate.FromDouble(-(double)raw);
+            return WindowCoordinate.FromLong(-raw);
+        }
+
+        return WindowCoordinate.FromDouble(descending ? -fallbackNumber : fallbackNumber);
+    }
+
+    private static WindowCoordinate ComputeWindowTargetCoordinate(
+        WindowCoordinate coordinate,
+        SqlValue offset,
+        bool subtract)
+    {
+        // RANGE-mode offsets are always pre-converted to SqlValueKind.Real by
+        // EvaluateWindowFrameOffset (it accepts any non-negative number, not just integer
+        // literals), so an exact-integer offset like "2 PRECEDING" no longer carries an Integer
+        // kind by the time it reaches here. Recover it from the whole-number REAL instead of
+        // giving up on exact arithmetic for every RANGE frame.
+        if (coordinate.Exact is { } exact && TryGetExactOffsetInteger(offset, out var offsetLong))
+        {
+            var overflowed = subtract
+                ? SubtractOverflows(exact, offsetLong, out var result)
+                : AddOverflows(exact, offsetLong, out result);
+            if (!overflowed)
+                return WindowCoordinate.FromLong(result);
+
+            return WindowCoordinate.FromDouble(subtract ? (double)exact - offsetLong : (double)exact + offsetLong);
+        }
+
+        var distance = offset.AsReal();
+        return WindowCoordinate.FromDouble(subtract ? coordinate.Value - distance : coordinate.Value + distance);
+    }
+
+    // Decimal precision-safely bridges the ~2^11 gap between representable doubles near +/-2^63
+    // (SQLite's own int/float comparison is precision-safe the same way), but decimal cannot
+    // represent infinities or magnitudes past roughly 7.9e28: those fall back to plain double
+    // comparison, which is exactly what the existing (and still correct) handling for genuinely
+    // huge/infinite REAL keys already relied on.
+    private static int CompareWindowCoordinates(WindowCoordinate left, WindowCoordinate right)
+    {
+        if (left.Exact is { } exactLeft && right.Exact is { } exactRight)
+            return exactLeft.CompareTo(exactRight);
+        if (!double.IsFinite(left.Value) || !double.IsFinite(right.Value)
+            || Math.Abs(left.Value) >= 7.9e28 || Math.Abs(right.Value) >= 7.9e28)
+        {
+            return left.Value.CompareTo(right.Value);
+        }
+
+        var decimalLeft = left.Exact is { } el ? (decimal)el : (decimal)left.Value;
+        var decimalRight = right.Exact is { } er ? (decimal)er : (decimal)right.Value;
+        return decimalLeft.CompareTo(decimalRight);
+    }
+
     private long ResolveRangeFrameBound(
         FrameBound bound,
         bool isStart,
@@ -47191,23 +49374,61 @@ out bool hasReturning)
         if (!TryGetStoredWindowNumber(current, out var currentNumber))
             return isStart ? peers.Starts[position] : peers.Ends[position];
 
-        var direction = orderBy[0].Descending ? -1d : 1d;
-        // Negating descending keys maps both directions onto one ascending coordinate space.
-        var currentCoordinate = direction * currentNumber;
-        var distance = offset!.Value.AsReal();
-        var target = bound.Kind == FrameBoundKind.Preceding
-            ? currentCoordinate - distance
-            : currentCoordinate + distance;
+        var descending = orderBy[0].Descending;
+
+        // NULL's raw-value sense (smallest vs "biggest") depends on where it actually sorts:
+        // by default it is the smallest value regardless of ASC/DESC, but an explicit NULLS
+        // FIRST under DESC (or NULLS LAST under ASC) makes it sort as the biggest value instead
+        // — mirrors emit_window_range_test's "big_null" flag (window.rs). TEXT/BLOB keys have no
+        // such placement option: SQLite's type-affinity ordering (NULL < INTEGER/REAL < TEXT <
+        // BLOB) always sorts them *after* every numeric value, so they are unconditionally "big"
+        // relative to a numeric current-row target, unlike NULL.
+        var nullsFirst = orderBy[0].NullPlacement switch
+        {
+            NullPlacement.Default => !descending,
+            NullPlacement.First => true,
+            NullPlacement.Last => false,
+            _ => throw new InvalidOperationException(
+                $"Unsupported NULL placement {orderBy[0].NullPlacement}."),
+        };
+        var nullIsBig = (!descending && !nullsFirst) || (descending && nullsFirst);
+
+        // The *comparison sense* actually applied to a non-numeric candidate is "<=" exactly
+        // when isStart and DESC disagree (start bound under DESC, or end bound under ASC) —
+        // mirrors emit_window_range_test's raw null_eq comparison, which never negates the
+        // non-numeric operand itself. A "small" candidate is trivially "<=" any real threshold
+        // and a "big" one is trivially ">="; under the matching op sense the candidate always
+        // satisfies membership, and under the opposite sense it can never satisfy a finite
+        // threshold and is skipped.
+        var rawOpIsLe = isStart ? descending : !descending;
+
+        bool NonNumericSatisfies(SqlValue key)
+        {
+            var isBig = key.Kind == SqlValueKind.Null ? nullIsBig : true;
+            return rawOpIsLe == !isBig;
+        }
+
+        var currentCoordinate = ComputeWindowKeyCoordinate(current, descending, currentNumber);
+        var target = ComputeWindowTargetCoordinate(
+            currentCoordinate,
+            offset!.Value,
+            subtract: bound.Kind == FrameBoundKind.Preceding);
 
         if (isStart)
         {
             for (var candidate = 0; candidate < entries.Count; candidate++)
             {
-                if (TryGetStoredWindowNumber(entries[candidate].OrderKeys[0], out var value)
-                    && direction * value >= target)
+                var key = entries[candidate].OrderKeys[0];
+                if (!TryGetStoredWindowNumber(key, out var candidateNumber))
                 {
-                    return candidate;
+                    if (NonNumericSatisfies(key))
+                        return candidate;
+                    continue;
                 }
+
+                var coordinate = ComputeWindowKeyCoordinate(key, descending, candidateNumber);
+                if (CompareWindowCoordinates(coordinate, target) >= 0)
+                    return candidate;
             }
 
             return entries.Count;
@@ -47215,14 +49436,57 @@ out bool hasReturning)
 
         for (var candidate = entries.Count - 1; candidate >= 0; candidate--)
         {
-            if (TryGetStoredWindowNumber(entries[candidate].OrderKeys[0], out var value)
-                && direction * value <= target)
+            var key = entries[candidate].OrderKeys[0];
+            if (!TryGetStoredWindowNumber(key, out var candidateNumber))
             {
-                return candidate;
+                if (NonNumericSatisfies(key))
+                    return candidate;
+                continue;
             }
+
+            var coordinate = ComputeWindowKeyCoordinate(key, descending, candidateNumber);
+            if (CompareWindowCoordinates(coordinate, target) <= 0)
+                return candidate;
         }
 
         return -1;
+    }
+
+    private static bool AddOverflows(long left, long right, out long result)
+    {
+        result = unchecked(left + right);
+        return ((left ^ result) & (right ^ result)) < 0;
+    }
+
+    private static bool SubtractOverflows(long left, long right, out long result)
+    {
+        result = unchecked(left - right);
+        return ((left ^ right) & (left ^ result)) < 0;
+    }
+
+    private static bool TryGetExactOffsetInteger(SqlValue offset, out long value)
+    {
+        if (offset.Kind == SqlValueKind.Integer)
+        {
+            value = offset.AsInteger();
+            return true;
+        }
+
+        if (offset.Kind == SqlValueKind.Real)
+        {
+            var real = offset.AsReal();
+            if (double.IsFinite(real)
+                && real == Math.Floor(real)
+                && real >= -9223372036854775000d
+                && real < 9223372036854775000d)
+            {
+                value = (long)real;
+                return true;
+            }
+        }
+
+        value = 0;
+        return false;
     }
 
     private SqlValue EvaluateWindowFunctionAtPosition(
@@ -52639,6 +54903,9 @@ public sealed partial class EmbeddedConnection : IDisposable
     [field: ThreadStatic]
     internal static Action? AfterMvccBeginBeforeCatalogSnapshotForTesting { get; set; }
 
+    [field: ThreadStatic]
+    internal static Action<EmbeddedDatabase>? BeforeCommittingPersistentChangeForTesting { get; set; }
+
     private readonly EmbeddedDatabase _database;
     private EmbeddedDatabase _tempDatabase;
     private readonly Dictionary<string, AttachedDatabase> _attachedDatabases = new(StringComparer.OrdinalIgnoreCase);
@@ -53784,7 +56051,26 @@ public sealed partial class EmbeddedConnection : IDisposable
         ParsedStatement Statement,
         bool IsAttached,
         EmbeddedDatabase.SchemaCatalog? ReadCatalog = null,
-        IReadOnlyDictionary<string, EmbeddedTable>? ExternalTables = null);
+        IReadOnlyDictionary<string, EmbeddedTable>? ExternalTables = null,
+        ForeignCdcCommit? ForeignCdcCommit = null);
+
+    /// <summary>
+    /// Everything <see cref="AugmentRoutedStatementWithForeignCdcTable"/> needs deferred until the
+    /// routed statement's outcome (success, or SQLite's ON CONFLICT FAIL / recursive-trigger-depth
+    /// "preserve changes" partial success) is actually known. <see cref="ClonedTables"/> are
+    /// statement-scoped clones (turso_cdc, and sqlite_sequence when the CDC table is
+    /// AUTOINCREMENT) merged into the statement's <c>ExternalTables</c> - mutated in place by
+    /// ChangeDataCaptureSession.Append during execution, exactly like the routed database's own
+    /// statementCatalog clone, and merged back into the foreign owner only when the statement's
+    /// mutation is confirmed durable. <see cref="TrackedState"/> is non-null when
+    /// <see cref="Database"/> is already a tracked explicit-transaction participant (every
+    /// attached database is, from BEGIN); null means autocommit (or no active transaction), where
+    /// the caller must instead durably publish <see cref="Database"/>'s live catalog itself.
+    /// </summary>
+    private readonly record struct ForeignCdcCommit(
+        EmbeddedDatabase Database,
+        TransactionDatabaseState? TrackedState,
+        IReadOnlyDictionary<string, EmbeddedTable> ClonedTables);
 
     internal EmbeddedConnection(EmbeddedDatabase database)
     {
@@ -53919,7 +56205,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfDisposed();
         ThrowIfInsideHookCallback();
         var parameterMap = SqlParameterMap.Parse(sql);
-        var statement = SqlParser.Parse(sql, parameterMap);
+        var statement = SqlParser.Parse(sql, parameterMap, IsKnownTableOrViewName);
         if (_hooks.Authorizer is not null)
             statement = Authorize(statement);
 
@@ -54085,11 +56371,49 @@ public sealed partial class EmbeddedConnection : IDisposable
         => throw new EmbeddedSqlException(
             "Managed connections do not support reentrant use of the connection from a hook callback.");
 
+    // Names declared by an earlier CREATE TABLE/CREATE VIEW statement within the SAME
+    // PrepareScript call, before any statement in that script has actually been executed.
+    // A multi-statement script prepares every statement upfront (PrepareScript's own
+    // Select(Prepare).ToArray()), so without this, a later statement's "is not a function"
+    // diagnostic (IsKnownTableOrViewName) would only see the connection's already-committed
+    // catalog - which does not yet include a table/view an earlier statement in the SAME
+    // script is about to create (cte.sqltest::table-referenced-with-call-arguments-rejected).
+    private HashSet<string>? _pendingScriptObjectNames;
+
     public IReadOnlyList<EmbeddedStatement> PrepareScript(string sql)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
-        return SqlScript.Split(sql).Select(Prepare).ToArray();
+        var previousPending = _pendingScriptObjectNames;
+        var pending = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _pendingScriptObjectNames = pending;
+        try
+        {
+            var results = new List<EmbeddedStatement>();
+            foreach (var statementSql in SqlScript.Split(sql))
+            {
+                var statement = Prepare(statementSql);
+                results.Add(statement);
+                var declaredName = statement.Statement switch
+                {
+                    CreateTableStatement createTable => createTable.Name,
+                    CreateViewStatement createView => createView.Name,
+                    _ => null,
+                };
+                if (declaredName is not null)
+                {
+                    pending.Add(ManagedSchemaName.TrySplit(declaredName, out _, out var localName)
+                        ? localName
+                        : declaredName);
+                }
+            }
+
+            return results;
+        }
+        finally
+        {
+            _pendingScriptObjectNames = previousPending;
+        }
     }
 
     public void ResetForPooling()
@@ -54701,7 +57025,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                     throw new EmbeddedSqlException("attempt to write a readonly database");
                 return ExecuteCreateTableAs(createTableAs, parameters, cancellationToken);
             default:
-                var routed = RouteStatement(statement);
+                var routed = AugmentRoutedStatementWithForeignCdcTable(RouteStatement(statement));
                 var routedMayMutate = StatementMayMutate(routed.Database, routed.Statement);
                 if (_queryOnly && routedMayMutate)
                     throw new EmbeddedSqlException("attempt to write a readonly database");
@@ -54784,7 +57108,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
                                 virtualTableTransaction: transactionState?.VirtualTableTransaction,
-                                sequenceSession: _sequenceSession);
+                                sequenceSession: _sequenceSession,
+                                describeJournalMode: DescribeJournalModeForSchema);
                         }
                         else if (transactionState is null)
                         {
@@ -54809,7 +57134,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     changeDataCapture: changeDataCapture,
                                     vdbeExecutionOptions: vdbeExecutionOptions,
                                     synchronousMode: GetSynchronousMode(routed.Database),
-                                    sequenceSession: _sequenceSession);
+                                    sequenceSession: _sequenceSession,
+                                    describeJournalMode: DescribeJournalModeForSchema);
                             }
                             catch (Exception failure)
                                 when (failure is not EmbeddedConflictFailException
@@ -54818,10 +57144,19 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 // SQLite rolls back the implicit transaction wrapping a failed
                                 // autocommit mutation and notifies the rollback hook. ON CONFLICT
                                 // FAIL is excluded because the rows written before the failure are
-                                // still committed.
+                                // still committed (and handled by the outer EmbeddedConflictFailException
+                                // catch below, which also covers publishing a foreign CDC owner for
+                                // that case).
                                 FireRollbackHook();
                                 throw;
                             }
+
+                            // A foreign CDC owner's statement-scoped clone (built by
+                            // AugmentRoutedStatementWithForeignCdcTable) was mutated in place during
+                            // execution, but nothing else in this autocommit path knows to merge it
+                            // back and persist that database - it isn't the one routed.Database.Execute
+                            // just committed above.
+                            PublishForeignCdcCommitIfNeeded(routed.ForeignCdcCommit);
                         }
                         else
                         {
@@ -54858,7 +57193,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     ? null
                                     : transactionState.PinnedSnapshot,
                                 transactionBlobMutation: transactionState.RecordBlobMutation,
-                                sequenceSession: _sequenceSession);
+                                sequenceSession: _sequenceSession,
+                                describeJournalMode: DescribeJournalModeForSchema);
                             if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not
@@ -54929,6 +57265,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 routed.Statement,
                                 statementCatalog,
                                 result);
+                            PublishForeignCdcCommitIfNeeded(routed.ForeignCdcCommit);
                         }
                     }
 
@@ -55033,6 +57370,12 @@ public sealed partial class EmbeddedConnection : IDisposable
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
                     }
+                    // ON CONFLICT FAIL durably keeps the rows written before the conflict
+                    // (autocommit) or the transaction's partial mutation (above) - including
+                    // whatever a foreign CDC owner's statement-scoped clone captured up to that
+                    // point - so its merge/publish must still happen here, exactly as on
+                    // outright success.
+                    PublishForeignCdcCommitIfNeeded(routed.ForeignCdcCommit);
                     if (ReferenceEquals(routed.Database, _tempDatabase))
                         _tempInitialized = true;
 
@@ -55085,12 +57428,18 @@ public sealed partial class EmbeddedConnection : IDisposable
                             mvccStatementSavepoint);
                         // The catalog is discarded (never written back) when a recursive-trigger
                         // abort does not preserve changes, so the overlay must discard this
-                        // statement's writes too.
+                        // statement's writes too. A foreign CDC owner's statement-scoped clone is
+                        // discarded the same way (never merged/published) - it was never touched
+                        // beyond this local clone, so the foreign owner stays untouched.
                         if (statementOverlayCheckpoint is not null)
                             transactionState?.Overlay?.RestoreCheckpoint(statementOverlayCheckpoint);
                     }
                     else
                     {
+                        // Mirrors ON CONFLICT FAIL: PreserveChanges durably keeps the partial
+                        // mutation regardless of transaction mode, so a foreign CDC owner's
+                        // statement-scoped clone must be merged/published here too.
+                        PublishForeignCdcCommitIfNeeded(routed.ForeignCdcCommit);
                         ReleaseConcurrentStatementSavepoint(
                             concurrentStore,
                             concurrentTxId,
@@ -55175,14 +57524,16 @@ public sealed partial class EmbeddedConnection : IDisposable
         var requestedPath = EmbeddedDatabase.ToSqlText(pathValue);
         var (path, uriReadOnly) = ResolveAttachmentPath(requestedPath);
 
+        if (_attachedDatabases.ContainsKey(statement.Alias))
+            throw new EmbeddedSqlException($"database {statement.Alias} is already in use");
+
         if (statement.Alias.Equals("main", StringComparison.OrdinalIgnoreCase)
             || statement.Alias.Equals("temp", StringComparison.OrdinalIgnoreCase))
         {
-            throw new EmbeddedSqlException($"cannot attach database as {statement.Alias}");
+            // Turso core/connection.rs attach_database_with_config: reserved-alias rejection
+            // uses the same "already in use" wording as a duplicate alias, not a bespoke message.
+            throw new EmbeddedSqlException($"reserved name {statement.Alias} is already in use");
         }
-
-        if (_attachedDatabases.ContainsKey(statement.Alias))
-            throw new EmbeddedSqlException($"database {statement.Alias} is already in use");
         if (_attachedDatabases.Count >= MaximumAttachedDatabases)
             throw new EmbeddedSqlException($"too many attached databases - maximum {MaximumAttachedDatabases}");
 
@@ -55560,7 +57911,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 cancellationToken,
                 vdbeExecutionOptions,
                 ExecutePragmaTableList,
-                source.ExternalTables)
+                source.ExternalTables,
+                DescribeJournalModeForSchema)
             : source.Database.MaterializeCreateTableAs(
                 sourceQuery,
                 parameters,
@@ -55571,7 +57923,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 cancellationToken,
                 vdbeExecutionOptions,
                 ExecutePragmaTableList,
-                source.ExternalTables);
+                source.ExternalTables,
+                DescribeJournalModeForSchema);
         cancellationToken.ThrowIfCancellationRequested();
         if (ReferenceEquals(source.Database, _tempDatabase))
             _tempInitialized = true;
@@ -55610,6 +57963,211 @@ public sealed partial class EmbeddedConnection : IDisposable
             : CatalogContainsSchemaObject(state.Catalog, objectName, kind);
     }
 
+    /// <summary>
+    /// Turso's CDC log is connection-wide: <c>PRAGMA capture_data_changes_conn</c> names an
+    /// unqualified table (never schema-qualified - see <c>ChangeDataCaptureConfiguration.Parse</c>),
+    /// and a write to *any* database while capture is active appends to that one table,
+    /// wherever it actually lives (typically main, since that is where a user creates it before
+    /// enabling capture). If the routed statement's own database does not have that table
+    /// locally, this finds whichever database does (the same main/temp/attached search order an
+    /// unqualified reference resolves through) and merges statement-scoped CLONES of its table(s)
+    /// - not the live objects - into this statement's external tables, exactly mirroring how the
+    /// routed database's own statementCatalog clone works: ChangeDataCaptureSession.Append
+    /// mutates the clone during execution, and the caller merges it back into the foreign owner
+    /// (<see cref="ForeignCdcCommit"/>) only once the statement's outcome confirms the mutation is
+    /// durable (success, or a FAIL/preserve-changes partial success) - never on an ordinary
+    /// failure, where the clone is simply discarded and the foreign owner is left untouched.
+    /// <para>
+    /// The foreign database must become a real participant of whatever transaction (or lack of
+    /// one) is in effect, not just an untracked side mutation. Before doing anything else, this
+    /// also re-runs the SAME multi-physical-database eligibility check the routed database's own
+    /// write already passed at <c>ReserveTransactionMutation</c> time, against the foreign owner -
+    /// this statement is about to become a hidden second mutation source for it, so the
+    /// at-most-one-physical-database guard must reject an unsafe combination here and now (fail
+    /// fast), not silently defer detection to the much later, harder-to-diagnose
+    /// <c>InvalidOperationException</c> <c>CommitTransaction</c> throws once two physical
+    /// databases' <c>HasChanges</c> finally surface together at COMMIT.
+    /// </para>
+    /// </summary>
+    private RoutedStatement AugmentRoutedStatementWithForeignCdcTable(RoutedStatement routed)
+    {
+        if (_changeDataCapture is not { } changeDataCapture
+            || !StatementMayMutate(routed.Database, routed.Statement))
+        {
+            return routed;
+        }
+
+        var tableName = changeDataCapture.Configuration.Table;
+        var routedState = GetTrackedTransactionState(routed.Database);
+        var localCatalog = routedState?.Catalog ?? routed.Database.LiveCatalog;
+        if (localCatalog.Tables.ContainsKey(tableName)
+            || (routed.ExternalTables?.ContainsKey(tableName) ?? false))
+        {
+            return routed;
+        }
+
+        EmbeddedDatabase? foreignCdcDatabase = null;
+        EmbeddedDatabase.SchemaCatalog? foreignCdcCatalog = null;
+        TransactionDatabaseState? foreignCdcState = null;
+        if (!ReferenceEquals(routed.Database, _tempDatabase))
+        {
+            var state = GetTrackedTransactionState(_tempDatabase);
+            var candidate = state?.Catalog ?? _tempDatabase.LiveCatalog;
+            if (candidate.Tables.ContainsKey(tableName))
+                (foreignCdcDatabase, foreignCdcCatalog, foreignCdcState) = (_tempDatabase, candidate, state);
+        }
+
+        if (foreignCdcDatabase is null && !ReferenceEquals(routed.Database, _database))
+        {
+            var state = GetTrackedTransactionState(_database);
+            var candidate = state?.Catalog ?? _database.LiveCatalog;
+            if (candidate.Tables.ContainsKey(tableName))
+                (foreignCdcDatabase, foreignCdcCatalog, foreignCdcState) = (_database, candidate, state);
+        }
+
+        if (foreignCdcDatabase is null)
+        {
+            foreach (var attachment in _attachedDatabases.Values.OrderBy(static attachment => attachment.Sequence))
+            {
+                if (ReferenceEquals(attachment.Database, routed.Database))
+                    continue;
+
+                var state = GetTrackedTransactionState(attachment.Database);
+                var candidate = state?.Catalog ?? attachment.Database.LiveCatalog;
+                if (candidate.Tables.ContainsKey(tableName))
+                {
+                    (foreignCdcDatabase, foreignCdcCatalog, foreignCdcState) = (attachment.Database, candidate, state);
+                    break;
+                }
+            }
+        }
+
+        if (foreignCdcDatabase is null || foreignCdcCatalog is null)
+            return routed;
+
+        // Fail fast (see the doc comment above): validate the foreign owner's eligibility as an
+        // extra mutation source for THIS statement before cloning/merging anything. MayMutate
+        // depends only on the statement's own shape (not which database it is checked against),
+        // and this statement is already known to be mutating (StatementMayMutate above), so this
+        // reuses the exact same guard the routed database's own write went through.
+        //
+        // EnsureTransactionMayMutate's own check only sees an ALREADY-established HasChanges on
+        // some OTHER tracked database - it cannot see the routed database's own pending write,
+        // since that flag is only set after Execute() succeeds, strictly later than this routing
+        // step. A single EXPLICIT-TRANSACTION statement whose routed target and CDC owner are two
+        // DIFFERENT databases, where at least one of them is physical, is therefore just as much
+        // an immediate violation of the "a physical write must be the only database this
+        // transaction touches" rule as if the routed write had already completed and set
+        // HasChanges - StatementMayMutate already confirmed this statement mutates
+        // routed.Database above, so that write is unconditional (barring failure) regardless of
+        // whether its own HasChanges flag exists yet. Scoped to _transactionDatabases is not
+        // null for the same reason EnsureTransactionMayMutate's own check is: an autocommit
+        // statement's routed-database write and its separate foreign-CDC-owner publish are each
+        // their own independent single-file commit, with no combined-COMMIT atomicity ever
+        // claimed between them, so two different databases across (or even within) autocommit
+        // statements over time is not the same hazard this guard exists to prevent.
+        if (_transactionDatabases is not null
+            && !ReferenceEquals(routed.Database, foreignCdcDatabase)
+            && (foreignCdcDatabase.IsFileBacked || routed.Database.IsFileBacked))
+        {
+            throw new EmbeddedSqlException(
+                "Managed ATTACH transactions cannot modify more than one database because "
+                + "independent WAL files cannot be committed atomically.");
+        }
+
+        EnsureTransactionMayMutate(foreignCdcDatabase, routed.Statement);
+
+        var foreignCdcTable = foreignCdcCatalog.Tables[tableName];
+        var clonedCdcTable = foreignCdcTable.Clone();
+        var clonedTables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase)
+        {
+            [tableName] = clonedCdcTable,
+        };
+        var externalTables = routed.ExternalTables is { } existing
+            ? new Dictionary<string, EmbeddedTable>(existing, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
+        externalTables[tableName] = clonedCdcTable;
+
+        // An AUTOINCREMENT CDC table's watermark lives in its own database's sqlite_sequence,
+        // which ValidateSqliteSequenceCatalog requires whenever the merged table set contains
+        // any AUTOINCREMENT table. Merge a clone of that same object in too (unless the routed
+        // database already carries its own, in which case ChangeDataCaptureSession must keep
+        // using that one instead), so AllocateChangeId reads and updates the CDC table's real
+        // watermark row rather than tripping the "no sqlite_sequence for an AUTOINCREMENT table"
+        // corruption check against the routed database's unrelated (or absent) one.
+        if (foreignCdcTable.IsAutoIncrement
+            && !localCatalog.Tables.ContainsKey(EmbeddedDatabase.SqliteSequenceTableName)
+            && foreignCdcCatalog.Tables.TryGetValue(EmbeddedDatabase.SqliteSequenceTableName, out var foreignSequence))
+        {
+            var clonedSequence = foreignSequence.Clone();
+            clonedTables[EmbeddedDatabase.SqliteSequenceTableName] = clonedSequence;
+            externalTables[EmbeddedDatabase.SqliteSequenceTableName] = clonedSequence;
+        }
+
+        return routed with
+        {
+            ExternalTables = externalTables,
+            ForeignCdcCommit = new ForeignCdcCommit(foreignCdcDatabase, foreignCdcState, clonedTables),
+        };
+    }
+
+    /// <summary>
+    /// Merges a pending <see cref="ForeignCdcCommit"/>'s statement-scoped clones back into the
+    /// foreign CDC owner, once the routed statement's outcome confirms the mutation is durable
+    /// (success, or ON CONFLICT FAIL / recursive-trigger-depth preserve-changes partial success).
+    /// Never call this on an ordinary failure path - leaving the clones unmerged is precisely how
+    /// the foreign owner stays untouched, symmetric with how the routed database's own discarded
+    /// statementCatalog clone never gets written back to <c>TransactionDatabaseState.Catalog</c>.
+    /// <para>
+    /// A tracked explicit-transaction participant merges directly into its own
+    /// <c>TrackedState.Catalog.Tables</c> and only now flips <c>HasChanges</c>, so the unmodified
+    /// commit/rollback path durably persists it and a later ROLLBACK correctly discards it like
+    /// any other write in that transaction. An untracked owner (autocommit, or no active
+    /// transaction) takes a fresh <see cref="EmbeddedDatabase.SnapshotCatalog"/> - a real clone,
+    /// never <see cref="EmbeddedDatabase.LiveCatalog"/>, which wraps the live dictionaries by
+    /// reference and would otherwise let this mutate the live catalog before
+    /// <c>PublishTriggerBodyCatalog</c> ever runs - patches in the mutated clone(s), and durably
+    /// publishes it (a bare reference republish for ':memory:', a real pager/WAL flush for a
+    /// physical database).
+    /// </para>
+    /// </summary>
+    private void PublishForeignCdcCommitIfNeeded(ForeignCdcCommit? commit)
+    {
+        if (commit is not { } foreignCdcCommit)
+            return;
+
+        if (foreignCdcCommit.TrackedState is { } trackedState)
+        {
+            foreach (var (name, table) in foreignCdcCommit.ClonedTables)
+                trackedState.Catalog.Tables[name] = table;
+            trackedState.HasChanges = true;
+            // Appending a CDC record is never a targeted index rebuild: an earlier REINDEX in
+            // this same transaction must not cause commit to skip persisting it.
+            trackedState.HasNonTargetedIndexRebuildChange = true;
+            return;
+        }
+
+        var patchedCatalog = foreignCdcCommit.Database.SnapshotCatalog();
+        foreach (var (name, table) in foreignCdcCommit.ClonedTables)
+            patchedCatalog.Tables[name] = table;
+        foreignCdcCommit.Database.PublishTriggerBodyCatalog(
+            patchedCatalog,
+            forceFullRewrite: false,
+            GetSynchronousMode(foreignCdcCommit.Database));
+    }
+
+    /// <summary>
+    /// <see cref="GetTransactionState"/> throws when a transaction is active but the given
+    /// database is not one of its participants (a real bug for the routed database itself, which
+    /// is always a participant by construction). A CDC owner search has to probe every schema
+    /// speculatively, including ones the active transaction may never have touched, so this
+    /// returns null for that case instead of throwing.
+    /// </summary>
+    private TransactionDatabaseState? GetTrackedTransactionState(EmbeddedDatabase database)
+        => _transactionDatabases is not null && _transactionDatabases.ContainsKey(database)
+            ? GetTransactionState(database)
+            : null;
+
     private RoutedStatement RouteStatement(ParsedStatement statement)
     {
         return statement switch
@@ -55618,12 +58176,23 @@ public sealed partial class EmbeddedConnection : IDisposable
             CreateVirtualTableStatement createVirtual => RouteNamedStatement(
                 createVirtual.Name,
                 name => createVirtual with { Name = name }),
+            // A sequence's backing table lives only in the schema the CREATE/DROP names: an
+            // unrouted "aux.s1" would otherwise run against main with the schema marker still
+            // embedded in the backing-table name, leaving aux without the table nextval/currval/
+            // setval (see TryGetSequenceFunctionSchema) correctly route reads and writes to.
+            CreateSequenceStatement createSequence => RouteNamedStatement(
+                createSequence.Name,
+                name => createSequence with { Name = name }),
+            DropSequenceStatement dropSequence => RouteNamedStatement(
+                dropSequence.Name,
+                name => dropSequence with { Name = name }),
             CreateTriggerStatement createTrigger => RouteCreateTrigger(createTrigger),
             CreateViewStatement createView => RouteCreateView(createView),
             DropTableStatement drop => RouteExistingNamedStatement(
                 drop.Name,
                 ManagedSchemaObjectKind.Table,
-                name => drop with { Name = name }),
+                name => drop with { Name = name },
+                ifExists: drop.IfExists),
             CreateIndexStatement createIndex => RouteCreateIndex(createIndex),
             DropIndexStatement dropIndex => RouteExistingNamedStatement(
                 dropIndex.Name,
@@ -55764,14 +58333,12 @@ public sealed partial class EmbeddedConnection : IDisposable
         if (ManagedSchemaName.TrySplit(statement.Target, out var schema, out var localName))
             return RouteSchema(schema, localName, target => statement with { Target = target });
 
-        if (statement.Target.Equals("temp", StringComparison.OrdinalIgnoreCase))
-        {
-            return new RoutedStatement(
-                _tempDatabase,
-                statement with { Target = "main" },
-                IsAttached: false);
-        }
-
+        // Unlike DROP/REINDEX, a bare (unqualified) ANALYZE target is never treated as the
+        // "temp" schema name — Turso's resolve_analyze_targets (core/translate/analyze.rs)
+        // only special-cases "main" and attached-database aliases here; anything else,
+        // including the literal word "temp", is looked up as a table/index name in the main
+        // schema. A table that happens to be named "temp" must resolve to itself, matching
+        // turso-sqltests/analyze.sqltest's `CREATE TABLE temp (...); ANALYZE temp;`.
         if (_attachedDatabases.TryGetValue(statement.Target, out var attachment))
         {
             return new RoutedStatement(
@@ -56074,13 +58641,17 @@ Func<string, ParsedStatement> rewrite)
     private RoutedStatement RouteExistingNamedStatement(
         string objectName,
         ManagedSchemaObjectKind kind,
-        Func<string, ParsedStatement> rewrite)
+        Func<string, ParsedStatement> rewrite,
+        bool ifExists = false)
     {
         if (ManagedSchemaName.TrySplit(objectName, out var schema, out var localName))
         {
             // SQLite reports a missing qualified object at resolve time with the
-            // qualifier kept, so validate before the routing rewrite strips it.
+            // qualifier kept, so validate before the routing rewrite strips it. A
+            // DROP ... IF EXISTS defers that check to the routed database's own
+            // executor, which already treats a missing target as a no-op.
             if (kind == ManagedSchemaObjectKind.Table
+                && !ifExists
                 && !SchemaExists(schema, localName))
                 throw NoSuchTableError(objectName);
             return RouteSchema(schema, localName, rewrite);
@@ -56380,36 +58951,38 @@ Func<string, ParsedStatement> rewrite)
             : hasViewSchema
                 ? viewSchema
                 : "main";
+        // A view may only reference objects in its own schema: Turso's translate_create_view
+        // walks the body for table references and rejects the first one that resolves to a
+        // different database (view cannot reference table in attached database: schema.table),
+        // in either direction - a main-homed view reaching into an attachment, or an
+        // attached-homed view reaching back into main/another attachment.
         if (!statement.Temporary
-            && homeSchema.Equals("main", StringComparison.OrdinalIgnoreCase)
-            && ContainsSchemaQualification(statement))
+            && FindFirstForeignViewTableReference(statement.Query, homeSchema) is { } foreignReference)
         {
             throw new EmbeddedSqlException(
-                "A view in the main schema cannot reference objects in an attached database.");
-        }
-        if (!statement.Temporary
-            && !homeSchema.Equals("main", StringComparison.OrdinalIgnoreCase)
-            && ContainsSchemaQualification(statement.Query))
-        {
-            throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH.");
+                $"view cannot reference table in attached database: {foreignReference}");
         }
 
-        // A temp view's body may reference only temp-schema objects: the managed
-        // engine evaluates a view inside the database that owns it, so a body
-        // touching main-schema tables cannot be evaluated from temp. Upstream
-        // SQLite stores the view in temp but resolves names at query time; this
-        // cross-schema evaluation is a documented divergence (see
-        // managed-sqltest-expected-failures.txt).
+        // A temp view's body may freely reference main-schema objects, exactly like a temp
+        // table can - EnterView (the runtime scope entered when the view executes) does not
+        // restrict which schema's tables its body can see, it only isolates the view's own
+        // CTE namespace, so a plain unqualified `t` inside a TEMP VIEW body already resolves
+        // to a main table the same way it would for any other statement (temp-view.sqltest,
+        // views.sqltest::drop-view-finds-temp-view-with-unqualified-name). Only an explicit
+        // reference into an attached database stays unsupported, matching the restriction
+        // every other non-main-schema view already has (Turso view.rs:316-383/planner.rs
+        // resolves a view body against the connection's full schema search path, not just
+        // the schema that owns the view).
         if (statement.Temporary)
         {
             var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             CollectQuerySchemas(statement.Query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
             foreach (var schema in schemas.Select(ResolveCollectedSchema))
             {
-                if (!schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+                if (!schema.Equals("temp", StringComparison.OrdinalIgnoreCase)
+                    && !schema.Equals("main", StringComparison.OrdinalIgnoreCase))
                 {
-                    throw new EmbeddedSqlException(
-                        "Managed temporary views can only reference objects in the temp schema.");
+                    throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH.");
                 }
             }
         }
@@ -56420,11 +58993,177 @@ Func<string, ParsedStatement> rewrite)
             local => statement with
             {
                 Name = local,
+                // Every qualifier left in the body now provably names this same home schema (the
+                // check above rejected anything else), so it is safe to strip down to local names:
+                // the view is evaluated inside the database that owns it, which has no notion of
+                // its own ATTACH alias.
+                Query = RewriteQuerySchema(
+                    statement.Query,
+                    homeSchema,
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase)),
                 // The parser already strips the view's own-name schema qualifier from
                 // statement.Sql; no further removal is needed here (and counting it again could
                 // over-consume a body identifier spelled like the schema name).
                 Sql = statement.Sql,
             });
+    }
+
+    /// <summary>
+    /// Finds the first table reference in a view body that is explicitly schema-qualified to
+    /// something other than <paramref name="homeSchema"/>, returning its "schema.table" spelling
+    /// for the diagnostic. Traversal order mirrors <see cref="CollectQuerySchemas"/> so the
+    /// reported table is the first one a left-to-right/top-to-bottom read of the SQL would reach,
+    /// matching upstream's diagnostic. Unqualified references are never flagged here: a view is
+    /// always allowed to reference its own schema without writing the qualifier.
+    /// </summary>
+    private static string? FindFirstForeignViewTableReference(QueryStatement query, string homeSchema)
+    {
+        switch (query)
+        {
+            case SelectStatement select:
+                return FindFirstForeignInSource(select.Source, homeSchema)
+                    ?? FindFirstForeignInProjections(select.Projections, homeSchema)
+                    ?? FindFirstForeignInExpression(select.Where, homeSchema)
+                    ?? select.GroupBy.Select(expression => FindFirstForeignInExpression(expression, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(select.Having, homeSchema)
+                    ?? select.NamedWindows.Select(window => FindFirstForeignInWindow(window.Specification, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? select.OrderBy.Select(term => FindFirstForeignInExpression(term.Expression, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(select.Limit, homeSchema)
+                    ?? FindFirstForeignInExpression(select.Offset, homeSchema);
+            case ValuesClause values:
+                return values.Rows.SelectMany(row => row)
+                    .Select(expression => FindFirstForeignInExpression(expression, homeSchema))
+                    .FirstOrDefault(found => found is not null);
+            case CompoundSelectStatement compound:
+                return compound.Terms
+                        .Select(term => FindFirstForeignViewTableReference(term, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? compound.OrderBy.Select(term => FindFirstForeignInExpression(term.Expression, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(compound.Limit, homeSchema)
+                    ?? FindFirstForeignInExpression(compound.Offset, homeSchema);
+            case WithSelectStatement with:
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                {
+                    if (FindFirstForeignViewTableReference(commonTableExpression.Query, homeSchema) is { } found)
+                        return found;
+                }
+                return FindFirstForeignViewTableReference(with.Query, homeSchema);
+            default:
+                throw new InvalidOperationException($"Cannot inspect query {query.GetType().Name}.");
+        }
+    }
+
+    private static string? FindFirstForeignInSource(TableSource? source, string homeSchema)
+    {
+        switch (source)
+        {
+            case null:
+                return null;
+            case NamedTableSource named:
+                if (!ManagedSchemaName.TrySplit(named.Name, out var schema, out var localName)
+                    || schema.Equals(homeSchema, StringComparison.OrdinalIgnoreCase))
+                {
+                    return null;
+                }
+
+                return schema + "." + localName;
+            case DerivedTableSource derived:
+                return FindFirstForeignViewTableReference(derived.Query, homeSchema);
+            case JoinTableSource join:
+                return FindFirstForeignInSource(join.Left, homeSchema)
+                    ?? FindFirstForeignInSource(join.Right, homeSchema)
+                    ?? FindFirstForeignInExpression(join.Condition, homeSchema);
+            case TableValuedFunctionSource function:
+                return function.Schema is { } explicitSchema
+                    && !explicitSchema.Equals(homeSchema, StringComparison.OrdinalIgnoreCase)
+                        ? explicitSchema + "." + function.Name
+                        : function.Arguments
+                            .Select(argument => FindFirstForeignInExpression(argument, homeSchema))
+                            .FirstOrDefault(found => found is not null);
+            default:
+                return null;
+        }
+    }
+
+    private static string? FindFirstForeignInProjections(IReadOnlyList<Projection> projections, string homeSchema)
+        => projections.Select(projection => FindFirstForeignInExpression(projection.Expression, homeSchema))
+            .FirstOrDefault(found => found is not null);
+
+    private static string? FindFirstForeignInWindow(WindowSpecification? window, string homeSchema)
+    {
+        if (window is null)
+            return null;
+
+        return window.PartitionBy.Select(expression => FindFirstForeignInExpression(expression, homeSchema))
+                .FirstOrDefault(found => found is not null)
+            ?? window.OrderBy.Select(term => FindFirstForeignInExpression(term.Expression, homeSchema))
+                .FirstOrDefault(found => found is not null)
+            ?? FindFirstForeignInExpression(window.Frame?.Start.Offset, homeSchema)
+            ?? FindFirstForeignInExpression(window.Frame?.End.Offset, homeSchema);
+    }
+
+    private static string? FindFirstForeignInExpression(Expression? expression, string homeSchema)
+    {
+        switch (expression)
+        {
+            case null:
+                return null;
+            case ScalarSubqueryExpression scalarSubquery:
+                return FindFirstForeignViewTableReference(scalarSubquery.Query, homeSchema);
+            case ExistsExpression exists:
+                return FindFirstForeignViewTableReference(exists.Query, homeSchema);
+            case InSubqueryExpression inSubquery:
+                return FindFirstForeignInExpression(inSubquery.Value, homeSchema)
+                    ?? FindFirstForeignViewTableReference(inSubquery.Query, homeSchema);
+            case RowValueExpression rowValue:
+                return rowValue.Values.Select(value => FindFirstForeignInExpression(value, homeSchema))
+                    .FirstOrDefault(found => found is not null);
+            case FunctionExpression function:
+                return function.Arguments.Select(argument => FindFirstForeignInExpression(argument, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(function.Filter, homeSchema)
+                    ?? (function.AggregateOrderBy ?? [])
+                        .Select(orderBy => FindFirstForeignInExpression(orderBy.Expression, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInWindow(function.Window, homeSchema);
+            case CollationExpression collation:
+                return FindFirstForeignInExpression(collation.Expression, homeSchema);
+            case CastExpression cast:
+                return FindFirstForeignInExpression(cast.Expression, homeSchema);
+            case CaseExpression @case:
+                return FindFirstForeignInExpression(@case.Operand, homeSchema)
+                    ?? @case.Clauses.Select(clause =>
+                            FindFirstForeignInExpression(clause.When, homeSchema)
+                            ?? FindFirstForeignInExpression(clause.Then, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(@case.Else, homeSchema);
+            case LikeExpression like:
+                return FindFirstForeignInExpression(like.Value, homeSchema)
+                    ?? FindFirstForeignInExpression(like.Pattern, homeSchema)
+                    ?? FindFirstForeignInExpression(like.Escape, homeSchema);
+            case GlobExpression glob:
+                return FindFirstForeignInExpression(glob.Value, homeSchema)
+                    ?? FindFirstForeignInExpression(glob.Pattern, homeSchema);
+            case InExpression @in:
+                return FindFirstForeignInExpression(@in.Value, homeSchema)
+                    ?? @in.Values.Select(value => FindFirstForeignInExpression(value, homeSchema))
+                        .FirstOrDefault(found => found is not null);
+            case BetweenExpression between:
+                return FindFirstForeignInExpression(between.Value, homeSchema)
+                    ?? FindFirstForeignInExpression(between.Lower, homeSchema)
+                    ?? FindFirstForeignInExpression(between.Upper, homeSchema);
+            case UnaryExpression unary:
+                return FindFirstForeignInExpression(unary.Operand, homeSchema);
+            case BinaryExpression binary:
+                return FindFirstForeignInExpression(binary.Left, homeSchema)
+                    ?? FindFirstForeignInExpression(binary.Right, homeSchema);
+            default:
+                return null;
+        }
     }
 
     private static int CopyQuotedToken(
@@ -56514,7 +59253,114 @@ Func<string, ParsedStatement> rewrite)
     {
         var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         CollectQuerySchemas(query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        ExpandViewSchemas(
+            query,
+            schemas,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
         return RouteForSchemas(query, schemas);
+    }
+
+    // A view reference resolves (for routing purposes) to whichever schema stores the view,
+    // but the view's OWN body may touch other schemas the outer statement's text never
+    // mentions at all - a TEMP VIEW commonly wraps a query against MAIN tables. Schema-based
+    // statement routing only sees the outer statement's own text, so without this expansion a
+    // query that only appears to touch the view's owning schema gets routed there alone, and
+    // the view later fails to resolve its own body against that single-schema catalog
+    // (temp-view.sqltest, views.sqltest::drop-view-finds-temp-view-with-unqualified-name).
+    // Walks the statement's FROM sources (recursively through CTEs/compounds/derived tables),
+    // and for every reference that resolves to a view, merges in every schema that view's body
+    // touches - recursively, for a view whose body itself references another view - guarding
+    // against a cycle with `visitedViews`.
+    private void ExpandViewSchemas(
+        QueryStatement query,
+        HashSet<string> schemas,
+        HashSet<string> commonTableExpressions,
+        HashSet<string> visitedViews)
+    {
+        switch (query)
+        {
+            case SelectStatement select:
+                ExpandSourceViewSchemas(select.Source, schemas, commonTableExpressions, visitedViews);
+                break;
+            case CompoundSelectStatement compound:
+                foreach (var term in compound.Terms)
+                    ExpandViewSchemas(term, schemas, commonTableExpressions, visitedViews);
+                break;
+            case WithSelectStatement with:
+                var names = new HashSet<string>(commonTableExpressions, StringComparer.OrdinalIgnoreCase);
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                {
+                    names.Add(commonTableExpression.Name);
+                    ExpandViewSchemas(commonTableExpression.Query, schemas, names, visitedViews);
+                }
+                ExpandViewSchemas(with.Query, schemas, names, visitedViews);
+                break;
+        }
+    }
+
+    private void ExpandSourceViewSchemas(
+        TableSource? source,
+        HashSet<string> schemas,
+        HashSet<string> commonTableExpressions,
+        HashSet<string> visitedViews)
+    {
+        switch (source)
+        {
+            case NamedTableSource named:
+                ExpandNamedSourceView(named, schemas, commonTableExpressions, visitedViews);
+                break;
+            case DerivedTableSource derived:
+                ExpandViewSchemas(derived.Query, schemas, commonTableExpressions, visitedViews);
+                break;
+            case JoinTableSource join:
+                ExpandSourceViewSchemas(join.Left, schemas, commonTableExpressions, visitedViews);
+                ExpandSourceViewSchemas(join.Right, schemas, commonTableExpressions, visitedViews);
+                break;
+        }
+    }
+
+    private void ExpandNamedSourceView(
+        NamedTableSource named,
+        HashSet<string> schemas,
+        HashSet<string> commonTableExpressions,
+        HashSet<string> visitedViews)
+    {
+        var hasExplicitSchema = ManagedSchemaName.TrySplit(named.Name, out var explicitSchema, out var objectName);
+        if (!hasExplicitSchema)
+        {
+            if (commonTableExpressions.Contains(named.Name))
+                return;
+            objectName = named.Name;
+        }
+
+        var owningSchema = hasExplicitSchema
+            ? explicitSchema
+            : ResolveCollectedSchema(UnqualifiedSchemaMarker + objectName);
+        if (!TryFindViewDefinition(owningSchema, objectName, out var view))
+            return;
+
+        var viewKey = owningSchema + "\u0001" + objectName;
+        if (!visitedViews.Add(viewKey))
+            return;
+
+        CollectQuerySchemas(view.Query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        ExpandViewSchemas(
+            view.Query,
+            schemas,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            visitedViews);
+    }
+
+    private bool TryFindViewDefinition(string schema, string objectName, out ViewDefinition view)
+    {
+        view = null!;
+        var database = FindSchemaDatabase(schema);
+        if (database is null)
+            return false;
+
+        var catalog = GetTransactionState(database)?.Catalog ?? database.LiveCatalog;
+        return catalog.Views.TryGetValue(objectName, out view!);
     }
 
     private RoutedStatement RouteDataStatement(ParsedStatement statement)
@@ -56524,9 +59370,11 @@ Func<string, ParsedStatement> rewrite)
         var resolvedSchemas = schemas
             .Select(ResolveCollectedSchema)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        return TryRouteAttachedUpdateReadingMain(statement, resolvedSchemas, out var routed)
-            ? routed
-            : RouteForSchemas(statement, schemas);
+        if (TryRouteAttachedUpdateReadingMain(statement, resolvedSchemas, out var routed))
+            return routed;
+        if (TryRouteSingleWriteMultiSchemaStatement(statement, resolvedSchemas, out routed))
+            return routed;
+        return RouteForSchemas(statement, schemas);
     }
 
     // Turso acquires the independent read and write databases needed by a temp trigger subprogram
@@ -56644,6 +59492,125 @@ Func<string, ParsedStatement> rewrite)
             static entry => entry.Value.Clone(),
             StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Generalizes <see cref="TryRouteAttachedUpdateReadingMain"/> beyond "attached UPDATE reading
+    /// main only": any INSERT/UPDATE/DELETE that touches more than one schema routes here as long
+    /// as exactly one of those schemas is the statement's actual write target (any of main, temp,
+    /// or an attachment - not just main). The target keeps its own catalog; every other schema the
+    /// source/predicate reads is merged in as a read-only external table, aliased on a name
+    /// collision, mirroring how <see cref="RouteMultiSchemaReadQuery"/> merges every referenced
+    /// schema for pure reads. Turso plans the write and every read with independent database IDs; this is the
+    /// managed equivalent for the narrow "one write, several reads" shape the corpus exercises
+    /// (INSERT ... SELECT across databases, DELETE ... WHERE x IN (SELECT ... FROM other db)).
+    /// </summary>
+    private bool TryRouteSingleWriteMultiSchemaStatement(
+        ParsedStatement statement,
+        IReadOnlySet<string> resolvedSchemas,
+        out RoutedStatement routed)
+    {
+        routed = default;
+        if (resolvedSchemas.Count < 2)
+            return false;
+
+        string targetName;
+        switch (statement)
+        {
+            case InsertStatement { Upsert: null } insert:
+                targetName = insert.TableName;
+                break;
+            case UpdateStatement { From: null, IndexDirective: null } update:
+                targetName = update.TableName;
+                break;
+            case DeleteStatement delete:
+                targetName = delete.TableName;
+                break;
+            default:
+                return false;
+        }
+
+        var targetSchema = ManagedSchemaName.TrySplit(targetName, out var qualifiedSchema, out var targetLocalName)
+            ? qualifiedSchema
+            : ResolveCollectedSchema(UnqualifiedSchemaMarker + targetName);
+        if (!ManagedSchemaName.TrySplit(targetName, out _, out targetLocalName))
+            targetLocalName = targetName;
+
+        if (!resolvedSchemas.Contains(targetSchema)
+            || FindSchemaDatabase(targetSchema) is not { } targetDatabase)
+        {
+            return false;
+        }
+
+        var readSchemas = resolvedSchemas
+            .Where(schema => !schema.Equals(targetSchema, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (readSchemas.Length == 0)
+            return false;
+
+        var targetCatalog = GetTransactionState(targetDatabase)?.Catalog ?? targetDatabase.LiveCatalog;
+        var usedNames = new HashSet<string>(targetCatalog.Tables.Keys, StringComparer.OrdinalIgnoreCase);
+        var externalTables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
+        var sourceNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var schema in readSchemas)
+        {
+            if (FindSchemaDatabase(schema) is not { } database)
+                return false;
+
+            var catalog = GetTransactionState(database)?.Catalog ?? database.LiveCatalog;
+            foreach (var pair in catalog.Tables)
+            {
+                var sourceName = usedNames.Contains(pair.Key) ? "\u0001" + schema + ":" + pair.Key : pair.Key;
+                usedNames.Add(sourceName);
+                externalTables[sourceName] = pair.Value.Clone();
+                sourceNames[MainTempSourceKey(schema, pair.Key)] = sourceName;
+            }
+        }
+
+        var noCtes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rewritten = statement switch
+        {
+            InsertStatement insert => insert with
+            {
+                TableName = targetLocalName,
+                Source = insert.Source is null
+                    ? null
+                    : RewriteMainTempReadQuery(insert.Source, sourceNames, noCtes),
+                Rows = insert.Rows.Select(row => row.Select(expression =>
+                    RewriteMainTempReadExpression(expression, sourceNames, noCtes)!).ToArray()).ToArray(),
+                Returning = RewriteMainTempReadProjections(insert.Returning, sourceNames, noCtes),
+            },
+            UpdateStatement update => update with
+            {
+                TableName = targetLocalName,
+                Assignments = update.Assignments.Select(assignment => assignment with
+                {
+                    Value = RewriteMainTempReadExpression(assignment.Value, sourceNames, noCtes)!,
+                }).ToArray(),
+                Where = RewriteMainTempReadExpression(update.Where, sourceNames, noCtes),
+                OrderBy = RewriteMainTempReadOrderBy(update.EffectiveOrderBy, sourceNames, noCtes),
+                Limit = RewriteMainTempReadExpression(update.Limit, sourceNames, noCtes),
+                Offset = RewriteMainTempReadExpression(update.Offset, sourceNames, noCtes),
+                Returning = RewriteMainTempReadProjections(update.Returning, sourceNames, noCtes),
+            },
+            DeleteStatement delete => delete with
+            {
+                TableName = targetLocalName,
+                Where = RewriteMainTempReadExpression(delete.Where, sourceNames, noCtes),
+                OrderBy = RewriteMainTempReadOrderBy(delete.EffectiveOrderBy, sourceNames, noCtes),
+                Limit = RewriteMainTempReadExpression(delete.Limit, sourceNames, noCtes),
+                Offset = RewriteMainTempReadExpression(delete.Offset, sourceNames, noCtes),
+                Returning = RewriteMainTempReadProjections(delete.Returning, sourceNames, noCtes),
+            },
+            _ => statement,
+        };
+
+        routed = new RoutedStatement(
+            targetDatabase,
+            rewritten,
+            IsAttached: !ReferenceEquals(targetDatabase, _database) && !ReferenceEquals(targetDatabase, _tempDatabase),
+            ExternalTables: externalTables);
+        return true;
+    }
+
     private RoutedStatement RouteForSchemas(ParsedStatement statement, HashSet<string> schemas)
     {
         var resolvedSchemas = schemas
@@ -56654,11 +59621,9 @@ Func<string, ParsedStatement> rewrite)
         if (statement is QueryStatement query
             && !StatementMayMutate(_database, statement)
             && !StatementMayMutate(_tempDatabase, statement)
-            && resolvedSchemas.Count == 2
-            && resolvedSchemas.Contains("main")
-            && resolvedSchemas.Contains("temp"))
+            && resolvedSchemas.Count >= 2)
         {
-            return RouteMainTempReadQuery(query);
+            return RouteMultiSchemaReadQuery(query, resolvedSchemas);
         }
         if (resolvedSchemas.Count != 1)
         {
@@ -56768,18 +59733,46 @@ Func<string, ParsedStatement> rewrite)
     }
 
     // Temp is connection-private, so a read-only catalog can safely combine its current snapshot with main.
-    // Attached databases deliberately remain outside this route because they have independent lock lifecycles.
-    private RoutedStatement RouteMainTempReadQuery(QueryStatement query)
+    // Attached databases have independent lock lifecycles, but a pure SELECT never needs a write lock on
+    // them, so the same synthetic-catalog technique generalizes to any set of schemas: merge every
+    // referenced schema's tables into one read-only catalog (aliasing a name that exists in more than one
+    // schema so both stay reachable), rewrite every table/column reference to the merged name, and execute
+    // against main's engine (which already shares the function/collation registry every attachment was
+    // seeded with at ATTACH time).
+    private RoutedStatement RouteMultiSchemaReadQuery(QueryStatement query, IEnumerable<string> resolvedSchemas)
     {
-        var mainCatalog = GetTransactionState(_database)?.Catalog ?? _database.LiveCatalog;
-        var tempCatalog = GetTransactionState(_tempDatabase)?.Catalog ?? _tempDatabase.LiveCatalog;
-        var mainTableNames = new HashSet<string>(mainCatalog.Tables.Keys, StringComparer.OrdinalIgnoreCase);
-        var tempTableNames = new HashSet<string>(tempCatalog.Tables.Keys, StringComparer.OrdinalIgnoreCase);
         var tables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
         var sourceNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        AddTables("main", mainCatalog, tempTableNames);
-        AddTables("temp", tempCatalog, mainTableNames);
+        foreach (var schema in resolvedSchemas)
+        {
+            if (FindSchemaDatabase(schema) is not { } database)
+                throw new EmbeddedSqlException($"no such database: {schema}");
+
+            var catalog = GetTransactionState(database)?.Catalog ?? database.LiveCatalog;
+            foreach (var pair in catalog.Tables)
+            {
+                var sourceName = usedNames.Contains(pair.Key) ? "\u0001" + schema + ":" + pair.Key : pair.Key;
+                usedNames.Add(sourceName);
+                tables[sourceName] = pair.Value;
+                sourceNames[MainTempSourceKey(schema, pair.Key)] = sourceName;
+            }
+        }
+
+        // A view's own identity/routing stays wherever CREATE [TEMP] VIEW stored it (its name
+        // is never renamed the way a colliding table's is), but its body must resolve through
+        // this same merged catalog once the outer statement reaches here - real SQLite never
+        // restricts a view's body to the schema that owns it (temp-view.sqltest,
+        // views.sqltest::drop-view-finds-temp-view-with-unqualified-name). Temp shadows main on
+        // a name collision, matching ordinary unqualified-name precedence.
+        var mainCatalog = GetTransactionState(_database)?.Catalog ?? _database.LiveCatalog;
+        var tempCatalog = GetTransactionState(_tempDatabase)?.Catalog ?? _tempDatabase.LiveCatalog;
+        var views = new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in mainCatalog.Views)
+            views[pair.Key] = pair.Value;
+        foreach (var pair in tempCatalog.Views)
+            views[pair.Key] = pair.Value;
 
         return new RoutedStatement(
             _database,
@@ -56787,23 +59780,8 @@ Func<string, ParsedStatement> rewrite)
             IsAttached: false,
             new EmbeddedDatabase.SchemaCatalog(
                 tables,
-                new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase),
+                views,
                 new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase)));
-
-        void AddTables(
-            string schema,
-            EmbeddedDatabase.SchemaCatalog catalog,
-            HashSet<string> otherTableNames)
-        {
-            foreach (var pair in catalog.Tables)
-            {
-                var sourceName = otherTableNames.Contains(pair.Key)
-                    ? "\u0001" + schema + ":" + pair.Key
-                    : pair.Key;
-                tables.Add(sourceName, pair.Value);
-                sourceNames.Add(MainTempSourceKey(schema, pair.Key), sourceName);
-            }
-        }
     }
 
     private QueryStatement RewriteMainTempReadQuery(
@@ -56923,9 +59901,15 @@ Func<string, ParsedStatement> rewrite)
         if (!ManagedSchemaName.TrySplit(sourceName, out _, out localName))
             localName = sourceName;
 
-        return sourceNames.TryGetValue(MainTempSourceKey(schema, localName), out var rewritten)
-            ? source with { Name = rewritten, IsSchemaQualified = false }
-            : source;
+        if (sourceNames.TryGetValue(MainTempSourceKey(schema, localName), out var rewritten))
+            return source with { Name = rewritten, IsSchemaQualified = false };
+
+        // No cross-schema name collision (the common case, and the only shape a view name
+        // takes here - a view is never entered into sourceNames, only tables are): the merged
+        // catalog stores this source under its bare name regardless of which schema owns it,
+        // so an explicit qualifier that survived unrenamed would otherwise fail to resolve
+        // against it (RouteMainTempReadQuery merges main+temp tables and views by bare name).
+        return source.IsSchemaQualified ? source with { Name = localName, IsSchemaQualified = false } : source;
     }
 
     private IReadOnlyList<OrderByTerm> RewriteMainTempReadOrderBy(
@@ -56935,6 +59919,15 @@ Func<string, ParsedStatement> rewrite)
         => orderBy.Select(term => term with
         {
             Expression = RewriteMainTempReadExpression(term.Expression, sourceNames, commonTableExpressions)!,
+        }).ToArray();
+
+    private IReadOnlyList<Projection>? RewriteMainTempReadProjections(
+        IReadOnlyList<Projection>? projections,
+        IReadOnlyDictionary<string, string> sourceNames,
+        HashSet<string> commonTableExpressions)
+        => projections?.Select(projection => projection with
+        {
+            Expression = RewriteMainTempReadExpression(projection.Expression, sourceNames, commonTableExpressions)!,
         }).ToArray();
 
     private Expression? RewriteMainTempReadExpression(
@@ -57101,6 +60094,11 @@ Func<string, ParsedStatement> rewrite)
             return schema;
 
         var objectName = schema[1..];
+        return IsKnownTableOrViewName(objectName) ? ResolveCollectedSchemaCore(objectName) : "main";
+    }
+
+    private string ResolveCollectedSchemaCore(string objectName)
+    {
         if (IsTemporarySchemaTable(objectName))
             return "temp";
         if (GetTransactionState(_tempDatabase) is { } tempState
@@ -57128,6 +60126,46 @@ Func<string, ParsedStatement> rewrite)
         }
 
         return "main";
+    }
+
+    // True when `name` names a real table or view somewhere on this connection's schema
+    // search path (temp, main, or an attached database) - or was declared by an earlier
+    // CREATE TABLE/CREATE VIEW statement still pending within the same PrepareScript call
+    // (_pendingScriptObjectNames). Handed to SqlParser as a lookup so a bare `name(args)`
+    // call that resolves to one of these - not a registered table-valued function, not a
+    // CTE - gets the same "'name' is not a function" diagnostic a CTE called with arguments
+    // already gets, instead of the generic "is not supported" message
+    // (cte.sqltest::table-referenced-with-call-arguments-rejected).
+    private bool IsKnownTableOrViewName(string name)
+    {
+        if (_pendingScriptObjectNames?.Contains(name) == true)
+            return true;
+        if (IsTemporarySchemaTable(name))
+            return true;
+        if (GetTransactionState(_tempDatabase) is { } tempState
+            ? tempState.Catalog.Tables.ContainsKey(name) || tempState.Catalog.Views.ContainsKey(name)
+            : _tempDatabase.ContainsTableOrView(name))
+        {
+            return true;
+        }
+        if (GetTransactionState(_database) is { } mainState
+            ? mainState.Catalog.Tables.ContainsKey(name) || mainState.Catalog.Views.ContainsKey(name)
+            : _database.ContainsTableOrView(name))
+        {
+            return true;
+        }
+
+        foreach (var attachment in _attachedDatabases.Values)
+        {
+            if (GetTransactionState(attachment.Database) is { } state
+                ? state.Catalog.Tables.ContainsKey(name) || state.Catalog.Views.ContainsKey(name)
+                : attachment.Database.ContainsTableOrView(name))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsTemporarySchemaTable(string name)
@@ -57342,6 +60380,7 @@ Func<string, ParsedStatement> rewrite)
             case QualifiedStarExpression:
             case CurrentTimeExpression:
             case RaiseExpression:
+            case DefaultValueExpression:
                 return;
             case ScalarSubqueryExpression scalarSubquery:
                 CollectQuerySchemas(scalarSubquery.Query, schemas, commonTableExpressions);
@@ -57358,6 +60397,8 @@ Func<string, ParsedStatement> rewrite)
                     CollectExpressionSchemas(value, schemas, commonTableExpressions);
                 return;
             case FunctionExpression function:
+                if (TryGetSequenceFunctionSchema(function, out var sequenceSchema))
+                    schemas.Add(sequenceSchema);
                 foreach (var argument in function.Arguments)
                     CollectExpressionSchemas(argument, schemas, commonTableExpressions);
                 CollectExpressionSchemas(function.Filter, schemas, commonTableExpressions);
@@ -57409,6 +60450,35 @@ Func<string, ParsedStatement> rewrite)
             default:
                 throw new InvalidOperationException($"Cannot route expression {expression.GetType().Name}.");
         }
+    }
+
+    /// <summary>
+    /// A <c>nextval</c>/<c>currval</c>/<c>setval</c> call names its sequence via a string-literal
+    /// argument rather than an ordinary table/column reference, so the generic schema collector never
+    /// sees it. Upstream's <c>translate_sequence_function</c> resolves an unqualified name against the
+    /// main schema only (never the dynamic temp/main/attached lookup ordinary table names get), and a
+    /// <c>schema.name</c> spelling names the schema explicitly. Surfacing that schema here lets routing
+    /// send the call to the attached database that actually owns the backing table, instead of always
+    /// executing against main's catalog.
+    /// </summary>
+    private static bool TryGetSequenceFunctionSchema(FunctionExpression function, out string schema)
+    {
+        schema = "main";
+        if (function.Window is not null
+            || !(function.Name.Equals("nextval", StringComparison.OrdinalIgnoreCase)
+                || function.Name.Equals("currval", StringComparison.OrdinalIgnoreCase)
+                || function.Name.Equals("setval", StringComparison.OrdinalIgnoreCase))
+            || function.Arguments.Count == 0
+            || function.Arguments[0] is not LiteralExpression { Value.Kind: SqlValueKind.Text } literal)
+        {
+            return false;
+        }
+
+        var rawName = literal.Value.AsText();
+        var dot = rawName.LastIndexOf('.');
+        if (dot >= 0)
+            schema = rawName[..dot];
+        return true;
     }
 
     private static void CollectWindowSchemas(
@@ -58487,14 +61557,60 @@ Func<string, ParsedStatement> rewrite)
 
         if (ReferenceEquals(database, _tempDatabase))
             return;
-        if (_transactionWriteDatabase is null
-            || ReferenceEquals(_transactionWriteDatabase, database))
-        {
-            return;
-        }
 
-        throw new EmbeddedSqlException(
-            "Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.");
+        // The multi-database guard below only protects an *explicit* transaction: autocommit
+        // wraps each statement in its own independent commit, so a single statement touching one
+        // database is trivially safe regardless of which database that is, and (as in the
+        // original single-field guard this generalizes) nothing here should accumulate state
+        // that outlives one autocommit statement. _transactionWriteDatabase itself is populated
+        // by the explicit-transaction execute paths, never by this guard, for the same reason.
+        if (_transactionDatabases is null)
+            return;
+
+        // Turso documents multi-database transaction atomicity as broken only when a COMMIT
+        // updates two or more *physical* (disk-backed) database files: "transactions continue
+        // to be atomic within each individual database file... if the host computer crashes in
+        // the middle of a COMMIT where two or more database files are updated, some of those
+        // files might get the changes where others might not" (sqlite.org/lang_attach.html). A
+        // ':memory:' attachment has no file and no crash-recovery contract at all - a crash
+        // loses its state regardless of commit ordering, and each ':memory:' attachment is
+        // private to this connection (see ExecuteAttach), so there is never a concurrent writer
+        // that could invalidate a healthy commit either - so any number of memory databases may
+        // be written together in one transaction.
+        //
+        // A physical database's write, however, must still be the ONLY database this transaction
+        // touches - not just "at most one OTHER physical database", but no other database at
+        // all, including ':memory:' ones. Committing a physical database first and then applying
+        // already-computed ':memory:' publishes second is not, on its own, enough to claim
+        // combined atomicity: if a later ':memory:' database's own commit then fails (a real,
+        // if rare, possibility - a concurrent MVCC merge conflict, for instance), the physical
+        // effect is retained while the memory effect is lost, which is an honestly-classified
+        // PARTIAL commit, not the atomic transaction a single COMMIT implies. Proving the
+        // ':memory:' publish step can never fail once the physical commit has already returned
+        // requires preflighting/reserving every fallible piece of that publish (schema merge,
+        // version-conflict detection) while holding each database's commit lock continuously
+        // from before the physical commit through the memory apply - a real, currently
+        // unimplemented staged-commit design - so mixing a physical write with any other
+        // database's write in the same transaction stays rejected until that design exists.
+        //
+        // This is computed live from _transactionDatabases's own HasChanges bookkeeping (the
+        // same source CommitTransaction's persistentChanges reads) rather than a separately
+        // tracked set, so it automatically inherits that bookkeeping's existing savepoint-
+        // rollback and failed-statement semantics: a statement that merely attempted a write and
+        // then failed (see RecursiveNoOpDepthErrorDoesNotReserveATransactionWriteDatabase) never
+        // sets HasChanges, and rolling back to a savepoint already restores it, so neither can
+        // wrongly "reserve" a database this guard would otherwise have to un-reserve itself.
+        var otherChangedDatabases = _transactionDatabases
+            .Where(pair => pair.Value.HasChanges && !ReferenceEquals(pair.Key, database));
+        var conflictsWithAnotherDatabase = database.IsFileBacked
+            ? otherChangedDatabases.Any()
+            : otherChangedDatabases.Any(pair => pair.Key.IsFileBacked);
+        if (conflictsWithAnotherDatabase)
+        {
+            throw new EmbeddedSqlException(
+                "Managed ATTACH transactions cannot modify more than one database because "
+                + "independent WAL files cannot be committed atomically.");
+        }
     }
 
     private bool ReserveTransactionMutation(EmbeddedDatabase database, ParsedStatement statement)
@@ -58843,8 +61959,17 @@ Func<string, ParsedStatement> rewrite)
         var persistentChanges = changed
             .Where(pair => !ReferenceEquals(pair.Key, _tempDatabase))
             .ToArray();
-        if (persistentChanges.Length > 1)
-            throw new InvalidOperationException("A managed ATTACH transaction reached an unsafe multi-database write state.");
+        // Mirrors the EnsureTransactionMayMutate rule: a physical (disk-backed) database's write
+        // must be the ONLY database committed here - not just "at most one other physical
+        // database". Any number of ':memory:' databases may be committed together (none of them
+        // carries a crash-recovery contract this commit could break), but never alongside a
+        // physical one, until a provably non-failing staged-memory-publish design exists (see
+        // EnsureTransactionMayMutate's doc comment).
+        if (persistentChanges.Length > 1 && persistentChanges.Any(pair => pair.Key.IsFileBacked))
+        {
+            throw new InvalidOperationException(
+                "A managed ATTACH transaction reached an unsafe multi-database write state.");
+        }
 
         var tempChange = changed
             .Where(pair => ReferenceEquals(pair.Key, _tempDatabase))
@@ -58863,13 +61988,44 @@ Func<string, ParsedStatement> rewrite)
 
         ExceptionDispatchInfo? deferredMaintenanceFailure = null;
         var schemaCatalogWasPublished = false;
+        // Every ':memory:' database this loop has already durably published, paired with the
+        // catalog it held immediately before that publish, so a later database's failure can
+        // revert it: PublishCatalog is an irreversible reference swap, so once the try/catch
+        // below completes a memory database's commit successfully, ResetTransactionState() alone
+        // can no longer undo it. persistentChanges is EITHER a single physical database (the
+        // guard above forbids mixing) or N ':memory:' databases - so this list is only ever
+        // populated in the all-memory case; a physical commit is durable the instant
+        // PersistFileCatalog returns and is never reverted.
+        var publishedMemoryDatabases = new List<(EmbeddedDatabase Database, EmbeddedDatabase.SchemaCatalog PreviousCatalog)>();
+        // True once the sole physical database in this transaction (if any) has durably
+        // committed, even with no schema change. schemaCatalogWasPublished alone under-reports
+        // durability here: a pure data write (no schema change) to the physical database still
+        // means real, irreversible I/O happened, which the outer catch below must not mistake for
+        // "nothing happened yet, safe to leave the transaction open for retry".
+        var anyPersistentChangeWasPublished = false;
         try
         {
-            if (persistentChanges.Length == 1)
+            // persistentChanges holds either the sole physical database or N ':memory:'
+            // databases (the guard above forbids mixing), so this ordering is a no-op in
+            // practice - kept only so a later database's failure in the all-memory case still
+            // reverts every ':memory:' database that already published earlier in this same
+            // loop via publishedMemoryDatabases before the failure propagates, so a subsequent
+            // ROLLBACK (or the exception itself) never leaves a partially-committed transaction
+            // that looks committed from a fresh read.
+            foreach (var (database, state) in persistentChanges.OrderByDescending(pair => pair.Key.IsFileBacked))
             {
-                var (database, state) = persistentChanges[0];
+                var previousCatalogForRevert = database.LiveCatalog;
                 try
                 {
+                    // Test-only hook (mirrors BeforePinningTransactionSnapshotForTesting/
+                    // AfterMvccBeginBeforeCatalogSnapshotForTesting): lets a test inject a
+                    // genuine failure at a controlled point inside this real commit loop - not a
+                    // hand-rolled simulation of it - so a multi-':memory:'-database commit's
+                    // revert-on-later-failure behavior can be verified end-to-end, exercising
+                    // CommitTransaction() itself rather than only the isolated
+                    // RevertPublishedMemoryCatalog primitive. Placed inside the try so a thrown
+                    // fault is caught by the exact same handler as a real commit failure below.
+                    BeforeCommittingPersistentChangeForTesting?.Invoke(database);
                     database.CommitTransaction(
                         state.Catalog,
                         state.Version,
@@ -58900,7 +62056,30 @@ Func<string, ParsedStatement> rewrite)
                     // maintenance error is surfaced.
                     deferredMaintenanceFailure = ExceptionDispatchInfo.Capture(failure);
                 }
-                schemaCatalogWasPublished = state.HasSchemaChanges;
+                catch
+                {
+                    // A real (non-post-commit-maintenance) failure: revert every ':memory:'
+                    // database this loop already published before this one, then let the
+                    // original exception continue to the outer catch below unchanged.
+                    RevertPublishedMemoryDatabases(publishedMemoryDatabases);
+                    throw;
+                }
+
+                if (!database.IsFileBacked)
+                {
+                    publishedMemoryDatabases.Add((database, previousCatalogForRevert));
+                }
+                else
+                {
+                    // Unlike a ':memory:' database's publish (which the catch above can and does
+                    // revert if a later database's commit fails), a physical commit is durable
+                    // the instant this call returns and is never reverted, so it is the only
+                    // outcome that must force the "already partially durable" categorization
+                    // below regardless of whether it happened to change the schema.
+                    anyPersistentChangeWasPublished = true;
+                }
+
+                schemaCatalogWasPublished |= state.HasSchemaChanges;
             }
 
             foreach (var (database, txId) in preparedSchemaCommits)
@@ -58916,7 +62095,7 @@ Func<string, ParsedStatement> rewrite)
         }
         catch (Exception failure)
         {
-            if (!mvccWriteWasPublished && !schemaCatalogWasPublished)
+            if (!mvccWriteWasPublished && !schemaCatalogWasPublished && !anyPersistentChangeWasPublished)
             {
                 if (preparedSchemaCommits.Count != 0)
                     ResetTransactionState();
@@ -58937,6 +62116,33 @@ Func<string, ParsedStatement> rewrite)
             ResetTransactionState(rollbackVirtualTables: false);
         }
         deferredMaintenanceFailure?.Throw();
+    }
+
+    /// <summary>
+    /// Undoes every ':memory:' database that already published in this commit's loop before a
+    /// later database's commit failed, restoring each one's exact pre-publish catalog. Best-
+    /// effort in the face of a further failure while reverting: swallows and continues so one
+    /// broken revert cannot mask the original failure or leave the remaining reverts undone, and
+    /// intentionally does not add to <see cref="ExceptionDispatchInfo"/>/rethrow, mirroring how
+    /// the rest of this method's cleanup paths already treat this stage as unconditional cleanup
+    /// rather than a reportable failure of its own.
+    /// </summary>
+    private static void RevertPublishedMemoryDatabases(
+        IReadOnlyList<(EmbeddedDatabase Database, EmbeddedDatabase.SchemaCatalog PreviousCatalog)> publishedMemoryDatabases)
+    {
+        for (var index = publishedMemoryDatabases.Count - 1; index >= 0; index--)
+        {
+            var (database, previousCatalog) = publishedMemoryDatabases[index];
+            try
+            {
+                database.RevertPublishedMemoryCatalog(previousCatalog);
+            }
+            catch
+            {
+                // Best-effort: keep unwinding the remaining reverts rather than letting a
+                // secondary failure here replace or hide the real commit failure.
+            }
+        }
     }
 
     private void CommitTemporaryTransaction(TransactionDatabaseState? tempChange)
@@ -59191,6 +62397,13 @@ Func<string, ParsedStatement> rewrite)
         if (!database.IsFileBacked)
             return "memory";
         return database.GetJournalMode().ToString().ToLowerInvariant();
+    }
+
+    // A null schema has the same main-database default as the statement form.
+    private string DescribeJournalModeForSchema(string? schema)
+    {
+        var database = ResolvePragmaDatabase(schema);
+        return DescribeJournalMode(database, isTempDatabase: ReferenceEquals(database, _tempDatabase));
     }
 
     private static bool TryParseJournalMode(string mode, out SqliteJournalMode journalMode)
@@ -59492,9 +62705,23 @@ Func<string, ParsedStatement> rewrite)
     private ExecutionResult ExecutePragmaAutoVacuum(PragmaAutoVacuumStatement statement)
     {
         ValidatePragmaSchema(statement.Schema);
-        return statement.Value is null
-            ? new ExecutionResult(["auto_vacuum"], [[SqlValue.Integer(0)]], 0)
-            : ExecutionResult.Empty;
+        if (statement.Value is null)
+            return new ExecutionResult(["auto_vacuum"], [[SqlValue.Integer(0)]], 0);
+
+        // Auto-vacuum is always off: Ahtola has no `--experimental-autovacuum` flag/engine
+        // support to turn it on. SQLite spells the mode either by name or by number (0/NONE,
+        // 1/FULL, 2/INCREMENTAL); requesting NONE only restates the state the database is
+        // already in, so it is always accepted, while requesting FULL/INCREMENTAL (or any
+        // unrecognized value) fails the same way it would if the flag existed but was unset.
+        var isNone = string.Equals(statement.Value, "none", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(statement.Value, "0", StringComparison.Ordinal);
+        if (!isNone)
+        {
+            throw new EmbeddedSqlException(
+                "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.");
+        }
+
+        return ExecutionResult.Empty;
     }
 
     private ExecutionResult ExecutePragmaDataSyncRetry(PragmaDataSyncRetryStatement statement)
@@ -59631,7 +62858,9 @@ Func<string, ParsedStatement> rewrite)
         if (_queryOnly)
             throw new EmbeddedSqlException("attempt to write a readonly database");
         if (_transactionDatabases is not null)
-            throw new EmbeddedSqlException("cannot VACUUM from within a transaction");
+            throw new EmbeddedSqlException(statement.Into is null
+                ? "cannot VACUUM from within a transaction"
+                : "cannot VACUUM INTO from within a transaction");
 
         var databaseName = statement.Schema ?? "main";
         var database = ResolveDatabase(databaseName);
@@ -59670,6 +62899,8 @@ Func<string, ParsedStatement> rewrite)
                 throw new EmbeddedSqlException("non-text filename");
 
             var destinationPath = destinationValue.AsText();
+            if (destinationPath.Length == 0)
+                throw new EmbeddedSqlException("VACUUM INTO path cannot be empty");
             if (string.IsNullOrWhiteSpace(destinationPath)
                 || destinationPath.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
                 || destinationPath.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
@@ -60205,6 +63436,11 @@ public sealed class EmbeddedStatement : IDisposable
         _boundValues = new SqlValue[parameters.Count + 1];
     }
 
+    // Exposes the parsed statement for same-assembly callers that need to inspect its
+    // shape without re-parsing (PrepareScript's incremental "does an earlier statement in
+    // this same script declare this name" tracking).
+    internal ParsedStatement Statement => _statement;
+
     public int ParameterCount => _parameters.Count;
 
     public int ColumnCount => _result?.Columns.Length ?? _columnNames?.Length ?? 0;
@@ -60603,6 +63839,25 @@ public sealed class EmbeddedStatement : IDisposable
 // Row storage that funnels every mutation through a revision counter, so
 // statement-level caches (transient equality lookups) can detect staleness
 // without hunting down each individual mutation site.
+/// <summary>
+/// One <see cref="EmbeddedTable"/> instance's independent claim on a shared resource a pending
+/// row loader depends on (see <see cref="EmbeddedTable.AttachPendingRowLoader"/>) — concretely,
+/// <c>EmbeddedFileStore</c>'s pinned page-materialization transaction. Every distinct table
+/// instance that might invoke the same loader delegate (the original, plus every per-statement
+/// working-copy clone made before it was ever hydrated — see
+/// <see cref="EmbeddedTable.HasPendingRowLoad"/>) retains its own reference via
+/// <see cref="Retain"/> and releases it exactly once via <see cref="Release"/>, so one instance
+/// finishing first can never tear down a resource a sibling instance still needs.
+/// </summary>
+internal interface IPendingRowLoadResourceLease
+{
+    /// <summary>Retains an additional, independent reference for a new owning instance.</summary>
+    IPendingRowLoadResourceLease Retain();
+
+    /// <summary>Releases this instance's reference.</summary>
+    void Release();
+}
+
 internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
 {
     private static long _lineageSequence;
@@ -60614,11 +63869,14 @@ internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
     /// <summary>
     /// Identifies this specific RowStore instance's physical storage lineage, distinct from
     /// <see cref="Revision"/>. Assigned fresh, process-uniquely, whenever a RowStore is
-    /// constructed, and copied forward only by <see cref="ReplaceContentsPreservingRevision"/> —
-    /// i.e. only <see cref="EmbeddedTable.Clone"/>'s same-statement working copy carries the
-    /// same LineageId as its source; every other path that builds a replacement
-    /// <see cref="EmbeddedTable"/> (ALTER COLUMN, ADD/DROP COLUMN, or any other full rebuild that
-    /// re-adds every row into a brand-new RowStore) gets a distinct one.
+    /// constructed, and copied forward only by <see cref="ReplaceContentsPreservingRevision"/>
+    /// or <see cref="AdoptIdentity"/> — i.e. only <see cref="EmbeddedTable.Clone"/>'s
+    /// same-statement working copy carries the same LineageId as its source (whether that copy
+    /// happened eagerly, or was deferred because the source's own rows are still an unresolved
+    /// page-backed load — see <see cref="EmbeddedTable.HasPendingRowLoad"/>); every other path
+    /// that builds a replacement <see cref="EmbeddedTable"/> (ALTER COLUMN, ADD/DROP COLUMN, or
+    /// any other full rebuild that re-adds every row into a brand-new RowStore) gets a distinct
+    /// one.
     /// </summary>
     /// <remarks>
     /// Revision alone cannot distinguish "the same physical row store, unchanged since the
@@ -60716,6 +63974,29 @@ internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
             _rows.Add(row.ToArray());
         Revision = source.Revision;
         LineageId = source.LineageId;
+    }
+
+    /// <summary>
+    /// Adopts a source RowStore's Revision and LineageId onto this still-empty
+    /// RowStore without copying any row content. Used only when a table's base rows have
+    /// not yet been read from page storage (see <see cref="EmbeddedTable.HasPendingRowLoad"/>):
+    /// a per-statement working-copy clone of an untouched table must stay just as lazy as its
+    /// source, but <see cref="EmbeddedFileStore.IsTableRowStorageUnchangedFromPrevious"/> still
+    /// needs to prove "unchanged since the previous commit" by comparing Revision/LineageId
+    /// alone, without forcing either side to actually load its rows. Both sides independently
+    /// reload the identical committed page image later if anything ever touches them, so sharing
+    /// these two numbers ahead of time cannot make either one observe stale content.
+    /// </summary>
+    internal void AdoptIdentity(long lineageId, long revision)
+    {
+        if (_rows.Count != 0)
+        {
+            throw new InvalidOperationException(
+                "AdoptIdentity can only be used on a RowStore that has not been populated yet.");
+        }
+
+        LineageId = lineageId;
+        Revision = revision;
     }
 
     System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
@@ -61056,7 +64337,7 @@ internal sealed class EmbeddedTable
                     PrimaryKeyConstraintOrdinal = existing.ConstraintOrdinal;
                     SetEffectivePrimaryKeyConflictAlgorithm(mergedConflictAlgorithm);
                     PrimaryKeyColumns = Array.AsReadOnly(existing.Columns
-                        .Select(column => (column.ColumnIndex, column.Descending))
+                        .Select(column => (column.ColumnIndex, column.Descending, column.NullPlacement))
                         .ToArray());
                     PrimaryKeySchema = CreatePrimaryKeySchema(ColumnDefinitions, existing.Columns);
                 }
@@ -61272,7 +64553,8 @@ internal sealed class EmbeddedTable
                 ColumnDefinitions[columnIndex].Name,
                 columnIndex,
                 term.Collation ?? ColumnDefinitions[columnIndex].Collation,
-                term.Descending);
+                term.Descending,
+                NullPlacement: term.NullPlacement);
         }
 
         return columns;
@@ -61437,11 +64719,241 @@ internal sealed class EmbeddedTable
 
     public EmbeddedColumn[] ColumnDefinitions { get; private set; }
 
-    public RowStore Rows { get; } = new();
+    private readonly RowStore _rowsStore = new();
 
     // Parallel to <see cref="Rows"/> (index-aligned): the SQLite rowid backing each row.
     // Every row-mutating site keeps this list the same length and order as Rows.
-    public List<long> RowIds { get; } = [];
+    private readonly List<long> _rowIdsStore = [];
+
+    // Set by EmbeddedFileStore.Load() for a page-backed base table instead of eagerly
+    // walking its b-tree at physical-open time (see AttachPendingRowLoader). Null for
+    // every in-memory-only table and for any table whose rows have already been loaded.
+    private Action<EmbeddedTable>? _pendingRowLoader;
+
+    // A pending loader may depend on a shared resource (a pinned page-materialization
+    // transaction) that must survive at least as long as any EmbeddedTable instance that might
+    // still invoke it — see IPendingRowLoadResourceLease and EmbeddedFileStore's
+    // MaterializationTransactionLease. Released exactly once, whenever this specific instance's
+    // copy of the loader actually runs (see EnsureRowsLoaded).
+    private IPendingRowLoadResourceLease? _pendingRowLoadResourceLease;
+    private readonly object _rowLoadGate = new();
+    private bool _rowsLoaded = true;
+
+    // True only while EnsureRowsLoaded's own loader invocation is on the call stack. The loader
+    // populates this exact table through the very same Rows/RowIds properties
+    // (table.Rows.Add(...)); without this guard, that reentrant access would call
+    // EnsureRowsLoaded again for every single row appended. _rowsLoaded itself cannot be set to
+    // true before the loader runs to serve this purpose (as an earlier revision did): if the
+    // loader throws partway through, that would have already marked an incompletely-populated
+    // table as successfully, permanently loaded, so every later reader would silently observe a
+    // truncated row set forever — including a subsequent VACUUM/persist pass, which would then
+    // durably rewrite the database with the missing rows gone. See EnsureRowsLoaded.
+    private bool _rowLoadInProgress;
+
+    // Set when a previous load attempt threw partway through. A partially populated RowStore can
+    // never be trusted (see the reentrancy comment above), so a failed load's rows are discarded
+    // and every subsequent access fails closed by rethrowing this captured failure, rather than
+    // silently retrying (which could mask a real, persistent corruption or I/O fault) or silently
+    // returning the incomplete rows a prior attempt happened to append before failing.
+    private ExceptionDispatchInfo? _rowLoadFailure;
+
+    /// <summary>
+    /// The table's committed base rows, loaded from page storage on first access rather
+    /// than eagerly at physical-open time when <see cref="AttachPendingRowLoader"/> attached
+    /// a page-backed loader. Every other member below funnels through this getter (or
+    /// <see cref="RowIds"/>'s) so existing callers observe the same compatible, fully
+    /// in-memory, indexable row list they always have — only the timing of the underlying
+    /// page walk changes.
+    /// </summary>
+    public RowStore Rows
+    {
+        get
+        {
+            EnsureRowsLoaded();
+            return _rowsStore;
+        }
+    }
+
+    // Parallel to <see cref="Rows"/> (index-aligned): the SQLite rowid backing each row.
+    // Every row-mutating site keeps this list the same length and order as Rows.
+    public List<long> RowIds
+    {
+        get
+        {
+            EnsureRowsLoaded();
+            return _rowIdsStore;
+        }
+    }
+
+    /// <summary>
+    /// The row storage's lineage/revision identity, read directly without forcing a still-
+    /// pending lazy load (contrast <see cref="Rows"/>/<see cref="RowIds"/>, which both force
+    /// one). Safe to call at any time and from any table state (pending, loaded, or
+    /// permanently failed): <see cref="RowStore.LineageId"/> is assigned once at construction
+    /// and only ever carried forward verbatim by <see cref="RowStore.AdoptIdentity"/> /
+    /// <see cref="RowStore.ReplaceContentsPreservingRevision"/> (both plain field copies, never
+    /// touched by <see cref="EnsureRowsLoaded"/> itself), and <see cref="RowStore.Revision"/>
+    /// only ever increases — so a caller that only needs to prove "this table's row storage is
+    /// provably the same physical lineage, unchanged since a previous snapshot" (see
+    /// <c>EmbeddedFileStore.IsTableRowStorageUnchangedFromPrevious</c>) never needs to pay for
+    /// decoding a whole table's pages just to answer that.
+    /// </summary>
+    internal (long LineageId, long Revision) RowStorageIdentity => (_rowsStore.LineageId, _rowsStore.Revision);
+
+    /// <summary>
+    /// True while this table's committed base rows have not yet been read from page
+    /// storage and no earlier attempt to do so has failed (see <see cref="HasFailedRowLoad"/>).
+    /// Observable so tests and diagnostics can prove a physical open, or a statement that never
+    /// touches this table, did not materialize it. Always false for an in-memory-only table
+    /// (nothing ever attaches a loader) and for any table whose rows have already been loaded,
+    /// whether lazily or eagerly.
+    /// </summary>
+    internal bool HasPendingRowLoad
+    {
+        get
+        {
+            lock (_rowLoadGate)
+                return !_rowsLoaded && _rowLoadFailure is null;
+        }
+    }
+
+    /// <summary>
+    /// True once a previous attempt to load this table's committed rows has thrown partway
+    /// through. Every access to <see cref="Rows"/>/<see cref="RowIds"/> keeps rethrowing that
+    /// same failure from this point on — the table's row set can never be trusted again once a
+    /// load has failed partway (see <see cref="EnsureRowsLoaded"/>).
+    /// </summary>
+    internal bool HasFailedRowLoad
+    {
+        get
+        {
+            lock (_rowLoadGate)
+                return _rowLoadFailure is not null;
+        }
+    }
+
+    /// <summary>
+    /// Defers this table's initial row load to first access instead of populating it
+    /// immediately. Called by <c>EmbeddedFileStore.Load()</c> for a page-backed base table:
+    /// physical open only reconstructs the schema catalog, and <paramref name="loader"/> —
+    /// which reads this specific table's committed b-tree and populates
+    /// <see cref="Rows"/>/<see cref="RowIds"/> in lockstep, exactly as the eager path used
+    /// to — runs at most once, the first time anything actually observes this table's rows.
+    /// <paramref name="resourceLease"/>, if supplied, is released exactly once — when this
+    /// specific instance's copy of the loader actually runs (successfully or not) — and is
+    /// this instance's own claim on whatever shared resource the loader depends on; see
+    /// <see cref="TryCopyPendingRowLoadTo"/> for why a clone must retain its own reference
+    /// rather than share this one.
+    /// </summary>
+    internal void AttachPendingRowLoader(Action<EmbeddedTable> loader, IPendingRowLoadResourceLease? resourceLease = null)
+    {
+        ArgumentNullException.ThrowIfNull(loader);
+        lock (_rowLoadGate)
+        {
+            if (_rowLoadInProgress)
+                throw new InvalidOperationException("Cannot replace a row loader while it is running.");
+            _pendingRowLoader = loader;
+            _pendingRowLoadResourceLease = resourceLease;
+            _rowLoadFailure = null;
+            Volatile.Write(ref _rowsLoaded, false);
+        }
+    }
+
+    private void EnsureRowsLoaded()
+    {
+        if (Volatile.Read(ref _rowsLoaded))
+            return;
+
+        lock (_rowLoadGate)
+            EnsureRowsLoadedCore();
+    }
+
+    private void EnsureRowsLoadedCore()
+    {
+        // The monitor is reentrant for the loader's own Rows.Add/RowIds.Add calls;
+        // a different thread cannot observe the in-progress stores.
+        if (_rowsLoaded || _rowLoadInProgress)
+            return;
+
+        if (_rowLoadFailure is { } failure)
+        {
+            // A previous attempt already left this table's rows untrustworthy (see the class
+            // field comments on _rowLoadInProgress/_rowLoadFailure). Fail closed permanently:
+            // never silently retry a page-decode failure (it usually means real corruption or an
+            // I/O fault, and non-deterministic retry could mask that — the same "do not retry,
+            // require a fresh open" philosophy EmbeddedPostCommitMaintenanceException already
+            // uses elsewhere in this store) and never allow a caller to observe the partial rows
+            // the failed attempt happened to append before throwing.
+            throw new InvalidOperationException(
+                $"A previous attempt to load table '{Name}' rows failed; its rows can no longer "
+                + "be trusted. Reopen the database to retry.",
+                failure.SourceException);
+        }
+
+        var loader = _pendingRowLoader;
+        var resourceLease = _pendingRowLoadResourceLease;
+        _rowLoadInProgress = true;
+        try
+        {
+            loader?.Invoke(this);
+            // Only a fully successful run may retire the pending loader/lease and declare the
+            // table loaded: flipping _rowsLoaded before this point (as an earlier revision did)
+            // would let a mid-load throw permanently strand a truncated row set that every later
+            // reader — including a subsequent VACUUM/persist pass — would then treat as complete.
+            _pendingRowLoader = null;
+            _pendingRowLoadResourceLease = null;
+            Volatile.Write(ref _rowsLoaded, true);
+        }
+        catch (Exception exception)
+        {
+            _rowsStore.Clear();
+            _rowIdsStore.Clear();
+            _pendingRowLoader = null;
+            _pendingRowLoadResourceLease = null;
+            _rowLoadFailure = ExceptionDispatchInfo.Capture(exception);
+            throw;
+        }
+        finally
+        {
+            _rowLoadInProgress = false;
+            resourceLease?.Release();
+        }
+    }
+
+    /// <summary>
+    /// Propagates an unresolved lazy row load from this table onto <paramref name="clone"/>
+    /// without forcing either side to actually load anything, so a per-statement working-copy
+    /// clone of a table nobody has touched yet stays exactly as lazy as its source. Returns
+    /// false (having done nothing) when this table's rows are already loaded, or partially
+    /// loaded/in flight, so the caller falls back to its ordinary eager content copy.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="clone"/> retains its own reference to the shared resource lease (rather
+    /// than sharing this table's reference) because the two instances can now be hydrated
+    /// completely independently — for example, this table's committed copy and a per-statement
+    /// working-copy clone of it can both end up read during the same commit (see
+    /// EmbeddedFileStore.HaveSameRows / MergeConcurrentCatalogFromStoreLocked) — and one
+    /// instance finishing first must never tear down a resource the other still needs for its
+    /// own, independent invocation of the very same loader delegate.
+    /// </remarks>
+    private bool TryCopyPendingRowLoadTo(EmbeddedTable clone)
+    {
+        Action<EmbeddedTable> loader;
+        IPendingRowLoadResourceLease? lease;
+        lock (_rowLoadGate)
+        {
+            if (_rowLoadInProgress)
+                throw new InvalidOperationException("Cannot clone a row store while its loader is running.");
+            if (_rowsLoaded || _pendingRowLoader is null)
+                return false;
+            loader = _pendingRowLoader;
+            lease = _pendingRowLoadResourceLease?.Retain();
+            clone._rowsStore.AdoptIdentity(_rowsStore.LineageId, _rowsStore.Revision);
+        }
+
+        clone.AttachPendingRowLoader(loader, lease);
+        return true;
+    }
 
     // Index of the INTEGER PRIMARY KEY column that aliases the rowid, or -1 when the
     // table has a hidden rowid. A single column-level INTEGER PRIMARY KEY (declared type
@@ -61617,9 +65129,11 @@ internal sealed class EmbeddedTable
 
     public int? PrimaryKeyConstraintOrdinal { get; private set; }
 
-    // The resolved primary-key columns (index + direction) in key order. Empty when the
-    // table has no primary key. Used for WITHOUT ROWID ordering/uniqueness and table_info.
-    public IReadOnlyList<(int Index, bool Descending)> PrimaryKeyColumns { get; private set; }
+    // The resolved primary-key columns (index + direction + NULLS placement) in key order.
+    // Empty when the table has no primary key. Used for WITHOUT ROWID ordering/uniqueness
+    // and table_info. NullPlacement is Default for a column-level marker (never parses
+    // NULLS); a table-level PRIMARY KEY(...) column may carry an explicit placement.
+    public IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> PrimaryKeyColumns { get; private set; }
 
     // The immutable physical-key descriptor in declaration order. A table-level COLLATE
     // overrides the declared column collation; absent declarations use SQLite's BINARY
@@ -61828,9 +65342,13 @@ internal sealed class EmbeddedTable
     internal void AdoptContentFrom(EmbeddedTable source)
     {
         ArgumentNullException.ThrowIfNull(source);
-        Rows.ReplaceContentsPreservingRevision(source.Rows);
-        RowIds.Clear();
-        RowIds.AddRange(source.RowIds);
+        if (!source.TryCopyPendingRowLoadTo(this))
+        {
+            Rows.ReplaceContentsPreservingRevision(source.Rows);
+            RowIds.Clear();
+            RowIds.AddRange(source.RowIds);
+        }
+
         Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         Indexes.AddRange(source.Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
         source.CopyMethodAttachmentsTo(this);
@@ -61880,7 +65398,7 @@ internal sealed class EmbeddedTable
     private static int ComputeRowidAliasColumnIndex(
         IReadOnlyList<EmbeddedColumn> columns,
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey,
-        IReadOnlyList<(int Index, bool Descending)> primaryKeyColumns)
+        IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> primaryKeyColumns)
     {
         if (tablePrimaryKey is not null)
         {
@@ -61920,16 +65438,16 @@ internal sealed class EmbeddedTable
     // more than one primary key is rejected, matching SQLite/Turso: multiple column-level
     // markers, or a table-level key alongside any column-level marker (a second table-level
     // key is rejected earlier in the parser).
-    private static IReadOnlyList<(int Index, bool Descending)> ResolvePrimaryKeyColumns(
+    private static IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> ResolvePrimaryKeyColumns(
         IReadOnlyList<EmbeddedColumn> columns,
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey,
         IReadOnlyDictionary<string, int> indices)
     {
-        var columnLevel = new List<(int Index, bool Descending)>();
+        var columnLevel = new List<(int Index, bool Descending, NullPlacement NullPlacement)>();
         for (var index = 0; index < columns.Count; index++)
         {
             if (columns[index].PrimaryKey)
-                columnLevel.Add((index, columns[index].PrimaryKeyDescending));
+                columnLevel.Add((index, columns[index].PrimaryKeyDescending, NullPlacement.Default));
         }
 
         if (columnLevel.Count > 1)
@@ -61941,13 +65459,13 @@ internal sealed class EmbeddedTable
         if (columnLevel.Count > 0)
             throw new EmbeddedSqlException("table has more than one primary key");
 
-        var resolved = new List<(int Index, bool Descending)>(tablePrimaryKey.Count);
+        var resolved = new List<(int Index, bool Descending, NullPlacement NullPlacement)>(tablePrimaryKey.Count);
         foreach (var keyColumn in tablePrimaryKey)
         {
             if (!indices.TryGetValue(keyColumn.Name, out var index))
                 throw new EmbeddedSqlException($"no such column: {keyColumn.Name}");
 
-            resolved.Add((index, keyColumn.Descending));
+            resolved.Add((index, keyColumn.Descending, keyColumn.NullPlacement));
         }
 
         return resolved;
@@ -61956,7 +65474,7 @@ internal sealed class EmbeddedTable
     private static SqlitePrimaryKeySchema? CreatePrimaryKeySchema(
         IReadOnlyList<EmbeddedColumn> columns,
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey,
-        IReadOnlyList<(int Index, bool Descending)> primaryKeyColumns)
+        IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> primaryKeyColumns)
     {
         if (primaryKeyColumns.Count == 0)
             return null;
@@ -61967,13 +65485,16 @@ internal sealed class EmbeddedTable
         var terms = new SqlitePrimaryKeyTerm[primaryKeyColumns.Count];
         for (var position = 0; position < primaryKeyColumns.Count; position++)
         {
-            var (columnIndex, descending) = primaryKeyColumns[position];
+            var (columnIndex, descending, nullPlacement) = primaryKeyColumns[position];
             var collation = tablePrimaryKey?[position].Collation ?? columns[columnIndex].Collation;
             terms[position] = new SqlitePrimaryKeyTerm(
                 columnIndex,
                 columns[columnIndex].Name,
                 descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
-                collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation));
+                collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation))
+            {
+                NullsOrder = ToNullsOrder(nullPlacement),
+            };
         }
 
         return new SqlitePrimaryKeySchema(terms);
@@ -61990,17 +65511,34 @@ internal sealed class EmbeddedTable
                 column.ColumnIndex,
                 columns[column.ColumnIndex].Name,
                 column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
-                collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation));
+                collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation))
+            {
+                NullsOrder = ToNullsOrder(column.NullPlacement),
+            };
         });
         return new SqlitePrimaryKeySchema(terms);
     }
+
+    /// <summary>
+    /// Maps a schema-level <see cref="NullPlacement"/> (Default/First/Last) to the storage
+    /// comparator's <see cref="SqliteIndexNullsOrder"/> (First/Last, or <see langword="null"/>
+    /// for "no explicit clause — derive from ASC/DESC"). Mirrors
+    /// <c>EmbeddedFileStore.ToNullsOrder</c> for the table-constraint primary-key path.
+    /// </summary>
+    private static SqliteIndexNullsOrder? ToNullsOrder(NullPlacement placement) => placement switch
+    {
+        NullPlacement.Default => null,
+        NullPlacement.First => SqliteIndexNullsOrder.First,
+        NullPlacement.Last => SqliteIndexNullsOrder.Last,
+        _ => throw new InvalidOperationException($"Unknown NULL placement {placement}."),
+    };
 
     // Validates the generated columns and returns their evaluation order. The precedence of
     // checks matches SQLite: DEFAULT-on-generated, generated-in-PRIMARY-KEY, at-least-one
     // non-generated column, then per-expression validation and loop detection.
     private static IReadOnlyList<int> ValidateAndOrderGeneratedColumns(
         IReadOnlyList<EmbeddedColumn> columns,
-        IReadOnlyList<(int Index, bool Descending)> primaryKeyColumns,
+        IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> primaryKeyColumns,
         IReadOnlyDictionary<string, int> indices)
     {
         var generated = new List<int>();
@@ -62019,7 +65557,7 @@ internal sealed class EmbeddedTable
                 throw new EmbeddedSqlException("cannot use DEFAULT on a generated column");
         }
 
-        foreach (var (index, _) in primaryKeyColumns)
+        foreach (var (index, _, _) in primaryKeyColumns)
         {
             if (columns[index].IsGenerated)
                 throw new EmbeddedSqlException("generated columns cannot be part of the PRIMARY KEY");
@@ -62097,6 +65635,9 @@ internal sealed class EmbeddedTable
                 }
                 return;
             case AlterTableAddColumnStatement { Column.GenerationExpression: { } expression }:
+                ValidateGenerationExpressionAllowed(expression);
+                return;
+            case AlterTableAlterColumnStatement { Column.GenerationExpression: { } expression }:
                 ValidateGenerationExpressionAllowed(expression);
                 return;
         }
@@ -62572,6 +66113,10 @@ internal sealed class EmbeddedTable
     /// complete column definition, while table-level constraints and explicit indexes survive.
     /// A rename first uses the established token-aware rewrite path so dependent expressions,
     /// self references, and explicit-index text continue to resolve against the replacement name.
+    /// Turning the column into (or out of) a VIRTUAL generated column is supported the way
+    /// Turso's schema.rs alter_table_alter_column does; STORED remains rejected because adding a
+    /// STORED column requires rewriting every row's payload, which ALTER COLUMN's schema-text
+    /// edit does not do (see ALTER TABLE ADD COLUMN's identical STORED rejection).
     /// </summary>
     public EmbeddedTable CreateWithAlteredColumn(
         string name,
@@ -62589,10 +66134,13 @@ internal sealed class EmbeddedTable
             throw new EmbeddedSqlException("PRIMARY KEY constraint cannot be altered");
         if (replacementColumn.Unique)
             throw new EmbeddedSqlException("UNIQUE constraint cannot be altered");
-        if (replacementColumn.IsGenerated)
-            throw new EmbeddedSqlException("ALTER COLUMN to a generated column is not supported");
+        if (replacementColumn.IsGenerated && replacementColumn.GeneratedStored)
+            throw new EmbeddedSqlException("cannot add a STORED column");
         if (replacementColumn.ForeignKeyConstraints.Count > 0)
             throw new EmbeddedSqlException("ALTER COLUMN with REFERENCES is not supported");
+
+        var wasVirtual = ColumnDefinitions[alteredColumnIndex].IsGenerated
+            && !ColumnDefinitions[alteredColumnIndex].GeneratedStored;
 
         var renamed = string.Equals(oldName, replacementColumn.Name, StringComparison.Ordinal)
             ? Clone()
@@ -62636,6 +66184,16 @@ internal sealed class EmbeddedTable
                 cancellationToken.ThrowIfCancellationRequested();
 
             var row = renamed.Rows[rowIndex].ToArray();
+            if (wasVirtual && !replacementColumn.IsGenerated)
+            {
+                // Neither SQLite nor Turso ever persist a virtual generated column's computed
+                // value to the row, so a pre-existing row has no history for the column once it
+                // becomes an ordinary one: it gets the new column's DEFAULT, or NULL when it has
+                // none -- mirroring ADD COLUMN's backfill (EvaluateConstantDefault) -- rather
+                // than keeping the stale value this row array happened to cache from the last
+                // time the (still virtual) column was computed.
+                row[alteredColumnIndex] = EvaluateConstantDefault(replacementColumn) ?? SqlValue.Null;
+            }
             row[alteredColumnIndex] = ApplyColumnAffinity(replacementColumn, row[alteredColumnIndex]);
             altered.Rows.Add(row);
             EmbeddedDatabase.ComputeGeneratedColumnsAfterAddColumn(altered, Name, row);
@@ -63037,9 +66595,12 @@ internal sealed class EmbeddedTable
             Strict);
         clone.SchemaSqlCompact = SchemaSqlCompact;
         clone.Sql = Sql;
-        clone.Rows.ReplaceContentsPreservingRevision(Rows);
+        if (!TryCopyPendingRowLoadTo(clone))
+        {
+            clone.Rows.ReplaceContentsPreservingRevision(Rows);
+            clone.RowIds.AddRange(RowIds);
+        }
 
-        clone.RowIds.AddRange(RowIds);
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
         CopyMethodAttachmentsTo(clone);

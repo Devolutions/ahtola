@@ -19,13 +19,21 @@ public class ExplainQueryPlanFormatJsonTests
     {
         using var embedded = new EmbeddedDatabase();
         using var connection = embedded.Connect();
-        connection.PrepareScript("CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);").ToList();
+        Execute(
+            connection,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER); " +
+            "CREATE INDEX idx_users_age ON users(age);");
 
         var rows = ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT id FROM users WHERE age > 21;");
         rows.Should().HaveCount(1);
         var json = rows[0];
         json.Should().StartWith("{\"version\":1,");
-        json.Should().Contain("\"sql\":\"EXPLAIN QUERY PLAN SELECT id FROM users WHERE age > 21\"");
+        // The envelope echoes the statement exactly as written, FORMAT=JSON clause and trailing
+        // ';' both included (turso-src/docs/eqp-json.md; core/translate/eqp.rs's `sql` field is
+        // the verbatim input, terminator included -- SqlScript.Split retains it and
+        // SqlParser.Parse already tolerated one trailing semicolon via
+        // Consume(TokenKind.Semicolon) before Expect(TokenKind.End)).
+        json.Should().Contain("\"sql\":\"EXPLAIN QUERY PLAN FORMAT=JSON SELECT id FROM users WHERE age > 21;\"");
         json.Should().Contain("\"result_columns\":[");
         json.Should().Contain("\"nodes\":[");
         json.Should().Contain("\"detail\":\"");
@@ -71,15 +79,136 @@ public class ExplainQueryPlanFormatJsonTests
     {
         using var embedded = new EmbeddedDatabase();
         using var connection = embedded.Connect();
-        connection.PrepareScript("CREATE TABLE t(a INTEGER PRIMARY KEY);").ToList();
+        Execute(
+            connection,
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER); " +
+            "CREATE INDEX idx_t_b ON t(b);");
 
-        var json = ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t;");
+        var json = ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT a FROM t WHERE b = 1;");
         json.Should().HaveCount(1);
-        // Every node entry carries a non-empty detail drawn from the engine's plan text
-        // (a SCAN/SEARCH detail or the evaluator-fallback marker).
+        // A modeled node (here, an index SEARCH) carries a non-empty detail drawn from the
+        // engine's plan text. A statement with no per-step plan modeled yet reports an empty
+        // nodes array instead of a fabricated node (see ExecuteExplainQueryPlan's
+        // isPlaceholderOnly handling) rather than a fake "detail".
         json[0].Should().MatchRegex("\"detail\":\"[^\"]+\"");
         json[0].Should().Contain("\"id\":");
         json[0].Should().Contain("\"parent\":");
+    }
+
+    /// <summary>
+    /// A hand-written LEFT JOIN with a non-equality condition, grouped by the outer rowid and
+    /// filtered by HAVING, has exactly the same AST shape TryRewriteAggregateJoinFirst produces
+    /// for its own rewrite -- but it was never produced by that rewrite (it is what the user
+    /// wrote), and a hash join cannot execute a "&gt;" condition at all. The describer must not
+    /// mistake this shape for its own rewrite's output and must not claim "HASH JOIN" here.
+    /// </summary>
+    [Test]
+    public void HandWrittenNonEquiJoinLeftJoinIsNotMisdescribedAsHashJoin()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(
+            connection,
+            "CREATE TABLE outer_t(id INTEGER PRIMARY KEY, k INTEGER); " +
+            "CREATE TABLE inner_t(k INTEGER, x INTEGER);");
+
+        var json = ReadAll(
+            connection,
+            """
+            EXPLAIN QUERY PLAN FORMAT=JSON
+            SELECT o.id
+            FROM outer_t o
+            LEFT JOIN inner_t i ON i.k > o.k
+            GROUP BY o.rowid
+            HAVING count(i.x) > 0;
+            """);
+        json.Should().HaveCount(1);
+        json[0].Should().NotContain("hash_join");
+        json[0].Should().NotContain("HASH JOIN");
+    }
+
+    /// <summary>
+    /// A correlated aggregate subquery that stays correlated (unnest.rs declines every rewrite)
+    /// still routes its outer table through ExecuteSelect's ordinary TryPlanManagedIndexScan
+    /// planner, so an indexable predicate on the outer table's own WHERE genuinely executes as
+    /// an index SEARCH, not a hardcoded full SCAN.
+    /// </summary>
+    [Test]
+    public void StaysCorrelatedDescriberUsesRealIndexPlanForOuterTable()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(
+            connection,
+            "CREATE TABLE idx_outer(id INTEGER PRIMARY KEY, k INTEGER, age INTEGER); " +
+            "CREATE INDEX idx_outer_age ON idx_outer(age); " +
+            "CREATE TABLE nondet_inner(k INTEGER, x INTEGER);");
+
+        var json = ReadAll(
+            connection,
+            """
+            EXPLAIN QUERY PLAN FORMAT=JSON
+            SELECT o.id
+            FROM idx_outer o
+            WHERE o.age > 21
+              AND o.id + (random() % 2) = o.id
+              AND o.k > (
+                  SELECT sum(i.x)
+                  FROM nondet_inner i
+                  WHERE i.k = o.k
+              );
+            """);
+        json.Should().HaveCount(1);
+        json[0].Should().Contain("\"detail\":\"SEARCH o USING INDEX idx_outer_age");
+        json[0].Should().Contain("\"index\":{\"name\":\"idx_outer_age\"");
+    }
+
+    /// <summary>
+    /// EXISTS/NOT EXISTS unnested into an internal semi/anti join always executes on the
+    /// evaluator's GetSemiOrAntiJoinRows, which probes an in-memory hash bucket
+    /// (TryGetTransientLookupRows) rather than seeking any real declared index -- even when one
+    /// exists on the correlation column. The describer must report that honestly ("USING
+    /// AUTOMATIC COVERING INDEX") instead of naming the real index this access path never
+    /// actually reads.
+    /// </summary>
+    [Test]
+    public void ExistsSemiJoinDescribesAutomaticIndexNotTheRealOne()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(
+            connection,
+            "CREATE TABLE semi_users (id INTEGER PRIMARY KEY, name TEXT); " +
+            "CREATE TABLE semi_orders (id INTEGER PRIMARY KEY, user_id INTEGER); " +
+            "CREATE INDEX idx_semi_orders_user ON semi_orders(user_id);");
+
+        var json = ReadAll(
+            connection,
+            """
+            EXPLAIN QUERY PLAN FORMAT=JSON
+            SELECT *
+            FROM semi_users u
+            WHERE EXISTS (SELECT 1 FROM semi_orders o WHERE o.user_id = u.id);
+            """);
+        json.Should().HaveCount(1);
+        json[0].Should().Contain("\"detail\":\"SCAN semi_users AS u\"");
+        json[0].Should().Contain(
+            "\"detail\":\"SEARCH o USING AUTOMATIC COVERING INDEX (user_id=?)\",\"op\":{\"type\":\"search\",\"table\":\"semi_orders\",\"alias\":\"o\",\"join\":\"semi\"");
+        json[0].Should().NotContain("idx_semi_orders_user");
+        json[0].Should().NotContain("\"integer_primary_key\"");
+    }
+
+    private static void Execute(EmbeddedConnection connection, string sql)
+    {
+        foreach (var statement in connection.PrepareScript(sql))
+        {
+            using (statement)
+            {
+                while (statement.Step(default) == StatementStepResult.Row)
+                {
+                }
+            }
+        }
     }
 
     private static List<string> ReadAll(EmbeddedConnection connection, string sql)

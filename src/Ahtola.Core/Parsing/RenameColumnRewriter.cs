@@ -894,12 +894,21 @@ internal static class RenameColumnRewriter
 
         public void WalkCreateTable(CreateTableStatement statement, string tableName, IReadOnlyList<string> columns)
         {
+            // This method is also used to rewrite a *dependent* child table whose FOREIGN KEY
+            // merely references the renamed column's table (CreateWithRenamedForeignKeyParentColumn).
+            // In that case `tableName` is the child, not the table whose column is being renamed,
+            // so the child's own column names, PRIMARY KEY/UNIQUE lists, and FK child-column list
+            // must be left untouched -- only a FOREIGN KEY's parent-column list may follow the
+            // rename (guarded separately by WalkForeignKeyParentColumns via schema.IsRenameTarget
+            // on the *parent* table). Without this guard, a child column that merely happens to
+            // share the renamed column's old spelling would be renamed too.
+            var isRenameTarget = schema.IsRenameTarget(tableName);
             var scope = new Scope(null);
-            scope.Bindings.Add(new Binding(tableName, columns, IsTarget: true, QualifiedOnly: false));
+            scope.Bindings.Add(new Binding(tableName, columns, IsTarget: isRenameTarget, QualifiedOnly: false));
 
             foreach (var column in statement.Columns)
             {
-                if (Matches(column.Name))
+                if (isRenameTarget && Matches(column.Name))
                 {
                     var span = spans.GetName(column);
                     if (span is not null)
@@ -918,13 +927,16 @@ internal static class RenameColumnRewriter
                     WalkForeignKeyParentColumns(foreignKey);
             }
 
-            foreach (var keyColumn in statement.PrimaryKeyColumns ?? [])
-                EditConstraintColumnName(keyColumn);
-
-            foreach (var unique in statement.UniqueConstraints ?? [])
+            if (isRenameTarget)
             {
-                foreach (var keyColumn in unique.Columns)
+                foreach (var keyColumn in statement.PrimaryKeyColumns ?? [])
                     EditConstraintColumnName(keyColumn);
+
+                foreach (var unique in statement.UniqueConstraints ?? [])
+                {
+                    foreach (var keyColumn in unique.Columns)
+                        EditConstraintColumnName(keyColumn);
+                }
             }
 
             foreach (var check in statement.CheckConstraints ?? [])
@@ -932,7 +944,8 @@ internal static class RenameColumnRewriter
 
             foreach (var foreignKey in statement.TableForeignKeys ?? [])
             {
-                WalkForeignKeyChildColumns(foreignKey);
+                if (isRenameTarget)
+                    WalkForeignKeyChildColumns(foreignKey);
                 WalkForeignKeyParentColumns(foreignKey);
             }
         }

@@ -72,7 +72,14 @@ internal sealed record IndexedColumnDefinition(
     bool Descending,
     Expression? Expression = null,
     string? ExpressionSql = null,
-    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null)
+    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null,
+    // Explicit NULLS FIRST/LAST on a CREATE INDEX column (turso-src core/schema.rs:5744
+    // IndexColumn.nulls_order). Default means no explicit clause was written; the effective
+    // placement then follows ASC/DESC exactly like SQLite's implicit default (see
+    // NullPlacementExtensions.ResolvesToNullsFirst). Never set outside CREATE INDEX: table
+    // constraints and UPSERT conflict targets keep rejecting this clause (SQLite's
+    // sqlite3HasExplicitNulls / Turso's reject_explicit_nulls).
+    NullPlacement NullPlacement = NullPlacement.Default)
 {
     public bool IsExpression => Expression is not null;
 }
@@ -128,7 +135,14 @@ internal sealed record ViewDefinition(
     string Name,
     IReadOnlyList<string>? Columns,
     QueryStatement Query,
-    string Sql);
+    string Sql,
+    // Set when the row's stored SQL failed to (re)parse while reopening a persisted database
+    // (e.g. a CREATE VIEW column list an older Turso/Ahtola build wrote without identifier
+    // quoting). The view stays listed in sqlite_schema/sqlite_master with its raw stored text,
+    // but every attempt to resolve it as a query source fails closed instead of running a
+    // Query this class never actually parsed; DROP VIEW still removes the row. See
+    // ManagedSchemaRowParser.ParseView and EmbeddedDatabase.TryGetView.
+    string? BrokenReason = null);
 
 internal sealed record TriggerDefinition(
     string Name,
@@ -660,6 +674,24 @@ internal sealed record OrderByTerm(
     NullPlacement NullPlacement = NullPlacement.Default,
     long? Ordinal = null);
 
+internal static class NullPlacementExtensions
+{
+    /// <summary>
+    /// Resolves an explicit or default NULL placement to whether NULLs sort first, mirroring
+    /// Turso's <c>NullsOrder::default_for</c> / <c>IndexColumn::effective_nulls_order</c>
+    /// (turso-src/sqlite/parser/src/ast.rs, turso-src/core/schema.rs:5774). SQLite's implicit
+    /// default is NULLS FIRST for ASC and NULLS LAST for DESC; an explicit clause always wins
+    /// regardless of direction.
+    /// </summary>
+    public static bool ResolvesToNullsFirst(this NullPlacement placement, bool descending) => placement switch
+    {
+        NullPlacement.First => true,
+        NullPlacement.Last => false,
+        NullPlacement.Default => !descending,
+        _ => throw new InvalidOperationException($"Unknown NULL placement {placement}."),
+    };
+}
+
 internal sealed record WindowSpecification(
     string? BaseWindowName,
     IReadOnlyList<Expression> PartitionBy,
@@ -814,7 +846,13 @@ internal sealed record TablePrimaryKeyColumn(
     string Name,
     bool Descending,
     string? Collation = null,
-    bool AutoIncrement = false);
+    bool AutoIncrement = false,
+    // Explicit NULLS FIRST/LAST on a table-level PRIMARY KEY(...)/UNIQUE(...) constraint
+    // column (turso-src core/schema.rs:5938/5992 thread nulls_order through
+    // constraint_columns for the constraint's automatic index). Never set for a
+    // column-level PRIMARY KEY/UNIQUE marker or an ON CONFLICT target list: those keep
+    // rejecting the clause.
+    NullPlacement NullPlacement = NullPlacement.Default);
 
 internal sealed record TableUniqueConstraint(
     string? Name,
@@ -861,7 +899,10 @@ internal sealed record EmbeddedIndexColumn(
     bool Descending,
     Expression? Expression = null,
     string? ExpressionSql = null,
-    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null)
+    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null,
+    // See IndexedColumnDefinition.NullPlacement: propagated verbatim from the parsed CREATE
+    // INDEX column term, Default when no explicit NULLS FIRST/LAST clause was written.
+    NullPlacement NullPlacement = NullPlacement.Default)
 {
     public bool IsExpression => Expression is not null;
 }
@@ -904,6 +945,16 @@ internal enum CurrentTimeKind
 }
 
 internal sealed record CurrentTimeExpression(CurrentTimeKind Kind) : Expression;
+
+/// <summary>
+/// A bare <c>DEFAULT</c> token in value position, e.g.
+/// <c>INSERT INTO t VALUES (1, DEFAULT)</c>. Valid only inside an INSERT statement's
+/// VALUES row list, where <c>EmbeddedDatabase.BuildInsertRow</c> resolves it to
+/// the target column's declared default (schema <c>DEFAULT</c> clause, or NULL); evaluating
+/// it in any other expression context (SELECT list, WHERE, etc.) is a compile-time error,
+/// matching SQLite/Turso, which reject <c>DEFAULT</c> outside a VALUES row.
+/// </summary>
+internal sealed record DefaultValueExpression : Expression;
 
 internal sealed record ParameterExpression(int Index) : Expression;
 

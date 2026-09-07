@@ -230,12 +230,11 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
 
         var crossDatabaseOrder = () => Execute(
             connection,
-            "UPDATE aux.items SET value = 'rejected' "
+            "UPDATE aux.items SET value = 'cross-db-ordered' "
             + "ORDER BY (SELECT count(*) FROM main.items) LIMIT 1;");
-        crossDatabaseOrder.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Cross-database statements are not supported by managed ATTACH;*");
-        ReadRows(connection, "SELECT count(*) FROM aux.items WHERE value = 'rejected';")
-            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+        crossDatabaseOrder.Should().NotThrow();
+        ReadRows(connection, "SELECT count(*) FROM aux.items WHERE value = 'cross-db-ordered';")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1));
 
         Execute(connection, "BEGIN;");
         Execute(connection, "UPDATE main.items SET value = 'pending' ORDER BY id LIMIT 1;");
@@ -304,12 +303,11 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
         missingSchema.Should().Throw<EmbeddedSqlException>().WithMessage("no such database: absent");
 
         Execute(connection, "CREATE TABLE main_items(id INTEGER PRIMARY KEY);");
+        Execute(connection, "INSERT INTO main_items VALUES(7);");
         Execute(connection, "CREATE TABLE aux.items(id INTEGER PRIMARY KEY);");
-        var crossDatabase = () => ReadRows(
-            connection,
-            "SELECT * FROM main.main_items JOIN aux.items ON 1 = 1;");
-        crossDatabase.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Cross-database statements are not supported by managed ATTACH;*");
+        Execute(connection, "INSERT INTO aux.items VALUES(9);");
+        ReadRows(connection, "SELECT * FROM main.main_items JOIN aux.items ON 1 = 1;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(7), SqlValue.Integer(9));
 
         var temporary = () => ReadRows(connection, "SELECT * FROM temp.items;");
         temporary.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: temp.items");
@@ -633,9 +631,9 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
         fileSystem.FileExists("attach-limit-overflow.db").Should().BeFalse();
 
         var mainAlias = () => Execute(connection, "ATTACH DATABASE 'unused-main.db' AS main;");
-        mainAlias.Should().Throw<EmbeddedSqlException>().WithMessage("cannot attach database as main");
+        mainAlias.Should().Throw<EmbeddedSqlException>().WithMessage("reserved name main is already in use");
         var tempAlias = () => Execute(connection, "ATTACH DATABASE 'unused-temp.db' AS temp;");
-        tempAlias.Should().Throw<EmbeddedSqlException>().WithMessage("cannot attach database as temp");
+        tempAlias.Should().Throw<EmbeddedSqlException>().WithMessage("reserved name temp is already in use");
 
         Execute(connection, "CREATE TABLE db0.only_attached(value INTEGER);");
         Execute(connection, "CREATE TABLE main.index_owner(value INTEGER);");

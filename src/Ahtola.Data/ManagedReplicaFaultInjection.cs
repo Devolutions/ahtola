@@ -271,6 +271,33 @@ internal enum ManagedReplicaDurableBoundary
     /// SQLite lease used for the authoritative classification.
     /// </summary>
     MainFileReplacementRecoveryClassifiedBeforeLease,
+
+    /// <summary>
+    /// Hit immediately after <see cref="ManagedReplicaBootstrapper.EnsurePagesApplyIsSafe"/>'s
+    /// Incremental+pending branch durably checkpoints the live WAL into the main file (so the
+    /// live-file staging copy the caller is about to take with a plain <c>File.Copy</c> reflects
+    /// every locally committed schema/row change), and strictly before the fingerprint republish
+    /// that keeps metadata in step with those newly durable bytes (see
+    /// <see cref="IncrementalPendingLiveWalCheckpointFingerprintPublished"/>). The checkpoint
+    /// itself is durable, lossless, and idempotent (a second checkpoint of an already-empty WAL is
+    /// a no-op), and the change journal -- not the WAL -- remains the sole source of truth for
+    /// which local changes are still pending. An interruption exactly here, before the republish,
+    /// is a narrow window this design does not silently self-heal across: a later, unrelated pull
+    /// that happens to land in this same method's zero-pending branch with every remaining pending
+    /// change drained by then would fail closed against the stale pre-checkpoint fingerprint,
+    /// rather than silently corrupting or losing data.
+    /// </summary>
+    IncrementalPendingLiveWalCheckpointed,
+
+    /// <summary>
+    /// Hit immediately after <see cref="ManagedReplicaBootstrapper.EnsurePagesApplyIsSafe"/>'s
+    /// Incremental+pending branch republishes metadata's fingerprint to match the bytes the
+    /// checkpoint above just made durable, before returning. Without this republish, a later,
+    /// unrelated pull attempt that happens to land in the same method's zero-pending branch would
+    /// compare the (by then fully drained) pending set's file against a stale pre-checkpoint
+    /// fingerprint and spuriously reject it as local divergence.
+    /// </summary>
+    IncrementalPendingLiveWalCheckpointFingerprintPublished,
 }
 
 /// <summary>

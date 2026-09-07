@@ -95,6 +95,69 @@ public class GetSetByteAndJsonObjectStarTests
             "json_object(*) requires a FROM clause");
     }
 
+    /// <summary>
+    /// json_object(*) must expand correctly wherever it appears in an expression tree — not
+    /// only when it is a projection's entire top-level expression — because the star can be
+    /// nested inside another call or used as a WHERE predicate operand, and because a
+    /// table-valued function's hidden columns must stay excluded even when the star is not
+    /// evaluated through the runtime's raw-row fallback.
+    /// </summary>
+    [Test]
+    public void JsonObjectStarExpandsWhenNestedOrUsedAsAPredicate()
+    {
+        using var connection = Open();
+        ExecuteScript(connection, """
+            CREATE TABLE js_products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+            INSERT INTO js_products VALUES (1, 'Widget', 9.99);
+            """);
+
+        // Nested inside another function call: the star must still expand, not survive as a
+        // CountStar call the runtime evaluator would otherwise read straight off the row.
+        ReadScalar(connection, "SELECT upper(json_object(*)) FROM js_products WHERE id = 1;")
+            .Should().Be("""{"ID":1,"NAME":"WIDGET","PRICE":9.99}""");
+
+        // Used as a WHERE predicate operand over a table-valued function: generate_series's
+        // hidden start/stop/step columns must stay excluded from the comparison, exactly as
+        // they are excluded from a SELECT projection.
+        ReadRows(
+            connection,
+            "SELECT value FROM generate_series(1,3) WHERE json_object(*) = json('{\"value\":1}');")
+            .Should().Equal("1");
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void JsonObjectStarExpandsInsideInlineAndNamedWindows(bool cancelable)
+    {
+        using var connection = Open();
+        const string partition = """CASE WHEN json_object(*) = '{"value":1}' THEN 0 ELSE 1 END""";
+        const string order = """CASE WHEN json_object(*) = '{"value":2}' THEN 0 ELSE value END""";
+
+        ReadRows(connection, $"""
+            SELECT value, count(*) OVER (PARTITION BY {partition}),
+                row_number() OVER (ORDER BY {order})
+            FROM generate_series(1,3) ORDER BY value;
+            """, cancelable).Should().Equal("1|1|2", "2|2|1", "3|2|3");
+        ReadRows(connection, $"""
+            SELECT value, count(*) OVER w, row_number() OVER ordered
+            FROM generate_series(1,3)
+            WINDOW w AS (PARTITION BY {partition}), ordered AS (ORDER BY {order})
+            ORDER BY value;
+            """, cancelable).Should().Equal("1|1|2", "2|2|1", "3|2|3");
+    }
+
+    [TestCase("json_object(*)")]
+    [TestCase("json(jsonb_object(*))")]
+    public void JsonObjectStarExpandsInsideOrderedSetAggregates(string expression)
+    {
+        using var connection = Open();
+
+        ReadScalar(connection, $"""
+            SELECT percentile_disc(1) WITHIN GROUP (ORDER BY {expression})
+            FROM generate_series(1,3);
+            """).Should().Be("""{"value":3}""");
+    }
+
     private static EmbeddedConnection Open()
     {
         var embedded = new EmbeddedDatabase();
@@ -119,14 +182,16 @@ public class GetSetByteAndJsonObjectStarTests
     private static string ReadScalar(EmbeddedConnection connection, string sql)
         => ReadRows(connection, sql).SingleOrDefault() ?? string.Empty;
 
-    private static List<string> ReadRows(EmbeddedConnection connection, string sql)
+    private static List<string> ReadRows(EmbeddedConnection connection, string sql, bool cancelable = false)
     {
+        using var cancellation = new CancellationTokenSource();
+        var token = cancelable ? cancellation.Token : default;
         var rows = new List<string>();
         foreach (var statement in connection.PrepareScript(sql))
         {
             using (statement)
             {
-                while (statement.Step(default) == StatementStepResult.Row)
+                while (statement.Step(token) == StatementStepResult.Row)
                 {
                     var values = new List<string>();
                     for (var column = 0; column < statement.ColumnCount; column++)
