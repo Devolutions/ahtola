@@ -41,6 +41,8 @@ internal static class ManagedIndexMethodSemantics
                 throw new EmbeddedSqlException($"index '{index.Name}' cannot index an expression with an index method");
             if (column.Descending)
                 throw new EmbeddedSqlException($"index '{index.Name}' cannot use DESC with an index method");
+            if (column.NullPlacement != NullPlacement.Default)
+                throw new EmbeddedSqlException($"index '{index.Name}' cannot use NULLS FIRST/LAST with an index method");
             if (column.Collation is not null)
                 throw new EmbeddedSqlException($"index '{index.Name}' cannot use COLLATE with an index method");
         }

@@ -100,12 +100,43 @@ public enum SqliteKeySortOrder
     Descending,
 }
 
+/// <summary>
+/// Where NULL values sort within an index key term, independent of that term's ASC/DESC value
+/// direction. Mirrors Turso's <c>turso_parser::ast::NullsOrder</c> (turso-src/sqlite/parser/src/ast.rs)
+/// and <c>IndexColumn.nulls_order</c> (turso-src/core/schema.rs:5744): SQLite has no explicit-NULLS
+/// syntax for <c>CREATE INDEX</c>, so a term carrying this only arises from Turso's/Ahtola's
+/// <c>NULLS FIRST</c>/<c>NULLS LAST</c> index-column extension.
+/// </summary>
+public enum SqliteIndexNullsOrder
+{
+    /// <summary>NULLs sort before all other values for this term.</summary>
+    First,
+
+    /// <summary>NULLs sort after all other values for this term.</summary>
+    Last,
+}
+
 /// <summary>One column in a canonical SQLite primary-key schema.</summary>
+/// <remarks>
+/// <see cref="NullsOrder"/> is an init-only property added to the record body, not a fifth
+/// positional-constructor parameter, so the original four-parameter positional constructor and
+/// its matching <c>Deconstruct</c> stay byte-identical for already-compiled consumers of this
+/// public type (see <see cref="SqliteIndexComparisonTerm"/> for the same rule). Use an object
+/// initializer to set it.
+/// </remarks>
 public sealed record SqlitePrimaryKeyTerm(
     int ColumnIndex,
     string ColumnName,
     SqliteKeySortOrder SortOrder,
-    SqliteKeyCollation Collation);
+    SqliteKeyCollation Collation)
+{
+    /// <summary>
+    /// Explicit NULLS FIRST/LAST placement for this term (Turso's table-constraint extension;
+    /// turso-src/core/schema.rs:5938/5992), or <see langword="null"/> for SQLite's implicit
+    /// ASC/DESC-derived default. See <see cref="SqliteIndexComparisonTerm.NullsOrder"/>.
+    /// </summary>
+    public SqliteIndexNullsOrder? NullsOrder { get; init; }
+}
 
 /// <summary>
 /// An immutable primary-key descriptor that preserves declaration order, column

@@ -7335,13 +7335,41 @@ public sealed partial class EmbeddedDatabase : IDisposable
         for (var position = 0; position < primaryKeySchema.Terms.Count; position++)
         {
             var term = primaryKeySchema.Terms[position];
-            var comparison = Compare(left[position], right[position], term.Collation.Name);
+            var leftValue = left[position];
+            var rightValue = right[position];
+            if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+            {
+                if (leftValue.Kind == rightValue.Kind)
+                    continue;
+
+                var nullsFirst = ResolvesToNullsFirst(term.NullsOrder, term.SortOrder);
+                return leftValue.Kind == SqlValueKind.Null
+                    ? (nullsFirst ? -1 : 1)
+                    : (nullsFirst ? 1 : -1);
+            }
+
+            var comparison = Compare(leftValue, rightValue, term.Collation.Name);
             if (comparison != 0)
                 return term.SortOrder == SqliteKeySortOrder.Descending ? -comparison : comparison;
         }
 
         return 0;
     }
+
+    /// <summary>
+    /// Whether NULLs sort before non-NULL values for a primary-key term, resolving an explicit
+    /// <see cref="SqlitePrimaryKeyTerm.NullsOrder"/> override or falling back to SQLite's implicit
+    /// ASC/DESC-derived default when unset. Mirrors
+    /// <see cref="SqliteIndexComparisonTerm.NullsSortFirst"/> for the primary-key-schema shape.
+    /// </summary>
+    private static bool ResolvesToNullsFirst(SqliteIndexNullsOrder? nullsOrder, SqliteKeySortOrder sortOrder)
+        => nullsOrder switch
+        {
+            SqliteIndexNullsOrder.First => true,
+            SqliteIndexNullsOrder.Last => false,
+            null => sortOrder == SqliteKeySortOrder.Ascending,
+            _ => throw new InvalidOperationException($"Unknown NULLS order {nullsOrder}."),
+        };
 
     private bool PrimaryKeyPrefixesEqual(
         SqlitePrimaryKeySchema primaryKeySchema,
@@ -13545,7 +13573,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             foreach (var row in rows)
             {
-                foreach (var (columnIndex, _) in primaryKey)
+                foreach (var (columnIndex, _, _) in primaryKey)
                 {
                     if (row[columnIndex].Kind == SqlValueKind.Null)
                         throw new EmbeddedSqlException(
@@ -13689,7 +13717,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             persistedComparer = new SqliteIndexRecordComparer(
                 SqliteTextEncoding.Utf8,
                 primaryKeySchema.Terms.Select(term =>
-                    new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+                    new SqliteIndexComparisonTerm(term.SortOrder, term.Collation) { NullsOrder = term.NullsOrder })
+                    .ToArray());
         }
         var keys = persistedComparer is null
             ? null
@@ -13702,13 +13731,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             for (var position = 0; position < primaryKey.Count; position++)
             {
-                var (columnIndex, descending) = primaryKey[position];
+                var (columnIndex, descending, nullPlacement) = primaryKey[position];
                 var collation = table.TableLevelPrimaryKey?[position].Collation
                     ?? table.ColumnDefinitions[columnIndex].Collation;
-                var comparison = Compare(
-                    table.Rows[left][columnIndex],
-                    table.Rows[right][columnIndex],
-                    collation);
+                var leftValue = table.Rows[left][columnIndex];
+                var rightValue = table.Rows[right][columnIndex];
+                if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+                {
+                    if (leftValue.Kind == rightValue.Kind)
+                        continue;
+
+                    var nullsFirst = nullPlacement.ResolvesToNullsFirst(descending);
+                    return leftValue.Kind == SqlValueKind.Null
+                        ? (nullsFirst ? -1 : 1)
+                        : (nullsFirst ? 1 : -1);
+                }
+
+                var comparison = Compare(leftValue, rightValue, collation);
                 if (comparison != 0)
                     return descending ? -comparison : comparison;
             }
@@ -22192,7 +22231,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 new SqliteIndexRecordComparer(
                     context.MvccTextEncoding,
                     primaryKey.Terms.Select(term =>
-                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray()));
+                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation) { NullsOrder = term.NullsOrder })
+                        .ToArray()));
         }
 
         var mergeComparer = index is not null
@@ -29679,7 +29719,7 @@ out bool hasReturning)
             var indexed = index.Columns[position];
             if (order.Ordinal is not null
                 || order.Descending != indexed.Descending
-                || !NullPlacementMatchesIndex(order)
+                || !NullPlacementMatchesIndex(order, indexed)
                 || !QueryExpressionMatchesIndexTerm(order.Expression, table, indexed))
             {
                 return false;
@@ -29689,15 +29729,18 @@ out bool hasReturning)
         return true;
     }
 
-    private static bool NullPlacementMatchesIndex(OrderByTerm order)
+    /// <summary>
+    /// Whether an ORDER BY term's NULL placement (explicit or SQLite's implicit ASC/DESC-derived
+    /// default) matches the index column's own effective placement, so the index's persisted
+    /// physical order actually satisfies this term without an extra sort step. Mirrors Turso's
+    /// <c>match_intrinsic_order</c> (turso-src/core/translate/optimizer/order.rs:565-566) comparing
+    /// <c>effective_nulls_order()</c> against the intrinsic column's placement.
+    /// </summary>
+    private static bool NullPlacementMatchesIndex(OrderByTerm order, EmbeddedIndexColumn indexed)
     {
-        return order.NullPlacement switch
-        {
-            NullPlacement.Default => true,
-            NullPlacement.First => !order.Descending,
-            NullPlacement.Last => order.Descending,
-            _ => throw new InvalidOperationException($"Unknown NULL placement {order.NullPlacement}."),
-        };
+        var requestedNullsFirst = order.NullPlacement.ResolvesToNullsFirst(order.Descending);
+        var indexedNullsFirst = indexed.NullPlacement.ResolvesToNullsFirst(indexed.Descending);
+        return requestedNullsFirst == indexedNullsFirst;
     }
 
     private bool IndexUsesRegisteredFunctions(EmbeddedIndex index)
@@ -29822,7 +29865,8 @@ out bool hasReturning)
                 new SqliteIndexRecordComparer(
                     context.MvccTextEncoding,
                     primaryKey.Terms.Select(term =>
-                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray()));
+                        new SqliteIndexComparisonTerm(term.SortOrder, term.Collation) { NullsOrder = term.NullsOrder })
+                        .ToArray()));
         }
 
         var indexComparer = Comparer<MvccDualCursor.IndexRow>.Create(
@@ -30285,7 +30329,23 @@ out bool hasReturning)
             if (!IsCollationResolvable(collationName))
                 continue;
 
-            var comparison = Compare(left.Key[position], right.Key[position], collationName);
+            var leftValue = left.Key[position];
+            var rightValue = right.Key[position];
+            if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+            {
+                if (leftValue.Kind == rightValue.Kind)
+                    continue;
+
+                // Explicit NULLS FIRST/LAST placement is independent of ASC/DESC value direction
+                // (turso-src/core/types.rs cmp_with_sort); resolve it directly instead of the
+                // generic Descending flip below, mirroring SqliteIndexRecordComparer.
+                var nullsFirst = term.NullPlacement.ResolvesToNullsFirst(term.Descending);
+                return leftValue.Kind == SqlValueKind.Null
+                    ? (nullsFirst ? -1 : 1)
+                    : (nullsFirst ? 1 : -1);
+            }
+
+            var comparison = Compare(leftValue, rightValue, collationName);
             if (comparison != 0)
                 return term.Descending ? -comparison : comparison;
         }
@@ -30354,7 +30414,20 @@ out bool hasReturning)
         for (var position = 0; position < primaryKeySchema.Terms.Count; position++)
         {
             var term = primaryKeySchema.Terms[position];
-            var comparison = Compare(left.Key[position], right.Key[position], term.Collation.Name);
+            var leftValue = left.Key[position];
+            var rightValue = right.Key[position];
+            if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+            {
+                if (leftValue.Kind == rightValue.Kind)
+                    continue;
+
+                var nullsFirst = ResolvesToNullsFirst(term.NullsOrder, term.SortOrder);
+                return leftValue.Kind == SqlValueKind.Null
+                    ? (nullsFirst ? -1 : 1)
+                    : (nullsFirst ? 1 : -1);
+            }
+
+            var comparison = Compare(leftValue, rightValue, term.Collation.Name);
             if (comparison != 0)
                 return term.SortOrder == SqliteKeySortOrder.Descending ? -comparison : comparison;
         }
@@ -36587,7 +36660,8 @@ out bool hasReturning)
                     new SqliteIndexRecordComparer(
                         context.MvccTextEncoding,
                         primaryKey.Terms.Select(term =>
-                            new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray()));
+                            new SqliteIndexComparisonTerm(term.SortOrder, term.Collation) { NullsOrder = term.NullsOrder })
+                            .ToArray()));
             }
 
             IEnumerable<MvccDualCursor.Row> EnumerateBaseRows()
@@ -36999,6 +37073,11 @@ out bool hasReturning)
                 SqlIdentifierFormatter.QuoteIfNeeded(keyColumn.Name)
                 + (keyColumn.Collation is { } collation ? " COLLATE " + collation : string.Empty)
                 + (keyColumn.Descending ? " DESC" : string.Empty)
+                + (keyColumn.NullPlacement == NullPlacement.First
+                    ? " NULLS FIRST"
+                    : keyColumn.NullPlacement == NullPlacement.Last
+                        ? " NULLS LAST"
+                        : string.Empty)
                 + (keyColumn.AutoIncrement ? " AUTOINCREMENT" : string.Empty));
             tableKeyConstraints.Add((
                 table.TablePrimaryKeyDeclarationOrder ?? -1,
@@ -37015,7 +37094,12 @@ out bool hasReturning)
             var keyColumns = unique.Columns.Select(keyColumn =>
                 SqlIdentifierFormatter.QuoteIfNeeded(keyColumn.Name)
                 + (keyColumn.Collation is { } collation ? " COLLATE " + collation : string.Empty)
-                + (keyColumn.Descending ? " DESC" : string.Empty));
+                + (keyColumn.Descending ? " DESC" : string.Empty)
+                + (keyColumn.NullPlacement == NullPlacement.First
+                    ? " NULLS FIRST"
+                    : keyColumn.NullPlacement == NullPlacement.Last
+                        ? " NULLS LAST"
+                        : string.Empty));
             tableKeyConstraints.Add((
                 unique.DeclarationOrder,
                 index + 1,
@@ -62736,7 +62820,7 @@ internal sealed class EmbeddedTable
                     PrimaryKeyConstraintOrdinal = existing.ConstraintOrdinal;
                     SetEffectivePrimaryKeyConflictAlgorithm(mergedConflictAlgorithm);
                     PrimaryKeyColumns = Array.AsReadOnly(existing.Columns
-                        .Select(column => (column.ColumnIndex, column.Descending))
+                        .Select(column => (column.ColumnIndex, column.Descending, column.NullPlacement))
                         .ToArray());
                     PrimaryKeySchema = CreatePrimaryKeySchema(ColumnDefinitions, existing.Columns);
                 }
@@ -62952,7 +63036,8 @@ internal sealed class EmbeddedTable
                 ColumnDefinitions[columnIndex].Name,
                 columnIndex,
                 term.Collation ?? ColumnDefinitions[columnIndex].Collation,
-                term.Descending);
+                term.Descending,
+                NullPlacement: term.NullPlacement);
         }
 
         return columns;
@@ -63297,9 +63382,11 @@ internal sealed class EmbeddedTable
 
     public int? PrimaryKeyConstraintOrdinal { get; private set; }
 
-    // The resolved primary-key columns (index + direction) in key order. Empty when the
-    // table has no primary key. Used for WITHOUT ROWID ordering/uniqueness and table_info.
-    public IReadOnlyList<(int Index, bool Descending)> PrimaryKeyColumns { get; private set; }
+    // The resolved primary-key columns (index + direction + NULLS placement) in key order.
+    // Empty when the table has no primary key. Used for WITHOUT ROWID ordering/uniqueness
+    // and table_info. NullPlacement is Default for a column-level marker (never parses
+    // NULLS); a table-level PRIMARY KEY(...) column may carry an explicit placement.
+    public IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> PrimaryKeyColumns { get; private set; }
 
     // The immutable physical-key descriptor in declaration order. A table-level COLLATE
     // overrides the declared column collation; absent declarations use SQLite's BINARY
@@ -63560,7 +63647,7 @@ internal sealed class EmbeddedTable
     private static int ComputeRowidAliasColumnIndex(
         IReadOnlyList<EmbeddedColumn> columns,
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey,
-        IReadOnlyList<(int Index, bool Descending)> primaryKeyColumns)
+        IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> primaryKeyColumns)
     {
         if (tablePrimaryKey is not null)
         {
@@ -63600,16 +63687,16 @@ internal sealed class EmbeddedTable
     // more than one primary key is rejected, matching SQLite/Turso: multiple column-level
     // markers, or a table-level key alongside any column-level marker (a second table-level
     // key is rejected earlier in the parser).
-    private static IReadOnlyList<(int Index, bool Descending)> ResolvePrimaryKeyColumns(
+    private static IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> ResolvePrimaryKeyColumns(
         IReadOnlyList<EmbeddedColumn> columns,
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey,
         IReadOnlyDictionary<string, int> indices)
     {
-        var columnLevel = new List<(int Index, bool Descending)>();
+        var columnLevel = new List<(int Index, bool Descending, NullPlacement NullPlacement)>();
         for (var index = 0; index < columns.Count; index++)
         {
             if (columns[index].PrimaryKey)
-                columnLevel.Add((index, columns[index].PrimaryKeyDescending));
+                columnLevel.Add((index, columns[index].PrimaryKeyDescending, NullPlacement.Default));
         }
 
         if (columnLevel.Count > 1)
@@ -63621,13 +63708,13 @@ internal sealed class EmbeddedTable
         if (columnLevel.Count > 0)
             throw new EmbeddedSqlException("table has more than one primary key");
 
-        var resolved = new List<(int Index, bool Descending)>(tablePrimaryKey.Count);
+        var resolved = new List<(int Index, bool Descending, NullPlacement NullPlacement)>(tablePrimaryKey.Count);
         foreach (var keyColumn in tablePrimaryKey)
         {
             if (!indices.TryGetValue(keyColumn.Name, out var index))
                 throw new EmbeddedSqlException($"no such column: {keyColumn.Name}");
 
-            resolved.Add((index, keyColumn.Descending));
+            resolved.Add((index, keyColumn.Descending, keyColumn.NullPlacement));
         }
 
         return resolved;
@@ -63636,7 +63723,7 @@ internal sealed class EmbeddedTable
     private static SqlitePrimaryKeySchema? CreatePrimaryKeySchema(
         IReadOnlyList<EmbeddedColumn> columns,
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey,
-        IReadOnlyList<(int Index, bool Descending)> primaryKeyColumns)
+        IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> primaryKeyColumns)
     {
         if (primaryKeyColumns.Count == 0)
             return null;
@@ -63647,13 +63734,16 @@ internal sealed class EmbeddedTable
         var terms = new SqlitePrimaryKeyTerm[primaryKeyColumns.Count];
         for (var position = 0; position < primaryKeyColumns.Count; position++)
         {
-            var (columnIndex, descending) = primaryKeyColumns[position];
+            var (columnIndex, descending, nullPlacement) = primaryKeyColumns[position];
             var collation = tablePrimaryKey?[position].Collation ?? columns[columnIndex].Collation;
             terms[position] = new SqlitePrimaryKeyTerm(
                 columnIndex,
                 columns[columnIndex].Name,
                 descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
-                collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation));
+                collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation))
+            {
+                NullsOrder = ToNullsOrder(nullPlacement),
+            };
         }
 
         return new SqlitePrimaryKeySchema(terms);
@@ -63670,17 +63760,34 @@ internal sealed class EmbeddedTable
                 column.ColumnIndex,
                 columns[column.ColumnIndex].Name,
                 column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
-                collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation));
+                collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation))
+            {
+                NullsOrder = ToNullsOrder(column.NullPlacement),
+            };
         });
         return new SqlitePrimaryKeySchema(terms);
     }
+
+    /// <summary>
+    /// Maps a schema-level <see cref="NullPlacement"/> (Default/First/Last) to the storage
+    /// comparator's <see cref="SqliteIndexNullsOrder"/> (First/Last, or <see langword="null"/>
+    /// for "no explicit clause — derive from ASC/DESC"). Mirrors
+    /// <c>EmbeddedFileStore.ToNullsOrder</c> for the table-constraint primary-key path.
+    /// </summary>
+    private static SqliteIndexNullsOrder? ToNullsOrder(NullPlacement placement) => placement switch
+    {
+        NullPlacement.Default => null,
+        NullPlacement.First => SqliteIndexNullsOrder.First,
+        NullPlacement.Last => SqliteIndexNullsOrder.Last,
+        _ => throw new InvalidOperationException($"Unknown NULL placement {placement}."),
+    };
 
     // Validates the generated columns and returns their evaluation order. The precedence of
     // checks matches SQLite: DEFAULT-on-generated, generated-in-PRIMARY-KEY, at-least-one
     // non-generated column, then per-expression validation and loop detection.
     private static IReadOnlyList<int> ValidateAndOrderGeneratedColumns(
         IReadOnlyList<EmbeddedColumn> columns,
-        IReadOnlyList<(int Index, bool Descending)> primaryKeyColumns,
+        IReadOnlyList<(int Index, bool Descending, NullPlacement NullPlacement)> primaryKeyColumns,
         IReadOnlyDictionary<string, int> indices)
     {
         var generated = new List<int>();
@@ -63699,7 +63806,7 @@ internal sealed class EmbeddedTable
                 throw new EmbeddedSqlException("cannot use DEFAULT on a generated column");
         }
 
-        foreach (var (index, _) in primaryKeyColumns)
+        foreach (var (index, _, _) in primaryKeyColumns)
         {
             if (columns[index].IsGenerated)
                 throw new EmbeddedSqlException("generated columns cannot be part of the PRIMARY KEY");

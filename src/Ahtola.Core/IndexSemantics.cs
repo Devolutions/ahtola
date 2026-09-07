@@ -31,7 +31,8 @@ internal static class EmbeddedIndexFactory
                     columnIndex,
                     term.Collation ?? table.ColumnDefinitions[columnIndex].Collation,
                     term.Descending,
-                    MethodParameters: term.MethodParameters);
+                    MethodParameters: term.MethodParameters,
+                    NullPlacement: term.NullPlacement);
                 continue;
             }
 
@@ -56,7 +57,8 @@ internal static class EmbeddedIndexFactory
                     literalColumnIndex,
                     term.Collation ?? table.ColumnDefinitions[literalColumnIndex].Collation,
                     term.Descending,
-                    MethodParameters: term.MethodParameters);
+                    MethodParameters: term.MethodParameters,
+                    NullPlacement: term.NullPlacement);
                 continue;
             }
 
@@ -71,7 +73,8 @@ internal static class EmbeddedIndexFactory
                 term.Descending,
                 expression,
                 expressionSql,
-                term.MethodParameters);
+                term.MethodParameters,
+                term.NullPlacement);
         }
 
         var definition = new EmbeddedIndex(
@@ -105,6 +108,11 @@ internal static class IndexSqlFormatter
                 definition += " COLLATE " + FormatIdentifier(collation);
             if (term.Descending)
                 definition += " DESC";
+            // Only emit an explicit clause when the user actually wrote one: an ordinary,
+            // default-ordered index must keep byte-identical, real-SQLite-compatible SQL text
+            // (turso-src/core/translate/display.rs:23-33 follows the same "only when Some" rule).
+            if (term.NullPlacement != NullPlacement.Default)
+                definition += term.NullPlacement == NullPlacement.First ? " NULLS FIRST" : " NULLS LAST";
             if (index.Method is not null && term.MethodParameters is { Count: > 0 })
             {
                 definition += " WITH ("
@@ -169,6 +177,7 @@ internal static class IndexExpressionSemantics
             var right = reconstructed.Columns[position];
             if (left.IsExpression != right.IsExpression
                 || left.Descending != right.Descending
+                || left.NullPlacement != right.NullPlacement
                 || !string.Equals(
                     GetCollationName(table, left),
                     GetCollationName(table, right),

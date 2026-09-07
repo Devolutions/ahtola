@@ -42,6 +42,7 @@ Method indexes deliberately reject the shapes Turso also rejects
 | `… USING … WHERE <predicate>` (partial) | `A partial WHERE clause is not supported with an index method` |
 | expression column under `USING` | `An index method column must be a plain column name` |
 | `DESC` under `USING` | `DESC is not supported on an index method column` |
+| `NULLS FIRST`/`NULLS LAST` under `USING` | `cannot use NULLS FIRST/LAST with an index method` |
 | `COLLATE` under `USING` | `COLLATE is not supported on an index method column` |
 | `WITH (…)` without `USING` | `WITH is valid only on an index that declares USING` |
 | method index on a `WITHOUT ROWID` table | `… cannot use an index method on WITHOUT ROWID table …` |

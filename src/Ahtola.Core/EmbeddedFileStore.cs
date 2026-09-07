@@ -9256,6 +9256,10 @@ internal sealed class EmbeddedFileStore : IDisposable
            && definition.Index.Columns.All(column =>
                !column.IsExpression
                && !column.Descending
+               // An explicit NULLS FIRST/LAST clause changes physical byte order relative to the
+               // plain ASC-BINARY layout this bounded fast path assumes (see
+               // SqliteIndexComparisonTerm.NullsSortFirst); only the implicit ASC default is safe here.
+               && column.NullPlacement == NullPlacement.Default
                && (column.Collation is null
                    || string.Equals(column.Collation, "BINARY", StringComparison.OrdinalIgnoreCase)));
 
@@ -10106,6 +10110,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             var primaryKeyColumn = table.PrimaryKeyColumns[position];
             if (term.ColumnIndex != primaryKeyColumn.Index
                 || (term.SortOrder == SqliteKeySortOrder.Descending) != primaryKeyColumn.Descending
+                || term.NullsOrder != ToNullsOrder(primaryKeyColumn.NullPlacement)
                 || term.ColumnIndex < 0
                 || term.ColumnIndex >= table.ColumnDefinitions.Length
                 || !string.Equals(
@@ -12212,7 +12217,10 @@ internal sealed class EmbeddedFileStore : IDisposable
             var rowidTerms = index.Columns
                 .Select(column => new SqliteIndexComparisonTerm(
                     column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
-                    GetIndexCollation(table, column)))
+                    GetIndexCollation(table, column))
+                {
+                    NullsOrder = ToNullsOrder(column.NullPlacement),
+                })
                 .ToArray();
             return CreateIndexComparerOrThrowNoSuchCollation(
                 index,
@@ -12224,7 +12232,10 @@ internal sealed class EmbeddedFileStore : IDisposable
         var terms = GetWithoutRowidIndexStorageColumns(table, index)
             .Select(column => new SqliteIndexComparisonTerm(
                 column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
-                GetIndexCollation(table, column)))
+                GetIndexCollation(table, column))
+            {
+                NullsOrder = ToNullsOrder(column.NullPlacement),
+            })
             .ToArray();
         return CreateIndexComparerOrThrowNoSuchCollation(
             index,
@@ -12232,6 +12243,35 @@ internal sealed class EmbeddedFileStore : IDisposable
             allowDeferredCustomCollation,
             forceDeferCustomCollation);
     }
+
+    /// <summary>
+    /// Maps a schema-level <see cref="NullPlacement"/> (Default/First/Last) to the storage
+    /// comparator's <see cref="SqliteIndexNullsOrder"/> (First/Last, or <see langword="null"/> for
+    /// "no explicit clause — derive from ASC/DESC"). <see cref="NullPlacement.Default"/> is the
+    /// only case that maps to <see langword="null"/>: it means the CREATE INDEX column carried no
+    /// explicit NULLS FIRST/LAST clause.
+    /// </summary>
+    private static SqliteIndexNullsOrder? ToNullsOrder(NullPlacement placement) => placement switch
+    {
+        NullPlacement.Default => null,
+        NullPlacement.First => SqliteIndexNullsOrder.First,
+        NullPlacement.Last => SqliteIndexNullsOrder.Last,
+        _ => throw new InvalidOperationException($"Unknown NULL placement {placement}."),
+    };
+
+    /// <summary>
+    /// The inverse of <see cref="ToNullsOrder"/>, for re-wrapping a primary-key term's explicit
+    /// placement as an <see cref="EmbeddedIndexColumn.NullPlacement"/> (e.g. when a WITHOUT ROWID
+    /// table's own primary-key terms are appended as trailing storage columns — see
+    /// <see cref="GetWithoutRowidIndexStorageColumns"/>).
+    /// </summary>
+    private static NullPlacement ToNullPlacement(SqliteIndexNullsOrder? nullsOrder) => nullsOrder switch
+    {
+        null => NullPlacement.Default,
+        SqliteIndexNullsOrder.First => NullPlacement.First,
+        SqliteIndexNullsOrder.Last => NullPlacement.Last,
+        _ => throw new InvalidOperationException($"Unknown NULLS order {nullsOrder}."),
+    };
 
     /// <summary>
     /// Builds the comparer for <paramref name="index"/>'s complete key terms, converting the
@@ -12271,7 +12311,9 @@ internal sealed class EmbeddedFileStore : IDisposable
     internal SqliteIndexRecordComparer CreatePrimaryKeyComparer(SqlitePrimaryKeySchema schema)
         => new(
             _textEncoding,
-            schema.Terms.Select(term => new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+            schema.Terms.Select(term =>
+                new SqliteIndexComparisonTerm(term.SortOrder, term.Collation) { NullsOrder = term.NullsOrder })
+                .ToArray());
 
     /// <summary>
     /// Projects a row into the exact comparison-key shape the durable pager uses when persisting
@@ -12349,7 +12391,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 term.ColumnName,
                 term.ColumnIndex,
                 keyCollation,
-                term.SortOrder == SqliteKeySortOrder.Descending));
+                term.SortOrder == SqliteKeySortOrder.Descending,
+                NullPlacement: ToNullPlacement(term.NullsOrder)));
         }
 
         return columns;
@@ -12814,7 +12857,10 @@ internal sealed class EmbeddedFileStore : IDisposable
             _textEncoding,
             index.Columns.Select(column => new SqliteIndexComparisonTerm(
                 column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
-                GetIndexCollation(table, column))).ToArray());
+                GetIndexCollation(table, column))
+            {
+                NullsOrder = ToNullsOrder(column.NullPlacement),
+            }).ToArray());
         SqlValue[]? previousKey = null;
         foreach (var record in records)
         {

@@ -1269,16 +1269,22 @@ internal sealed class SqlParser
             if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
                 descending = true;
 
+            // Turso-only extension (turso-src core/schema.rs:5938/5992): table-level
+            // PRIMARY KEY(...)/UNIQUE(...) constraint columns accept the same NULLS
+            // FIRST/LAST clause as CREATE INDEX indexed-column terms.
+            var nullPlacement = NullPlacement.Default;
             if (ConsumeKeyword("NULLS"))
             {
-                if (!ConsumeKeyword("FIRST") && !ConsumeKeyword("LAST"))
+                if (ConsumeKeyword("FIRST"))
+                    nullPlacement = NullPlacement.First;
+                else if (ConsumeKeyword("LAST"))
+                    nullPlacement = NullPlacement.Last;
+                else
                     throw Error("Expected FIRST or LAST after NULLS.");
-
-                throw Error("NULLS FIRST/LAST is not supported in table constraints.");
             }
 
             var autoIncrement = allowAutoIncrement && ConsumeKeyword("AUTOINCREMENT");
-            var column = new TablePrimaryKeyColumn(columnName, descending, collation, autoIncrement);
+            var column = new TablePrimaryKeyColumn(columnName, descending, collation, autoIncrement, nullPlacement);
             _spans?.RecordName(column, nameToken);
             columns.Add(column);
         }
@@ -1451,7 +1457,7 @@ internal sealed class SqlParser
         var columns = new List<IndexedColumnDefinition>();
         do
         {
-            columns.Add(ParseIndexedColumn(allowMethodParameters: method is not null));
+            columns.Add(ParseIndexedColumn(allowMethodParameters: method is not null, allowNulls: true));
         }
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
@@ -1582,7 +1588,11 @@ internal sealed class SqlParser
         }
     }
 
-    private IndexedColumnDefinition ParseIndexedColumn(bool allowMethodParameters = false)
+    // allowNulls gates Turso's CREATE-INDEX-only NULLS FIRST/LAST extension (turso-src
+    // core/schema.rs:5744 IndexColumn.nulls_order). It stays false for the UPSERT conflict-target
+    // call site: SQLite/Turso reject an explicit NULLS clause there (sqlite3HasExplicitNulls /
+    // core/translate/index.rs reject_explicit_nulls), independent of the CREATE INDEX grammar.
+    private IndexedColumnDefinition ParseIndexedColumn(bool allowMethodParameters = false, bool allowNulls = false)
     {
         var startOffset = _lexer.Current.Offset;
         var expression = ParseExpression();
@@ -1598,12 +1608,27 @@ internal sealed class SqlParser
         if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
             descending = true;
 
+        var nullPlacement = NullPlacement.Default;
         if (ConsumeKeyword("NULLS"))
         {
-            if (!ConsumeKeyword("FIRST") && !ConsumeKeyword("LAST"))
+            NullPlacement parsed;
+            if (ConsumeKeyword("FIRST"))
+                parsed = NullPlacement.First;
+            else if (ConsumeKeyword("LAST"))
+                parsed = NullPlacement.Last;
+            else
                 throw Error("Expected FIRST or LAST after NULLS.");
 
-            throw Error("NULLS FIRST/LAST is not supported in index expressions.");
+            if (!allowNulls)
+            {
+                // Matches SQLite's sqlite3HasExplicitNulls / Turso's reject_explicit_nulls
+                // (turso-src/core/translate/upsert.rs): only an UPSERT conflict target reaches
+                // this branch, since the CREATE INDEX call site always passes allowNulls: true.
+                throw Error(
+                    "NULLS FIRST/LAST is not supported in an ON CONFLICT target.");
+            }
+
+            nullPlacement = parsed;
         }
 
         if (_lexer.Current.Kind is not TokenKind.Comma and not TokenKind.RightParen)
@@ -1624,7 +1649,8 @@ internal sealed class SqlParser
                 column.Name,
                 collation,
                 descending,
-                MethodParameters: methodParameters);
+                MethodParameters: methodParameters,
+                NullPlacement: nullPlacement);
             var columnSpan = _spans?.GetName(column);
             if (columnSpan is not null)
                 _spans!.RecordName(definition, columnSpan.Value);
@@ -1638,7 +1664,8 @@ internal sealed class SqlParser
             descending,
             expression,
             expressionSql,
-            methodParameters);
+            methodParameters,
+            nullPlacement);
     }
 
     private IReadOnlyList<Indexing.ManagedIndexMethodParameter> ParseIndexMethodColumnParameters()

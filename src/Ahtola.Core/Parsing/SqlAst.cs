@@ -72,7 +72,14 @@ internal sealed record IndexedColumnDefinition(
     bool Descending,
     Expression? Expression = null,
     string? ExpressionSql = null,
-    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null)
+    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null,
+    // Explicit NULLS FIRST/LAST on a CREATE INDEX column (turso-src core/schema.rs:5744
+    // IndexColumn.nulls_order). Default means no explicit clause was written; the effective
+    // placement then follows ASC/DESC exactly like SQLite's implicit default (see
+    // NullPlacementExtensions.ResolvesToNullsFirst). Never set outside CREATE INDEX: table
+    // constraints and UPSERT conflict targets keep rejecting this clause (SQLite's
+    // sqlite3HasExplicitNulls / Turso's reject_explicit_nulls).
+    NullPlacement NullPlacement = NullPlacement.Default)
 {
     public bool IsExpression => Expression is not null;
 }
@@ -660,6 +667,24 @@ internal sealed record OrderByTerm(
     NullPlacement NullPlacement = NullPlacement.Default,
     long? Ordinal = null);
 
+internal static class NullPlacementExtensions
+{
+    /// <summary>
+    /// Resolves an explicit or default NULL placement to whether NULLs sort first, mirroring
+    /// Turso's <c>NullsOrder::default_for</c> / <c>IndexColumn::effective_nulls_order</c>
+    /// (turso-src/sqlite/parser/src/ast.rs, turso-src/core/schema.rs:5774). SQLite's implicit
+    /// default is NULLS FIRST for ASC and NULLS LAST for DESC; an explicit clause always wins
+    /// regardless of direction.
+    /// </summary>
+    public static bool ResolvesToNullsFirst(this NullPlacement placement, bool descending) => placement switch
+    {
+        NullPlacement.First => true,
+        NullPlacement.Last => false,
+        NullPlacement.Default => !descending,
+        _ => throw new InvalidOperationException($"Unknown NULL placement {placement}."),
+    };
+}
+
 internal sealed record WindowSpecification(
     string? BaseWindowName,
     IReadOnlyList<Expression> PartitionBy,
@@ -814,7 +839,13 @@ internal sealed record TablePrimaryKeyColumn(
     string Name,
     bool Descending,
     string? Collation = null,
-    bool AutoIncrement = false);
+    bool AutoIncrement = false,
+    // Explicit NULLS FIRST/LAST on a table-level PRIMARY KEY(...)/UNIQUE(...) constraint
+    // column (turso-src core/schema.rs:5938/5992 thread nulls_order through
+    // constraint_columns for the constraint's automatic index). Never set for a
+    // column-level PRIMARY KEY/UNIQUE marker or an ON CONFLICT target list: those keep
+    // rejecting the clause.
+    NullPlacement NullPlacement = NullPlacement.Default);
 
 internal sealed record TableUniqueConstraint(
     string? Name,
@@ -861,7 +892,10 @@ internal sealed record EmbeddedIndexColumn(
     bool Descending,
     Expression? Expression = null,
     string? ExpressionSql = null,
-    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null)
+    IReadOnlyList<Indexing.ManagedIndexMethodParameter>? MethodParameters = null,
+    // See IndexedColumnDefinition.NullPlacement: propagated verbatim from the parsed CREATE
+    // INDEX column term, Default when no explicit NULLS FIRST/LAST clause was written.
+    NullPlacement NullPlacement = NullPlacement.Default)
 {
     public bool IsExpression => Expression is not null;
 }

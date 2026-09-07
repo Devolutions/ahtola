@@ -8,7 +8,11 @@ namespace Ahtola.Core.Storage;
 /// </summary>
 /// <remarks>
 /// Fields after the retained terms use ascending BINARY order. For an ordinary
-/// SQLite index this is the appended rowid field.
+/// SQLite index this is the appended rowid field. A term's NULL placement is
+/// independent of its ASC/DESC value direction — <see cref="SqliteIndexComparisonTerm.NullsOrder"/>
+/// resolves it explicitly, or implicitly from ASC/DESC when unset — mirroring
+/// turso-src/core/types.rs <c>cmp_with_sort</c> and turso-src/core/schema.rs
+/// <c>IndexColumn.effective_nulls_order</c>.
 /// </remarks>
 public sealed class SqliteIndexRecordComparer
 {
@@ -167,11 +171,16 @@ public sealed class SqliteIndexRecordComparer
             var term = index < _terms.Length
                 ? _terms[index]
                 : SqliteIndexComparisonTerm.BinaryAscending;
-            var result = CompareValue(left[index], right[index], term.Collation);
+            var result = CompareValue(left[index], right[index], term.Collation, out var involvesNull);
             if (result != 0)
+            {
+                if (involvesNull)
+                    return ResolveNullOrdering(term, left[index].Kind == SqlValueKind.Null);
+
                 return term.SortOrder == SqliteKeySortOrder.Descending
                     ? -Math.Sign(result)
                     : result;
+            }
         }
 
         return left.Length.CompareTo(right.Length);
@@ -191,15 +200,30 @@ public sealed class SqliteIndexRecordComparer
             var term = index < _terms.Length
                 ? _terms[index]
                 : SqliteIndexComparisonTerm.BinaryAscending;
-            var result = CompareValue(left[index], right[index], term.Collation);
+            var result = CompareValue(left[index], right[index], term.Collation, out var involvesNull);
             if (result != 0)
+            {
+                if (involvesNull)
+                    return ResolveNullOrdering(term, left[index].Kind == SqlValueKind.Null);
+
                 return term.SortOrder == SqliteKeySortOrder.Descending
                     ? -Math.Sign(result)
                     : result;
+            }
         }
 
         return left.Count.CompareTo(right.Count);
     }
+
+    /// <summary>
+    /// Resolves a NULL-versus-non-NULL comparison for one term, independent of that term's
+    /// ASC/DESC value direction. Mirrors turso-src/core/types.rs <c>cmp_with_sort</c>: an explicit
+    /// NULLS FIRST/LAST clause (or its ASC/DESC-derived implicit default, see
+    /// <see cref="SqliteIndexComparisonTerm.NullsSortFirst"/>) decides NULL placement directly and
+    /// is never re-flipped by the general descending-value-direction sign flip below.
+    /// </summary>
+    private static int ResolveNullOrdering(SqliteIndexComparisonTerm term, bool leftIsNull)
+        => term.NullsSortFirst == leftIsNull ? -1 : 1;
 
     /// <summary>Validates that <paramref name="record"/> is a supported index key record.</summary>
     /// <remarks>
@@ -219,10 +243,11 @@ public sealed class SqliteIndexRecordComparer
             || string.Equals(collation, "NOCASE", StringComparison.OrdinalIgnoreCase)
             || string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase);
 
-    private int CompareValue(SqlValue left, SqlValue right, SqliteKeyCollation collation)
+    private int CompareValue(SqlValue left, SqlValue right, SqliteKeyCollation collation, out bool involvesNull)
     {
         var leftClass = GetStorageClass(left.Kind);
         var rightClass = GetStorageClass(right.Kind);
+        involvesNull = leftClass == StorageClass.Null || rightClass == StorageClass.Null;
         if (leftClass != rightClass)
             return leftClass.CompareTo(rightClass);
 
@@ -461,10 +486,41 @@ public sealed class SqliteIndexRecordComparer
 }
 
 /// <summary>Comparison metadata for one leading SQLite index-record field.</summary>
+/// <remarks>
+/// <see cref="NullsOrder"/> is intentionally an init-only property added to the record body
+/// rather than a third positional-constructor parameter: the positional constructor
+/// <c>SqliteIndexComparisonTerm(SqliteKeySortOrder, SqliteKeyCollation)</c> and its matching
+/// two-element <c>Deconstruct</c> must stay byte-identical for already-compiled consumers of this
+/// public type. Use an object initializer (<c>new SqliteIndexComparisonTerm(order, collation)
+/// { NullsOrder = ... }</c>) to set it.
+/// </remarks>
 public sealed record SqliteIndexComparisonTerm(
     SqliteKeySortOrder SortOrder,
     SqliteKeyCollation Collation)
 {
+    /// <summary>
+    /// Explicit NULLS FIRST/LAST placement for this term, or <see langword="null"/> when no
+    /// explicit clause was written. <see langword="null"/> resolves to SQLite's implicit default —
+    /// NULLS FIRST for an ascending term, NULLS LAST for a descending one — exactly reproducing
+    /// pre-existing behavior for every term built before this property existed. See
+    /// <see cref="SqliteIndexRecordComparer"/>'s remarks and turso-src/core/types.rs
+    /// <c>cmp_with_sort</c> for the upstream rule this mirrors.
+    /// </summary>
+    public SqliteIndexNullsOrder? NullsOrder { get; init; }
+
     internal static SqliteIndexComparisonTerm BinaryAscending { get; } =
         new(SqliteKeySortOrder.Ascending, SqliteKeyCollation.Binary);
+
+    /// <summary>
+    /// Whether NULLs sort before non-NULL values for this term, resolving an explicit
+    /// <see cref="NullsOrder"/> override or falling back to SQLite's implicit ASC/DESC-derived
+    /// default when unset.
+    /// </summary>
+    internal bool NullsSortFirst => NullsOrder switch
+    {
+        SqliteIndexNullsOrder.First => true,
+        SqliteIndexNullsOrder.Last => false,
+        null => SortOrder == SqliteKeySortOrder.Ascending,
+        _ => throw new InvalidOperationException($"Unknown NULLS order {NullsOrder}."),
+    };
 }
