@@ -2074,8 +2074,8 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         // precollect/reapply and unlike ReplaceBase's full statement replay onto a pristine
         // snapshot. EnsurePagesApplyIsSafe allows this shape (CREATE/ADD COLUMN pending schema,
         // any pending row changes) and ApplyIncrementalPagesAsync's precollect/patch/reassert
-        // path must recover both the still-unpushed row values and the still-unpushed additive
-        // column regardless of what the incoming page patch physically touched.
+        // path must recover the still-unpushed rows while retaining the acknowledged column
+        // already present in the authoritative remote page image.
         var path = NewReplicaPath("managed-replica-incremental-pending-local");
         var sourcePath = path + ".source";
         byte[] initialImage;
@@ -2105,7 +2105,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 incremented.Open();
                 incremented.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
                 incremented.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (84);");
-                incremented.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+                incremented.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT, extra TEXT);");
             }
 
             incrementedImage = File.ReadAllBytes(incrementedSource);
@@ -2133,8 +2133,8 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             // The additive ADD COLUMN executes first so it is the oldest journal entry: with
             // PushOperationsThreshold=1, the sync below pushes and acknowledges exactly that one
             // entry before pulling, leaving only the two row INSERTs pending -- so this exercises
-            // both new reconciliation paths at once, the acknowledged-statement replay onto the
-            // rebuilt remote base and the pending-row precollect/reassert onto the installed file.
+            // pending-row precollect/reassert without replaying the acknowledged ADD COLUMN
+            // onto a remote base that already includes it.
             connection.ExecuteNonQuery("ALTER TABLE local_items ADD COLUMN extra TEXT;");
             connection.ExecuteNonQuery("INSERT INTO local_items(id, x, extra) VALUES (1, 'first', 'extra-1');");
             connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (2, 'second');");

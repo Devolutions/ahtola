@@ -2583,37 +2583,14 @@ internal static class ManagedReplicaBootstrapper
                 // The remote base this pull publishes must never contain the still-pending rows:
                 // it is reconstructed by advancing the PREVIOUS remote base (not the live file,
                 // which may already carry unpushed writes on pages this patch never touches) by
-                // this pull's page patch and by changes the server has already acknowledged --
-                // mirrors ApplyLogicalUpdatesWithProtectedPending's BuildRemoteBaseImage.
+                // this pull's authoritative page patch. Physical pages already include any
+                // acknowledged changes; logical client-echo filtering does not apply here.
                 // Publishing anything else would make a later push believe the server already
                 // has rows it has never seen, silently dropping them from the next push.
                 var previousRemoteBasePath = ResolveRemoteBaseSnapshot(options.Path, metadata);
                 File.Copy(previousRemoteBasePath, protectedStagingPath, overwrite: false);
                 await ApplyPagePatchAsync(protectedStagingPath, pages, header.DatabasePages, cancellationToken)
                     .ConfigureAwait(false);
-                if (acknowledgedLocalChanges.Count != 0)
-                {
-                    using var opened = ManagedReplicaEncryption.OpenDatabase(
-                        protectedStagingPath,
-                        options.RemoteEncryption);
-                    var connection = opened.Database.Connect();
-                    ExecuteNonQuery(connection, "BEGIN IMMEDIATE");
-                    try
-                    {
-                        ManagedReplicaLogicalReplayer.ReplayPendingLocalStatements(
-                            connection,
-                            acknowledgedLocalChanges,
-                            cancellationToken);
-                        ExecuteNonQuery(connection, "COMMIT");
-                    }
-                    catch
-                    {
-                        TryExecuteNonQuery(connection, "ROLLBACK");
-                        throw;
-                    }
-
-                    ExecuteNonQuery(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
-                }
                 ValidateStagedDatabase(protectedStagingPath, options.RemoteEncryption);
 
                 // The installed file: stagingPath already carries the live file's own committed-
@@ -2621,7 +2598,7 @@ internal static class ManagedReplicaBootstrapper
                 // patch happened to overwrite the same physical page, that write is gone.
                 // Idempotently reassert every still-pending schema/row change on top: a no-op
                 // wherever the patch left it untouched, a genuine repair wherever the patch
-                // clobbered it. Unlike ReplayPendingLocalStatements (used above, and by the
+                // clobbered it. Unlike ReplayPendingLocalStatements (used by the
                 // ReplaceBase+pending branch), this cannot double-apply: it upserts by captured
                 // rowid/value and idempotent DDL rather than re-executing the original
                 // INSERT/UPDATE/DELETE text, which would violate uniqueness on a base that
