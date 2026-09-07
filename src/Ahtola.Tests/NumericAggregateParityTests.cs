@@ -74,6 +74,7 @@ public sealed class NumericAggregateParityTests
             "WITH t(x) AS (VALUES(9223372036854775807),(1),(-1.0)) "
             + "SELECT typeof(sum(x)), sum(x) FROM t";
 
+        RunManaged(sql).Should().StartWith("real|");
         AssertMatchesSqlite(sql);
     }
 
