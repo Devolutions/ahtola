@@ -41,6 +41,30 @@ namespace Ahtola.Core.Collation;
 /// so this trades an unbounded memory leak for a bounded amount of repeated,
 /// inexpensive work on the (rare, already-erroring) rejection path.
 /// </para>
+/// <para>
+/// <b>The cache key is the tag's canonical SEMANTIC identity, never the raw
+/// input text.</b> A follow-up review (2026-09-07) found that the first fix
+/// above was incomplete: even restricting caching to successfully-ACCEPTED
+/// tags left the cache unbounded, because <see cref="LocaleCollationTag.TryParse"/>
+/// (at the time) still tolerated arbitrary ignored BCP-47 attributes,
+/// unrecognized keywords, and a private-use suffix on an otherwise-accepted
+/// profile — so a caller could still vary the raw input text without bound
+/// (e.g. <c>en-u-zzzzzzzz-kf-upper</c>, <c>en-x-aaaaaaaa</c>,
+/// <c>en-u-zz-abcdefgh</c>) while every variant still "resolved". Two things
+/// closed this completely: <see cref="LocaleCollationTag.TryParse"/> now
+/// rejects that previously-tolerated content outright (see its remarks), and —
+/// belt-and-suspenders, since BCP-47 keyword ORDER is legitimately
+/// unconstrained and can't simply be "rejected" — this cache is keyed by
+/// <see cref="LocaleCollationTag.CanonicalName"/>, which is rebuilt from only
+/// the tag's parsed semantic fields (language, region, collation type,
+/// case-first, numeric) in a FIXED keyword order, excluding the raw input's
+/// casing, keyword order, and the parsed-but-inert <c>ks</c> value entirely.
+/// Because <see cref="LocaleCollationTag.CanonicalName"/> only depends on a small, enumerable set
+/// of semantic field combinations (24 across the three profiles this port
+/// currently accepts), the cache is now provably bounded regardless of how a
+/// caller spells, orders, or (within the accepted grammar) pads an equivalent
+/// input tag — not merely "bounded because we hope no one tries too hard".
+/// </para>
 /// </remarks>
 public static class LocaleCollationRegistry
 {
@@ -67,12 +91,14 @@ public static class LocaleCollationRegistry
     /// Returns <see langword="false"/> for <see langword="null"/>/blank input,
     /// for the three built-in names (which callers must handle themselves), and
     /// for a tag this port cannot parse (structurally malformed, a recognized
-    /// keyword with an invalid value, or a syntactically valid tag outside
+    /// keyword with an invalid value, an unrecognized-but-otherwise-legal
+    /// BCP-47 construct, or a syntactically valid tag outside
     /// <see cref="LocaleCollationTag"/>'s accepted-profile allowlist) — the
     /// caller should treat that exactly like any other unresolvable collation
     /// name ("no such collation sequence"). Only a successful resolution is
-    /// cached; see the type remarks for why a failed/rejected lookup is
-    /// deliberately never cached.
+    /// cached, keyed by the resolved tag's canonical semantic identity rather
+    /// than the caller's raw input text; see the type remarks for why both
+    /// halves of that are necessary to keep this cache provably bounded.
     /// </summary>
     public static bool TryResolve(string? name, out Func<string, string, int>? compare)
     {
@@ -86,21 +112,20 @@ public static class LocaleCollationRegistry
             return false;
         }
 
-        var key = name.ToLowerInvariant();
+        if (!LocaleCollationTag.TryParse(name, out var tag) || tag is null)
+            return false;
+
         lock (Gate)
         {
-            if (Cache.TryGetValue(key, out var cached))
+            if (Cache.TryGetValue(tag.CanonicalName, out var cached))
             {
                 compare = cached;
                 return true;
             }
 
-            if (!LocaleCollationTag.TryParse(name, out var tag) || tag is null)
-                return false;
-
             var collator = new LocaleCollator(tag);
             Func<string, string, int> resolved = collator.Compare;
-            Cache[key] = resolved;
+            Cache[tag.CanonicalName] = resolved;
             compare = resolved;
             return true;
         }

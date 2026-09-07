@@ -72,6 +72,34 @@ public sealed class LocaleCollationTests
     }
 
     [Test]
+    [TestCase("en-u-zzzzzzzz-kf-upper")] // arbitrary ignored "attribute" subtag before a keyword
+    [TestCase("en-u-abc-kf-upper")]      // shorter (3-char) attribute -- still rejected
+    [TestCase("en-x-aaaaaaaa")]          // private-use singleton extension
+    [TestCase("en-x-a")]
+    [TestCase("en-u-zz-abcdefgh")]       // unrecognized 2-letter keyword with an arbitrary type value
+    [TestCase("en-u-qq-true")]
+    [TestCase("en-t-abc")]               // a non-"u" singleton extension besides private-use
+    public void PreviouslyTolerated_ButSemanticallyIgnored_Bcp47ConstructsAreNowRejected(string tag)
+    {
+        // A review (2026-09-07) found that tolerating these constructs -- while each is
+        // individually legal, generic BCP-47 syntax -- let an unbounded family of DISTINCT raw
+        // tag strings all resolve successfully to an otherwise-ordinary accepted profile (e.g.
+        // varying the ignored attribute or private-use suffix text), reopening the same
+        // unbounded-cache-growth concern the rejected-name fix closed, just via inputs that
+        // still "worked". LocaleCollationTag.TryParse now rejects all of these outright instead
+        // of silently skipping/tolerating them. See LocaleCollationTag and
+        // LocaleCollationRegistry's remarks for the complete fix (this rejection, plus caching
+        // by canonical semantic identity rather than raw input text).
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile($"locale-ignored-construct-{Math.Abs(tag.GetHashCode())}.db", fileSystem);
+        using var connection = database.Connect();
+
+        Action select = () => Query(connection, $"SELECT 'a' = 'b' COLLATE '{tag}';");
+        select.Should().Throw<EmbeddedSqlException>()
+            .WithMessage($"*no such collation sequence*{tag}*");
+    }
+
+    [Test]
     [TestCase("en")]
     [TestCase("es")]
     [TestCase("es-u-co-trad")]
@@ -484,6 +512,69 @@ public sealed class LocaleCollationTests
         LocaleCollationRegistry.CachedEntryCount.Should().Be(
             beforeAccepted + 1,
             "resolving the same accepted tag again must not grow the cache further");
+    }
+
+    [Test]
+    public void ThousandSemanticallyEquivalentAcceptedSpellingsShareOneCacheEntry()
+    {
+        // A follow-up review (2026-09-07) found the previous fix incomplete: even restricting
+        // caching to successfully-ACCEPTED tags left the cache unbounded, because
+        // LocaleCollationTag.TryParse (at the time) still tolerated arbitrary ignored BCP-47
+        // attributes, unrecognized keywords, and a private-use suffix -- all now rejected
+        // outright (see PreviouslyTolerated_ButSemanticallyIgnored_Bcp47ConstructsAreNowRejected)
+        // -- and, independent of that, BCP-47 keyword ORDER is legitimately unconstrained and
+        // can't simply be rejected. Generate 1000 distinct RAW spellings of the exact same
+        // semantic profile (varying keyword order among co/kf/kn, an inert ks value, and random
+        // per-character casing) and verify they all resolve successfully to equivalently-behaving
+        // comparators while adding only ONE new cache entry -- the canonical semantic identity,
+        // never one per raw spelling.
+        const string canonicalIdentity = "es-u-co-trad-kf-lower-kn-true";
+        var keywordOrders = new[]
+        {
+            "co-trad-kf-lower-kn-true",
+            "kf-lower-co-trad-kn-true",
+            "kn-true-co-trad-kf-lower",
+            "co-trad-kn-true-kf-lower",
+            "kf-lower-kn-true-co-trad",
+            "kn-true-kf-lower-co-trad",
+        };
+        var ksSuffixes = new[] { "", "-ks-level1", "-ks-level2", "-ks-level3", "-ks-level4", "-ks-identic" };
+
+        var before = LocaleCollationRegistry.CachedEntryCount;
+        var resolvedCount = 0;
+        for (var i = 0; i < 1000; i++)
+        {
+            var order = keywordOrders[i % keywordOrders.Length];
+            var ks = ksSuffixes[(i / keywordOrders.Length) % ksSuffixes.Length];
+            var raw = RandomizeCase($"es-u-{order}{ks}", seed: i);
+
+            LocaleCollationRegistry.TryResolve(raw, out var compare)
+                .Should().BeTrue($"'{raw}' is a legal spelling of the same accepted profile");
+            compare.Should().NotBeNull();
+            // "pollo" > "polvo" under the Spanish traditional digraph tailoring must hold
+            // regardless of how this particular spelling of the profile was written.
+            compare!("pollo", "polvo").Should().BeGreaterThan(0);
+            resolvedCount++;
+        }
+
+        resolvedCount.Should().Be(1000);
+
+        LocaleCollationRegistry.CachedEntryCount.Should().Be(
+            before + 1,
+            $"every one of the 1000 spellings must collapse onto the single canonical entry '{canonicalIdentity}'");
+    }
+
+    private static string RandomizeCase(string value, int seed)
+    {
+        var random = new Random(seed);
+        var chars = value.ToCharArray();
+        for (var i = 0; i < chars.Length; i++)
+        {
+            if (char.IsAsciiLetter(chars[i]) && random.Next(2) == 0)
+                chars[i] = char.ToUpperInvariant(chars[i]);
+        }
+
+        return new string(chars);
     }
 
     [Test]

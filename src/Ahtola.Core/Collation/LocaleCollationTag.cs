@@ -68,10 +68,21 @@ public enum LocaleCaseFirst
 /// (length-then-text, leading-zeros-stripped) numeric comparison in both forms.
 /// </para>
 /// <para>
-/// Any unrecognized <c>-u-</c> keyword is tolerated and ignored (BCP-47 permits
-/// private/registry-specific keywords); an unrecognized singleton extension
-/// (e.g. <c>-t-</c>, <c>-a-</c>) is skipped structurally rather than
-/// interpreted.
+/// Any unrecognized <c>-u-</c> keyword, any Unicode locale extension
+/// "attribute" subtag (BCP-47 permits free-form 3-8 alphanumeric attributes
+/// before the first keyword), and any singleton extension other than <c>u</c>
+/// (including private-use <c>-x-...</c>) are REJECTED by <see cref="TryParse"/>
+/// rather than tolerated/skipped. A review (2026-09-07) correctly found that
+/// silently tolerating such content — while syntactically legal BCP-47 — let
+/// an essentially unbounded family of distinct raw tag strings (e.g.
+/// <c>en-u-zzzzzzzz-kf-upper</c> with an arbitrary ignored attribute,
+/// <c>en-x-aaaaaaaa</c> with an arbitrary private-use suffix, or
+/// <c>en-u-zz-abcdefgh</c> with an arbitrary unrecognized keyword) all resolve
+/// successfully to an otherwise-ordinary accepted profile. Combined with
+/// caching by raw input text, that reopened the same unbounded-cache-growth
+/// vector the prior fix closed for outright-rejected names — except this time
+/// via inputs that still "worked". See <see cref="LocaleCollationRegistry"/>'s
+/// remarks for the complete fix (a canonical, semantics-only cache key).
 /// </para>
 /// <para>
 /// <b>Accepted profiles are an explicit, conservative allowlist — not full ICU
@@ -129,10 +140,23 @@ public sealed record LocaleCollationTag
     }
 
     /// <summary>
-    /// The case-folded original tag text, used as the registry cache key. BCP-47
-    /// tags are case-insensitive (<c>FR-fr</c> and <c>fr-FR</c> name the same
-    /// locale), matching Turso's <c>eq_ignore_ascii_case</c> name comparison in
-    /// <c>LocaleCollationRegistry::find</c>.
+    /// A canonical name synthesized ONLY from this tag's parsed semantic
+    /// fields (<see cref="Language"/>, region, <see cref="CollationType"/>,
+    /// <see cref="CaseFirst"/>, <see cref="Numeric"/>) in a fixed keyword
+    /// order — NEVER the caller's raw input text. Used both for display (error
+    /// messages) and as <see cref="LocaleCollationRegistry"/>'s cache key. A
+    /// review (2026-09-07) found that using the raw (only lowercased) input
+    /// text here let two tags with IDENTICAL semantics but different spelling
+    /// (different keyword order, an inert differently-valued <c>ks</c>, or
+    /// simply different casing) occupy distinct cache entries — effectively
+    /// unbounded, since BCP-47 keyword order is unconstrained and <c>ks</c>
+    /// alone contributes 5 inert variants. Because this is rebuilt from only
+    /// the finite semantic fields every accepted profile can have, the total
+    /// number of distinct <see cref="CanonicalName"/> values across ALL
+    /// accepted profiles is small and fixed (language/region combination ×
+    /// collation type × case-first × numeric — 24 for the three profiles this
+    /// port currently accepts), regardless of how creatively a caller spells,
+    /// orders, or pads an equivalent input tag.
     /// </summary>
     public string CanonicalName { get; }
 
@@ -164,18 +188,22 @@ public sealed record LocaleCollationTag
     /// Attempts to parse <paramref name="tag"/> as a BCP-47 locale identifier
     /// carrying the Unicode locale extension keywords this port understands.
     /// Returns <see langword="false"/> for structurally malformed tags, a
-    /// recognized keyword carrying an out-of-enumeration value, OR a
-    /// syntactically well-formed tag that does not match one of
-    /// <see cref="AcceptedProfiles"/> (see the type remarks: this includes
-    /// known-different-tailoring languages like Swedish/Turkish/German
-    /// phonebook, unverified regional variants like <c>fr-CA</c>, and any
-    /// fictional language). Mirrors <c>icu_locale::Locale::from_str</c>/
-    /// <c>icu_collator::Collator::try_new</c> failing closed for malformed
-    /// input (empirically verified: a bad <c>ks</c> value is rejected by
-    /// <c>Locale::from_str</c> itself with <c>InvalidExtension</c>, and
-    /// space/punctuation-bearing garbage is rejected with
-    /// <c>InvalidLanguage</c>) — the accepted-profile allowlist is this port's
-    /// own additional, more conservative restriction on top of that.
+    /// recognized keyword carrying an out-of-enumeration value, an unrecognized
+    /// <c>-u-</c> keyword/attribute or any non-<c>u</c> singleton extension
+    /// (including private-use <c>-x-</c> — see the type remarks on why these
+    /// are rejected rather than tolerated), OR a syntactically well-formed tag
+    /// that does not match one of <see cref="AcceptedProfiles"/> (see the type
+    /// remarks: this includes known-different-tailoring languages like
+    /// Swedish/Turkish/German phonebook, unverified regional variants like
+    /// <c>fr-CA</c>, and any fictional language). Mirrors
+    /// <c>icu_locale::Locale::from_str</c>/<c>icu_collator::Collator::try_new</c>
+    /// failing closed for malformed input (empirically verified: a bad
+    /// <c>ks</c> value is rejected by <c>Locale::from_str</c> itself with
+    /// <c>InvalidExtension</c>, and space/punctuation-bearing garbage is
+    /// rejected with <c>InvalidLanguage</c>) — the accepted-profile allowlist,
+    /// and the rejection of any unrecognized-but-otherwise-legal BCP-47
+    /// construct, are this port's own additional, more conservative
+    /// restrictions on top of that.
     /// </summary>
     public static bool TryParse(string? tag, out LocaleCollationTag? result)
     {
@@ -229,113 +257,98 @@ public sealed record LocaleCollationTag
             if (singleton.Length != 1 || !IsAlphaNumeric(singleton))
                 return false;
 
-            if (string.Equals(singleton, "x", StringComparison.OrdinalIgnoreCase))
-            {
-                // Private-use extension: the remainder is opaque content we do not
-                // interpret. Validate subtag shape only, then stop.
-                index++;
-                while (index < subtags.Length)
-                {
-                    if (subtags[index].Length is < 1 or > 8 || !IsAlphaNumeric(subtags[index]))
-                        return false;
-                    index++;
-                }
+            // Only the Unicode locale extension ("-u-") is recognized. Every
+            // other singleton extension — including private-use ("-x-...") —
+            // is REJECTED outright rather than tolerated/skipped: see the type
+            // remarks for why silently skipping arbitrary ignored content here
+            // reopened an unbounded-cache-key vector a review found.
+            if (!string.Equals(singleton, "u", StringComparison.OrdinalIgnoreCase))
+                return false;
 
-                break;
+            index++;
+
+            // Unicode locale extension "attributes" (free-form 3-8
+            // alphanumeric subtags preceding the first keyword key) carry no
+            // semantics this port interprets. Reject their presence instead
+            // of silently skipping them, for the same reason.
+            if (index < subtags.Length
+                && subtags[index].Length is >= 3 and <= 8
+                && IsAlphaNumeric(subtags[index]))
+            {
+                return false;
             }
 
-            if (string.Equals(singleton, "u", StringComparison.OrdinalIgnoreCase))
+            while (index < subtags.Length && subtags[index].Length != 1)
             {
+                var key = subtags[index];
+                if (key.Length != 2 || !IsAlphaNumeric(key))
+                    return false;
                 index++;
 
-                // Attributes: subtags of length 3-8 that appear before the first
-                // 2-character keyword key.
+                var types = new List<string>();
                 while (index < subtags.Length
                     && subtags[index].Length is >= 3 and <= 8
                     && IsAlphaNumeric(subtags[index]))
                 {
+                    types.Add(subtags[index]);
                     index++;
                 }
 
-                while (index < subtags.Length && subtags[index].Length != 1)
+                switch (key.ToLowerInvariant())
                 {
-                    var key = subtags[index];
-                    if (key.Length != 2 || !IsAlphaNumeric(key))
+                    case "kf":
+                        if (types.Count != 1)
+                            return false;
+                        switch (types[0].ToLowerInvariant())
+                        {
+                            case "upper":
+                                caseFirst = LocaleCaseFirst.Upper;
+                                break;
+                            case "lower":
+                                caseFirst = LocaleCaseFirst.Lower;
+                                break;
+                            case "false":
+                                caseFirst = LocaleCaseFirst.Off;
+                                break;
+                            default:
+                                return false;
+                        }
+                        break;
+                    case "kn":
+                        if (types.Count != 1)
+                            return false;
+                        switch (types[0].ToLowerInvariant())
+                        {
+                            case "true":
+                                numeric = true;
+                                break;
+                            case "false":
+                                numeric = false;
+                                break;
+                            default:
+                                return false;
+                        }
+                        break;
+                    case "ks":
+                        // Parsed and validated for shape fidelity only — see remarks
+                        // above on why this has no effect on comparison strength.
+                        // Deliberately excluded from CanonicalName/the cache key.
+                        if (types.Count != 1)
+                            return false;
+                        if (types[0].ToLowerInvariant() is not ("level1" or "level2" or "level3" or "level4" or "identic"))
+                            return false;
+                        break;
+                    case "co":
+                        if (types.Count != 1)
+                            return false;
+                        collationType = types[0].ToLowerInvariant();
+                        break;
+                    default:
+                        // Unrecognized keyword: REJECTED, not tolerated — see the
+                        // type remarks (e.g. "en-u-zz-abcdefgh").
                         return false;
-                    index++;
-
-                    var types = new List<string>();
-                    while (index < subtags.Length
-                        && subtags[index].Length is >= 3 and <= 8
-                        && IsAlphaNumeric(subtags[index]))
-                    {
-                        types.Add(subtags[index]);
-                        index++;
-                    }
-
-                    switch (key.ToLowerInvariant())
-                    {
-                        case "kf":
-                            if (types.Count != 1)
-                                return false;
-                            switch (types[0].ToLowerInvariant())
-                            {
-                                case "upper":
-                                    caseFirst = LocaleCaseFirst.Upper;
-                                    break;
-                                case "lower":
-                                    caseFirst = LocaleCaseFirst.Lower;
-                                    break;
-                                case "false":
-                                    caseFirst = LocaleCaseFirst.Off;
-                                    break;
-                                default:
-                                    return false;
-                            }
-                            break;
-                        case "kn":
-                            if (types.Count != 1)
-                                return false;
-                            switch (types[0].ToLowerInvariant())
-                            {
-                                case "true":
-                                    numeric = true;
-                                    break;
-                                case "false":
-                                    numeric = false;
-                                    break;
-                                default:
-                                    return false;
-                            }
-                            break;
-                        case "ks":
-                            // Parsed and validated for shape fidelity only — see remarks
-                            // above on why this has no effect on comparison strength.
-                            if (types.Count != 1)
-                                return false;
-                            if (types[0].ToLowerInvariant() is not ("level1" or "level2" or "level3" or "level4" or "identic"))
-                                return false;
-                            break;
-                        case "co":
-                            if (types.Count != 1)
-                                return false;
-                            collationType = types[0].ToLowerInvariant();
-                            break;
-                        default:
-                            // Unrecognized keyword: tolerated, its type subtags are
-                            // already consumed above; no interpretation possible.
-                            break;
-                    }
                 }
-
-                continue;
             }
-
-            // Unrecognized extension singleton: skip its content without
-            // interpreting it (we do not implement transform/other extensions).
-            index++;
-            while (index < subtags.Length && subtags[index].Length != 1)
-                index++;
         }
 
         // Accepted-profile allowlist: reject anything outside the base
@@ -355,12 +368,40 @@ public sealed record LocaleCollationTag
         }
 
         result = new LocaleCollationTag(
-            tag.ToLowerInvariant(),
+            BuildCanonicalName(language, region, collationType, caseFirst, numeric),
             language,
             collationType,
             caseFirst,
             numeric);
         return true;
+    }
+
+    /// <summary>
+    /// Synthesizes <see cref="CanonicalName"/> from only the parsed semantic
+    /// fields, in a fixed keyword order (<c>co</c>, then <c>kf</c>, then
+    /// <c>kn</c>), so that every accepted tag with the same semantics —
+    /// regardless of input casing, keyword order, or an accompanying (inert)
+    /// <c>ks</c> value — produces the exact same string. See
+    /// <see cref="CanonicalName"/>'s remarks.
+    /// </summary>
+    private static string BuildCanonicalName(
+        string language,
+        string? region,
+        string? collationType,
+        LocaleCaseFirst caseFirst,
+        bool numeric)
+    {
+        var name = region is null ? language : $"{language}-{region}";
+
+        var extensions = new List<string>(3);
+        if (collationType is not null)
+            extensions.Add($"co-{collationType}");
+        if (caseFirst != LocaleCaseFirst.Off)
+            extensions.Add($"kf-{(caseFirst == LocaleCaseFirst.Upper ? "upper" : "lower")}");
+        if (numeric)
+            extensions.Add("kn-true");
+
+        return extensions.Count == 0 ? name : $"{name}-u-{string.Join('-', extensions)}";
     }
 
     private static bool IsAlpha(string value)
