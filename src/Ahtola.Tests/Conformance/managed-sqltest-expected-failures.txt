@@ -85,8 +85,6 @@ turso/explain-query-plan-json.sqltest::a-recursive-cte-reports-its-setup-and-ste
 turso/explain-query-plan-json.sqltest::the-json-tree-matches-the-text-rows | List-subquery/sorter text and JSON topology differ from the pinned snapshot
 turso/explain-query-plan-json.sqltest::leaving-out-the-format-clause-means-text | Remaining execution-route gap: the managed harness supplies a cancellation token, so CanUseCompiledSelectRoute keeps this non-aggregate LEFT JOIN on the evaluator; the compiled index-search suffix fix alone does not provide the fixture's two SEARCH rows
 turso/explain-query-plan-json.sqltest::quotes-in-the-statement-are-escaped-in-the-echo | Original SQL echo loses its terminator; index access text uses the alias instead of table AS alias
-turso/explain-query-plan-json.sqltest::the-format-clause-is-case-insensitive | Original SQL echo loses its terminator; constant-row representation differs
-turso/explain-query-plan-json.sqltest::planning-a-write-does-not-run-it | Original SQL echo loses its trailing semicolon; the non-executing write plan otherwise matches
 turso/vector.sqltest::vector-insert-no-quotes | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is otherwise identical)
 turso/without_rowid.sqltest::without-rowid-secondary-unique-rejected | intentional extension: Ahtola supports secondary UNIQUE constraints on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-create-index-rejected | intentional extension: Ahtola supports secondary CREATE INDEX on WITHOUT ROWID tables where the pinned Turso corpus expects rejection

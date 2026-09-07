@@ -28,10 +28,12 @@ public class ExplainQueryPlanFormatJsonTests
         rows.Should().HaveCount(1);
         var json = rows[0];
         json.Should().StartWith("{\"version\":1,");
-        // The envelope echoes the statement exactly as written, FORMAT=JSON clause included
-        // (turso-src/docs/eqp-json.md; core/translate/eqp.rs's `sql` field is the verbatim
-        // input), so the echo names the format the caller asked for.
-        json.Should().Contain("\"sql\":\"EXPLAIN QUERY PLAN FORMAT=JSON SELECT id FROM users WHERE age > 21\"");
+        // The envelope echoes the statement exactly as written, FORMAT=JSON clause and trailing
+        // ';' both included (turso-src/docs/eqp-json.md; core/translate/eqp.rs's `sql` field is
+        // the verbatim input, terminator included -- SqlScript.Split retains it and
+        // SqlParser.Parse already tolerated one trailing semicolon via
+        // Consume(TokenKind.Semicolon) before Expect(TokenKind.End)).
+        json.Should().Contain("\"sql\":\"EXPLAIN QUERY PLAN FORMAT=JSON SELECT id FROM users WHERE age > 21;\"");
         json.Should().Contain("\"result_columns\":[");
         json.Should().Contain("\"nodes\":[");
         json.Should().Contain("\"detail\":\"");
