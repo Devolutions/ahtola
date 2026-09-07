@@ -27,7 +27,7 @@ namespace Ahtola.Core;
 /// </para>
 /// <para>
 /// Each row this method builds also carries a parallel <see cref="EqpJsonOp"/> (via
-/// <paramref name="ops"/>), matching the field names/values <c>core/translate/eqp.rs::write_json</c>
+/// its <c>ops</c> output), matching the field names/values <c>core/translate/eqp.rs::write_json</c>
 /// emits for the equivalent shape (<c>hash_join</c>, <c>scan</c>, <c>group_by</c>,
 /// <c>scalar_subquery</c>), so <c>EXPLAIN QUERY PLAN FORMAT=JSON</c> describes every row this
 /// describer produces as a typed op instead of falling back to the generic "unmodeled" wrapper.
