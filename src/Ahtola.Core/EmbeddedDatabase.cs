@@ -2590,7 +2590,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 MvccTextEncoding: outer.MvccTextEncoding,
                 VirtualTables: catalog.VirtualTables,
                 VirtualTableTransaction: outer.VirtualTableTransaction,
-                ChangeDataCapture: outer.ChangeDataCapture);
+                ChangeDataCapture: outer.ChangeDataCapture,
+                DescribeJournalMode: outer.DescribeJournalMode);
             return statement switch
             {
                 InsertStatement insert => ExecuteDmlWithAutoIncrementState(

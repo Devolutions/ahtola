@@ -6,6 +6,24 @@ namespace Ahtola.Tests;
 
 public class ManagedSqlBindingParityTests
 {
+    [TestCase(false)]
+    [TestCase(true)]
+    public void TriggerJournalModeUsesTheFiringConnection(bool temporary)
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(value); CREATE TABLE log(mode TEXT);", default);
+        Execute(connection, $"""
+            CREATE {(temporary ? "TEMP " : string.Empty)}TRIGGER trg AFTER INSERT ON main.t BEGIN
+              INSERT INTO log SELECT journal_mode FROM pragma_journal_mode();
+            END;
+            INSERT INTO t VALUES(1);
+            """, default);
+
+        ReadRows(connection, "SELECT mode FROM log;", default)
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("memory"));
+    }
+
     [Test]
     public void JournalModeResolutionStaysWithTheCallingConnection()
     {
