@@ -57,28 +57,43 @@ public sealed class NumericAggregateParityTests
     [TestCase("WITH t(x) AS (VALUES(9223372036854775807),(1)) SELECT typeof(avg(x)), avg(x) FROM t")]
     public void TotalAndAveragePromoteAfterIntegerOverflowLikeSqlite(string sql) => AssertMatchesSqlite(sql);
 
-    // Turso's Numeric::Integer AggStep fails immediately on overflow. A later REAL cannot reach
-    // sum() to turn the accumulator approximate, unlike stock SQLite's deferred overflow flag.
+    // Pinned turso-src/core/vdbe/execute.rs's Sum/Total AggStep (the Value::Numeric(Numeric::Float)
+    // match arm) explicitly clears any earlier integer-overflow flag once the accumulator has
+    // already switched to Float and a further float input arrives: "A float input clears any
+    // earlier integer-overflow flag: the result is a float approximation regardless, so there's
+    // nothing to report (func.c:1852)." So MAX+1 (which overflows and switches the accumulator to
+    // Float with ovrfl=true) followed by a REAL forgives the overflow exactly like SQLite's own
+    // deferred-flag semantics, matching bundled SQLite byte-for-byte here. This test previously
+    // asserted the opposite (an immediate, unforgivable error) since the initial commit, predating
+    // the pin's sumStep/sumInverse tracing that closed window/frame_sum_overflow.sqltest's
+    // sum-overflow-forgiven-by-later-float case with the identical shape (int, int overflow, real).
     [Test]
-    public void SumFailsBeforeLaterRealInputLikeTurso()
+    public void SumForgivesIntegerOverflowWhenALaterRealArrivesLikeTurso()
     {
         const string sql =
             "WITH t(x) AS (VALUES(9223372036854775807),(1),(-1.0)) "
             + "SELECT typeof(sum(x)), sum(x) FROM t";
 
-        RunManaged(sql).Should().StartWith("ERR:").And.Contain("integer overflow");
+        AssertMatchesSqlite(sql);
     }
 
-    // Turso's Text conversion path is deliberately distinct from Numeric::Integer: a text integer
-    // promotes on overflow and sum() returns a real result rather than raising the integer error.
+    // Pinned turso-src/core/vdbe/execute.rs's handle_text_sum runs the *same* checked_add overflow
+    // path as the Numeric::Integer arm for a text value that parses as a full (non-partial)
+    // integer: on overflow it sets sum_state.ovrfl = true exactly like the numeric path, with no
+    // special forgiveness for the text conversion route. With no later float to clear the flag,
+    // Finalize's `if approx && ovrfl` check reports the same "integer overflow" error as the
+    // all-integer case, matching bundled SQLite byte-for-byte here. This test previously asserted
+    // an unconditional real-typed forgiveness since the initial commit; that predates tracing
+    // handle_text_sum against the current pin.
     [Test]
-    public void TextIntegerOverflowPromotesSumLikeTurso()
+    public void TextIntegerOverflowReportsTheSameErrorAsNumericOverflowLikeTurso()
     {
         const string sql =
             "WITH t(x) AS (VALUES('9223372036854775807'),('1')) "
             + "SELECT typeof(sum(x)), sum(x) FROM t";
 
-        RunManaged(sql).Should().StartWith("real|");
+        RunManaged(sql).Should().StartWith("ERR:").And.Contain("integer overflow");
+        RunSqlite(sql).Should().StartWith("ERR:").And.Contain("integer overflow");
     }
 
     // The flag is sticky across later integer inputs, so the third case still fails even though the
