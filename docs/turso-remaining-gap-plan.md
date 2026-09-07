@@ -260,3 +260,40 @@ falling back or replaying SQL. It must bound live pages, decoded records, schema
 and WAL metadata, and in-flight buffers, with real cancellation/disposal
 boundaries. The current WholeImage and ReadOnlyMirror profiles remain unchanged.
 This slice is not general asynchronous SQL execution or encrypted-page support.
+
+### Later checkpoint: `b383ae6`
+
+The live inventory now contains 115 recorded differences. Eleven planner
+markers closed (eight correlated-query descriptions and three generated-column
+index descriptions); adoption of the 15-case JSON EQP file exposed 14 remaining
+contract differences. The compiled LEFT JOIN suffix change does not close the
+cancelable evaluator route used by the corpus, so that case remains explicitly
+assigned rather than being reported as passing.
+
+The SQL extension follow-up now binds JSON stars inside inline/named windows
+and ordered-set expressions without sending ordinary COUNT(*) through that
+rewrite. Same-value SETVAL uses a true MVCC update: a later transaction moving
+off the repeated key no longer resurrects an obsolete watermark. Unchanged
+INTEGER PRIMARY KEY sibling tables no longer hydrate merely because another
+table is written.
+
+HASH is delivered: partition residency, adaptive splitting, lightweight key
+indexes, and bounded probe batching preserve output order. Per-probe output
+reservation happens before predicate evaluation; failed admission uses the
+streaming path without replaying callbacks, matched flags are committed only
+with retained output, and released batch entries drop their actual references.
+Working sets larger than cache capacity can still reload indexes; this is not
+a claim of full partition-reordered grace execution.
+
+Mixed-database atomic publication and foreign CDC remain blocked. Reordering
+physical and memory commits, or accurately labeling a partial commit, is not
+an atomicity guarantee. Foreign CDC also needs durable handling of partial
+ON CONFLICT FAIL writes. The locale implementation and bounded browser profile
+remain withheld pending their respective cache-bound and corrupt-schema
+recovery corrections. A dedicated follow-up owns reusable sync prefix history;
+the accepted staging/rebase/hash-reuse slice is not that history implementation.
+
+The broader conformance run exposed timeout failures in groupby/default.sqltest
+and subquery/default.sqltest. A focused worker is checking the current engine
+against the same fixtures and per-case time budget; neither the timeout nor
+the fixture size is being relaxed.
