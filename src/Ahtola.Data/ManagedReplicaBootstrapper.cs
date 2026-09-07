@@ -4240,10 +4240,11 @@ internal static class ManagedReplicaBootstrapper
     }
 
     /// <summary>
-    /// Rejects a non-empty logical apply while a pending local schema change cannot be rebased.
-    /// Additive <c>ALTER TABLE ... ADD COLUMN</c> is always allowed: extra local columns are
-    /// ignored during remote table refresh and reapplied afterward. <c>CREATE</c> remains
-    /// allowed because it introduces an object the server cannot yet know.
+    /// Rejects a non-empty apply (logical, or an incremental page patch reconciling pending
+    /// changes) while a pending local schema change cannot be rebased. Additive
+    /// <c>ALTER TABLE ... ADD COLUMN</c> is always allowed: extra local columns are ignored
+    /// during remote table refresh and reapplied afterward. <c>CREATE</c> remains allowed because
+    /// it introduces an object the server cannot yet know.
     /// </summary>
     private static void RejectIfLocalSchemaChangesConflictWithRemoteChanges(
         IReadOnlyList<ReplicaLocalChange> pendingLocalChanges)
