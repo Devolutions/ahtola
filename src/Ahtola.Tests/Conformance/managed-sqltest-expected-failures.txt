@@ -41,8 +41,6 @@
 # expects rejection (see the two gencol markers below).
 
 agg_sum_overflow.sqltest::sum-overflow-forgiven-by-later-float | database variant 1/1 (:memory:): expected success but got error: integer overflow
-aggregate-of-outer-column.sqltest::count-of-outer-column-is-an-aggregate-of-the-outer-query | database variant 1/1 (:memory:): expected 1 row(s), got 3 row(s); row 0 expected '3' but was '1'
-aggregate-of-outer-column.sqltest::count-of-outer-column-wins-over-the-subquerys-own-from | database variant 1/1 (:memory:): expected 1 row(s), got 3 row(s); row 0 expected '3' but was '2'
 aggregate-of-outer-column.sqltest::outer-where-filters-before-the-outer-aggregate | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s); row 0 expected '2' but was '1'
 cte.sqltest::table-referenced-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'not_a_function' is not supported: no module registration, planner, or execution contract is available. At SQL offset 28.' does not 
 delete-update-limit-rejected.sqltest::delete-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
@@ -53,10 +51,8 @@ delete-update-limit-rejected.sqltest::update-limit-rejected | database variant 1
 delete-update-limit-rejected.sqltest::update-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::update-where-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::update-order-by-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
-from-subquery-affinity.sqltest::derived-table-compound-select-real-blob-leading-arm-not-skipped | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '' but was '3'
 gencol.sqltest::gencol_stored_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 gencol.sqltest::gencol_stored_generated_always_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
-join/outer_hash_join.sqltest::full-outer-with-not-exists-subquery | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
 multi_index_or_compound.sqltest::compound-or-analyzed-benchmark-shape-eqp | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH e USING INDEX idx_edge_label (label=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 pragma/memory.sqltest::pragma-function-update-journal-mode | assigned to coordinator: database variant 1/1 (:memory:): expected success but got error: no such table: pragma_journal_mode At SQL offset 33.
 pragma/memory.sqltest::pragma-update-journal-mode-wal | intentional storage-mode divergence: Ahtola reports journal_mode='memory' (SQLite-correct) for a :memory: database; Turso's Rust engine always reports wal/mvcc even in-memory
@@ -115,10 +111,6 @@ window/moving_min_max.sqltest::moving-min-max-argument-collation | database vari
 window/rows_frame.sqltest::rows-mixed-int-float-approx-transition | database variant 1/1 (:memory:): expected 4 row(s), got 4 row(s); row 2 expected '3/300.0' but was '3/300'
 unnest-correlated.sqltest::one-value-group-concat-does-not-build-unused-groups | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN outer_rows AS o.*CORRELATED SCALAR SUBQUERY'
 unnest-correlated.sqltest::one-value-group-concat-joins-before-grouping | database variant 1/1 (:memory:): output does not match pattern '(?s)JOIN inner_rows AS i.*SCAN outer_rows AS o.*USE SORTER FOR GROUP BY'
-unnest-correlated.sqltest::correlated-in-null-results-do-not-match | database variant 1/1 (:memory:): expected 1 row(s), got 4 row(s); row 0 expected '3' but was '1'
-unnest-correlated.sqltest::exists-after-full-join | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
-unnest-correlated.sqltest::exists-linked-past-full-join | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
-unnest-correlated.sqltest::not-exists-linked-past-full-join | database variant 1/1 (:memory:): expected success but got error: FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
 unnest-correlated.sqltest::one-value-sum-joins-before-grouping | database variant 1/1 (:memory:): output does not match pattern '(?s)HASH JOIN sum_join_inner AS i.*SCAN sum_join_outer AS o.*USE SORTER FOR GROUP BY'
 unnest-correlated.sqltest::one-value-sum-compared-with-subquery-stays-correlated | database variant 1/1 (:memory:): output does not match pattern '(?s)CORRELATED SCALAR SUBQUERY.*CORRELATED SCALAR SUBQUERY'
 unnest-correlated.sqltest::one-value-sum-with-nondeterministic-where-term-stays-correlated | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN nondet_outer AS o.*CORRELATED SCALAR SUBQUERY'

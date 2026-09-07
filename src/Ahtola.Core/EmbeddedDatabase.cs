@@ -30351,7 +30351,14 @@ out bool hasReturning)
         var hasAggregate = statement.Projections.Any(projection =>
                 ContainsAggregateAcrossWindows(projection.Expression))
             || statement.Having is not null && ContainsAggregate(statement.Having)
-            || statement.OrderBy.Any(term => ContainsAggregateAcrossWindows(term.Expression));
+            || statement.OrderBy.Any(term => ContainsAggregateAcrossWindows(term.Expression))
+            // ContainsAggregate/ContainsAggregateAcrossWindows never look inside a subquery
+            // boundary, so an aggregate call nested in a scalar/EXISTS/IN subquery whose
+            // argument columns belong to THIS query's own FROM - an aggregate of the outer
+            // query, not of the subquery it is written in - would otherwise be missed here,
+            // leaving this block at its per-row cardinality instead of collapsing to one
+            // aggregate row (aggregate-of-outer-column.sqltest).
+            || ContainsOuterOwnedAggregate(statement, context);
         if (statement.Having is not null && !hasAggregate && statement.GroupBy.Count == 0)
             throw new EmbeddedSqlException("HAVING clause on a non-aggregate query");
         var hasWindow = windowFunctions.Count > 0;
@@ -37316,7 +37323,14 @@ out bool hasReturning)
         string? Qualifier,
         string Name,
         ColumnAffinity Affinity,
-        string? DeclaredType = null);
+        string? DeclaredType = null,
+        // True when Affinity came from a real declared source (a column, CAST, or a
+        // recursively-derived subquery/compound result built from one) rather than from an
+        // expression with no affinity at all (a literal, function call, or arithmetic
+        // result) that merely defaults to Blob. Mirrors Turso's ExprAffinityInfo::has_affinity
+        // (core/translate/expr/affinity.rs): only a genuinely declared BLOB affinity blocks
+        // the datatype3 4.2 rule 2 TEXT-coercion an affinity-less operand still receives.
+        bool HasAffinity = true);
 
     private static IReadOnlyList<QueryAffinityColumn> DescribeQueryAffinities(
         QueryStatement statement,
@@ -37329,7 +37343,7 @@ out bool hasReturning)
             CompoundSelectStatement compound => DescribeCompoundAffinities(compound, context, commonTableExpressions),
             WithSelectStatement with => DescribeWithSelectAffinities(with, context, commonTableExpressions),
             ValuesClause values => Enumerable.Range(0, values.Rows[0].Count)
-                .Select(index => new QueryAffinityColumn(null, $"column{index + 1}", ColumnAffinity.Blob))
+                .Select(index => new QueryAffinityColumn(null, $"column{index + 1}", ColumnAffinity.Blob, HasAffinity: false))
                 .ToArray(),
             _ => throw new EmbeddedSqlException($"Unsupported query type {statement.GetType().Name}."),
         };
@@ -37344,7 +37358,8 @@ out bool hasReturning)
                 column.Qualifier,
                 column.Name,
                 column.Affinity,
-                column.DeclaredType))
+                column.DeclaredType,
+                column.HasAffinity))
             .ToArray();
 
     // One result column of a single SELECT arm, carrying both its comparison affinity and
@@ -37354,7 +37369,9 @@ out bool hasReturning)
         string Name,
         ColumnAffinity Affinity,
         StorageClassMask Data,
-        string? DeclaredType = null);
+        string? DeclaredType = null,
+        // See QueryAffinityColumn.HasAffinity.
+        bool HasAffinity = true);
 
     private static IReadOnlyList<ArmColumn> DescribeSelectArmColumns(
         SelectStatement statement,
@@ -37375,7 +37392,8 @@ out bool hasReturning)
                     column.Name,
                     column.Affinity,
                     StorageClassFromAffinity(column.Affinity),
-                    column.DeclaredType)));
+                    column.DeclaredType,
+                    column.HasAffinity)));
                 continue;
             }
 
@@ -37394,16 +37412,20 @@ out bool hasReturning)
                     column.Name,
                     column.Affinity,
                     StorageClassFromAffinity(column.Affinity),
-                    column.DeclaredType)));
+                    column.DeclaredType,
+                    column.HasAffinity)));
                 continue;
             }
 
+            var (projectionAffinity, projectionHasAffinity) = GetExpressionAffinity(
+                projection.Expression, output, context, commonTableExpressions);
             result.Add(new ArmColumn(
                 null,
                 GetProjectionName(projection),
-                GetExpressionAffinity(projection.Expression, output, context, commonTableExpressions),
+                projectionAffinity,
                 GetExpressionStorageClassMask(projection.Expression, output, context, commonTableExpressions),
-                GetExpressionDeclaredType(projection.Expression, output, context, commonTableExpressions)));
+                GetExpressionDeclaredType(projection.Expression, output, context, commonTableExpressions),
+                projectionHasAffinity));
         }
 
         return result;
@@ -37460,7 +37482,7 @@ out bool hasReturning)
             case ColumnExpression:
             case ScalarSubqueryExpression:
                 return StorageClassFromAffinity(
-                    GetExpressionAffinity(expression, sourceColumns, context, commonTableExpressions));
+                    GetExpressionAffinity(expression, sourceColumns, context, commonTableExpressions).Affinity);
             default:
                 return StorageClassMask.Numeric;
         }
@@ -37478,7 +37500,7 @@ out bool hasReturning)
         {
             SelectStatement select => DescribeSelectArmColumns(select, context, commonTableExpressions),
             ValuesClause values => Enumerable.Range(0, values.Rows[0].Count)
-                .Select(index => new ArmColumn(null, $"column{index + 1}", ColumnAffinity.Blob, StorageClassMask.All))
+                .Select(index => new ArmColumn(null, $"column{index + 1}", ColumnAffinity.Blob, StorageClassMask.All, HasAffinity: false))
                 .ToArray(),
             _ => DescribeQueryAffinities(statement, context, commonTableExpressions)
                 .Select(column => new ArmColumn(
@@ -37486,41 +37508,49 @@ out bool hasReturning)
                     column.Name,
                     column.Affinity,
                     StorageClassFromAffinity(column.Affinity),
-                    column.DeclaredType))
+                    column.DeclaredType,
+                    column.HasAffinity))
                 .ToArray(),
         };
     }
 
     // The combined affinity of one column across all arms of a compound SELECT, an exact
-    // port of Turso's compound_column_affinity (core/translate/plan.rs). A column keeps its
-    // first non-BLOB arm's affinity unless a later arm can produce a storage class that
-    // forces the result to BLOB (text arm with a numeric-producing arm, or vice versa).
-    private static ColumnAffinity CompoundColumnAffinity(
+    // port of Turso's compound_column_affinity (core/translate/plan.rs). Scanning arms
+    // left-to-right, the result keeps the first arm's affinity that actually HasAffinity -
+    // not merely the first arm whose *value* happens to be Blob, since a genuinely declared
+    // BLOB arm (a real column/CAST) stops the scan immediately just like any other declared
+    // affinity (from-subquery-affinity.sqltest::derived-table-compound-select-real-blob-
+    // leading-arm-not-skipped) - unless a later arm can produce a storage class that forces
+    // the result to BLOB (text arm with a numeric-producing arm, or vice versa). Only when
+    // every arm has no affinity at all does the column itself end up with no affinity.
+    private static (ColumnAffinity Affinity, bool HasAffinity) CompoundColumnAffinity(
         IReadOnlyList<IReadOnlyList<ArmColumn>> arms,
         int index)
     {
         var affinity = arms[0][index].Affinity;
+        var hasAffinity = arms[0][index].HasAffinity;
         var dataTypes = StorageClassMask.None;
         var armIndex = 0;
-        while (affinity == ColumnAffinity.Blob && armIndex + 1 < arms.Count)
+        while (!hasAffinity && armIndex + 1 < arms.Count)
         {
             dataTypes |= arms[armIndex][index].Data;
             armIndex++;
             affinity = arms[armIndex][index].Affinity;
+            hasAffinity = arms[armIndex][index].HasAffinity;
         }
 
-        if (affinity == ColumnAffinity.Blob)
-            return ColumnAffinity.Blob;
+        if (!hasAffinity)
+            return (ColumnAffinity.Blob, false);
 
         for (var other = armIndex + 1; other < arms.Count; other++)
             dataTypes |= arms[other][index].Data;
 
         if (affinity == ColumnAffinity.Text && dataTypes.HasFlag(StorageClassMask.Numeric))
-            return ColumnAffinity.Blob;
+            return (ColumnAffinity.Blob, true);
         if (IsNumericAffinity(affinity) && dataTypes.HasFlag(StorageClassMask.Text))
-            return ColumnAffinity.Blob;
+            return (ColumnAffinity.Blob, true);
 
-        return affinity;
+        return (affinity, true);
     }
 
     private static IReadOnlyList<QueryAffinityColumn> DescribeCompoundAffinities(
@@ -37544,7 +37574,7 @@ out bool hasReturning)
         var result = new List<QueryAffinityColumn>(width);
         for (var index = 0; index < width; index++)
         {
-            var affinity = CompoundColumnAffinity(arms, index);
+            var (affinity, hasAffinity) = CompoundColumnAffinity(arms, index);
             result.Add(new QueryAffinityColumn(
                 null,
                 arms[0][index].Name,
@@ -37552,7 +37582,8 @@ out bool hasReturning)
                 // The pragma/view column-type walk reports the first branch's declared type
                 // (its pre-existing behavior); the compound affinity above is what comparison
                 // threading consumes, and it re-derives the declared type independently.
-                arms[0][index].DeclaredType));
+                arms[0][index].DeclaredType,
+                hasAffinity));
         }
 
         return result;
@@ -37573,6 +37604,19 @@ out bool hasReturning)
     // Builds the static CTE affinity map consumed by DescribeQueryAffinities from the
     // runtime-materialized CTEs carried on a QueryContext, recovering each column's
     // affinity from the threaded column definitions (BLOB when unavailable).
+    //
+    // KNOWN RESIDUAL GAP: BuildSourceColumnDefinitionsFromAffinities already collapses a
+    // genuinely-declared-BLOB column with no custom collation to "no definition" (the same
+    // shape a no-affinity column produces), so a missing definition here cannot be told
+    // apart from a truly affinity-less one - both fall to the ColumnAffinity.Blob branch
+    // below with the QueryAffinityColumn.HasAffinity default (true). That default happens to
+    // be correct whenever the missing definition came from a genuinely-declared BLOB source
+    // (the case every current corpus test exercises), but would incorrectly report
+    // HasAffinity for a CTE column that is truly affinity-less (e.g. `WITH u(x) AS (SELECT 5)
+    // ...`). Fixing that fully requires carrying HasAffinity through EmbeddedColumn itself,
+    // which is out of scope here; the direct (non-CTE-materialized) affinity pipeline above
+    // (GetExpressionAffinity/CompoundColumnAffinity/QueryAffinityColumn) already tracks it
+    // precisely.
     private static Dictionary<string, IReadOnlyList<QueryAffinityColumn>> BuildAffinityMapFromRuntimeCtes(
         IReadOnlyDictionary<string, SourceData> runtimeCtes)
     {
@@ -37814,7 +37858,13 @@ out bool hasReturning)
         string? qualifier)
         => columns.Select(column => column with { Qualifier = qualifier }).ToArray();
 
-    private static ColumnAffinity GetExpressionAffinity(
+    // Resolves an expression's comparison affinity together with whether that affinity is
+    // genuinely declared (a column, CAST, or something recursively derived from one) as
+    // opposed to an expression with no affinity at all (a literal, function call, or
+    // arithmetic result) that has nothing better to report than Blob. Mirrors Turso's
+    // get_expr_affinity_info (core/translate/expr/affinity.rs): only the former blocks the
+    // datatype3 4.2 rule 2 TEXT-coercion an affinity-less operand still receives.
+    private static (ColumnAffinity Affinity, bool HasAffinity) GetExpressionAffinity(
         Expression expression,
         IReadOnlyList<QueryAffinityColumn> sourceColumns,
         QueryContext context,
@@ -37829,7 +37879,7 @@ out bool hasReturning)
                 commonTableExpressions);
         }
         if (expression is CastExpression cast)
-            return EmbeddedTable.GetAffinity(cast.TypeName);
+            return (EmbeddedTable.GetAffinity(cast.TypeName), true);
         if (expression is ScalarSubqueryExpression { Query: SelectStatement { Source: null } select }
             && select.Projections.Count == 1)
         {
@@ -37845,10 +37895,12 @@ out bool hasReturning)
                 scalarSubquery.Query,
                 context,
                 commonTableExpressions);
-            return columns.Count == 1 ? columns[0].Affinity : ColumnAffinity.Blob;
+            return columns.Count == 1
+                ? (columns[0].Affinity, columns[0].HasAffinity)
+                : (ColumnAffinity.Blob, false);
         }
         if (expression is not ColumnExpression column)
-            return ColumnAffinity.Blob;
+            return (ColumnAffinity.Blob, false);
 
         var name = column.UnqualifiedName ?? column.Name[(column.Name.LastIndexOf('.') + 1)..];
         var matches = sourceColumns.Where(candidate =>
@@ -37856,7 +37908,9 @@ out bool hasReturning)
             && (column.Qualifier is null
                 || string.Equals(candidate.Qualifier, column.Qualifier, StringComparison.OrdinalIgnoreCase)))
             .ToArray();
-        return matches.Length == 1 ? matches[0].Affinity : ColumnAffinity.Blob;
+        return matches.Length == 1
+            ? (matches[0].Affinity, matches[0].HasAffinity)
+            : (ColumnAffinity.Blob, false);
     }
 
     // Derives the declared-type string SQLite's table-valued PRAGMA functions report
@@ -39743,7 +39797,7 @@ out bool hasReturning)
                 throw new EmbeddedSqlException("FULL OUTER JOIN chaining is not yet supported");
         }
 
-        if (ContainsCorrelatedSubqueryReferencingFromSources(statement))
+        if (ContainsCorrelatedSubqueryReferencingFullJoinNullSide(statement, fullOuterJoins))
         {
             throw new EmbeddedSqlException(
                 "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables");
@@ -39815,10 +39869,35 @@ out bool hasReturning)
                 || ContainsOuterJoin(join.Right));
     }
 
-    private static bool ContainsCorrelatedSubqueryReferencingFromSources(SelectStatement statement)
+    // A correlated subquery confined to a FULL JOIN's always-present side is evaluated as
+    // an ordinary per-row WHERE filter after the FULL JOIN materializes its null-padded
+    // rows: RewriteCorrelatedSubqueriesAsJoins already declines the semi/anti-join rewrite
+    // whenever any outer join is present (SourceContainsOuterJoin), so the correlated
+    // subquery keeps its normal three-valued evaluation against whatever row the FULL JOIN
+    // produced, including a null-padded one - the same answer a plain SQL WHERE clause
+    // gives. The chaining guard above (ContainsOuterJoin(fullOuterJoin.Left)) already
+    // proves that side holds no independent outer join of its own, so nothing there can be
+    // null-padded except by this same FULL JOIN, as a unit. Only a reference into a FULL
+    // JOIN's own right side - the side whose match-or-not decides the null padding, and
+    // whose planning Turso's join-order search cannot always complete
+    // (core/translate/optimizer/join.rs:1340-1365) - stays rejected.
+    private static bool ContainsCorrelatedSubqueryReferencingFullJoinNullSide(
+        SelectStatement statement,
+        IReadOnlyList<JoinTableSource> fullOuterJoins)
     {
-        var fromNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        CollectFromSourceNames(statement.Source, fromNames);
+        var unsafeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var fullOuterJoin in fullOuterJoins)
+            CollectFromSourceNames(fullOuterJoin.Right, unsafeNames);
+        if (unsafeNames.Count == 0)
+            return false;
+
+        return ContainsCorrelatedSubqueryReferencingFromSources(statement, unsafeNames);
+    }
+
+    private static bool ContainsCorrelatedSubqueryReferencingFromSources(
+        SelectStatement statement,
+        HashSet<string> fromNames)
+    {
         if (fromNames.Count == 0)
             return false;
 
@@ -41183,6 +41262,132 @@ out bool hasReturning)
 
     private static bool TryResolveColumnLocally(SourceRow row, ColumnExpression column)
         => (row.Parent is null ? row : row with { Parent = null }).TryGetValue(column, out _);
+
+    // ContainsAggregate/ContainsAggregateAcrossWindows never look inside a subquery
+    // boundary (a scalar/EXISTS/IN subquery has its own scope), so they cannot see an
+    // aggregate call written inside one whose argument columns actually belong to
+    // `statement`'s own FROM. SQLite's resolveExprStep walks outward through enclosing
+    // scopes and binds such a call to whichever one owns the column it references,
+    // marking that scope aggregate-bearing (NC_HasAgg) even though the call is written
+    // one level down (aggregate-of-outer-column.sqltest). This detects that shape so
+    // ExecuteSelect can fold it into `hasAggregate` before picking between the per-row
+    // and per-group/aggregate execution shapes; TryEvaluateOuterScopedAggregate performs
+    // the matching per-row redirect once this block's aggregate pass exposes its rows as
+    // an OuterAggregateScope.
+    private bool ContainsOuterOwnedAggregate(SelectStatement statement, QueryContext context)
+    {
+        if (statement.Source is null)
+            return false;
+
+        var outerProbe = CreateQuerySchemaValidationRow(
+            statement.Source,
+            context,
+            GetSourceColumns(statement.Source, context),
+            GetOutputColumns(statement.Source, context),
+            outerRow: null);
+
+        return statement.Projections.Any(projection =>
+                ExpressionHoldsOuterOwnedAggregate(projection.Expression, outerProbe, context))
+            || (statement.Having is not null
+                && ExpressionHoldsOuterOwnedAggregate(statement.Having, outerProbe, context))
+            || statement.OrderBy.Any(term =>
+                ExpressionHoldsOuterOwnedAggregate(term.Expression, outerProbe, context));
+    }
+
+    // Walks an expression tree looking for a nested scalar/EXISTS/IN subquery whose own
+    // aggregate calls resolve against `outerProbe` instead of the subquery's own FROM. A
+    // subquery nested more than one level down is left alone: TryEvaluateOuterScopedAggregate's
+    // per-row redirect already covers ownership further out, once an immediate ancestor is
+    // marked aggregate-bearing by this same detection at its own level. Does not itself count
+    // a direct aggregate call at this level - ContainsAggregate/ContainsAggregateAcrossWindows
+    // already do that - only its arguments are walked, in case they hold a further subquery.
+    private bool ExpressionHoldsOuterOwnedAggregate(Expression? expression, SourceRow outerProbe, QueryContext context)
+    {
+        switch (expression)
+        {
+            case null:
+                return false;
+            case ScalarSubqueryExpression { Query: SelectStatement innerScalar }:
+                return SelectHasAggregateOwnedByOuter(innerScalar, outerProbe, context);
+            case ExistsExpression { Query: SelectStatement innerExists }:
+                return SelectHasAggregateOwnedByOuter(innerExists, outerProbe, context);
+            case InSubqueryExpression inSubquery:
+                return ExpressionHoldsOuterOwnedAggregate(inSubquery.Value, outerProbe, context)
+                    || (inSubquery.Query is SelectStatement innerIn
+                        && SelectHasAggregateOwnedByOuter(innerIn, outerProbe, context));
+            case RowValueExpression rowValue:
+                return rowValue.Values.Any(value => ExpressionHoldsOuterOwnedAggregate(value, outerProbe, context));
+            case UnaryExpression unary:
+                return ExpressionHoldsOuterOwnedAggregate(unary.Operand, outerProbe, context);
+            case BinaryExpression binary:
+                return ExpressionHoldsOuterOwnedAggregate(binary.Left, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(binary.Right, outerProbe, context);
+            case CollationExpression collation:
+                return ExpressionHoldsOuterOwnedAggregate(collation.Expression, outerProbe, context);
+            case CastExpression cast:
+                return ExpressionHoldsOuterOwnedAggregate(cast.Expression, outerProbe, context);
+            case CaseExpression @case:
+                return (@case.Operand is not null && ExpressionHoldsOuterOwnedAggregate(@case.Operand, outerProbe, context))
+                    || @case.Clauses.Any(clause =>
+                        ExpressionHoldsOuterOwnedAggregate(clause.When, outerProbe, context)
+                        || ExpressionHoldsOuterOwnedAggregate(clause.Then, outerProbe, context))
+                    || (@case.Else is not null && ExpressionHoldsOuterOwnedAggregate(@case.Else, outerProbe, context));
+            case LikeExpression like:
+                return ExpressionHoldsOuterOwnedAggregate(like.Value, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(like.Pattern, outerProbe, context)
+                    || (like.Escape is not null && ExpressionHoldsOuterOwnedAggregate(like.Escape, outerProbe, context));
+            case GlobExpression glob:
+                return ExpressionHoldsOuterOwnedAggregate(glob.Value, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(glob.Pattern, outerProbe, context);
+            case InExpression @in:
+                return ExpressionHoldsOuterOwnedAggregate(@in.Value, outerProbe, context)
+                    || @in.Values.Any(value => ExpressionHoldsOuterOwnedAggregate(value, outerProbe, context));
+            case BetweenExpression between:
+                return ExpressionHoldsOuterOwnedAggregate(between.Value, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(between.Lower, outerProbe, context)
+                    || ExpressionHoldsOuterOwnedAggregate(between.Upper, outerProbe, context);
+            case FunctionExpression function:
+                return function.Arguments.Any(argument => ExpressionHoldsOuterOwnedAggregate(argument, outerProbe, context))
+                    || (function.Filter is not null && ExpressionHoldsOuterOwnedAggregate(function.Filter, outerProbe, context));
+            default:
+                return false;
+        }
+    }
+
+    // A subquery's own aggregate calls resolve against its own FROM first (SQL's shadowing
+    // rule keeps the nearest owner); only a call whose columns cannot resolve there but do
+    // resolve against `outerProbe` is an aggregate of the outer query.
+    private bool SelectHasAggregateOwnedByOuter(SelectStatement inner, SourceRow outerProbe, QueryContext context)
+    {
+        var aggregates = new List<FunctionExpression>();
+        foreach (var projection in inner.Projections)
+            CollectNonWindowAggregates(projection.Expression, aggregates);
+        if (inner.Having is not null)
+            CollectNonWindowAggregates(inner.Having, aggregates);
+        foreach (var term in inner.OrderBy)
+            CollectNonWindowAggregates(term.Expression, aggregates);
+        if (aggregates.Count == 0)
+            return false;
+
+        var innerProbe = inner.Source is null
+            ? null
+            : CreateQuerySchemaValidationRow(
+                inner.Source,
+                context,
+                GetSourceColumns(inner.Source, context),
+                GetOutputColumns(inner.Source, context),
+                outerRow: null);
+
+        foreach (var aggregate in aggregates)
+        {
+            if (AggregateColumnsResolveLocally(aggregate, innerProbe) is true)
+                continue;
+            if (AggregateColumnsResolveLocally(aggregate, outerProbe) is true)
+                return true;
+        }
+
+        return false;
+    }
 
     // True when every aggregate call this statement evaluates belongs to an enclosing
     // aggregate block. With selected rows, ownership is probed against the first row: a
@@ -44924,9 +45129,12 @@ out bool hasReturning)
     }
 
     // The affinity of a scalar-subquery comparison operand, resolved statically from the
-    // subquery's single result column. Returns null for BLOB affinity, a multi-column result,
-    // or any shape the affinity describer cannot model (so the comparison falls back to the
-    // other operand's affinity), mirroring SQLite.
+    // subquery's single result column. Returns the declared affinity as-is - including BLOB,
+    // which datatype3 4.2 rule 2 treats differently from "no affinity" (TEXT affinity is only
+    // pulled onto a truly affinity-less operand, never onto a genuinely BLOB-affinity one; see
+    // Turso's ExprAffinityInfo::has_affinity, core/translate/expr/affinity.rs) - or null for a
+    // multi-column result or any shape the affinity describer cannot model (so the comparison
+    // falls back to the other operand's affinity).
     private static ColumnAffinity? GetScalarSubqueryComparisonAffinity(
         ScalarSubqueryExpression subquery,
         QueryContext? context)
@@ -44943,8 +45151,7 @@ out bool hasReturning)
             if (affinities.Count != 1)
                 return null;
 
-            var affinity = affinities[0].Affinity;
-            return affinity == ColumnAffinity.Blob ? null : affinity;
+            return affinities[0].HasAffinity ? affinities[0].Affinity : null;
         }
         catch (EmbeddedSqlException)
         {
@@ -44953,8 +45160,12 @@ out bool hasReturning)
     }
 
     // The per-column candidate affinities of an IN-subquery's result set, so the membership
-    // comparison can apply affinity to each LHS element (SQLite datatype3 §4.1). BLOB-affinity
-    // columns yield null (no candidate affinity); an undescribable subquery yields null overall.
+    // comparison can apply affinity to each LHS element (SQLite datatype3 §4.1). A column's
+    // declared affinity is returned as-is - including BLOB, which is a real declared affinity
+    // distinct from "no affinity" for the TEXT-coercion rule (datatype3 4.2 rule 2; Turso's
+    // ExprAffinityInfo::has_affinity, core/translate/expr/affinity.rs) - a column that resolved
+    // with no declared affinity at all reports null, and an undescribable subquery yields null
+    // overall.
     private static IReadOnlyList<ColumnAffinity?>? DescribeSubqueryCandidateAffinities(
         QueryStatement query,
         QueryContext context)
@@ -44966,7 +45177,7 @@ out bool hasReturning)
                 context,
                 BuildAffinityMapFromRuntimeCtes(context.CommonTableExpressions));
             return affinities
-                .Select(column => column.Affinity == ColumnAffinity.Blob ? null : (ColumnAffinity?)column.Affinity)
+                .Select(column => column.HasAffinity ? (ColumnAffinity?)column.Affinity : null)
                 .ToArray();
         }
         catch (EmbeddedSqlException)
