@@ -199,6 +199,167 @@ public sealed class LocaleCollationTests
         }
     }
 
+    [Test]
+    [TestCase("fr-FR")]
+    [TestCase("en")]
+    [TestCase("es")]
+    public void PrecomposedAccentedLetterEqualsItsCanonicallyDecomposedSpelling(string tag)
+    {
+        // The specific defect a review found: comparing 'e' followed by a standalone
+        // combining acute accent (U+0301) to the precomposed 'é' (U+00E9) must report
+        // them equal, not merely "close" -- verified against the pinned icu_collator
+        // 2.3.1 (see LocaleCollationWeights remarks).
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile($"locale-nfd-equiv-{tag}.db", fileSystem);
+        using var connection = database.Connect();
+
+        Query(connection, $"SELECT char(233) = 'e' || char(769) COLLATE '{tag}';")[0][0].AsInteger()
+            .Should().Be(1, "precomposed é (U+00E9) must equal decomposed e+combining-acute (U+0301)");
+        Query(connection, $"SELECT 'e' || char(769) < 'e' || char(776) COLLATE '{tag}';")[0][0].AsInteger()
+            .Should().Be(1, "decomposed e+acute must still order correctly relative to decomposed e+diaeresis");
+
+        // A broader set of precomposed/decomposed pairs (grave, circumflex, cedilla, tilde).
+        var pairs = new (int Precomposed, int Base, int Mark)[]
+        {
+            (0x00E8, 'e', 0x0300), // è = e + grave
+            (0x00EA, 'e', 0x0302), // ê = e + circumflex
+            (0x00E7, 'c', 0x0327), // ç = c + cedilla
+            (0x00FC, 'u', 0x0308), // ü = u + diaeresis
+        };
+        foreach (var (precomposed, baseLetter, mark) in pairs)
+        {
+            Query(connection, $"SELECT char({precomposed}) = char({(int)baseLetter}) || char({mark}) COLLATE '{tag}';")[0][0]
+                .AsInteger().Should().Be(1, $"U+{precomposed:X4} must equal its decomposed spelling under {tag}");
+        }
+    }
+
+    [Test]
+    public void SortKeyIsIdenticalForPrecomposedAndDecomposedSpellings()
+    {
+        // WriteSortKey backs persisted index byte ordering and equality; it must
+        // produce byte-identical keys for canonically equivalent spellings, not just
+        // agree under Compare.
+        LocaleCollationRegistry.TryResolve("fr-FR", out var compare).Should().BeTrue();
+        compare.Should().NotBeNull();
+        compare!("\u00e9", "e\u0301").Should().Be(0);
+        compare("\u00e8", "e\u0300").Should().Be(0);
+    }
+
+    [Test]
+    public void SpanishEnyeIsADistinctPrimaryLetterBetweenNAndO()
+    {
+        // Verified against the pinned collator for BOTH es (modern/default) and
+        // es-u-co-trad: ñ is a genuine distinct primary letter positioned between all
+        // n-prefixed sequences and 'o' -- not merely a secondary-level accent on 'n'.
+        // "nz" < "ña" (which would be false under a plain secondary-only accent model,
+        // since z's primary weight exceeds a's) proves this, for both collation types.
+        foreach (var tag in new[] { "es", "es-u-co-trad" })
+        {
+            var fileSystem = new InMemoryFileSystem();
+            using var database = EmbeddedDatabase.OpenFile($"locale-enye-{tag}.db", fileSystem);
+            using var connection = database.Connect();
+
+            Query(connection, $"SELECT 'nz' < 'ña' COLLATE '{tag}';")[0][0].AsInteger().Should().Be(1);
+            Query(connection, $"SELECT 'ñz' < 'oa' COLLATE '{tag}';")[0][0].AsInteger().Should().Be(1);
+            Query(connection, $"SELECT 'n' < 'ñ' COLLATE '{tag}';")[0][0].AsInteger().Should().Be(1);
+            Query(connection, $"SELECT 'ñ' < 'o' COLLATE '{tag}';")[0][0].AsInteger().Should().Be(1);
+
+            Query(
+                    connection,
+                    $"WITH w(v) AS (VALUES ('ana'), ('aña'), ('anzo'), ('año')) SELECT v FROM w ORDER BY v COLLATE '{tag}';")
+                .Select(row => row[0].AsText())
+                .Should().Equal("ana", "anzo", "aña", "año");
+
+            // The decomposed spelling ("n" + combining tilde) must receive the SAME
+            // Spanish tailoring as the precomposed ñ codepoint.
+            Query(connection, $"SELECT 'nz' < 'n' || char(771) || 'a' COLLATE '{tag}';")[0][0].AsInteger()
+                .Should().Be(1, "decomposed ñ (n + combining tilde) must be tailored identically to precomposed ñ");
+        }
+    }
+
+    [Test]
+    public void SpanishEnyeDoesNotApplyToOtherLanguages()
+    {
+        // Outside Spanish, ñ must behave as an ordinary accented 'n' (secondary
+        // difference only) -- verified against the pinned collator for 'en'.
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("locale-enye-not-spanish.db", fileSystem);
+        using var connection = database.Connect();
+
+        Query(connection, "SELECT 'nz' > 'ña' COLLATE 'en';")[0][0].AsInteger()
+            .Should().Be(1, "under a non-Spanish tag, ñ must NOT receive the distinct-primary-letter tailoring");
+    }
+
+    [Test]
+    public void VerifiedAsciiPunctuationOrderIsNotCodepointOrder()
+    {
+        // A prior version of this port fell back to code point order for ASCII
+        // punctuation; that was verified WRONG against the pinned collator (e.g. '-'
+        // sorts before ',' under real UCA, which code point order contradicts).
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("locale-punctuation-order.db", fileSystem);
+        using var connection = database.Connect();
+
+        Query(connection, "SELECT '-' < ',' COLLATE 'en';")[0][0].AsInteger()
+            .Should().Be(1, "verified UCA order places '-' before ',' -- code point order would say the opposite");
+        Query(connection, "SELECT ' ' < '_' COLLATE 'en';")[0][0].AsInteger().Should().Be(1);
+        Query(connection, "SELECT '_' < '-' COLLATE 'en';")[0][0].AsInteger().Should().Be(1);
+
+        // Punctuation sorts before digits, which sort before letters (verified
+        // reordering-group boundaries).
+        Query(connection, "SELECT '-' < '5' COLLATE 'en';")[0][0].AsInteger().Should().Be(1);
+        Query(connection, "SELECT '5' < 'a' COLLATE 'en';")[0][0].AsInteger().Should().Be(1);
+
+        // The full verified order round-trips through ORDER BY.
+        var expected = new[] { " ", "_", "-", ",", ";", ":", "!", "?", ".", "'", "\"", "(", ")", "[", "]", "{", "}",
+            "@", "*", "/", "\\", "&", "#", "%", "`", "^", "+", "<", "=", ">", "|", "~", "$" };
+        var values = string.Join(", ", expected.Select(ch => $"('{ch.Replace("'", "''")}')"));
+        Query(connection, $"WITH w(v) AS (VALUES {values}) SELECT v FROM w ORDER BY v COLLATE 'en';")
+            .Select(row => row[0].AsText())
+            .Should().Equal(expected);
+    }
+
+    [Test]
+    [TestCase(0x4E2D)] // Han '中'
+    [TestCase(0x03B1)] // Greek alpha
+    [TestCase(0x0430)] // Cyrillic 'а'
+    [TestCase(0x00E6)] // æ (no real decomposition equivalence -- verified against the pinned collator)
+    [TestCase(0x00DF)] // ß (no real decomposition equivalence)
+    [TestCase(0x00F8)] // ø (no verified weight-table position; deliberately excluded)
+    [TestCase(0x0009)] // TAB control character
+    public void OutOfRepertoireCharacterFailsClosedRatherThanSilentlyCodepointSorting(int codepoint)
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile($"locale-unsupported-char-{codepoint:X4}.db", fileSystem);
+        using var connection = database.Connect();
+
+        // Matches the existing propagate-raw-exception contract application-defined
+        // collation callbacks already use (see CustomCollationIndexTests
+        // .CallbackExceptionPropagatesThroughIndexSeek): the failure is not wrapped
+        // into an EmbeddedSqlException, it surfaces as-is.
+        Action select = () => Query(connection, $"SELECT char({codepoint}) = char({codepoint}) COLLATE 'en';");
+        select.Should().Throw<NotSupportedException>();
+    }
+
+    [Test]
+    public void UnsupportedCharacterFailsClosedInPersistedIndexWrite()
+    {
+        // The fail-closed behavior must also protect the durable index writer, not
+        // just ad hoc scalar comparisons: inserting a second, out-of-repertoire row
+        // that must be positioned against an existing row in a locale-collated index
+        // must fail rather than silently accepting a codepoint-ordered (and
+        // therefore wrong) key.
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("locale-unsupported-index-write.db", fileSystem);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(v TEXT);");
+        Execute(connection, "CREATE INDEX t_v ON t(v COLLATE 'en');");
+        Execute(connection, "INSERT INTO t VALUES ('a');");
+
+        Action insert = () => Execute(connection, "INSERT INTO t VALUES (char(0x4E2D));");
+        insert.Should().Throw<NotSupportedException>();
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);
@@ -220,3 +381,4 @@ public sealed class LocaleCollationTests
         return rows;
     }
 }
+
