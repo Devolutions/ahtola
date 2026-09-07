@@ -28307,23 +28307,27 @@ out bool hasReturning)
         foreach (var instruction in program.Instructions)
         {
             if (instruction is OpenJoinCursorInstruction open)
-                Collect(open.Plan.Root);
+                Collect(open.Plan.Root, suffix: null);
         }
 
         return searches;
 
-        void Collect(VdbeJoinPlanNode node)
+        void Collect(VdbeJoinPlanNode node, string? suffix)
         {
             if (node is IVdbeJoinSeekPlan index)
             {
-                searches.Add(index.SearchDescription);
+                searches.Add(suffix is null ? index.SearchDescription : index.SearchDescription + suffix);
                 return;
             }
 
             if (node is not VdbeJoinOperatorPlan join)
                 return;
-            Collect(join.Left);
-            Collect(join.Right);
+            Collect(join.Left, suffix);
+            // Turso tags the preserved (right) side of a LEFT JOIN's access-method line with
+            // " LEFT-JOIN" so EXPLAIN QUERY PLAN reads which side the outer join keeps NULL-padded
+            // rows for (core/translate/eqp.rs). RIGHT/FULL have no equivalent fixture evidence yet,
+            // so they are left exactly as before rather than guessed at.
+            Collect(join.Right, join.Kind == VdbeJoinKind.Left ? " LEFT-JOIN" : suffix);
         }
     }
 

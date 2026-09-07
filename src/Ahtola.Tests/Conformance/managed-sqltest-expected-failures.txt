@@ -83,7 +83,6 @@ turso/explain-query-plan-json.sqltest::list-and-scalar-subqueries-report-whether
 turso/explain-query-plan-json.sqltest::an-or-over-two-indexes-lists-both-branches | JSON SQL echo, multi-index branch metadata and rowid PRIMARY KEY naming differ
 turso/explain-query-plan-json.sqltest::a-recursive-cte-reports-its-setup-and-step-phases | JSON SQL echo and recursive setup/step topology differ
 turso/explain-query-plan-json.sqltest::the-json-tree-matches-the-text-rows | List-subquery/sorter text and JSON topology differ from the pinned snapshot
-turso/explain-query-plan-json.sqltest::leaving-out-the-format-clause-means-text | Compiled LEFT JOIN access descriptions omit the LEFT-JOIN suffix
 turso/explain-query-plan-json.sqltest::quotes-in-the-statement-are-escaped-in-the-echo | Original SQL echo loses its terminator; index access text uses the alias instead of table AS alias
 turso/explain-query-plan-json.sqltest::the-format-clause-is-case-insensitive | Original SQL echo loses its terminator; constant-row representation differs
 turso/explain-query-plan-json.sqltest::planning-a-write-does-not-run-it | Original SQL echo loses its trailing semicolon; the non-executing write plan otherwise matches
