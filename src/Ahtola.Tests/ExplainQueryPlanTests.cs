@@ -383,11 +383,14 @@ public sealed class ExplainQueryPlanTests
                 SqlValue.Integer(1),
                 SqlValue.Integer(0),
                 SqlValue.Integer(0),
-                SqlValue.Text("SEARCH products USING INDEX active_sku (sku=?)"));
+                // The partial predicate implies the status term, and id is the
+                // rowid, so the index covers the query without the table row
+                // (partial_idx.sqltest plan-partial-index-equality-predicate).
+                SqlValue.Text("SEARCH products USING COVERING INDEX active_sku (sku=?)"));
         ReadPlan(
                 connection,
                 "EXPLAIN QUERY PLAN SELECT count(*) FROM products WHERE status = 'active';")
-            .Rows[0][3].Should().Be(SqlValue.Text("SCAN products USING INDEX active_sku"));
+            .Rows[0][3].Should().Be(SqlValue.Text("SCAN products USING COVERING INDEX active_sku"));
         ReadScalar(connection, "SELECT count(*) FROM products WHERE status = 'active';")
             .Should().Be(SqlValue.Integer(2));
         ReadPlan(

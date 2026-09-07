@@ -328,10 +328,11 @@ internal static class DdlStatementCompiler
             if (statement.IfNotExists)
                 return CompileNoOp(context);
 
-            throw new EmbeddedSqlException($"table {statement.Name} already exists");
+            // SQLite echoes the name exactly as the user wrote it, quotes included.
+            throw new EmbeddedSqlException($"table {statement.WrittenName ?? statement.Name} already exists");
         }
         if (catalog.Views.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a view named {statement.Name}");
+            throw new EmbeddedSqlException($"view {statement.Name} already exists");
         if (EmbeddedDatabase.TryFindIndex(catalog.Tables, statement.Name, out _, out _))
             throw new EmbeddedSqlException($"there is already an index named {statement.Name}");
 
@@ -900,10 +901,11 @@ internal static class DdlStatementCompiler
             if (statement.IfNotExists)
                 return CompileNoOp(context);
 
-            throw new EmbeddedSqlException($"view {statement.Name} already exists");
+            // SQLite echoes the name exactly as the user wrote it, quotes included.
+            throw new EmbeddedSqlException($"view {statement.WrittenName ?? statement.Name} already exists");
         }
         if (catalog.Tables.ContainsKey(statement.Name) || catalog.VirtualTables.ContainsKey(statement.Name))
-            throw new EmbeddedSqlException($"there is already a table named {statement.Name}");
+            throw new EmbeddedSqlException($"table {statement.Name} already exists");
         if (catalog.Triggers.ContainsKey(statement.Name))
             throw new EmbeddedSqlException($"there is already a trigger named {statement.Name}");
         if (EmbeddedDatabase.TryFindIndex(catalog.Tables, statement.Name, out _, out _))
@@ -1055,7 +1057,8 @@ internal static class DdlStatementCompiler
             if (statement.IfNotExists)
                 return CompileNoOp(context);
 
-            throw new EmbeddedSqlException($"trigger {statement.Name} already exists");
+            // SQLite echoes the name exactly as the user wrote it, quotes included.
+            throw new EmbeddedSqlException($"trigger {statement.WrittenName ?? statement.Name} already exists");
         }
 
         var targetsTable = catalog.Tables.ContainsKey(statement.TableName);

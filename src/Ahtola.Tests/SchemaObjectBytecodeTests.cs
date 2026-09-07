@@ -288,7 +288,7 @@ public sealed class SchemaObjectBytecodeTests
         duplicate.Should().Throw<EmbeddedSqlException>().WithMessage("trigger t already exists");
 
         Action viewOverTrigger = () => Execute(connection, "CREATE VIEW t AS SELECT a FROM t;");
-        viewOverTrigger.Should().Throw<EmbeddedSqlException>().WithMessage("there is already a table named t");
+        viewOverTrigger.Should().Throw<EmbeddedSqlException>().WithMessage("table t already exists");
     }
 
     [Test]
@@ -353,7 +353,7 @@ public sealed class SchemaObjectBytecodeTests
 
         Action triggerOnMissingTable =
             () => Execute(connection, "CREATE TRIGGER tr AFTER INSERT ON missing BEGIN SELECT 1; END;");
-        triggerOnMissingTable.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: missing");
+        triggerOnMissingTable.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: main.missing");
 
         Action dropMissingTrigger = () => Execute(connection, "DROP TRIGGER missing;");
         dropMissingTrigger.Should().Throw<EmbeddedSqlException>().WithMessage("no such trigger: missing");

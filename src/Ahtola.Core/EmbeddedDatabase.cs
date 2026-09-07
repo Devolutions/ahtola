@@ -5511,7 +5511,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ReindexStatement reindex => ExecuteReindex(reindex, catalog),
                 OptimizeIndexStatement optimize => ExecuteOptimizeIndex(optimize, catalog),
                 ExplainStatement explain => ExecuteExplain(explain, parameters, context),
-                ExplainQueryPlanStatement explainQueryPlan => ExecuteExplainQueryPlan(explainQueryPlan, parameters, context),
+                ExplainQueryPlanStatement explainQueryPlan => ExecuteExplainQueryPlan(
+                    explainQueryPlan,
+                    parameters,
+                    context),
                 BeginStatement => ExecutionResult.Empty,
                 CommitStatement => ExecutionResult.Empty,
                 RollbackStatement => ExecutionResult.Empty,
@@ -10122,7 +10125,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         cancellationToken.ThrowIfCancellationRequested();
         switch (expression)
         {
-            case LiteralExpression or CurrentTimeExpression or ParameterExpression
+            case LiteralExpression or HexNegationOverflowExpression or CurrentTimeExpression or ParameterExpression
                 or StarExpression or QualifiedStarExpression:
                 return;
             case RowValueExpression rowValue:
@@ -14437,6 +14440,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var backup = CloneTablesShallow(context.Tables);
         var updatedRows = new List<SqlValue[]>();
         var updatedRowIds = new List<long>();
+        var returningSnapshots = new List<ReturningTableSnapshot>();
         try
         {
             foreach (var selectedRowId in selectedRowIds)
@@ -14502,6 +14506,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
                 updatedRows.Add(updated);
                 updatedRowIds.Add(newRowId);
+                if (statement.Returning is not null)
+                {
+                    // RETURNING sees the row after the write but before the AFTER
+                    // trigger fires (returning.sqltest update-returning-after-trigger
+                    // cases): snapshot the table state per row so subqueries and
+                    // later rows read the pre-trigger view.
+                    returningSnapshots.Add(new ReturningTableSnapshot(
+                        table.Rows.Select(static row => row.ToArray()).ToArray(),
+                        table.RowIds.ToArray()));
+                }
+
                 if (afterTriggers.Count > 0)
                     _ = FireTriggers(afterTriggers, context, frame);
             }
@@ -14545,7 +14560,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     updatedRows.Count,
                     updatedRows.Count > 0,
                     parameters,
-                    context);
+                    context,
+                    returningTableSnapshots: returningSnapshots);
             }
             catch
             {
@@ -15369,10 +15385,54 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (value.Kind != SqlValueKind.Null && !IsTrue(value))
             {
                 throw new EmbeddedSqlException(
-                    $"CHECK constraint failed: {check.Name ?? check.Sql}",
+                    $"CHECK constraint failed: {check.Name ?? DequoteConstraintMessageSource(check.Sql)}",
                     InsertConflictAlgorithm.Abort);
             }
         }
+    }
+
+    /// <summary>
+    /// SQLite dequotes the leading token of a CHECK constraint's source text when it
+    /// reports a failure: <c>CHECK("xy" &lt; +5)</c> reports
+    /// <c>CHECK constraint failed: xy</c> — only the first quoted token survives, with its
+    /// quotes stripped, when the message source starts with a quote character.
+    /// </summary>
+    private static string DequoteConstraintMessageSource(string sql)
+    {
+        var trimmed = sql.TrimStart();
+        if (trimmed.Length == 0 || trimmed[0] is not ('"' or '`' or '['))
+            return sql;
+
+        var closing = trimmed[0] switch
+        {
+            '"' => '"',
+            '`' => '`',
+            _ => ']',
+        };
+
+        var end = 1;
+        var result = new System.Text.StringBuilder();
+        while (end < trimmed.Length)
+        {
+            if (trimmed[end] == closing)
+            {
+                if (end + 1 < trimmed.Length && trimmed[end + 1] == closing)
+                {
+                    result.Append(closing);
+                    end += 2;
+                    continue;
+                }
+
+                end++;
+                break;
+            }
+
+            result.Append(trimmed[end]);
+            end++;
+        }
+
+        // Only the first quoted token survives; the rest of the expression is dropped.
+        return result.ToString();
     }
 
     // Mirrors Turso's columns_affected_by_update + ROWID_STRS expansion in the update
@@ -24824,7 +24884,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             spec = (frame is { Mode: Ahtola.Core.Parsing.WindowFrameMode.Groups }
                 ? WindowFrameSpec.GroupsRunning
-                : WindowFrameSpec.RangeRunning) with { Exclusion = exclusion };
+                : WindowFrameSpec.RangeRunning) with
+            { Exclusion = exclusion };
             return true;
         }
 
@@ -24837,7 +24898,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             spec = (frame.Mode == Ahtola.Core.Parsing.WindowFrameMode.Groups
                 ? WindowFrameSpec.GroupsCurrentPeer
-                : WindowFrameSpec.RangeCurrentPeer) with { Exclusion = exclusion };
+                : WindowFrameSpec.RangeCurrentPeer) with
+            { Exclusion = exclusion };
             return true;
         }
 
@@ -25333,7 +25395,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             ((NthValueAccumulator)contextObject!).Remove();
                         return contextObject;
                     }
-                    : null,
+                : null,
                 Finalize = static contextObject => contextObject switch
                 {
                     LagAccumulator lag => lag.Finalize(),
@@ -27164,6 +27226,9 @@ out bool hasReturning)
         return expression switch
         {
             LiteralExpression => true,
+            // The overflowing hex negation folds to the prepare-time error, so it
+            // is constant-shaped for the compiler (the fold raises like upstream).
+            HexNegationOverflowExpression => true,
             BinaryExpression binary when TryMapArithmeticOperator(binary.Operator, out _)
                 => IsConstantScalarExpression(binary.Left) && IsConstantScalarExpression(binary.Right),
             UnaryExpression unary when TryMapArithmeticOperator(unary.Operator, out _)
@@ -27636,6 +27701,90 @@ out bool hasReturning)
     internal static string[] ExplainColumns() => ["addr", "opcode", "p1", "p2", "p3", "p4", "comment"];
 
     private ExecutionResult ExecuteExplainQueryPlan(
+        ExplainQueryPlanStatement statement,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var result = ExecuteExplainQueryPlanText(statement, parameters, context);
+        if (statement.Format != ExplainQueryPlanFormat.Json)
+            return result;
+
+        // EXPLAIN QUERY PLAN FORMAT=JSON emits one plan_json TEXT row carrying the
+        // machine-readable envelope documented in turso-src/docs/eqp-json.md. The
+        // managed engine's plan rows become node entries; the structured `op` objects
+        // of the upstream format are not yet modeled, so each node carries the plan
+        // detail text with the node id/parent linkage from the text rows.
+        var sql = statement.InnerSql ?? string.Empty;
+        // The query's result columns come from the same auto-increment statement state the
+        // text path binds; when the inner statement is not a plain query, fall back to
+        // the plan row columns.
+        string[] resultColumns;
+        try
+        {
+            resultColumns = statement.Inner is QueryStatement innerQuery
+                ? DescribeQuery(innerQuery, EnsureAutoIncrementStatementState(context))
+                : result.Columns;
+        }
+        catch (EmbeddedSqlException)
+        {
+            resultColumns = result.Columns;
+        }
+        var json = new System.Text.StringBuilder()
+            .Append("{\"version\":1,\"sql\":")
+            .Append(JsonEscape("EXPLAIN QUERY PLAN " + sql))
+            .Append(",\"result_columns\":[")
+            .Append(string.Join(",", resultColumns.Select(static column => JsonEscape(column))))
+            .Append("],\"nodes\":[")
+            .Append(string.Join(",", result.Rows.Select((row, index) =>
+            {
+                var detail = row.Length >= 4 ? row[3] : SqlValue.Null;
+                var nodeId = row.Length >= 1 && row[0].Kind == SqlValueKind.Integer
+                    ? row[0].AsInteger().ToString(CultureInfo.InvariantCulture)
+                    : (index + 1).ToString(CultureInfo.InvariantCulture);
+                var parent = row.Length >= 2 && row[1].Kind == SqlValueKind.Integer
+                    ? row[1].AsInteger().ToString(CultureInfo.InvariantCulture)
+                    : "null";
+                return $"{{\"id\":{nodeId},\"parent\":{parent},\"detail\":{JsonEscape(detail.Kind == SqlValueKind.Text ? detail.AsText() : string.Empty)}}}";
+            })))
+            .Append("]}");
+        return new ExecutionResult(["plan_json"], [[SqlValue.Text(json.ToString())]], 0);
+    }
+
+    private static string JsonEscape(string value)
+    {
+        var escaped = new System.Text.StringBuilder(value.Length + 2);
+        foreach (var character in value)
+        {
+            switch (character)
+            {
+                case '"':
+                    escaped.Append("\\\"");
+                    break;
+                case '\\':
+                    escaped.Append("\\\\");
+                    break;
+                case '\n':
+                    escaped.Append("\\n");
+                    break;
+                case '\r':
+                    escaped.Append("\\r");
+                    break;
+                case '\t':
+                    escaped.Append("\\t");
+                    break;
+                default:
+                    if (char.IsControl(character))
+                        escaped.Append("\\u").Append(((int)character).ToString("X4", CultureInfo.InvariantCulture));
+                    else
+                        escaped.Append(character);
+                    break;
+            }
+        }
+
+        return $"\"{escaped}\"";
+    }
+
+    private ExecutionResult ExecuteExplainQueryPlanText(
         ExplainQueryPlanStatement statement,
         SqlValue[] parameters,
         QueryContext context)
@@ -28444,7 +28593,7 @@ out bool hasReturning)
     {
         switch (expression)
         {
-            case null or LiteralExpression or CurrentTimeExpression or ParameterExpression or RaiseExpression
+            case null or LiteralExpression or HexNegationOverflowExpression or CurrentTimeExpression or ParameterExpression or RaiseExpression
                 or ColumnExpression or StarExpression or QualifiedStarExpression:
                 return;
             case RowValueExpression row:
@@ -29259,12 +29408,31 @@ out bool hasReturning)
                 return false;
         }
 
-        if (select.Where is not null
-            && !ExpressionCoveredByIndex(select.Where, table, covered))
+        if (select.Where is not null)
         {
-            return false;
-        }
+            // A partial index's WHERE clause implies the query's matching WHERE
+            // term, so that term never reads the table row: SQLite drops the
+            // implied term from the key-only check (whereLoopAddBtree's
+            // pPartIdxWhere handling). Only the implied term's columns count as
+            // covered here — a projection still needs the real column.
+            var whereCovered = covered;
+            if (index.Where is { } partialWhere)
+            {
+                foreach (var (term, _) in SplitConjunction(select.Where))
+                {
+                    if (!ExpressionsAreEquivalent(term, partialWhere))
+                        continue;
 
+                    whereCovered = new HashSet<int>(covered);
+                    foreach (var column in CollectColumnIndexes(term, table))
+                        whereCovered.Add(column);
+                    break;
+                }
+            }
+
+            if (!ExpressionCoveredByIndex(select.Where, table, whereCovered))
+                return false;
+        }
         foreach (var term in select.OrderBy)
         {
             if (!ExpressionCoveredByIndex(term.Expression, table, covered))
@@ -29272,6 +29440,54 @@ out bool hasReturning)
         }
 
         return true;
+    }
+
+    /// <summary>Splits an expression's top-level AND conjunction into its terms.</summary>
+    private static IEnumerable<(Expression Term, int Index)> SplitConjunction(Expression expression)
+    {
+        var index = 0;
+        var stack = new Stack<Expression>();
+        stack.Push(expression);
+        while (stack.Count > 0)
+        {
+            var current = stack.Pop();
+            if (current is BinaryExpression { Operator: BinaryOperator.And } and)
+            {
+                stack.Push(and.Right);
+                stack.Push(and.Left);
+                continue;
+            }
+
+            yield return (current, index++);
+        }
+    }
+
+    /// <summary>Collects the table column indexes a WHERE-term references.</summary>
+    private static IEnumerable<int> CollectColumnIndexes(Expression expression, EmbeddedTable table)
+    {
+        switch (expression)
+        {
+            case ColumnExpression column:
+                var bare = column.UnqualifiedName ?? column.Name;
+                var name = bare.IndexOf('.') >= 0 ? bare[(bare.IndexOf('.') + 1)..] : bare;
+                if (table.TryGetColumnIndex(name, out var columnIndex))
+                    yield return columnIndex;
+                break;
+            case BinaryExpression binary:
+                foreach (var index in CollectColumnIndexes(binary.Left, table))
+                    yield return index;
+                foreach (var index in CollectColumnIndexes(binary.Right, table))
+                    yield return index;
+                break;
+            case UnaryExpression unary:
+                foreach (var index in CollectColumnIndexes(unary.Operand, table))
+                    yield return index;
+                break;
+            case CollationExpression collation:
+                foreach (var index in CollectColumnIndexes(collation.Expression, table))
+                    yield return index;
+                break;
+        }
     }
 
     private static bool ProjectionCoveredByIndex(
@@ -29337,7 +29553,14 @@ out bool hasReturning)
             return true;
 
         if (table.TryGetColumnIndex(bare, out var index))
+        {
+            // An index entry carries the rowid, and the rowid-alias column is the
+            // rowid under its declared name, so a reference to that column is
+            // always satisfiable from the index.
+            if (table.HasRowid && index == table.RowidAliasColumnIndex)
+                return true;
             return covered.Contains(index);
+        }
 
         // Qualified name: strip qualifier.
         var separator = bare.IndexOf('.');
@@ -29347,7 +29570,11 @@ out bool hasReturning)
             if (table.HasRowid && EmbeddedTable.IsRowidAliasName(name))
                 return true;
             if (table.TryGetColumnIndex(name, out index))
+            {
+                if (table.HasRowid && index == table.RowidAliasColumnIndex)
+                    return true;
                 return covered.Contains(index);
+            }
         }
 
         return false;
@@ -31077,7 +31304,7 @@ out bool hasReturning)
                 ValidateColumnReferences(binary.Left, row);
                 ValidateColumnReferences(binary.Right, row);
                 return;
-            case LiteralExpression or ParameterExpression or StarExpression or QualifiedStarExpression or ScalarSubqueryExpression or ExistsExpression:
+            case LiteralExpression or HexNegationOverflowExpression or ParameterExpression or StarExpression or QualifiedStarExpression or ScalarSubqueryExpression or ExistsExpression:
                 return;
             default:
                 throw new EmbeddedSqlException($"Unsupported expression type {expression.GetType().Name}.");
@@ -31897,6 +32124,43 @@ out bool hasReturning)
             recursiveTerms.Add(term);
         }
 
+        // The compound's own LIMIT/OFFSET bounds the recursion the way SQLite's
+        // co-routine does (recursive_cte.rs init_limit/emit_offset): a literal
+        // LIMIT 0 skips everything — the anchor is never evaluated — a negative
+        // limit is unlimited, OFFSET drops rows from the output while still
+        // feeding them to the recursive step, and the limit counter stops the
+        // whole expansion the moment enough rows have been emitted.
+        long? emitLimit = null;
+        if (compound.Limit is not null)
+        {
+            var limitValue = RequireLimitInteger(
+                Evaluate(compound.Limit, parameters, outerRow, cteContext));
+            if (limitValue == 0)
+            {
+                // The declared column list names the output without running the
+                // anchor, so an empty body still has the right shape.
+                var emptyColumns = ResolveCommonTableExpressionColumns(
+                    commonTableExpression,
+                    DescribeQuery(compound.Terms[0], cteContext));
+                var emptyDefinitions = DescribeRuntimeSourceColumnDefinitions(
+                    compound.Terms[0], emptyColumns, cteContext);
+                return new SourceData(
+                    emptyColumns,
+                    [],
+                    GetQueryOutputCollations(commonTableExpression.Query, cteContext),
+                    emptyDefinitions);
+            }
+
+            if (limitValue > 0)
+                emitLimit = limitValue;
+        }
+
+        var emitOffset = compound.Offset is null
+            ? 0
+            : Math.Max(
+                0,
+                RequireLimitInteger(Evaluate(compound.Offset, parameters, outerRow, cteContext)));
+
         var anchor = MaterializeQueryResult(
             EvaluateRecursiveAnchor(compound, firstRecursiveIndex, parameters, cteContext, outerRow));
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, anchor.Columns);
@@ -31943,6 +32207,16 @@ out bool hasReturning)
         var result = new List<SourceRow>();
         var seen = deduplicate ? new List<SqlValue[]>() : null;
         var workingSet = new List<SourceRow>();
+        // The budget caps how many EMITTED rows the expansion may produce: the
+        // compound's own LIMIT (the OFFSET is consumed inside this loop), or the
+        // outer query's row budget when the compound is unlimited. With both, the
+        // smaller wins.
+        var compoundBudget = emitLimit is long compoundLimitValue
+            ? compoundLimitValue > int.MaxValue ? int.MaxValue : (int)compoundLimitValue
+            : (int?)null;
+        var budget = outerRowBudget is int outerBudgetValue && compoundBudget is int innerBudgetValue
+            ? Math.Min(outerBudgetValue, innerBudgetValue)
+            : outerRowBudget ?? compoundBudget;
         foreach (var row in anchor.Rows)
         {
             var values = row.ToArray();
@@ -31950,12 +32224,21 @@ out bool hasReturning)
                 continue;
 
             var sourceRow = new SourceRow(columns, values);
-            result.Add(sourceRow);
             workingSet.Add(sourceRow);
-            // The outer consumer can never observe more than its budget, so stop expanding as soon
-            // as the budget is filled rather than materializing (or overflowing on) the whole set.
-            if (outerRowBudget is int anchorBudget && result.Count >= anchorBudget)
-                return new SourceData(columns, result, collations, columnDefinitions);
+            if (emitOffset > 0)
+            {
+                // An OFFSET row is dropped from the output but still feeds the
+                // recursive step, like SQLite's emit_offset jumping past the emit.
+                emitOffset--;
+            }
+            else
+            {
+                result.Add(sourceRow);
+                // The consumer can never observe more than its budget, so stop
+                // expanding as soon as the budget is filled.
+                if (budget is int anchorBudget && result.Count >= anchorBudget)
+                    return new SourceData(columns, result, collations, columnDefinitions);
+            }
         }
 
         while (workingSet.Count > 0)
@@ -31985,13 +32268,20 @@ out bool hasReturning)
                         continue;
 
                     var sourceRow = new SourceRow(columns, values);
-                    result.Add(sourceRow);
                     produced.Add(sourceRow);
-                    if (outerRowBudget is int budget && result.Count >= budget)
-                        return new SourceData(columns, result, collations, columnDefinitions);
-                    if (result.Count > RecursiveCteRowLimit)
-                        throw new EmbeddedSqlException(
-                            $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
+                    if (emitOffset > 0)
+                    {
+                        emitOffset--;
+                    }
+                    else
+                    {
+                        result.Add(sourceRow);
+                        if (budget is int budgetValue && result.Count >= budgetValue)
+                            return new SourceData(columns, result, collations, columnDefinitions);
+                        if (result.Count > RecursiveCteRowLimit)
+                            throw new EmbeddedSqlException(
+                                $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
+                    }
                 }
             }
 
@@ -32971,13 +33261,20 @@ out bool hasReturning)
         var expression = orderBy.Expression;
         if (orderBy.Ordinal is { } ordinal)
         {
-            if (ordinal >= 1 && ordinal <= columns.Count)
-                return (int)ordinal - 1;
+            // Only an integer that fits a 32-bit int is a column reference, mirroring
+            // resolve_compound_order_by_expr (select.rs): an i32-fitting literal below 1 or
+            // past the column count errors, while a literal beyond i32 falls through to
+            // constant-expression handling below.
+            if (ordinal is >= int.MinValue and <= int.MaxValue)
+            {
+                if (ordinal >= 1 && ordinal <= columns.Count)
+                    return (int)ordinal - 1;
 
-            // Turso reports the literal's own value as the prefix for compound range
-            // errors (resolve_compound_order_by_expr in select.rs).
-            throw new EmbeddedSqlException(
-                $"{ordinal} ORDER BY term out of range - should be between 1 and {columns.Count}");
+                // Turso reports the literal's own value as the prefix for compound range
+                // errors (resolve_compound_order_by_expr in select.rs).
+                throw new EmbeddedSqlException(
+                    $"{ordinal} ORDER BY term out of range - should be between 1 and {columns.Count}");
+            }
         }
 
         var reference = UnwrapCollation(expression);
@@ -32998,14 +33295,43 @@ out bool hasReturning)
                         return index;
                 }
             }
+
+            // A qualified reference (t1.b) matches the arm's own projection of the
+            // same column even when that arm renamed it with an alias: binding the
+            // term against the arm's tables yields the same column the projection
+            // reads, whatever the output name is (select.rs binds before comparing).
+            if (column.Qualifier is not null)
+            {
+                foreach (var term in selectTerms)
+                {
+                    if (!TermReferencesSource(term, column.Qualifier))
+                        continue;
+
+                    for (var index = 0; index < term.Projections.Count; index++)
+                    {
+                        var projection = term.Projections[index].Expression;
+                        if (projection is ColumnExpression projectionColumn
+                            && string.Equals(
+                                projectionColumn.UnqualifiedName ?? projectionColumn.Name,
+                                column.UnqualifiedName ?? column.Name,
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            return index;
+                        }
+                    }
+                }
+            }
         }
 
+        // A general expression matches the arm's projection with the same shape,
+        // the way exprs_are_equivalent compares the bound ORDER BY term with each
+        // result column (select.rs): upper(b) matches an upper(b) projection.
         foreach (var term in selectTerms)
         {
             for (var index = 0; index < term.Projections.Count; index++)
             {
-                if (term.Projections[index].Expression.Equals(expression)
-                    || term.Projections[index].Expression.Equals(reference))
+                if (ExpressionsAreEquivalent(term.Projections[index].Expression, reference)
+                    || ExpressionsAreEquivalent(term.Projections[index].Expression, expression))
                     return index;
             }
         }
@@ -33015,6 +33341,139 @@ out bool hasReturning)
         throw new EmbeddedSqlException(
             $"{OrdinalSuffix(termNumber - 1)} ORDER BY term does not match any column in the result set");
     }
+
+    /// <summary>
+    /// Whether a compound-select arm reads from a table source whose effective
+    /// name (alias, or table name) matches <paramref name="qualifier"/>.
+    /// </summary>
+    private static bool TermReferencesSource(SelectStatement term, string qualifier)
+    {
+        if (term.Source is null)
+            return false;
+
+        bool Visit(TableSource source)
+            => source switch
+            {
+                NamedTableSource named => string.Equals(named.Alias ?? named.Name, qualifier, StringComparison.OrdinalIgnoreCase),
+                TableValuedFunctionSource tableFunction => string.Equals(tableFunction.Alias, qualifier, StringComparison.OrdinalIgnoreCase),
+                DerivedTableSource derived => string.Equals(derived.Alias, qualifier, StringComparison.OrdinalIgnoreCase),
+                JoinTableSource join => Visit(join.Left) || Visit(join.Right),
+                _ => false,
+            };
+
+        return Visit(term.Source);
+    }
+
+    /// <summary>
+    /// Structural expression equivalence mirroring Turso's exprs_are_equivalent
+    /// (util.rs): identifiers and function names compare case-insensitively, and
+    /// commutative binary operators also match with their sides swapped.
+    /// </summary>
+    private static bool ExpressionsAreEquivalent(Expression? left, Expression? right)
+    {
+        if (left is null || right is null)
+            return ReferenceEquals(left, right);
+
+        if (left is ColumnExpression leftColumn && right is ColumnExpression rightColumn)
+        {
+            // A qualified reference is equivalent to the same column spelled with
+            // its qualifier when both name the same column.
+            return string.Equals(leftColumn.Name, rightColumn.Name, StringComparison.OrdinalIgnoreCase)
+                && Equals(leftColumn.Qualifier, rightColumn.Qualifier);
+        }
+
+        if (left is BinaryExpression leftBinary && right is BinaryExpression rightBinary)
+        {
+            if (leftBinary.Operator != rightBinary.Operator)
+                return false;
+
+            if ((ExpressionsAreEquivalent(leftBinary.Left, rightBinary.Left)
+                    && ExpressionsAreEquivalent(leftBinary.Right, rightBinary.Right))
+                || (IsCommutative(leftBinary.Operator)
+                    && ExpressionsAreEquivalent(leftBinary.Left, rightBinary.Right)
+                    && ExpressionsAreEquivalent(leftBinary.Right, rightBinary.Left)))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        if (left is UnaryExpression leftUnary && right is UnaryExpression rightUnary)
+            return leftUnary.Operator == rightUnary.Operator
+                && ExpressionsAreEquivalent(leftUnary.Operand, rightUnary.Operand);
+
+        if (left is FunctionExpression leftFunction && right is FunctionExpression rightFunction)
+        {
+            if (!string.Equals(leftFunction.Name, rightFunction.Name, StringComparison.OrdinalIgnoreCase)
+                || leftFunction.CountStar != rightFunction.CountStar
+                || leftFunction.Distinct != rightFunction.Distinct
+                || leftFunction.Arguments.Count != rightFunction.Arguments.Count)
+            {
+                return false;
+            }
+
+            for (var index = 0; index < leftFunction.Arguments.Count; index++)
+            {
+                if (!ExpressionsAreEquivalent(leftFunction.Arguments[index], rightFunction.Arguments[index]))
+                    return false;
+            }
+
+            return true;
+        }
+
+        if (left is CollationExpression leftCollation && right is CollationExpression rightCollation)
+        {
+            return string.Equals(leftCollation.Name, rightCollation.Name, StringComparison.OrdinalIgnoreCase)
+                && ExpressionsAreEquivalent(leftCollation.Expression, rightCollation.Expression);
+        }
+
+        if (left is CastExpression leftCast && right is CastExpression rightCast)
+        {
+            return string.Equals(leftCast.TypeName, rightCast.TypeName, StringComparison.OrdinalIgnoreCase)
+                && ExpressionsAreEquivalent(leftCast.Expression, rightCast.Expression);
+        }
+
+        if (left is LiteralExpression leftLiteral && right is LiteralExpression rightLiteral)
+            return leftLiteral.Value.Equals(rightLiteral.Value);
+
+        if (left is BetweenExpression leftBetween && right is BetweenExpression rightBetween)
+        {
+            return leftBetween.Negated == rightBetween.Negated
+                && ExpressionsAreEquivalent(leftBetween.Value, rightBetween.Value)
+                && ExpressionsAreEquivalent(leftBetween.Lower, rightBetween.Lower)
+                && ExpressionsAreEquivalent(leftBetween.Upper, rightBetween.Upper);
+        }
+
+        if (left is InExpression leftIn && right is InExpression rightIn)
+        {
+            return leftIn.Negated == rightIn.Negated
+                && ExpressionsAreEquivalent(leftIn.Value, rightIn.Value)
+                && leftIn.Values.Count == rightIn.Values.Count
+                && leftIn.Values.Zip(rightIn.Values, ExpressionsAreEquivalent).All(static equivalent => equivalent);
+        }
+
+        if (left is CaseExpression leftCase && right is CaseExpression rightCase)
+        {
+            return ExpressionsAreEquivalent(leftCase.Operand, rightCase.Operand)
+                && leftCase.Clauses.Count == rightCase.Clauses.Count
+                && leftCase.Clauses.Zip(rightCase.Clauses, (leftClause, rightClause)
+                    => ExpressionsAreEquivalent(leftClause.When, rightClause.When)
+                        && ExpressionsAreEquivalent(leftClause.Then, rightClause.Then))
+                    .All(static equivalent => equivalent)
+                && ExpressionsAreEquivalent(leftCase.Else, rightCase.Else);
+        }
+
+        return left.Equals(right);
+    }
+
+    private static bool IsCommutative(BinaryOperator operatorKind)
+        => operatorKind is BinaryOperator.Equal
+            or BinaryOperator.NotEqual
+            or BinaryOperator.Multiply
+            or BinaryOperator.Add
+            or BinaryOperator.BitwiseAnd
+            or BinaryOperator.BitwiseOr;
 
     private SqlValue[][] ApplyDistinctLimit(
         IEnumerable<SqlValue[]> source,
@@ -37552,6 +38011,8 @@ out bool hasReturning)
         var result = expression switch
         {
             LiteralExpression literal => literal.Value,
+            HexNegationOverflowExpression hexNegation => throw new EmbeddedSqlException(
+                $"hex literal too big: {hexNegation.Text}"),
             CurrentTimeExpression current => current.Kind switch
             {
                 CurrentTimeKind.Date => SqliteDateTime.Execute([], SqliteDateTime.Func.Date),
@@ -38072,9 +38533,36 @@ out bool hasReturning)
         SourceRow? row,
         QueryContext context)
     {
-        var exists = ExecuteSubquery(expression.Query, parameters, row, context).Rows.Count > 0;
+        // EXISTS only checks whether a row comes out, so SQLite drops ORDER BY and
+        // DISTINCT from the subquery (select.c, "dropping superfluous ORDER BY").
+        // Dropped ORDER BY terms are still name-resolved during validation but never
+        // evaluated, so a term that would overflow at runtime must not fail the query
+        // (exists-drops-order-by-distinct.sqltest). LIMIT and OFFSET stay: OFFSET
+        // reduces visible rows (it decides whether a row comes out at all) and LIMIT 0
+        // means no rows.
+        var exists = ExecuteSubquery(
+            DropExistsSuperfluities(expression.Query),
+            parameters,
+            row,
+            context).Rows.Count > 0;
         return SqlValue.Integer(exists == expression.Negated ? 0 : 1);
     }
+
+    /// <summary>Removes ORDER BY and DISTINCT from an EXISTS subquery.</summary>
+    private static QueryStatement DropExistsSuperfluities(QueryStatement query)
+        => query switch
+        {
+            SelectStatement select => select with
+            {
+                Distinct = false,
+                OrderBy = [],
+            },
+            CompoundSelectStatement compound => compound with
+            {
+                OrderBy = [],
+            },
+            _ => query,
+        };
 
     private SqlValue EvaluateInSubquery(
         InSubqueryExpression expression,
@@ -41953,6 +42441,26 @@ out bool hasReturning)
         return foundNull ? SqlValue.Null : SqlValue.Integer(1);
     }
 
+    /// <summary>
+    /// Expands <c>json_object(*)</c>'s star into alternating column-name/column-value
+    /// arguments drawn from the current FROM row, mirroring the Turso extension pinned by
+    /// turso-sqltests/json_object_star.sqltest.
+    /// </summary>
+    private static SqlValue[] ExpandJsonObjectStarArguments(SourceRow? row)
+    {
+        if (row is null || row.Columns.Length == 0)
+            throw new EmbeddedSqlException("json_object(*) requires a FROM clause");
+
+        var expanded = new SqlValue[row.Columns.Length * 2];
+        for (var index = 0; index < row.Columns.Length; index++)
+        {
+            expanded[index * 2] = SqlValue.Text(row.Columns[index]);
+            expanded[(index * 2) + 1] = row.Values[index];
+        }
+
+        return expanded;
+    }
+
     private SqlValue EvaluateScalarFunction(
         FunctionExpression function,
         SqlValue[] parameters,
@@ -41977,6 +42485,19 @@ out bool hasReturning)
             ValidateLikelihood(function);
         if (!builtinIsShadowed && normalizedName == "MATCH")
             return EvaluateFtsMatchOperator(function, parameters, row, context);
+
+        // json_object(*) (and jsonb_object(*)) expands to one label/value pair per visible
+        // column of the current FROM row, matching the Turso extension pinned by
+        // turso-sqltests/json_object_star.sqltest. A bare star without a FROM row errors.
+        if (function.CountStar
+            && normalizedName is "JSON_OBJECT" or "JSONB_OBJECT"
+            && !builtinIsShadowed)
+        {
+            var expanded = ExpandJsonObjectStarArguments(row);
+            return normalizedName == "JSON_OBJECT"
+                ? SqliteJson.JsonObject(expanded)
+                : SqliteJson.JsonbObject(expanded);
+        }
 
         var arguments = function.Arguments.Select(argument => Evaluate(argument, parameters, row, context)).ToArray();
         if (!context.IndexExpression
@@ -42036,6 +42557,59 @@ out bool hasReturning)
             "CHAR" or "CHR" => EvaluateChar(arguments),
             "UNICODE" => EvaluateUnicode(arguments),
             "UNHEX" => EvaluateUnhex(arguments),
+            "GET_BYTE" => EvaluateGetByte(arguments),
+            "SET_BYTE" => EvaluateSetByte(arguments),
+            "REGEXP" => EvaluateRegexp(arguments),
+            "REGEXP_LIKE" => EvaluateRegexpLike(arguments),
+            "REGEXP_SUBSTR" => EvaluateRegexpSubstr(arguments),
+            "REGEXP_REPLACE" => EvaluateRegexpReplace(arguments),
+            "REGEXP_CAPTURE" => EvaluateRegexpCapture(arguments),
+            "TIME_NOW" => EvaluateTimeNow(arguments),
+            "MAKE_DATE" => EvaluateMakeDate(arguments),
+            "MAKE_TIMESTAMP" => EvaluateMakeTimestamp(arguments),
+            "TIME_GET" => EvaluateTimeGet(arguments),
+            "TIME_GET_YEAR" => EvaluateTimeGetYear(arguments),
+            "TIME_GET_MONTH" => EvaluateTimeGetMonth(arguments),
+            "TIME_GET_DAY" => EvaluateTimeGetDay(arguments),
+            "TIME_GET_HOUR" => EvaluateTimeGetHour(arguments),
+            "TIME_GET_MINUTE" => EvaluateTimeGetMinute(arguments),
+            "TIME_GET_SECOND" => EvaluateTimeGetSecond(arguments),
+            "TIME_GET_NANO" => EvaluateTimeGetNano(arguments),
+            "TIME_GET_WEEKDAY" => EvaluateTimeGetWeekday(arguments),
+            "TIME_GET_YEARDAY" => EvaluateTimeGetYearday(arguments),
+            "TIME_GET_ISOYEAR" => EvaluateTimeGetIsoyear(arguments),
+            "TIME_GET_ISOWEEK" => EvaluateTimeGetIsoweek(arguments),
+            "TIME_UNIX" => EvaluateTimeUnix(arguments),
+            "TO_TIMESTAMP" => EvaluateToTimestamp(arguments),
+            "TIME_MILLI" => EvaluateTimeMilli(arguments),
+            "TIME_MICRO" => EvaluateTimeMicro(arguments),
+            "TIME_NANO" => EvaluateTimeNano(arguments),
+            "TIME_TO_UNIX" => EvaluateTimeToUnix(arguments),
+            "TIME_TO_MILLI" => EvaluateTimeToMilli(arguments),
+            "TIME_TO_MICRO" => EvaluateTimeToMicro(arguments),
+            "TIME_TO_NANO" => EvaluateTimeToNano(arguments),
+            "TIME_AFTER" => EvaluateTimeAfter(arguments),
+            "TIME_BEFORE" => EvaluateTimeBefore(arguments),
+            "TIME_COMPARE" => EvaluateTimeCompare(arguments),
+            "TIME_EQUAL" => EvaluateTimeEqual(arguments),
+            "DUR_NS" => EvaluateDurNs(arguments),
+            "DUR_US" => EvaluateDurUs(arguments),
+            "DUR_MS" => EvaluateDurMs(arguments),
+            "DUR_S" => EvaluateDurS(arguments),
+            "DUR_M" => EvaluateDurM(arguments),
+            "DUR_H" => EvaluateDurH(arguments),
+            "TIME_ADD" => EvaluateTimeAdd(arguments),
+            "TIME_ADD_DATE" => EvaluateTimeAddDate(arguments),
+            "TIME_SUB" => EvaluateTimeSub(arguments),
+            "TIME_SINCE" => EvaluateTimeSince(arguments),
+            "TIME_UNTIL" => EvaluateTimeUntil(arguments),
+            "TIME_TRUNC" => EvaluateTimeTrunc(arguments),
+            "TIME_ROUND" => EvaluateTimeRound(arguments),
+            "TIME_FMT_ISO" => EvaluateTimeFmtIso(arguments),
+            "TIME_FMT_DATETIME" => EvaluateTimeFmtDatetime(arguments),
+            "TIME_FMT_DATE" => EvaluateTimeFmtDate(arguments),
+            "TIME_FMT_TIME" => EvaluateTimeFmtTime(arguments),
+            "TIME_PARSE" => EvaluateTimeParse(arguments),
             "ZEROBLOB" => EvaluateZeroBlob(arguments),
             "RANDOMBLOB" => EvaluateRandomBlob(arguments),
             "RANDOM" => EvaluateRandom(arguments),
@@ -42083,6 +42657,7 @@ out bool hasReturning)
             "JSONB_SET" => SqliteJson.JsonbSet(arguments),
             "JSON_TYPE" => SqliteJson.JsonType(arguments),
             "JSON_VALID" => SqliteJson.JsonValid(arguments),
+            "SUBTYPE" => EvaluateSubtype(arguments),
             "JULIANDAY" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.JulianDay),
             "LAST_INSERT_ROWID" => EvaluateLastInsertRowId(arguments, context),
             "IS_AUTOCOMMIT" => EvaluateIsAutocommit(arguments, context),
@@ -42139,6 +42714,18 @@ out bool hasReturning)
             "SETVAL" => EvaluateSetVal(arguments, context),
             _ => throw new EmbeddedSqlException($"no such function: {function.Name}"),
         };
+    }
+
+    // subtype() reports the ephemeral subtype of a value: 74 ('J') for text a
+    // JSON function produced as a JSON value, and 0 for everything else —
+    // including JSONB blobs, whose acceptance as JSON arguments is purely
+    // structural.
+    private static SqlValue EvaluateSubtype(IReadOnlyList<SqlValue> arguments)
+    {
+        RequireArgumentCount("subtype", arguments, 1);
+        var value = arguments[0];
+        return SqlValue.Integer(
+            value.Kind == SqlValueKind.Text && value.IsJson ? 74 : 0);
     }
 
     private static SqlValue EvaluateRTreeCheck(
@@ -42395,9 +42982,11 @@ out bool hasReturning)
     }
 
     // Keep this bounded independently of SQLite's process-wide SQLITE_LIMIT_LENGTH. The managed
-    // evaluator must not let a SQL format string allocate an unbounded managed string.
+    // evaluator must not let a SQL format string allocate an unbounded managed string. The
+    // precision cap matches upstream printf.rs (MAX_WIDTH), which the overflow-payload corpus
+    // fixtures rely on (printf('%.*c', 5000, 'y')).
     private const int MaximumPrintfWidth = 1_000_000;
-    private const int MaximumPrintfPrecision = 1_000;
+    private const int MaximumPrintfPrecision = 1_000_000;
     private const int MaximumPrintfOutputLength = 1_000_000;
 
     // SQLite format() is an alias for printf(). Keep the parser independent of the platform
@@ -44587,7 +45176,7 @@ out bool hasReturning)
 
         WindowSpecification ResolveSpecification(
             WindowSpecification specification,
-            bool ignoreUnknownBase = false)
+            string[]? forwardReferenceNames = null)
         {
             if (specification.BaseWindowName is null)
             {
@@ -44596,14 +45185,21 @@ out bool hasReturning)
 
             if (!resolved.TryGetValue(specification.BaseWindowName, out var baseSpecification))
             {
-                if (!ignoreUnknownBase || specification.IsNamedReference)
-                    throw new EmbeddedSqlException($"no such window: {specification.BaseWindowName}");
-
-                return RewriteWindowExpressions(specification with
+                // A base defined later in the WINDOW clause is a forward reference:
+                // SQLite skips it silently (empty base).
+                if (forwardReferenceNames is not null
+                    && forwardReferenceNames.Contains(
+                        specification.BaseWindowName,
+                        StringComparer.OrdinalIgnoreCase))
                 {
-                    BaseWindowName = null,
-                    IsNamedReference = false,
-                });
+                    return RewriteWindowExpressions(specification with
+                    {
+                        BaseWindowName = null,
+                        IsNamedReference = false,
+                    });
+                }
+
+                throw new EmbeddedSqlException($"no such window: {specification.BaseWindowName}");
             }
 
             if (specification.IsNamedReference)
@@ -44725,10 +45321,21 @@ out bool hasReturning)
         }
 
         // SQLite resolves bases against definitions already seen and lets the last duplicate
-        // name win. A forward base is therefore an empty base, while OVER name is resolved
-        // after the complete WINDOW clause.
-        foreach (var definition in statement.NamedWindows)
-            resolved[definition.Name] = ResolveSpecification(definition.Specification, ignoreUnknownBase: true);
+        // name win. A forward base is silently ignored (an empty base), while a base that
+        // is defined nowhere is an error; OVER name is resolved after the complete WINDOW
+        // clause (window/memory.sqltest named-window-chain cases).
+        var definitionNames = statement.NamedWindows
+            .Select(static definition => definition.Name)
+            .ToArray();
+        for (var index = 0; index < statement.NamedWindows.Count; index++)
+        {
+            var definition = statement.NamedWindows[index];
+            resolved[definition.Name] = ResolveSpecification(
+                definition.Specification,
+                // A base named by a LATER definition is a forward reference: SQLite
+                // skips it silently. A base named nowhere errors.
+                forwardReferenceNames: definitionNames[(index + 1)..]);
+        }
 
         return statement with
         {
@@ -47061,20 +47668,25 @@ out bool hasReturning)
             // returns before the alias fallback below, so a resolved expression is never
             // re-matched against result aliases (SELECT x AS y, y AS x FROM t ORDER BY 1
             // sorts by x, not by the alias sharing a later output column's name).
-            if (value is >= 1 and <= int.MaxValue && value <= projections.Count)
-                return projections[(int)value - 1].Expression;
-
-            // A star projection expands to more result columns than projections.Count
-            // reflects; the expanded range is validated where the star is expanded
-            // (ResolveOrderByBindings). Pass the literal through so star queries keep their
-            // pre-rewrite behavior instead of erroring on the unexpanded count.
-            if (!projections.Any(projection =>
-                    projection.Expression is StarExpression or QualifiedStarExpression))
+            // Only an integer that fits a 32-bit int is a column reference, mirroring
+            // SQLite's sqlite3ExprIsInteger (select.rs); a literal beyond i32 is a constant.
+            if (value is >= int.MinValue and <= int.MaxValue)
             {
-                // Turso hard-codes the "1st" prefix for simple-select range errors
-                // regardless of which term carries the ordinal (select.rs:1124).
-                throw new EmbeddedSqlException(
-                    $"1st ORDER BY term out of range - should be between 1 and {projections.Count}");
+                if (value >= 1 && value <= projections.Count)
+                    return projections[(int)value - 1].Expression;
+
+                // A star projection expands to more result columns than projections.Count
+                // reflects; the expanded range is validated where the star is expanded
+                // (ResolveOrderByBindings). Pass the literal through so star queries keep their
+                // pre-rewrite behavior instead of erroring on the unexpanded count.
+                if (!projections.Any(projection =>
+                        projection.Expression is StarExpression or QualifiedStarExpression))
+                {
+                    // Turso hard-codes the "1st" prefix for simple-select range errors
+                    // regardless of which term carries the ordinal (select.rs:1124).
+                    throw new EmbeddedSqlException(
+                        $"1st ORDER BY term out of range - should be between 1 and {projections.Count}");
+                }
             }
         }
 
@@ -48799,6 +49411,7 @@ out bool hasReturning)
         private sealed class JMember
         {
             public string RawKey = string.Empty;
+            public string? RawKey5;
             public string Key = string.Empty;
             public JNode Value = null!;
         }
@@ -48807,6 +49420,7 @@ out bool hasReturning)
         {
             public JKind Kind;
             public string Raw = string.Empty; // Verbatim token for numbers and quoted strings.
+            public string? Raw5; // Verbatim JSON5 payload for strings with JSON5-only escapes (TEXT5 elements).
             public string Str = string.Empty; // Decoded text for Text nodes.
             public List<JNode>? Items;
             public List<JMember>? Members;
@@ -48856,18 +49470,662 @@ out bool hasReturning)
 
         internal static SqlValue JsonValid(IReadOnlyList<SqlValue> args)
         {
-            RequireArgumentCount("json_valid", args, 1);
+            if (args.Count is < 1 or > 2)
+                throw new EmbeddedSqlException("wrong number of arguments to function json_valid()");
+
+            // json_valid(X) is json_valid(X, 1): strict RFC 8259 text only. The two
+            // argument form takes a bitmask picking which representations count:
+            // 1 = strict text, 2 = JSON5 text, 4 = blob that superficially looks
+            // like JSONB, 8 = blob that is fully valid JSONB (SQLite's json_valid).
+            long flags = 1;
+            if (args.Count == 2)
+            {
+                flags = FlagsArgument(args[1]);
+                if (flags is < 1 or > 15)
+                    throw new EmbeddedSqlException("FLAGS parameter to json_valid() must be between 1 and 15");
+            }
+
             var value = args[0];
             switch (value.Kind)
             {
                 case SqlValueKind.Null:
                     return SqlValue.Null;
                 case SqlValueKind.Integer:
+                    return SqlValue.Integer((flags & (TextStrict | TextJson5)) != 0 ? 1 : 0);
                 case SqlValueKind.Real:
-                    return SqlValue.Integer(1);
+                    // SQLite renders a REAL argument as text; an infinite one is
+                    // only reachable through the JSON5 Infinity literal (9e999),
+                    // so only the JSON5 text flag accepts it.
+                    return SqlValue.Integer(
+                        double.IsInfinity(value.AsReal())
+                            ? (flags & TextJson5) != 0 ? 1 : 0
+                            : (flags & (TextStrict | TextJson5)) != 0 ? 1 : 0);
                 default:
-                    return SqlValue.Integer(TryParse(InputText(value)) is null ? 0 : 1);
+                    return SqlValue.Integer(IsValidForFlags(value, flags) ? 1 : 0);
             }
+        }
+
+        private const long TextStrict = 1;
+        private const long TextJson5 = 2;
+
+        /// <summary>
+        /// Coerces the FLAGS argument like sqlite3_value_int: numbers convert,
+        /// text and blobs take their leading integer prefix, and NULL is 0 (which
+        /// the caller rejects with the range error).
+        /// </summary>
+        private static long FlagsArgument(SqlValue value)
+            => value.Kind switch
+            {
+                SqlValueKind.Integer => value.AsInteger(),
+                SqlValueKind.Real => (long)value.AsReal(),
+                SqlValueKind.Text => IntegerPrefix(value.AsText()),
+                SqlValueKind.Blob => IntegerPrefix(Encoding.UTF8.GetString(value.AsBlob().Span)),
+                _ => 0,
+            };
+
+        private static long IntegerPrefix(string text)
+        {
+            var span = text.AsSpan().TrimStart();
+            int end = 0;
+            if (end < span.Length && (span[end] is '+' or '-'))
+                end++;
+            int digits = end;
+            while (end < span.Length && char.IsAsciiDigit(span[end]))
+                end++;
+            if (end == digits)
+                return 0;
+            return long.TryParse(span[..end], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var v) ? v : 0;
+        }
+
+        private static bool IsValidForFlags(SqlValue value, long flags)
+        {
+            if (value.Kind == SqlValueKind.Blob)
+            {
+                var blob = value.AsBlob().Span;
+                // SQLite classifies the raw blob first: a blob that superficially
+                // looks like JSONB can only match the blob flags, while any other
+                // blob validates as text.
+                if (LooksLikeJsonbBlob(blob))
+                {
+                    if ((flags & 4) != 0)
+                        return true;
+                    return (flags & 8) != 0 && JsonbErrorPosition(blob) == 0;
+                }
+
+                return TextCheck(blob, flags);
+            }
+
+            return TextCheck(Encoding.UTF8.GetBytes(value.AsText()), flags);
+        }
+
+        private static bool TextCheck(ReadOnlySpan<byte> bytes, long flags)
+        {
+            // With neither text flag selected the answer is already 0; SQLite does
+            // not parse at all in that case, so a huge input must not error either.
+            if ((flags & (TextStrict | TextJson5)) == 0)
+                return false;
+
+            var (parsed, hasJson5) = TryParseTracking(bytes);
+            if (parsed is null)
+                return false;
+            if (hasJson5)
+                return (flags & TextJson5) != 0;
+            return (flags & (TextStrict | TextJson5)) != 0;
+        }
+
+        /// <summary>
+        /// SQLite's shallow "superficially looks like JSONB" test
+        /// (jsonFuncArgMightBeBinary): the outer header must parse, claim exactly
+        /// the whole blob, and a NULL/TRUE/FALSE element must have no payload. The
+        /// payload bytes themselves are never examined, except that RFC 8259 text
+        /// can only masquerade as JSONB when it starts with '{', '[' or a digit,
+        /// and in every such coincidence the claimed payload is at most 7 bytes —
+        /// those are resolved by full strict validation, falling back to text.
+        /// </summary>
+        private static bool LooksLikeJsonbBlob(ReadOnlySpan<byte> slice)
+        {
+            if (slice.IsEmpty)
+                return false;
+
+            // SQLite reads the 8-byte size encoding (header nibble 15) with a
+            // 32-bit size, so the header only parses when the first four size
+            // bytes are zero.
+            if (slice[0] >> 4 == 15 && (slice.Length < 9 || (slice[1] != 0 || slice[2] != 0 || slice[3] != 0 || slice[4] != 0)))
+                return false;
+
+            if (!TryReadJsonbHeaderAt(slice, 0, out var type, out var headerSize, out var payloadSize))
+                return false;
+
+            if (headerSize + payloadSize != slice.Length)
+                return false;
+
+            if (payloadSize > 0 && type is 0 or 1 or 2)
+                return false;
+
+            if (payloadSize <= 7 && (slice[0] is (byte)'{' or (byte)'[' or >= (byte)'0' and <= (byte)'9'))
+                return JsonbErrorPosition(slice) == 0;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Reads the JSONB header at <paramref name="start"/> without any
+        /// structural assumptions. Returns false when the header itself cannot
+        /// parse (unknown type, truncated size bytes, or an oversized payload).
+        /// </summary>
+        private static bool TryReadJsonbHeaderAt(ReadOnlySpan<byte> data, int start, out int type, out int headerSize, out int payloadSize)
+        {
+            type = 0;
+            headerSize = 0;
+            payloadSize = 0;
+            if (start >= data.Length)
+                return false;
+
+            var header = data[start];
+            headerSize = 1;
+            type = header & 0x0F;
+            if (type > 12)
+                return false;
+
+            var sizeMarker = header >> 4;
+            if (sizeMarker <= 11)
+            {
+                payloadSize = sizeMarker;
+                return true;
+            }
+
+            var sizeBytes = sizeMarker switch
+            {
+                12 => 1,
+                13 => 2,
+                14 => 4,
+                15 => 8,
+                _ => 0,
+            };
+            if (sizeBytes == 0 || start + 1 + sizeBytes > data.Length)
+            {
+                headerSize = 0;
+                return false;
+            }
+
+            ulong length = 0;
+            for (int i = 0; i < sizeBytes; i++)
+                length = (length << 8) | data[start + 1 + i];
+
+            if (length > int.MaxValue)
+            {
+                headerSize = 0;
+                return false;
+            }
+
+            headerSize = 1 + sizeBytes;
+            payloadSize = (int)length;
+            return true;
+        }
+
+        /// <summary>
+        /// SQLite's jsonbValidityCheck: 0 when the data is fully valid JSONB
+        /// including numeric payload contents, otherwise the 1-based byte offset
+        /// of the first malformed byte or element. json_valid(X, 8) and
+        /// json_error_position report this strict check.
+        /// </summary>
+        internal static int JsonbErrorPosition(ReadOnlySpan<byte> data)
+        {
+            // SQLite starts jsonbValidityCheck at depth 1, so exactly
+            // MaxJsonbDepth nested containers pass and one more fails.
+            return ValidateJsonbElement(data, 0, data.Length, 1, strict: true) is int error ? error : 0;
+        }
+
+        private const int MaxJsonbDepth = 1000;
+
+        /// <summary>
+        /// Validates one JSONB element. Returns null for a valid element or the
+        /// 1-based byte offset of the first problem, following
+        /// jsonbValidityCheck: a malformed header or payload shape reports the
+        /// element's own start, and a bad byte inside a numeric payload reports
+        /// that byte. Strict turns on the numeric payload checks and the
+        /// bare-header requirement for NULL/TRUE/FALSE.
+        /// </summary>
+        private static int? ValidateJsonbElement(ReadOnlySpan<byte> data, int start, int end, int depth, bool strict)
+        {
+            if (depth > MaxJsonbDepth)
+                return start + 1;
+
+            if (start >= end)
+                return start + 1;
+
+            // SQLite reads the 8-byte size encoding (header nibble 15) with a
+            // 32-bit size, so jsonbPayloadSize accepts the header only when the
+            // first four size bytes are zero.
+            if (strict
+                && data[start] >> 4 == 15
+                && (start + 9 > data.Length || data[start + 1] != 0 || data[start + 2] != 0 || data[start + 3] != 0 || data[start + 4] != 0))
+            {
+                return start + 1;
+            }
+
+            if (!TryReadJsonbHeaderAt(data, start, out var type, out var headerSize, out var payloadSize))
+                return start + 1;
+
+            var payloadStart = start + headerSize;
+            if (payloadStart + payloadSize != end || payloadStart + payloadSize > data.Length)
+                return start + 1;
+
+            var payloadEnd = payloadStart + payloadSize;
+            switch (type)
+            {
+                case 0 or 1 or 2:
+                    if (payloadSize != 0)
+                        return start + 1;
+                    // SQLite accepts these only as their bare one-byte headers
+                    // (jsonbValidityCheck requires n+sz==1), so an extended-size
+                    // encoding of the empty payload is malformed.
+                    if (strict && headerSize != 1)
+                        return start + 1;
+                    return null;
+                case 3: // INT: payload is all ASCII digits, with an optional leading '-'.
+                    if (payloadSize == 0)
+                        return start + 1;
+                    if (!strict)
+                        return null;
+                    var pos = payloadStart;
+                    if (data[pos] == (byte)'-')
+                    {
+                        pos++;
+                        if (payloadSize < 2)
+                            return start + 1;
+                    }
+                    for (var offset = 0; pos + offset < payloadEnd; offset++)
+                    {
+                        if (!char.IsAsciiDigit((char)data[pos + offset]))
+                            return pos + offset + 1;
+                    }
+                    return null;
+                case 4: // INT5: payload is a hexadecimal literal [-]0x<hex digits>.
+                    if (payloadSize == 0)
+                        return start + 1;
+                    if (!strict)
+                        return null;
+                    if (payloadSize < 3)
+                        return start + 1;
+                    pos = payloadStart;
+                    if (data[pos] == (byte)'-')
+                    {
+                        if (payloadSize < 4)
+                            return start + 1;
+                        pos++;
+                    }
+                    if (data[pos] != (byte)'0')
+                        return start + 1;
+                    if (data[pos + 1] is not ((byte)'x' or (byte)'X'))
+                        return pos + 2;
+                    pos += 2;
+                    for (var offset = 0; pos + offset < payloadEnd; offset++)
+                    {
+                        if (!char.IsAsciiHexDigit((char)data[pos + offset]))
+                            return pos + offset + 1;
+                    }
+                    return null;
+                case 5 or 6: // FLOAT / FLOAT5
+                    if (payloadSize == 0)
+                        return start + 1;
+                    if (!strict)
+                        return null;
+                    return ValidateFloatPayload(data, start, payloadStart, payloadEnd, float5: type == 6);
+                case 7 or 8 or 9 or 10: // TEXT / TEXTJ / TEXT5 / TEXTRAW
+                    if (!strict)
+                    {
+                        // The lenient document check decodes text payloads as
+                        // strings, so the payload must be valid UTF-8.
+                        try
+                        {
+                            JsonbUtf8.GetString(data[payloadStart..payloadEnd]);
+                        }
+                        catch (DecoderFallbackException)
+                        {
+                            return payloadStart + 1;
+                        }
+                        return null;
+                    }
+                    return ValidateTextPayload(data, payloadStart, payloadEnd, type);
+                case 11: // ARRAY
+                    pos = payloadStart;
+                    while (pos < payloadEnd)
+                    {
+                        if (ChildElementEnd(data, pos, payloadEnd) is not int childEnd)
+                            return pos + 1;
+                        if (ValidateJsonbElement(data, pos, childEnd, depth + 1, strict) is int inner)
+                            return inner;
+                        pos = childEnd;
+                    }
+                    return null;
+                case 12: // OBJECT
+                    pos = payloadStart;
+                    var count = 0;
+                    while (pos < payloadEnd)
+                    {
+                        if (ChildElementEnd(data, pos, payloadEnd) is not int elemEnd)
+                            return pos + 1;
+                        if (count % 2 == 0)
+                        {
+                            // Keys must be text elements.
+                            if (!TryReadJsonbHeaderAt(data, pos, out var keyType, out _, out _)
+                                || keyType is < 7 or > 10)
+                            {
+                                return pos + 1;
+                            }
+                        }
+                        if (ValidateJsonbElement(data, pos, elemEnd, depth + 1, strict) is int inner)
+                            return inner;
+                        pos = elemEnd;
+                        count++;
+                    }
+                    if (count % 2 != 0)
+                        return payloadEnd + 1;
+                    return null;
+                default:
+                    return start + 1;
+            }
+        }
+
+        /// <summary>
+        /// Reads the header of the child element at <paramref name="pos"/> and
+        /// returns where the child ends, or the 1-based offset of pos when the
+        /// header is malformed or the child would run past payloadEnd.
+        /// </summary>
+        private static int? ChildElementEnd(ReadOnlySpan<byte> data, int pos, int payloadEnd)
+        {
+            if (!TryReadJsonbHeaderAt(data, pos, out _, out var headerSize, out var payloadSize))
+                return pos + 1;
+            var end = pos + headerSize + payloadSize;
+            if (end > payloadEnd)
+                return pos + 1;
+            return end;
+        }
+
+        /// <summary>
+        /// Validates a text payload the way jsonbValidityCheck does. TEXTRAW
+        /// accepts anything, TEXT allows no escapes and no raw control bytes or
+        /// double quotes, TEXTJ adds the RFC 8259 escapes, and TEXT5
+        /// additionally allows raw control bytes, raw double quotes and the
+        /// JSON5 escapes. A bad JSON5 escape is reported at its initial
+        /// backslash, even when line continuations sit between that backslash
+        /// and the offending bytes, because SQLite decodes the whole run as one
+        /// escape.
+        /// </summary>
+        private static int? ValidateTextPayload(ReadOnlySpan<byte> data, int payloadStart, int payloadEnd, int type)
+        {
+            if (type == 10) // TEXTRAW
+                return null;
+
+            var pos = payloadStart;
+            while (pos < payloadEnd)
+            {
+                var b = data[pos];
+                if (b > 0x1f && b != (byte)'"' && b != (byte)'\\')
+                {
+                    pos++;
+                    continue;
+                }
+
+                if (type == 7) // TEXT: no escapes at all
+                    return pos + 1;
+
+                if (b != (byte)'\\')
+                {
+                    // A raw control byte or double quote is a JSON5 literal.
+                    if (type == 8) // TEXTJ
+                        return pos + 1;
+                    pos++;
+                    continue;
+                }
+
+                if (pos + 1 >= payloadEnd)
+                    return pos + 1;
+
+                var escaped = data[pos + 1];
+                switch (escaped)
+                {
+                    // The 0 arm is SQLite bug-compatibility: its standard-escape
+                    // test is strchr("\"\\/bfnrt", z[j+1]), and strchr with a
+                    // NUL needle matches the string's own terminator, so a
+                    // backslash-NUL sequence passes in TEXTJ and TEXT5 payloads.
+                    case 0 or (byte)'"' or (byte)'\\' or (byte)'/' or (byte)'b' or (byte)'f' or (byte)'n' or (byte)'r' or (byte)'t':
+                        pos += 2;
+                        continue;
+                    case (byte)'u':
+                        if (pos + 5 >= payloadEnd
+                            || !char.IsAsciiHexDigit((char)data[pos + 2])
+                            || !char.IsAsciiHexDigit((char)data[pos + 3])
+                            || !char.IsAsciiHexDigit((char)data[pos + 4])
+                            || !char.IsAsciiHexDigit((char)data[pos + 5]))
+                        {
+                            return pos + 1;
+                        }
+                        pos += 6;
+                        continue;
+                }
+
+                if (type != 9) // TEXT5
+                    return pos + 1;
+
+                // A JSON5 escape: consume it exactly the way SQLite's
+                // jsonUnescapeOneChar does, without inspecting bytes past the
+                // payload end (the lookahead stops at payloadEnd).
+                var (consumed, valid) = UnescapeOneChar(data[pos..payloadEnd]);
+                if (!valid)
+                    return pos + 1;
+                pos += consumed;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Walks over the run of JSON5 line continuations at the start of
+        /// <paramref name="z"/> and returns how many bytes they span: \&lt;LF&gt;,
+        /// \&lt;CR&gt;, \&lt;CRLF&gt;, and \ before U+2028 or U+2029 each continue
+        /// the string without contributing a character.
+        /// </summary>
+        private static int BytesToBypass(ReadOnlySpan<byte> z)
+        {
+            var n = z.Length;
+            var i = 0;
+            while (i + 1 < n)
+            {
+                if (z[i] != (byte)'\\')
+                    return i;
+                if (z[i + 1] == (byte)'\n')
+                {
+                    i += 2;
+                    continue;
+                }
+                if (z[i + 1] == (byte)'\r')
+                {
+                    if (i + 2 < n && z[i + 2] == (byte)'\n')
+                        i += 3;
+                    else
+                        i += 2;
+                    continue;
+                }
+                if (z[i + 1] == 0xe2 && i + 3 < n && z[i + 2] == 0x80 && (z[i + 3] is 0xa8 or 0xa9))
+                {
+                    i += 4;
+                    continue;
+                }
+                break;
+            }
+            return i;
+        }
+
+        /// <summary>
+        /// SQLite's jsonHexToInt: converts a byte to its hex digit value without
+        /// validating it first, so garbage bytes map to arbitrary but
+        /// deterministic values. The surrogate-pair detection below needs the
+        /// exact same garbage mapping to consume the same number of bytes as
+        /// SQLite does.
+        /// </summary>
+        private static uint JsonHexToInt(byte h)
+            => (uint)((h + 9 * (1 & (h >> 6))) & 0xf);
+
+        private static uint JsonHexToInt4(ReadOnlySpan<byte> z)
+            => (JsonHexToInt(z[0]) << 12) + (JsonHexToInt(z[1]) << 8) + (JsonHexToInt(z[2]) << 4) + JsonHexToInt(z[3]);
+
+        /// <summary>
+        /// SQLite's sqlite3Utf8ReadLimited consumption rule: one lead byte, and
+        /// for leads at or above 0xC0 also up to three following continuation
+        /// bytes. The payload may not be UTF-8, and a malformed sequence must
+        /// consume exactly the bytes SQLite consumes or later escapes would be
+        /// scanned from a different offset.
+        /// </summary>
+        private static int Utf8ReadLimitedLen(ReadOnlySpan<byte> z)
+        {
+            var i = 1;
+            if (z[0] >= 0xC0)
+            {
+                var n = Math.Min(z.Length, 4);
+                while (i < n && (z[i] & 0xC0) == 0x80)
+                    i++;
+            }
+            return i;
+        }
+
+        /// <summary>
+        /// Consumes one JSON5 escape at the start of <paramref name="z"/>
+        /// (which begins with a backslash) and reports whether it was valid. A
+        /// line continuation swallows the whole run of continuations and then
+        /// the character or escape that follows, which is why a \u reached
+        /// through a continuation is consumed without checking its hex digits:
+        /// jsonUnescapeOneChar converts them blindly, so SQLite accepts it.
+        /// </summary>
+        private static (int Consumed, bool Valid) UnescapeOneChar(ReadOnlySpan<byte> z)
+        {
+            var n = z.Length;
+            if (n < 2)
+                return (n, false);
+            switch (z[1])
+            {
+                case (byte)'u':
+                    if (n < 6)
+                        return (n, false);
+                    var v = JsonHexToInt4(z[2..6]);
+                    if ((v & 0xfc00) == 0xd800
+                        && n >= 12
+                        && z[6] == (byte)'\\'
+                        && z[7] == (byte)'u'
+                        && (JsonHexToInt4(z[8..12]) & 0xfc00) == 0xdc00)
+                    {
+                        return (12, true);
+                    }
+                    return (6, true);
+                case (byte)'b' or (byte)'f' or (byte)'n' or (byte)'r' or (byte)'t' or (byte)'v'
+                    or (byte)'\'' or (byte)'"' or (byte)'/' or (byte)'\\':
+                    return (2, true);
+                case (byte)'0':
+                    // JSON5 forbids a digit right after \0.
+                    return (2, !(n > 2 && char.IsAsciiDigit((char)z[2])));
+                case (byte)'x':
+                    // Like SQLite, the two bytes after \x are consumed without
+                    // being checked as hex digits.
+                    if (n < 4)
+                        return (n, false);
+                    return (4, true);
+                case 0xe2 or (byte)'\r' or (byte)'\n':
+                    var skip = BytesToBypass(z);
+                    if (skip == 0)
+                        return (n, false);
+                    if (skip == n)
+                        return (n, true);
+                    if (z[skip] == (byte)'\\')
+                    {
+                        var (consumed, valid) = UnescapeOneChar(z[skip..]);
+                        return (skip + consumed, valid);
+                    }
+                    return (skip + Utf8ReadLimitedLen(z[skip..]), true);
+                default:
+                    return (2, false);
+            }
+        }
+
+        /// <summary>
+        /// Validates a FLOAT or FLOAT5 payload the way jsonbValidityCheck does:
+        /// FLOAT must be a canonical RFC 8259 number with a '.' or exponent,
+        /// FLOAT5 additionally allows the JSON5 forms '.5' and '5.'.
+        /// </summary>
+        private static int? ValidateFloatPayload(ReadOnlySpan<byte> data, int start, int payloadStart, int payloadEnd, bool float5)
+        {
+            const byte SeenDot = 1;
+            const byte SeenExp = 2;
+            if (payloadEnd - payloadStart < 2)
+                return start + 1;
+
+            var pos = payloadStart;
+            byte seen = 0;
+            if (data[pos] == (byte)'-')
+            {
+                pos++;
+                if (payloadEnd - payloadStart < 3)
+                    return start + 1;
+            }
+
+            if (data[pos] == (byte)'.')
+            {
+                if (!float5 || pos + 1 >= payloadEnd || !char.IsAsciiDigit((char)data[pos + 1]))
+                    return pos + 1;
+                pos += 2;
+                seen = SeenDot;
+            }
+            else if (data[pos] == (byte)'0' && !float5)
+            {
+                // A strict leading zero must be the whole integer part.
+                if (pos + 3 > payloadEnd)
+                    return pos + 1;
+                if (data[pos + 1] is not ((byte)'.' or (byte)'e' or (byte)'E'))
+                    return pos + 1;
+                pos += 1;
+            }
+
+            while (pos < payloadEnd)
+            {
+                var b = data[pos];
+                if (char.IsAsciiDigit((char)b))
+                {
+                    pos++;
+                    continue;
+                }
+
+                if (b == (byte)'.')
+                {
+                    if (seen != 0)
+                        return pos + 1;
+                    if (!float5 && (pos == payloadEnd - 1 || pos + 1 >= payloadEnd || !char.IsAsciiDigit((char)data[pos + 1])))
+                        return pos + 1;
+                    seen = SeenDot;
+                    pos++;
+                    continue;
+                }
+
+                if (b is (byte)'e' or (byte)'E')
+                {
+                    if (seen == SeenExp || pos == payloadEnd - 1)
+                        return pos + 1;
+                    if (pos + 1 < payloadEnd && data[pos + 1] is ((byte)'+' or (byte)'-'))
+                    {
+                        pos++;
+                        if (pos == payloadEnd - 1)
+                            return pos + 1;
+                    }
+                    seen = SeenExp;
+                    pos++;
+                    continue;
+                }
+
+                return pos + 1;
+            }
+
+            if (seen == 0)
+                return start + 1;
+            return null;
         }
 
         internal static SqlValue JsonType(IReadOnlyList<SqlValue> args)
@@ -49098,6 +50356,12 @@ out bool hasReturning)
             RequireArgumentCount("json_error_position", args, 1);
             if (args[0].Kind == SqlValueKind.Null)
                 return SqlValue.Null;
+
+            // A blob that superficially looks like JSONB reports the byte offset
+            // of its first malformed element instead of being re-read as text;
+            // any other blob validates as text.
+            if (args[0].Kind == SqlValueKind.Blob && LooksLikeJsonbBlob(args[0].AsBlob().Span))
+                return SqlValue.Integer(JsonbErrorPosition(args[0].AsBlob().Span));
 
             string input = args[0].Kind switch
             {
@@ -49735,9 +50999,12 @@ out bool hasReturning)
         }
 
         private static string InputText(SqlValue value)
-            => value.Kind == SqlValueKind.Blob
-                ? SqliteTextPrefix(Encoding.UTF8.GetString(value.AsBlob().Span))
-                : value.AsText();
+            // SQLite treats text as a NUL-terminated C string when parsing a JSON
+            // document, so parsing stops at the first embedded NUL. A text value
+            // converted to a JSON string literal keeps the NUL as an escape.
+            => SqliteTextPrefix(value.Kind == SqlValueKind.Blob
+                ? Encoding.UTF8.GetString(value.AsBlob().Span)
+                : value.AsText());
 
         private static string RequirePathText(SqlValue value)
             => value.Kind switch
@@ -49862,7 +51129,7 @@ out bool hasReturning)
                     payload.AddRange(JsonbUtf8.GetBytes(node.Raw));
                     break;
                 case JKind.Text:
-                    AppendJsonbText(payload, node.Raw, node.Str, out type);
+                    AppendJsonbText(payload, node.Raw, node.Raw5, node.Str, out type);
                     break;
                 case JKind.Array:
                     type = 11;
@@ -49873,7 +51140,7 @@ out bool hasReturning)
                     type = 12;
                     foreach (var member in node.Members!)
                     {
-                        AppendJsonbTextNode(payload, member.RawKey, member.Key);
+                        AppendJsonbTextNode(payload, member.RawKey, member.RawKey5, member.Key);
                         AppendJsonbNode(payload, member.Value);
                     }
                     break;
@@ -49887,14 +51154,33 @@ out bool hasReturning)
 
         private static void AppendJsonbTextNode(List<byte> destination, string raw, string text)
         {
+            AppendJsonbTextNode(destination, raw, raw5: null, text);
+        }
+
+        private static void AppendJsonbTextNode(List<byte> destination, string raw, string? raw5, string text)
+        {
             var payload = new List<byte>();
-            AppendJsonbText(payload, raw, text, out var type);
+            AppendJsonbText(payload, raw, raw5, text, out var type);
             WriteJsonbHeader(destination, type, payload.Count);
             destination.AddRange(payload);
         }
 
         private static void AppendJsonbText(List<byte> destination, string raw, string text, out int type)
         {
+            AppendJsonbText(destination, raw, raw5: null, text, out type);
+        }
+
+        private static void AppendJsonbText(List<byte> destination, string raw, string? raw5, string text, out int type)
+        {
+            // A JSON5 string (Raw5) stores its verbatim payload in a TEXT5
+            // element; a standard-escaped string is TEXTJ and a plain one TEXT.
+            if (raw5 is not null)
+            {
+                type = 9;
+                destination.AddRange(JsonbUtf8.GetBytes(raw5));
+                return;
+            }
+
             var payload = raw.Length >= 2 && raw[0] == '"' && raw[^1] == '"'
                 ? raw[1..^1]
                 : text;
@@ -49989,6 +51275,16 @@ out bool hasReturning)
                         return false;
                     }
                     node = escapedText;
+                    cursor = payloadEnd;
+                    return true;
+                case 9:
+                    // A TEXT5 payload holds verbatim JSON5 escapes (raw control
+                    // bytes, raw double quotes, \x, \v, line continuations), so it
+                    // decodes through the dedicated TEXT5 scanner and keeps the
+                    // verbatim payload for JSONB round-trips.
+                    if (!TryDecodeJsonbText(data[payloadStart..payloadEnd], out var json5))
+                        return false;
+                    node = DecodeText5Payload(json5);
                     cursor = payloadEnd;
                     return true;
                 case 11:
@@ -50089,6 +51385,201 @@ out bool hasReturning)
                 text = string.Empty;
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Decodes a TEXT5 payload: the verbatim JSON5 escapes and raw bytes it
+        /// stores (raw control bytes, raw double quotes, \x, \v, \0, line
+        /// continuations, \uXXXX) turn into their decoded string value while the
+        /// verbatim payload is kept for JSONB round-trips.
+        /// </summary>
+        private static JNode DecodeText5Payload(string payload)
+        {
+            var sb = new StringBuilder(payload.Length);
+            var raw = new StringBuilder(payload.Length + 2);
+            raw.Append('"');
+            for (var i = 0; i < payload.Length; i++)
+            {
+                var c = payload[i];
+                if (c != '\\')
+                {
+                    sb.Append(c);
+                    if (c == '"')
+                        raw.Append("\\\"");
+                    else
+                        raw.Append(c);
+                    continue;
+                }
+
+                // An escape at the very end is malformed, but the lenient read
+                // tolerates it as a literal backslash.
+                if (i + 1 >= payload.Length)
+                {
+                    sb.Append(c);
+                    raw.Append(c);
+                    continue;
+                }
+
+                var escaped = payload[i + 1];
+                switch (escaped)
+                {
+                    case '"': sb.Append('"'); raw.Append("\\\""); break;
+                    case '\\': sb.Append('\\'); raw.Append("\\\\"); break;
+                    case '/': sb.Append('/'); raw.Append("\\/"); break;
+                    case 'b': sb.Append('\b'); raw.Append("\\b"); break;
+                    case 'f': sb.Append('\f'); raw.Append("\\f"); break;
+                    case 'n': sb.Append('\n'); raw.Append("\\n"); break;
+                    case 'r': sb.Append('\r'); raw.Append("\\r"); break;
+                    case 't': sb.Append('\t'); raw.Append("\\t"); break;
+                    case '\'': sb.Append('\''); raw.Append("\\'"); break;
+                    case '0': sb.Append('\0'); raw.Append("\\0"); break;
+                    case 'v': sb.Append('\v'); raw.Append("\\v"); break;
+                    case 'x':
+                        if (i + 3 < payload.Length)
+                        {
+                            int hex = (HexDigit(payload[i + 2]) << 4) | HexDigit(payload[i + 3]);
+                            sb.Append((char)hex);
+                            raw.Append(payload, i, 4);
+                            i += 2;
+                        }
+                        else
+                        {
+                            sb.Append(escaped);
+                            raw.Append(payload, i, 2);
+                            i += 1;
+                        }
+                        break;
+                    case 'u':
+                        if (i + 5 < payload.Length)
+                        {
+                            int cp = 0;
+                            for (var k = 2; k <= 5; k++)
+                                cp = (cp * 16) + HexDigit(payload[i + k]);
+                            sb.Append((char)cp);
+                            raw.Append(payload, i, 6);
+                            i += 4;
+                        }
+                        else
+                        {
+                            sb.Append(escaped);
+                            raw.Append(payload, i, 2);
+                            i += 1;
+                        }
+                        break;
+                    case '\n':
+                        // Line continuations decode to nothing and render away.
+                        i += 1;
+                        break;
+                    case '\r':
+                        if (i + 2 < payload.Length && payload[i + 2] == '\n')
+                            i += 2;
+                        else
+                            i += 1;
+                        break;
+                    case '\u2028':
+                    case '\u2029':
+                        i += 1;
+                        break;
+                    default:
+                        sb.Append(escaped);
+                        raw.Append(payload, i, 2);
+                        i += 1;
+                        break;
+                }
+
+                i++;
+            }
+
+            raw.Append('"');
+            return new JNode
+            {
+                Kind = JKind.Text,
+                Str = sb.ToString(),
+                Raw = CanonicalizeHexEscapes(raw.ToString()),
+                Raw5 = payload,
+            };
+        }
+
+        private static int HexDigit(char c) => c switch
+        {
+            >= '0' and <= '9' => c - '0',
+            >= 'a' and <= 'f' => c - 'a' + 10,
+            >= 'A' and <= 'F' => c - 'A' + 10,
+            _ => 0,
+        };
+
+        /// <summary>
+        /// Re-renders a JSON5 string's verbatim source into canonical JSON text:
+        /// \x and \v escapes convert to \u00XX (SQLite renders \v as the
+        /// horizontal-tab escape through 3.51.1), line continuations drop, \0
+        /// becomes \u0000, and standard escapes pass through untouched.
+        /// </summary>
+        private static string CanonicalizeHexEscapes(string source)
+        {
+            var result = new StringBuilder(source.Length + 8);
+            result.Append('"');
+            for (var index = 1; index < source.Length - 1; index++)
+            {
+                var character = source[index];
+                if (character != '\\' || index + 1 >= source.Length - 1)
+                {
+                    if (character < 0x20)
+                    {
+                        result.Append("\\u");
+                        result.Append(((int)character).ToString("x4", CultureInfo.InvariantCulture));
+                    }
+                    else
+                    {
+                        result.Append(character);
+                    }
+                    continue;
+                }
+
+                var escaped = source[++index];
+                if (escaped == 'x' && index + 2 < source.Length - 1)
+                {
+                    result.Append("\\u00");
+                    result.Append(source[index + 1]);
+                    result.Append(source[index + 2]);
+                    index += 2;
+                    continue;
+                }
+
+                if (escaped == '0')
+                {
+                    result.Append("\\u0000");
+                    continue;
+                }
+                if (escaped == 'v')
+                {
+                    // SQLite (through 3.51.1) renders the JSON5 vertical-tab
+                    // escape with the horizontal-tab escape, and we are
+                    // bug-compatible with that; extraction decodes the stored
+                    // \v directly and still yields the real 0x0B byte.
+                    result.Append("\\u0009");
+                    continue;
+                }
+                if (escaped == '\u2028' || escaped == '\u2029')
+                    continue;
+                if (escaped == '\n')
+                    continue;
+                if (escaped == '\r')
+                {
+                    if (index + 1 < source.Length - 1 && source[index + 1] == '\n')
+                        index++;
+                    continue;
+                }
+                if (escaped == '\'')
+                {
+                    result.Append('\'');
+                    continue;
+                }
+
+                result.Append('\\').Append(escaped);
+            }
+
+            result.Append('"');
+            return result.ToString();
         }
 
         private static void Serialize(JNode node, StringBuilder sb)
@@ -50259,7 +51750,15 @@ out bool hasReturning)
         }
 
         private static EmbeddedSqlException BadPath(string path)
-            => new($"bad JSON path: '{path}'");
+        {
+            // SQLite formats the path with %Q, which wraps in single quotes,
+            // doubles embedded apostrophes, and reads a C string — so the
+            // message stops at an embedded NUL.
+            var nul = path.IndexOf('\0');
+            var cstring = nul >= 0 ? path[..nul] : path;
+            return new EmbeddedSqlException(
+                $"bad JSON path: '{cstring.Replace("'", "''", StringComparison.Ordinal)}'");
+        }
 
         private static string FormatJsonReal(double d)
         {
@@ -50325,6 +51824,38 @@ out bool hasReturning)
             return parser.AtEnd ? node : null;
         }
 
+        /// <summary>
+        /// Parses like <see cref="TryParseJson5"/> but also reports whether the
+        /// text used any JSON5-only syntax, which json_valid needs to tell
+        /// strict RFC 8259 documents apart from merely parseable ones. Text
+        /// stops at the first NUL like SQLite.
+        /// </summary>
+        private static (JNode? Node, bool HasJson5) TryParseTracking(ReadOnlySpan<byte> bytes)
+        {
+            // SQLite parses the text up to the first NUL byte.
+            var zero = bytes.IndexOf((byte)0);
+            var slice = zero >= 0 ? bytes[..zero] : bytes;
+            string text;
+            try
+            {
+                text = JsonbUtf8.GetString(slice);
+            }
+            catch (DecoderFallbackException)
+            {
+                return (null, false);
+            }
+
+            var parser = new Parser(text, 0, json5: true);
+            parser.SkipWs();
+            var node = parser.ParseValue();
+            if (node is null)
+                return (null, false);
+            parser.SkipWs();
+            if (!parser.AtEnd)
+                return (null, false);
+            return (node, parser.Json5Seen);
+        }
+
         private static JNode? TryParseJson5(string s)
         {
             var parser = new Parser(s, 0, json5: true);
@@ -50342,6 +51873,7 @@ out bool hasReturning)
             private readonly bool _json5;
             private int _i;
             private int _errorPosition = -1;
+            private bool _json5Seen;
 
             public Parser(string s, int start)
                 : this(s, start, json5: false)
@@ -50361,6 +51893,11 @@ out bool hasReturning)
 
             public int ErrorPosition => _errorPosition;
 
+            /// <summary>Whether any JSON5-only syntax was consumed, which keeps a TEXT5 string element from demoting to TEXTJ when a standard escape follows it.</summary>
+            public bool Json5Seen => _json5Seen;
+
+            private void MarkJson5() => _json5Seen = true;
+
             public void SkipWs()
             {
                 while (_i < _s.Length)
@@ -50379,6 +51916,7 @@ out bool hasReturning)
                             _i += 2;
                             while (_i < _s.Length && _s[_i] != '\n')
                                 _i++;
+                            MarkJson5();
                             continue;
                         }
 
@@ -50388,6 +51926,7 @@ out bool hasReturning)
                             while (_i + 1 < _s.Length && !(_s[_i] == '*' && _s[_i + 1] == '/'))
                                 _i++;
                             _i = _i + 1 < _s.Length ? _i + 2 : _s.Length;
+                            MarkJson5();
                             continue;
                         }
                     }
@@ -50420,6 +51959,7 @@ out bool hasReturning)
                     case '"':
                         return ParseString();
                     case '\'' when _json5:
+                        MarkJson5();
                         return ParseString();
                     case 't':
                         return ParseLiteral("true", JKind.True);
@@ -50430,6 +51970,7 @@ out bool hasReturning)
                         if (_json5 && MatchesIgnoreCase("nan"))
                         {
                             _i += 3;
+                            MarkJson5();
                             return new JNode { Kind = JKind.Null };
                         }
 
@@ -50438,7 +51979,10 @@ out bool hasReturning)
                         if (c == '-' || char.IsAsciiDigit(c))
                             return ParseNumber();
                         if (_json5 && (c == '+' || c == '.' || c is 'I' or 'i'))
+                        {
+                            MarkJson5();
                             return ParseNumber();
+                        }
                         RecordFailure();
                         return null;
                 }
@@ -50467,6 +52011,7 @@ out bool hasReturning)
 
             private JNode? ParseNumber()
             {
+                int numberStart = _i;
                 int start = _i;
                 bool negative = false;
                 if (_i < _s.Length && _s[_i] == '-')
@@ -50478,19 +52023,23 @@ out bool hasReturning)
                 {
                     // (2) JSON5 explicit-plus numbers: the sign is consumed and dropped so the
                     // canonical form matches the unsigned spelling.
+                    MarkJson5();
                     _i++;
                     start = _i;
                 }
 
                 if (_i >= _s.Length)
                 {
-                    RecordFailure();
+                    // A bare sign has no mantissa at all: SQLite reports at the
+                    // start of the number (the sign itself).
+                    RecordFailure(numberStart);
                     return null;
                 }
 
                 if (_json5 && (_s[_i] is 'I' or 'i'))
                 {
                     // (5) JSON5 Infinity: canonicalized to SQLite's 9e999 spelling.
+                    MarkJson5();
                     if (!MatchesIgnoreCase("infinity"))
                     {
                         RecordFailure();
@@ -50517,6 +52066,7 @@ out bool hasReturning)
                 if (_json5 && _s[_i] == '0' && _i + 1 < _s.Length && (_s[_i + 1] is 'x' or 'X'))
                 {
                     // (1) JSON5 hexadecimal numbers: canonicalized to a decimal integer.
+                    MarkJson5();
                     _i += 2;
                     int hexStart = _i;
                     while (_i < _s.Length && HexValue(_s[_i]) >= 0)
@@ -50553,11 +52103,13 @@ out bool hasReturning)
                 else if (_json5 && _s[_i] == '.')
                 {
                     // (3) JSON5 leading-dot numbers: ".5" canonicalizes to "0.5".
+                    // The dot itself is consumed by the fraction block below.
+                    MarkJson5();
                     leadingDot = true;
                 }
                 else
                 {
-                    RecordFailure();
+                    RecordFailure(numberStart);
                     return null;
                 }
 
@@ -50566,26 +52118,33 @@ out bool hasReturning)
                 if (_i < _s.Length && _s[_i] == '.')
                 {
                     isReal = true;
+                    int dot = _i;
                     _i++;
                     if (_i >= _s.Length || !char.IsAsciiDigit(_s[_i]))
                     {
-                        // (4) JSON5 trailing-dot numbers: "42." canonicalizes to "42.0".
-                        if (!_json5 || leadingDot)
+                        if (leadingDot)
                         {
-                            RecordFailure();
+                            // A leading dot needs a digit after it: SQLite reports
+                            // an unsigned bare dot at the dot and a signed one
+                            // just after it.
+                            RecordFailure(negative || numberStart != start ? dot + 1 : dot);
                             return null;
                         }
 
+                        // (4) JSON5 trailing-dot numbers: "42." canonicalizes to "42.0",
+                        // and "5.e2" keeps the exponent.
+                        if (!_json5)
+                        {
+                            RecordFailure(dot);
+                            return null;
+                        }
+
+                        MarkJson5();
                         trailingDot = true;
                     }
 
                     while (_i < _s.Length && char.IsAsciiDigit(_s[_i]))
                         _i++;
-                }
-                else if (leadingDot)
-                {
-                    RecordFailure();
-                    return null;
                 }
 
                 if (_i < _s.Length && (_s[_i] == 'e' || _s[_i] == 'E'))
@@ -50601,6 +52160,15 @@ out bool hasReturning)
                     }
                     while (_i < _s.Length && char.IsAsciiDigit(_s[_i]))
                         _i++;
+                }
+
+                // A number holds at most one dot and one exponent: any leftover
+                // dot or exponent letter at this point is reported at the
+                // offending character (json5_numbers_reject_repeated_dots_and_exponents).
+                if (_i < _s.Length && (_s[_i] == '.' || _s[_i] == 'e' || _s[_i] == 'E'))
+                {
+                    RecordFailure(_i);
+                    return null;
                 }
 
                 string raw = _s.Substring(start, _i - start);
@@ -50697,6 +52265,11 @@ out bool hasReturning)
                                     _i++;
                                 json5Only = true;
                                 break;
+                            case '\u2028' when _json5:
+                            case '\u2029' when _json5:
+                                // JSON5 line continuation over the Unicode line separators.
+                                json5Only = true;
+                                break;
                             case 'x' when _json5:
                                 if (_i + 2 >= _s.Length)
                                 {
@@ -50704,6 +52277,7 @@ out bool hasReturning)
                                     return null;
                                 }
 
+                                MarkJson5();
                                 int hex = 0;
                                 for (int k = 1; k <= 2; k++)
                                 {
@@ -50765,88 +52339,82 @@ out bool hasReturning)
 
                 string text = sb.ToString();
                 var source = _s.Substring(start, _i - start);
-                string raw = quote == '"' && !json5Only
-                    ? source
-                    : quote == '"' && source.Contains("\\x", StringComparison.Ordinal)
-                        ? CanonicalizeHexEscapes(source)
-                        : QuoteString(text);
-                return new JNode { Kind = JKind.Text, Raw = raw, Str = text };
-            }
-
-            private static string CanonicalizeHexEscapes(string source)
-            {
-                var result = new StringBuilder(source.Length + 8);
-                result.Append('"');
-                for (var index = 1; index < source.Length - 1; index++)
+                // A strict double-quoted string keeps its verbatim source. A JSON5
+                // string keeps its verbatim payload for the JSONB TEXT5 element
+                // (upstream stores the raw escapes) and canonicalizes for the
+                // rendered text: \x and \v re-render through \u (SQLite renders
+                // \v as the horizontal-tab escape, through 3.51.1), line
+                // continuations are dropped, and standard escapes pass through.
+                string raw;
+                string? raw5 = null;
+                if (quote == '"')
                 {
-                    var character = source[index];
-                    if (character != '\\' || index + 1 >= source.Length - 1)
+                    if (!json5Only)
                     {
-                        if (character < 0x20)
-                        {
-                            result.Append("\\u");
-                            result.Append(((int)character).ToString("x4", CultureInfo.InvariantCulture));
-                        }
-                        else
-                        {
-                            result.Append(character);
-                        }
-                        continue;
+                        raw = source;
                     }
-
-                    var escaped = source[++index];
-                    if (escaped == 'x' && index + 2 < source.Length - 1)
+                    else
                     {
-                        result.Append("\\u00");
-                        result.Append(source[index + 1]);
-                        result.Append(source[index + 2]);
-                        index += 2;
-                        continue;
+                        raw5 = source[1..^1];
+                        raw = CanonicalizeHexEscapes(source);
                     }
-
-                    if (escaped == '0')
-                    {
-                        result.Append("\\u0000");
-                        continue;
-                    }
-                    if (escaped == 'v')
-                    {
-                        result.Append("\\u000b");
-                        continue;
-                    }
-                    if (escaped == '\n')
-                        continue;
-                    if (escaped == '\r')
-                    {
-                        if (index + 1 < source.Length - 1 && source[index + 1] == '\n')
-                            index++;
-                        continue;
-                    }
-                    if (escaped == '\'')
-                    {
-                        result.Append('\'');
-                        continue;
-                    }
-
-                    result.Append('\\').Append(escaped);
+                }
+                else
+                {
+                    // (6) Single-quoted strings store their content verbatim in a
+                    // TEXT5 element; the rendered text re-quotes with '"'.
+                    raw5 = source[1..^1];
+                    raw = QuoteString(text);
                 }
 
-                result.Append('"');
-                return result.ToString();
+                if (json5Only)
+                    MarkJson5();
+                return new JNode { Kind = JKind.Text, Raw = raw, Raw5 = raw5, Str = text };
             }
 
-            // (7) JSON5 unquoted object keys: a bare ECMAScript-style identifier is accepted as a
-            // key and re-emitted in canonical double-quoted form.
+            // (7) JSON5 unquoted object keys: a bare ECMAScript-style identifier is
+            // accepted as a key and re-emitted in canonical double-quoted form.
+            // SQLite's identifier rules: ASCII letters, '_' and '$' may start one,
+            // digits only continue one, non-ASCII characters are accepted, and a
+            // \uXXXX escape may appear anywhere (whatever it decodes to; kept
+            // verbatim for rendering while path matching decodes it). No other
+            // escape is allowed. A comment directly after the key acts as
+            // whitespace, ending the key.
             private JNode? ParseUnquotedKey()
             {
                 int start = _i;
+                var key = new StringBuilder();
                 while (_i < _s.Length)
                 {
                     char c = _s[_i];
-                    if (char.IsLetterOrDigit(c) || c == '_' || c == '$')
+                    if (char.IsAsciiLetter(c) || c == '_' || c == '$'
+                        || (c >= 0x7f && !char.IsSurrogate(c))
+                        || (key.Length > 0 && char.IsAsciiDigit(c)))
+                    {
+                        key.Append(c);
                         _i++;
-                    else
-                        break;
+                        continue;
+                    }
+
+                    if (c == '\\' && _i + 1 < _s.Length && _s[_i + 1] == 'u')
+                    {
+                        // \uXXXX escapes are accepted without being validated as
+                        // identifiers; the escape is kept verbatim in the rendered
+                        // key while the decoded value is used for matching.
+                        if (_i + 5 >= _s.Length
+                            || HexValue(_s[_i + 2]) < 0 || HexValue(_s[_i + 3]) < 0
+                            || HexValue(_s[_i + 4]) < 0 || HexValue(_s[_i + 5]) < 0)
+                        {
+                            RecordFailure(_i);
+                            return null;
+                        }
+
+                        key.Append(_s, _i, 6);
+                        _i += 6;
+                        continue;
+                    }
+
+                    break;
                 }
 
                 if (_i == start)
@@ -50857,12 +52425,44 @@ out bool hasReturning)
 
                 if (char.IsAsciiDigit(_s[start]))
                 {
+                    // A digit cannot start an identifier.
                     RecordFailure(start);
                     return null;
                 }
 
-                string text = _s.Substring(start, _i - start);
-                return new JNode { Kind = JKind.Text, Raw = QuoteString(text), Str = text };
+                MarkJson5();
+                string text = key.ToString();
+                // The key text is identifier characters and \uXXXX escapes only,
+                // so it is already safe inside quotes; the escape stays verbatim
+                // in the rendered key while matching decodes it.
+                return new JNode
+                {
+                    Kind = JKind.Text,
+                    Raw = "\"" + text + "\"",
+                    Str = DecodeKeyEscapes(text),
+                };
+            }
+
+            private static string DecodeKeyEscapes(string text)
+            {
+                if (!text.Contains('\\', StringComparison.Ordinal))
+                    return text;
+                var result = new StringBuilder(text.Length);
+                for (var index = 0; index < text.Length; index++)
+                {
+                    if (text[index] == '\\' && index + 5 < text.Length && text[index + 1] == 'u')
+                    {
+                        int cp = 0;
+                        for (int k = 2; k <= 5; k++)
+                            cp = (cp * 16) + HexValue(text[index + k]);
+                        result.Append((char)cp);
+                        index += 5;
+                        continue;
+                    }
+
+                    result.Append(text[index]);
+                }
+                return result.ToString();
             }
 
             private JNode? ParseArray()
@@ -50899,6 +52499,7 @@ out bool hasReturning)
                             SkipWs();
                             if (_i < _s.Length && _s[_i] == ']')
                             {
+                                MarkJson5();
                                 _i++;
                                 break;
                             }
@@ -50968,7 +52569,7 @@ out bool hasReturning)
                     var v = ParseValue();
                     if (v is null)
                         return null;
-                    members.Add(new JMember { RawKey = key.Raw, Key = key.Str, Value = v });
+                    members.Add(new JMember { RawKey = key.Raw, RawKey5 = key.Raw5, Key = key.Str, Value = v });
                     SkipWs();
                     if (_i >= _s.Length)
                     {
@@ -50985,6 +52586,7 @@ out bool hasReturning)
                             SkipWs();
                             if (_i < _s.Length && _s[_i] == '}')
                             {
+                                MarkJson5();
                                 _i++;
                                 break;
                             }
@@ -51064,6 +52666,13 @@ public sealed partial class EmbeddedConnection : IDisposable
     /// </summary>
     private readonly ManagedSequenceSession _sequenceSession = new();
     private bool _queryOnly;
+
+    /// <summary>
+    /// <c>PRAGMA count_changes</c>: when enabled, each INSERT/UPDATE/DELETE returns one row
+    /// carrying the number of changed rows (SQLite's deprecated count_changes behavior,
+    /// pinned by pragma-count-changes.sqltest).
+    /// </summary>
+    private bool _countChanges;
     private bool _foreignKeys;
     private bool _deferForeignKeys;
     private bool _recursiveTriggers;
@@ -53027,6 +54636,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 return ExecutePragmaFreelistCount(freelistCount);
             case PragmaQueryOnlyStatement queryOnly:
                 return ExecutePragmaQueryOnly(queryOnly);
+            case PragmaCountChangesStatement countChanges:
+                return ExecutePragmaCountChanges(countChanges);
             case PragmaForeignKeysStatement foreignKeys:
                 return ExecutePragmaForeignKeys(foreignKeys);
             case PragmaDeferForeignKeysStatement deferForeignKeys:
@@ -53340,6 +54951,12 @@ public sealed partial class EmbeddedConnection : IDisposable
                         concurrentTxId,
                         mvccStatementSavepoint);
                     tempTriggerSession?.Commit();
+
+                    // PRAGMA count_changes: each INSERT/UPDATE/DELETE returns one row with
+                    // the number of rows it changed (SQLite's deprecated count_changes).
+                    if (_countChanges && result.Changed && statement is InsertStatement or UpdateStatement or DeleteStatement)
+                        return new ExecutionResult(["changes"], [[SqlValue.Integer(result.RowsAffected)]], 0, result.Changed);
+
                     return result;
                 }
                 catch (EmbeddedConflictRollbackException exception)
@@ -54098,7 +55715,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                             rewritten => new ExplainStatement(rewritten)),
             ExplainQueryPlanStatement explainQueryPlan => RouteExplain(
                 explainQueryPlan.Inner,
-                rewritten => new ExplainQueryPlanStatement(rewritten)),
+                rewritten => new ExplainQueryPlanStatement(
+                    rewritten,
+                    explainQueryPlan.Format,
+                    explainQueryPlan.InnerSql)),
             _ when ContainsSchemaQualification(statement)
                 => throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH."),
             _ => new RoutedStatement(_database, statement, IsAttached: false),
@@ -54159,6 +55779,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                 statement with { Target = "main" },
                 IsAttached: true);
         }
+
+        // `ANALYZE sqlite_schema` re-analyzes the main schema (the schema-table name is
+        // not an ordinary table target).
+        if (EmbeddedDatabase.IsSchemaTable(statement.Target))
+            return new RoutedStatement(_database, statement with { Target = null }, IsAttached: false);
 
         return new RoutedStatement(_database, statement, IsAttached: false);
     }
@@ -54452,10 +56077,43 @@ Func<string, ParsedStatement> rewrite)
         Func<string, ParsedStatement> rewrite)
     {
         if (ManagedSchemaName.TrySplit(objectName, out var schema, out var localName))
+        {
+            // SQLite reports a missing qualified object at resolve time with the
+            // qualifier kept, so validate before the routing rewrite strips it.
+            if (kind == ManagedSchemaObjectKind.Table
+                && !SchemaExists(schema, localName))
+                throw NoSuchTableError(objectName);
             return RouteSchema(schema, localName, rewrite);
+        }
 
         schema = ResolveExistingObjectSchema(objectName, kind);
         return RouteSchema(schema, objectName, rewrite);
+    }
+
+    private bool SchemaExists(string schema, string localName)
+    {
+        // The schema-table pseudo-tables (sqlite_schema/sqlite_master/sqlite_temp_schema)
+        // resolve through their own read paths, not the ordinary catalog.
+        if (EmbeddedDatabase.IsSchemaTable(localName)
+            || string.Equals(localName, "sqlite_temp_schema", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(localName, "sqlite_temp_master", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+            return DatabaseContains(_tempDatabase, localName);
+        if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
+            return DatabaseContains(_database, localName);
+        return _attachedDatabases.TryGetValue(schema, out var attachment)
+               && DatabaseContains(attachment.Database, localName);
+
+        bool DatabaseContains(EmbeddedDatabase database, string name)
+            => GetTransactionState(database) is { } state
+                ? state.Catalog.Tables.ContainsKey(name)
+                    || state.Catalog.Views.ContainsKey(name)
+                    || state.Catalog.VirtualTables.ContainsKey(name)
+                    || database.ContainsSchemaObject(name, ManagedSchemaObjectKind.Table)
+                : database.ContainsSchemaObject(name, ManagedSchemaObjectKind.Table)
+                    || database.ContainsTableOrView(name);
     }
 
     private RoutedStatement RoutePragmaTableMetadataStatement(
@@ -54540,6 +56198,10 @@ Func<string, ParsedStatement> rewrite)
                 ManagedSchemaObjectKind.Table)
                 ? "temp"
                 : "main";
+            // An index always lives in its table's database, so SQLite reports a missing
+            // target with that database qualifier even when the user wrote it bare.
+            if (!SchemaExists(schema, statement.TableName))
+                throw NoSuchTableError(ManagedSchemaName.Create(schema, statement.TableName));
             return RouteSchema(schema, statement.TableName, localTableName => statement with
             {
                 TableName = localTableName,
@@ -54549,6 +56211,12 @@ Func<string, ParsedStatement> rewrite)
         {
             if (hasTableSchema && !string.Equals(indexSchema, tableSchema, StringComparison.OrdinalIgnoreCase))
                 throw new EmbeddedSqlException("CREATE INDEX cannot span managed database schemas.");
+
+            // The index lives in the index name's database, so a missing target reports
+            // that database's qualifier even when the table name was written bare.
+            var unqualifiedTableName = hasTableSchema ? tableName : statement.TableName;
+            if (!SchemaExists(indexSchema, unqualifiedTableName))
+                throw NoSuchTableError(ManagedSchemaName.Create(indexSchema, unqualifiedTableName));
 
             return RouteSchema(
                 indexSchema,
@@ -54565,6 +56233,9 @@ Func<string, ParsedStatement> rewrite)
             throw new EmbeddedSqlException(
                 "CREATE INDEX on an attached table must qualify the index name with the attached schema.");
         }
+
+        if (!SchemaExists(tableSchema, tableName))
+            throw NoSuchTableError(ManagedSchemaName.Create(tableSchema, tableName));
 
         return RouteSchema(
             tableSchema,
@@ -54621,6 +56292,17 @@ Func<string, ParsedStatement> rewrite)
         {
             throw new EmbeddedSqlException(
                 "Managed persistent trigger bodies cannot reference another database schema.");
+        }
+
+        // SQLite reports a missing trigger target with the trigger's database qualifier when
+        // the trigger is persistent (its target lives in the same database), and with the
+        // plain user-written name when the trigger is temporary (its target is searched in
+        // every database).
+        if (!SchemaExists(resolvedTargetSchema, localTargetName))
+        {
+            throw temporary
+                ? NoSuchTableError(localTargetName)
+                : NoSuchTableError(ManagedSchemaName.Create(homeSchema, localTargetName));
         }
 
         return RouteSchema(
@@ -54712,18 +56394,23 @@ Func<string, ParsedStatement> rewrite)
             throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH.");
         }
 
-        // A temp view is stored in the connection-private temp database, and the managed engine
-        // evaluates a view inside the database that owns it, so a body reaching another schema has
-        // to be rejected outright instead of failing later with a confusing "no such table".
+        // A temp view's body may reference only temp-schema objects: the managed
+        // engine evaluates a view inside the database that owns it, so a body
+        // touching main-schema tables cannot be evaluated from temp. Upstream
+        // SQLite stores the view in temp but resolves names at query time; this
+        // cross-schema evaluation is a documented divergence (see
+        // managed-sqltest-expected-failures.txt).
         if (statement.Temporary)
         {
             var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             CollectQuerySchemas(statement.Query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-            if (schemas.Select(ResolveCollectedSchema)
-                .Any(schema => !schema.Equals("temp", StringComparison.OrdinalIgnoreCase)))
+            foreach (var schema in schemas.Select(ResolveCollectedSchema))
             {
-                throw new EmbeddedSqlException(
-                    "Managed temporary views can only reference objects in the temp schema.");
+                if (!schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new EmbeddedSqlException(
+                        "Managed temporary views can only reference objects in the temp schema.");
+                }
             }
         }
 
@@ -54980,6 +56667,7 @@ Func<string, ParsedStatement> rewrite)
         }
 
         var schema = resolvedSchemas.Single();
+        ValidateQualifiedDmlTargetsExist(statement, schema);
         var rewritten = RewriteStatementSchema(statement, schema);
         if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
             return new RoutedStatement(_database, rewritten, IsAttached: false);
@@ -54989,6 +56677,94 @@ Func<string, ParsedStatement> rewrite)
             throw new EmbeddedSqlException($"no such database: {schema}");
 
         return new RoutedStatement(attachment.Database, rewritten, IsAttached: true);
+    }
+
+    /// <summary>
+    /// Validates that every schema-qualified DML target or read source exists before the
+    /// routing rewrite strips its qualifier, so a missing table reports the name the user
+    /// wrote with the qualifier kept (<c>no such table: main.nosuch</c>), exactly like SQLite.
+    /// </summary>
+    private void ValidateQualifiedDmlTargetsExist(ParsedStatement statement, string schema)
+    {
+        switch (statement)
+        {
+            case InsertStatement insert:
+                ValidateQualifiedTarget(insert.TableName);
+                ValidateQualifiedSources(insert.Source, schema);
+                break;
+            case UpdateStatement update:
+                ValidateQualifiedTarget(update.TableName);
+                ValidateQualifiedSource(update.From, schema);
+                break;
+            case DeleteStatement delete:
+                ValidateQualifiedTarget(delete.TableName);
+                break;
+            case QueryStatement query:
+                ValidateQualifiedSources(query, schema);
+                break;
+            case WithDmlStatement with:
+                ValidateQualifiedDmlTargetsExist(with.Dml, schema);
+                break;
+        }
+
+        return;
+
+        void ValidateQualifiedTarget(string tableName)
+        {
+            if (!ManagedSchemaName.TrySplit(tableName, out var targetSchema, out var targetName))
+                return;
+            if (targetSchema.Equals(schema, StringComparison.OrdinalIgnoreCase)
+                && !SchemaExists(targetSchema, targetName))
+                throw NoSuchTableError(tableName);
+        }
+    }
+
+    private void ValidateQualifiedSources(QueryStatement? query, string schema)
+    {
+        if (query is null)
+            return;
+        if (query is SelectStatement select)
+        {
+            ValidateQualifiedSource(select.Source, schema);
+            return;
+        }
+
+        // Compound arms carry their own sources.
+        if (query is CompoundSelectStatement compound)
+        {
+            foreach (var arm in compound.Terms)
+                ValidateQualifiedSources(arm, schema);
+        }
+    }
+
+    private void ValidateQualifiedSource(TableSource? source, string schema)
+    {
+        // Only the main and temp schemas are pre-validated here: an attached or unknown
+        // schema qualifier keeps its existing error paths (e.g. "no such database: aux"),
+        // which fire when the statement routes.
+        if (!schema.Equals("main", StringComparison.OrdinalIgnoreCase)
+            && !schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        switch (source)
+        {
+            case NamedTableSource named when named.IsSchemaQualified
+                && ManagedSchemaName.TrySplit(named.Name, out var qualifiedSchema, out var qualifiedName):
+                if (qualifiedSchema.Equals(schema, StringComparison.OrdinalIgnoreCase)
+                    && !EmbeddedDatabase.IsSchemaTable(qualifiedName)
+                    && !SchemaExists(qualifiedSchema, qualifiedName))
+                    throw NoSuchTableError(named.Name);
+                break;
+            case JoinTableSource join:
+                ValidateQualifiedSource(join.Left, schema);
+                ValidateQualifiedSource(join.Right, schema);
+                break;
+            case DerivedTableSource derived:
+                ValidateQualifiedSources(derived.Query, schema);
+                break;
+        }
     }
 
     // Temp is connection-private, so a read-only catalog can safely combine its current snapshot with main.
@@ -55559,6 +57335,7 @@ Func<string, ParsedStatement> rewrite)
         {
             case null:
             case LiteralExpression:
+            case HexNegationOverflowExpression:
             case ParameterExpression:
             case ColumnExpression:
             case StarExpression:
@@ -56094,6 +57871,15 @@ Func<string, ParsedStatement> rewrite)
 
         return new RoutedStatement(attachment.Database, rewrite(localName), IsAttached: true);
     }
+
+    /// <summary>
+    /// Reports a missing table using the name the user wrote, with quotes stripped but any
+    /// database qualifier kept: <c>SELECT * FROM main."t1"</c> fails with
+    /// <c>no such table: main.t1</c>, exactly like SQLite (mirrors the qualified-name
+    /// reporting the upstream corpus pins in no-such-table-error-message.sqltest).
+    /// </summary>
+    private static EmbeddedSqlException NoSuchTableError(string userWrittenName)
+        => new($"no such table: {ManagedSchemaName.Display(userWrittenName)}");
 
     private EmbeddedDatabase ResolveBlobDatabase(string databaseName)
     {
@@ -57189,6 +58975,18 @@ Func<string, ParsedStatement> rewrite)
         return new ExecutionResult(["query_only"], [[SqlValue.Integer(_queryOnly ? 1 : 0)]], 0);
     }
 
+    private ExecutionResult ExecutePragmaCountChanges(PragmaCountChangesStatement statement)
+    {
+        ValidatePragmaSchema(statement.Schema);
+        if (statement.Enabled is { } enabled)
+        {
+            _countChanges = enabled;
+            return ExecutionResult.Empty;
+        }
+
+        return new ExecutionResult(["count_changes"], [[SqlValue.Integer(_countChanges ? 1 : 0)]], 0);
+    }
+
     private ExecutionResult ExecutePragmaForeignKeys(PragmaForeignKeysStatement statement)
     {
         ValidatePragmaSchema(statement.Schema);
@@ -57943,6 +59741,8 @@ Func<string, ParsedStatement> rewrite)
             return ["freelist_count"];
         if (statement is PragmaQueryOnlyStatement { Enabled: null })
             return ["query_only"];
+        if (statement is PragmaCountChangesStatement { Enabled: null })
+            return ["count_changes"];
         if (statement is PragmaForeignKeysStatement { Enabled: null })
             return ["foreign_keys"];
         if (statement is PragmaDeferForeignKeysStatement { Enabled: null })
@@ -59003,7 +60803,7 @@ internal sealed class EmbeddedTable
         if (autoIncrementColumns.Length > 0)
         {
             if (withoutRowid)
-                throw new EmbeddedSqlException("AUTOINCREMENT not allowed on WITHOUT ROWID tables");
+                throw new EmbeddedSqlException("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
             if (autoIncrementColumns.Length != 1
                 || RowidAliasColumnIndex < 0
                 || autoIncrementColumns[0] != RowidAliasColumnIndex)
@@ -59498,6 +61298,7 @@ internal sealed class EmbeddedTable
         {
             case LiteralExpression:
             case CurrentTimeExpression:
+            case HexNegationOverflowExpression:
                 return;
             case ColumnExpression column:
                 // A bare TRUE/FALSE keyword is the integer literal 1/0 unless a column of that
@@ -60646,8 +62447,12 @@ internal sealed class EmbeddedTable
             TableForeignKeys,
             Strict);
 
-        if (column.DefaultExpression is not null && Rows.Count > 0)
+        if (column.DefaultExpression is not null
+            && Rows.Count > 0
+            && !IsConstantDefaultExpression(column.DefaultExpression))
+        {
             throw new EmbeddedSqlException("Cannot add a column with non-constant default.");
+        }
 
         // Turso (translate/alter.rs strict_default_type_mismatch): the added column's constant
         // DEFAULT gets PLAIN affinity conversion without a strict storage-class throw. A STRICT
@@ -60655,7 +62460,7 @@ internal sealed class EmbeddedTable
         // rows, because upstream emits the validation as a table scan; an empty table defers the
         // failure to the first INSERT that stores the default (which hits the normal strict
         // storage-class check).
-        var defaultValue = CoerceColumnAffinity(column, column.DefaultValue ?? SqlValue.Null);
+        var defaultValue = CoerceColumnAffinity(column, EvaluateConstantDefault(column) ?? SqlValue.Null);
         if (Strict
             && Rows.Count > 0
             && defaultValue.Kind != SqlValueKind.Null
@@ -60689,6 +62494,77 @@ internal sealed class EmbeddedTable
             if (column.IsGenerated)
                 EmbeddedDatabase.ComputeGeneratedColumnsAfterAddColumn(this, Name, row);
         }
+    }
+
+    /// <summary>
+    /// Whether a DEFAULT expression is a constant one — literals (with the bare-identifier
+    /// string form already folded by the parser), unary +/- over a literal, and a single
+    /// parenthesized constant — mirroring Turso's is_strict_constant_default
+    /// (translate/alter.rs).
+    /// </summary>
+    private static bool IsConstantDefaultExpression(Expression expression)
+        => expression switch
+        {
+            LiteralExpression => true,
+            HexNegationOverflowExpression => true,
+            ColumnExpression { BooleanKeyword: not null } => true,
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Plus or UnaryOperator.Negate,
+                Operand: LiteralExpression or HexNegationOverflowExpression,
+            } => true,
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Plus or UnaryOperator.Negate,
+                Operand: ColumnExpression { BooleanKeyword: not null },
+            } => true,
+            _ => false,
+        };
+
+    /// <summary>
+    /// The backfill value an ALTER TABLE ADD COLUMN writes into pre-existing rows,
+    /// mirroring Turso's eval_constant_default_value (translate/alter.rs): the stored
+    /// constant default, with a negation that overflows i64 promoted to the REAL
+    /// magnitude (SQLite's valueFromExpr) instead of the prepare-time error the
+    /// expression paths raise.
+    /// </summary>
+    private static SqlValue? EvaluateConstantDefault(EmbeddedColumn column)
+    {
+        if (column.DefaultValue is { } value)
+            return value;
+
+        if (column.DefaultExpression is not { } expression)
+            return null;
+
+        return expression switch
+        {
+            HexNegationOverflowExpression => SqlValue.Real(-(double)long.MinValue),
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Negate,
+                Operand: LiteralExpression negated,
+            } => negated.Value.Kind switch
+            {
+                SqlValueKind.Integer => negated.Value.AsInteger() == long.MinValue
+                    ? SqlValue.Real(-(double)long.MinValue)
+                    : SqlValue.Integer(-negated.Value.AsInteger()),
+                SqlValueKind.Real => SqlValue.Real(-negated.Value.AsReal()),
+                _ => negated.Value,
+            },
+            UnaryExpression { Operator: UnaryOperator.Plus, Operand: LiteralExpression positive }
+                => positive.Value,
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Negate,
+                Operand: HexNegationOverflowExpression,
+            } => SqlValue.Real(-(double)long.MinValue),
+            UnaryExpression
+            {
+                Operator: UnaryOperator.Plus,
+                Operand: HexNegationOverflowExpression,
+            } => SqlValue.Real(-(double)long.MinValue),
+            _ => null,
+        };
     }
 
     /// <summary>

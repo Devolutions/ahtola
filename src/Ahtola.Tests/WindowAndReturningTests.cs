@@ -258,6 +258,8 @@ public class WindowAndReturningTests
             END;
             """);
 
+        // SQLite's RETURNING subquery reads the target table after the write but
+        // before the AFTER trigger (returning.sqltest), so both projections see 20.
         ReadRows(
                 connection,
                 """
@@ -266,7 +268,7 @@ public class WindowAndReturningTests
                 """)
             .Should()
             .ContainSingle()
-            .Which.Should().Equal(SqlValue.Integer(120), SqlValue.Integer(120));
+            .Which.Should().Equal(SqlValue.Integer(20), SqlValue.Integer(20));
     }
 
     [Test]

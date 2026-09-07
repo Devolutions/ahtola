@@ -99,6 +99,12 @@ internal static class SqltestCorpus
                 var (status, reason) = Classify(file, test);
                 discovered.Add(new SqltestDiscoveredCase(relativePath, fullPath, test.Name, status, reason));
             }
+
+            foreach (var test in file.ExpandedMatrixTests())
+            {
+                var (status, reason) = Classify(file, test);
+                discovered.Add(new SqltestDiscoveredCase(relativePath, fullPath, test.Name, status, reason));
+            }
         }
 
         return discovered;

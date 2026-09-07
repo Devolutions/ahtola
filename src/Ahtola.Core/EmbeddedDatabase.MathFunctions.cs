@@ -460,7 +460,13 @@ public sealed partial class EmbeddedDatabase
 
     /// <summary>
     /// timediff(A, B) renders A minus B as a signed ISO-8601-like interval using
-    /// SQLite's fixed +YYYY-MM-DD HH:MM:SS.SSS layout.
+    /// SQLite's fixed +YYYY-MM-DD HH:MM:SS.SSS layout. The result is a modifier that
+    /// turns B into A (<c>datetime(B, timediff(A, B)) = A</c>), so the month/day split
+    /// must use SQLite's month-arithmetic direction: forward month adds clamp a
+    /// day-of-month overflow forward (Jan 31 + 1 month = Mar 2), while the negative
+    /// direction is anchored on the later date and walked backwards, which can give a
+    /// different month/day split than the positive direction (upstream issue #8242,
+    /// timediff-negative-month-roundtrip.sqltest).
     /// </summary>
     private static SqlValue EvaluateTimeDiff(IReadOnlyList<SqlValue> arguments)
     {
@@ -474,37 +480,101 @@ public sealed partial class EmbeddedDatabase
             return SqlValue.Null;
         }
 
+        if (left == right)
+            return SqlValue.Text("+0000-00-00 00:00:00.000");
+
         var negative = left < right;
-        var start = negative ? left : right;
-        var end = negative ? right : left;
+        // The result is a modifier applied to B: positive walks B forward to A, and a
+        // negative result is applied to the later date and walked backwards, so the
+        // month/day split can differ from the positive direction (upstream #8242).
+        var anchor = right;
+        var target = left;
 
-        var years = end.Year - start.Year;
-        var months = end.Month - start.Month;
-        var days = end.Day - start.Day;
-        var time = end.TimeOfDay - start.TimeOfDay;
+        int WalkCompare(int months)
+            => AddMonthsSqlite(anchor, months).CompareTo(target);
 
-        if (time < TimeSpan.Zero)
+        // The walk is monotonic in the month count. Positive: find the maximum m with
+        // walk(m) <= target. Negative: find the minimum m with walk(m) >= target.
+        int monthDelta;
+        if (negative)
         {
-            time += TimeSpan.FromDays(1);
-            days--;
+            var low = (target.Year - anchor.Year) * 12 + target.Month - anchor.Month - 2;
+            while (WalkCompare(low) >= 0)
+                low--;
+            var high = 0;
+            while (high - low > 1)
+            {
+                var middle = low + (high - low + 1) / 2;
+                if (WalkCompare(middle) >= 0)
+                    high = middle;
+                else
+                    low = middle;
+            }
+
+            monthDelta = high;
+        }
+        else
+        {
+            var high = (target.Year - anchor.Year) * 12 + target.Month - anchor.Month + 2;
+            while (WalkCompare(high) <= 0)
+                high++;
+            var low = 0;
+            while (high - low > 1)
+            {
+                var middle = low + (high - low) / 2;
+                if (WalkCompare(middle) <= 0)
+                    low = middle;
+                else
+                    high = middle;
+            }
+
+            monthDelta = low;
         }
 
-        if (days < 0)
-        {
-            var previousMonth = end.AddMonths(-1);
-            days += DateTime.DaysInMonth(previousMonth.Year, previousMonth.Month);
-            months--;
-        }
+        var walkedAnchor = AddMonthsSqlite(anchor, monthDelta);
+        var remainder = target - walkedAnchor;
 
-        if (months < 0)
-        {
-            months += 12;
-            years--;
-        }
+        // The remainder is a day count (negative for the backward direction) plus a
+        // time-of-day delta. SQLite renders the days as the magnitude with the
+        // interval sign and the clock part always as the delta toward the target.
+        // SQLite renders negative sub-day intervals with the sign applied to the
+        // whole interval: timediff('-02:30', '00:00') is "-0000-00-00 02:30:00"
+        // (days stay 0, the time digits are the absolute remainder). Truncate
+        // toward zero so days never borrow a negative time into a positive one.
+        var days = (long)Math.Truncate(remainder.TotalDays);
+        var time = remainder - TimeSpan.FromDays(days);
 
         var sign = negative ? '-' : '+';
+        var monthMagnitude = Math.Abs(monthDelta) % 12;
+        var yearMagnitude = Math.Abs(monthDelta) / 12;
         return SqlValue.Text(string.Create(
             CultureInfo.InvariantCulture,
-            $"{sign}{years:D4}-{months:D2}-{days:D2} {time.Hours:D2}:{time.Minutes:D2}:{time.Seconds:D2}.{time.Milliseconds:D3}"));
+            $"{sign}{yearMagnitude:D4}-{monthMagnitude:D2}-{Math.Abs(days):D2} {Math.Abs(time.Hours):D2}:{Math.Abs(time.Minutes):D2}:{Math.Abs(time.Seconds):D2}.{Math.Abs(time.Milliseconds):D3}"));
+    }
+
+    /// <summary>
+    /// SQLite month arithmetic: adding N months, then normalizing an overflowed
+    /// day-of-month forward (date.c's computeJD normalization), so Jan 31 + 1 month
+    /// lands on Mar 2/3, and Feb 29 + 1 month lands on Mar 29.
+    /// </summary>
+    private static DateTime AddMonthsSqlite(DateTime value, int months)
+    {
+        var totalMonths = value.Month - 1 + months;
+        var year = value.Year + totalMonths / 12;
+        var month = totalMonths % 12;
+        if (month < 0)
+        {
+            month += 12;
+            year--;
+        }
+
+        month++;
+        var dayOverflow = value.Day - DateTime.DaysInMonth(year, month);
+        if (dayOverflow <= 0)
+            return new DateTime(year, month, value.Day, value.Hour, value.Minute, value.Second, value.Millisecond, DateTimeKind.Utc);
+
+        // An overflowed day normalizes forward into the following month.
+        var normalized = new DateTime(year, month, DateTime.DaysInMonth(year, month), value.Hour, value.Minute, value.Second, value.Millisecond, DateTimeKind.Utc);
+        return normalized.AddDays(dayOverflow);
     }
 }

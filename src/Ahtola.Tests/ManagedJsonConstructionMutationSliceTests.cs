@@ -118,7 +118,11 @@ public class ManagedJsonConstructionMutationSliceTests
         AssertNull("json_remove(NULL, '$.a')");
 
         Assert.Throws<EmbeddedSqlException>(() => Scalar("json_array_length('not json')"));
-        Assert.Throws<EmbeddedSqlException>(() => Scalar("json_valid('[1,]', 2)"));
+        // json_valid(X, 2) is the flagged JSON5 form: a trailing comma is valid
+        // JSON5 (result 1), while the strict one-argument form rejects it (0).
+        AssertInteger("json_valid('[1,]', 2)", 1);
+        AssertInteger("json_valid('[1,]')", 0);
+        Assert.Throws<EmbeddedSqlException>(() => Scalar("json_valid('[1,]', 0)"));
     }
 
     [Test]

@@ -84,7 +84,7 @@ public sealed class ManagedTempCtasStrictVirtualContractTests
         using var connection = database.Connect();
 
         var missing = () => ReadRows(connection, "SELECT * FROM temp.missing;");
-        missing.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: missing");
+        missing.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: temp.missing");
         ReadRows(connection, "PRAGMA database_list;")
             .Should().ContainSingle().Which[1].Should().Be(SqlValue.Text("main"));
     }
@@ -193,7 +193,7 @@ public sealed class ManagedTempCtasStrictVirtualContractTests
             .Should().Equal("main", "temp", "aux");
 
         var unqualifiedAttachedIndex = () => Execute(connection, "CREATE INDEX only_aux_index ON only_aux(value);");
-        unqualifiedAttachedIndex.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: only_aux");
+        unqualifiedAttachedIndex.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: main.only_aux");
         Execute(connection, "CREATE INDEX aux.only_aux_index ON only_aux(value);");
     }
 

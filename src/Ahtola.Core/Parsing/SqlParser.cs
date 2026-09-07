@@ -14,6 +14,8 @@ internal sealed class SqlParser
     private int _maximumParameterIndex;
     private bool _inTriggerBody;
     private IReadOnlyList<SqlToken>? _pendingUpdateOfTokens;
+    /// <summary>CTE names in scope for the statement body being parsed (WITH clause).</summary>
+    private HashSet<string>? _activeCteNames;
 
     private SqlParser(string sql, SqlParameterMap parameterMap, SqlSourceSpans? spans = null)
     {
@@ -65,6 +67,33 @@ internal sealed class SqlParser
         return expression;
     }
 
+    /// <summary>
+    /// Parses the optional <c>FORMAT=JSON</c> / <c>FORMAT=TEXT</c> clause after
+    /// <c>EXPLAIN QUERY PLAN</c>, mirroring <c>parse_explain_query_plan_format</c>
+    /// (parser.rs): the clause is case-insensitive and an unknown format errors.
+    /// </summary>
+    private ExplainQueryPlanFormat ParseExplainQueryPlanFormat()
+    {
+        if (!CurrentIsKeyword("FORMAT"))
+            return ExplainQueryPlanFormat.Text;
+
+        _lexer.Next();
+        if (!Consume(TokenKind.Equal))
+            throw Error("Expected '=' after FORMAT in EXPLAIN QUERY PLAN.");
+
+        var token = _lexer.Current;
+        if (token.Kind is not (TokenKind.Identifier or TokenKind.String) || token.IsQuoted)
+            throw Error("Expected a format name after FORMAT= in EXPLAIN QUERY PLAN.");
+
+        _lexer.Next();
+        if (token.Text.Equals("JSON", StringComparison.OrdinalIgnoreCase))
+            return ExplainQueryPlanFormat.Json;
+        if (token.Text.Equals("TEXT", StringComparison.OrdinalIgnoreCase))
+            return ExplainQueryPlanFormat.Text;
+
+        throw Error($"unknown EXPLAIN QUERY PLAN format: {token.Text} (supported formats: TEXT, JSON)");
+    }
+
     private ParsedStatement ParseStatement()
     {
         if (ConsumeKeyword("EXPLAIN"))
@@ -72,7 +101,11 @@ internal sealed class SqlParser
             if (ConsumeKeyword("QUERY"))
             {
                 ExpectKeyword("PLAN");
-                return new ExplainQueryPlanStatement(ParseStatement());
+                var format = ParseExplainQueryPlanFormat();
+                var innerStart = _lexer.Current.Offset;
+                var inner = ParseStatement();
+                var innerSql = _sql[innerStart..].Trim();
+                return new ExplainQueryPlanStatement(inner, format, InnerSql: innerSql);
             }
 
             return new ExplainStatement(ParseStatement());
@@ -256,6 +289,8 @@ internal sealed class SqlParser
         }
         if (name.Equals("query_only", StringComparison.OrdinalIgnoreCase))
             return new PragmaQueryOnlyStatement(ParseOptionalPragmaBoolean(name), schema);
+        if (name.Equals("count_changes", StringComparison.OrdinalIgnoreCase))
+            return new PragmaCountChangesStatement(ParseOptionalPragmaBoolean(name), schema);
         if (name.Equals("foreign_keys", StringComparison.OrdinalIgnoreCase))
             return new PragmaForeignKeysStatement(ParseOptionalPragmaBoolean(name), schema);
         if (name.Equals("defer_foreign_keys", StringComparison.OrdinalIgnoreCase))
@@ -1103,7 +1138,8 @@ internal sealed class SqlParser
             tableForeignKeys,
             strict,
             InitialRows: null,
-            Sql: NormalizeObjectSql("CREATE TABLE ", tableNameToken));
+            Sql: NormalizeObjectSql("CREATE TABLE ", tableNameToken),
+            WrittenName: tableNameToken.WrittenForm);
         _spans?.RecordQualifier(createTable, columnListCloseParen);
         _spans?.RecordName(createTable, tableNameToken);
         return createTable;
@@ -1739,7 +1775,14 @@ internal sealed class SqlParser
             throw Error("Expected a SELECT query in the view definition.");
 
         var query = ParseQuery();
-        return new CreateViewStatement(name, columns, query, NormalizeObjectSql("CREATE VIEW ", viewNameToken), ifNotExists, temporary);
+        return new CreateViewStatement(
+            name,
+            columns,
+            query,
+            NormalizeObjectSql("CREATE VIEW ", viewNameToken),
+            ifNotExists,
+            temporary,
+            WrittenName: viewNameToken.WrittenForm);
     }
 
     private ParsedStatement ParseCreateTrigger(bool temporary)
@@ -1801,7 +1844,8 @@ internal sealed class SqlParser
                 body,
                 NormalizeObjectSql("CREATE TRIGGER ", triggerNameToken),
                 ifNotExists,
-                temporary);
+                temporary,
+                WrittenName: triggerNameToken.WrittenForm);
             if (_spans is not null && _pendingUpdateOfTokens is not null)
                 _spans.RecordList(trigger, _pendingUpdateOfTokens);
             _spans?.RecordQualifier(trigger, triggerTableToken);
@@ -1905,6 +1949,10 @@ internal sealed class SqlParser
         ExpectKeyword("INTO");
         var tableName = ParseSchemaQualifiedName(out var insertTableToken);
         RejectQualifiedTriggerDmlTarget(tableName);
+        // SQLite's insert-stmt grammar allows an AS alias on the target so an
+        // UPSERT DO UPDATE body can qualify its references (INSERT INTO v AS z ...
+        // ON CONFLICT DO UPDATE SET d = z.d); the plain statement ignores it.
+        var targetAlias = ParseDmlTargetAlias();
         string[]? columns = null;
         IReadOnlyList<SqlToken>? columnTokens = null;
         if (Consume(TokenKind.LeftParen))
@@ -1957,7 +2005,8 @@ internal sealed class SqlParser
             source,
             ParseReturning(),
             upsert,
-            conflictAlgorithm);
+            conflictAlgorithm,
+            targetAlias);
         _spans?.RecordName(insert, insertTableToken);
         if (_spans is not null && columnTokens is not null)
             _spans.RecordList(insert, columnTokens);
@@ -2235,6 +2284,19 @@ internal sealed class SqlParser
             ? ([], null, null)
             : ParseOrderByAndLimit();
 
+        // An ORDER BY/LIMIT clause followed by another compound operator was misplaced:
+        // SQLite rejects it with "ORDER BY clause should come after UNION not before"
+        // (parser.rs: the clause/operator swap check after parsing ORDER BY/LIMIT).
+        if ((orderBy.Count != 0 || limit is not null)
+            && (CurrentIsKeyword("UNION") || CurrentIsKeyword("INTERSECT") || CurrentIsKeyword("EXCEPT")))
+        {
+            var operatorName = CurrentIsKeyword("UNION")
+                ? ConsumeKeyword("ALL") ? "UNION ALL" : "UNION"
+                : CurrentIsKeyword("INTERSECT") ? "INTERSECT" : "EXCEPT";
+            var clause = orderBy.Count != 0 ? "ORDER BY" : "LIMIT";
+            throw Error($"{clause} clause should come after {operatorName} not before");
+        }
+
         if (terms.Count == 1)
         {
             return terms[0] switch
@@ -2280,27 +2342,52 @@ internal sealed class SqlParser
         var commonTableExpressions = ParseCommonTableExpressions();
         if (!IsQueryStart())
             throw Error("Expected a SELECT query after the common table expression.");
-        return new WithSelectStatement(commonTableExpressions, ParseQuery());
+
+        // CTE names stay in scope for the query body, so a call like cte1(7) can be
+        // rejected as "'cte1' is not a function" at parse time (upstream planner.rs).
+        var previous = _activeCteNames;
+        _activeCteNames = new HashSet<string>(
+            commonTableExpressions.Select(static expression => expression.Name),
+            StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            return new WithSelectStatement(commonTableExpressions, ParseQuery());
+        }
+        finally
+        {
+            _activeCteNames = previous;
+        }
     }
 
     private ParsedStatement ParseWithStatement()
     {
         var commonTableExpressions = ParseCommonTableExpressions();
-        if (ConsumeKeyword("INSERT"))
-            return new WithDmlStatement(commonTableExpressions, ParseInsert());
-        if (ConsumeKeyword("REPLACE"))
-            return new WithDmlStatement(
-                commonTableExpressions,
-                ParseInsert(InsertConflictAlgorithm.Replace));
-        if (ConsumeKeyword("UPDATE"))
-            return new WithDmlStatement(commonTableExpressions, ParseUpdate());
-        if (ConsumeKeyword("DELETE"))
-            return new WithDmlStatement(commonTableExpressions, ParseDelete());
-        if (IsQueryStart())
-            return new WithSelectStatement(commonTableExpressions, ParseQuery());
+        var previous = _activeCteNames;
+        _activeCteNames = new HashSet<string>(
+            commonTableExpressions.Select(static expression => expression.Name),
+            StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (ConsumeKeyword("INSERT"))
+                return new WithDmlStatement(commonTableExpressions, ParseInsert());
+            if (ConsumeKeyword("REPLACE"))
+                return new WithDmlStatement(
+                    commonTableExpressions,
+                    ParseInsert(InsertConflictAlgorithm.Replace));
+            if (ConsumeKeyword("UPDATE"))
+                return new WithDmlStatement(commonTableExpressions, ParseUpdate());
+            if (ConsumeKeyword("DELETE"))
+                return new WithDmlStatement(commonTableExpressions, ParseDelete());
+            if (IsQueryStart())
+                return new WithSelectStatement(commonTableExpressions, ParseQuery());
 
-        throw Error(
-            "Expected a SELECT, INSERT, REPLACE, UPDATE, or DELETE statement after the common table expression.");
+            throw Error(
+                "Expected a SELECT, INSERT, REPLACE, UPDATE, or DELETE statement after the common table expression.");
+        }
+        finally
+        {
+            _activeCteNames = previous;
+        }
     }
 
     private IReadOnlyList<CommonTableExpression> ParseCommonTableExpressions()
@@ -3046,6 +3133,10 @@ internal sealed class SqlParser
         {
             if (functionName.StartsWith("pragma_", StringComparison.OrdinalIgnoreCase))
                 throw Error($"no such table: {ManagedSchemaName.Display(name)}");
+            // A CTE referenced with call arguments is a known non-function (upstream
+            // planner.rs: "'cte1' is not a function").
+            if (_activeCteNames is not null && _activeCteNames.Contains(functionName))
+                throw Error($"'{functionName}' is not a function");
             throw Error(TableValuedFunctionRegistry.UnsupportedMessage(ManagedSchemaName.Display(name)));
         }
 
@@ -3308,7 +3399,37 @@ internal sealed class SqlParser
             Expect(TokenKind.RightParen);
         }
 
+        // `x IN ((SELECT ...))` is subquery membership, the same as
+        // `x IN (SELECT ...)`: an empty subquery yields 0/1, never NULL. A list of
+        // two or more values, or a subquery embedded in a larger expression, stays a
+        // value list (mirrors is_bare_subquery/into_bare_subquery in parser.rs).
+        if (values.Count == 1 && TryUnwrapBareSubquery(values[0], out var subquery))
+            return new InSubqueryExpression(expression, subquery, negated);
+
         return new InExpression(expression, values, negated);
+    }
+
+    /// <summary>
+    /// True when <paramref name="expression"/> is a bare subquery, possibly wrapped in
+    /// one or more layers of single-element parentheses.
+    /// </summary>
+    private static bool TryUnwrapBareSubquery(Expression expression, out QueryStatement query)
+    {
+        while (true)
+        {
+            switch (expression)
+            {
+                case ScalarSubqueryExpression scalar:
+                    query = scalar.Query;
+                    return true;
+                case RowValueExpression row when row.Values.Count == 1:
+                    expression = row.Values[0];
+                    continue;
+                default:
+                    query = null!;
+                    return false;
+            }
+        }
     }
 
     private Expression ParseRelational()
@@ -3405,12 +3526,47 @@ internal sealed class SqlParser
                 return new LiteralExpression(SqlValue.Integer(long.MinValue));
             }
 
+            var hexNegation = TryParseHexNegation();
+            if (hexNegation is not null)
+                return hexNegation;
+
             return new UnaryExpression(UnaryOperator.Negate, ParseUnary());
         }
         if (Consume(TokenKind.BitwiseNot))
             return new UnaryExpression(UnaryOperator.BitwiseNot, ParseUnary());
 
         return ParsePrimary();
+    }
+
+    /// <summary>
+    /// Folds a negated hex literal the way SQLite's codeInteger does: the value
+    /// negates directly while the magnitude fits, and negating
+    /// 0x8000000000000000 becomes the prepare-time "hex literal too big" error
+    /// (kept as a marker so the ALTER TABLE default backfill can still promote
+    /// it to the REAL 2^63). Must be called right after a Minus token.
+    /// </summary>
+    private Expression? TryParseHexNegation()
+    {
+        if (_lexer.Current is not { Kind: TokenKind.Integer } hexToken
+            || !hexToken.Text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (!ulong.TryParse(
+                hexToken.Text.AsSpan(2),
+                NumberStyles.AllowHexSpecifier,
+                CultureInfo.InvariantCulture,
+                out var hex))
+        {
+            return null;
+        }
+
+        _lexer.Next();
+        if (hex == 0x8000000000000000UL)
+            return new HexNegationOverflowExpression("-" + hexToken.Text);
+
+        return new LiteralExpression(SqlValue.Integer(-unchecked((long)hex)));
     }
 
     private Expression ParseSignedPrimary()
@@ -3424,6 +3580,10 @@ internal sealed class SqlParser
                 _lexer.Next();
                 return new LiteralExpression(SqlValue.Integer(long.MinValue));
             }
+
+            var hexNegation = TryParseHexNegation();
+            if (hexNegation is not null)
+                return hexNegation;
 
             return new UnaryExpression(UnaryOperator.Negate, ParseSignedPrimary());
         }
@@ -4213,6 +4373,15 @@ internal sealed class SqlParser
             return true;
         }
 
+        // The overflowing hex negation stays an expression: the ALTER backfill
+        // promotes it to the REAL 2^63, while INSERT code generation hits the
+        // prepare-time "hex literal too big" error like upstream.
+        if (expression is HexNegationOverflowExpression)
+        {
+            value = default;
+            return false;
+        }
+
         // DEFAULT expressions are resolved with no columns in scope, so a bare TRUE/FALSE
         // keyword is always the integer literal 1/0 and stays a constant default.
         if (expression is ColumnExpression { BooleanKeyword: { } keyword })
@@ -4227,9 +4396,14 @@ internal sealed class SqlParser
                 Operand: LiteralExpression right,
             })
         {
+            // Negating i64::MIN overflows: match SQLite's valueFromExpr, which
+            // promotes -(i64::MIN) to the REAL value 2^63 (upstream
+            // eval_constant_default_value, translate/alter.rs).
             value = right.Value.Kind switch
             {
-                SqlValueKind.Integer => SqlValue.Integer(-right.Value.AsInteger()),
+                SqlValueKind.Integer => right.Value.AsInteger() == long.MinValue
+                    ? SqlValue.Real(-(double)long.MinValue)
+                    : SqlValue.Integer(-right.Value.AsInteger()),
                 SqlValueKind.Real => SqlValue.Real(-right.Value.AsReal()),
                 _ => default,
             };

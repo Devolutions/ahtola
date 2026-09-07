@@ -285,7 +285,7 @@ public sealed class FromSourcePlannerParityTests
         ReadPlanDetail(
                 connection,
                 "EXPLAIN QUERY PLAN SELECT observe(id) FROM entries INDEXED BY entries_name;")
-            .Should().Be("SCAN entries USING INDEX entries_name");
+            .Should().Be("SCAN entries USING COVERING INDEX entries_name");
         calls.Should().BeEmpty();
 
         using (var explain = connection.Prepare(

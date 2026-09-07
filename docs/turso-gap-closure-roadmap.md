@@ -31,12 +31,129 @@ scope decision; it does not mean Ahtola implements every newer Turso feature.
 | 8 | `planner-access-path-depth` | Access-path depth completed | `core/translate/optimizer/`, `planner.rs`, `main_loop/` | Done |
 | 9 | `mvcc-page-native-depth` | Documented runtime limit | `core/mvcc/` | Done |
 | 10 | `sync-engine-depth` | Split wait/apply lifecycle and crash-safe checkpoint policy | `sync/engine/src/` | Done |
+| 11 | `corpus-refresh-v0.8.0-pre.7` | 51 new files vendored, 30 refreshed, matrix runner added | `sqlite/conformance/sqlite-sqltests/`, `testing/sqltest/src/` | Done |
+| 12 | `upstream-delta-correctness` | ~180 newly vendored cases closed by engine fixes | `core/vdbe/value.rs`, `sqlite/parser/src/parser.rs`, `core/translate/select.rs` | Done |
+| 13 | `eqp-format-json` | Parser clause + plan_json envelope | `core/translate/eqp.rs`, `docs/eqp-json.md` | Done |
+| 14 | `get-set-byte-json-object-star` | Built-in `get_byte`/`set_byte` + `json_object(*)` | `turso-sqltests/get-set-byte.sqltest`, `json_object_star.sqltest` | Done |
+| 15 | `regexp-family` | Built-in regexp + operator without registration; corpus 19/19 | `core/regexp.rs`, `extensions/regexp`, `turso-sqltests/regexp.sqltest` | Done |
+| 16 | `time-family` | Full sqlean time_*/dur_* family; corpus 34/34 | `core/time/`, `turso-sqltests/time.sqltest` | Done |
+| 17 | `turso-sqltests-adoption` | regexp/sequence/time/vector/without_rowid vendored into turso/ | `turso-sqltests/` | Done |
+| 18 | `eqp-json-op-objects` | Structured per-node op objects not yet modeled | `core/translate/eqp.rs` | Open |
 
 The sqltest counts overlap by subsystem only in implementation, not in this
 classification: ranks 1-7 account for 133 distinct expected-failure entries.
 
 ## Progress
 
+- 2026-09-06: **upstream-delta continuation wave** (17 more vendored cases closed):
+  - `timediff(A, B)` now produces a modifier that turns B into A using SQLite's
+    directional month arithmetic: forward month adds clamp a day-of-month overflow
+    forward (Jan 31 + 1 month = Mar 2), while a negative diff is anchored on the
+    later date and walked backwards — the asymmetry upstream issue #8242 pins. All
+    12 `timediff-negative-month-roundtrip.sqltest` cases pass.
+  - EXISTS subqueries drop ORDER BY and DISTINCT (name-resolution still runs on the
+    dropped terms; LIMIT/OFFSET stay, since OFFSET decides whether a row comes out
+    at all): the three `exists-drops-order-by-distinct.sqltest` gaps close.
+  - A WINDOW-clause definition with a base that is defined nowhere errors
+    (`no such window: X`), while a forward reference (a base defined later in the
+    same clause) is silently ignored — SQLite's resolution order, matching all
+    14 named-window-chain cases.
+  - UPDATE ... RETURNING sees the row after the write but before the AFTER trigger
+    fires (the returning.sqltest after-trigger cases; two prior tests asserting the
+    old post-trigger behavior updated to the SQLite-cross-checked semantics).
+  - A DELETE resets the conflict-policy override to ABORT for the triggers it
+    fires (SQLite's OE_Default row-delete coding), so an outer UPDATE OR REPLACE no
+    longer propagates through a DELETE into its trigger's plain INSERT, while an
+    explicit OR clause on the inner statement still wins.
+  - TEMP triggers fire before the table's own triggers and, among themselves, in
+    creation order (the main schema's own list stays newest-first), matching
+    temp-trigger-fires-before-main.sqltest.
+  - `WITH cte1(x) AS ... SELECT * FROM cte1(7)` rejects with `'cte1' is not a
+    function` (parser CTE-scope tracking; the plain-table variant needs a plan-time
+    catalog check and remains an expected-failure).
+- 2026-09-06: **sqlean extension ports completed.**
+  - The regexp family is now built-in: `regexp(pattern, source)` follows
+    `core/regexp.rs`'s `to_text_coerced` semantics (integers/reals as text, blobs as
+    UTF-8 bytes, NULL as NULL, invalid patterns as NULL, wrong arity as an error),
+    the `X REGEXP Y` operator works without user registration, and the
+    `extensions/regexp` family (`regexp_like`, `regexp_substr`, `regexp_replace`
+    first-match with `$N` group expansion, `regexp_capture` with an optional group
+    index) is registered. The vendored `turso/regexp.sqltest` passes 19/19.
+  - The full sqlean time family (~45 functions) is ported in
+    `EmbeddedDatabase.TimeFunctions.cs`: a `SqleanTime` value with the documented
+    13-byte blob layout (version, 8 big-endian seconds since 0001-01-01, 4 big-endian
+    nanoseconds) and civil-calendar arithmetic (Howard Hinnant's
+    days_from_civil/civil_from_days) so the corpus's BCE years round-trip;
+    time_now/make_date/make_timestamp; the time_get family (named getters return
+    INTEGER whole seconds per `get_second()`, the two-argument `time_get(t,
+    'second')` carries the nanosecond fraction as REAL); time_unix/to_timestamp/
+    time_milli/micro/nano and time_to_*; comparisons; the `dur_*` constants;
+    time_add/time_add_date (chrono-style whole-month moves with day clamping)/
+    time_sub/since/until; time_trunc (field form incl. the corpus's ISO-week
+    Jan-1+(week-1)*7 semantics, duration form) and time_round (nearest-multiple,
+    ties away from zero, via decimal to avoid seconds*1e9 overflow); time_fmt_* with
+    optional UTC offsets; time_parse (RFC 3339, naive datetime, date, time forms).
+    The vendored `turso/time.sqltest` passes 34/34.
+  - The supported `turso-sqltests` subset is vendored under
+    `conformance/sqlite-sqltests/turso/`: regexp (19/19), sequence (23/23), time
+    (34/34), vector (21/22 — the one difference is Turso's CLI "Parse error:"
+    display prefix, recorded as an expected-failure), without_rowid (3/11 — the
+    failing cases pin Turso's insert-only WITHOUT ROWID restrictions that Ahtola
+    deliberately exceeds: secondary UNIQUE/INDEX, UPDATE, DELETE, INSERT OR
+    REPLACE, UPSERT, and FOREIGN KEY are all supported extensions, recorded as
+    intentional expected-failures). The AUTOINCREMENT-on-WITHOUT-ROWID message was
+    aligned to upstream ("is not allowed").
+- 2026-09-05: **corpus refresh to the v0.8.0-pre.7 pin.** The vendored
+  `conformance/sqlite-sqltests/` corpus was stale at the v0.7.2 vintage while
+  `turso-src/` had moved to v0.8.0-pre.7 (`277ddd050`). Vendored the 51
+  post-v0.7.2 files (~707 test blocks: the window-frame matrix suite,
+  `recursive-cte` (118), `unnest-correlated` (90), `json-valid-strict` (101),
+  error-message/affinity/trigger regression files) and refreshed the 30 drifted
+  files (90 net-new tests). Added the upstream `@var`/`matrix` grammar to the
+  managed sqltest parser with a differential SQLite oracle
+  (`SqltestMatrixOracle` over Microsoft.Data.Sqlite, mirroring
+  `matrix_oracle.rs`): every matrix expansion runs against bundled SQLite and
+  the managed engine must agree. Fixed the slug/dedup semantics so operator
+  values (`=`, `<=`) that slug identically get `~N` suffixes.
+- 2026-09-05: **upstream-delta correctness wave** (~180 newly vendored cases
+  closed by engine fixes): `char()` now coerces every argument to an integer
+  codepoint (text/blob numeric prefix, real truncation, NULL as 0) per
+  `exec_char` in `core/vdbe/value.rs`; `IN ((SELECT ...))` is subquery
+  membership, not a one-element value list (parser.rs
+  `is_bare_subquery`); ORDER BY/GROUP BY ordinals only reference a column when
+  the literal fits an i32 (select.rs `resolve_order_by_or_group_by_expr`),
+  so `ORDER BY 6641019685895816357` is a constant and `ORDER BY -1` errors;
+  compound ORDER BY before an operator reports
+  "ORDER BY clause should come after UNION not before"; missing
+  qualified tables report the user-written name (`no such table: main.nosuch`)
+  for SELECT/DML/DDL/CREATE INDEX/CREATE TRIGGER, with pre-routing validation
+  that respects transaction-local catalogs, temp virtual tables, and
+  `no such database` precedence for unknown schemas; "already exists"
+  collision errors echo the user's written quoting
+  (`table "t""q" already exists`) and view/table cross-namespace clashes use
+  SQLite's "view v already exists" / "there is already a table named t"
+  spellings; CHECK-constraint failures dequote the leading quoted token and
+  carry no `(19)` shell suffix (matching sqlite3_errmsg); `printf` precision
+  cap raised to 1,000,000 (upstream `MAX_WIDTH`) for the overflow-payload
+  fixtures; `PRAGMA count_changes` implemented (DML returns one changes row);
+  `pragma_function_list` now lists `percent_rank`/`cume_dist`;
+  `ANALYZE sqlite_schema` re-analyzes main.
+- 2026-09-05: **new upstream extensions**: `EXPLAIN QUERY PLAN FORMAT=JSON`
+  (case-insensitive clause, `plan_json` row with the documented
+  version/sql/result_columns/nodes envelope; the structured `op` objects are a
+  documented follow-up), built-in `get_byte`/`set_byte`
+  (PostgreSQL-parity byte access with wrap semantics and range errors), and
+  `json_object(*)`/`jsonb_object(*)` star expansion over the current FROM row.
+- 2026-09-05: expected-failures baseline regenerated for the refreshed
+  corpus: 177 entries. The newly exposed remaining gaps are concentrated in
+  json_valid strict flags (45), recursive-CTE depth semantics (36), the
+  window frame matrix edge families (23), `unnest` correlated-plan EQP shapes
+  (21), timediff negative-month asymmetry (8), DELETE/UPDATE LIMIT
+  rejections (8 — intentional extension, documented), plus scattered
+  smaller clusters (partial-index EQP labels, aggregate-of-outer-column,
+  ALTER default negate overflow, SUM inverse-mode persistence). The
+  sqlean-time family, the sqlean regexp extension functions, and adopting
+  the supported subset of `turso-sqltests/` remain open (rank 15).
 - 2026-08-28: closed `scalar-expression-parity` (31 markers).
 - 2026-08-28: closed `pragma-introspection-parity` (29 markers).
 - 2026-08-29: closed `json-jsonb-parity` (21 markers).
@@ -400,3 +517,88 @@ Each workstream must cite the matching Turso source, add focused tests, run the
 smallest affected managed suite through `Invoke-ManagedTestSuite.ps1`, run the
 full affected sqltest file(s), remove newly passing expected-failure entries,
 and keep the shipped closure pure managed, trim-safe, and NativeAOT-safe.
+
+- 2026-09-06: **json conformance wave** (the 45-case json-valid-strict cluster
+  closed, 152 expected-failures remain):
+  - Two-argument `json_valid(X, Y)`: Y is a bitmask (1 = strict RFC 8259 text,
+    2 = JSON5 text, 4 = blob that superficially looks like JSONB, 8 = blob that
+    is fully valid JSONB) and X is valid when any selected check passes. The
+    FLAGS argument coerces like sqlite3_value_int (numeric conversion, text and
+    blobs take their leading integer prefix), and out-of-range flags error with
+    SQLite's exact message. The parser now tracks which constructs were JSON5
+    (unquoted keys, single quotes, trailing commas, comments, hex numbers,
+    leading `+`/`.` and trailing `.`, Infinity/NaN, `\x`/`\v`/`\0` escapes, raw
+    control bytes, line continuations), and the marking survives later standard
+    escapes exactly like upstream's TEXT5/TEXTJ element-type promotion.
+  - A byte-faithful port of SQLite's jsonbValidityCheck drives flags 4/8 and
+    json_error_position on JSONB blobs: shallow outer-header classification with
+    the ambiguous small `{`/`[`/digit-blob fallback to strict validation,
+    32-bit nine-byte header reads, bare-header requirements for NULL/TRUE/FALSE,
+    digit/hex/canonical-float payload checks, TEXTJ/TEXT5 escape validation
+    including the strchr backslash-NUL bug-compatibility, line continuations,
+    the blind \u conversion after a continuation, and the 1000-deep nesting
+    limit. Non-JSONB blobs and text validate as before, and document parsing
+    now stops at the first embedded NUL like SQLite.
+  - JSON5 leniencies: numbers need a mantissa digit with SQLite's error
+    positions (bare dot at the dot, signed just after the dot, exponent-less
+    forms at the number start, repeated dots/exponents at the offending
+    character); `\` + U+2028/U+2029 line continuations; unquoted keys follow
+    SQLite's identifier rules (letters/`_`/`$` start, digits continue,
+    non-ASCII accepted) with `\uXXXX` escapes kept verbatim in the rendered key
+    while matching decodes them and every other escape rejected; comments after
+    a key act as whitespace; the vertical-tab escape renders through
+    `\u0009` (SQLite through 3.51.1 bug-compatibility) while extraction still
+    yields 0x0B.
+  - JSONB TEXT5 payloads store verbatim JSON5 escapes (hex(jsonb('"\x41\n"'))
+    is a TEXT5 element with the raw source), and TEXT5 payloads re-read through
+    a dedicated decoder so json(jsonb(...)) round-trips.
+  - `subtype(X)` builtin: 74 for text carrying the JSON subtype, 0 for
+    everything else including JSONB blobs.
+  - Bad-path messages use SQLite's %Q: apostrophes doubled, embedded NUL ends
+    the message.
+
+- 2026-09-06 (continued): **compound ORDER BY + hex-negation overflow wave**
+  (6 more vendored cases closed, 146 expected-failures remain):
+  - A compound SELECT's ORDER BY term now matches an arm's projection
+    structurally (function calls like `upper(b)`, arithmetic, and qualified
+    references against an aliased output), porting Turso's
+    resolve_compound_order_by_expr + exprs_are_equivalent (select.rs/util.rs):
+    identifiers compare case-insensitively and commutative binary operators
+    match with sides swapped.
+  - A negated hex literal folds at parse time like SQLite's codeInteger:
+    `-0xNNNN` becomes the negated integer while the magnitude fits, and
+    `-0x8000000000000000` is the prepare-time "hex literal too big" error.
+    The ALTER TABLE ADD COLUMN backfill still promotes the negation to the
+    REAL 2^63 (upstream eval_constant_default_value), while INSERT
+    code-generation and direct SELECT hit the error (upstream issue #4621).
+
+- 2026-09-06 (continued): **partial-index covering wave** (5 vendored cases
+  closed, 141 expected-failures remain):
+  - A partial index covers a query whose WHERE contains the partial predicate
+    verbatim: the implied term is dropped from the key-only check (SQLite's
+    whereLoopAddBtree pPartIdxWhere handling), so `EXPLAIN QUERY PLAN` reports
+    USING COVERING INDEX for both SEARCH and SCAN shapes.
+  - A reference to the table's rowid-alias column under its declared name (e.g.
+    `id` for `id INTEGER PRIMARY KEY`) is always satisfiable from an index
+    entry, closing the plain covering gap that also affected non-partial
+    indexes.
+  - `INSERT INTO t AS z ...` parses SQLite's target alias (used to qualify
+    UPSERT DO UPDATE references); the plain statement accepts and ignores it.
+  - Two EQP tests that pinned the pre-fix non-covering wording were updated to
+    the SQLite-verified COVERING plans.
+
+- 2026-09-06 (continued): **recursive-CTE LIMIT/OFFSET wave** (12 vendored
+  cases closed, 129 expected-failures remain):
+  - A recursive CTE's own LIMIT/OFFSET now bounds the recursion the way
+    SQLite's co-routine does (recursive_cte.rs init_limit/emit_offset): a
+    literal LIMIT 0 skips everything (the anchor is never evaluated, so its
+    errors never surface), a negative limit is unlimited, expressions evaluate
+    once up front, OFFSET rows are dropped from the output while still feeding
+    the recursive step, and the limit counter stops the expansion the moment
+    enough rows have been emitted. The emit budget combines with (and caps at)
+    the outer query's row budget.
+  - Closed: limit, limit-offset, zero-limit x2, expression-limit-and-offset,
+    fuzz-120717, left-join-on-clause x2, order-with-limit-stops-infinite, and
+    the correlated limit/offset family.
+  - Remaining in the cluster: ORDER BY priority-queue semantics (7), nested-CTE
+    self-reference rules (7), and scattered singles (10).

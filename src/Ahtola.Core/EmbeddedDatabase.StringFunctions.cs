@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Ahtola.Core;
 
@@ -512,20 +513,19 @@ public sealed partial class EmbeddedDatabase
         var builder = new StringBuilder(arguments.Count);
         foreach (var argument in arguments)
         {
-            // Turso only converts INTEGER arguments to code points. NULL remains a NUL character,
-            // while REAL, TEXT, and BLOB arguments do not contribute a character.
-            long codePoint;
-            switch (argument.Kind)
+            // char() coerces every argument to an integer codepoint, the same way
+            // sqlite3_value_int64 / CAST(... AS INTEGER) does: text and blobs by their
+            // numeric prefix (0 if none), floats by truncation, NULL as 0
+            // (turso-src/core/vdbe/value.rs exec_char).
+            long codePoint = argument.Kind switch
             {
-                case SqlValueKind.Integer:
-                    codePoint = argument.AsInteger();
-                    break;
-                case SqlValueKind.Null:
-                    codePoint = 0;
-                    break;
-                default:
-                    continue;
-            }
+                SqlValueKind.Integer => argument.AsInteger(),
+                SqlValueKind.Real => RealToInteger(argument.AsReal()),
+                SqlValueKind.Text => CoerceTextPrefixToInteger(argument.AsText()),
+                SqlValueKind.Blob => CoerceTextPrefixToInteger(
+                    Encoding.UTF8.GetString(argument.AsBlob().Span)),
+                _ => 0,
+            };
 
             // SQLite substitutes U+FFFD for values outside the Unicode range and
             // for surrogate code points, which cannot stand alone.
@@ -541,6 +541,52 @@ public sealed partial class EmbeddedDatabase
         return SqlValue.Text(builder.ToString());
     }
 
+    /// <summary>
+    /// Coerces a text value's numeric prefix to an integer the way SQLite's
+    /// <c>sqlite3_value_int64</c> does for text: the longest leading numeric run,
+    /// or 0 when there is none.
+    /// </summary>
+    private static long CoerceTextPrefixToInteger(string text)
+    {
+        var end = 0;
+        var seenDigit = false;
+        while (end < text.Length)
+        {
+            var character = text[end];
+            if (char.IsDigit(character))
+            {
+                seenDigit = true;
+                end++;
+            }
+            else if ((character is '+' or '-') && end == 0)
+            {
+                end++;
+            }
+            else if (character == '.' && seenDigit)
+            {
+                end++;
+            }
+            else if ((character is 'e' or 'E') && seenDigit)
+            {
+                end++;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        return seenDigit && long.TryParse(text[..end], out var value)
+            ? value
+            : 0;
+    }
+
+    /// <summary>Truncates a REAL toward zero into an i64, saturating at the i64 bounds.</summary>
+    private static long RealToInteger(double value)
+        => value >= long.MaxValue ? long.MaxValue
+            : value <= long.MinValue ? long.MinValue
+            : (long)value;
+
     private static SqlValue EvaluateUnicode(IReadOnlyList<SqlValue> arguments)
     {
         RequireArgumentCount("unicode", arguments, 1);
@@ -552,6 +598,218 @@ public sealed partial class EmbeddedDatabase
             return SqlValue.Null;
 
         return SqlValue.Integer(char.ConvertToUtf32(text, 0));
+    }
+
+    /// <summary>
+    /// <c>regexp(pattern, source)</c>: 1 when the pattern matches, 0 when it does not,
+    /// NULL when either operand is NULL or the pattern is invalid (not an error). Every
+    /// operand coerces to text the way <c>to_text_coerced</c> does in
+    /// <c>turso-src/core/regexp.rs</c>: integers/reals by their decimal text, blobs by their
+    /// UTF-8 bytes. Wrong arity raises the dedicated error because the upstream varargs
+    /// shim used to panic on it.
+    /// </summary>
+    private static SqlValue EvaluateRegexp(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count != 2)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp()");
+
+        return RegexpMatch(RegexpText(arguments[0]), RegexpText(arguments[1]));
+    }
+
+    /// <summary>
+    /// <c>regexp_like(source, pattern)</c>: the same match test with swapped operands,
+    /// mirroring <c>extensions/regexp</c>; NULL for non-text operands (the extension is
+    /// stricter than the core <c>regexp</c> path).
+    /// </summary>
+    private static SqlValue EvaluateRegexpLike(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count != 2)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp_like()");
+
+        var source = arguments[0].Kind == SqlValueKind.Text ? arguments[0].AsText() : null;
+        var pattern = arguments[1].Kind == SqlValueKind.Text ? arguments[1].AsText() : null;
+        return RegexpMatch(pattern, source);
+    }
+
+    /// <summary>
+    /// <c>regexp_substr(source, pattern)</c>: the first matching substring, or NULL when
+    /// there is no match, an operand is non-text/NULL, or the pattern is invalid.
+    /// </summary>
+    private static SqlValue EvaluateRegexpSubstr(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count != 2)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp_substr()");
+
+        if (arguments[0].Kind != SqlValueKind.Text || arguments[1].Kind != SqlValueKind.Text)
+            return SqlValue.Null;
+
+        var regex = TryCompileRegexp(arguments[1].AsText());
+        if (regex is null)
+            return SqlValue.Null;
+
+        var match = regex.Match(arguments[0].AsText());
+        return match.Success ? SqlValue.Text(match.Value) : SqlValue.Null;
+    }
+
+    /// <summary>
+    /// <c>regexp_replace(source, pattern, replacement)</c>: replaces the first match (the
+    /// Rust <c>Regex::replace</c> default) with the replacement text, where <c>$1</c>-style
+    /// capture references expand. A missing third argument is an empty replacement.
+    /// </summary>
+    private static SqlValue EvaluateRegexpReplace(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count < 2 || arguments.Count > 3)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp_replace()");
+
+        var source = arguments[0].Kind == SqlValueKind.Text ? arguments[0].AsText() : null;
+        var pattern = arguments[1].Kind == SqlValueKind.Text ? arguments[1].AsText() : null;
+        var replacement = arguments.Count == 3 && arguments[2].Kind == SqlValueKind.Text
+            ? arguments[2].AsText()
+            : string.Empty;
+        if (source is null || pattern is null)
+            return SqlValue.Text(string.Empty);
+
+        var regex = TryCompileRegexp(pattern);
+        if (regex is null)
+            return SqlValue.Text(string.Empty);
+
+        return SqlValue.Text(regex.Replace(source, replacement, count: 1));
+    }
+
+    /// <summary>
+    /// <c>regexp_capture(source, pattern[, group])</c>: the first capture group (default 1)
+    /// of the first match, or NULL when there is no match, the group is missing, an operand
+    /// is NULL, or the pattern is invalid.
+    /// </summary>
+    private static SqlValue EvaluateRegexpCapture(IReadOnlyList<SqlValue> arguments)
+    {
+        if (arguments.Count < 2 || arguments.Count > 3)
+            throw new EmbeddedSqlException("wrong number of arguments to function regexp_capture()");
+
+        if (arguments[0].Kind != SqlValueKind.Text || arguments[1].Kind != SqlValueKind.Text)
+            return SqlValue.Null;
+
+        var group = 1;
+        if (arguments.Count == 3)
+        {
+            if (arguments[2].Kind == SqlValueKind.Null)
+                return SqlValue.Null;
+            group = arguments[2].Kind == SqlValueKind.Integer ? (int)arguments[2].AsInteger() : 1;
+        }
+
+        var regex = TryCompileRegexp(arguments[1].AsText());
+        if (regex is null)
+            return SqlValue.Null;
+
+        var match = regex.Match(arguments[0].AsText());
+        if (!match.Success || group >= match.Groups.Count || !match.Groups[group].Success)
+            return SqlValue.Null;
+
+        return SqlValue.Text(match.Groups[group].Value);
+    }
+
+    private static SqlValue RegexpMatch(string? pattern, string? source)
+    {
+        if (pattern is null || source is null)
+            return SqlValue.Null;
+
+        var regex = TryCompileRegexp(pattern);
+        if (regex is null)
+            return SqlValue.Null;
+
+        return SqlValue.Integer(regex.IsMatch(source) ? 1 : 0);
+    }
+
+    private static Regex? TryCompileRegexp(string pattern)
+    {
+        try
+        {
+            return new Regex(pattern, RegexOptions.CultureInvariant);
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Coerces a regexp operand to text the way <c>to_text_coerced</c> does
+    /// (extensions/core/src/types.rs): text verbatim, integers/reals by their
+    /// invariant-culture text, blobs by their UTF-8 bytes, NULL stays null.
+    /// </summary>
+    private static string? RegexpText(SqlValue value) => value.Kind switch
+    {
+        SqlValueKind.Null => null,
+        SqlValueKind.Text => value.AsText(),
+        SqlValueKind.Integer => value.AsInteger().ToString(CultureInfo.InvariantCulture),
+        SqlValueKind.Real => value.AsReal().ToString(CultureInfo.InvariantCulture),
+        SqlValueKind.Blob => Encoding.UTF8.GetString(value.AsBlob().Span),
+        _ => null,
+    };
+
+    /// <summary>
+    /// <c>get_byte(data, offset)</c>: PostgreSQL-compatible byte access on blobs. Text input
+    /// is read as its UTF-8 bytes; NULL in either argument yields NULL; an out-of-range
+    /// offset raises <c>index N out of valid range, 0..LEN-1</c> exactly like PG
+    /// (turso-sqltests/get-set-byte.sqltest).
+    /// </summary>
+    private static SqlValue EvaluateGetByte(IReadOnlyList<SqlValue> arguments)
+    {
+        RequireArgumentCount("get_byte", arguments, 2);
+        if (HasNullArgument(arguments))
+            return SqlValue.Null;
+
+        var data = ToByteString(arguments[0]);
+        var offset = ToByteOffset(arguments[1]);
+        ValidateByteOffset(offset, data.Length);
+        return SqlValue.Integer(data[offset]);
+    }
+
+    /// <summary>
+    /// <c>set_byte(data, offset, value)</c>: PostgreSQL-compatible byte replacement. The value
+    /// wraps to its low 8 bits, the result is always a blob (even for text input), NULL in any
+    /// argument yields NULL, and out-of-range offsets raise the PG-style range error.
+    /// </summary>
+    private static SqlValue EvaluateSetByte(IReadOnlyList<SqlValue> arguments)
+    {
+        RequireArgumentCount("set_byte", arguments, 3);
+        if (HasNullArgument(arguments))
+            return SqlValue.Null;
+
+        var data = ToByteString(arguments[0]);
+        var offset = ToByteOffset(arguments[1]);
+        ValidateByteOffset(offset, data.Length);
+
+        var value = ToByteOffset(arguments[2]);
+        var replaced = new byte[data.Length];
+        data.AsSpan().CopyTo(replaced);
+        replaced[offset] = (byte)(value & 0xff);
+        return SqlValue.BlobOwned(replaced);
+    }
+
+    private static byte[] ToByteString(SqlValue value)
+        => value.Kind switch
+        {
+            SqlValueKind.Blob => value.AsBlob().ToArray(),
+            SqlValueKind.Text => Encoding.UTF8.GetBytes(value.AsText()),
+            SqlValueKind.Integer => [(byte)(value.AsInteger() & 0xff)],
+            SqlValueKind.Real => [(byte)((long)value.AsReal() & 0xff)],
+            _ => [],
+        };
+
+    private static long ToByteOffset(SqlValue value)
+        => value.Kind switch
+        {
+            SqlValueKind.Integer => value.AsInteger(),
+            SqlValueKind.Text => CoerceTextPrefixToInteger(value.AsText()),
+            SqlValueKind.Real => RealToInteger(value.AsReal()),
+            _ => 0,
+        };
+
+    private static void ValidateByteOffset(long offset, int length)
+    {
+        if (offset < 0 || offset >= length)
+            throw new EmbeddedSqlException($"index {offset} out of valid range, 0..{length - 1}");
     }
 
     private static SqlValue EvaluateUnhex(IReadOnlyList<SqlValue> arguments)

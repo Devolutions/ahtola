@@ -283,7 +283,14 @@ internal sealed class SqlLexer
                 continue;
             }
 
-            return new SqlToken(TokenKind.Identifier, value.ToString(), start, IsQuoted: true);
+            // RawText preserves the user's exact spelling (quotes and escaped quotes)
+            // for error messages that echo the written name, like SQLite's
+            // `table "t2" already exists`.
+            var raw = _sql[start.._offset];
+            return new SqlToken(TokenKind.Identifier, value.ToString(), start, IsQuoted: true)
+            {
+                RawText = raw,
+            };
         }
 
         throw new EmbeddedSqlException($"Unterminated quoted identifier at offset {start}.");
@@ -507,6 +514,16 @@ internal readonly record struct SqlToken(
     bool IsQuoted = false)
 {
     public int End { get; init; } = Offset;
+
+    /// <summary>
+    /// The identifier exactly as the user wrote it, quotes included — empty for
+    /// unquoted identifiers (where it matches <see cref="Text"/>). SQLite echoes this
+    /// spelling in "already exists" collision errors.
+    /// </summary>
+    public string RawText { get; init; } = string.Empty;
+
+    /// <summary>Returns the user-written spelling: <see cref="RawText"/> when quoted, else <see cref="Text"/>.</summary>
+    public string WrittenForm => IsQuoted && RawText.Length != 0 ? RawText : Text;
 }
 
 internal readonly record struct LexerState(int Offset, SqlToken Token);

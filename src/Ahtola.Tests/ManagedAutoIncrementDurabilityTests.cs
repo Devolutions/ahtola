@@ -343,7 +343,7 @@ public sealed class ManagedAutoIncrementDurabilityTests
                         connection,
                         "CREATE TABLE rejected("
                         + "id INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID"))!
-                .Message.Should().Be("AUTOINCREMENT not allowed on WITHOUT ROWID tables");
+                .Message.Should().Be("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
             ReadInteger(
                     connection,
                     "SELECT count(*) FROM sqlite_schema "

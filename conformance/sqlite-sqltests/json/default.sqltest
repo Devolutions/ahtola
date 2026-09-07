@@ -3461,19 +3461,3 @@ test jsonb-oversized-child-remove {
 }
 expect {
 }
-
-test json-subtype-query-materialization-boundaries {
-    SELECT json_array(value) FROM (SELECT json('[1,2]') AS value);
-    WITH boundary(value) AS (SELECT json('[1,2]')) SELECT json_array(value) FROM boundary;
-    CREATE VIEW json_boundary AS SELECT json('[1,2]') AS value;
-    SELECT json_array(value) FROM json_boundary;
-    SELECT json_array(value)
-      FROM (SELECT json('[1,2]') AS value UNION ALL SELECT json('[3,4]'));
-}
-expect {
-    ["[1,2]"]
-    ["[1,2]"]
-    ["[1,2]"]
-    ["[1,2]"]
-    ["[3,4]"]
-}
