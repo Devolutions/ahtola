@@ -853,11 +853,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         Action<string, long>? TransactionBlobMutation = null,
         ManagedSchemaRowSet? StagedSchemaRows = null,
         ManagedSequenceSession? SequenceSession = null,
-        // Resolves the journal_mode string for a schema name (null = the routed database
-        // itself), set once per EmbeddedDatabase instance by its owning EmbeddedConnection
-        // (EmbeddedDatabase.SetDescribeJournalMode) so pragma_journal_mode() can report the
-        // connection-aware value (including temp's special "always wal") instead of
-        // conflating it with the single routed instance context.Database alone exposes.
+        // Connection-scoped: several connections may share the same EmbeddedDatabase.
         Func<string?, string>? DescribeJournalMode = null)
     {
         /// <summary>
@@ -1691,17 +1687,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     public EmbeddedConnection Connect() => new(this);
 
-    // Set once by the owning EmbeddedConnection (mirroring
-    // CopyFunctionAndCollationRegistriesTo) so a table-valued function whose result depends
-    // on connection-level state spanning multiple physical databases - pragma_journal_mode,
-    // which must report "wal" for temp regardless of this instance's own pager state - can
-    // resolve any schema name through the connection instead of being limited to
-    // context.Database, which is only ever this one routed instance.
-    private Func<string?, string>? _describeJournalMode;
-
-    internal void SetDescribeJournalMode(Func<string?, string> describeJournalMode)
-        => _describeJournalMode = describeJournalMode;
-
     internal void CopyFunctionAndCollationRegistriesTo(EmbeddedDatabase target)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
@@ -2161,7 +2146,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
-        ManagedSequenceSession? sequenceSession = null)
+        ManagedSequenceSession? sequenceSession = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         var result = ExecuteCore(
             statement,
@@ -2182,7 +2168,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             vdbeExecutionOptions,
             synchronousMode,
             virtualTableTransaction,
-            sequenceSession);
+            sequenceSession,
+            describeJournalMode);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -2225,7 +2212,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
-        ManagedSequenceSession? sequenceSession = null)
+        ManagedSequenceSession? sequenceSession = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         synchronousMode.Validate(nameof(synchronousMode));
         ThrowIfRecursiveTriggerCallbackReentry();
@@ -2254,7 +2242,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 vdbeExecutionOptions,
                 synchronousMode,
                 virtualTableTransaction,
-                sequenceSession));
+                sequenceSession,
+                describeJournalMode));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -2315,7 +2304,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                     changeDataCapture: changeDataCapture,
                                     vdbeExecutionOptions: vdbeExecutionOptions,
                                     virtualTableTransaction: statementVirtualTableTransaction,
-                                    sequenceSession: sequenceSession);
+                                    sequenceSession: sequenceSession,
+                                    describeJournalMode: describeJournalMode);
                             }
                             catch (EmbeddedConflictFailException)
                             {
@@ -2416,7 +2406,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 externalTables,
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
-                                sequenceSession: sequenceSession);
+                                sequenceSession: sequenceSession,
+                                describeJournalMode: describeJournalMode);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -2464,7 +2455,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             externalTables,
                             changeDataCapture: changeDataCapture,
                             vdbeExecutionOptions: vdbeExecutionOptions,
-                            sequenceSession: sequenceSession);
+                            sequenceSession: sequenceSession,
+                            describeJournalMode: describeJournalMode);
 
                     var working = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
                     try
@@ -2491,7 +2483,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
                                 virtualTableTransaction: virtualTableTransaction,
-                                sequenceSession: sequenceSession);
+                                sequenceSession: sequenceSession,
+                                describeJournalMode: describeJournalMode);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -3341,7 +3334,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CancellationToken cancellationToken,
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
-        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null)
+        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         lock (_gate)
         {
@@ -3355,7 +3349,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 cancellationToken,
                 vdbeExecutionOptions,
                 executeTableList,
-                externalTables);
+                externalTables,
+                describeJournalMode);
         }
     }
 
@@ -3369,7 +3364,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CancellationToken cancellationToken,
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
-        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null)
+        IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         var tables = CreateExecutionTables(catalog.Tables, externalTables);
         var context = new QueryContext(
@@ -3385,7 +3381,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             VirtualTables: catalog.VirtualTables,
             VdbeExecutionOptions: vdbeExecutionOptions,
             Database: this,
-            DescribeJournalMode: _describeJournalMode);
+            DescribeJournalMode: describeJournalMode);
         var result = MaterializeQueryResult(ExecuteQuery(statement, parameters, context, outerRow: null));
         var affinities = DescribeQueryAffinities(
             statement,
@@ -5362,7 +5358,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         TransactionMutationOverlay? transactionOverlay = null,
         EmbeddedFileReadSnapshot? transactionPinnedSnapshot = null,
         Action<string, long>? transactionBlobMutation = null,
-        ManagedSequenceSession? sequenceSession = null)
+        ManagedSequenceSession? sequenceSession = null,
+        Func<string?, string>? describeJournalMode = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -5395,7 +5392,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 transactionOverlay,
                 transactionPinnedSnapshot,
                 transactionBlobMutation,
-                sequenceSession));
+                sequenceSession,
+                describeJournalMode));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -5443,7 +5441,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ? new CteMutationState()
                 : null,
             Database: this,
-            DescribeJournalMode: _describeJournalMode,
+            DescribeJournalMode: describeJournalMode,
             TransactionOverlay: transactionOverlay,
             TransactionPinnedSnapshot: transactionPinnedSnapshot,
             TransactionBlobMutation: transactionBlobMutation,
@@ -54025,8 +54023,6 @@ public sealed partial class EmbeddedConnection : IDisposable
         _database = database;
         _tempDatabase = new EmbeddedDatabase();
         _database.CopyFunctionAndCollationRegistriesTo(_tempDatabase);
-        _database.SetDescribeJournalMode(DescribeJournalModeForSchema);
-        _tempDatabase.SetDescribeJournalMode(DescribeJournalModeForSchema);
     }
 
     internal bool HasActiveTransaction => _transactionDatabases is not null;
@@ -54815,7 +54811,6 @@ public sealed partial class EmbeddedConnection : IDisposable
         _tempDatabase.Dispose();
         _tempDatabase = new EmbeddedDatabase();
         _database.CopyFunctionAndCollationRegistriesTo(_tempDatabase);
-        _tempDatabase.SetDescribeJournalMode(DescribeJournalModeForSchema);
     }
 
     internal ExecutionResult Execute(
@@ -55059,7 +55054,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
                                 virtualTableTransaction: transactionState?.VirtualTableTransaction,
-                                sequenceSession: _sequenceSession);
+                                sequenceSession: _sequenceSession,
+                                describeJournalMode: DescribeJournalModeForSchema);
                         }
                         else if (transactionState is null)
                         {
@@ -55084,7 +55080,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     changeDataCapture: changeDataCapture,
                                     vdbeExecutionOptions: vdbeExecutionOptions,
                                     synchronousMode: GetSynchronousMode(routed.Database),
-                                    sequenceSession: _sequenceSession);
+                                    sequenceSession: _sequenceSession,
+                                    describeJournalMode: DescribeJournalModeForSchema);
                             }
                             catch (Exception failure)
                                 when (failure is not EmbeddedConflictFailException
@@ -55133,7 +55130,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     ? null
                                     : transactionState.PinnedSnapshot,
                                 transactionBlobMutation: transactionState.RecordBlobMutation,
-                                sequenceSession: _sequenceSession);
+                                sequenceSession: _sequenceSession,
+                                describeJournalMode: DescribeJournalModeForSchema);
                             if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
                             // The catalog overload used for transactional statements does not
@@ -55475,7 +55473,6 @@ public sealed partial class EmbeddedConnection : IDisposable
                 // Fresh in-memory attach inherits main page size (and MVCC when enabled).
                 inMemoryAttached._inMemoryPageSize = _database.GetPageSize();
                 _database.CopyFunctionAndCollationRegistriesTo(inMemoryAttached);
-                inMemoryAttached.SetDescribeJournalMode(DescribeJournalModeForSchema);
                 inMemoryAttached.BusyTimeout = BusyTimeout;
                 if (_database.IsMvccEnabled)
                     _ = inMemoryAttached.EnableMvccMode();
@@ -55559,7 +55556,6 @@ public sealed partial class EmbeddedConnection : IDisposable
                 readOnly,
                 initialPageSize: isFreshAttach ? _database.GetPageSize() : null);
             _database.CopyFunctionAndCollationRegistriesTo(attached);
-            attached.SetDescribeJournalMode(DescribeJournalModeForSchema);
             attached.BusyTimeout = BusyTimeout;
 
             if (isFreshAttach)
@@ -55837,7 +55833,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 cancellationToken,
                 vdbeExecutionOptions,
                 ExecutePragmaTableList,
-                source.ExternalTables)
+                source.ExternalTables,
+                DescribeJournalModeForSchema)
             : source.Database.MaterializeCreateTableAs(
                 sourceQuery,
                 parameters,
@@ -55848,7 +55845,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 cancellationToken,
                 vdbeExecutionOptions,
                 ExecutePragmaTableList,
-                source.ExternalTables);
+                source.ExternalTables,
+                DescribeJournalModeForSchema);
         cancellationToken.ThrowIfCancellationRequested();
         if (ReferenceEquals(source.Database, _tempDatabase))
             _tempInitialized = true;
@@ -59644,12 +59642,7 @@ Func<string, ParsedStatement> rewrite)
         return database.GetJournalMode().ToString().ToLowerInvariant();
     }
 
-    // The pragma_journal_mode() table-valued function's connection-aware resolver: a null
-    // schema (the TVF called with no argument) reports main's mode, matching PRAGMA
-    // journal_mode's own unqualified default. Reused by every EmbeddedDatabase instance this
-    // connection owns (SetDescribeJournalMode), since a routed statement's context.Database
-    // is only ever the single instance that statement targets and cannot see its sibling
-    // schemas (temp, an attached database) on its own.
+    // A null schema has the same main-database default as the statement form.
     private string DescribeJournalModeForSchema(string? schema)
     {
         var database = ResolvePragmaDatabase(schema);

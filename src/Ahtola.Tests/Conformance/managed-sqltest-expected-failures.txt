@@ -27,10 +27,9 @@
 # correlated-subquery-aggregate-groupby.sqltest (4 cases) and
 # trigger-before-insert-affinity.sqltest (3 cases) fully passing. It also exposed
 # a missing pragma_journal_mode() function and two VACUUM INTO diagnostics.
-# The VACUUM INTO diagnostics are aligned; the function remains assigned to
-# the SQL-binding workstream. Both upstream journal-mode cases expect wal
-# for :memory:, whereas Ahtola preserves SQLite's memory mode. Once the function
-# exists, its output will retain that same intentional storage-mode divergence.
+# The VACUUM INTO diagnostics and table-valued function are implemented. Both
+# upstream journal-mode cases expect wal for :memory:, whereas Ahtola preserves
+# SQLite's memory mode in both the statement and table-valued forms.
 
 # Intentional SQLite-compatible extensions beyond the pinned Turso baseline:
 # Ahtola supports DELETE/UPDATE ... ORDER BY/LIMIT (the SQLite
@@ -52,7 +51,7 @@ delete-update-limit-rejected.sqltest::update-order-by-limit-rejected | database 
 gencol.sqltest::gencol_stored_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 gencol.sqltest::gencol_stored_generated_always_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 multi_index_or_compound.sqltest::compound-or-analyzed-benchmark-shape-eqp | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH e USING INDEX idx_edge_label (label=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
-pragma/memory.sqltest::pragma-function-update-journal-mode | assigned to coordinator (missing capability): database variant 1/1 (:memory:): expected success but got error: no such table: pragma_journal_mode At SQL offset 33. Note: expected value is 'wal', so once pragma_journal_mode() lands this is still an intentional storage-mode divergence (see pragma-update-journal-mode-wal), not a passing case.
+pragma/memory.sqltest::pragma-function-update-journal-mode | intentional storage-mode divergence: pragma_journal_mode() reports the same SQLite-correct memory mode as the statement form for :memory:, while the pinned Turso case expects wal
 pragma/memory.sqltest::pragma-update-journal-mode-wal | intentional storage-mode divergence: Ahtola reports journal_mode='memory' (SQLite-correct) for a :memory: database; Turso's Rust engine always reports wal/mvcc even in-memory
 recursive-cte.sqltest::recursive-cte-union-recursive-collation | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s)
 recursive-cte.sqltest::recursive-cte-create-table-as-select | database variant 1/1 (:memory:): expected success but got error: no such table: c

@@ -241,20 +241,8 @@ internal sealed class PragmaCacheSizeModule : TableValuedFunctionModule
 /// <summary>
 /// <c>pragma_journal_mode</c>. Reports the current journal mode for the given schema (main
 /// when the argument is omitted, matching PRAGMA journal_mode's own unqualified default) -
-/// always the live value, reflecting any PRAGMA journal_mode change already applied, never a
-/// cached or hardcoded one. The schema name comes from the hidden argument itself
-/// (SchemaNameArgumentIndex), evaluated exactly like any other call argument, so a bound
-/// parameter (`pragma_journal_mode(?)`) resolves the same as a literal - call.Schema is a
-/// different concept entirely (an explicit `schema.pragma_journal_mode(...)` qualifier on
-/// the function name, used only for BestIndex routing of literal schema arguments via
-/// CollectTableValuedFunctionSchemas) and is left alone. context.Database alone is only the
-/// single database this statement's own routing picked, which is wrong whenever the argument
-/// names a different schema (a bound parameter can never be seen by that static routing, and
-/// even a literal argument only routes correctly when it is the sole schema the statement
-/// touches), so this goes through context.DescribeJournalMode - set once per EmbeddedDatabase
-/// instance by its owning EmbeddedConnection (EmbeddedDatabase.SetDescribeJournalMode) - which
-/// re-resolves the named schema itself, including temp's special "always wal" regardless of
-/// the routed instance's own pager state.
+/// evaluated through the calling connection so bound schema arguments, attached databases,
+/// and the connection's temporary schema use the same resolution as the statement form.
 /// </summary>
 internal sealed class PragmaJournalModeModule : TableValuedFunctionModule
 {
@@ -272,26 +260,10 @@ internal sealed class PragmaJournalModeModule : TableValuedFunctionModule
         var schema = call.HasArgument(0) && call.Arguments[0].Kind != SqlValueKind.Null
             ? TableValuedFunctionRows.CoerceToText(call.Arguments[0])
             : null;
-        var mode = call.Context.DescribeJournalMode?.Invoke(schema)
-            ?? DescribeWithoutConnection(call.Context.Database);
+        var describe = call.Context.DescribeJournalMode
+            ?? throw new InvalidOperationException("A connection-scoped journal-mode resolver is required.");
+        var mode = describe(schema);
         return [[SqlValue.Text(mode), call.Arguments[0]]];
-    }
-
-    // Degraded fallback for a context with no connection-aware resolver wired - every real
-    // execution path wires one onto each EmbeddedDatabase instance a connection owns
-    // (EmbeddedConnection's constructor, ResetTemporaryDatabase, ExecuteAttach), so this only
-    // matters for a context built outside that lifecycle. Describes context.Database's own
-    // mode directly, correct unless the schema argument actually names a different database
-    // than the one this statement was routed to.
-    private static string DescribeWithoutConnection(EmbeddedDatabase? database)
-    {
-        if (database is null)
-            return "memory";
-        if (database.IsMvccEnabled)
-            return "mvcc";
-        if (!database.IsFileBacked)
-            return "memory";
-        return database.GetJournalMode().ToString().ToLowerInvariant();
     }
 }
 

@@ -226,9 +226,9 @@ See `managed-sqltest-expected-failures.txt`'s COVER provenance note and commit
 `7e33e6cb1bc06998ed332e170b3c79e9d7c05a2a` for the full detail: all 12 `@backend rust`
 declarations in the pinned corpus were reviewed individually and found to be ordinary SQL/
 PRAGMA cases (none needed a harness exclusion). Ten now match after the parent corrected the
-two `VACUUM INTO` diagnostics. Two journal-mode cases remain: the missing
-`pragma_journal_mode()` function is assigned to the SQL-binding workstream, while both
-cases retain a documented storage-mode difference once that function exists
+two `VACUUM INTO` diagnostics. The `pragma_journal_mode()` function is implemented with
+per-connection execution context; the two journal-mode cases retain a documented
+storage-mode difference
 (`journal_mode='memory'` for `:memory:` is SQLite-correct; Turso's Rust engine always reports
 `wal`/`mvcc`). `@backend cli` (sqlite3 CLI dot-commands: `btree_dump`, `cmdlineshell*`,
 `select/memory.sqltest`'s dot-command cases, etc.) remains skipped — genuinely CLI-process-
