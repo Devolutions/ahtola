@@ -34,8 +34,10 @@ a missing feature relative to this pin; both engines reject it.
   integration; do not select one worker's whole file over another's.
 - Workers report commit IDs, exact closed case IDs, executed validation commands
   and counts, upstream citations, remaining blockers, and any new failures.
-- No worker creates/pushes a PR or changes another worktree. The coordinator
-  assembles reviewed commits in this session before any publication decision.
+- No worker pushes, creates a PR, or changes another worktree. The coordinator
+  brings every accepted worker commit back to `copilot/closeable-turso-gaps`,
+  resolves overlaps, and validates the combined result here. The deliverable is
+  one final PR from this parent session, not one PR per child.
 
 ## Wave 1: recorded SQL correctness
 
