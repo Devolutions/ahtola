@@ -63672,6 +63672,7 @@ internal sealed class EmbeddedTable
     // MaterializationTransactionLease. Released exactly once, whenever this specific instance's
     // copy of the loader actually runs (see EnsureRowsLoaded).
     private IPendingRowLoadResourceLease? _pendingRowLoadResourceLease;
+    private readonly object _rowLoadGate = new();
     private bool _rowsLoaded = true;
 
     // True only while EnsureRowsLoaded's own loader invocation is on the call stack. The loader
@@ -63728,7 +63729,14 @@ internal sealed class EmbeddedTable
     /// (nothing ever attaches a loader) and for any table whose rows have already been loaded,
     /// whether lazily or eagerly.
     /// </summary>
-    internal bool HasPendingRowLoad => !_rowsLoaded && _rowLoadFailure is null;
+    internal bool HasPendingRowLoad
+    {
+        get
+        {
+            lock (_rowLoadGate)
+                return !_rowsLoaded && _rowLoadFailure is null;
+        }
+    }
 
     /// <summary>
     /// True once a previous attempt to load this table's committed rows has thrown partway
@@ -63736,7 +63744,14 @@ internal sealed class EmbeddedTable
     /// same failure from this point on — the table's row set can never be trusted again once a
     /// load has failed partway (see <see cref="EnsureRowsLoaded"/>).
     /// </summary>
-    internal bool HasFailedRowLoad => _rowLoadFailure is not null;
+    internal bool HasFailedRowLoad
+    {
+        get
+        {
+            lock (_rowLoadGate)
+                return _rowLoadFailure is not null;
+        }
+    }
 
     /// <summary>
     /// Defers this table's initial row load to first access instead of populating it
@@ -63754,14 +63769,30 @@ internal sealed class EmbeddedTable
     internal void AttachPendingRowLoader(Action<EmbeddedTable> loader, IPendingRowLoadResourceLease? resourceLease = null)
     {
         ArgumentNullException.ThrowIfNull(loader);
-        _pendingRowLoader = loader;
-        _pendingRowLoadResourceLease = resourceLease;
-        _rowsLoaded = false;
-        _rowLoadFailure = null;
+        lock (_rowLoadGate)
+        {
+            if (_rowLoadInProgress)
+                throw new InvalidOperationException("Cannot replace a row loader while it is running.");
+            _pendingRowLoader = loader;
+            _pendingRowLoadResourceLease = resourceLease;
+            _rowLoadFailure = null;
+            Volatile.Write(ref _rowsLoaded, false);
+        }
     }
 
     private void EnsureRowsLoaded()
     {
+        if (Volatile.Read(ref _rowsLoaded))
+            return;
+
+        lock (_rowLoadGate)
+            EnsureRowsLoadedCore();
+    }
+
+    private void EnsureRowsLoadedCore()
+    {
+        // The monitor is reentrant for the loader's own Rows.Add/RowIds.Add calls;
+        // a different thread cannot observe the in-progress stores.
         if (_rowsLoaded || _rowLoadInProgress)
             return;
 
@@ -63790,9 +63821,9 @@ internal sealed class EmbeddedTable
             // table loaded: flipping _rowsLoaded before this point (as an earlier revision did)
             // would let a mid-load throw permanently strand a truncated row set that every later
             // reader — including a subsequent VACUUM/persist pass — would then treat as complete.
-            _rowsLoaded = true;
             _pendingRowLoader = null;
             _pendingRowLoadResourceLease = null;
+            Volatile.Write(ref _rowsLoaded, true);
         }
         catch (Exception exception)
         {
@@ -63828,11 +63859,20 @@ internal sealed class EmbeddedTable
     /// </remarks>
     private bool TryCopyPendingRowLoadTo(EmbeddedTable clone)
     {
-        if (_rowsLoaded || _pendingRowLoader is null)
-            return false;
+        Action<EmbeddedTable> loader;
+        IPendingRowLoadResourceLease? lease;
+        lock (_rowLoadGate)
+        {
+            if (_rowLoadInProgress)
+                throw new InvalidOperationException("Cannot clone a row store while its loader is running.");
+            if (_rowsLoaded || _pendingRowLoader is null)
+                return false;
+            loader = _pendingRowLoader;
+            lease = _pendingRowLoadResourceLease?.Retain();
+            clone._rowsStore.AdoptIdentity(_rowsStore.LineageId, _rowsStore.Revision);
+        }
 
-        clone._rowsStore.AdoptIdentity(_rowsStore.LineageId, _rowsStore.Revision);
-        clone.AttachPendingRowLoader(_pendingRowLoader, _pendingRowLoadResourceLease?.Retain());
+        clone.AttachPendingRowLoader(loader, lease);
         return true;
     }
 
