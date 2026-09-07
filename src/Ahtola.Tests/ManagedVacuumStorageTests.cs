@@ -15,6 +15,32 @@ public sealed class ManagedVacuumStorageTests
         "202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F";
 
     [Test]
+    public void VacuumIntoRejectsEmptyDestinationWithTursoDiagnostic()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Action vacuum = () => Execute(connection, "VACUUM INTO '';");
+        vacuum.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("VACUUM INTO path cannot be empty");
+    }
+
+    [TestCase("VACUUM;", "cannot VACUUM from within a transaction")]
+    [TestCase("VACUUM INTO 'not-created.db';", "cannot VACUUM INTO from within a transaction")]
+    public void VacuumTransactionDiagnosticDistinguishesInto(string sql, string message)
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(value); BEGIN;");
+
+        Action vacuum = () => Execute(connection, sql);
+        vacuum.Should().Throw<EmbeddedSqlException>().WithMessage(message);
+
+        Execute(connection, "INSERT INTO t VALUES (1); ROLLBACK;");
+        ReadValue(connection, "SELECT count(*) FROM t;").Should().Be(SqlValue.Integer(0));
+    }
+
+    [Test]
     public void VacuumMainReclaimsCompleteCatalogAndPreservesHeaderAndRowids()
     {
         var path = CreateDatabasePath("catalog");

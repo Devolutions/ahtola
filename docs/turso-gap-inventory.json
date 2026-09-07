@@ -14,8 +14,8 @@
       "commit_at_analysis": "7b62a3f"
     },
     "conformance_ground_truth": "src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt (606 failure lines at analysis time)",
-    "current_conformance_expected_failures": 100,
-    "current_conformance_expected_failures_note": "At Ahtola 83bb892, the refreshed v0.8.0-pre.7 corpus records 82 engine/planner/diagnostic parity candidates, 17 deliberate extensions (8 DML LIMIT, 2 STORED generated columns, 7 WITHOUT ROWID), and one CLI-only vector error-prefix difference. The 217 closed records below are historical dispositions, including scope decisions, not an exhaustive current parity claim.",
+    "current_conformance_expected_failures": 102,
+    "current_conformance_expected_failures_note": "The refreshed v0.8.0-pre.7 corpus records the original 82 parity candidates, 17 deliberate extensions, and one CLI-only vector prefix difference, plus two newly enabled Rust-backend journal-mode cases. pragma_journal_mode() is assigned to the SQL-binding workstream; both cases ultimately retain the intentional SQLite-correct memory-versus-wal mode difference. The two newly exposed VACUUM INTO diagnostics are aligned. The 217 closed records below are historical dispositions, not an exhaustive current parity claim.",
     "current_execution_plan": "docs/turso-remaining-gap-plan.md",
     "last_reconciled": "2026-09-06",
     "entry_count": 217,

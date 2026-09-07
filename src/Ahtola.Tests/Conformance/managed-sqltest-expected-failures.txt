@@ -26,11 +26,11 @@
 # @backend cli remains skipped (sqlite3 CLI dot-commands only). This newly ran
 # correlated-subquery-aggregate-groupby.sqltest (4 cases) and
 # trigger-before-insert-affinity.sqltest (3 cases) fully passing. It also exposed
-# 3 genuine diagnostic/implementation gaps (pragma_journal_mode() and the two
-# VACUUM INTO message texts below, assigned to the coordinator for a fix) and 1
-# intentional storage-mode divergence: Ahtola reports the SQLite-correct
-# journal_mode='memory' for a :memory: database, while Turso's Rust engine always
-# reports wal/mvcc even in-memory — that upstream expectation is not adopted.
+# a missing pragma_journal_mode() function and two VACUUM INTO diagnostics.
+# The VACUUM INTO diagnostics are aligned; the function remains assigned to
+# the SQL-binding workstream. Both upstream journal-mode cases expect wal
+# for :memory:, whereas Ahtola preserves SQLite's memory mode. Once the function
+# exists, its output will retain that same intentional storage-mode divergence.
 
 # Intentional SQLite-compatible extensions beyond the pinned Turso baseline:
 # Ahtola supports DELETE/UPDATE ... ORDER BY/LIMIT (the SQLite
@@ -134,8 +134,6 @@ unnest-correlated.sqltest::two-identical-averages-use-one-grouped-table | databa
 unnest-correlated.sqltest::grouped-seek-does-not-copy-unused-columns | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
 unnest-correlated.sqltest::unnested-in-reuses-unused-cursor | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
 unnest-correlated.sqltest::grouped-aggregate-reuses-unused-result-register | database variant 1/1 (:memory:): expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
-vacuum_into.sqltest::vacuum-into-empty-path-rejected | assigned to coordinator: database variant 1/1 (:memory:): error 'Managed VACUUM INTO supports only non-empty ordinary file paths.' does not match pattern 'VACUUM INTO path cannot be empty'
-vacuum_into.sqltest::vacuum-into-rejected-in-transaction | assigned to coordinator: database variant 1/1 (:memory:): error 'cannot VACUUM from within a transaction' does not match pattern 'cannot VACUUM INTO from within a transaction'
 turso/vector.sqltest::vector-insert-no-quotes | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is otherwise identical)
 turso/without_rowid.sqltest::without-rowid-secondary-unique-rejected | intentional extension: Ahtola supports secondary UNIQUE constraints on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-create-index-rejected | intentional extension: Ahtola supports secondary CREATE INDEX on WITHOUT ROWID tables where the pinned Turso corpus expects rejection

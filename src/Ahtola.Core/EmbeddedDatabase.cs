@@ -59631,7 +59631,9 @@ Func<string, ParsedStatement> rewrite)
         if (_queryOnly)
             throw new EmbeddedSqlException("attempt to write a readonly database");
         if (_transactionDatabases is not null)
-            throw new EmbeddedSqlException("cannot VACUUM from within a transaction");
+            throw new EmbeddedSqlException(statement.Into is null
+                ? "cannot VACUUM from within a transaction"
+                : "cannot VACUUM INTO from within a transaction");
 
         var databaseName = statement.Schema ?? "main";
         var database = ResolveDatabase(databaseName);
@@ -59670,6 +59672,8 @@ Func<string, ParsedStatement> rewrite)
                 throw new EmbeddedSqlException("non-text filename");
 
             var destinationPath = destinationValue.AsText();
+            if (destinationPath.Length == 0)
+                throw new EmbeddedSqlException("VACUUM INTO path cannot be empty");
             if (string.IsNullOrWhiteSpace(destinationPath)
                 || destinationPath.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
                 || destinationPath.StartsWith("file:", StringComparison.OrdinalIgnoreCase))

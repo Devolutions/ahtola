@@ -39,16 +39,9 @@ internal static class SqltestCorpus
         new(StringComparer.Ordinal) { "trigger", "strict" };
 
     /// <summary>
-    /// <c>@backend</c> values the managed engine can execute directly. <c>rust</c> marks a
-    /// case that pins the Rust-native engine's own behavior (as opposed to <c>cli</c>, which
-    /// targets sqlite3 CLI dot-commands the managed engine has no equivalent for, or a build
-    /// distinguishing sqlite3 semantics the pinned corpus otherwise runs unconditionally).
-    /// Ahtola is the managed analog of the Rust engine, so ordinary SQL under <c>@backend
-    /// rust</c> is runnable; it is not an API/process-only contract. Reviewed case-by-case
-    /// against conformance/sqlite-sqltests: correlated-subquery-aggregate-groupby.sqltest (4),
-    /// pragma/memory.sqltest (2 journal_mode cases), trigger-before-insert-affinity.sqltest (3
-    /// REAL-affinity NEW-column cases), and vacuum_into.sqltest (3 validation-error cases) are
-    /// all ordinary SQL/PRAGMA statements with no CLI dot-command or native-process dependency.
+    /// The pinned <c>@backend rust</c> cases contain ordinary SQL, not native API calls.
+    /// Execute them and classify behavioral differences rather than hiding them as skips.
+    /// CLI and other backend contracts remain excluded.
     /// </summary>
     private static readonly HashSet<string> RunnableBackends =
         new(StringComparer.Ordinal) { "rust" };
