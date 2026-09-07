@@ -58989,16 +58989,29 @@ Func<string, ParsedStatement> rewrite)
                     : RewriteMainTempReadQuery(insert.Source, sourceNames, noCtes),
                 Rows = insert.Rows.Select(row => row.Select(expression =>
                     RewriteMainTempReadExpression(expression, sourceNames, noCtes)!).ToArray()).ToArray(),
+                Returning = RewriteMainTempReadProjections(insert.Returning, sourceNames, noCtes),
             },
             UpdateStatement update => update with
             {
                 TableName = targetLocalName,
+                Assignments = update.Assignments.Select(assignment => assignment with
+                {
+                    Value = RewriteMainTempReadExpression(assignment.Value, sourceNames, noCtes)!,
+                }).ToArray(),
                 Where = RewriteMainTempReadExpression(update.Where, sourceNames, noCtes),
+                OrderBy = RewriteMainTempReadOrderBy(update.EffectiveOrderBy, sourceNames, noCtes),
+                Limit = RewriteMainTempReadExpression(update.Limit, sourceNames, noCtes),
+                Offset = RewriteMainTempReadExpression(update.Offset, sourceNames, noCtes),
+                Returning = RewriteMainTempReadProjections(update.Returning, sourceNames, noCtes),
             },
             DeleteStatement delete => delete with
             {
                 TableName = targetLocalName,
                 Where = RewriteMainTempReadExpression(delete.Where, sourceNames, noCtes),
+                OrderBy = RewriteMainTempReadOrderBy(delete.EffectiveOrderBy, sourceNames, noCtes),
+                Limit = RewriteMainTempReadExpression(delete.Limit, sourceNames, noCtes),
+                Offset = RewriteMainTempReadExpression(delete.Offset, sourceNames, noCtes),
+                Returning = RewriteMainTempReadProjections(delete.Returning, sourceNames, noCtes),
             },
             _ => statement,
         };
@@ -59166,6 +59179,8 @@ Func<string, ParsedStatement> rewrite)
         // restricts a view's body to the schema that owns it (temp-view.sqltest,
         // views.sqltest::drop-view-finds-temp-view-with-unqualified-name). Temp shadows main on
         // a name collision, matching ordinary unqualified-name precedence.
+        var mainCatalog = GetTransactionState(_database)?.Catalog ?? _database.LiveCatalog;
+        var tempCatalog = GetTransactionState(_tempDatabase)?.Catalog ?? _tempDatabase.LiveCatalog;
         var views = new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in mainCatalog.Views)
             views[pair.Key] = pair.Value;
@@ -59317,6 +59332,15 @@ Func<string, ParsedStatement> rewrite)
         => orderBy.Select(term => term with
         {
             Expression = RewriteMainTempReadExpression(term.Expression, sourceNames, commonTableExpressions)!,
+        }).ToArray();
+
+    private IReadOnlyList<Projection>? RewriteMainTempReadProjections(
+        IReadOnlyList<Projection>? projections,
+        IReadOnlyDictionary<string, string> sourceNames,
+        HashSet<string> commonTableExpressions)
+        => projections?.Select(projection => projection with
+        {
+            Expression = RewriteMainTempReadExpression(projection.Expression, sourceNames, commonTableExpressions)!,
         }).ToArray();
 
     private Expression? RewriteMainTempReadExpression(
