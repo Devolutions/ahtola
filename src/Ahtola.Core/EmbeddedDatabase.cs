@@ -255,6 +255,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
     internal const string SqliteStat4TableName = "sqlite_stat4";
     private const string TursoSequenceBackingTablePrefix = "__turso_internal_seq_";
     private const string TursoAutoIncrementSequencePrefix = "__turso_internal_autoincrement_";
+    // Mirrors Turso's RESERVED_TABLE_PREFIXES (core/schema.rs): the whole "__turso_internal_"
+    // namespace is reserved for internal objects (sequence backing tables, the autoincrement
+    // namespace, DBSP materialized-view state, ...), not just the two specific sub-prefixes
+    // above. ALTER TABLE RENAME TO checks this directly (core/translate/alter.rs::validate);
+    // object creation goes through IsReservedObjectName instead.
+    private const string TursoInternalReservedPrefix = "__turso_internal_";
     private static readonly ConditionalWeakTable<IFileSystem, FileCatalogWriteLockScope> FileCatalogWriteLocks = new();
     private static readonly ConditionalWeakTable<IFileSystem, FileCatalogWriterRegistry> FileCatalogWriterRegistries = new();
     private readonly object _gate = new();
@@ -27530,6 +27536,11 @@ out bool hasReturning)
             throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
         if (IsSqliteSequenceTable(statement.NewName))
             throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
+        // The whole __turso_internal_ namespace is reserved (sequence backing tables, the
+        // autoincrement namespace, DBSP materialized-view state, ...), not just the specific
+        // sub-prefixes IsSqliteSequenceTable/IsAutoIncrementSequenceBackingTable already reject.
+        if (statement.NewName.StartsWith(TursoInternalReservedPrefix, StringComparison.OrdinalIgnoreCase))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {statement.NewName}");
         if (tables.ContainsKey(statement.NewName) || virtualTables?.ContainsKey(statement.NewName) == true)
             throw new EmbeddedSqlException($"table {statement.NewName} already exists");
         if (views?.ContainsKey(statement.NewName) == true)
@@ -64342,6 +64353,9 @@ internal sealed class EmbeddedTable
             case AlterTableAddColumnStatement { Column.GenerationExpression: { } expression }:
                 ValidateGenerationExpressionAllowed(expression);
                 return;
+            case AlterTableAlterColumnStatement { Column.GenerationExpression: { } expression }:
+                ValidateGenerationExpressionAllowed(expression);
+                return;
         }
     }
 
@@ -64815,6 +64829,10 @@ internal sealed class EmbeddedTable
     /// complete column definition, while table-level constraints and explicit indexes survive.
     /// A rename first uses the established token-aware rewrite path so dependent expressions,
     /// self references, and explicit-index text continue to resolve against the replacement name.
+    /// Turning the column into (or out of) a VIRTUAL generated column is supported the way
+    /// Turso's schema.rs alter_table_alter_column does; STORED remains rejected because adding a
+    /// STORED column requires rewriting every row's payload, which ALTER COLUMN's schema-text
+    /// edit does not do (see ALTER TABLE ADD COLUMN's identical STORED rejection).
     /// </summary>
     public EmbeddedTable CreateWithAlteredColumn(
         string name,
@@ -64832,10 +64850,13 @@ internal sealed class EmbeddedTable
             throw new EmbeddedSqlException("PRIMARY KEY constraint cannot be altered");
         if (replacementColumn.Unique)
             throw new EmbeddedSqlException("UNIQUE constraint cannot be altered");
-        if (replacementColumn.IsGenerated)
-            throw new EmbeddedSqlException("ALTER COLUMN to a generated column is not supported");
+        if (replacementColumn.IsGenerated && replacementColumn.GeneratedStored)
+            throw new EmbeddedSqlException("cannot add a STORED column");
         if (replacementColumn.ForeignKeyConstraints.Count > 0)
             throw new EmbeddedSqlException("ALTER COLUMN with REFERENCES is not supported");
+
+        var wasVirtual = ColumnDefinitions[alteredColumnIndex].IsGenerated
+            && !ColumnDefinitions[alteredColumnIndex].GeneratedStored;
 
         var renamed = string.Equals(oldName, replacementColumn.Name, StringComparison.Ordinal)
             ? Clone()
@@ -64879,6 +64900,16 @@ internal sealed class EmbeddedTable
                 cancellationToken.ThrowIfCancellationRequested();
 
             var row = renamed.Rows[rowIndex].ToArray();
+            if (wasVirtual && !replacementColumn.IsGenerated)
+            {
+                // Neither SQLite nor Turso ever persist a virtual generated column's computed
+                // value to the row, so a pre-existing row has no history for the column once it
+                // becomes an ordinary one: it gets the new column's DEFAULT, or NULL when it has
+                // none -- mirroring ADD COLUMN's backfill (EvaluateConstantDefault) -- rather
+                // than keeping the stale value this row array happened to cache from the last
+                // time the (still virtual) column was computed.
+                row[alteredColumnIndex] = EvaluateConstantDefault(replacementColumn) ?? SqlValue.Null;
+            }
             row[alteredColumnIndex] = ApplyColumnAffinity(replacementColumn, row[alteredColumnIndex]);
             altered.Rows.Add(row);
             EmbeddedDatabase.ComputeGeneratedColumnsAfterAddColumn(altered, Name, row);

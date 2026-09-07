@@ -157,19 +157,6 @@ turso/legacy-unquoted-view-columns.sqltest::legacy-broken-view-row-still-listed-
 # the coordinator's ownership; COVER does not implement engine fixes.
 turso/alter_column.sqltest::alter-column-all-to-generated-error | database variant 1/1 (:memory:): error 'ALTER COLUMN to a generated column is not supported' does not match pattern 'Parse error: must have at least one non-generated column'
 turso/alter_column.sqltest::alter-column-only-to-generated-error | database variant 1/1 (:memory:): error 'ALTER COLUMN to a generated column is not supported' does not match pattern 'Parse error: must have at least one non-generated column'
-turso/alter_column.sqltest::alter-column-regular-to-virtual-rewrites-rows | database variant 1/1 (:memory:): expected success but got error: ALTER COLUMN to a generated column is not supported
-turso/alter_column.sqltest::alter-column-to-generated-check-violation | database variant 1/1 (:memory:): error 'ALTER COLUMN to a generated column is not supported' does not match pattern 'CHECK constraint failed'
-turso/alter_column.sqltest::alter-column-to-generated-missing-column-error | database variant 1/1 (:memory:): error 'ALTER COLUMN to a generated column is not supported' does not match pattern 'no such column: missing'
-turso/alter_column.sqltest::alter-column-to-generated-nondeterministic-error | database variant 1/1 (:memory:): error 'ALTER COLUMN to a generated column is not supported' does not match pattern 'non-deterministic functions prohibited in generated columns'
-turso/alter_column.sqltest::alter-column-to-generated-notnull-ok | database variant 1/1 (:memory:): expected success but got error: ALTER COLUMN to a generated column is not supported
-turso/alter_column.sqltest::alter-column-to-generated-notnull-violation | database variant 1/1 (:memory:): error 'ALTER COLUMN to a generated column is not supported' does not match pattern 'NOT NULL constraint failed'
-turso/alter_column.sqltest::alter-column-to-generated-rewrites-existing-rows | database variant 1/1 (:memory:): expected success but got error: ALTER COLUMN to a generated column is not supported
-turso/alter_column.sqltest::alter-column-to-generated-with-existing-virtual | database variant 1/1 (:memory:): expected success but got error: ALTER COLUMN to a generated column is not supported
-turso/alter_column.sqltest::alter-column-to-generated-with-other-columns | database variant 1/1 (:memory:): expected success but got error: ALTER COLUMN to a generated column is not supported
-turso/alter_column.sqltest::alter-column-to-stored-error | database variant 1/1 (:memory:): error 'ALTER COLUMN to a generated column is not supported' does not match pattern 'cannot add a STORED column'
-turso/alter_column.sqltest::alter-column-virtual-to-regular-preserves-trailing-columns | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected 'aa||cc|1' but was 'aa|aa_x|cc|1'
-turso/alter_column.sqltest::alter-column-virtual-to-regular-rewrites-rows | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 0 expected 'i-001|A001|' but was 'i-001|A001|i-001:A001'
-turso/alter_column.sqltest::alter-column-virtual-to-regular-rewrites-rows-mvcc | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 1 expected 'i-001|A001|' but was 'i-001|A001|i-001:A001'
 turso/alter_column.sqltest::alter-table-add-column-with-fk-updates-schema | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a))' but was 'CREATE TABLE s(a, b REFERENCES t(a))'
 turso/alter_column.sqltest::alter-table-add-self-ref-fk-updates-schema | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))' but was 'CREATE TABLE s(a, b REFERENCES s(a))'
 turso/alter_column.sqltest::alter-table-rename-complex-constraints | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (x INTEGER, y TEXT, c REAL, PRIMARY KEY (x, y), UNIQUE (y, c), FOREIGN KEY (x) REFERENCES t (x))' but was 'CREATE TABLE t (
@@ -245,4 +232,3 @@ turso/mvcc_sequence_adversarial.sqltest::mvcc-user-sequence-survives-concurrent-
 turso/mvcc_sequence.sqltest::mvcc-to-wal-autoincrement-continues | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 1 expected 'wal' but was 'mvcc'
 turso/mvcc_sequence.sqltest::mvcc-to-wal-user-sequence-continues | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 4 expected 'wal' but was 'mvcc'
 turso/mvcc_sequence.sqltest::mvcc-wal-mvcc-roundtrip-autoincrement | database variant 1/1 (:memory:): expected 7 row(s), got 7 row(s); row 1 expected 'wal' but was 'mvcc'
-turso/sequence_adversarial.sqltest::alter-rename-rejects-internal-prefix-target | database variant 1/1 (:memory:): expected an error but the statement succeeded
