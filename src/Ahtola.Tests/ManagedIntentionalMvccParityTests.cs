@@ -69,6 +69,50 @@ public class ManagedIntentionalMvccParityTests
     }
 
     [Test]
+    public void ConcurrentSameValueSetvalCallsDoNotDuplicateTheWatermarkRow()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, """
+            PRAGMA journal_mode=mvcc;
+            CREATE SEQUENCE s;
+            BEGIN CONCURRENT;
+            """);
+        // Two setval calls to the identical value: WriteSequenceWatermark's delete-before-insert
+        // only runs when the rowid actually changes (value is the rowid-aliased primary key), so
+        // a same-value call must be a true update of the existing live MVCC version, not a second
+        // MvStore.Insert at a rowid that already has one - that used to leave a duplicate/
+        // conflicting version behind instead of replacing it.
+        ReadValue(connection, "SELECT setval('s', 100);").Should().Be(SqlValue.Integer(100));
+        ReadValue(connection, "SELECT setval('s', 100);").Should().Be(SqlValue.Integer(100));
+        Execute(connection, "COMMIT;");
+
+        ReadValue(connection, "SELECT count(*) FROM \"__turso_internal_seq_s\";").Should().Be(SqlValue.Integer(1));
+        ReadValue(connection, "SELECT nextval('s');").Should().Be(SqlValue.Integer(101));
+    }
+
+    [Test]
+    public void ConcurrentSameValueSetvalIsCalledOnlyChangeIsATrueUpdateNotADuplicateRow()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, """
+            PRAGMA journal_mode=mvcc;
+            CREATE SEQUENCE s;
+            BEGIN CONCURRENT;
+            """);
+        ReadValue(connection, "SELECT setval('s', 100);").Should().Be(SqlValue.Integer(100));
+        // Same value, only is_called flips true -> false: still a same-rowid write, exercising
+        // the same WriteSequenceWatermark path as an outright same-value repeat call above.
+        ReadValue(connection, "SELECT setval('s', 100, 0);").Should().Be(SqlValue.Integer(100));
+        Execute(connection, "COMMIT;");
+
+        ReadValue(connection, "SELECT count(*) FROM \"__turso_internal_seq_s\";").Should().Be(SqlValue.Integer(1));
+        // is_called=false means the watermark itself is returned un-incremented on the next call.
+        ReadValue(connection, "SELECT nextval('s');").Should().Be(SqlValue.Integer(100));
+    }
+
+    [Test]
     public void InMemoryWalRequestsPreserveMvccAndAllocationWatermarks()
     {
         using var database = new EmbeddedDatabase();

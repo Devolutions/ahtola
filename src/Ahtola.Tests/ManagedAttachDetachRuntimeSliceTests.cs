@@ -240,7 +240,7 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
         Execute(connection, "UPDATE main.items SET value = 'pending' ORDER BY id LIMIT 1;");
         var secondDatabaseWrite = () => Execute(connection, "DELETE FROM aux.items ORDER BY id LIMIT 1;");
         secondDatabaseWrite.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*cannot modify more than one database*atomically*");
+            .WithMessage("*cannot modify more than one physical (disk-backed) database*atomically*");
         Execute(connection, "ROLLBACK;");
 
         ReadRows(connection, "SELECT value FROM main.items;")
@@ -351,7 +351,7 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
             Execute(connection, "INSERT INTO main.items VALUES (1);");
             var secondDatabaseWrite = () => Execute(connection, "INSERT INTO aux.items VALUES (4);");
             secondDatabaseWrite.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("*cannot modify more than one database*atomically*");
+                .WithMessage("*cannot modify more than one physical (disk-backed) database*atomically*");
             ReadRows(connection, "SELECT COUNT(*) FROM aux.items;")
                 .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(2));
             Execute(connection, "ROLLBACK;");
@@ -464,7 +464,7 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
                 .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(3), SqlValue.Integer(4));
             Action secondDatabaseWrite = () => Execute(connection, "DELETE FROM main.parent;");
             secondDatabaseWrite.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("*cannot modify more than one database*atomically*");
+                .WithMessage("*cannot modify more than one physical (disk-backed) database*atomically*");
             Execute(connection, "COMMIT;");
             Execute(connection, "DETACH aux;");
         }

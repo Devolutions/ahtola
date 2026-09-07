@@ -143,8 +143,11 @@ integrity_check/parity_overflow_list_length_mismatch.sqltest::quick-check-overfl
 # sequence watermarks have since been fixed. Remaining ALTER entries preserve SQLite-style
 # token-spliced schema text or differ in CLI error decoration. FK replay/reopen and generated
 # column value-preservation tests guard the semantic fixes independently of text formatting.
-# Cross-database atomic publication and CDC remain separately owned implementation gaps.
-# The final MVCC entries retain intentional DDL/allocation/storage-mode contracts, pinned by
+# Cross-database atomic publication (reversible multi-database transactions with at most one
+# physical file) and attached-database CDC routing (connection-wide capture routed to whichever
+# attached database owns turso_cdc) have since been fixed, leaving only one intentional
+# SQL-source canonicalization difference in turso/attach/writes.sqltest. The final MVCC entries
+# retain intentional DDL/allocation/storage-mode contracts, pinned by
 # ManagedIntentionalMvccParityTests, not unsupported-harness exclusions.
 turso/alter_column.sqltest::alter-column-all-to-generated-error | diagnostic decoration: the engine rejects losing the last ordinary column with "must have at least one non-generated column"; the fixture requires Turso's CLI "Parse error:" prefix instead of the managed ALTER context
 turso/alter_column.sqltest::alter-column-only-to-generated-error | diagnostic decoration: same semantic rejection and CLI-prefix difference as alter-column-all-to-generated-error
@@ -165,16 +168,8 @@ turso/alter_column.sqltest::rename-parent-2-inline | schema rendering: SQLite-st
 turso/alter_column.sqltest::rename-parent-3-composite | schema rendering: replacement table-name quoting and retained source whitespace differ from Turso's canonical form
 turso/alter_column.sqltest::rename-self-1 | schema rendering: valid REFERENCES "s1_new" does not match the fixture's sql LIKE '%REFERENCES s1_new%' check for an unquoted table name
 turso/alter_column.sqltest::rename-self-2-composite | schema rendering: replacement table-name quoting and retained source whitespace differ from Turso's canonical form
-turso/attach/writes.sqltest::attach-begin-exclusive-multiple-attached | database variant 1/1 (:memory:): expected success but got error: Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.
-turso/attach/writes.sqltest::attach-write-cdc-delete | database variant 1/1 (:memory:): expected success but got error: no such table: turso_cdc
-turso/attach/writes.sqltest::attach-write-cdc-insert | database variant 1/1 (:memory:): expected success but got error: no such table: turso_cdc
-turso/attach/writes.sqltest::attach-write-cdc-update | database variant 1/1 (:memory:): expected success but got error: no such table: turso_cdc
-turso/attach/writes.sqltest::attach-write-cross-db-begin-commit | database variant 1/1 (:memory:): expected success but got error: Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.
-turso/attach/writes.sqltest::attach-write-cross-db-begin-rollback | database variant 1/1 (:memory:): expected success but got error: Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.
 turso/attach/writes.sqltest::attach-write-schema-with-index-sql-canonical | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE INDEX idx1 ON t1 (name)' but was 'CREATE INDEX idx1 ON t1(name)'
-turso/attach/writes.sqltest::attach-write-transaction-commit | database variant 1/1 (:memory:): expected success but got error: Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.
-turso/attach/writes.sqltest::attach-write-transaction-rollback | database variant 1/1 (:memory:): expected success but got error: Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.
-turso/attach/writes.sqltest::attach-write-txn-error-rollback | database variant 1/1 (:memory:): error 'Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.' does not match pattern 'NOT NULL constraint failed'
+turso/gencol-index-order.sqltest::eqp-eq-prefix-order-by-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SEARCH t USING INDEX tav (a=?)' but was '1|0|0|SEARCH t USING COVERING INDEX tav (a=?)'
 turso/gencol-index-order.sqltest::eqp-group-by-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '0|0|0|MANAGED COMPILED VDBE'
 turso/gencol-index-order.sqltest::eqp-max-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '0|0|0|MANAGED COMPILED VDBE'
 turso/gencol-index-order.sqltest::eqp-order-by-desc-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '0|0|0|MANAGED EVALUATOR FALLBACK'

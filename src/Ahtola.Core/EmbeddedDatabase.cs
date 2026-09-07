@@ -2641,6 +2641,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// Reverts an in-memory database's already-published catalog back to a snapshot captured
+    /// before the publish, when a LATER database in the same multi-database commit failed after
+    /// this one already succeeded. <see cref="PublishCatalog"/> is otherwise an irreversible
+    /// reference swap that <c>EmbeddedConnection.ResetTransactionState</c> cannot undo (that
+    /// method only discards the transaction's own staged clones, not an already-published live
+    /// catalog). Only valid for a <c>:memory:</c> database: a file-backed commit is durable the
+    /// instant <c>PersistFileCatalog</c> returns and must never be reverted here - see the
+    /// physical-database-first ordering in <c>EmbeddedConnection.CommitTransaction</c>, which
+    /// exists precisely so a physical commit is never the one this revert needs to undo.
+    /// </summary>
+    internal void RevertPublishedMemoryCatalog(SchemaCatalog previous)
+    {
+        if (IsFileBacked)
+        {
+            throw new InvalidOperationException(
+                "A durable physical commit cannot be reverted after PersistFileCatalog returns.");
+        }
+
+        lock (_gate)
+            PublishCatalog(previous);
+    }
+
     internal SchemaCatalog SnapshotCatalog()
     {
         lock (_gate)
@@ -56025,7 +56048,26 @@ public sealed partial class EmbeddedConnection : IDisposable
         ParsedStatement Statement,
         bool IsAttached,
         EmbeddedDatabase.SchemaCatalog? ReadCatalog = null,
-        IReadOnlyDictionary<string, EmbeddedTable>? ExternalTables = null);
+        IReadOnlyDictionary<string, EmbeddedTable>? ExternalTables = null,
+        ForeignCdcCommit? ForeignCdcCommit = null);
+
+    /// <summary>
+    /// Everything <see cref="AugmentRoutedStatementWithForeignCdcTable"/> needs deferred until the
+    /// routed statement's outcome (success, or SQLite's ON CONFLICT FAIL / recursive-trigger-depth
+    /// "preserve changes" partial success) is actually known. <see cref="ClonedTables"/> are
+    /// statement-scoped clones (turso_cdc, and sqlite_sequence when the CDC table is
+    /// AUTOINCREMENT) merged into the statement's <c>ExternalTables</c> - mutated in place by
+    /// ChangeDataCaptureSession.Append during execution, exactly like the routed database's own
+    /// statementCatalog clone, and merged back into the foreign owner only when the statement's
+    /// mutation is confirmed durable. <see cref="TrackedState"/> is non-null when
+    /// <see cref="Database"/> is already a tracked explicit-transaction participant (every
+    /// attached database is, from BEGIN); null means autocommit (or no active transaction), where
+    /// the caller must instead durably publish <see cref="Database"/>'s live catalog itself.
+    /// </summary>
+    private readonly record struct ForeignCdcCommit(
+        EmbeddedDatabase Database,
+        TransactionDatabaseState? TrackedState,
+        IReadOnlyDictionary<string, EmbeddedTable> ClonedTables);
 
     internal EmbeddedConnection(EmbeddedDatabase database)
     {
@@ -56980,7 +57022,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                     throw new EmbeddedSqlException("attempt to write a readonly database");
                 return ExecuteCreateTableAs(createTableAs, parameters, cancellationToken);
             default:
-                var routed = RouteStatement(statement);
+                var routed = AugmentRoutedStatementWithForeignCdcTable(RouteStatement(statement));
                 var routedMayMutate = StatementMayMutate(routed.Database, routed.Statement);
                 if (_queryOnly && routedMayMutate)
                     throw new EmbeddedSqlException("attempt to write a readonly database");
@@ -57099,10 +57141,19 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 // SQLite rolls back the implicit transaction wrapping a failed
                                 // autocommit mutation and notifies the rollback hook. ON CONFLICT
                                 // FAIL is excluded because the rows written before the failure are
-                                // still committed.
+                                // still committed (and handled by the outer EmbeddedConflictFailException
+                                // catch below, which also covers publishing a foreign CDC owner for
+                                // that case).
                                 FireRollbackHook();
                                 throw;
                             }
+
+                            // A foreign CDC owner's statement-scoped clone (built by
+                            // AugmentRoutedStatementWithForeignCdcTable) was mutated in place during
+                            // execution, but nothing else in this autocommit path knows to merge it
+                            // back and persist that database - it isn't the one routed.Database.Execute
+                            // just committed above.
+                            PublishForeignCdcCommitIfNeeded(routed.ForeignCdcCommit);
                         }
                         else
                         {
@@ -57211,6 +57262,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 routed.Statement,
                                 statementCatalog,
                                 result);
+                            PublishForeignCdcCommitIfNeeded(routed.ForeignCdcCommit);
                         }
                     }
 
@@ -57315,6 +57367,12 @@ public sealed partial class EmbeddedConnection : IDisposable
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
                     }
+                    // ON CONFLICT FAIL durably keeps the rows written before the conflict
+                    // (autocommit) or the transaction's partial mutation (above) - including
+                    // whatever a foreign CDC owner's statement-scoped clone captured up to that
+                    // point - so its merge/publish must still happen here, exactly as on
+                    // outright success.
+                    PublishForeignCdcCommitIfNeeded(routed.ForeignCdcCommit);
                     if (ReferenceEquals(routed.Database, _tempDatabase))
                         _tempInitialized = true;
 
@@ -57367,12 +57425,18 @@ public sealed partial class EmbeddedConnection : IDisposable
                             mvccStatementSavepoint);
                         // The catalog is discarded (never written back) when a recursive-trigger
                         // abort does not preserve changes, so the overlay must discard this
-                        // statement's writes too.
+                        // statement's writes too. A foreign CDC owner's statement-scoped clone is
+                        // discarded the same way (never merged/published) - it was never touched
+                        // beyond this local clone, so the foreign owner stays untouched.
                         if (statementOverlayCheckpoint is not null)
                             transactionState?.Overlay?.RestoreCheckpoint(statementOverlayCheckpoint);
                     }
                     else
                     {
+                        // Mirrors ON CONFLICT FAIL: PreserveChanges durably keeps the partial
+                        // mutation regardless of transaction mode, so a foreign CDC owner's
+                        // statement-scoped clone must be merged/published here too.
+                        PublishForeignCdcCommitIfNeeded(routed.ForeignCdcCommit);
                         ReleaseConcurrentStatementSavepoint(
                             concurrentStore,
                             concurrentTxId,
@@ -57895,6 +57959,186 @@ public sealed partial class EmbeddedConnection : IDisposable
             ? database.ContainsSchemaObject(objectName, kind)
             : CatalogContainsSchemaObject(state.Catalog, objectName, kind);
     }
+
+    /// <summary>
+    /// Turso's CDC log is connection-wide: <c>PRAGMA capture_data_changes_conn</c> names an
+    /// unqualified table (never schema-qualified - see <c>ChangeDataCaptureConfiguration.Parse</c>),
+    /// and a write to *any* database while capture is active appends to that one table,
+    /// wherever it actually lives (typically main, since that is where a user creates it before
+    /// enabling capture). If the routed statement's own database does not have that table
+    /// locally, this finds whichever database does (the same main/temp/attached search order an
+    /// unqualified reference resolves through) and merges statement-scoped CLONES of its table(s)
+    /// - not the live objects - into this statement's external tables, exactly mirroring how the
+    /// routed database's own statementCatalog clone works: ChangeDataCaptureSession.Append
+    /// mutates the clone during execution, and the caller merges it back into the foreign owner
+    /// (<see cref="ForeignCdcCommit"/>) only once the statement's outcome confirms the mutation is
+    /// durable (success, or a FAIL/preserve-changes partial success) - never on an ordinary
+    /// failure, where the clone is simply discarded and the foreign owner is left untouched.
+    /// <para>
+    /// The foreign database must become a real participant of whatever transaction (or lack of
+    /// one) is in effect, not just an untracked side mutation. Before doing anything else, this
+    /// also re-runs the SAME multi-physical-database eligibility check the routed database's own
+    /// write already passed at <c>ReserveTransactionMutation</c> time, against the foreign owner -
+    /// this statement is about to become a hidden second mutation source for it, so the
+    /// at-most-one-physical-database guard must reject an unsafe combination here and now (fail
+    /// fast), not silently defer detection to the much later, harder-to-diagnose
+    /// <c>InvalidOperationException</c> <c>CommitTransaction</c> throws once two physical
+    /// databases' <c>HasChanges</c> finally surface together at COMMIT.
+    /// </para>
+    /// </summary>
+    private RoutedStatement AugmentRoutedStatementWithForeignCdcTable(RoutedStatement routed)
+    {
+        if (_changeDataCapture is not { } changeDataCapture
+            || !StatementMayMutate(routed.Database, routed.Statement))
+        {
+            return routed;
+        }
+
+        var tableName = changeDataCapture.Configuration.Table;
+        var routedState = GetTrackedTransactionState(routed.Database);
+        var localCatalog = routedState?.Catalog ?? routed.Database.LiveCatalog;
+        if (localCatalog.Tables.ContainsKey(tableName)
+            || (routed.ExternalTables?.ContainsKey(tableName) ?? false))
+        {
+            return routed;
+        }
+
+        EmbeddedDatabase? foreignCdcDatabase = null;
+        EmbeddedDatabase.SchemaCatalog? foreignCdcCatalog = null;
+        TransactionDatabaseState? foreignCdcState = null;
+        if (!ReferenceEquals(routed.Database, _tempDatabase))
+        {
+            var state = GetTrackedTransactionState(_tempDatabase);
+            var candidate = state?.Catalog ?? _tempDatabase.LiveCatalog;
+            if (candidate.Tables.ContainsKey(tableName))
+                (foreignCdcDatabase, foreignCdcCatalog, foreignCdcState) = (_tempDatabase, candidate, state);
+        }
+
+        if (foreignCdcDatabase is null && !ReferenceEquals(routed.Database, _database))
+        {
+            var state = GetTrackedTransactionState(_database);
+            var candidate = state?.Catalog ?? _database.LiveCatalog;
+            if (candidate.Tables.ContainsKey(tableName))
+                (foreignCdcDatabase, foreignCdcCatalog, foreignCdcState) = (_database, candidate, state);
+        }
+
+        if (foreignCdcDatabase is null)
+        {
+            foreach (var attachment in _attachedDatabases.Values.OrderBy(static attachment => attachment.Sequence))
+            {
+                if (ReferenceEquals(attachment.Database, routed.Database))
+                    continue;
+
+                var state = GetTrackedTransactionState(attachment.Database);
+                var candidate = state?.Catalog ?? attachment.Database.LiveCatalog;
+                if (candidate.Tables.ContainsKey(tableName))
+                {
+                    (foreignCdcDatabase, foreignCdcCatalog, foreignCdcState) = (attachment.Database, candidate, state);
+                    break;
+                }
+            }
+        }
+
+        if (foreignCdcDatabase is null || foreignCdcCatalog is null)
+            return routed;
+
+        // Fail fast (see the doc comment above): validate the foreign owner's eligibility as an
+        // extra mutation source for THIS statement before cloning/merging anything. MayMutate
+        // depends only on the statement's own shape (not which database it is checked against),
+        // and this statement is already known to be mutating (StatementMayMutate above), so this
+        // reuses the exact same guard the routed database's own write went through.
+        EnsureTransactionMayMutate(foreignCdcDatabase, routed.Statement);
+
+        var foreignCdcTable = foreignCdcCatalog.Tables[tableName];
+        var clonedCdcTable = foreignCdcTable.Clone();
+        var clonedTables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase)
+        {
+            [tableName] = clonedCdcTable,
+        };
+        var externalTables = routed.ExternalTables is { } existing
+            ? new Dictionary<string, EmbeddedTable>(existing, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
+        externalTables[tableName] = clonedCdcTable;
+
+        // An AUTOINCREMENT CDC table's watermark lives in its own database's sqlite_sequence,
+        // which ValidateSqliteSequenceCatalog requires whenever the merged table set contains
+        // any AUTOINCREMENT table. Merge a clone of that same object in too (unless the routed
+        // database already carries its own, in which case ChangeDataCaptureSession must keep
+        // using that one instead), so AllocateChangeId reads and updates the CDC table's real
+        // watermark row rather than tripping the "no sqlite_sequence for an AUTOINCREMENT table"
+        // corruption check against the routed database's unrelated (or absent) one.
+        if (foreignCdcTable.IsAutoIncrement
+            && !localCatalog.Tables.ContainsKey(EmbeddedDatabase.SqliteSequenceTableName)
+            && foreignCdcCatalog.Tables.TryGetValue(EmbeddedDatabase.SqliteSequenceTableName, out var foreignSequence))
+        {
+            var clonedSequence = foreignSequence.Clone();
+            clonedTables[EmbeddedDatabase.SqliteSequenceTableName] = clonedSequence;
+            externalTables[EmbeddedDatabase.SqliteSequenceTableName] = clonedSequence;
+        }
+
+        return routed with
+        {
+            ExternalTables = externalTables,
+            ForeignCdcCommit = new ForeignCdcCommit(foreignCdcDatabase, foreignCdcState, clonedTables),
+        };
+    }
+
+    /// <summary>
+    /// Merges a pending <see cref="ForeignCdcCommit"/>'s statement-scoped clones back into the
+    /// foreign CDC owner, once the routed statement's outcome confirms the mutation is durable
+    /// (success, or ON CONFLICT FAIL / recursive-trigger-depth preserve-changes partial success).
+    /// Never call this on an ordinary failure path - leaving the clones unmerged is precisely how
+    /// the foreign owner stays untouched, symmetric with how the routed database's own discarded
+    /// statementCatalog clone never gets written back to <c>TransactionDatabaseState.Catalog</c>.
+    /// <para>
+    /// A tracked explicit-transaction participant merges directly into its own
+    /// <c>TrackedState.Catalog.Tables</c> and only now flips <c>HasChanges</c>, so the unmodified
+    /// commit/rollback path durably persists it and a later ROLLBACK correctly discards it like
+    /// any other write in that transaction. An untracked owner (autocommit, or no active
+    /// transaction) takes a fresh <see cref="EmbeddedDatabase.SnapshotCatalog"/> - a real clone,
+    /// never <see cref="EmbeddedDatabase.LiveCatalog"/>, which wraps the live dictionaries by
+    /// reference and would otherwise let this mutate the live catalog before
+    /// <c>PublishTriggerBodyCatalog</c> ever runs - patches in the mutated clone(s), and durably
+    /// publishes it (a bare reference republish for ':memory:', a real pager/WAL flush for a
+    /// physical database).
+    /// </para>
+    /// </summary>
+    private void PublishForeignCdcCommitIfNeeded(ForeignCdcCommit? commit)
+    {
+        if (commit is not { } foreignCdcCommit)
+            return;
+
+        if (foreignCdcCommit.TrackedState is { } trackedState)
+        {
+            foreach (var (name, table) in foreignCdcCommit.ClonedTables)
+                trackedState.Catalog.Tables[name] = table;
+            trackedState.HasChanges = true;
+            // Appending a CDC record is never a targeted index rebuild: an earlier REINDEX in
+            // this same transaction must not cause commit to skip persisting it.
+            trackedState.HasNonTargetedIndexRebuildChange = true;
+            return;
+        }
+
+        var patchedCatalog = foreignCdcCommit.Database.SnapshotCatalog();
+        foreach (var (name, table) in foreignCdcCommit.ClonedTables)
+            patchedCatalog.Tables[name] = table;
+        foreignCdcCommit.Database.PublishTriggerBodyCatalog(
+            patchedCatalog,
+            forceFullRewrite: false,
+            GetSynchronousMode(foreignCdcCommit.Database));
+    }
+
+    /// <summary>
+    /// <see cref="GetTransactionState"/> throws when a transaction is active but the given
+    /// database is not one of its participants (a real bug for the routed database itself, which
+    /// is always a participant by construction). A CDC owner search has to probe every schema
+    /// speculatively, including ones the active transaction may never have touched, so this
+    /// returns null for that case instead of throwing.
+    /// </summary>
+    private TransactionDatabaseState? GetTrackedTransactionState(EmbeddedDatabase database)
+        => _transactionDatabases is not null && _transactionDatabases.ContainsKey(database)
+            ? GetTransactionState(database)
+            : null;
 
     private RoutedStatement RouteStatement(ParsedStatement statement)
     {
@@ -61285,14 +61529,43 @@ Func<string, ParsedStatement> rewrite)
 
         if (ReferenceEquals(database, _tempDatabase))
             return;
-        if (_transactionWriteDatabase is null
-            || ReferenceEquals(_transactionWriteDatabase, database))
-        {
-            return;
-        }
 
-        throw new EmbeddedSqlException(
-            "Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.");
+        // The multi-database guard below only protects an *explicit* transaction: autocommit
+        // wraps each statement in its own independent commit, so a single statement touching one
+        // database is trivially safe regardless of which database that is, and (as in the
+        // original single-field guard this generalizes) nothing here should accumulate state
+        // that outlives one autocommit statement. _transactionWriteDatabase itself is populated
+        // by the explicit-transaction execute paths, never by this guard, for the same reason.
+        if (_transactionDatabases is null)
+            return;
+
+        // Turso documents multi-database transaction atomicity as broken only when a COMMIT
+        // updates two or more *physical* (disk-backed) database files: "transactions continue
+        // to be atomic within each individual database file... if the host computer crashes in
+        // the middle of a COMMIT where two or more database files are updated, some of those
+        // files might get the changes where others might not" (sqlite.org/lang_attach.html). A
+        // ':memory:' attachment has no file and no crash-recovery contract at all - a crash
+        // loses its state regardless of commit ordering - so any number of memory databases may
+        // be written in one transaction alongside at most one physical database without
+        // weakening that guarantee. Two or more physical databases stays rejected: Ahtola has no
+        // coordinated multi-file recovery (a master/super-journal or equivalent), so it cannot
+        // claim the atomicity SQLite itself declines to guarantee there.
+        //
+        // This is computed live from _transactionDatabases's own HasChanges bookkeeping (the
+        // same source CommitTransaction's persistentChanges reads) rather than a separately
+        // tracked set, so it automatically inherits that bookkeeping's existing savepoint-
+        // rollback and failed-statement semantics: a statement that merely attempted a write and
+        // then failed (see RecursiveNoOpDepthErrorDoesNotReserveATransactionWriteDatabase) never
+        // sets HasChanges, and rolling back to a savepoint already restores it, so neither can
+        // wrongly "reserve" a database this guard would otherwise have to un-reserve itself.
+        if (database.IsFileBacked
+            && _transactionDatabases.Any(pair =>
+                pair.Value.HasChanges && pair.Key.IsFileBacked && !ReferenceEquals(pair.Key, database)))
+        {
+            throw new EmbeddedSqlException(
+                "Managed ATTACH transactions cannot modify more than one physical (disk-backed) "
+                + "database because independent WAL files cannot be committed atomically.");
+        }
     }
 
     private bool ReserveTransactionMutation(EmbeddedDatabase database, ParsedStatement statement)
@@ -61641,8 +61914,14 @@ Func<string, ParsedStatement> rewrite)
         var persistentChanges = changed
             .Where(pair => !ReferenceEquals(pair.Key, _tempDatabase))
             .ToArray();
-        if (persistentChanges.Length > 1)
-            throw new InvalidOperationException("A managed ATTACH transaction reached an unsafe multi-database write state.");
+        // Mirrors the EnsureTransactionMayMutate relaxation: at most one physical (disk-backed)
+        // database may be committed here. Any number of ':memory:' databases may accompany it,
+        // since none of them carries a crash-recovery contract this commit could break.
+        if (persistentChanges.Count(pair => pair.Key.IsFileBacked) > 1)
+        {
+            throw new InvalidOperationException(
+                "A managed ATTACH transaction reached an unsafe multi-physical-database write state.");
+        }
 
         var tempChange = changed
             .Where(pair => ReferenceEquals(pair.Key, _tempDatabase))
@@ -61661,11 +61940,37 @@ Func<string, ParsedStatement> rewrite)
 
         ExceptionDispatchInfo? deferredMaintenanceFailure = null;
         var schemaCatalogWasPublished = false;
+        // Every ':memory:' database this loop has already durably published, paired with the
+        // catalog it held immediately before that publish, so a later database's failure (memory
+        // or the one physical database) can revert it: PublishCatalog is an irreversible
+        // reference swap, so once the try/catch below completes a memory database's commit
+        // successfully, ResetTransactionState() alone can no longer undo it. A file-backed
+        // database is never in this list - its commit is durable the instant PersistFileCatalog
+        // returns and must not be reverted, which is exactly why it is committed first below.
+        var publishedMemoryDatabases = new List<(EmbeddedDatabase Database, EmbeddedDatabase.SchemaCatalog PreviousCatalog)>();
+        // True once the (at most one) physical database in this transaction has durably
+        // committed, even with no schema change. Unlike a ':memory:' database's publish (which
+        // is reverted by RevertPublishedMemoryDatabases if a later database's own commit fails),
+        // a physical commit is never reverted, so schemaCatalogWasPublished alone under-reports
+        // durability for a multi-database transaction: a pure data write (no schema change) to
+        // the physical database, followed by a later ':memory:' database's commit failing, must
+        // still be treated as a partially-durable commit, not the "nothing happened yet, safe to
+        // leave the transaction open for retry" case the original single-database bare rethrow
+        // below was written for.
+        var anyPersistentChangeWasPublished = false;
         try
         {
-            if (persistentChanges.Length == 1)
+            // Commit the at-most-one physical database first: if it fails, nothing else in this
+            // transaction has published yet, so the failure propagates exactly like the original
+            // single-database path always did. Every ':memory:' database follows - each is a bare
+            // catalog-reference publish with no I/O and no crash-recovery contract of its own -
+            // and if one of them fails, every ':memory:' database that already published earlier
+            // in this same loop is reverted via publishedMemoryDatabases before the failure
+            // propagates, so a subsequent ROLLBACK (or the exception itself) never leaves a
+            // partially-committed transaction that looks committed from a fresh read.
+            foreach (var (database, state) in persistentChanges.OrderByDescending(pair => pair.Key.IsFileBacked))
             {
-                var (database, state) = persistentChanges[0];
+                var previousCatalogForRevert = database.LiveCatalog;
                 try
                 {
                     database.CommitTransaction(
@@ -61698,7 +62003,30 @@ Func<string, ParsedStatement> rewrite)
                     // maintenance error is surfaced.
                     deferredMaintenanceFailure = ExceptionDispatchInfo.Capture(failure);
                 }
-                schemaCatalogWasPublished = state.HasSchemaChanges;
+                catch
+                {
+                    // A real (non-post-commit-maintenance) failure: revert every ':memory:'
+                    // database this loop already published before this one, then let the
+                    // original exception continue to the outer catch below unchanged.
+                    RevertPublishedMemoryDatabases(publishedMemoryDatabases);
+                    throw;
+                }
+
+                if (!database.IsFileBacked)
+                {
+                    publishedMemoryDatabases.Add((database, previousCatalogForRevert));
+                }
+                else
+                {
+                    // Unlike a ':memory:' database's publish (which the catch above can and does
+                    // revert if a later database's commit fails), a physical commit is durable
+                    // the instant this call returns and is never reverted, so it is the only
+                    // outcome that must force the "already partially durable" categorization
+                    // below regardless of whether it happened to change the schema.
+                    anyPersistentChangeWasPublished = true;
+                }
+
+                schemaCatalogWasPublished |= state.HasSchemaChanges;
             }
 
             foreach (var (database, txId) in preparedSchemaCommits)
@@ -61714,7 +62042,7 @@ Func<string, ParsedStatement> rewrite)
         }
         catch (Exception failure)
         {
-            if (!mvccWriteWasPublished && !schemaCatalogWasPublished)
+            if (!mvccWriteWasPublished && !schemaCatalogWasPublished && !anyPersistentChangeWasPublished)
             {
                 if (preparedSchemaCommits.Count != 0)
                     ResetTransactionState();
@@ -61735,6 +62063,33 @@ Func<string, ParsedStatement> rewrite)
             ResetTransactionState(rollbackVirtualTables: false);
         }
         deferredMaintenanceFailure?.Throw();
+    }
+
+    /// <summary>
+    /// Undoes every ':memory:' database that already published in this commit's loop before a
+    /// later database's commit failed, restoring each one's exact pre-publish catalog. Best-
+    /// effort in the face of a further failure while reverting: swallows and continues so one
+    /// broken revert cannot mask the original failure or leave the remaining reverts undone, and
+    /// intentionally does not add to <see cref="ExceptionDispatchInfo"/>/rethrow, mirroring how
+    /// the rest of this method's cleanup paths already treat this stage as unconditional cleanup
+    /// rather than a reportable failure of its own.
+    /// </summary>
+    private static void RevertPublishedMemoryDatabases(
+        IReadOnlyList<(EmbeddedDatabase Database, EmbeddedDatabase.SchemaCatalog PreviousCatalog)> publishedMemoryDatabases)
+    {
+        for (var index = publishedMemoryDatabases.Count - 1; index >= 0; index--)
+        {
+            var (database, previousCatalog) = publishedMemoryDatabases[index];
+            try
+            {
+                database.RevertPublishedMemoryCatalog(previousCatalog);
+            }
+            catch
+            {
+                // Best-effort: keep unwinding the remaining reverts rather than letting a
+                // secondary failure here replace or hide the real commit failure.
+            }
+        }
     }
 
     private void CommitTemporaryTransaction(TransactionDatabaseState? tempChange)

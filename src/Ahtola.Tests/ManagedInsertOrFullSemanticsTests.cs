@@ -1181,7 +1181,7 @@ public sealed class ManagedInsertOrFullSemanticsTests
             connection,
             "INSERT OR REPLACE INTO aux.items VALUES(should_not_run())");
         secondWrite.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*cannot modify more than one database*atomically*");
+            .WithMessage("*cannot modify more than one physical (disk-backed) database*atomically*");
         callbackCount.Should().Be(0);
         Execute(connection, "ROLLBACK");
         ReadRows(connection, "SELECT count(*) FROM main.items").Should().Equal("I:0");
