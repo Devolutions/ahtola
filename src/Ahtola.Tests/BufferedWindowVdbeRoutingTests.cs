@@ -678,6 +678,58 @@ public sealed class BufferedWindowVdbeRoutingTests
         AssertMatchesSqlite(setup, query);
     }
 
+    [Test]
+    public void MovingGroupConcatBackfillsUniformSeparatorHistoryOnFirstDivergence()
+    {
+        // The first time a variable separator's length diverges from first_separator_len, every
+        // separator used so far (there are count-1 of them, all implicitly first_separator_len)
+        // must be backfilled into the queue before the divergent length is enqueued. Otherwise a
+        // later xInverse dequeues the wrong (divergent) length for a gap that was actually
+        // uniform, corrupting both the retained text and the queue's own alignment for every
+        // subsequent removal. Mirrors Turso's prior_separator_count backfill
+        // (execute.rs::update_agg_payload).
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, sep TEXT);",
+            "INSERT INTO t VALUES (1,'A',','),(2,'B',','),(3,'C',','),(4,'D','||'),(5,'E',',');",
+        ];
+        const string query =
+            """
+            SELECT id,
+                   quote(group_concat(v, sep) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)),
+                   quote(string_agg(v, sep) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW))
+            FROM t ORDER BY id;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
+    public void GrowingMinMaxKeepsTheFirstArgumentCollationTieButMovingMinPrefersTheNewest()
+    {
+        // A growing (UNBOUNDED PRECEDING start, no eviction) frame must keep the ordinary,
+        // first-seen-wins tie behavior every non-window aggregate MIN/MAX uses; only a genuinely
+        // moving frame — where Inverse actually retires rows — uses the collated(value, sequence)
+        // newest-wins representative. Both share the exact same NOCASE data and partition so the
+        // only variable is the frame shape.
+        string[] setup =
+        [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, txt TEXT COLLATE NOCASE);",
+            "INSERT INTO t VALUES (1,'abc'),(2,'ABC'),(3,'aaa');",
+        ];
+        const string query =
+            """
+            SELECT id,
+                   min(txt) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                   min(txt) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+            FROM t ORDER BY id;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
     // ---- Helpers ---------------------------------------------------------------------------
 
     private static void AssertRoutesThroughWindowBuffer(IReadOnlyList<string> setup, string query)

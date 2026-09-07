@@ -24753,7 +24753,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var names = argumentNames.ToArray();
-        var aggregate = BuildAccumulatorAggregate(function, names, parameters, context, outerRow);
+        var aggregate = BuildAccumulatorAggregate(
+            function,
+            names,
+            parameters,
+            context,
+            outerRow,
+            growing: frame.Start == WindowBound.UnboundedPreceding);
         if (function.Filter is not null && !ranking)
             aggregate = ApplyWindowFilter(aggregate, function.Filter, names, parameters, context, outerRow);
         if (frame.RequiresInverse && aggregate.Inverse is null)
@@ -25381,7 +25387,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         string[] argumentNames,
         SqlValue[] parameters,
         QueryContext context,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        bool growing)
     {
         SqlValue ValueOf(Expression expression, SqlValue[] arguments) =>
             Evaluate(
@@ -25602,10 +25609,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             var maximum = function.Name == "MAX";
             var minMaxCollation = GetEffectiveCollation(function.Arguments[0], context);
+            // A growing (UNBOUNDED PRECEDING start) frame never evicts, so it must keep the
+            // ordinary, first-seen-wins tie behavior every non-window aggregate MIN/MAX uses.
+            // Only a genuinely moving frame — where Inverse actually retires rows — uses
+            // upstream's collated(value, sequence) newest-wins representative.
             return new VdbeAggregate
             {
                 Name = function.Name.ToLowerInvariant(),
-                CreateContext = () => new ExtremumAggregateAccumulator(maximum, Compare, minMaxCollation),
+                CreateContext = () => new ExtremumAggregateAccumulator(
+                    maximum,
+                    Compare,
+                    minMaxCollation,
+                    preferNewestOnTie: !growing),
                 Accumulate = (contextObject, arguments) =>
                 {
                     ((ExtremumAggregateAccumulator)contextObject!).Add(ValueOf(function.Arguments[0], arguments));
@@ -42381,16 +42396,25 @@ out bool hasReturning)
         private readonly bool _maximum;
         private readonly Func<SqlValue, SqlValue, string?, int> _compare;
         private readonly string? _collation;
+        // Growing (UNBOUNDED PRECEDING start, no eviction) frames — and ordinary, non-window
+        // MIN/MAX — keep the first-seen representative on a tie, matching every plain aggregate.
+        // Only a genuinely moving frame (rows actually retired via Remove) uses Turso's
+        // collated(value, sequence) ephemeral index, whose newest-equal member represents the
+        // extremum. Defaults to false so any caller that doesn't pass this explicitly keeps the
+        // ordinary (first-wins) behavior.
+        private readonly bool _preferNewestOnTie;
         private readonly List<SqlValue> _values = [];
 
         internal ExtremumAggregateAccumulator(
             bool maximum,
             Func<SqlValue, SqlValue, string?, int> compare,
-            string? collation = null)
+            string? collation = null,
+            bool preferNewestOnTie = false)
         {
             _maximum = maximum;
             _compare = compare;
             _collation = collation;
+            _preferNewestOnTie = preferNewestOnTie;
         }
 
         internal void Add(SqlValue value)
@@ -42423,14 +42447,19 @@ out bool hasReturning)
             if (_values.Count == 0)
                 return SqlValue.Null;
 
-            // Mirrors Turso's collated(value, sequence) ephemeral index: among argument-collation
-            // ties, the most recently added (highest sequence) member represents the extremum, so
-            // the scan uses a non-strict comparison and lets later members win on ties.
+            // Moving frames mirror Turso's collated(value, sequence) ephemeral index: among
+            // argument-collation ties, the most recently added (highest sequence) member
+            // represents the extremum, so the scan uses a non-strict comparison and lets later
+            // members win on ties. Growing frames and ordinary aggregates use a strict comparison
+            // so the first-seen member wins instead.
             var extremum = _values[0];
             for (var index = 1; index < _values.Count; index++)
             {
                 var comparison = _compare(_values[index], extremum, _collation);
-                if (_maximum ? comparison >= 0 : comparison <= 0)
+                var replaces = _preferNewestOnTie
+                    ? (_maximum ? comparison >= 0 : comparison <= 0)
+                    : (_maximum ? comparison > 0 : comparison < 0);
+                if (replaces)
                     extremum = _values[index];
             }
 
@@ -42476,7 +42505,21 @@ out bool hasReturning)
                     _buffer.Append(ToSqlText(separator));
                 var separatorLength = _buffer.Length - before;
                 if (separatorLength != _firstSeparatorLength || _separatorLengths.Count > 0)
+                {
+                    if (_separatorLengths.Count == 0)
+                    {
+                        // First divergence from the uniform first_separator_len: every separator
+                        // used so far (there are _count - 1 of them, one before each of the
+                        // _count values already accumulated) was implicitly first_separator_len
+                        // and was never explicitly recorded. Backfill them now so a later Remove
+                        // dequeues the length that was *actually* used for that gap, mirroring
+                        // Turso's prior_separator_count backfill (execute.rs update_agg_payload).
+                        for (var index = 0; index < _count - 1; index++)
+                            _separatorLengths.Enqueue(_firstSeparatorLength);
+                    }
+
                     _separatorLengths.Enqueue(separatorLength);
+                }
             }
 
             _buffer!.Append(ToSqlText(value));
@@ -47758,6 +47801,7 @@ out bool hasReturning)
         private readonly EmbeddedDatabase _database;
         private readonly SlidingWindowAggregateKind _kind;
         private readonly string? _collation;
+        private readonly bool _preferNewestOnTie;
         private NumericAggregateAccumulator? _numeric;
         private ExtremumAggregateAccumulator? _extremum;
         private GroupConcatAggregateAccumulator? _concat;
@@ -47766,11 +47810,13 @@ out bool hasReturning)
         internal SlidingWindowAggregate(
             EmbeddedDatabase database,
             SlidingWindowAggregateKind kind,
-            string? collation)
+            string? collation,
+            bool preferNewestOnTie)
         {
             _database = database;
             _kind = kind;
             _collation = collation;
+            _preferNewestOnTie = preferNewestOnTie;
             CreateAccumulators();
         }
 
@@ -47798,7 +47844,11 @@ out bool hasReturning)
                 _ => null,
             };
             _extremum = _kind is SlidingWindowAggregateKind.Minimum or SlidingWindowAggregateKind.Maximum
-                ? new ExtremumAggregateAccumulator(_kind == SlidingWindowAggregateKind.Maximum, _database.Compare, _collation)
+                ? new ExtremumAggregateAccumulator(
+                    _kind == SlidingWindowAggregateKind.Maximum,
+                    _database.Compare,
+                    _collation,
+                    _preferNewestOnTie)
                 : null;
             _concat = _kind == SlidingWindowAggregateKind.GroupConcat
                 ? new GroupConcatAggregateAccumulator()
@@ -48094,6 +48144,11 @@ out bool hasReturning)
             // All sliding-eligible functions in this batch share one window spec, so a single
             // pair of pointers tracks the currently-accumulated frame range [slidingStart,
             // slidingEnd] for every one of them (start > end represents "nothing added yet").
+            // A growing (UNBOUNDED PRECEDING start, no eviction) frame keeps the ordinary,
+            // first-seen-wins MIN/MAX tie behavior; only a genuinely moving frame — where
+            // Remove actually retires rows — uses upstream's newest-wins representative.
+            var slidingFrameIsGrowing = spec.Frame is null
+                || spec.Frame.Start.Kind == FrameBoundKind.UnboundedPreceding;
             var slidingAggregates = new Dictionary<FunctionExpression, SlidingWindowAggregate>();
             foreach (var (function, kind) in slidingEligible)
                 slidingAggregates[function] = new SlidingWindowAggregate(
@@ -48101,7 +48156,8 @@ out bool hasReturning)
                     kind,
                     slidingCollations is not null && slidingCollations.TryGetValue(function, out var collation)
                         ? collation
-                        : null);
+                        : null,
+                    preferNewestOnTie: !slidingFrameIsGrowing);
             var slidingStart = 0;
             var slidingEnd = -1;
 
