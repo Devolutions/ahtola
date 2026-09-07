@@ -29,32 +29,23 @@ public sealed partial class EmbeddedDatabase
         // json_object(*)/jsonb_object(*) must be expanded into explicit column references
         // before RewriteSelectSubqueries's FROM-subquery flattening runs, so a flattened
         // derived table's computed columns and a table-valued function's hidden columns are
-        // resolved the same way an ordinary `SELECT *` resolves them (see
-        // RewriteJsonObjectStarExpressions for why the ordering matters). The star can appear
-        // anywhere in an expression tree — nested inside another call (`upper(json_object(*))`),
-        // in WHERE/HAVING/GROUP BY/ORDER BY — not just as a projection's entire expression, so
-        // every clause that can carry an arbitrary expression would need rewriting. Doing that
-        // unconditionally would mean walking every clause of every SELECT this method resolves
-        // — including a correlated subquery's WHERE/projection re-evaluated once per outer
-        // row — even for the overwhelming majority of statements that use `x(*)` only for
-        // COUNT(*) or not at all. StatementMayContainCountStarCall is a single cheap
-        // early-exiting scan (no allocation, no `with`-reconstruction, short-circuits on the
-        // first match) that skips the whole rewrite family below unless at least one `x(*)`
-        // call is actually present somewhere in the statement.
-        var mayContainCountStarCall = StatementMayContainCountStarCall(statement);
-        var projections = mayContainCountStarCall
+        // resolved the same way an ordinary `SELECT *` resolves them. Detect JSON stars
+        // without rebuilding the tree first: COUNT(*) alone must not trigger this pass,
+        // particularly in correlated subqueries rebound once per outer row.
+        var containsJsonStar = ContainsJsonObjectStar(statement);
+        var projections = containsJsonStar
             ? RewriteJsonObjectStarInProjections(statement.Projections, outputColumns)
             : statement.Projections;
-        var starRewrittenWhere = mayContainCountStarCall && statement.Where is not null
+        var starRewrittenWhere = containsJsonStar && statement.Where is not null
             ? RewriteJsonObjectStarExpressions(statement.Where, outputColumns)
             : statement.Where;
-        var starRewrittenHaving = mayContainCountStarCall && statement.Having is not null
+        var starRewrittenHaving = containsJsonStar && statement.Having is not null
             ? RewriteJsonObjectStarExpressions(statement.Having, outputColumns)
             : statement.Having;
-        var starRewrittenGroupBy = mayContainCountStarCall
+        var starRewrittenGroupBy = containsJsonStar
             ? RewriteJsonObjectStarExpressionList(statement.GroupBy, outputColumns)
             : statement.GroupBy;
-        var starRewrittenOrderBy = mayContainCountStarCall
+        var starRewrittenOrderBy = containsJsonStar
             ? RewriteJsonObjectStarInOrderBy(statement.OrderBy, outputColumns)
             : statement.OrderBy;
 
@@ -89,120 +80,148 @@ public sealed partial class EmbeddedDatabase
             Having = having,
             Where = where,
             OrderBy = orderBy,
+            NamedWindows = containsJsonStar
+                ? RewriteJsonObjectStarInNamedWindows(statement.NamedWindows, outputColumns)
+                : statement.NamedWindows,
         };
     }
 
     /// <summary>
-    /// Cheap, allocation-free, early-exiting scan for whether <paramref name="statement"/>
-    /// contains an <c>x(*)</c>-shaped function call (<see cref="FunctionExpression.CountStar"/>)
-    /// anywhere in its Projections, WHERE, HAVING, GROUP BY, or ORDER BY — the gate for whether
-    /// the (comparatively expensive) json_object(*)/jsonb_object(*) rewrite family in
-    /// <see cref="ResolveSelectBindings"/> needs to run at all. <c>CountStar</c> is set only for
-    /// <c>COUNT(*)</c>/<c>json_object(*)</c>/<c>jsonb_object(*)</c>, so this returns false — and
-    /// skips the rewrite entirely — for the overwhelming majority of statements.
+    /// Allocation-free gate for JSON star expansion within this SELECT's expression scope.
     /// </summary>
-    private static bool StatementMayContainCountStarCall(SelectStatement statement)
+    private static bool ContainsJsonObjectStar(SelectStatement statement)
     {
         foreach (var projection in statement.Projections)
         {
-            if (ContainsCountStarFunctionCall(projection.Expression))
+            if (ContainsJsonObjectStar(projection.Expression))
                 return true;
         }
 
-        if (statement.Where is not null && ContainsCountStarFunctionCall(statement.Where))
+        if (statement.Where is not null && ContainsJsonObjectStar(statement.Where))
             return true;
-        if (statement.Having is not null && ContainsCountStarFunctionCall(statement.Having))
+        if (statement.Having is not null && ContainsJsonObjectStar(statement.Having))
             return true;
 
         foreach (var expression in statement.GroupBy)
         {
-            if (ContainsCountStarFunctionCall(expression))
+            if (ContainsJsonObjectStar(expression))
                 return true;
         }
 
         foreach (var term in statement.OrderBy)
         {
-            if (ContainsCountStarFunctionCall(term.Expression))
+            if (ContainsJsonObjectStar(term.Expression))
+                return true;
+        }
+
+        foreach (var window in statement.NamedWindows)
+        {
+            if (ContainsJsonObjectStar(window.Specification))
                 return true;
         }
 
         return false;
     }
 
+    private static bool IsJsonObjectStar(FunctionExpression function)
+        => function.CountStar
+            && (function.Name.Equals("JSON_OBJECT", StringComparison.OrdinalIgnoreCase)
+                || function.Name.Equals("JSONB_OBJECT", StringComparison.OrdinalIgnoreCase));
+
+    private static bool ContainsJsonObjectStar(WindowSpecification window)
+    {
+        foreach (var partition in window.PartitionBy)
+        {
+            if (ContainsJsonObjectStar(partition))
+                return true;
+        }
+
+        foreach (var order in window.OrderBy)
+        {
+            if (ContainsJsonObjectStar(order.Expression))
+                return true;
+        }
+
+        return window.Frame is { } frame
+            && ((frame.Start.Offset is { } start && ContainsJsonObjectStar(start))
+                || (frame.End.Offset is { } end && ContainsJsonObjectStar(end)));
+    }
+
     /// <summary>
     /// Mirrors <see cref="RewriteJsonObjectStarExpressions"/>'s traversal shape (including not
-    /// descending into a subquery's own scope) but only answers "does an <c>x(*)</c> call exist
+    /// descending into a subquery's own scope) but only answers "does a JSON star call exist
     /// anywhere", short-circuiting on the first one found instead of rebuilding the tree.
     /// </summary>
-    private static bool ContainsCountStarFunctionCall(Expression expression)
+    private static bool ContainsJsonObjectStar(Expression expression)
     {
         switch (expression)
         {
             case FunctionExpression function:
-                if (function.CountStar)
+                if (IsJsonObjectStar(function))
                     return true;
                 foreach (var argument in function.Arguments)
                 {
-                    if (ContainsCountStarFunctionCall(argument))
+                    if (ContainsJsonObjectStar(argument))
                         return true;
                 }
 
-                if (function.Filter is not null && ContainsCountStarFunctionCall(function.Filter))
+                if (function.Filter is not null && ContainsJsonObjectStar(function.Filter))
                     return true;
                 if (function.AggregateOrderBy is not null)
                 {
                     foreach (var term in function.AggregateOrderBy)
                     {
-                        if (ContainsCountStarFunctionCall(term.Expression))
+                        if (ContainsJsonObjectStar(term.Expression))
                             return true;
                     }
                 }
 
-                return false;
+                return (function.OrderedSetOrderBy is { } ordered && ContainsJsonObjectStar(ordered.Expression))
+                    || (function.Window is { } window && ContainsJsonObjectStar(window));
             case CollationExpression collation:
-                return ContainsCountStarFunctionCall(collation.Expression);
+                return ContainsJsonObjectStar(collation.Expression);
             case CastExpression cast:
-                return ContainsCountStarFunctionCall(cast.Expression);
+                return ContainsJsonObjectStar(cast.Expression);
             case CaseExpression @case:
-                if (@case.Operand is not null && ContainsCountStarFunctionCall(@case.Operand))
+                if (@case.Operand is not null && ContainsJsonObjectStar(@case.Operand))
                     return true;
                 foreach (var clause in @case.Clauses)
                 {
-                    if (ContainsCountStarFunctionCall(clause.When) || ContainsCountStarFunctionCall(clause.Then))
+                    if (ContainsJsonObjectStar(clause.When) || ContainsJsonObjectStar(clause.Then))
                         return true;
                 }
 
-                return @case.Else is not null && ContainsCountStarFunctionCall(@case.Else);
+                return @case.Else is not null && ContainsJsonObjectStar(@case.Else);
             case LikeExpression like:
-                return ContainsCountStarFunctionCall(like.Value)
-                    || ContainsCountStarFunctionCall(like.Pattern)
-                    || (like.Escape is not null && ContainsCountStarFunctionCall(like.Escape));
+                return ContainsJsonObjectStar(like.Value)
+                    || ContainsJsonObjectStar(like.Pattern)
+                    || (like.Escape is not null && ContainsJsonObjectStar(like.Escape));
             case GlobExpression glob:
-                return ContainsCountStarFunctionCall(glob.Value) || ContainsCountStarFunctionCall(glob.Pattern);
+                return ContainsJsonObjectStar(glob.Value) || ContainsJsonObjectStar(glob.Pattern);
             case InExpression @in:
-                if (ContainsCountStarFunctionCall(@in.Value))
+                if (ContainsJsonObjectStar(@in.Value))
                     return true;
                 foreach (var value in @in.Values)
                 {
-                    if (ContainsCountStarFunctionCall(value))
+                    if (ContainsJsonObjectStar(value))
                         return true;
                 }
 
                 return false;
             case InSubqueryExpression inSubquery:
-                return ContainsCountStarFunctionCall(inSubquery.Value);
+                return ContainsJsonObjectStar(inSubquery.Value);
             case BetweenExpression between:
-                return ContainsCountStarFunctionCall(between.Value)
-                    || ContainsCountStarFunctionCall(between.Lower)
-                    || ContainsCountStarFunctionCall(between.Upper);
+                return ContainsJsonObjectStar(between.Value)
+                    || ContainsJsonObjectStar(between.Lower)
+                    || ContainsJsonObjectStar(between.Upper);
             case UnaryExpression unary:
-                return ContainsCountStarFunctionCall(unary.Operand);
+                return ContainsJsonObjectStar(unary.Operand);
             case BinaryExpression binary:
-                return ContainsCountStarFunctionCall(binary.Left) || ContainsCountStarFunctionCall(binary.Right);
+                return ContainsJsonObjectStar(binary.Left) || ContainsJsonObjectStar(binary.Right);
             case RowValueExpression rowValue:
                 foreach (var value in rowValue.Values)
                 {
-                    if (ContainsCountStarFunctionCall(value))
+                    if (ContainsJsonObjectStar(value))
                         return true;
                 }
 
@@ -394,6 +413,51 @@ public sealed partial class EmbeddedDatabase
         return result ?? orderBy;
     }
 
+    private static WindowSpecification RewriteJsonObjectStarInWindow(
+        WindowSpecification window,
+        IReadOnlyList<OutputColumn> outputColumns)
+    {
+        var partitions = RewriteJsonObjectStarExpressionList(window.PartitionBy, outputColumns);
+        var order = RewriteJsonObjectStarInOrderBy(window.OrderBy, outputColumns);
+        var frame = window.Frame;
+        if (frame is not null)
+        {
+            var start = frame.Start.Offset is { } startOffset
+                ? RewriteJsonObjectStarExpressions(startOffset, outputColumns)
+                : null;
+            var end = frame.End.Offset is { } endOffset
+                ? RewriteJsonObjectStarExpressions(endOffset, outputColumns)
+                : null;
+            if (!ReferenceEquals(start, frame.Start.Offset) || !ReferenceEquals(end, frame.End.Offset))
+                frame = frame with { Start = frame.Start with { Offset = start }, End = frame.End with { Offset = end } };
+        }
+
+        return ReferenceEquals(partitions, window.PartitionBy)
+            && ReferenceEquals(order, window.OrderBy)
+            && ReferenceEquals(frame, window.Frame)
+            ? window
+            : window with { PartitionBy = partitions, OrderBy = order, Frame = frame };
+    }
+
+    private static IReadOnlyList<NamedWindowDefinition> RewriteJsonObjectStarInNamedWindows(
+        IReadOnlyList<NamedWindowDefinition> windows,
+        IReadOnlyList<OutputColumn> outputColumns)
+    {
+        List<NamedWindowDefinition>? result = null;
+        for (var index = 0; index < windows.Count; index++)
+        {
+            var definition = windows[index];
+            var rewritten = RewriteJsonObjectStarInWindow(definition.Specification, outputColumns);
+            if (ReferenceEquals(rewritten, definition.Specification))
+                continue;
+
+            result ??= new List<NamedWindowDefinition>(windows);
+            result[index] = definition with { Specification = rewritten };
+        }
+
+        return result ?? windows;
+    }
+
     /// <summary>
     /// Recursively rewrites every <c>json_object(*)</c>/<c>jsonb_object(*)</c> call reachable
     /// from <paramref name="expression"/> — including nested inside another function call, a
@@ -411,8 +475,7 @@ public sealed partial class EmbeddedDatabase
         {
             case FunctionExpression function:
                 {
-                    if (function.CountStar
-                        && function.Name.ToUpperInvariant() is "JSON_OBJECT" or "JSONB_OBJECT")
+                    if (IsJsonObjectStar(function))
                     {
                         if (outputColumns.Count == 0)
                         {
@@ -438,11 +501,31 @@ public sealed partial class EmbeddedDatabase
                     var aggregateOrderBy = function.AggregateOrderBy is null
                         ? null
                         : RewriteJsonObjectStarInOrderBy(function.AggregateOrderBy, outputColumns);
+                    var orderedSetOrderBy = function.OrderedSetOrderBy;
+                    if (orderedSetOrderBy is not null)
+                    {
+                        var orderedExpression = RewriteJsonObjectStarExpressions(orderedSetOrderBy.Expression, outputColumns);
+                        if (!ReferenceEquals(orderedExpression, orderedSetOrderBy.Expression))
+                            orderedSetOrderBy = orderedSetOrderBy with { Expression = orderedExpression };
+                    }
+
+                    var window = function.Window is null
+                        ? null
+                        : RewriteJsonObjectStarInWindow(function.Window, outputColumns);
                     return ReferenceEquals(arguments, function.Arguments)
                         && ReferenceEquals(filter, function.Filter)
                         && ReferenceEquals(aggregateOrderBy, function.AggregateOrderBy)
+                        && ReferenceEquals(orderedSetOrderBy, function.OrderedSetOrderBy)
+                        && ReferenceEquals(window, function.Window)
                         ? function
-                        : function with { Arguments = arguments, Filter = filter, AggregateOrderBy = aggregateOrderBy };
+                        : function with
+                        {
+                            Arguments = arguments,
+                            Filter = filter,
+                            AggregateOrderBy = aggregateOrderBy,
+                            OrderedSetOrderBy = orderedSetOrderBy,
+                            Window = window,
+                        };
                 }
             case CollationExpression collation:
                 {
