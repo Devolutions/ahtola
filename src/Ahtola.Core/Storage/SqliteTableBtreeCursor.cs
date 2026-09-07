@@ -40,6 +40,69 @@ public sealed class SqliteTableBtreeCursor
     }
 
     /// <summary>
+    /// Enumerates every cell in the tree in ascending rowid order, without seeking to any
+    /// particular key and without materializing the whole tree first.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <see cref="SqliteIndexBtreeCursor.ScanAscending"/>'s natural, left-to-right,
+    /// depth-first in-order traversal for table b-trees: every leaf is visited exactly once, in
+    /// page order, so the caller can stream complete rows one at a time — the bounded,
+    /// page-native alternative to reading every row into an in-memory list before returning any
+    /// of them. Physical page-shape validation (rowid ordering, page-type consistency) is the
+    /// same structural proof <c>EmbeddedFileStore.Load()</c> already performs once at open time;
+    /// this cursor does not repeat it on every scan, exactly like <see cref="SqliteIndexBtreeCursor"/>
+    /// does not re-validate index page shape on every <c>ScanAscending</c> call either.
+    /// </remarks>
+    public IEnumerable<SqliteTableLeafCell> ScanAscending(uint rootPage, Action? pageRead = null)
+    {
+        if (rootPage == 0 || rootPage > _io.PageCount)
+            throw new ArgumentOutOfRangeException(nameof(rootPage));
+
+        return EnumerateNodeAscending(rootPage, depth: 0, pageRead);
+    }
+
+    private IEnumerable<SqliteTableLeafCell> EnumerateNodeAscending(uint pageNumber, int depth, Action? pageRead)
+    {
+        if (depth >= MaximumDepth)
+        {
+            throw new InvalidDataException(
+                $"SQLite table b-tree rooted above page {pageNumber} is deeper than {MaximumDepth} levels.");
+        }
+
+        var isFirstPage = pageNumber == 1;
+        var image = _io.ReadPage(pageNumber);
+        pageRead?.Invoke();
+        switch (SqliteBtreePageHeader.Parse(image, isFirstPage).PageType)
+        {
+            case SqliteBtreePageType.TableLeaf:
+                {
+                    var leaf = SqliteTableLeafPageView.Parse(image, _io.UsableSpace, isFirstPage);
+                    foreach (var cell in leaf.Cells)
+                        yield return cell.Cell;
+                    yield break;
+                }
+
+            case SqliteBtreePageType.TableInterior:
+                {
+                    var interior = SqliteTableInteriorPageView.Parse(image, _io.UsableSpace, isFirstPage);
+                    foreach (var childPage in interior.Cells
+                                 .Select(cell => cell.Cell.LeftChildPage)
+                                 .Append(interior.Header.RightMostChildPage))
+                    {
+                        foreach (var cell in EnumerateNodeAscending(childPage, depth + 1, pageRead))
+                            yield return cell;
+                    }
+
+                    yield break;
+                }
+
+            default:
+                throw new InvalidDataException(
+                    $"SQLite page {pageNumber} is not part of a rowid-table b-tree.");
+        }
+    }
+
+    /// <summary>
     /// Reads one exact range from the record payload stored at
     /// <paramref name="rowId"/> without materializing the complete record.
     /// </summary>

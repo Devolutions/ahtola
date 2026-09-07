@@ -1026,6 +1026,97 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     /// <summary>
+    /// Answers "can the pager physically stream this ordinary rowid table's own committed b-tree
+    /// in ascending rowid order" — the rowid-table counterpart of
+    /// <see cref="CanOpenIndexAccessor"/>'s null-index (WITHOUT ROWID primary-key b-tree) case.
+    /// An ordinary rowid table's root page is a table b-tree (<see cref="SqliteTableBtreeCursor"/>),
+    /// never an index b-tree, so it is deliberately excluded from <see cref="CanOpenIndexAccessor"/>
+    /// itself rather than folded into it.
+    /// </summary>
+    internal bool CanOpenBaseTableFullScanAccessor(
+        EmbeddedTable table,
+        bool requireCommittedTableIdentity = true)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        return !_disposed
+            && _committedTables is not null
+            && (requireCommittedTableIdentity
+                ? _committedTables.TryGetValue(table.Name, out var committedTable) && ReferenceEquals(committedTable, table)
+                : _committedTables.ContainsKey(table.Name))
+            && _tableRootPages.ContainsKey(table.Name)
+            && table.HasRowid;
+    }
+
+    /// <summary>
+    /// Opens a durable full-ascending-rowid-order scan accessor over an ordinary rowid table's
+    /// own committed b-tree — the table-b-tree counterpart of
+    /// <see cref="TryOpenPrimaryKeyIndexFullScanAccessor"/>, used by a caller (an ORDER
+    /// BY-elision scan, or an MVCC merge that must visit every base row) with no seek prefix, so
+    /// it can stream rows in their natural committed order lazily instead of materializing the
+    /// whole table into memory first.
+    /// </summary>
+    internal bool TryOpenBaseTableFullScanAccessor(
+        EmbeddedTable table,
+        EmbeddedFileReadSnapshot? sharedSnapshot,
+        out EmbeddedFileIndexFullScanAccessor accessor,
+        bool requireCommittedTableIdentity = true)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        accessor = null!;
+        if (!CanOpenBaseTableFullScanAccessor(table, requireCommittedTableIdentity))
+            return false;
+
+        // See the identical comment in TryOpenIndexAccessor: a shared snapshot's own captured
+        // root-page mapping must win over the store's live one.
+        var tableRootPages = sharedSnapshot?.TableRootPages ?? _tableRootPages;
+        if (!tableRootPages.TryGetValue(table.Name, out var tableRootPage))
+            return false;
+
+        var (getPageIo, openSnapshot, closeSnapshot) = CreateIndexAccessorSnapshotAdapter(sharedSnapshot);
+        accessor = new EmbeddedFileIndexFullScanAccessor(
+            (pageRead, _) => ScanCommittedRowidTableAscending(
+                table,
+                tableRootPage,
+                getPageIo(),
+                pageRead),
+            openSnapshot,
+            closeSnapshot);
+        return true;
+    }
+
+    /// <summary>
+    /// Streams an ordinary rowid table's own committed rows in ascending rowid order, decoding
+    /// each cell as it is visited rather than reading the whole tree into memory first. The
+    /// bounded, page-native counterpart of the eager decode loop in
+    /// <see cref="LoadTableLeafRows"/>/<see cref="LoadTableTreeNodeRows"/>: those populate
+    /// <see cref="EmbeddedTable.Rows"/> once, at (deferred) load time, and keep every row
+    /// resident for the table's remaining lifetime, while this method re-reads the identical
+    /// committed page image on every call and never retains more than the single row currently
+    /// being yielded.
+    /// </summary>
+    private IEnumerable<EmbeddedFileIndexSeekRow> ScanCommittedRowidTableAscending(
+        EmbeddedTable table,
+        uint tableRootPage,
+        ISqliteBtreePageIo pageIo,
+        Action? pageRead)
+    {
+        var cursor = new SqliteTableBtreeCursor(pageIo);
+        var overflowReader = new SqliteOverflowChainReader(pageIo);
+        var aliasIndex = table.RowidAliasColumnIndex;
+        foreach (var cell in cursor.ScanAscending(tableRootPage, pageRead))
+        {
+            var payload = cell.FirstOverflowPage is null
+                ? cell.LocalPayload.ToArray()
+                : overflowReader.ReadPayload(cell);
+            var values = RestoreRowidTableRecord(table, SqliteRecordCodec.Decode(payload, _textEncoding));
+            if (aliasIndex >= 0)
+                values[aliasIndex] = SqlValue.Integer(cell.RowId);
+            EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, values);
+            yield return new EmbeddedFileIndexSeekRow(values, cell.RowId);
+        }
+    }
+
+    /// <summary>
     /// Builds the shared lazy-open/close committed-page-snapshot plumbing used by every durable
     /// index accessor (secondary index, or WITHOUT ROWID primary-key b-tree). When
     /// <paramref name="sharedSnapshot"/> is supplied the accessor reuses its page I/O and never
