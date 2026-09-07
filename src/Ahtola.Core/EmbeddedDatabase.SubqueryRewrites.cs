@@ -44,9 +44,11 @@ namespace Ahtola.Core;
 /// The stage runs inside <c>ExecuteSelectStatement</c>, after <c>ValidateQuerySchema</c>, so
 /// name-resolution diagnostics are always produced from the <em>original</em> statement and a
 /// rewrite can never mask a "no such column" error or invent scope. For the same reason it is
-/// skipped inside trigger bodies, where that validation does not run. <c>EXPLAIN</c> and
-/// <c>EXPLAIN QUERY PLAN</c> use their own routes and therefore describe the un-rewritten
-/// statement.
+/// skipped inside trigger bodies, where that validation does not run. <c>EXPLAIN</c> uses its own
+/// route and describes the un-rewritten statement. <c>EXPLAIN QUERY PLAN</c> runs this same
+/// rewrite (see <c>EmbeddedDatabase.ExplainQueryPlanDescriber.cs</c>) for the correlated-
+/// aggregate-subquery shapes it can already describe, so the reported plan matches what actually
+/// executes instead of the statement as written.
 /// </para>
 /// </summary>
 public sealed partial class EmbeddedDatabase

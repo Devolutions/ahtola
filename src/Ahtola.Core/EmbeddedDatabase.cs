@@ -28176,6 +28176,14 @@ out bool hasReturning)
                 }).ToArray(),
                 0);
         }
+        if (statement.Inner is SelectStatement correlatedAggregateSelect
+            && TryDescribeCorrelatedAggregateSubqueryPlan(
+                correlatedAggregateSelect,
+                compilationContext,
+                out var correlatedAggregatePlan))
+        {
+            return correlatedAggregatePlan;
+        }
 
         var usesCompiledProgram = statement.Inner switch
         {
