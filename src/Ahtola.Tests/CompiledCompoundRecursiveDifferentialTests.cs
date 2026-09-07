@@ -125,8 +125,42 @@ public class CompiledCompoundRecursiveDifferentialTests
     }
 
     [Test]
-    public void JoinedAndDistinctRecursiveTermsMatchSqliteAndRoute()
+    public void JoinedRecursiveTermMatchesSqliteAndRoutesThroughGenerationExpansion()
     {
+        string[] setup =
+        [
+            "CREATE TABLE edges(src INTEGER, dst INTEGER)",
+            "INSERT INTO edges VALUES (1, 2), (1, 3), (2, 4), (3, 4), (4, 1)",
+        ];
+        const string joined =
+            "WITH RECURSIVE reach(n) AS ("
+            + "VALUES (1) UNION SELECT dst FROM edges JOIN reach ON src = n"
+            + ") SELECT * FROM reach";
+
+        var output = AssertMatchesSqlite(setup, joined);
+        output.Rows.Select(row => row[0]).Should().Equal(
+            SqlValue.Integer(1),
+            SqlValue.Integer(2),
+            SqlValue.Integer(3),
+            SqlValue.Integer(4));
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var sql in setup)
+            Execute(connection, sql);
+        ExplainOpcodes(connection, joined).Should().Contain("WorkTableExpandGeneration");
+        QueryPlanDetail(connection, joined).Should().Be("MANAGED COMPILED VDBE");
+    }
+
+    [Test]
+    public void DistinctRecursiveTermMatchesSqliteAndTruthfullyReportsFallback()
+    {
+        // A DISTINCT recursive projection must be evaluated once per current row: a
+        // single-row DISTINCT never removes anything, preserving duplicates the
+        // whole-generation worktable transform would otherwise incorrectly collapse
+        // (see IsRoutableRecursiveTerm / recursive-cte-distinct-in-recursive-step). So this
+        // shape stays on the evaluator's own per-row priority queue instead of routing
+        // through generation expansion, and EXPLAIN must not fabricate a bytecode dump for
+        // a program that never runs.
         string[] setup =
         [
             "CREATE TABLE edges(src INTEGER, dst INTEGER)",
@@ -147,8 +181,8 @@ public class CompiledCompoundRecursiveDifferentialTests
         using var connection = new EmbeddedDatabase().Connect();
         foreach (var sql in setup)
             Execute(connection, sql);
-        ExplainOpcodes(connection, joined).Should().Contain("WorkTableExpandGeneration");
-        QueryPlanDetail(connection, joined).Should().Be("MANAGED COMPILED VDBE");
+        QueryPlanDetail(connection, joined).Should().Be("MANAGED EVALUATOR FALLBACK");
+        Assert.Throws<EmbeddedSqlException>(() => ExplainOpcodes(connection, joined));
     }
 
     [Test]
