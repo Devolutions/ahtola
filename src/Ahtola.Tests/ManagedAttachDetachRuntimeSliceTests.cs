@@ -633,9 +633,9 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
         fileSystem.FileExists("attach-limit-overflow.db").Should().BeFalse();
 
         var mainAlias = () => Execute(connection, "ATTACH DATABASE 'unused-main.db' AS main;");
-        mainAlias.Should().Throw<EmbeddedSqlException>().WithMessage("cannot attach database as main");
+        mainAlias.Should().Throw<EmbeddedSqlException>().WithMessage("reserved name main is already in use");
         var tempAlias = () => Execute(connection, "ATTACH DATABASE 'unused-temp.db' AS temp;");
-        tempAlias.Should().Throw<EmbeddedSqlException>().WithMessage("cannot attach database as temp");
+        tempAlias.Should().Throw<EmbeddedSqlException>().WithMessage("reserved name temp is already in use");
 
         Execute(connection, "CREATE TABLE db0.only_attached(value INTEGER);");
         Execute(connection, "CREATE TABLE main.index_owner(value INTEGER);");

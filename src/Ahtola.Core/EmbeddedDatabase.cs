@@ -57142,14 +57142,16 @@ public sealed partial class EmbeddedConnection : IDisposable
         var requestedPath = EmbeddedDatabase.ToSqlText(pathValue);
         var (path, uriReadOnly) = ResolveAttachmentPath(requestedPath);
 
+        if (_attachedDatabases.ContainsKey(statement.Alias))
+            throw new EmbeddedSqlException($"database {statement.Alias} is already in use");
+
         if (statement.Alias.Equals("main", StringComparison.OrdinalIgnoreCase)
             || statement.Alias.Equals("temp", StringComparison.OrdinalIgnoreCase))
         {
-            throw new EmbeddedSqlException($"cannot attach database as {statement.Alias}");
+            // Turso core/connection.rs attach_database_with_config: reserved-alias rejection
+            // uses the same "already in use" wording as a duplicate alias, not a bespoke message.
+            throw new EmbeddedSqlException($"reserved name {statement.Alias} is already in use");
         }
-
-        if (_attachedDatabases.ContainsKey(statement.Alias))
-            throw new EmbeddedSqlException($"database {statement.Alias} is already in use");
         if (_attachedDatabases.Count >= MaximumAttachedDatabases)
             throw new EmbeddedSqlException($"too many attached databases - maximum {MaximumAttachedDatabases}");
 
@@ -57587,6 +57589,16 @@ public sealed partial class EmbeddedConnection : IDisposable
             CreateVirtualTableStatement createVirtual => RouteNamedStatement(
                 createVirtual.Name,
                 name => createVirtual with { Name = name }),
+            // A sequence's backing table lives only in the schema the CREATE/DROP names: an
+            // unrouted "aux.s1" would otherwise run against main with the schema marker still
+            // embedded in the backing-table name, leaving aux without the table nextval/currval/
+            // setval (see TryGetSequenceFunctionSchema) correctly route reads and writes to.
+            CreateSequenceStatement createSequence => RouteNamedStatement(
+                createSequence.Name,
+                name => createSequence with { Name = name }),
+            DropSequenceStatement dropSequence => RouteNamedStatement(
+                dropSequence.Name,
+                name => dropSequence with { Name = name }),
             CreateTriggerStatement createTrigger => RouteCreateTrigger(createTrigger),
             CreateViewStatement createView => RouteCreateView(createView),
             DropTableStatement drop => RouteExistingNamedStatement(
@@ -59500,6 +59512,8 @@ Func<string, ParsedStatement> rewrite)
                     CollectExpressionSchemas(value, schemas, commonTableExpressions);
                 return;
             case FunctionExpression function:
+                if (TryGetSequenceFunctionSchema(function, out var sequenceSchema))
+                    schemas.Add(sequenceSchema);
                 foreach (var argument in function.Arguments)
                     CollectExpressionSchemas(argument, schemas, commonTableExpressions);
                 CollectExpressionSchemas(function.Filter, schemas, commonTableExpressions);
@@ -59551,6 +59565,35 @@ Func<string, ParsedStatement> rewrite)
             default:
                 throw new InvalidOperationException($"Cannot route expression {expression.GetType().Name}.");
         }
+    }
+
+    /// <summary>
+    /// A <c>nextval</c>/<c>currval</c>/<c>setval</c> call names its sequence via a string-literal
+    /// argument rather than an ordinary table/column reference, so the generic schema collector never
+    /// sees it. Upstream's <c>translate_sequence_function</c> resolves an unqualified name against the
+    /// main schema only (never the dynamic temp/main/attached lookup ordinary table names get), and a
+    /// <c>schema.name</c> spelling names the schema explicitly. Surfacing that schema here lets routing
+    /// send the call to the attached database that actually owns the backing table, instead of always
+    /// executing against main's catalog.
+    /// </summary>
+    private static bool TryGetSequenceFunctionSchema(FunctionExpression function, out string schema)
+    {
+        schema = "main";
+        if (function.Window is not null
+            || !(function.Name.Equals("nextval", StringComparison.OrdinalIgnoreCase)
+                || function.Name.Equals("currval", StringComparison.OrdinalIgnoreCase)
+                || function.Name.Equals("setval", StringComparison.OrdinalIgnoreCase))
+            || function.Arguments.Count == 0
+            || function.Arguments[0] is not LiteralExpression { Value.Kind: SqlValueKind.Text } literal)
+        {
+            return false;
+        }
+
+        var rawName = literal.Value.AsText();
+        var dot = rawName.LastIndexOf('.');
+        if (dot >= 0)
+            schema = rawName[..dot];
+        return true;
     }
 
     private static void CollectWindowSchemas(
