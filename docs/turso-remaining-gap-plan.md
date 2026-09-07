@@ -11,6 +11,10 @@ generated columns, 7 WITHOUT ROWID); and 1 Turso CLI error-prefix difference.
 These are coverage entries, not independent defects. The historical inventory's
 217 closed records and its two-failure metadata are not the current backlog.
 
+Baseline discovery reports 11,077 cases: 10,959 runnable, 85 skipped by the
+corpus/backend policy, and 33 unsupported by the harness. These are discovery
+counts, not evidence that every runnable case has passed in this execution.
+
 Implement the parity and architectural work below without removing the deliberate
 extensions. Native companions, loadable native extensions, and raw sqlite3 handles
 remain excluded. Typed values, TYPE/DOMAIN, and incremental materialized views
@@ -23,7 +27,9 @@ a missing feature relative to this pin; both engines reject it.
 - Every implementation worker uses Claude Sonnet 5 (`claude-sonnet-5`), high
   reasoning effort, and the long-context tier requested for 1M context.
 - Use isolated worktree sessions, with at most three implementation workers
-  active initially. Each owns one cohesive workstream and commits its result.
+  active initially. A fourth, harness-only coverage worker can proceed without
+  changing production engine files. Each owns one cohesive workstream and
+  commits its result.
 - Base the first wave on the analyzed integration branch, not the stale local
   master ref. Subsequent workers start from integrated prerequisite commits.
 - The coordinator owns this plan, historical inventory reconciliation, integration
@@ -103,7 +109,7 @@ rejection parity, not a promise of general recursive FULL JOIN support.
 | PLAN | Remaining 18 EQP/EXPLAIN entries | SQL, CTE | EQP describes actual rewrites; cost original versus decorrelated plans; reuse identical aggregate subqueries; lower eligible semi/anti/grouped shapes for real EXPLAIN |
 | EQP | Complete FORMAT=JSON | PLAN | Structured op variants, CTE materializations, null root parents, original SQL, correct result columns; adopt the 15 pinned upstream cases |
 | NULLIDX | Explicit index NULLS FIRST/LAST | Integrated Wave 1 parser/schema | Metadata, persisted ordering, forward/reverse seeks, bounds, ORDER BY satisfaction, uniqueness/UPSERT, reopen and corruption checks; adopt 83 upstream cases |
-| COVER | Expand upstream coverage | Integrated Wave 1 | Classify all remaining Turso-specific files, run eligible backend-tagged SQL, and provide equivalents for path fixtures without rewriting expected SQL |
+| COVER | Expand upstream coverage | Harness work parallel with Wave 1; engine-dependent adoption after integration | Classify all remaining Turso-specific files, run eligible backend-tagged SQL, and provide equivalents for path fixtures without rewriting expected SQL |
 
 Do not implement plan parity by fabricating upstream display strings. A runtime
 optimization can exist while its EQP is incomplete; trace both surfaces.
